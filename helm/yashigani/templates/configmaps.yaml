@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-07T01:00:00+01:00 — retro #83: add yashigani-grafana-provisioning ConfigMap (mTLS datasources) */ -}}
+{{- /* Last updated: 2026-05-07T09:00:00+01:00 — fix(helm): G9 blocker: rename grafana-provisioning ConfigMap keys (forward-slash → underscore) so K8s API accepts them */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -852,7 +852,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     {{- include "yashigani.labels" . | nindent 4 }}
 data:
-  datasources/prometheus.yml: |
+  datasources_prometheus.yml: |
     # retro #83: Grafana → Prometheus datasource over mTLS (Pattern B).
     # TA-1/TA-2: mTLS prevents impersonation and eavesdropping on obs network.
     apiVersion: 1
@@ -872,7 +872,7 @@ data:
           tlsCACert: $__file{/run/secrets/ca_intermediate.crt}
           tlsClientCert: $__file{/run/secrets/grafana_client.crt}
           tlsClientKey: $__file{/run/secrets/grafana_client.key}
-  datasources/loki.yml: |
+  datasources_loki.yml: |
     # retro #83: Grafana → Loki datasource over mTLS (Pattern B).
     # NOTE: Loki TLS termination enabled by parallel PR #84.
     apiVersion: 1
@@ -898,7 +898,7 @@ data:
           tlsCACert: $__file{/run/secrets/ca_intermediate.crt}
           tlsClientCert: $__file{/run/secrets/grafana_client.crt}
           tlsClientKey: $__file{/run/secrets/grafana_client.key}
-  datasources/jaeger.yml: |
+  datasources_jaeger.yml: |
     # retro #83: Jaeger query/UI port (16686) remains HTTP on obs-internal.
     # EX-231-09 closed otel-collector → Jaeger gRPC (4317) mTLS separately.
     # Jaeger UI TLS deferred to v2.24 (RETRO-84).

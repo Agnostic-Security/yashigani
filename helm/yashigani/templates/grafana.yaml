@@ -1,6 +1,7 @@
 {{- if .Values.grafana.enabled }}
-# Last updated: 2026-05-07T01:00:00+01:00
+# Last updated: 2026-05-07T09:00:00+01:00
 # retro #83: Grafana mTLS ingress + datasource mTLS (Pattern B).
+# fix(helm): G9 blocker: volume items: mapping restores in-pod path after ConfigMap key rename.
 # - GF_SERVER_PROTOCOL=https, port 3443, cert from yashigani-pki-certs secret.
 # - Datasource calls (Prometheus, Loki) use grafana_client.crt for mTLS.
 # - Readiness/liveness probes updated to HTTPS port 3443 with insecureSkipVerify
@@ -150,6 +151,13 @@ spec:
         - name: grafana-provisioning
           configMap:
             name: yashigani-grafana-provisioning
+            items:
+              - key: datasources_prometheus.yml
+                path: datasources/prometheus.yml
+              - key: datasources_loki.yml
+                path: datasources/loki.yml
+              - key: datasources_jaeger.yml
+                path: datasources/jaeger.yml
         {{- end }}
   {{- if .Values.grafana.persistence.enabled }}
   volumeClaimTemplates:
