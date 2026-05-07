@@ -1,0 +1,25 @@
+# Prometheus TLS web config — v2.23.2 retro #83
+# Last updated: 2026-05-07T00:00:00+01:00
+#
+# Enables HTTPS on Prometheus port 9090 so Grafana → Prometheus datasource
+# calls use mTLS (Pattern B — intermediate as trust anchor, never root).
+#
+# Prometheus presents prometheus_client.crt to callers (e.g. Grafana).
+# Callers must present a valid leaf cert signed by ca_intermediate.crt.
+# This closes the plaintext datasource gap identified in retro #83.
+#
+# TA-1 (insider) / TA-2 (external): without server TLS on Prometheus,
+# an attacker on the obs bridge could serve fabricated metric responses
+# or eavesdrop on metric data (e.g. tenant counts, error rates, license
+# usage). mTLS prevents both impersonation and eavesdropping.
+#
+# tls_config docs: https://prometheus.io/docs/prometheus/latest/configuration/https/
+tls_server_config:
+  cert_file: /run/secrets/prometheus_client.crt
+  key_file:  /run/secrets/prometheus_client.key
+  # Trust anchor: intermediate CA only (Pattern B).
+  # client_ca_file + client_auth_type=RequireAndVerifyClientCert means
+  # unauthenticated callers (e.g. raw curl without a client cert) are rejected.
+  client_ca_file: /run/secrets/ca_intermediate.crt
+  client_auth_type: RequireAndVerifyClientCert
+  min_version: TLS13

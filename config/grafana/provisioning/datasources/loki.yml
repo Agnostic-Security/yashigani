@@ -1,6 +1,7 @@
-# retro #84 (v2.23.2): Grafana→Loki datasource upgraded to mTLS.
-# Loki now requires a verified client cert (RequireAndVerifyClientCert).
-# Grafana presents grafana_client.crt/key (issued by install.sh PKI).
+# Last updated: 2026-05-07T12:05:00+01:00
+# v2.23.2 retro #83 + #84: Grafana→Loki datasource over mTLS (Pattern B).
+# Loki now requires a verified client cert (RequireAndVerifyClientCert) — retro #84.
+# Grafana presents grafana_client.crt/key (issued by install.sh PKI) — retro #83.
 # Trust anchor: ca_intermediate.crt (Pattern B — never ca_root.crt).
 #
 # NOTE: Grafana resolves cert paths relative to its data directory or
@@ -9,10 +10,13 @@
 #
 # Coordination: PR #83 (Grafana mTLS) configures GF_SERVER_* TLS for
 # inbound connections TO Grafana. This file configures the Grafana→Loki
-# OUTBOUND path. Both PRs must merge together for the obs plane to be
-# fully mTLS. The shared mTLS-handshake contract:
+# OUTBOUND path. Both PRs (#83 + #84) must merge together for the obs
+# plane to be fully mTLS. The shared mTLS-handshake contract:
 #   Loki accepts: leaf cert signed by yashigani internal intermediate CA.
 #   Grafana presents: grafana_client.crt (issued by same intermediate CA).
+#
+# TA-1 (insider) / TA-2 (external attacker): without mTLS on the datasource leg,
+# an attacker on the obs network could intercept log traffic. mTLS closes it.
 apiVersion: 1
 datasources:
   - name: Loki

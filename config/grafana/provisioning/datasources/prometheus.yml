@@ -1,11 +1,27 @@
+# Last updated: 2026-05-07T00:00:00+01:00
+# v2.23.2 retro #83: Grafana → Prometheus datasource upgraded to mTLS (Pattern B).
+# Trust anchor: ca_intermediate.crt (never ca_root.crt — Pattern B rule).
+# Client cert: grafana_client.crt / grafana_client.key (leaf issued by install.sh PKI bootstrap).
+# Prometheus presents prometheus_client.crt; grafana verifies it against ca_intermediate.
+#
+# TA-1 (insider) / TA-2 (external attacker): without mTLS on the datasource leg,
+# an attacker co-located on the obs network could impersonate Prometheus and serve
+# fabricated metrics. mTLS closes the impersonation vector.
 apiVersion: 1
 
 datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    url: https://prometheus:9090
     isDefault: true
     editable: false
     jsonData:
       timeInterval: "15s"
+      tlsAuth: true
+      tlsAuthWithCACert: true
+      tlsSkipVerify: false
+    secureJsonData:
+      tlsCACert: $__file{/run/secrets/ca_intermediate.crt}
+      tlsClientCert: $__file{/run/secrets/grafana_client.crt}
+      tlsClientKey: $__file{/run/secrets/grafana_client.key}
