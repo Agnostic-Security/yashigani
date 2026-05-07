@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-07T10:00:00+01:00 (retro #84: loki+promtail added to _pki_chown_client_keys UID map for mTLS cert issuance)
 # last-updated: 2026-05-06T20:00:00+01:00 (P-9 fix: _podman_verify_healthchecks() post-compose-up gate; called on Podman path in compose_up())
 # last-updated: 2026-05-06T12:00:00+01:00 (fix #85: bind-mount dirs auto-created for all runtimes incl. rootless Podman; sudo mkdir removed from promtail path; fail-loud on backups/tls mkdir)
 # last-updated: 2026-05-04T19:30:00+01:00 (v2.23.2: chown caddy_client.key to UID 0 — cap_drop ALL strips DAC_OVERRIDE; gate V232-SMOKE-019. sudo mkdir promtail dir; gate V232-SMOKE-020)
@@ -4637,6 +4638,22 @@ _pki_chown_client_keys() {
     # V232-SMOKE-002 — caught by Linux smoke gate 2026-05-03.
     "otel-collector:10001"
     "jaeger:10001"
+    # loki runs as UID 10001 (grafana/loki Dockerfile: USER 10001).
+    # retro #84 (v2.23.2): loki now terminates mTLS on port 3100; it reads
+    # loki_client.crt/key from /run/secrets. Without chown the startup fails
+    # with "open /run/secrets/loki_client.key: permission denied".
+    "loki:10001"
+    # promtail runs as UID 0 (root) inside the container — it needs to access
+    # /var/run/docker.sock and /var/lib/docker/containers. Root inside the
+    # container (with cap_drop: [ALL]) can still read a file owned by root
+    # without DAC_OVERRIDE, so the chown here is a no-op (file was already
+    # written by the installer running as root on Docker hosts). On rootless
+    # Podman hosts the effective UID inside the container maps to the subuid-
+    # remapped installer UID; the file is already accessible. We include
+    # promtail in the list so the issuer always generates promtail_client.crt/key
+    # (mtls_capable:true in service_identities.yaml) and the key is set 0600.
+    # retro #84 (v2.23.2).
+    "promtail:0"
   )
 
   # Determine chown strategy for this runtime.
