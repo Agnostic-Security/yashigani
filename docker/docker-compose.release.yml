@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Release digest overlay
-# Last updated: 2026-05-07T09:00:00+01:00 (chore: full image-bump sweep — sync all digests to upstream-latest-stable)
+# Last updated: 2026-05-07T10:30:00+01:00 (chore: convert floating-tag stubs to specific verified-existing versions)
 #
 # Purpose: overrides every `image:` field in docker-compose.yml to pin the
 # exact digest verified at release time. This closes ASVS V10.3.1 (H-02
@@ -27,13 +27,13 @@
 #
 # Digest inventory (verified 2026-05-07 via crane digest — INDEX-level multi-arch digest):
 #
-#   caddy:2-alpine                              sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
-#   redis:7-alpine                              sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+#   caddy:2.11.2-alpine                         sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+#   redis:7.4.9-alpine                          sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
 #   openpolicyagent/opa:1.16.1                  sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02
 #   ollama/ollama:0.23.1                        sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
 #   prom/prometheus:v3.11.3                     sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3
 #   grafana/grafana:13.0.1                      sha256:0f86bada30d65ef9d0183b90c1e2682ac92d53d95da8bed322b984ea78a4a73a
-#   pgvector/pgvector:pg16                      sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+#   pgvector/pgvector:0.8.2-pg16                sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
 #   edoburu/pgbouncer:v1.25.1-p0                sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
 #   prom/alertmanager:v0.32.1                   sha256:51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286
 #   grafana/loki:3.7.1                          sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4
@@ -60,10 +60,10 @@
 services:
 
   caddy:
-    image: docker.io/library/caddy:2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    image: docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
 
   budget-redis:
-    image: docker.io/library/redis:7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
 
   policy:
     image: docker.io/openpolicyagent/opa:1.16.1@sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02
@@ -81,7 +81,7 @@ services:
     image: docker.io/grafana/grafana:13.0.1@sha256:0f86bada30d65ef9d0183b90c1e2682ac92d53d95da8bed322b984ea78a4a73a
 
   postgres:
-    image: docker.io/pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
 
   pgbouncer:
     image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
@@ -108,7 +108,7 @@ services:
     image: docker.io/smallstep/step-ca:0.30.2@sha256:a2b17872915c193259b75a5474c398326f41bd199f0842093e52cf4182bc8270
 
   redis:
-    image: docker.io/library/redis:7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.9.2@sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49

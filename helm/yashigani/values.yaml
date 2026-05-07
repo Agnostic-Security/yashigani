@@ -1,6 +1,6 @@
 # Yashigani v2.23.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-07 (chore: bump ollama 0.23.0→0.23.1, loki 3.6.10→3.7.1, openclaw 2026.3.1→2026.5.6, alpine/k8s 1.29.4→1.29.15)
+# Last updated: 2026-05-07 (chore: convert floating-tag stubs to specific verified-existing versions)
 
 global:
   imageRegistry: "ghcr.io"
@@ -354,7 +354,7 @@ redis:
   enabled: true
   image:
     repository: redis
-    tag: "7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -592,7 +592,7 @@ caddy:
   enabled: true
   image:
     repository: caddy
-    tag: "2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+    tag: "2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -767,7 +767,7 @@ budgetRedis:
   enabled: true
   image:
     repository: redis
-    tag: "7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
