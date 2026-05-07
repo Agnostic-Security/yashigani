@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Helm release digest overlay
-# Last updated: 2026-05-06T00:00:00+01:00
+# Last updated: 2026-05-07T10:30:00+01:00
 #
 # Purpose: pins every upstream image in values.yaml to its sha256 digest,
 # closing ASVS V10.3.1 (H-02 from internal design-drift audit). Apply as a
@@ -31,9 +31,9 @@
 caddy:
   image:
     repository: docker.io/library/caddy
-    tag: "2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+    tag: "2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
     digest: "sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
-    # Full pinned ref: docker.io/library/caddy:2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    # Full pinned ref: docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
 
 policy:
   image:
@@ -44,13 +44,13 @@ policy:
 redis:
   image:
     repository: docker.io/library/redis
-    tag: "7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
     digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
 
 budgetRedis:
   image:
     repository: docker.io/library/redis
-    tag: "7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
     digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
 
 ollama:
@@ -74,7 +74,7 @@ grafana:
 postgres:
   image:
     repository: docker.io/pgvector/pgvector
-    tag: "pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+    tag: "0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
     digest: "sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
 
 pgbouncer:

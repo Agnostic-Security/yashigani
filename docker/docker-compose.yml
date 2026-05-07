@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Docker Compose stack
-# Last updated: 2026-05-07T00:00:00+01:00 (fix: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES default for canonical agent bundles)
+# Last updated: 2026-05-07T10:30:00+01:00 (chore: convert floating-tag stubs to specific verified-existing versions)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -87,7 +87,7 @@ services:
   # ---------------------------------------------------------------------------
   caddy:
     dns_search: ["."]
-    image: docker.io/library/caddy:2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    image: docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
     restart: unless-stopped
     mem_limit: ${YASHIGANI_CADDY_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_CADDY_CPU_LIMIT:-0.5}
@@ -472,7 +472,7 @@ services:
   # ---------------------------------------------------------------------------
   budget-redis:
     dns_search: ["."]
-    image: docker.io/library/redis:7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
     # gate V232-SMOKE-018: redis:7-alpine has no USER directive (defaults to root).
     # With cap_drop: [ALL], root has no DAC_OVERRIDE → cannot read TLS keys
     # chowned to 999:999 by `_pki_chown_client_keys`. Pin to UID 999:999 (the
@@ -566,7 +566,7 @@ services:
   # ---------------------------------------------------------------------------
   redis:
     dns_search: ["."]
-    image: docker.io/library/redis:7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
     # gate V232-SMOKE-018 — see budget-redis above for rationale.
     user: "999:999"
     restart: unless-stopped
@@ -616,7 +616,7 @@ services:
   # ---------------------------------------------------------------------------
   ollama:
     dns_search: ["."]
-    image: docker.io/ollama/ollama:0.23.0@sha256:5600a652d1081050f398152127c584222546354491f27fe47ccbc6351bc870bd
+    image: docker.io/ollama/ollama:0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
     # gate V232-SMOKE-018: bbd556e set user: "1000:1000" with HOME=/data
     # (verified working on macOS Podman where vfs initialises the volume
     # owned by the caller UID). On Linux Docker, named volumes are
@@ -660,7 +660,7 @@ services:
   # Model bootstrap — pull classifier model on first start
   ollama-init:
     dns_search: ["."]
-    image: docker.io/ollama/ollama:0.23.0@sha256:5600a652d1081050f398152127c584222546354491f27fe47ccbc6351bc870bd
+    image: docker.io/ollama/ollama:0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
     # gate V232-SMOKE-018 — same rationale as `ollama` service above.
     user: "0:0"
     restart: on-failure:3
@@ -790,7 +790,7 @@ services:
   # ---------------------------------------------------------------------------
   postgres:
     dns_search: ["."]
-    image: docker.io/pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
     # gate V232-SMOKE-018: pgvector/pgvector has no USER directive (defaults to
     # root). The postgres entrypoint then runs gosu/setpriv to switch from root
     # → postgres user, but `cap_drop: [ALL]` strips CAP_SETUID/SETGID/FOWNER —
@@ -1225,7 +1225,7 @@ services:
   # Integration: OpenClaw (:18789) → Yashigani Gateway (:8080) → Ollama/LLM
   openclaw:
     dns_search: ["."]
-    image: ghcr.io/openclaw/openclaw:2026.3.1@sha256:dcf11a3a97a9b0e42dd41fcd4891533e77ff72e7b0380c743177bfbfd6f38b2d
+    image: ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc
     restart: unless-stopped
     mem_limit: ${YASHIGANI_OPENCLAW_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_OPENCLAW_CPU_LIMIT:-1.0}

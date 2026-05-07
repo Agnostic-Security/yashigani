@@ -10,7 +10,7 @@ enabled: false
 #        Set caddy.enabled=false and configure an Ingress resource (global.tlsMode=nginx)."
 image:
   repository: caddy
-  tag: "2-alpine"
+  tag: "2.11.2-alpine"
   pullPolicy: IfNotPresent
 replicaCount: 1
 resources:
