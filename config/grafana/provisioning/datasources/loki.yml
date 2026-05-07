@@ -1,16 +1,36 @@
+# Last updated: 2026-05-07T00:00:00+01:00
+# v2.23.2 retro #83: Grafana → Loki datasource upgraded to mTLS (Pattern B).
+# Trust anchor: ca_intermediate.crt (never ca_root.crt — Pattern B rule).
+# Client cert: grafana_client.crt / grafana_client.key (leaf issued by install.sh PKI bootstrap).
+# Loki presents loki_client.crt; grafana verifies against ca_intermediate.
+#
+# NOTE: Loki TLS termination is enabled by parallel PR #84.
+# This datasource config presupposes that Loki is listening on https://loki:3100.
+# If deploying from this branch without #84, Loki still listens on HTTP 3100 —
+# the datasource will fail TLS. Merge #84 before or together with this PR.
+#
+# TA-1 (insider) / TA-2 (external attacker): without mTLS on the datasource leg,
+# an attacker on the obs network could intercept log traffic. mTLS closes it.
 apiVersion: 1
 datasources:
   - name: Loki
     type: loki
     access: proxy
-    url: http://loki:3100
+    url: https://loki:3100
     isDefault: false
     version: 1
     editable: false
     jsonData:
       maxLines: 1000
+      tlsAuth: true
+      tlsAuthWithCACert: true
+      tlsSkipVerify: false
       derivedFields:
         - datasourceUid: jaeger
           matcherRegex: '"trace_id":"(\w+)"'
           name: TraceID
           url: "$${__value.raw}"
+    secureJsonData:
+      tlsCACert: $__file{/run/secrets/ca_intermediate.crt}
+      tlsClientCert: $__file{/run/secrets/grafana_client.crt}
+      tlsClientKey: $__file{/run/secrets/grafana_client.key}

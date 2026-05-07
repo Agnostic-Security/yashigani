@@ -1,4 +1,4 @@
-# Last updated: 2026-05-02T01:00:00+01:00
+# Last updated: 2026-05-07T01:00:00+01:00
 """
 Caddyfile family contract tests — anti-rot gate.
 
@@ -8,11 +8,13 @@ blocks audited, all missing inject-caddy-verified imports detected and fixed).
 Contract assertions (all three Caddyfiles: selfsigned / acme / ca)
 -------------------------------------------------------------------
 1. inject-caddy-verified coverage:
-   Every ``reverse_proxy`` block targeting the mTLS services (gateway:8080 or
-   backoffice:8443) MUST be followed by ``import inject-caddy-verified`` within
-   the same block (within 6 lines).  Third-party upstreams (grafana:3000,
-   wazuh-dashboard:5601, prometheus:9090 in the after-forward_auth legs) are
-   deliberately excluded — they do not validate the header.
+   Every ``reverse_proxy`` block targeting the mTLS services (gateway:8080,
+   backoffice:8443, grafana:3443, prometheus:9090) MUST be followed by
+   ``import inject-caddy-verified`` within the same block (within 6 lines).
+   Third-party upstreams (wazuh-dashboard:5601, open-webui:8080 in the
+   after-forward_auth legs) are deliberately excluded — they do not validate
+   the header. retro #83: grafana and prometheus now use mTLS and are no
+   longer excluded.
 
 2. TLS 1.3 minimum on every public listener:
    Every ``tls`` directive inside a site block (HTTPS listeners) must contain
@@ -76,8 +78,13 @@ _MTLS_UPSTREAM_PATTERN = re.compile(
 # Upstreams that are legitimately excluded (they don't validate the header).
 # They're third-party services proxied AFTER a forward_auth gate; their
 # forward_auth call to backoffice:8443 already carries inject-caddy-verified.
+# retro #83: grafana:3000 and prometheus:9090 removed from exclusion list —
+# they now use https://grafana:3443 and https://prometheus:9090 WITH
+# import internal-mtls (mutual TLS). The forward_auth gate still applies.
+# wazuh-dashboard:5601 and open-webui:8080 remain excluded (third-party
+# upstreams without internal-mtls support).
 _EXCLUDED_UPSTREAMS = frozenset(
-    {"grafana:3000", "wazuh-dashboard:5601", "prometheus:9090", "open-webui:8080"}
+    {"wazuh-dashboard:5601", "open-webui:8080"}
 )
 
 # Maximum number of lines after a `reverse_proxy` opener to find the import.

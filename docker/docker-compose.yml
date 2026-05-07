@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Docker Compose stack
-# Last updated: 2026-05-07T00:00:00+01:00 (fix: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES default for canonical agent bundles)
+# Last updated: 2026-05-07T01:00:00+01:00 (retro #83: Grafana mTLS ingress + Prometheus TLS server + datasource mTLS)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -713,6 +713,9 @@ services:
       - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}"
       - "--web.enable-remote-write-receiver"
       - "--web.listen-address=0.0.0.0:9090"
+      # retro #83: enable TLS on Prometheus port 9090 (Pattern B mTLS).
+      # Grafana datasource calls now use https://prometheus:9090 with mutual TLS.
+      - "--web.config.file=/etc/prometheus/web-config.yml"
     # Internal security finding (EX-231-10 closure): Prometheus runs as uid 65534
     # (nobody) but needs to read prometheus_client.{crt,key} from /run/secrets.
     # Fix: add GID 1001 (yashigani app group) so Prometheus can read the
@@ -729,9 +732,15 @@ services:
       # :8444 (gateway) + :8445 (backoffice) listeners for SPIFFE-URI-gated
       # scrapes of /internal/metrics. Split-listener design replaced the prior
       # Host-header matcher (Prom v3 forbids setting Host via http_headers).
+      # retro #83: web-config.yml enables TLS + mTLS on port 9090 so Grafana
+      # → Prometheus datasource calls use mutual TLS (Pattern B).
+      - ../config/prometheus-web-config.yml:/etc/prometheus/web-config.yml:ro
       - ./secrets:/run/secrets:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      # retro #83: Prometheus now serves HTTPS. Use --no-check-certificate so
+      # the self-signed internal CA is trusted without mounting the CA into wget.
+      # wget inside the prom/prometheus image supports --no-check-certificate.
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://localhost:9090/-/healthy"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -762,13 +771,26 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
       GF_SERVER_ROOT_URL: "https://${YASHIGANI_TLS_DOMAIN}/admin/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # retro #83: Grafana ingress mTLS.
+      # Grafana serves HTTPS on port 3443. Caddy proxies /admin/grafana/* over
+      # mTLS using import internal-mtls (caddy_client.crt → ca_intermediate verify).
+      # TA-3 (network observer): without server TLS on Grafana, HTTPS only
+      # existed from the browser → Caddy; the Caddy → Grafana leg was plaintext
+      # HTTP on the obs bridge network. Any process on that bridge could read
+      # dashboard session traffic. mTLS closes both eavesdrop and MITM.
+      GF_SERVER_PROTOCOL: "https"
+      GF_SERVER_HTTP_PORT: "3443"
+      GF_SERVER_CERT_FILE: "/run/secrets/grafana_client.crt"
+      GF_SERVER_CERT_KEY: "/run/secrets/grafana_client.key"
     volumes:
       - grafana_data:/var/lib/grafana
       - ../config/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../config/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - ./secrets:/run/secrets:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      # retro #83: Grafana now serves HTTPS on 3443. wget --no-check-certificate
+      # skips CA verification for localhost-only healthcheck (no SPIFFE needed).
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:3443/api/health | grep -q ok"]
       interval: 15s
       timeout: 5s
       retries: 5

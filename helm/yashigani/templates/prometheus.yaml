@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-04-30T21:00:00+01:00 */ -}}
+{{- /* Last updated: 2026-05-07T01:00:00+01:00 — retro #83: add Prometheus TLS web-config (mTLS on port 9090 for Grafana datasource) */ -}}
 {{- if .Values.prometheus.enabled }}
 ---
 apiVersion: v1
@@ -68,6 +68,15 @@ data:
         metrics_path: /internal/metrics
     {{- end }}
       - job_name: prometheus
+        {{- if .Values.mtls.enabled }}
+        scheme: https
+        tls_config:
+          ca_file: /run/secrets/ca_intermediate.crt
+          cert_file: /run/secrets/prometheus_client.crt
+          key_file: /run/secrets/prometheus_client.key
+          # Self-scrape: server_name matches the cert's DNS SAN.
+          server_name: yashigani-prometheus
+        {{- end }}
         static_configs:
           - targets: ["localhost:9090"]
 ---
@@ -121,22 +130,47 @@ spec:
             - "--storage.tsdb.retention.time={{ .Values.prometheus.retention }}"
             - "--web.enable-remote-write-receiver"
             - "--web.listen-address=0.0.0.0:9090"
+            {{- if .Values.mtls.enabled }}
+            # retro #83: enable TLS on Prometheus port 9090 (Pattern B mTLS).
+            # Grafana datasource calls now use https://yashigani-prometheus:9090.
+            - "--web.config.file=/etc/prometheus/web-config.yml"
+            {{- end }}
           ports:
             - name: http
               containerPort: 9090
               protocol: TCP
           readinessProbe:
+            {{- if .Values.mtls.enabled }}
+            # retro #83: Prometheus now serves HTTPS. K8s httpGet probe sends
+            # plain HTTP which Prometheus rejects. Use exec+wget with
+            # --no-check-certificate (localhost probe — no mTLS client cert
+            # needed for healthcheck path; server TLS is what we verify).
+            exec:
+              command:
+                - sh
+                - -c
+                - "wget -qO- --no-check-certificate https://localhost:9090/-/healthy"
+            {{- else }}
             httpGet:
               path: /-/healthy
               port: 9090
+            {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
+            {{- if .Values.mtls.enabled }}
+            exec:
+              command:
+                - sh
+                - -c
+                - "wget -qO- --no-check-certificate https://localhost:9090/-/healthy"
+            {{- else }}
             httpGet:
               path: /-/healthy
               port: 9090
+            {{- end }}
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 5
@@ -152,8 +186,14 @@ spec:
             {{- if .Values.mtls.enabled }}
             # mTLS leaves: prometheus_client.{crt,key} + ca_intermediate.crt for
             # scraping Caddy's :8444 / :8445 SPIFFE-gated listeners (Pattern B).
+            # retro #83: also mounts prometheus-web-config ConfigMap at
+            # /etc/prometheus/web-config.yml to enable HTTPS on port 9090.
             - name: pki-certs
               mountPath: /run/secrets
+              readOnly: true
+            - name: prometheus-web-config
+              mountPath: /etc/prometheus/web-config.yml
+              subPath: web-config.yml
               readOnly: true
             {{- end }}
       {{- if .Values.mtls.enabled }}
@@ -171,6 +211,9 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+        - name: prometheus-web-config
+          configMap:
+            name: yashigani-prometheus-web-config
         {{- end }}
   {{- if .Values.prometheus.persistence.enabled }}
   volumeClaimTemplates:

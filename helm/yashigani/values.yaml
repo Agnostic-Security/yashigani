@@ -466,7 +466,10 @@ grafana:
       cpu: "250m"
       memory: "512Mi"
   service:
-    port: 3000
+    # retro #83: Grafana serves HTTPS on 3443 when mtls.enabled=true.
+    # Port value here is the Service port; targetPort is set in grafana.yaml
+    # based on mtls.enabled (3443 when true, 3000 when false).
+    port: 3443
     type: ClusterIP
   existingSecretName: ""
   adminUser: "grafana-admin"
