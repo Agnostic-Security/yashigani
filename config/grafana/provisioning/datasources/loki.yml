@@ -1,16 +1,44 @@
+# retro #84 (v2.23.2): Grafana→Loki datasource upgraded to mTLS.
+# Loki now requires a verified client cert (RequireAndVerifyClientCert).
+# Grafana presents grafana_client.crt/key (issued by install.sh PKI).
+# Trust anchor: ca_intermediate.crt (Pattern B — never ca_root.crt).
+#
+# NOTE: Grafana resolves cert paths relative to its data directory or
+# as absolute paths. The secrets volume is mounted at /run/secrets in
+# the Grafana container. TLS fields below reference that mount.
+#
+# Coordination: PR #83 (Grafana mTLS) configures GF_SERVER_* TLS for
+# inbound connections TO Grafana. This file configures the Grafana→Loki
+# OUTBOUND path. Both PRs must merge together for the obs plane to be
+# fully mTLS. The shared mTLS-handshake contract:
+#   Loki accepts: leaf cert signed by yashigani internal intermediate CA.
+#   Grafana presents: grafana_client.crt (issued by same intermediate CA).
 apiVersion: 1
 datasources:
   - name: Loki
     type: loki
     access: proxy
-    url: http://loki:3100
+    url: https://loki:3100
     isDefault: false
     version: 1
     editable: false
     jsonData:
       maxLines: 1000
+      tlsAuth: true
+      tlsAuthWithCACert: true
+      tlsSkipVerify: false
       derivedFields:
         - datasourceUid: jaeger
           matcherRegex: '"trace_id":"(\w+)"'
           name: TraceID
           url: "$${__value.raw}"
+    secureJsonData:
+      # Grafana reads cert material from these fields at provisioning time.
+      # The values are populated from /run/secrets at container start via
+      # GF_DATASOURCE_LOKI_TLS_CA_CERT_FILE / TLS_CLIENT_CERT_FILE /
+      # TLS_CLIENT_KEY_FILE environment variables (set in docker-compose.yml).
+      # The jsonData.tlsAuth: true flag tells Grafana to present the client
+      # cert during the TLS handshake with Loki.
+      tlsCACert: "$__file{/run/secrets/ca_intermediate.crt}"
+      tlsClientCert: "$__file{/run/secrets/grafana_client.crt}"
+      tlsClientKey: "$__file{/run/secrets/grafana_client.key}"

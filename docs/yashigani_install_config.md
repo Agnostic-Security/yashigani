@@ -1490,6 +1490,47 @@ Run through this checklist before exposing Yashigani to production traffic.
 - [ ] Jaeger trace UI loads at `https://your-domain/admin/jaeger`
 - [ ] Alertmanager receivers are configured (not just the default null receiver)
 - [ ] A test alert has been sent to verify each notification channel
+- [ ] Loki ingest mTLS verified: `docker compose logs promtail | grep -i 'connected\|push\|sending'` shows successful HTTPS pushes to Loki
+- [ ] Loki query mTLS verified: Grafana Explore → Loki datasource shows live logs (if Grafana returns an error about TLS, check that `grafana_client.crt/key` are present in `docker/secrets/`)
+- [ ] Plain HTTP to Loki rejected: `curl http://localhost:3100/loki/api/v1/push` from inside the `obs` network returns a TLS error (connection closed by server)
+
+#### Loki mTLS (retro #84, v2.23.2)
+
+Loki now requires mutual TLS on port 3100 for both ingest (Promtail → Loki) and query (Grafana → Loki) paths. The internal PKI bootstrap (run by `install.sh` at first install) issues leaf certificates for `loki`, `promtail`, `grafana`, and `otel-collector` — all signed by the internal intermediate CA.
+
+**Verification — ingest path (Promtail → Loki):**
+
+```bash
+# Inside a running stack:
+docker compose logs promtail | grep -i 'sent\|push\|error'
+# Expected: lines containing "successfully sent batch" or "Sending batch"
+# No lines containing "TLS handshake" errors
+
+# Manual mTLS push test (from the Docker host, using certs in docker/secrets/):
+curl --cert docker/secrets/promtail_client.crt \
+     --key  docker/secrets/promtail_client.key \
+     --cacert docker/secrets/ca_intermediate.crt \
+     -X POST https://loki:3100/loki/api/v1/push \
+     -H 'Content-Type: application/json' \
+     -d '{"streams":[{"stream":{"service":"test"},"values":[["'"$(date +%s%N)"'","mTLS smoke test"]]}]}'
+# Expected: HTTP 204 No Content
+```
+
+**Verification — plain HTTP rejected:**
+
+```bash
+# Plain HTTP must be refused (connection reset / TLS error):
+curl http://loki:3100/loki/api/v1/push 2>&1 | grep -i 'EOF\|reset\|tls\|refused'
+# Expected: non-200 + connection error (not a 200 or 204)
+```
+
+**Verification — Grafana → Loki query path:**
+Open Grafana → Explore → select the "Loki" datasource → run `{service="backoffice"}`. Live logs should appear. If the datasource shows a red error, check:
+1. `docker/secrets/grafana_client.crt` and `grafana_client.key` exist and are readable by the Grafana container (UID 472 on official Grafana images).
+2. The Grafana container was restarted after the cert files were created (`docker compose restart grafana`).
+
+**Trust model:**
+All Loki clients (Promtail, Grafana, otel-collector) present leaf certs issued by the Yashigani internal intermediate CA (`ca_intermediate.crt`). Loki's `RequireAndVerifyClientCert` policy rejects any connection without a valid client cert. The intermediate CA is Pattern B per the PKI trust pattern — the root CA is never exposed to workloads.
 
 > **WARNING — Jaeger In-Memory Storage (EX-231-06 / ASVS V7.3.1):** The default Jaeger deployment (`jaeger` service in `docker-compose.yml`) uses in-memory storage. **All distributed traces are lost when the Jaeger container restarts.** This is acceptable for development and non-regulated environments. For production deployments where trace retention is required (audit trail, incident investigation, compliance), replace the default Jaeger all-in-one container with a persistent backend before go-live:
 >

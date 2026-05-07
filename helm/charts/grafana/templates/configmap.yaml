@@ -16,6 +16,26 @@ data:
         url: http://yashigani-prometheus:9090
         isDefault: true
         editable: false
+      - name: Loki
+        type: loki
+        access: proxy
+        # retro #84 (v2.23.2): Loki now requires mTLS. Grafana presents its
+        # leaf cert (grafana_client.crt/key) from /run/secrets. Trust anchor:
+        # ca_intermediate.crt (Pattern B). tlsAuth:true triggers client-cert
+        # presentation; tlsAuthWithCACert:true makes Grafana verify Loki's
+        # server cert against the CA rather than system roots.
+        url: https://yashigani-loki:3100
+        isDefault: false
+        editable: false
+        jsonData:
+          maxLines: 1000
+          tlsAuth: true
+          tlsAuthWithCACert: true
+          tlsSkipVerify: false
+        secureJsonData:
+          tlsCACert: "$__file{/run/secrets/ca_intermediate.crt}"
+          tlsClientCert: "$__file{/run/secrets/grafana_client.crt}"
+          tlsClientKey: "$__file{/run/secrets/grafana_client.key}"
 
   dashboards.yaml: |
     apiVersion: 1

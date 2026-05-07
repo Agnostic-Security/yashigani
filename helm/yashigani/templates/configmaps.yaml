@@ -91,7 +91,15 @@ data:
           insecure: true
         {{- end }}
       loki:
-        endpoint: "http://yashigani-loki:3100/loki/api/v1/push"
+        # retro #84: endpoint switched to https; otel-collector presents its
+        # own leaf cert to Loki. Trust anchor: ca_intermediate.crt (Pattern B).
+        endpoint: "https://yashigani-loki:3100/loki/api/v1/push"
+        {{- if .Values.mtls.enabled }}
+        tls:
+          cert_file: /run/secrets/otel-collector_client.crt
+          key_file:  /run/secrets/otel-collector_client.key
+          ca_file:   /run/secrets/ca_intermediate.crt
+        {{- end }}
     extensions:
       health_check:
         endpoint: "0.0.0.0:13133"
@@ -219,9 +227,27 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
 data:
   loki.yml: |
+    # retro #84 (v2.23.2): mTLS enabled for Loki ingest + query paths.
+    # Server cert: /run/secrets/loki_client.crt/key (PKI Secret).
+    # Trust anchor: /run/secrets/ca_intermediate.crt (Pattern B).
     auth_enabled: false
     server:
       http_listen_port: 3100
+      grpc_listen_port: 9096
+      {{- if .Values.mtls.enabled }}
+      # retro #84: mTLS — Loki presents its leaf cert; clients must present
+      # a cert signed by the internal intermediate CA (Pattern B).
+      http_tls_config:
+        cert_file: /run/secrets/loki_client.crt
+        key_file:  /run/secrets/loki_client.key
+        client_ca_file: /run/secrets/ca_intermediate.crt
+        client_auth_type: RequireAndVerifyClientCert
+      grpc_tls_config:
+        cert_file: /run/secrets/loki_client.crt
+        key_file:  /run/secrets/loki_client.key
+        client_ca_file: /run/secrets/ca_intermediate.crt
+        client_auth_type: RequireAndVerifyClientCert
+      {{- end }}
     common:
       path_prefix: /loki
       storage:
