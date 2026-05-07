@@ -1,7 +1,7 @@
 # Yashigani — Installation and Configuration Guide
 
 **Version:** 2.23.2
-**Last updated:** 2026-05-07T00:00:00+01:00
+**Last updated:** 2026-05-07T01:00:00+01:00
 **Applies to:** Docker Compose and Kubernetes (Helm) deployments
 
 > **Last public release — v2.23.2**
@@ -1531,6 +1531,45 @@ Open Grafana → Explore → select the "Loki" datasource → run `{service="bac
 
 **Trust model:**
 All Loki clients (Promtail, Grafana, otel-collector) present leaf certs issued by the Yashigani internal intermediate CA (`ca_intermediate.crt`). Loki's `RequireAndVerifyClientCert` policy rejects any connection without a valid client cert. The intermediate CA is Pattern B per the PKI trust pattern — the root CA is never exposed to workloads.
+
+#### Observability mTLS (v2.23.2 retro #83)
+
+All internal observability plane connections now use mutual TLS (Pattern B — intermediate CA as trust anchor, never root):
+
+| Connection | Protocol | Port | Notes |
+|---|---|---|---|
+| Browser → Caddy → Grafana | HTTPS + mTLS | 443 → 3443 | Caddy forward_auth gate + internal mTLS to Grafana |
+| Grafana → Prometheus datasource | mTLS | 9090 | Grafana presents `grafana_client.crt`; Prometheus requires it |
+| Grafana → Loki datasource | mTLS | 3100 | Enabled alongside PR #84 (Loki mTLS) |
+| Prometheus scrape (self) | mTLS | 9090 | `prometheus_client.crt` used as both server and client |
+| Prometheus → Caddy internal listeners | mTLS | 8444/8445 | Unchanged from v2.23.1 — Caddy SPIFFE gate |
+| Grafana → Jaeger UI | HTTP | 16686 | Internal obs network only; TLS deferred to v2.24 (RETRO-84) |
+
+**Key files:** All certs live in `docker/secrets/` and are issued at install time by `install.sh bootstrap_internal_pki`. No manual cert management is required.
+
+**Verification** (run after `docker compose up`):
+
+```bash
+# 1. Confirm Grafana rejects plain HTTP
+curl http://grafana:3000/api/health  # → connection refused (no plain HTTP listener)
+
+# 2. Confirm mTLS handshake works (from a machine with the client cert)
+curl --cert docker/secrets/grafana_client.crt \
+     --key  docker/secrets/grafana_client.key \
+     --cacert docker/secrets/ca_intermediate.crt \
+     https://grafana:3443/api/health
+# → {"commit":"...","database":"ok","version":"..."}
+
+# 3. Confirm Prometheus rejects requests without client cert
+curl --cacert docker/secrets/ca_intermediate.crt \
+     https://prometheus:9090/-/healthy
+# → TLS error: certificate required
+
+# 4. Confirm Grafana → Prometheus datasource via admin API
+curl -u admin:<grafana_password> \
+     https://<your-domain>/admin/grafana/api/datasources
+# → datasource "Prometheus" with type "prometheus" present
+```
 
 > **WARNING — Jaeger In-Memory Storage (EX-231-06 / ASVS V7.3.1):** The default Jaeger deployment (`jaeger` service in `docker-compose.yml`) uses in-memory storage. **All distributed traces are lost when the Jaeger container restarts.** This is acceptable for development and non-regulated environments. For production deployments where trace retention is required (audit trail, incident investigation, compliance), replace the default Jaeger all-in-one container with a persistent backend before go-live:
 >

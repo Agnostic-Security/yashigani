@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-07T12:05:00+01:00 (retro #83: add grafana:472 to _pki_chown_client_keys; retro #84: loki:10001+promtail:0 added)
 # last-updated: 2026-05-07T10:00:00+01:00 (retro #84: loki+promtail added to _pki_chown_client_keys UID map for mTLS cert issuance)
 # last-updated: 2026-05-06T20:00:00+01:00 (P-9 fix: _podman_verify_healthchecks() post-compose-up gate; called on Podman path in compose_up())
 # last-updated: 2026-05-06T12:00:00+01:00 (fix #85: bind-mount dirs auto-created for all runtimes incl. rootless Podman; sudo mkdir removed from promtail path; fail-loud on backups/tls mkdir)
@@ -4654,6 +4655,11 @@ _pki_chown_client_keys() {
     # (mtls_capable:true in service_identities.yaml) and the key is set 0600.
     # retro #84 (v2.23.2).
     "promtail:0"
+    # Grafana runs as UID 472 (grafana/grafana upstream Dockerfile: USER 472).
+    # retro #83: Grafana now reads grafana_client.crt + grafana_client.key to
+    # serve mTLS on port 3443 and to authenticate datasource calls.
+    # Without chown, Grafana crashes with "permission denied" on the key file.
+    "grafana:472"
   )
 
   # Determine chown strategy for this runtime.
