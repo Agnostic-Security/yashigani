@@ -1,7 +1,7 @@
 # Yashigani Pre-Installation Checklist
 
-**Version:** v2.23.2
-**Last updated:** 2026-05-07
+**Version:** v2.23.3
+**Last updated:** 2026-05-08
 **Purpose:** Everything you must gather, configure, or verify *before* running `install.sh` or `docker compose up`. The automated installer handles software installation and secret generation — but it cannot know your infrastructure topology, DNS records, upstream server addresses, or credentials for external services. Collect all items marked **Required** before you start.
 
 > **Last public release — v2.23.2**
@@ -719,7 +719,8 @@ These are not installer inputs but must be planned before go-live.
 | TOTP enrollment plan | Required | All admin accounts must enroll TOTP before the bootstrap admin password is distributed. |
 | Admin initial password handling | Required | Printed at first run, one-time display. Store in password manager immediately. |
 | Host-level audit logging | Recommended | `/var/log/auth.log` + SSH logging in addition to Yashigani's own audit |
-| Container image pinning | Recommended | Replace `:latest` tags in docker-compose.yml with specific digest-pinned versions for production. |
+| Container image pinning | **Required for production** | Replace floating-stub tags in docker-compose.yml with specific `name:tag@sha256:<digest>` pins. Floating stubs (`redis:7-alpine`, `caddy:2-alpine`, etc.) are forbidden in release overlays. See `docs/release-process.md §6b` (G16) for command sequence and evidence format. |
+| Python / npm / Actions dep currency | **Required for production** | Confirm no dep is >2 minor behind latest stable and zero HIGH/CRITICAL Dependabot alerts are open across all in-scope repos. See §6b G16 dep-bump sweep. |
 | Seccomp/AppArmor | Recommended | Verify profiles are loading: `docker inspect --format='{{.HostConfig.SecurityOpt}}' yashigani-gateway-1` |
 | Volume encryption | Recommended | For cloud deployments, use encrypted EBS/Persistent Disk/Azure Managed Disk for the Docker data root |
 | Backup encryption | Recommended | Encrypt all Postgres backups at rest |
@@ -731,7 +732,12 @@ These are not installer inputs but must be planned before go-live.
 [ ] At least 2 admin accounts planned with named owners
 [ ] TOTP enrollment scheduled for all admin accounts at first login
 [ ] Postgres backup strategy decided and scheduled
-[ ] Container image pinning done for production docker-compose.yml
+[ ] Container image pinning: no floating-stub tags (redis:7-alpine style) in docker-compose.yml
+[ ] Container image pinning: release overlay uses name:tag@sha256:<digest> for all external images
+[ ] G16 dep-bump sweep completed and signed off (release managers: see docs/release-process.md §6b)
+[ ] Python packages: zero HIGH/CRITICAL open Dependabot alerts (yashigani + acs repos)
+[ ] npm/JS packages: npm audit --audit-level=high exit 0 (agnosticsec-website repo)
+[ ] GitHub Actions: all workflow-file action refs pinned to SHA at current tagged release
 [ ] OPA deny-by-default confirmed for unlisted paths
 ```
 
@@ -947,7 +953,7 @@ The current agent lineup is: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 [ ] 2+ admin accounts planned
 [ ] Postgres backup strategy confirmed (restore.sh for backup recovery)
 [ ] Postgres migrations run on startup confirmed
-[ ] Image versions pinned in docker-compose.yml
+[ ] Image versions pinned in docker-compose.yml (no floating stubs; release overlay uses @sha256: — see §6b G16)
 [ ] Monitoring/alerting receivers configured
 [ ] Budget tiers configured and tested
 [ ] Pre-release OWASP review completed (manual review of ASVS, API Security, Agentic AI controls against current code)

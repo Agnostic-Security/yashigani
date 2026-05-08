@@ -1,6 +1,6 @@
 # Yashigani Release Process
 
-**Last updated:** 2026-05-06T00:00:00+01:00
+**Last updated:** 2026-05-08T16:00:00+01:00
 
 This document covers the end-to-end process for cutting a Yashigani release from a clean branch tip to a signed, published GitHub release with full evidence archive. It is the authoritative source for M7 gate-check procedures.
 
@@ -172,6 +172,7 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 | 12 | Risk register updated | Compliance Reviewer | exception-register.md | All accepted risks logged |
 | 13 | Maintainer HITL GO | Release Coordinator | Verbal/chat confirmation | "GO release" |
 | 14 | Tag + push | Release Engineer | `git tag v<ver>` | Tag visible on GitHub |
+| G16 | Dep-bump sweep (all types) | Captain (images/Actions/Helm) / Tom (Python/JS) / Maxine (sign-off) | `ci-evidence/<sha>/dep-bump-sweep.txt` | `Dep sweep: PASS` |
 
 ---
 
@@ -214,6 +215,264 @@ gh pr view <number> --json reviews | jq '.reviews[] | select(.state=="APPROVED")
 **Cross-domain PRs:** decompose at review time — a PR touching Python and Helm needs both Tom and Captain approvals. A PR touching Python and shell needs both Tom and Su approvals.
 
 **Rule reference:** `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`
+
+---
+
+## 6b. Dependency-Bump Sweep Gate (G16) — HARD STOP
+
+**Origin:** `feedback_image_pinning.md` (container images); `feedback_dependabot_triage_cadence.md` (all dep types, 2026-05-08 Astro 4→6 catch-up incident).
+
+**Supersedes:** the image-only G16 draft in PR #84. This is the canonical, extended G16 covering all dependency types across all repos.
+
+**When to run:** at the start of every release cycle, immediately after the release branch is cut, before any feature work or pre-tag activity. If not run at branch-cut time, run and clear before Gate 13 (HITL GO).
+
+**Failure mode:** HARD STOP — no merge to main, no release tag, until G16 is PASS.
+
+**Owner mapping — generative by dep type (applies to ALL Agnostic Security repos, current AND future):**
+
+The owner-by-dep-type mapping is the canonical rule. New repos inherit this mapping by default — no per-repo configuration required. Tiago directive: "for any future projects or products/services" (2026-05-08).
+
+| Dep type | Default owner |
+|---|---|
+| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Tom |
+| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Captain |
+| Helm chart dependencies (`Chart.yaml`) | Captain |
+| Kubernetes manifest version pins | Captain |
+| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Captain |
+| JS / npm / TypeScript / frontend frameworks | Tom (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
+| Shell / installer / systemd-unit dependencies | Su |
+| Rust packages (`Cargo.toml`) | Tom (interim — Rust specialist gap) |
+| Go modules (`go.mod`) | Tom (interim — Go specialist gap) |
+
+Maxine reviews and signs off in the release evidence directory before Gate 13.
+
+#### Current-state repo coverage (snapshot, not authoritative — rule is the table above)
+
+| Repo | Dep types present |
+|---|---|
+| `agnosticsec-com/yashigani` | Python, Container/Helm, K8s, GitHub Actions, Shell |
+| `agnosticsec-com/acs` | Python, GitHub Actions |
+| `agnosticsec-com/agnosticsec-website` | JS/npm, GitHub Actions |
+| (Future) Any new product / service repo | All applicable types — automatically covered by generative owner mapping |
+
+### PASS/FAIL semantics
+
+**PASS:** all deps within 2 minor versions of latest stable, OR pinned with documented rationale, AND zero open HIGH/CRITICAL Dependabot alerts in any Agnostic Security repo (current or future).
+
+**FAIL:** any dep >2 minor behind without rationale, OR any open HIGH/CRITICAL Dependabot alert in any Agnostic Security repo (current or future), OR any floating-stub tag in container image pins (see below).
+
+### Command sequence — container images (Captain)
+
+```sh
+# 1. Enumerate every image reference across compose, Helm, and Dockerfiles
+grep -E '^\s+image:|^FROM ' \
+  docker/docker-compose.yml \
+  docker/docker-compose.*.yml \
+  docker/Dockerfile.* \
+  2>/dev/null | sort -u
+
+grep -E 'tag:|repository:' \
+  helm/yashigani/values.yaml \
+  helm/yashigani/values.release.yaml \
+  2>/dev/null | sort -u
+
+# 2. For each GitHub-hosted image, query upstream latest stable:
+gh api "/repos/<owner>/<repo>/releases/latest" --jq '.tag_name'
+
+# 3. For Docker Hub images, query current tags:
+curl -s "https://registry.hub.docker.com/v2/repositories/<owner>/<repo>/tags/?page_size=20&ordering=last_updated" \
+  | jq -r '.results[].name' | head -10
+
+# 4. Resolve digest for each image being pinned in the release overlay:
+docker buildx imagetools inspect <registry>/<name>:<tag> \
+  --format '{{json .Manifest}}' | jq -r '.digest'
+# or: crane digest <registry>/<name>:<tag>
+
+# 5. Verify no floating-stub tags remain in dev compose (no-floating-stubs rule, 2026-05-07):
+grep -rE 'image: .+:(latest|[0-9]+-[a-z]+|[a-z]+-[0-9]+)\s*$' \
+  docker/docker-compose.yml docker/docker-compose.*.yml \
+  helm/yashigani/values.yaml
+# Any output = FAIL (floating-stub pin found)
+
+# 6. Verify release overlay: every image ref must contain '@sha256:'
+grep -E '^\s+image:' docker/docker-compose.release.yml \
+  | grep -v '@sha256:' && echo "FAIL: unpinned image(s) in release overlay" \
+  || echo "Release overlay: all images digest-pinned"
+
+grep -E 'digest:' helm/yashigani/values.release.yaml | wc -l
+# Count must equal number of external images in scope
+```
+
+### Command sequence — Python packages (Tom)
+
+```sh
+# 1. Check pyproject.toml / requirements files for version pins
+grep -rE '^[A-Za-z].*[>=<~^]' pyproject.toml requirements*.txt 2>/dev/null
+
+# 2. Run pip-audit against the lock file (already a CI gate — run locally to preview)
+pip-audit --requirement requirements.txt --format json | jq '.dependencies[] | select(.vulns | length > 0)'
+
+# 3. Compare pinned versions against PyPI latest stable for key deps:
+pip index versions <package>   # shows available versions
+
+# 4. Confirm zero open HIGH/CRITICAL pip-audit findings:
+# CI pip-audit artifact must show exit 0 (see Gate 6 in §6 table).
+```
+
+### Command sequence — npm/JS packages (Tom, interim for agnosticsec-website)
+
+```sh
+# Run from the agnosticsec-website repo root:
+
+# 1. List outdated packages:
+npm outdated
+
+# 2. Check for known vulnerabilities:
+npm audit --audit-level=high
+# Exit non-zero = FAIL for HIGH+CRITICAL. MEDIUM treated per triage SOP.
+
+# 3. Verify lock file is committed and up to date:
+git diff package-lock.json  # must be clean (no unstaged lock drift)
+
+# 4. Check for packages >2 minor behind:
+# npm outdated output — "Wanted" vs "Latest" columns. Any gap >2 minor = document rationale.
+```
+
+### Command sequence — GitHub Actions (Captain)
+
+```sh
+# For each Agnostic Security repo with GitHub Actions present (see current-state snapshot above):
+
+# 1. List all workflow files and their pinned Action SHAs:
+grep -rn 'uses:' .github/workflows/ | grep -v '#'
+
+# 2. For each action, verify the pinned SHA corresponds to a current tagged release:
+gh api repos/<owner>/<repo>/releases/latest --jq '.tag_name'
+# or check https://github.com/<owner>/<repo>/releases
+
+# 3. If a SHA is pinned to a tag >2 minor behind latest: document rationale or bump.
+```
+
+### Command sequence — Helm chart dependencies (Captain)
+
+```sh
+# From yashigani repo:
+cat helm/yashigani/Chart.yaml | grep -A 5 'dependencies:'
+
+# For each dependency entry, check the upstream chart repo for latest stable version:
+helm search repo <repo>/<chart> --versions | head -10
+# or check the chart's GitHub releases.
+
+# Update if stale:
+helm dependency update helm/yashigani/
+```
+
+### Evidence file format
+
+The sweep owner writes `ci-evidence/<sha>/dep-bump-sweep.txt`:
+
+```
+Dep sweep: PASS
+Date: <ISO-8601>
+Release: v<ver>
+Commit: <sha>
+Checked by: captain@agnosticsec.com (images/Actions/Helm), tom@agnosticsec.com (Python/JS)
+Signed off by: maxine@agnosticsec.com
+
+Container images checked (<n> total):
+  postgres:<tag>@sha256:<digest>   upstream-latest: <tag>   status: CURRENT
+  redis:<tag>@sha256:<digest>      upstream-latest: <tag>   status: CURRENT
+  ...
+
+Python packages — yashigani:
+  cryptography <ver>   latest: <ver>   status: CURRENT
+  ...
+
+npm/JS packages — agnosticsec-website:
+  astro <ver>          latest: <ver>   status: CURRENT
+  ...
+
+GitHub Actions — yashigani:
+  docker/login-action@<sha> (v<tag>)   latest: v<tag>   status: CURRENT
+  ...
+
+Helm chart dependencies — yashigani:
+  <chart> <ver>   latest: <ver>   status: CURRENT
+  ...
+
+Hold-backs (if any):
+  <dep>  held at <ver>  reason: <CVE/regression/rationale>  planned-bump: <date>
+
+Open HIGH/CRITICAL Dependabot alerts:
+  yashigani: 0
+  acs: 0
+  agnosticsec-website: 0
+
+Floating-stub check (container images): PASS (zero matches)
+Release-overlay digest-pin check: PASS (all <n> images carry @sha256:)
+```
+
+Any dep >2 minor behind without a documented hold-back, or any open HIGH/CRITICAL Dependabot alert, produces `Dep sweep: FAIL`.
+
+Hold-backs are permitted only when the latest stable has an active CVE or confirmed regression. Each hold-back must carry a planned-bump date and must be logged in the release retro.
+
+---
+
+## 6c. Inter-Release Dependabot Triage SOP
+
+The dep-bump sweep (§6b / G16) runs at release time. Between releases, Dependabot alerts must be triaged on a rolling cadence to prevent accumulation. The 2026-05-08 Astro 4→6 incident (9 CVEs on agnosticsec-website while Astro stayed pinned at ^4.16.0) is the origin of this SOP.
+
+**Canonical memory reference:** `feedback_dependabot_triage_cadence.md`
+
+### Cadence
+
+| Severity | Triage window | Fix window |
+|---|---|---|
+| HIGH / CRITICAL | ≤ 24 h from alert | ≤ 5 working days |
+| MEDIUM | ≤ 7 days | bundle fix in next release cycle |
+| LOW | monthly review | absorb in regular bump sweep |
+
+### Owner mapping — generative by dep type
+
+The owner-by-dep-type mapping is the canonical rule and applies to ALL current AND future Agnostic Security repos by default. Tiago directive: "for any future projects or products/services" (2026-05-08).
+
+| Dep type | Default owner |
+|---|---|
+| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Tom |
+| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Captain |
+| Helm chart dependencies (`Chart.yaml`) | Captain |
+| Kubernetes manifest version pins | Captain |
+| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Captain |
+| JS / npm / TypeScript / frontend frameworks | Tom (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
+| Shell / installer / systemd-unit dependencies | Su |
+| Rust packages (`Cargo.toml`) | Tom (interim — Rust specialist gap) |
+| Go modules (`go.mod`) | Tom (interim — Go specialist gap) |
+
+#### Current-state repo snapshot (not authoritative — rule is the table above)
+
+| Repo | Dep types present |
+|---|---|
+| `agnosticsec-com/yashigani` | Python, Container/Helm, K8s, GitHub Actions, Shell |
+| `agnosticsec-com/acs` | Python, GitHub Actions |
+| `agnosticsec-com/agnosticsec-website` | JS/npm, GitHub Actions |
+| (Future) Any new product / service repo | All applicable types — automatically covered by generative owner mapping |
+
+#### When a new repo is created
+
+1. Enable Dependabot in `.github/dependabot.yml` for every dep type present in that repo.
+2. Confirm the generative owner mapping above covers all alert surfaces — no per-repo owner override required.
+3. If a new dep type appears that is not in the table above, propose an extension to both this doc and `feedback_dependabot_triage_cadence.md`, and flag to Maxine.
+4. Add the repo to the weekly Maxine triage roster — no further onboarding steps required.
+
+### Workflow
+
+1. Dependabot opens alert (auto-notifies owner per repo settings).
+2. Owner triages within cadence window: confirm impact + plan fix (`immediate` / `next-release` / `accept-risk`).
+3. If **immediate**: branch + PR + CI green + merge within 5 working days (HIGH/CRITICAL).
+4. If **next-release**: tag the alert with `defer:vN.Y.Z` label in GitHub.
+5. If **accept-risk**: document rationale in the exception register and close with `wontfix` or equivalent — requires Maxine sign-off.
+6. Maxine reviews Dependabot alert status weekly (surfaced in release planning check-in).
+7. G16 at next release will FAIL if any HIGH/CRITICAL alert remains open without an `accept-risk` exception on record.
 
 ---
 
