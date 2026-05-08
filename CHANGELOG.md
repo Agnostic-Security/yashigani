@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
 
 # Changelog
 
@@ -25,6 +25,24 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ## [Unreleased]
 
 No unreleased changes yet for the next version.
+
+---
+
+## [v2.23.2.1] — 2026-05-08 — Helm chart digest pin fix
+
+> **Chart-only patch. Code (gateway + backoffice binaries) is identical to v2.23.2.**
+>
+> **Tag:** `v2.23.2.1` → SHA `49b80fd` — [GitHub Release](https://github.com/agnosticsec-com/yashigani/releases/tag/v2.23.2.1)
+
+### Fixed
+
+- **(#77) Helm chart — image digest pointers corrected** — `helm/yashigani/values.yaml` referenced v2.23.1 image digests for `yashigani-gateway` and `yashigani-backoffice` after the v2.23.2 GA tag was cut. This caused Kubernetes Helm deployments to pull the v2.23.1 container images when running the v2.23.2 chart, producing a chart/binary version mismatch that was invisible to operators. The patch pins both images to the correct v2.23.2 GA digests:
+  - `yashigani-gateway:2.23.2@sha256:7ffe5b92b23224a5fdcf86bf2570345d979ca2f9f06beda52447efc6ef5b688c`
+  - `yashigani-backoffice:2.23.2@sha256:34f4e68dac35f6e045bfe6277cd9725340e0e662361cdfb81b2057d3a0ebd0dc`
+
+  **Upgrade path:** Helm users on v2.23.2 should upgrade to v2.23.2.1 immediately (`helm upgrade --version 2.23.2.1`). No image rebuild or config change needed. Docker / Podman Compose deployments are unaffected (image pins in `docker-compose.release.yml` were already correct).
+
+Full release narrative: [`docs/release-notes/v2.23.2.1.md`](docs/release-notes/v2.23.2.1.md)
 
 ---
 
