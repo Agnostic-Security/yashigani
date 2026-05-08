@@ -11,8 +11,14 @@ on restart, violating ASVS V2.1 and V2.8.
 All DB operations run inside tenant_transaction() against the platform
 sentinel tenant 00000000-0000-0000-0000-000000000000 — admin usernames
 are platform-scoped, not per-tenant.
+
+v2.23.3 — Password reuse history (CMMC L2 IA.L2-3.5.8):
+  change_password() checks the last PASSWORD_HISTORY_DEPTH hashes from the
+  password_history table, rejects on match, and records the old hash after a
+  successful change. Emits PASSWORD_REUSE_REJECTED audit event on rejection.
 """
-# Last updated: 2026-05-08T00:00:00+00:00
+
+# Last updated: 2026-05-09T00:00:00+00:00
 from __future__ import annotations
 
 import hashlib
@@ -29,6 +35,7 @@ from yashigani.auth.local_auth import (
     _MAX_FAILED_ATTEMPTS,
     _LOCKOUT_SECONDS,
     _TOTP_BACKOFF_SECONDS,
+    _get_history_depth,
 )
 from yashigani.auth.password import (
     generate_password,
@@ -140,7 +147,8 @@ class PostgresLocalAuthService:
                     record.locked_until = time.time() + _LOCKOUT_SECONDS
                     logger.warning(
                         "Account locked after %d failures: %s",
-                        _MAX_FAILED_ATTEMPTS, username,
+                        _MAX_FAILED_ATTEMPTS,
+                        username,
                     )
                 await self._update(conn, record)
                 return False, None, generic_fail
@@ -153,9 +161,7 @@ class PostgresLocalAuthService:
             if record.totp_backoff_until > time.time():
                 return False, None, generic_fail
 
-            totp_ok = await self._verify_totp_with_replay(
-                conn, record.totp_secret, totp_code
-            )
+            totp_ok = await self._verify_totp_with_replay(conn, record.totp_secret, totp_code)
 
             if not totp_ok:
                 record.totp_failed_attempts += 1
@@ -166,14 +172,17 @@ class PostgresLocalAuthService:
                     record.totp_backoff_until = 0.0
                     logger.warning(
                         "Account locked after %d TOTP failures: %s",
-                        _MAX_FAILED_ATTEMPTS, username,
+                        _MAX_FAILED_ATTEMPTS,
+                        username,
                     )
                 else:
                     delay = _TOTP_BACKOFF_SECONDS[min(n, len(_TOTP_BACKOFF_SECONDS) - 1)]
                     record.totp_backoff_until = time.time() + delay
                     logger.info(
                         "TOTP backoff applied: %ds for %s (attempt %d)",
-                        delay, username, n,
+                        delay,
+                        username,
+                        n,
                     )
                 await self._update(conn, record)
                 return False, None, generic_fail
@@ -188,9 +197,7 @@ class PostgresLocalAuthService:
 
     # -- TOTP provisioning --------------------------------------------------
 
-    async def provision_totp_start(
-        self, username: str
-    ) -> tuple[TotpProvisioning, RecoveryCodeSet]:
+    async def provision_totp_start(self, username: str) -> tuple[TotpProvisioning, RecoveryCodeSet]:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             record = await self._fetch_by_username(conn, username)
             if record is None:
@@ -204,26 +211,20 @@ class PostgresLocalAuthService:
             await self._update(conn, record)
             return prov, code_set
 
-    async def provision_totp_confirm(
-        self, username: str, totp_code: str
-    ) -> tuple[bool, str]:
+    async def provision_totp_confirm(self, username: str, totp_code: str) -> tuple[bool, str]:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             record = await self._fetch_by_username(conn, username)
             if record is None:
                 return False, "account_not_found"
             if not record.totp_secret:
                 return False, "no_pending_enrolment"
-            if not await self._verify_totp_with_replay(
-                conn, record.totp_secret, totp_code
-            ):
+            if not await self._verify_totp_with_replay(conn, record.totp_secret, totp_code):
                 return False, "invalid_totp_code"
             record.force_totp_provision = False
             await self._update(conn, record)
             return True, "ok"
 
-    async def provision_totp(
-        self, username: str
-    ) -> tuple[TotpProvisioning, RecoveryCodeSet]:
+    async def provision_totp(self, username: str) -> tuple[TotpProvisioning, RecoveryCodeSet]:
         # Back-compat wrapper — callers must still call provision_totp_confirm
         # to flip force_totp_provision = False.
         prov, code_set = await self.provision_totp_start(username)
@@ -237,23 +238,133 @@ class PostgresLocalAuthService:
         current_password: str,
         totp_code: str,
         new_password: str,
+        *,
+        audit_writer=None,
     ) -> tuple[bool, str]:
+        """
+        Self-service password change with reuse history enforcement.
+
+        CMMC L2 IA.L2-3.5.8: checks new password against the last
+        PASSWORD_HISTORY_DEPTH hashes from password_history.  Rejects with
+        reason "password_reuse" on match; emits PASSWORD_REUSE_REJECTED
+        audit event via audit_writer if supplied.
+
+        Returns (success, reason).
+        """
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             record = await self._fetch_by_username(conn, username)
             if record is None:
                 return False, "invalid_credentials"
             if not verify_password(current_password, record.password_hash):
                 return False, "invalid_credentials"
-            if not await self._verify_totp_with_replay(
-                conn, record.totp_secret, totp_code
-            ):
+            if not await self._verify_totp_with_replay(conn, record.totp_secret, totp_code):
                 return False, "invalid_totp"
 
+            # -- Reuse history check (IA.L2-3.5.8) --------------------------
+            depth = _get_history_depth()
+            reuse = await self._check_password_history(conn, record.account_id, new_password, depth)
+            if reuse:
+                logger.info(
+                    "Password change rejected — reuse detected (user_id=%s, depth=%d)",
+                    record.account_id,
+                    depth,
+                )
+                if audit_writer is not None:
+                    from yashigani.audit.schema import PasswordReuseRejectedEvent
+
+                    try:
+                        evt = PasswordReuseRejectedEvent(
+                            user_id=record.account_id,
+                            history_depth_checked=depth,
+                        )
+                        await audit_writer.write(evt)
+                    except Exception:
+                        logger.warning(
+                            "Failed to emit PASSWORD_REUSE_REJECTED audit event",
+                            exc_info=True,
+                        )
+                return False, "password_reuse"
+
+            # -- Commit change + record history ------------------------------
+            old_hash = record.password_hash
             record.password_hash = hash_password(new_password)
             record.force_password_change = False
             record.password_changed_at = time.time()
             await self._update(conn, record)
+
+            # Insert old hash into history, then prune oldest beyond depth.
+            await self._record_password_history(conn, record.account_id, old_hash, depth)
+
             return True, "ok"
+
+    async def _check_password_history(
+        self,
+        conn: asyncpg.Connection,
+        account_id: str,
+        new_password: str,
+        depth: int,
+    ) -> bool:
+        """
+        Returns True if new_password matches any of the last `depth` hashes.
+
+        Argon2id verify is used (constant-time-ish within each verify call).
+        We iterate at most `depth` hashes — bounded work per request.
+        """
+        rows = await conn.fetch(
+            """
+            SELECT password_hash FROM password_history
+            WHERE user_id = $1
+            ORDER BY changed_at DESC
+            LIMIT $2
+            """,
+            uuid.UUID(account_id),
+            depth,
+        )
+        for row in rows:
+            if verify_password(new_password, row["password_hash"]):
+                return True
+        return False
+
+    async def _record_password_history(
+        self,
+        conn: asyncpg.Connection,
+        account_id: str,
+        old_hash: str,
+        depth: int,
+    ) -> None:
+        """
+        Insert the old hash into password_history, then delete entries
+        older than the most-recent `depth` rows (keeps the table bounded).
+        """
+        import datetime as _dt
+
+        now_ts = _dt.datetime.now(_dt.timezone.utc)
+        uid = uuid.UUID(account_id)
+        await conn.execute(
+            """
+            INSERT INTO password_history (user_id, password_hash, changed_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, changed_at) DO NOTHING
+            """,
+            uid,
+            old_hash,
+            now_ts,
+        )
+        # Prune: keep only the most-recent `depth` rows per user.
+        await conn.execute(
+            """
+            DELETE FROM password_history
+            WHERE user_id = $1
+              AND changed_at NOT IN (
+                  SELECT changed_at FROM password_history
+                  WHERE user_id = $1
+                  ORDER BY changed_at DESC
+                  LIMIT $2
+              )
+            """,
+            uid,
+            depth,
+        )
 
     # -- Admin actions ------------------------------------------------------
 
@@ -264,9 +375,7 @@ class PostgresLocalAuthService:
         admin_totp_code: str,
     ) -> tuple[bool, str]:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
-            if not await self._verify_totp_with_replay(
-                conn, admin_totp_secret, admin_totp_code
-            ):
+            if not await self._verify_totp_with_replay(conn, admin_totp_secret, admin_totp_code):
                 return False, "invalid_admin_totp"
 
             record = await self._fetch_by_username(conn, username)
@@ -318,6 +427,7 @@ class PostgresLocalAuthService:
         before applying the safety rail (max-percent check).
         """
         import datetime as _dt
+
         cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=threshold_days)
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             rows = await conn.fetch(
@@ -346,6 +456,7 @@ class PostgresLocalAuthService:
         disable uses the existing disable() method which does NOT touch this column.
         """
         import datetime as _dt
+
         now_ts = _dt.datetime.now(_dt.timezone.utc)
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             res = await conn.execute(
@@ -375,30 +486,23 @@ class PostgresLocalAuthService:
     async def active_admin_count(self) -> int:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             val = await conn.fetchval(
-                "SELECT COUNT(*) FROM admin_accounts "
-                "WHERE account_tier = 'admin' AND disabled = false"
+                "SELECT COUNT(*) FROM admin_accounts WHERE account_tier = 'admin' AND disabled = false"
             )
             return int(val or 0)
 
     async def total_admin_count(self) -> int:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
-            val = await conn.fetchval(
-                "SELECT COUNT(*) FROM admin_accounts WHERE account_tier = 'admin'"
-            )
+            val = await conn.fetchval("SELECT COUNT(*) FROM admin_accounts WHERE account_tier = 'admin'")
             return int(val or 0)
 
     async def total_user_count(self) -> int:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
-            val = await conn.fetchval(
-                "SELECT COUNT(*) FROM admin_accounts WHERE account_tier = 'user'"
-            )
+            val = await conn.fetchval("SELECT COUNT(*) FROM admin_accounts WHERE account_tier = 'user'")
             return int(val or 0)
 
     async def list_accounts(self) -> list[AccountRecord]:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM admin_accounts ORDER BY created_at"
-            )
+            rows = await conn.fetch("SELECT * FROM admin_accounts ORDER BY created_at")
             return [_row_to_record(r) for r in rows]
 
     async def get_account(self, username: str) -> Optional[AccountRecord]:
@@ -440,8 +544,7 @@ class PostgresLocalAuthService:
     async def force_password_change(self, username: str) -> bool:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             res = await conn.execute(
-                "UPDATE admin_accounts SET force_password_change = true "
-                "WHERE username = $1",
+                "UPDATE admin_accounts SET force_password_change = true WHERE username = $1",
                 username,
             )
             try:
@@ -463,9 +566,7 @@ class PostgresLocalAuthService:
             except (ValueError, IndexError):
                 return False
 
-    async def set_totp_secret_direct(
-        self, username: str, totp_secret: str
-    ) -> bool:
+    async def set_totp_secret_direct(self, username: str, totp_secret: str) -> bool:
         """
         INSTALLER-PRIVILEGED bootstrap-only path.
 
@@ -482,9 +583,7 @@ class PostgresLocalAuthService:
         """
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             res = await conn.execute(
-                "UPDATE admin_accounts SET "
-                "totp_secret = $1, force_totp_provision = false "
-                "WHERE username = $2",
+                "UPDATE admin_accounts SET totp_secret = $1, force_totp_provision = false WHERE username = $2",
                 totp_secret,
                 username,
             )
@@ -497,13 +596,16 @@ class PostgresLocalAuthService:
 
     async def _insert(self, record: AccountRecord) -> None:
         import datetime as _dt
+
         last_login_ts = (
             _dt.datetime.fromtimestamp(record.last_login_at, tz=_dt.timezone.utc)
-            if record.last_login_at is not None else None
+            if record.last_login_at is not None
+            else None
         )
         inactive_disabled_ts = (
             _dt.datetime.fromtimestamp(record.inactive_disabled_at, tz=_dt.timezone.utc)
-            if record.inactive_disabled_at is not None else None
+            if record.inactive_disabled_at is not None
+            else None
         )
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             await conn.execute(
@@ -547,17 +649,18 @@ class PostgresLocalAuthService:
                 inactive_disabled_ts,
             )
 
-    async def _update(
-        self, conn: asyncpg.Connection, record: AccountRecord
-    ) -> None:
+    async def _update(self, conn: asyncpg.Connection, record: AccountRecord) -> None:
         import datetime as _dt
+
         last_login_ts = (
             _dt.datetime.fromtimestamp(record.last_login_at, tz=_dt.timezone.utc)
-            if record.last_login_at is not None else None
+            if record.last_login_at is not None
+            else None
         )
         inactive_disabled_ts = (
             _dt.datetime.fromtimestamp(record.inactive_disabled_at, tz=_dt.timezone.utc)
-            if record.inactive_disabled_at is not None else None
+            if record.inactive_disabled_at is not None
+            else None
         )
         await conn.execute(
             """
@@ -595,9 +698,7 @@ class PostgresLocalAuthService:
             inactive_disabled_ts,
         )
 
-    async def _fetch_by_username(
-        self, conn: asyncpg.Connection, username: str
-    ) -> Optional[AccountRecord]:
+    async def _fetch_by_username(self, conn: asyncpg.Connection, username: str) -> Optional[AccountRecord]:
         row = await conn.fetchrow(
             "SELECT * FROM admin_accounts WHERE username = $1",
             username,
@@ -622,9 +723,7 @@ class PostgresLocalAuthService:
             return False
         # GC expired entries inline — used_totp_codes is small and bounded
         # by (window_size × concurrent_users).
-        await conn.execute(
-            "DELETE FROM used_totp_codes WHERE expires_at < now()"
-        )
+        await conn.execute("DELETE FROM used_totp_codes WHERE expires_at < now()")
         rows = await conn.fetch("SELECT code_hash FROM used_totp_codes")
         cache: set[str] = {r["code_hash"] for r in rows}
         # Translate the opaque window_key verify_totp() uses into a sha256
@@ -667,6 +766,7 @@ class PostgresLocalAuthService:
 # ---------------------------------------------------------------------------
 # Row <-> record marshalling
 # ---------------------------------------------------------------------------
+
 
 def _serialise_recovery(code_set: Optional[RecoveryCodeSet]) -> Optional[str]:
     if code_set is None:
@@ -719,7 +819,9 @@ def _row_to_record(row) -> AccountRecord:
         created_at=float(row["created_at"]),
         password_changed_at=float(row["password_changed_at"]),
         last_login_at=_ts_to_epoch(row["last_login_at"]) if "last_login_at" in row.keys() else None,
-        inactive_disabled_at=_ts_to_epoch(row["inactive_disabled_at"]) if "inactive_disabled_at" in row.keys() else None,
+        inactive_disabled_at=_ts_to_epoch(row["inactive_disabled_at"])
+        if "inactive_disabled_at" in row.keys()
+        else None,
     )
 
 

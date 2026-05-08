@@ -9,6 +9,7 @@ POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value 
 
 Last updated: 2026-05-08T00:00:00+01:00
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,10 +32,11 @@ def _pg_tenant_transaction():
     """Shorthand: open a platform-scoped transaction on the shared pool."""
     return _pg_tenant_transaction_impl(_PLATFORM_TENANT_ID)
 
+
 router = APIRouter()
 
 _TOTP_FAILURE_LIMIT = 3
-_totp_failures: dict[str, int] = {}    # session_prefix → count
+_totp_failures: dict[str, int] = {}  # session_prefix → count
 
 _log = logging.getLogger("yashigani.auth")
 
@@ -51,12 +53,12 @@ _log = logging.getLogger("yashigani.auth")
 #   auth:throttle:global      — current delay level globally
 # ---------------------------------------------------------------------------
 
-_THROTTLE_IP_THRESHOLD = 3        # per-IP consecutive failures before throttle
-_THROTTLE_GLOBAL_THRESHOLD = 5    # global failures (any IP) in 15-min window
-_THROTTLE_WINDOW_SECONDS = 900    # 15-minute window for counters
-_THROTTLE_BASE_DELAY = 30         # Level 1: 30 seconds
-_THROTTLE_MULTIPLIER = 5          # Each level multiplies by 5  (sic — see spec)
-_THROTTLE_MAX_DELAY = 37500       # Cap at 625 minutes
+_THROTTLE_IP_THRESHOLD = 3  # per-IP consecutive failures before throttle
+_THROTTLE_GLOBAL_THRESHOLD = 5  # global failures (any IP) in 15-min window
+_THROTTLE_WINDOW_SECONDS = 900  # 15-minute window for counters
+_THROTTLE_BASE_DELAY = 30  # Level 1: 30 seconds
+_THROTTLE_MULTIPLIER = 5  # Each level multiplies by 5  (sic — see spec)
+_THROTTLE_MAX_DELAY = 37500  # Cap at 625 minutes
 
 # Delay schedule (pre-computed for clarity):
 # Level 1:     30s
@@ -85,6 +87,7 @@ def _check_ip_access(client_ip: str) -> None:
     Supports IPv4, IPv6, and CIDR ranges.
     """
     import ipaddress
+
     r = _get_throttle_redis()
 
     # 1. Check blocklist first (permanent bans)
@@ -103,8 +106,7 @@ def _check_ip_access(client_ip: str) -> None:
         try:
             addr = ipaddress.ip_address(client_ip)
         except ValueError:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail={"error": "ip_not_allowed"})
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"error": "ip_not_allowed"})
         allowed = False
         for entry in allowlist:
             entry_str = entry if isinstance(entry, str) else entry.decode()
@@ -160,7 +162,9 @@ def _apply_auth_throttle(client_ip: str, response: Response) -> None:
         delay = _throttle_delay_for_level(effective_level)
         _log.warning(
             "Auth throttle: ip=%s level=%d delay=%ds",
-            client_ip, effective_level, delay,
+            client_ip,
+            effective_level,
+            delay,
         )
         # RFC 6585 §4 — Retry-After header on 429.
         # Set on the response object so the header is present on the HTTPException
@@ -205,11 +209,17 @@ def _record_auth_failure(client_ip: str) -> None:
         # After max delay level → permanent block
         if new_level > len(_THROTTLE_DELAYS):
             import json
-            r.set(f"auth:blocked:{client_ip}", json.dumps({
-                "blocked_at": time.time(),
-                "reason": f"Exceeded max throttle level ({len(_THROTTLE_DELAYS)}) — permanent block",
-                "ip_failures": ip_fails,
-            }))  # No TTL = permanent
+
+            r.set(
+                f"auth:blocked:{client_ip}",
+                json.dumps(
+                    {
+                        "blocked_at": time.time(),
+                        "reason": f"Exceeded max throttle level ({len(_THROTTLE_DELAYS)}) — permanent block",
+                        "ip_failures": ip_fails,
+                    }
+                ),
+            )  # No TTL = permanent
             _log.critical("AUTH IP BLOCKED PERMANENTLY: ip=%s failures=%d", client_ip, ip_fails)
         else:
             r.set(ip_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
@@ -262,13 +272,11 @@ async def login(body: LoginRequest, request: Request, response: Response):
     _apply_auth_throttle(client_ip, response)
 
     state = backoffice_state
-    assert state.auth_service is not None   # set unconditionally at startup
+    assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
-    assert state.audit_writer is not None   # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
     try:
-        success, record, reason = await state.auth_service.authenticate(
-            body.username, body.password, body.totp_code
-        )
+        success, record, reason = await state.auth_service.authenticate(body.username, body.password, body.totp_code)
     except (ValueError, TypeError):
         _record_auth_failure(client_ip)
         raise HTTPException(
@@ -278,18 +286,18 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
     if not success:
         _record_auth_failure(client_ip)
-        state.audit_writer.write(
-            _make_login_event(body.username, "failure", reason)
-        )
+        state.audit_writer.write(_make_login_event(body.username, "failure", reason))
         # QA Wave 2 Issue 7 — do NOT disclose server_time to unauthenticated
         # callers. TOTP drift diagnostics only belong in authenticated flows
         # (/auth/password/change, /auth/totp/provision/confirm) where the
         # client has already proved they own an account.
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail={
-                                "error": "invalid_credentials",
-                                "hint": "If using TOTP, ensure your device clock is synchronised.",
-                            })
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "invalid_credentials",
+                "hint": "If using TOTP, ensure your device clock is synchronised.",
+            },
+        )
 
     # Success — reset per-IP failure counter (global decays via TTL)
     _reset_ip_auth_failures(client_ip)
@@ -313,9 +321,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
             account_tier="totp_provisioning",
             client_ip=client_ip,
         )
-        state.audit_writer.write(
-            _make_login_event(body.username, "totp_provision_restricted", None)
-        )
+        state.audit_writer.write(_make_login_event(body.username, "totp_provision_restricted", None))
         _log.info(
             "TOTP provisioning session issued for %s (force_totp_provision=True). "
             "Full admin access blocked until TOTP is provisioned.",
@@ -365,9 +371,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         client_ip=client_ip,
     )
 
-    state.audit_writer.write(
-        _make_login_event(body.username, "success", None)
-    )
+    state.audit_writer.write(_make_login_event(body.username, "success", None))
 
     _set_session_cookie(response, session.token, record.account_tier)
     return {
@@ -391,9 +395,7 @@ async def logout(
     # self_reset) are audited; logout was the only gap (yashigani-retro#95).
     state = backoffice_state
     if state.audit_writer is not None:
-        state.audit_writer.write(
-            _make_login_event(session.account_id, "logout", None)
-        )
+        state.audit_writer.write(_make_login_event(session.account_id, "logout", None))
     return {"status": "ok"}
 
 
@@ -414,9 +416,9 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
     ASVS V2.1: authenticated password reset without admin intervention.
     """
     state = backoffice_state
-    assert state.auth_service is not None   # set unconditionally at startup
+    assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
-    assert state.audit_writer is not None   # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
     record = await state.auth_service.get_account(body.username)
 
     # Same generic error for unknown user or wrong TOTP (prevent enumeration).
@@ -440,14 +442,13 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
     # path can't be abused for TOTP replay.
     # pylint: disable=protected-access
     async with _pg_tenant_transaction() as conn:
-        if not await state.auth_service._verify_totp_with_replay(
-            conn, record.totp_secret, body.totp_code
-        ):
+        if not await state.auth_service._verify_totp_with_replay(conn, record.totp_secret, body.totp_code):
             raise generic_error
 
     # TOTP valid — generate new temporary password and persist via the
     # Postgres-backed auth service so the reset survives restart (P0-2).
     from yashigani.auth.password import generate_password, hash_password
+
     temp_password = generate_password(36)
     try:
         # check_breach=False: temp password is system-generated, not user-chosen.
@@ -464,7 +465,9 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
             "UPDATE admin_accounts SET password_hash = $1, "
             "force_password_change = true, password_changed_at = $2 "
             "WHERE username = $3",
-            new_hash, time.time(), record.username,
+            new_hash,
+            time.time(),
+            record.username,
         )
 
     # Invalidate all sessions
@@ -490,7 +493,7 @@ async def verify_session(request: Request):
     Checks both user cookie (__Host-yashigani_session) and admin cookie (__Host-yashigani_admin_session).
     """
     state = backoffice_state
-    assert state.auth_service is not None   # set unconditionally at startup
+    assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
     token = request.cookies.get(_USER_SESSION_COOKIE) or request.cookies.get(_SESSION_COOKIE)
     if not token:
@@ -507,6 +510,7 @@ async def verify_session(request: Request):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
     from starlette.responses import Response as StarletteResponse
+
     resp = StarletteResponse(status_code=200)
     # X-Forwarded-User must be an email for Open WebUI's trusted header auth
     email = record.email or f"{record.username}@yashigani.local"
@@ -530,15 +534,15 @@ async def change_password(
     # Find account by account_id
     record = await _get_record_by_id(session.account_id)
     if record is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail={"error": "account_not_found"})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"error": "account_not_found"})
 
     from yashigani.auth.password import verify_password, hash_password, PasswordBreachedError
-    if not verify_password(body.current_password, record.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail={"error": "invalid_current_password"})
 
-    old_hash_tail = record.password_hash[-8:] if record.password_hash else ""
+    if not verify_password(body.current_password, record.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"error": "invalid_current_password"})
+
+    old_hash = record.password_hash
+    old_hash_tail = old_hash[-8:] if old_hash else ""
     try:
         new_hash = hash_password(body.new_password)
     except PasswordBreachedError as exc:
@@ -552,31 +556,106 @@ async def change_password(
             },
         )
     except (ValueError, TypeError):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail={"error": "password_rejected"})
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"error": "password_rejected"})
     new_hash_tail = new_hash[-8:]
-    # Durable update via Postgres — replaces in-memory field mutation.
+
+    # -- CMMC L2 IA.L2-3.5.8: password reuse history check ------------------
+    from yashigani.auth.local_auth import _get_history_depth
+    from yashigani.auth.password import verify_password as _verify_pw
+
+    history_depth = _get_history_depth()
+    async with _pg_tenant_transaction() as conn:
+        _history_rows = await conn.fetch(
+            """
+            SELECT password_hash FROM password_history
+            WHERE user_id = $1::uuid
+            ORDER BY changed_at DESC
+            LIMIT $2
+            """,
+            record.account_id,
+            history_depth,
+        )
+    for _hr in _history_rows:
+        if _verify_pw(body.new_password, _hr["password_hash"]):
+            # Emit audit event — user_id only, never password or hash.
+            from yashigani.audit.schema import PasswordReuseRejectedEvent
+
+            try:
+                _evt = PasswordReuseRejectedEvent(
+                    user_id=record.account_id,
+                    history_depth_checked=history_depth,
+                )
+                state.audit_writer.write(_evt)
+            except Exception:
+                _log.warning("Failed to emit PASSWORD_REUSE_REJECTED event", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "password_reuse",
+                    "message": (
+                        f"Password has been used recently. "
+                        f"Choose a password not used in the last {history_depth} change(s)."
+                    ),
+                },
+            )
+
+    # -- Durable update via Postgres -----------------------------------------
+    import datetime as _dt
+
+    _now_ts = _dt.datetime.now(_dt.timezone.utc)
+    _now_epoch = _now_ts.timestamp()
     async with _pg_tenant_transaction() as conn:
         await conn.execute(
             "UPDATE admin_accounts SET "
             "password_hash = $1, force_password_change = false, "
             "password_changed_at = $2 WHERE username = $3",
-            new_hash, time.time(), record.username,
+            new_hash,
+            _now_epoch,
+            record.username,
+        )
+        # Record old hash in history.
+        await conn.execute(
+            """
+            INSERT INTO password_history (user_id, password_hash, changed_at)
+            VALUES ($1::uuid, $2, $3)
+            ON CONFLICT (user_id, changed_at) DO NOTHING
+            """,
+            record.account_id,
+            old_hash,
+            _now_ts,
+        )
+        # Prune oldest beyond depth.
+        await conn.execute(
+            """
+            DELETE FROM password_history
+            WHERE user_id = $1::uuid
+              AND changed_at NOT IN (
+                  SELECT changed_at FROM password_history
+                  WHERE user_id = $1::uuid
+                  ORDER BY changed_at DESC
+                  LIMIT $2
+              )
+            """,
+            record.account_id,
+            history_depth,
         )
     record.password_hash = new_hash
     record.force_password_change = False
-    record.password_changed_at = time.time()
+    record.password_changed_at = _now_epoch
 
     # Invalidate ALL sessions including current (ASVS V2.1.4)
     store.invalidate_all_for_account(session.account_id)
     response.delete_cookie(_SESSION_COOKIE)
 
     # ASVS 6.3.7: audit event with hash tails for forensics / reuse detection
-    state.audit_writer.write(_make_config_event(
-        record.username, "password_change",
-        f"old_hash_tail={old_hash_tail}",
-        f"new_hash_tail={new_hash_tail}",
-    ))
+    state.audit_writer.write(
+        _make_config_event(
+            record.username,
+            "password_change",
+            f"old_hash_tail={old_hash_tail}",
+            f"new_hash_tail={new_hash_tail}",
+        )
+    )
     return {"status": "ok", "sessions_invalidated": True, "re_authentication_required": True}
 
 
@@ -601,8 +680,7 @@ async def provision_totp_start(
     assert state.auth_service is not None  # set unconditionally at startup
     record = await _get_record_by_id(session.account_id)
     if record is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail={"error": "account_not_found"})
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
@@ -640,12 +718,9 @@ async def provision_totp_confirm(
     assert state.audit_writer is not None  # set unconditionally at startup
     record = await _get_record_by_id(session.account_id)
     if record is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail={"error": "account_not_found"})
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
-    ok, reason = await state.auth_service.provision_totp_confirm(
-        record.username, body.totp_code
-    )
+    ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
     if not ok:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -685,23 +760,21 @@ async def provision_totp(
     assert state.audit_writer is not None  # set unconditionally at startup
     record = await _get_record_by_id(session.account_id)
     if record is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail={"error": "account_not_found"})
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
     # Verify the user-supplied code against the freshly-stored seed.
-    ok, reason = await state.auth_service.provision_totp_confirm(
-        record.username, body.totp_code
-    )
+    ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
     if not ok:
         # Rollback — clear the newly-set seed in the durable store so the
         # account is back to its pre-call state and the client can retry
         # cleanly.
         await state.auth_service.force_totp_reprovision(record.username)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail={"error": "invalid_totp_code",
-                                    "message": "TOTP code did not match. Re-scan the QR code."})
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_totp_code", "message": "TOTP code did not match. Re-scan the QR code."},
+        )
 
     state.audit_writer.write(_make_provision_event(record.username))
 
@@ -718,6 +791,7 @@ async def provision_totp(
 # ---------------------------------------------------------------------------
 # Step-up TOTP verification (ASVS V6.8.4)
 # ---------------------------------------------------------------------------
+
 
 class StepUpRequest(BaseModel):
     totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
@@ -772,9 +846,7 @@ async def stepup_verify(
 
     # Verify against Postgres-backed replay cache (same path as login).
     async with _pg_tenant_transaction() as conn:
-        ok = await state.auth_service._verify_totp_with_replay(
-            conn, admin_record.totp_secret, body.totp_code
-        )
+        ok = await state.auth_service._verify_totp_with_replay(conn, admin_record.totp_secret, body.totp_code)
 
     if not ok:
         _totp_failures[session_prefix] = failure_count + 1
@@ -793,6 +865,7 @@ async def stepup_verify(
     state.audit_writer.write(_make_stepup_event(admin_record.username, "success"))
 
     from yashigani.auth.stepup import STEPUP_TTL_SECONDS
+
     return {
         "status": "ok",
         "stepup_verified": True,
@@ -816,8 +889,8 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
             httponly=True,
             secure=True,
             samesite="strict",
-            max_age=14400,   # 4 hours absolute
-            path="/",        # __Host- prefix requires Path=/
+            max_age=14400,  # 4 hours absolute
+            path="/",  # __Host- prefix requires Path=/
         )
     # Always set the user-level cookie (used by forward_auth for Open WebUI)
     response.set_cookie(
@@ -835,6 +908,7 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
 # Admin IP access control — blocklist + allowlist (fail2ban-style)
 # ---------------------------------------------------------------------------
 
+
 @router.get("/blocked-ips")
 async def list_blocked_ips(request: Request, session: AdminSession):
     """List permanently blocked IPs AND currently soft-throttled IPs.
@@ -851,6 +925,7 @@ async def list_blocked_ips(request: Request, session: AdminSession):
         page hangs and /auth/blocked-ips says {}" diagnostic gap)
     """
     import json
+
     r = _get_throttle_redis()
 
     # Permanent blocks (existing behaviour)
@@ -921,14 +996,18 @@ async def list_allowed_ips(session: AdminSession):
     r = _get_throttle_redis()
     entries = r.smembers("auth:allowlist")
     allowed = [e.decode() if isinstance(e, bytes) else e for e in entries]
-    return {"allowed_ips": sorted(allowed), "total": len(allowed),
-            "mode": "restrict" if allowed else "open (all IPs permitted)"}
+    return {
+        "allowed_ips": sorted(allowed),
+        "total": len(allowed),
+        "mode": "restrict" if allowed else "open (all IPs permitted)",
+    }
 
 
 @router.post("/allowed-ips")
 async def add_allowed_ip(request: Request, session: AdminSession):
     """Add an IP or CIDR to the login allowlist. Supports IPv4 and IPv6."""
     import ipaddress
+
     body = await request.json()
     entry = body.get("ip", "").strip()
     if not entry:
@@ -940,7 +1019,10 @@ async def add_allowed_ip(request: Request, session: AdminSession):
         else:
             ipaddress.ip_address(entry)
     except ValueError:
-        raise HTTPException(status_code=400, detail={"error": "invalid_ip", "message": f"'{entry}' is not a valid IPv4/IPv6 address or CIDR range"})
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_ip", "message": f"'{entry}' is not a valid IPv4/IPv6 address or CIDR range"},
+        )
     r = _get_throttle_redis()
     r.sadd("auth:allowlist", entry)
     _log.info("Admin %s added IP to allowlist: %s", session.account_id, entry)
@@ -967,6 +1049,7 @@ async def _get_record_by_id(account_id: str):
 
 def _make_login_event(username: str, outcome: str, reason):
     from yashigani.audit.schema import AdminLoginEvent
+
     return AdminLoginEvent(
         account_tier="admin",
         admin_account=username,
@@ -977,6 +1060,7 @@ def _make_login_event(username: str, outcome: str, reason):
 
 def _make_config_event(username: str, setting: str, prev: str, new: str):
     from yashigani.audit.schema import ConfigChangedEvent
+
     return ConfigChangedEvent(
         account_tier="admin",
         admin_account=username,
@@ -988,6 +1072,7 @@ def _make_config_event(username: str, setting: str, prev: str, new: str):
 
 def _make_provision_event(username: str):
     from yashigani.audit.schema import TotpProvisionCompletedEvent
+
     return TotpProvisionCompletedEvent(
         account_tier="admin",
         user_handle=username,
@@ -996,6 +1081,7 @@ def _make_provision_event(username: str):
 
 def _make_stepup_event(username: str, outcome: str):
     from yashigani.audit.schema import AdminLoginEvent
+
     return AdminLoginEvent(
         account_tier="admin",
         admin_account=username,
