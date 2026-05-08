@@ -1,7 +1,7 @@
 """v2.23.3 — Persistent encrypted auth settings (admin-panel HIBP API key).
 
-Revision ID: 0007
-Revises: 0006
+Revision ID: 0008
+Revises: 0007
 Create Date: 2026-05-07
 
 Rationale:
@@ -22,15 +22,15 @@ Initial setting keys:
                    Empty string means "not configured" (fall back to env var
                    or anonymous request). Empty string is still encrypted.
 """
-# Last updated: 2026-05-07T00:00:00+01:00
+# Last updated: 2026-05-08T00:00:00+01:00
 from __future__ import annotations
 
 from typing import Sequence, Union
 
 from alembic import op
 
-revision: str = "0007"
-down_revision: Union[str, None] = "0006"
+revision: str = "0008"
+down_revision: Union[str, None] = "0007"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -216,8 +216,23 @@ async def lifespan(app: FastAPI):
 
             # v2.23.3 (#59): auth_settings_store for encrypted operator config
             # (e.g. HIBP API key). Initialised after the pool is ready.
+            # B2 fail-fast: YASHIGANI_DB_AES_KEY MUST be set; an empty or
+            # missing key causes pgp_sym_encrypt to encrypt with an empty
+            # passphrase, which is a silent data-security failure. We reject
+            # at startup rather than allowing a degraded-but-running state.
+            _aes_key = os.environ.get("YASHIGANI_DB_AES_KEY", "")
+            if not _aes_key:
+                raise RuntimeError(
+                    "YASHIGANI_DB_AES_KEY is not set. "
+                    "This key is required to encrypt auth_settings values at rest "
+                    "using pgcrypto pgp_sym_encrypt. "
+                    "Generate a 32-byte hex key (64 chars) with: "
+                    "openssl rand -hex 32 "
+                    "and add it to your .env file or Helm values secret."
+                )
             from yashigani.auth.settings_store import AuthSettingsStore
             backoffice_state.auth_settings_store = AuthSettingsStore(pool=get_pool())
+            _log.info("auth_settings_store initialised (pgcrypto-backed encrypted store)")
 
             import asyncio as _asyncio
             from yashigani.db.postgres import connect_with_retry_sync as _connect_retry
