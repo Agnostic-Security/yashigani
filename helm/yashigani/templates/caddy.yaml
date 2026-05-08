@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-04-29T16:04:58+01:00 */ -}}
+{{- /* Last updated: 2026-05-07T00:00:00+01:00 */ -}}
 {{- if .Values.caddy.enabled }}
 ---
 apiVersion: apps/v1
@@ -37,6 +37,11 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        # fsGroup triggers chgrp on Secret volumes so UID 1000 (caddy) can
+        # read /run/secrets/* at mode 0440. Without this, files stay root:root
+        # and caddy errors: open /run/secrets/caddy_client.crt: permission denied.
+        # ACS-RISK-008 omitted this; parity fix per G9 K8s restore round-trip.
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       containers:

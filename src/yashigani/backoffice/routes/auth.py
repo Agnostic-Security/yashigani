@@ -7,7 +7,7 @@ POST /auth/password/change  — forced change on first login
 POST /auth/totp/provision   — TOTP + recovery codes provisioning
 POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value flows
 
-Last updated: 2026-05-02T00:00:00+01:00
+Last updated: 2026-05-08T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -386,6 +386,14 @@ async def logout(
     store.invalidate(session.token)
     response.delete_cookie(_SESSION_COOKIE, path="/")
     response.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    # AU.L2-3.3.1 / OWASP A09: emit audit event for every auth lifecycle action.
+    # All other auth outcomes (login success/failure, totp_provision, stepup,
+    # self_reset) are audited; logout was the only gap (yashigani-retro#95).
+    state = backoffice_state
+    if state.audit_writer is not None:
+        state.audit_writer.write(
+            _make_login_event(session.account_id, "logout", None)
+        )
     return {"status": "ok"}
 
 

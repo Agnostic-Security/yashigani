@@ -1,6 +1,6 @@
 # Yashigani v2.23.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-04 (image bumps Phase 1+2: opa 1.16.1, open-webui v0.9.2, prometheus v3.11.3, alertmanager v0.32.1, loki/promtail 3.6.10, ollama 0.23.0, pgbouncer v1.25.1-p0)
+# Last updated: 2026-05-07 (chore: convert floating-tag stubs to specific verified-existing versions)
 
 global:
   imageRegistry: "ghcr.io"
@@ -120,7 +120,7 @@ mtls:
   # to your internal mirror if air-gapped.
   kubectlImage:
     repository: "alpine/k8s"
-    tag: "1.29.4@sha256:ed410d899e43e9df9eb70595ea42967bb3230676adf70a97a849ac965e4389fc"
+    tag: "1.29.15@sha256:82171c2a1b3412fc0450ff347f11451294f917122c7f49a63d77f3499a068f11"
     pullPolicy: IfNotPresent
 
   # Two-tier PKI lifetime policy. Must sit inside the bounds declared in
@@ -269,6 +269,20 @@ gateway:
 # ---------------------------------------------------------------------------
 backoffice:
   enabled: true
+  # v2.23.2 fix — SSRF guard hostname allowlist (TM-V231-004 / Pentest #95).
+  # _assert_safe_upstream_url() blocks loopback/RFC1918/link-local by default.
+  # agentUpstreamHostnames lists the Kubernetes service hostnames that are permitted
+  # as agent upstream URLs despite resolving to cluster-internal IPs. The rendered
+  # value is joined with commas and injected as YASHIGANI_AGENT_UPSTREAM_HOSTNAMES
+  # on the backoffice container.
+  # Default: the three canonical Yashigani-internal bundle service names.
+  # Extend: add your custom agent service names to this list.
+  # Security: adding a name trusts that K8s service as a legitimate internal mesh
+  # endpoint. Agent registration is still admin-gated (TOTP step-up + audit trail).
+  agentUpstreamHostnames:
+    - langflow
+    - letta
+    - openclaw
   image:
     # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
     # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
@@ -348,7 +362,7 @@ redis:
   enabled: true
   image:
     repository: redis
-    tag: "7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -378,7 +392,7 @@ ollama:
   enabled: true
   image:
     repository: ollama/ollama
-    tag: "0.23.0@sha256:5600a652d1081050f398152127c584222546354491f27fe47ccbc6351bc870bd"
+    tag: "0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -460,7 +474,10 @@ grafana:
       cpu: "250m"
       memory: "512Mi"
   service:
-    port: 3000
+    # retro #83: Grafana serves HTTPS on 3443 when mtls.enabled=true.
+    # Port value here is the Service port; targetPort is set in grafana.yaml
+    # based on mtls.enabled (3443 when true, 3000 when false).
+    port: 3443
     type: ClusterIP
   existingSecretName: ""
   adminUser: "grafana-admin"
@@ -502,7 +519,7 @@ loki:
   enabled: true
   image:
     repository: grafana/loki
-    tag: "3.6.10@sha256:f59e6aedfee6af2388d69962b178a35a23152573b4bf0937106746deb7146ec7"
+    tag: "3.7.1@sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -586,7 +603,7 @@ caddy:
   enabled: true
   image:
     repository: caddy
-    tag: "2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+    tag: "2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -665,11 +682,10 @@ agentBundles:
     # License: TBD — verify at openclaw.ai before production use.
     enabled: false
     image:
-      # Pinned to 2026.3.1 to match docker-compose.yml. :latest digest also
-      # captured (sha256:a0c8cb7f5e7857b4f40c3ceaeb37ec89641a9f3991e66957849e4e3f8e8497a6)
-      # but tag-version alignment takes precedence.
+      # Pinned to 2026.5.6 to match docker-compose.yml. INDEX digest verified
+      # 2026-05-07 via crane digest — multi-arch (linux/amd64 + linux/arm64).
       repository: ghcr.io/openclaw/openclaw
-      tag: "2026.3.1@sha256:dcf11a3a97a9b0e42dd41fcd4891533e77ff72e7b0380c743177bfbfd6f38b2d"
+      tag: "2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
@@ -762,7 +778,7 @@ budgetRedis:
   enabled: true
   image:
     repository: redis
-    tag: "7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.

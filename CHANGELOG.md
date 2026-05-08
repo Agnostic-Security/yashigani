@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
 
 # Changelog
 
@@ -10,29 +10,19 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-> **Last public release — v2.23.2**
->
-> v2.23.2 is the final public release of Yashigani. Future development moves to a private tier.
->
-> - **Existing public users:** this release will remain available; no automatic deprecation.
-> - **Continued updates (v2.23.3+):** require a paid licence — see [agnosticsec.com/yashigani/licensing](https://agnosticsec.com/yashigani/licensing).
-> - **Free tier (Community):** continues with v2.23.2; security patches delivered under the published support window.
-> - **Non-profit and education:** access remains free forever — see [agnosticsec.com/yashigani/non-profit](https://agnosticsec.com/yashigani/non-profit).
-> - **Public repository:** transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation.
-
----
-
 ## [Unreleased]
 
-No unreleased changes yet for the next version.
+### Security (v2.23.3)
+
+- **fix/hibp-route-through-httpclient** — `auth/password.py check_hibp()` now routes through `HttpClient._check_policy()` with `allowlist=["api.pwnedpasswords.com"]` and `allow_http=False` before issuing the outbound HIBP request. The URL is hardcoded (no immediate SSRF risk), but defence-in-depth ensures any future change to `_HIBP_API_URL` is automatically caught by the centralised gate. Fail-open preserved: `BlockedByPolicy` → `return None`. The `_check_hibp_urllib` fallback is only invoked after the policy gate passes (yashigani-retro#95 / OWASP A10 / API7 SSRF).
+- **fix/auth-logout-audit-emit** — `routes/auth.py logout()` now emits an `AdminLoginEvent(outcome="logout")` audit event before returning. Every other auth lifecycle outcome (login success/failure, totp_provision, stepup, self_reset) was already audited; logout was the only gap (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1). Guarded by `if state.audit_writer is not None` for partial-init safety.
+- **fix/break-glass-audit-writer-required** — `auth/break_glass.py init_break_glass(audit_writer=None)` default removed; `audit_writer` is now a required positional argument. Calling without it raises `TypeError` at startup rather than silently creating an audit-silent break-glass manager. The one call site (`backoffice/entrypoint.py:474`) already passes `audit_writer` explicitly — no functional change there. `_emit_activated` and `_emit_expired` None-guards preserved for defence-in-depth (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1).
 
 ---
 
-## [v2.23.2] — 2026-05-06 **[LAST PUBLIC RELEASE]**
+## [v2.23.2] — 2026-05-06
 
 Theme: **Security Hardening + Supply-Chain Controls + ASVS L3 92% + Agentic AI Overreliance Controls**.
-
-> **This is the last publicly distributed release of Yashigani.** v2.23.3 and beyond are private. The public repository transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation. See [`docs/release-notes/v2.23.2.md`](docs/release-notes/v2.23.2.md) for the full cutover notice.
 
 Full release narrative: [`docs/release-notes/v2.23.2.md`](docs/release-notes/v2.23.2.md)
 
@@ -91,6 +81,7 @@ Full release narrative: [`docs/release-notes/v2.23.2.md`](docs/release-notes/v2.
 
 ### Bug Fixes
 
+- **Agent bundle SSRF guard wiring** — Optional agent bundles (Langflow, Letta, OpenClaw) silently failed to register on canonical install because `YASHIGANI_AGENT_UPSTREAM_HOSTNAMES` was empty and not pre-populated. The default is now `langflow,letta,openclaw` in Compose and Helm; SSRF guard code unchanged. (fix/v232-openclaw-upstream-hostnames-default)
 - **str(exc) information disclosure** — `str(exc)` calls in internal result fields and error responses migrated to `safe_error_envelope` to prevent exception-class name leakage.
 - **Agent-name path injection** — Regex + resolve guard prevents path traversal via crafted agent names.
 - **CI workflow injection** — `env` indirection on `head_branch` + regex guard closes the GitHub Actions `workflow_run` injection vector.

@@ -1,15 +1,5 @@
 # Podman Deployment Guide
-<!-- Last updated: 2026-05-07T00:00:00+01:00 -->
-
-> **Last public release — v2.23.2**
->
-> v2.23.2 is the final public release of Yashigani. Future development moves to a private tier.
->
-> - **Existing public users:** this release will remain available; no automatic deprecation.
-> - **Continued updates (v2.23.3+):** require a paid licence — see [agnosticsec.com/yashigani/licensing](https://agnosticsec.com/yashigani/licensing).
-> - **Free tier (Community):** continues with v2.23.2; security patches delivered under the published support window.
-> - **Non-profit and education:** access remains free forever — see [agnosticsec.com/yashigani/non-profit](https://agnosticsec.com/yashigani/non-profit).
-> - **Public repository:** transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation.
+<!-- Last updated: 2026-05-08T13:00:00+01:00 -->
 
 Yashigani supports Podman as a drop-in Docker replacement. The Pool Manager
 (container-per-identity isolation, required for CIAA compliance) needs access
@@ -67,3 +57,15 @@ No rootful requirement on Linux -- user namespaces handle isolation.
 
 - **Stub mode is NEVER acceptable in production** -- it disables container-per-
   identity isolation and breaks CIAA compliance claims.
+
+## Storage Management
+
+Rootless Podman accumulates image layers and build cache over time, particularly during active development and release cycles. When disk usage becomes a concern, operators should follow the prune SOP:
+
+- **Dangling image prune** (safe, run freely): `podman image prune`
+- **Unused image prune** (verify no running containers first): `podman image prune --all --filter until=168h`
+- **System prune** (stopped containers + dangling images): `podman system prune`
+
+**Critical constraint:** never add `--volumes` to any prune command and never run `podman volume rm` without explicit operator authorisation. Named Yashigani volumes (postgres data, Redis, audit logs, PKI) are irreplaceable without a verified backup.
+
+The full storage prune SOP — including per-agent namespace isolation behaviour, schedule recommendations, and recovery procedures — is available to licensed operators as an internal runbook. Contact your account team for access.

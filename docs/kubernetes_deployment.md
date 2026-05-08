@@ -1,18 +1,6 @@
 # Yashigani — Kubernetes Deployment Guide
 
-Version: v2.23.2 | Chart version: 2.23.2 | Last updated: 2026-05-07T00:00:00+01:00
-
-> **Last public release — v2.23.2**
->
-> v2.23.2 is the final public release of Yashigani. Future development moves to a private tier.
->
-> - **Existing public users:** this release will remain available; no automatic deprecation.
-> - **Continued updates (v2.23.3+):** require a paid licence — see [agnosticsec.com/yashigani/licensing](https://agnosticsec.com/yashigani/licensing).
-> - **Free tier (Community):** continues with v2.23.2; security patches delivered under the published support window.
-> - **Non-profit and education:** access remains free forever — see [agnosticsec.com/yashigani/non-profit](https://agnosticsec.com/yashigani/non-profit).
-> - **Public repository:** transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation.
-
----
+Version: v2.23.3 | Chart version: 2.23.3 | Last updated: 2026-05-08T00:00:00+01:00
 
 ## Prerequisites
 
@@ -138,8 +126,15 @@ helm install yashigani helm/yashigani/ \
   --namespace yashigani \
   --set global.tlsDomain=yashigani.example.com \
   --set global.acmeEmail=admin@example.com \
-  --wait
+  --wait \
+  --wait-for-jobs \
+  --timeout 10m \
+  --atomic \
+  --burst-limit 1000 \
+  --qps 500
 ```
+
+> **Timeout guidance (v2.23.3+):** fresh installs use `--timeout 10m`; upgrades use `--timeout 5m`. Images must be pre-pulled into the node's containerd cache before installing — see the Docker Desktop preflight above. Override with `HELM_TIMEOUT=20m` when using `scripts/k8s-install.sh` on air-gap or slow-pull clusters.
 
 ### 3. Verify the release
 
@@ -477,3 +472,37 @@ kubectl logs job/yashigani-delete-legacy-hpa -n yashigani
 ```
 
 The Job requires the `yashigani` ServiceAccount to have `delete` on `horizontalpodautoscalers`. If RBAC is locked down, grant it temporarily or delete HPAs manually before upgrading.
+
+### Re-install: stale PersistentVolume cleanup (local-path-provisioner)
+
+On Docker Desktop K8s, kind, and k3s single-node clusters, PVs backed by local-path-provisioner may linger after `helm uninstall` or namespace deletion. On a subsequent `helm install`, Postgres can start against the old data directory with a mismatched password, causing `password authentication failed` on first startup.
+
+**Before re-installing**, check for stale PVs:
+
+```bash
+kubectl get pv | grep yashigani
+```
+
+If any PVs remain in `Released` or `Bound` state referencing the old namespace, they must be deleted before re-installing.
+
+> **Internal operator runbook:** Agnostic Security operators have a detailed step-by-step cleanup guide at `Internal/Compliance/yashigani/install-runbooks/k8s-pv-stale-data-cleanup.md` covering: how to identify stale PVs, when it is safe to delete, what data is permanently lost, how to confirm cleanup, and known failure modes (stuck `Terminating` namespaces, finalizer removal, local-path-provisioner backing directory cleanup).
+
+A safe abbreviated flow for development clusters where all data is expendable:
+
+```bash
+NAMESPACE=yashigani
+
+# Delete namespace (and its PVCs)
+kubectl delete namespace ${NAMESPACE} --ignore-not-found
+kubectl wait --for=delete namespace/${NAMESPACE} --timeout=120s 2>/dev/null || true
+
+# Delete any lingering PVs that referenced this namespace
+kubectl get pv -o custom-columns='NAME:.metadata.name,NS:.spec.claimRef.namespace' \
+  --no-headers | awk -v ns="${NAMESPACE}" '$2==ns {print $1}' \
+  | xargs -r kubectl delete pv
+
+# Confirm clean state
+kubectl get pv | grep yashigani || echo "No stale PVs — safe to re-install"
+```
+
+**This permanently destroys all data in those PVs.** Always take a backup first if the data is recoverable. See `restore.sh --k8s` for K8s-aware restore.

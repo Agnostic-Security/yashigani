@@ -57,6 +57,11 @@ class AccountRecord:
     totp_backoff_until: float = 0.0
     created_at: float = field(default_factory=time.time)
     password_changed_at: float = field(default_factory=time.time)
+    # v2.23.3 — FedRAMP AC-2(F2) inactive-account tracking (LU-YSG-002)
+    # last_login_at: None means never logged in (backfilled to created_at on migration).
+    # Use Optional[float] (epoch seconds) for symmetry with other time fields.
+    last_login_at: Optional[float] = None
+    inactive_disabled_at: Optional[float] = None
 
 
 class LocalAuthService:

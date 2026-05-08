@@ -1,0 +1,101 @@
+# Last updated: 2026-05-08T00:00:00+01:00
+# Enforces feedback_no_tiago_in_public_docs.md — blocks PRs that introduce
+# team member names or internal commercial strategy content into public-facing
+# files. Recurring leak pattern prompted this gate (2026-05-08 directive).
+#
+# Class 1: team member first names (agents + founder name)
+# Class 2: internal commercial strategy / governance phrases
+#
+# Exclusions: Internal/** (internal docs live there by design), tests/**
+# (test fixtures may use names in mock data), @agnosticsec.com email
+# addresses in verification command comments (literal GitHub account slugs).
+#
+# STRICT from day 1 on v2.23.3 — NO continue-on-error.
+# v2.23.3 is scrub-clean at gate install time; any new leak is a hard block.
+
+name: public-doc-hygiene
+
+on:
+  push:
+    branches: [v2.23.3, main]
+    paths:
+      - 'docs/**'
+      - 'README*'
+      - 'CHANGELOG.md'
+      - '*.md'
+  pull_request:
+    branches: [v2.23.3, main]
+    paths:
+      - 'docs/**'
+      - 'README*'
+      - 'CHANGELOG.md'
+      - '*.md'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Public doc hygiene scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Class 1 — team member names in public files
+        id: class1
+        run: |
+          set +e
+          HITS=$(grep -rn -i -E \
+            '\b(tiago|rosado|maxine|tom|su|captain|iris|laura|ava|ogen|rhea|nora|nico|lior|petra|reel)\b' \
+            --include='*.md' \
+            docs/ README* CHANGELOG.md \
+            2>/dev/null \
+            | grep -v -E "Internal/|tests/|node_modules|@agnosticsec\.com|\.lock")
+          set -e
+          if [ -n "$HITS" ]; then
+            echo "FAIL: Class 1 — team member names found in public-facing files:"
+            echo "$HITS"
+            echo "class1_fail=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PASS: Class 1 — no team member names in public files."
+            echo "class1_fail=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Class 2 — internal commercial strategy in public files
+        id: class2
+        run: |
+          set +e
+          HITS=$(grep -rn -i -E \
+            "private programme|customer programme|cutover|last public|going private|private tier|deprecation timeline|partner programme|nda default|support escalation ladder|tier rollout" \
+            --include='*.md' \
+            docs/ README* CHANGELOG.md \
+            2>/dev/null \
+            | grep -v -E "Internal/|tests/|node_modules")
+          set -e
+          if [ -n "$HITS" ]; then
+            echo "FAIL: Class 2 — internal strategy content found in public-facing files:"
+            echo "$HITS"
+            echo "class2_fail=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PASS: Class 2 — no internal strategy content in public files."
+            echo "class2_fail=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Gate result
+        run: |
+          C1="${{ steps.class1.outputs.class1_fail }}"
+          C2="${{ steps.class2.outputs.class2_fail }}"
+          if [ "$C1" = "true" ] || [ "$C2" = "true" ]; then
+            echo ""
+            echo "GATE FAILED — public-doc-hygiene"
+            echo "One or more forbidden patterns were found in public-facing files."
+            echo "See Class 1 / Class 2 steps above for file:line references."
+            echo ""
+            echo "Fix: rewrite the content using role-based wording (see"
+            echo "feedback_no_tiago_in_public_docs.md replacement-wording table)."
+            echo "Internal content belongs under Internal/ — not docs/, README, or CHANGELOG."
+            exit 1
+          else
+            echo "GATE PASSED — public-doc-hygiene: no forbidden patterns detected."
+          fi

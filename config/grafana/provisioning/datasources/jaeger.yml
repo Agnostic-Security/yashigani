@@ -1,3 +1,11 @@
+# Last updated: 2026-05-07T00:00:00+01:00
+# v2.23.2 retro #83: Jaeger datasource note.
+# Jaeger's query/UI port (16686) remains HTTP on the obs-internal network.
+# This is a documented design decision: the obs network is not exposed to the
+# host; Caddy enforces forward_auth before proxying /admin/jaeger/*. The
+# otel-collector → Jaeger gRPC ingest (port 4317) already uses mTLS per EX-231-09.
+# Enabling TLS on Jaeger's UI port (16686) would require a custom Jaeger image
+# build — deferred to v2.24 (tracked as RETRO-84). No change to this file this PR.
 apiVersion: 1
 datasources:
   - name: Jaeger

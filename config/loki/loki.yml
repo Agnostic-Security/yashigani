@@ -1,12 +1,37 @@
 # Loki 3.x single-binary mode — suitable for Docker Compose dev/staging.
 # For Kubernetes production, use the distributed Loki Helm chart.
 # All rings set to inmemory to avoid Consul/etcd dependency.
+#
+# retro #84 (v2.23.2): mTLS enabled for both ingest (Promtail→Loki) and
+# query (Grafana→Loki) paths.
+# Server cert:  /run/secrets/loki_client.crt / loki_client.key
+#   (issued by install.sh PKI bootstrap against the intermediate CA).
+# Trust anchor: /run/secrets/ca_intermediate.crt (Pattern B — never ca_root.crt).
+#   All clients (Promtail, Grafana, otel-collector) must present a valid leaf
+#   cert signed by the same intermediate. Unauthenticated plain-HTTP connections
+#   are rejected at the TLS handshake.
+# gRPC listener also upgraded to TLS on port 9096; clients that speak OTLP
+#   or Loki gRPC must use the same cert bundle.
 auth_enabled: false
 
 server:
   http_listen_port: 3100
   grpc_listen_port: 9096
   log_level: warn
+  # retro #84: mTLS — Loki presents its own leaf cert; all clients must
+  # present a cert signed by the internal intermediate CA (Pattern B).
+  http_tls_config:
+    cert_file: /run/secrets/loki_client.crt
+    key_file:  /run/secrets/loki_client.key
+    client_ca_file: /run/secrets/ca_intermediate.crt
+    # client_auth_type: RequireAndVerifyClientCert is the default when
+    # client_ca_file is set in Loki 3.x; stated explicitly for clarity.
+    client_auth_type: RequireAndVerifyClientCert
+  grpc_tls_config:
+    cert_file: /run/secrets/loki_client.crt
+    key_file:  /run/secrets/loki_client.key
+    client_ca_file: /run/secrets/ca_intermediate.crt
+    client_auth_type: RequireAndVerifyClientCert
 
 common:
   ring:

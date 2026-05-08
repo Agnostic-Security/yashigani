@@ -87,11 +87,19 @@ exporters:
   # `labels.resource` / `labels.attributes` config syntax. Label projection
   # now happens via the `loki.resource.labels` / `loki.attribute.labels`
   # attribute hints set by the resource/loki_labels processor below.
+  #
+  # retro #84 (v2.23.2): endpoint switched to https; otel-collector presents
+  # its own leaf cert (otel-collector_client.crt/key) to Loki for mutual auth.
+  # Trust anchor: ca_intermediate.crt (Pattern B).
   loki:
-    endpoint: http://loki:3100/loki/api/v1/push
+    endpoint: https://loki:3100/loki/api/v1/push
     default_labels_enabled:
       exporter: false
       job: true
+    tls:
+      cert_file: /run/secrets/otel-collector_client.crt
+      key_file:  /run/secrets/otel-collector_client.key
+      ca_file:   /run/secrets/ca_intermediate.crt
 
 extensions:
   health_check:

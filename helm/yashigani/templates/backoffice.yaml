@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-02T02:32:22+01:00 */ -}}
+{{- /* Last updated: 2026-05-07T00:00:00+01:00 — fix: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES wired from agentBundles.upstreamHostnames */ -}}
 {{- if .Values.backoffice.enabled }}
 ---
 apiVersion: apps/v1
@@ -200,6 +200,13 @@ spec:
             {{- end }}
             - name: YASHIGANI_TLS_DOMAIN
               value: {{ .Values.global.tlsDomain | quote }}
+            {{- if .Values.backoffice.agentUpstreamHostnames }}
+            # v2.23.2 fix — SSRF guard hostname allowlist (TM-V231-004 / Pentest #95).
+            # Permits canonical agent bundle service names to register with private
+            # upstream URLs. Mirrors Compose YASHIGANI_AGENT_UPSTREAM_HOSTNAMES.
+            - name: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES
+              value: {{ .Values.backoffice.agentUpstreamHostnames | join "," | quote }}
+            {{- end }}
             - name: OWUI_API_URL
               value: "http://open-webui:8080"
             - name: REDIS_PASSWORD

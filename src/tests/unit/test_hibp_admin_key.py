@@ -336,7 +336,7 @@ class TestCheckHibpUrllibApiKey:
             return mock_resp
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            _check_hibp_urllib(password, _HIBP_DEFAULT_API_URL, api_key=api_key)
+            _check_hibp_urllib(password, api_key=api_key)
 
         assert len(captured_requests) == 1
         req_obj = captured_requests[0]
@@ -359,7 +359,7 @@ class TestCheckHibpUrllibApiKey:
             return mock_resp
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            _check_hibp_urllib(password, _HIBP_DEFAULT_API_URL, api_key=None)
+            _check_hibp_urllib(password, api_key=None)
 
         assert len(captured_requests) == 1
         req_obj = captured_requests[0]

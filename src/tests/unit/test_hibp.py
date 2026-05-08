@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import yashigani.auth.password as _pw_module
 from yashigani.auth.password import (
     PasswordBreachedError,
     check_hibp,
@@ -35,6 +36,24 @@ from yashigani.auth.password import (
     _HIBP_DEFAULT_API_URL,
     _check_hibp_urllib,
 )
+
+
+# ---------------------------------------------------------------------------
+# Module-level SSRF policy bypass
+# ---------------------------------------------------------------------------
+# PR #81 added an SSRF policy check (_hibp_http_client()._check_policy()) to
+# check_hibp() before any outbound request.  Unit tests in this file pre-date
+# PR #81 and patch httpx.get directly.  The autouse fixture below neutralises
+# the policy check for all unit tests so they remain Redis/network-free.
+# SSRF policy correctness is separately verified in
+# test_v2233_hibp_route_through_httpclient.py.
+
+@pytest.fixture(autouse=True)
+def _bypass_ssrf_policy(monkeypatch):
+    """Patch the HIBP HttpClient policy check to a no-op for all unit tests."""
+    mock_client = MagicMock()
+    mock_client._check_policy = MagicMock(return_value=None)
+    monkeypatch.setattr(_pw_module, "_HIBP_HTTP_CLIENT", mock_client)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +466,7 @@ class TestCheckHibpUrllib:
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = _check_hibp_urllib(password, _HIBP_DEFAULT_API_URL)
+            result = _check_hibp_urllib(password)
 
         assert result == count
 
@@ -468,7 +487,7 @@ class TestCheckHibpUrllib:
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = _check_hibp_urllib(password, _HIBP_DEFAULT_API_URL)
+            result = _check_hibp_urllib(password)
 
         assert result is None
 
@@ -482,7 +501,7 @@ class TestCheckHibpUrllib:
                 "urllib.request.urlopen",
                 side_effect=urllib.error.URLError("connection refused"),
             ):
-                result = _check_hibp_urllib(password, _HIBP_DEFAULT_API_URL)
+                result = _check_hibp_urllib(password)
 
         assert result is None
         assert any("HIBP API unreachable" in r.message for r in caplog.records)

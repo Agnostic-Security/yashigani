@@ -5,14 +5,16 @@ All routes require an active admin session.
 
 Routes:
   GET    /admin/license          — current license status + usage across all dimensions
+  GET    /api/v1/license/status  — machine-readable expiry status (authenticated admin)
   POST   /admin/license/activate — activate a new license key
   DELETE /admin/license          — revert to community license
 """
-# Last updated: 2026-04-27T21:53:12+01:00
+# Last updated: 2026-05-07T00:00:00+01:00 (v2.23.3 expiry UX: /api/v1/license/status + banner_context)
 from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -47,6 +49,119 @@ def _limit_block(current: int, maximum: int) -> dict:
         "current": current,
         "maximum": maximum if maximum != -1 else None,
         "unlimited": maximum == -1,
+    }
+
+
+def get_license_banner_context(now: Optional[datetime] = None) -> dict:
+    """
+    Return a context dict suitable for injection into every Jinja2 template.
+
+    Keys:
+      license_mode      — str value of LicenseExpiryMode (e.g. "active", "warning")
+      license_days      — int | None (days remaining; negative = past expiry; None = perpetual)
+      license_expires   — ISO-8601 string | None
+      license_banner    — dict with keys: show (bool), severity (str), message (str)
+
+    This helper is safe to call before the licence is fully loaded (returns ACTIVE defaults
+    if the licensing module is unavailable).
+    """
+    try:
+        from yashigani.licensing import get_license
+        from yashigani.licensing.model import LicenseExpiryMode, WARN_ORANGE_DAYS, WARN_YELLOW_DAYS
+    except ImportError:
+        return _banner_defaults()
+
+    try:
+        lic = get_license()
+    except Exception:
+        return _banner_defaults()
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    mode = lic.expiry_mode(now=now)
+    days = lic.days_remaining(now=now)
+    expires_at_str = lic.expires_at.isoformat() if lic.expires_at is not None else None
+
+    banner = _build_banner(mode, days)
+
+    return {
+        "license_mode": mode.value,
+        "license_days": days,
+        "license_expires": expires_at_str,
+        "license_banner": banner,
+    }
+
+
+def _banner_defaults() -> dict:
+    from yashigani.licensing.model import LicenseExpiryMode
+    return {
+        "license_mode": LicenseExpiryMode.ACTIVE.value,
+        "license_days": None,
+        "license_expires": None,
+        "license_banner": {"show": False, "severity": "none", "message": ""},
+    }
+
+
+def _build_banner(mode, days: Optional[int]) -> dict:
+    """Build the banner payload for a given mode and days-remaining value."""
+    from yashigani.licensing.model import LicenseExpiryMode
+
+    if mode == LicenseExpiryMode.ACTIVE:
+        return {"show": False, "severity": "none", "message": ""}
+
+    if mode == LicenseExpiryMode.WARNING:
+        return {
+            "show": True,
+            "severity": "warning",
+            "message": (
+                f"Yashigani licence expires in {days} day{'s' if days != 1 else ''} — "
+                "renew to avoid service interruption."
+            ),
+        }
+
+    if mode == LicenseExpiryMode.CRITICAL:
+        return {
+            "show": True,
+            "severity": "critical",
+            "message": (
+                f"Yashigani licence expires in {days} day{'s' if days != 1 else ''} — "
+                "renew now: sales@agnosticsec.com."
+            ),
+        }
+
+    if mode == LicenseExpiryMode.EXPIRED:
+        days_since = -days if days is not None else "?"
+        from yashigani.licensing.model import GRACE_PERIOD_DAYS
+        grace_left = GRACE_PERIOD_DAYS - days_since if isinstance(days_since, int) else "?"
+        return {
+            "show": True,
+            "severity": "expired",
+            "message": (
+                f"Yashigani licence has expired. {grace_left} day{'s' if grace_left != 1 else ''} "
+                "of grace period remain. Renew now: sales@agnosticsec.com."
+            ),
+        }
+
+    if mode == LicenseExpiryMode.READONLY:
+        return {
+            "show": True,
+            "severity": "readonly",
+            "message": (
+                "Yashigani licence expired. Gateway is in read-only mode — "
+                "configuration changes and new agent-runs are blocked. "
+                "Renew now: sales@agnosticsec.com."
+            ),
+        }
+
+    # BLOCKED
+    return {
+        "show": True,
+        "severity": "blocked",
+        "message": (
+            "Yashigani licence expired more than 30 days ago. Gateway is blocked. "
+            "Renew at https://agnosticsec.com/pricing or contact sales@agnosticsec.com."
+        ),
     }
 
 
@@ -114,7 +229,54 @@ async def get_license_status(session=Depends(require_admin_session)):
             "saml": lic.has_feature("saml"),
             "scim": lic.has_feature("scim"),
         },
-        "upgrade_url": "https://yashigani.io/pricing",
+        "upgrade_url": "https://agnosticsec.com/pricing",
+    }
+
+
+@license_router.get("/status", summary="Machine-readable expiry status")
+async def get_license_expiry_status(session=Depends(require_admin_session)):
+    """
+    GET /admin/license/status
+
+    Returns a machine-readable summary of licence expiry state.  Also available
+    as GET /api/v1/license/status (mounted separately in app.py).
+
+    Response shape (v2.23.3):
+      {
+        "valid": bool,
+        "expires_at": "ISO-8601" | null,
+        "days_remaining": int | null,
+        "grace_period_active": bool,
+        "mode": "active" | "warning" | "critical" | "expired" | "readonly" | "blocked"
+      }
+
+    Authentication: admin session required (same as all /admin/* routes).
+
+    mode semantics:
+      active   — >30 days until expiry, or no expiry date
+      warning  — 7–30 days remaining (yellow banner)
+      critical — 1–7 days remaining (orange banner)
+      expired  — within 14-day grace period (red banner, continues serving)
+      readonly — 14–30 days past expiry (admin view-only; new runs blocked)
+      blocked  — 30+ days past expiry (HTTP 503 on data-plane)
+    """
+    from yashigani.licensing import get_license
+    from yashigani.licensing.model import LicenseExpiryMode
+
+    lic = get_license()
+    now = datetime.now(timezone.utc)
+    mode = lic.expiry_mode(now=now)
+    days = lic.days_remaining(now=now)
+    expires_at_str = lic.expires_at.isoformat() if lic.expires_at is not None else None
+
+    grace_period_active = mode == LicenseExpiryMode.EXPIRED
+
+    return {
+        "valid": lic.valid,
+        "expires_at": expires_at_str,
+        "days_remaining": days,
+        "grace_period_active": grace_period_active,
+        "mode": mode.value,
     }
 
 

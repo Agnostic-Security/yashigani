@@ -3,7 +3,7 @@ Yashigani Auth — Argon2id password hashing + HIBP breach check.
 OWASP ASVS V2.4: m=65536, t=3, p=4 minimum parameters.
 OWASP ASVS V2.1.7: Passwords must be checked against breach databases.
 
-Last updated: 2026-05-07T01:00:00+01:00
+Last updated: 2026-05-08T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -156,6 +156,26 @@ def generate_password(length: int = 36) -> str:
 _HIBP_DEFAULT_API_URL = "https://api.pwnedpasswords.com/range/"
 _HIBP_TIMEOUT = 5  # seconds
 
+# SSRF guardrail: route HIBP calls through the centralised HttpClient.
+# api.pwnedpasswords.com is public HTTPS-only — no SSRF risk in practice,
+# but defence-in-depth: all outbound HTTP must pass through the policy
+# gate so future changes to _HIBP_API_URL are automatically enforced.
+# OWASP A10 / API7 / yashigani-retro#95.
+_HIBP_HTTP_CLIENT = None   # lazy-initialised on first use
+
+
+def _hibp_http_client():
+    """Return a singleton HttpClient scoped to the HIBP allowlist."""
+    global _HIBP_HTTP_CLIENT
+    if _HIBP_HTTP_CLIENT is None:
+        from yashigani.net import HttpClient
+        _HIBP_HTTP_CLIENT = HttpClient(
+            allowlist=["api.pwnedpasswords.com"],
+            allow_http=False,   # HTTPS-only; HIBP never needs plain HTTP
+            timeout_s=float(_HIBP_TIMEOUT),
+        )
+    return _HIBP_HTTP_CLIENT
+
 
 def hibp_check_enabled() -> bool:
     """
@@ -193,6 +213,11 @@ def check_hibp(password: str, *, api_key: Optional[str] = None) -> Optional[int]
     """
     Check a password against the HIBP Passwords API using k-Anonymity.
 
+    Routes through the centralised :class:`~yashigani.net.HttpClient` with
+    an HTTPS-only allowlist scoped to ``api.pwnedpasswords.com``. This
+    enforces scheme + allowlist checks via the shared SSRF-guardrail policy
+    before any outbound request is issued (OWASP A10 / API7 / retro#95).
+
     Returns:
         None if the password is clean (not found in any breach).
         int (breach count) if the password has been compromised.
@@ -221,27 +246,6 @@ def check_hibp(password: str, *, api_key: Optional[str] = None) -> Optional[int]
     separately (see hibp_check_enabled()). This function always performs the
     check when called.
     """
-    _api_url = hibp_api_url()
-
-    # SSRF gate (PR #81 / W5): when PR #81 merges it re-routes this call through
-    # the centralised HttpClient which enforces the SSRF allowlist.  At that point
-    # the import below changes from `httpx.get` (direct) to HttpClient.get (gated).
-    # Unit tests that mock `httpx.get` must be updated to mock the HttpClient call
-    # path instead.  The urllib fallback path also moves through HttpClient then.
-    # Until PR #81 merges, this is the direct-httpx path (no SSRF gate).
-    try:
-        import httpx
-    except ImportError:
-        try:
-            import urllib.request
-            return _check_hibp_urllib(password, _api_url, api_key=api_key)
-        except Exception:
-            logger.warning(
-                "HIBP check skipped — no HTTP client available (install httpx for production)"
-            )
-            _increment_hibp_unavailable()
-            return None
-
     # HIBP k-Anonymity protocol mandates SHA-1 as the wire format (NIST SP 800-63B §5.1.1.2).
     # usedforsecurity=False: signals to hashlib/Bandit that this is a protocol requirement,
     # not a security primitive. The actual password is stored with Argon2id. Closes B324.
@@ -252,23 +256,46 @@ def check_hibp(password: str, *, api_key: Optional[str] = None) -> Optional[int]
     prefix = sha1_hash[:5]
     suffix = sha1_hash[5:]
 
+    request_url = f"{hibp_api_url()}{prefix}"
+
+    # Build request headers — api_key is never logged (security invariant).
     headers = {"User-Agent": "Yashigani-PasswordCheck/1.0"}
     if api_key:
-        # api_key deliberately not logged — security invariant
         headers["hibp-api-key"] = api_key
 
+    # --- SSRF policy check via HttpClient (defence-in-depth) ----------------
+    # _check_policy() is synchronous (pure URL validation, no I/O). This
+    # ensures scheme and allowlist are enforced even if _HIBP_API_URL is
+    # ever changed to a non-HTTPS or non-allowlisted value.
     try:
+        from yashigani.net import BlockedByPolicy
+        _hibp_http_client()._check_policy(request_url)
+    except BlockedByPolicy as exc:
+        logger.error(
+            "HIBP request blocked by SSRF policy — check_hibp disabled: %s", exc
+        )
+        return None
+    except Exception as exc:
+        logger.debug("HIBP policy check failed (%s) — skipping breach check", exc)
+        return None
+
+    # --- Outbound request ----------------------------------------------------
+    try:
+        import httpx
         response = httpx.get(
-            f"{_api_url}{prefix}",
+            request_url,
             timeout=_HIBP_TIMEOUT,
             headers=headers,
         )
         response.raise_for_status()
+    except ImportError:
+        # httpx not available — fall back to stdlib urllib (same policy already checked)
+        return _check_hibp_urllib(password, api_key=api_key)
     except Exception as exc:
         logger.warning(
             "HIBP API unreachable — skipping breach check (fail-open). "
-            "Network requirement: outbound HTTPS to %s. Error: %s",
-            _api_url, type(exc).__name__,
+            "Network requirement: outbound HTTPS to api.pwnedpasswords.com. Error: %s",
+            type(exc).__name__,
         )
         _increment_hibp_unavailable()
         return None
@@ -283,15 +310,17 @@ def check_hibp(password: str, *, api_key: Optional[str] = None) -> Optional[int]
 
 def _check_hibp_urllib(
     password: str,
-    api_url: str,
     *,
     api_key: Optional[str] = None,
 ) -> Optional[int]:
     """Fallback HIBP check using stdlib urllib (no httpx dependency).
 
+    The SSRF policy check is applied by the caller (check_hibp) before
+    this function is invoked, so we do NOT re-check here — policy is
+    enforced exactly once, as close to the decision point as possible.
+
     Args:
         password: Plaintext password to check.
-        api_url: HIBP API base URL.
         api_key: Optional HIBP API key. If non-empty, injects
             ``hibp-api-key: <key>`` header. Never logged.
     """
@@ -313,7 +342,7 @@ def _check_hibp_urllib(
         headers["hibp-api-key"] = api_key
 
     req = urllib.request.Request(
-        f"{api_url}{prefix}",
+        f"{hibp_api_url()}{prefix}",
         headers=headers,
     )
 
