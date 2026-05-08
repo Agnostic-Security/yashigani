@@ -82,6 +82,8 @@ from yashigani.backoffice.routes import (
     sso_router,
     # v2.23.2 — Backup status + verify (#47)
     backup_router,
+    # v2.23.3 — Admin-triggered secret rotation
+    secrets_router,
     # v2.23.3 — HIBP API key admin panel (#59)
     hibp_router,
     # v2.23.3 — WebAuthn v1 API (public login + step-up revoke)
@@ -499,6 +501,7 @@ def create_backoffice_app() -> FastAPI:
         ("/admin/users", 4 * 1024),  # username + opt email
         ("/admin/license", 4 * 1024),  # confirm flag or small LIC
         ("/api/v1/license", 256),  # status GET only, no body
+        ("/api/v1/admin/secrets", 256),  # secret name only (ASVS 4.3.1)
         ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
         ("/admin/ratelimit", 8 * 1024),
         ("/admin/rbac", 32 * 1024),
@@ -685,6 +688,9 @@ def create_backoffice_app() -> FastAPI:
 
     # v2.23.2 — Backup status + verify (#47)
     app.include_router(backup_router, tags=["backup"])
+
+    # v2.23.3 — Admin-triggered secret rotation
+    app.include_router(secrets_router, tags=["secrets"])
 
     # v2.23.3 — HIBP API key admin panel (#59)
     app.include_router(

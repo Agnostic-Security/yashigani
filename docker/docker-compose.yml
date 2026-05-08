@@ -295,6 +295,13 @@ services:
       YASHIGANI_INSPECTION_FALLBACK_CHAIN: ${YASHIGANI_INSPECTION_FALLBACK_CHAIN:-ollama,fail_closed}
       # Postgres via PgBouncer — TLS verify-ca + client cert.
       YASHIGANI_DB_DSN: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@pgbouncer:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
+      # v2.23.3 (B4 fix, PR #60): Direct-to-postgres DSN, bypassing pgbouncer.
+      # Used ONLY by postgres_password rotation (ALTER USER requires a session-mode
+      # postgres connection; pgbouncer transaction-pool mode blocks DDL across
+      # connection hops). Helm sets this automatically via backoffice.yaml; this
+      # line closes the Compose parity gap (Iris blocker 8, 2026-05-08).
+      # POSTGRES_PASSWORD_URLENC is set by install.sh (URL-encoded postgres password).
+      YASHIGANI_DB_DSN_DIRECT: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
       YASHIGANI_DEPLOYMENT_STREAM: ${YASHIGANI_DEPLOYMENT_STREAM:-opensource}
       OWUI_API_URL: http://open-webui:8080
       # OWUI_SECRET_KEY is required — install.sh generates a fresh random

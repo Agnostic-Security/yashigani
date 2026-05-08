@@ -114,6 +114,11 @@ class EventType(str, Enum):
     # type so forensic queries can easily filter by protocol)
     SSO_SAML_LOGIN_SUCCESS = "SSO_SAML_LOGIN_SUCCESS"
     SSO_SAML_LOGIN_FAILURE = "SSO_SAML_LOGIN_FAILURE"
+    # v2.23.3 — Admin-triggered secret rotation
+    SECRET_ROTATION_REQUESTED = "SECRET_ROTATION_REQUESTED"
+    SECRET_ROTATION_SUCCEEDED = "SECRET_ROTATION_SUCCEEDED"
+    SECRET_ROTATION_FAILED = "SECRET_ROTATION_FAILED"
+    SECRET_ROTATION_REVERTED = "SECRET_ROTATION_REVERTED"
     # v2.23.3 — HIBP API key management
     HIBP_API_KEY_UPDATED = "HIBP_API_KEY_UPDATED"
     HIBP_API_KEY_CLEARED = "HIBP_API_KEY_CLEARED"
@@ -885,6 +890,65 @@ class SAMLLoginFailureEvent(AuditEvent):
     idp_name: str = ""
     failure_reason: str = ""
     client_ip_prefix: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v2.23.3 — Admin-triggered secret rotation events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SecretRotationRequestedEvent(AuditEvent):
+    """
+    Written when an admin initiates a secret rotation.
+
+    secret_name is included (e.g. "postgres_password") but the secret value
+    is NEVER stored here or anywhere in the audit chain.
+    masking_applied=True is an immutable floor — this event is always masked.
+    """
+    event_type: str = EventType.SECRET_ROTATION_REQUESTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True            # immutable floor
+    admin_account: str = ""
+    secret_name: str = ""                   # e.g. "postgres_password" or "all"
+    request_id: str = ""                    # ties REQUEST→SUCCEEDED/FAILED events
+
+
+@dataclass
+class SecretRotationSucceededEvent(AuditEvent):
+    """
+    Written when a secret rotation completes successfully.
+
+    If secret_name="all", child_results contains per-secret outcomes.
+    No secret values are stored.
+    """
+    event_type: str = EventType.SECRET_ROTATION_SUCCEEDED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True            # immutable floor
+    admin_account: str = ""
+    secret_name: str = ""
+    request_id: str = ""
+    rotated_at: str = ""
+
+
+@dataclass
+class SecretRotationFailedEvent(AuditEvent):
+    """
+    Written when a secret rotation fails (before or after service state change).
+
+    reverted=True means the old secret was successfully restored.
+    revert_failed=True means the old secret could NOT be restored — CRITICAL.
+    No secret values are stored.
+    """
+    event_type: str = EventType.SECRET_ROTATION_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True            # immutable floor
+    admin_account: str = ""
+    secret_name: str = ""
+    request_id: str = ""
+    failure_reason: str = ""
+    reverted: bool = False
+    revert_failed: bool = False
+    severity: str = ""                      # "CRITICAL" when revert_failed=True
 
 
 # ---------------------------------------------------------------------------
