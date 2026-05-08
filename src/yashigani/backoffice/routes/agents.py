@@ -17,7 +17,7 @@ Routes:
   DELETE /admin/agents/{agent_id}               — deactivate (soft delete)
   POST   /admin/agents/{agent_id}/token/rotate  — rotate PSK, return new token once
 
-Last updated: 2026-05-03T00:00:00+01:00
+Last updated: 2026-05-08T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -54,44 +54,41 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# SSRF allowlist helper for Open WebUI outbound calls (YSG-RISK-007.A #3ax)
+# SSRF guard for Open WebUI outbound calls — centralised HttpClient
+# (YSG-RISK-007.A #3ax / yashigani-retro#95 OWASP A10 / API7)
+# ---------------------------------------------------------------------------
+# Replaces the hand-rolled _assert_safe_owui_url helper with the centralised
+# HttpClient. The OWUI URL is admin-configured (OWUI_API_URL env var) and is
+# typically an internal Docker-network address (http://open-webui:8080) so:
+#   - allow_http=True   — internal mesh; HTTPS not available by default.
+#   - allowlist driven by YASHIGANI_OWUI_HOSTNAMES (same env as before).
+#   - Scheme still restricted to http/https (not file/gopher/etc).
+#   - Hard-blocks: loopback, link-local, IMDS — inherited from HttpClient.
+#
+# The hand-rolled _assert_safe_owui_url is removed; all SSRF enforcement
+# is now centralised in HttpClient._check_policy().
 # ---------------------------------------------------------------------------
 
-def _assert_safe_owui_url(url: str) -> str:
-    """Assert that ``url`` is safe for outbound Open WebUI API calls.
+_OWUI_HTTP_CLIENT = None   # lazy-initialised on first use
 
-    Allowed:
-      - Scheme: http or https only.
-      - Hostname: must be in the YASHIGANI_OWUI_HOSTNAMES allowlist
-        (comma-separated, case-insensitive; default: open-webui,127.0.0.1,localhost).
 
-    Raises ``RuntimeError`` on any violation so the caller never issues an
-    outbound request to an operator-misconfigured or attacker-substituted URL.
-    """
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").lower()
-
-    if scheme not in ("http", "https"):
-        raise RuntimeError(
-            f"owui_url_blocked: scheme {scheme!r} not in {{http, https}} — "
-            f"OWUI_API_URL must use http:// or https:// (got {url!r})"
+def _owui_http_client():
+    """Return a singleton HttpClient scoped to the OWUI allowlist."""
+    global _OWUI_HTTP_CLIENT
+    if _OWUI_HTTP_CLIENT is None:
+        from yashigani.net import HttpClient
+        raw_allowlist = os.getenv(
+            "YASHIGANI_OWUI_HOSTNAMES",
+            "open-webui,127.0.0.1,localhost",
         )
-
-    raw_allowlist = os.getenv(
-        "YASHIGANI_OWUI_HOSTNAMES",
-        "open-webui,127.0.0.1,localhost",
-    )
-    allowed = {h.strip().lower() for h in raw_allowlist.split(",") if h.strip()}
-
-    if host not in allowed:
-        raise RuntimeError(
-            f"owui_url_blocked: hostname {host!r} not in YASHIGANI_OWUI_HOSTNAMES "
-            f"allowlist ({sorted(allowed)!r}) — set YASHIGANI_OWUI_HOSTNAMES to "
-            "override (CWE-918, YSG-RISK-007.A)"
+        allowlist = [h.strip() for h in raw_allowlist.split(",") if h.strip()]
+        _OWUI_HTTP_CLIENT = HttpClient(
+            allowlist=allowlist,
+            allow_http=True,    # OWUI runs on plain HTTP inside the Docker mesh
+            timeout_s=10.0,
         )
+    return _OWUI_HTTP_CLIENT
 
-    return url
 
 router = APIRouter()
 
@@ -386,15 +383,26 @@ def _push_openwebui_model(agent_name: str, upstream_url: str) -> None:
     """
     Register agent as a selectable model in Open WebUI via its REST API.
     Non-fatal: logs on failure. Idempotent — skips if already exists.
+
+    SSRF guard: OWUI_API_URL is validated through the centralised HttpClient
+    before any outbound request is issued (yashigani-retro#95 / OWASP A10 / API7).
+    The prior hand-rolled helper has been removed; policy is now enforced by
+    HttpClient._check_policy() via _owui_http_client().
     """
     try:
         import json
         import urllib.request
         import urllib.error
+        from yashigani.net import BlockedByPolicy
 
-        owui_url = _assert_safe_owui_url(
-            os.getenv("OWUI_API_URL", "http://open-webui:8080")
-        )
+        raw_owui_url = os.getenv("OWUI_API_URL", "http://open-webui:8080")
+        try:
+            _owui_http_client()._check_policy(raw_owui_url)
+        except BlockedByPolicy as _bp_exc:
+            raise RuntimeError(
+                f"owui_url_blocked: {_bp_exc} (CWE-918, YSG-RISK-007.A)"
+            ) from _bp_exc
+        owui_url = raw_owui_url
         owui_secret = os.getenv("OWUI_SECRET_KEY")
         if not owui_secret:
             # Fail-closed: OWUI integration requires an explicit secret. The

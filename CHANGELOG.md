@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
 
 # Changelog
 
@@ -24,7 +24,9 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ## [Unreleased]
 
-No unreleased changes yet for the next version.
+### Security (v2.23.3)
+
+- **fix/agents-urllib-through-httpclient** — `backoffice/routes/agents.py _push_openwebui_model()` previously used a hand-rolled `_assert_safe_owui_url()` with an inline SSRF allowlist (scheme check + `YASHIGANI_OWUI_HOSTNAMES` host allowlist). Replaced with a lazy singleton `_owui_http_client()` (HttpClient, `allow_http=True`, `YASHIGANI_OWUI_HOSTNAMES`-driven allowlist). `BlockedByPolicy` is caught and converted to `RuntimeError` (non-fatal). The hand-rolled helper is removed (yashigani-retro#95 / OWASP A10 / API7 SSRF).
 
 ---
 
