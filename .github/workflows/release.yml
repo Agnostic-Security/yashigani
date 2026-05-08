@@ -1,8 +1,14 @@
-# Last updated: 2026-05-02T10:00:00+01:00
+# Last updated: 2026-05-08T12:00:00+01:00
 name: Release — SBOM, Sign & Publish
 
-# Triggered on version tags (e.g. v2.2.0).
-# Assumes build-push.yml has already built and pushed the images.
+# Triggered via workflow_run AFTER 'Build & Push Images' completes successfully.
+# This eliminates the race condition where the SBOM workflow would run in
+# parallel with the build and attempt to attest images not yet pushed.
+#
+# Previously triggered on 'push: tags: v*.*.*' — that caused a parallel
+# execution race with build-push.yml. The workflow_run trigger guarantees
+# images are available before SBOM generation and attestation begins.
+#
 # This workflow:
 #   1. Generates CycloneDX 1.5 SBOM + CryptoBoM (Python script)
 #   2. Signs images with cosign (keyless — Fulcio + Rekor)
@@ -10,18 +16,19 @@ name: Release — SBOM, Sign & Publish
 #   4. Uploads SBOM + CryptoBoM as GitHub release artifacts
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_run:
+    workflows: ['Build & Push Images']
+    types: [completed]
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 permissions:
   contents: write       # create release + upload assets
   packages: write       # push attestations to GHCR
   id-token: write       # OIDC token for cosign keyless signing
+  attestations: write   # upload SBOM attestations to GitHub attestations store
 
 env:
   REGISTRY: ghcr.io
@@ -31,21 +38,38 @@ jobs:
   release-sbom-sign:
     name: SBOM, Sign & Publish
     runs-on: ubuntu-latest
+    # Only run if the upstream 'Build & Push Images' workflow succeeded.
+    # If the build failed (e.g. image push error), skip SBOM attestation
+    # rather than attesting a partial or missing image.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout
+      # 1. Checkout at the commit that triggered the build workflow
       # -----------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
 
       # -----------------------------------------------------------------------
       # 2. Resolve version from tag (strip leading 'v')
+      #    In workflow_run context, GITHUB_REF_NAME is the triggering workflow's
+      #    branch/tag. We derive the tag from head_branch which contains the tag
+      #    name when triggered by a tag push.
       # -----------------------------------------------------------------------
       - name: Resolve version
         id: version
         run: |
-          TAG="${GITHUB_REF_NAME}"          # e.g. v2.2.0
+          # workflow_run.head_branch holds the tag name when triggered by tag push
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          if [[ -z "${TAG}" ]] || [[ "${TAG}" != v* ]]; then
+            echo "ERROR: Expected a version tag (v*.*.*) but got: '${TAG}'" >&2
+            echo "This workflow should only run when triggered by a release tag push." >&2
+            exit 1
+          fi
           VERSION="${TAG#v}"                # e.g. 2.2.0
           echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
