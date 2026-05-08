@@ -101,8 +101,12 @@ class EventType(str, Enum):
     BREAK_GLASS_EXPIRED = "BREAK_GLASS_EXPIRED"
     # v0.9.0 — WebAuthn/Passkeys (Phase 6)
     WEBAUTHN_CREDENTIAL_REGISTERED = "WEBAUTHN_CREDENTIAL_REGISTERED"
-    WEBAUTHN_CREDENTIAL_USED = "WEBAUTHN_CREDENTIAL_USED"
-    WEBAUTHN_CREDENTIAL_DELETED = "WEBAUTHN_CREDENTIAL_DELETED"
+    WEBAUTHN_CREDENTIAL_USED = "WEBAUTHN_CREDENTIAL_USED"        # kept for v0.9.0 compat
+    WEBAUTHN_CREDENTIAL_DELETED = "WEBAUTHN_CREDENTIAL_DELETED"  # kept for v0.9.0 compat
+    # v2.23.3 — WebAuthn admin login events (PR #62, B5 fix — align wire names)
+    WEBAUTHN_LOGIN_SUCCESS = "WEBAUTHN_LOGIN_SUCCESS"
+    WEBAUTHN_LOGIN_FAILURE = "WEBAUTHN_LOGIN_FAILURE"
+    WEBAUTHN_CREDENTIAL_REVOKED = "WEBAUTHN_CREDENTIAL_REVOKED"
     # v2.1 — SSO / OIDC
     SSO_LOGIN_SUCCESS = "SSO_LOGIN_SUCCESS"
     SSO_LOGIN_FAILURE = "SSO_LOGIN_FAILURE"
@@ -750,6 +754,48 @@ class WebAuthnCredentialUsedEvent(AuditEvent):
 class WebAuthnCredentialDeletedEvent(AuditEvent):
     """Written when a WebAuthn credential is deleted by the owning admin."""
     event_type: str = EventType.WEBAUTHN_CREDENTIAL_DELETED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    credential_uuid: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v2.23.3 — WebAuthn admin login events (PR #62)
+#
+# B5 fix (Iris audit): the v0.9.0 dataclasses above carry event_type values
+# WEBAUTHN_CREDENTIAL_USED and WEBAUTHN_CREDENTIAL_DELETED. The v2.23.3
+# route labels are WEBAUTHN_LOGIN_SUCCESS, WEBAUTHN_LOGIN_FAILURE, and
+# WEBAUTHN_CREDENTIAL_REVOKED — semantically distinct and more operationally
+# meaningful for forensic queries. New dataclasses with the correct wire-format
+# event_type values. Old v0.9.0 classes retained for backward compatibility
+# with any existing consumers.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WebAuthnLoginSuccessEvent(AuditEvent):
+    """Written on successful WebAuthn authentication ceremony (admin hardware key login)."""
+    event_type: str = EventType.WEBAUTHN_LOGIN_SUCCESS
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    credential_uuid: str = ""
+
+
+@dataclass
+class WebAuthnLoginFailureEvent(AuditEvent):
+    """Written on failed WebAuthn assertion (wrong key, sign_count rollback, etc.)."""
+    event_type: str = EventType.WEBAUTHN_LOGIN_FAILURE
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    failure_reason: str = ""
+
+
+@dataclass
+class WebAuthnCredentialRevokedEvent(AuditEvent):
+    """Written when an admin revokes a WebAuthn credential (DELETE endpoint)."""
+    event_type: str = EventType.WEBAUTHN_CREDENTIAL_REVOKED
     account_tier: str = AccountTier.ADMIN
     masking_applied: bool = True
     admin_account: str = ""

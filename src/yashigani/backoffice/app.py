@@ -84,6 +84,8 @@ from yashigani.backoffice.routes import (
     backup_router,
     # v2.23.3 — HIBP API key admin panel (#59)
     hibp_router,
+    # v2.23.3 — WebAuthn v1 API (public login + step-up revoke)
+    webauthn_v1_router,
 )
 
 
@@ -288,6 +290,34 @@ async def lifespan(app: FastAPI):
             anomaly_client = _redis.from_url(anomaly_redis_url, decode_responses=False)
             backoffice_state.anomaly_detector = AnomalyDetector(redis_client=anomaly_client)
             _log.info("Backoffice: DB pool + inference logger + anomaly detector ready (lifespan)")
+
+            # v2.23.3 — PgWebAuthnService: DB+Redis backed FIDO2 service.
+            # Initialised here (after create_pool) so the credential store can
+            # open tenant_transaction()s immediately on first registration.
+            # Shares the session Redis (DB 1) for challenge storage with a
+            # yashigani:webauthn:challenge: namespace.
+            try:
+                from yashigani.auth.pg_webauthn import build_pg_webauthn_service
+                from yashigani.gateway._redis_url import build_redis_url as _build_redis_url
+                _webauthn_redis_url = _build_redis_url(
+                    1,
+                    use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+                    secrets_dir=os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+                    client_cert_name="backoffice_client",
+                )
+                _webauthn_redis = _redis.from_url(_webauthn_redis_url, decode_responses=False)
+                backoffice_state.pg_webauthn_service = build_pg_webauthn_service(_webauthn_redis)
+                _log.info("PgWebAuthnService initialised (v2.23.3 FIDO2)")
+            except Exception as _wa_exc:
+                # Non-fatal: WebAuthn is optional.  Routes return 503 if pg_webauthn_service is None.
+                # W19 fix: log with exc_info=True so the full traceback is captured (not just
+                # str(exc)) — Iris integration-audit warning on PR #62.  Without exc_info the
+                # stack frame that caused the failure is lost, making mis-config hard to diagnose.
+                _log.warning(
+                    "PgWebAuthnService init failed (%s) — /api/v1/admin/webauthn/* will return 503",
+                    _wa_exc,
+                    exc_info=True,
+                )
         except Exception as exc:
             # Retro #3ar — fail-closed on lifespan init failure (CLAUDE.md §3).
             # The previous behaviour was to log a warning and continue with
@@ -662,6 +692,9 @@ def create_backoffice_app() -> FastAPI:
         prefix="/api/v1/admin/auth/hibp",
         tags=["hibp-config"],
     )
+    # v2.23.3 — WebAuthn v1 API (Postgres+Redis backed, public login endpoints)
+    # Routes carry full /api/v1/admin/webauthn/ path — no prefix stripping.
+    app.include_router(webauthn_v1_router, tags=["webauthn-v1"])
 
     # v0.9.0 — Phase 6: WebAuthn/Passkeys
     # webauthn_router carries its own full path segments (no prefix stripping needed)

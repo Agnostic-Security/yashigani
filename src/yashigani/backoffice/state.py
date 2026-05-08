@@ -50,7 +50,8 @@ class BackofficeState:
     license_state: Optional[Any] = None         # LicenseState (v0.6.0)
     alert_config: Optional[Any] = None          # AlertConfigRequest (v0.7.0)
     ratelimit_config_last_changed: Optional[str] = None  # ISO-8601 UTC (v0.8.0)
-    webauthn_service: Optional[Any] = None               # WebAuthnService (v0.9.0)
+    webauthn_service: Optional[Any] = None               # WebAuthnService (v0.9.0) — in-memory, deprecated
+    pg_webauthn_service: Optional[Any] = None            # PgWebAuthnService (v2.23.3) — DB+Redis backed
     event_bus: Optional[Any] = None                      # EventBus (v0.9.0)
     response_inspection_pipeline: Optional[Any] = None   # ResponseInspectionPipeline (v1.0)
     model_alias_store: Optional[Any] = None               # ModelAliasStore (v2.3)
