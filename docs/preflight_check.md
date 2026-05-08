@@ -94,7 +94,7 @@ Yashigani proxies ALL traffic to one primary upstream. You must know where it is
 
 ### 2.2 DNS TTL
 
-For production: set DNS TTL to 300 seconds (5 minutes) before cutover, and restore to 3600 after. This makes rollback faster if something goes wrong.
+For production: set DNS TTL to 300 seconds (5 minutes) before go-live, and restore to 3600 after. This makes rollback faster if something goes wrong.
 
 ### Checklist — Section 2
 

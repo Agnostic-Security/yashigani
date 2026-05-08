@@ -69,7 +69,7 @@ During M7 pre-flight, interpret macOS smoke as follows:
 - `smoke-gate (Linux + mutation only)` RED = **real gate failure.** A Linux cell or the mutation test failed. Investigate before proceeding with the release.
 - macOS cells GREEN = unexpected positive signal (VZ happened to be available on the runner). Do not rely on it; note in the release retro if it occurs.
 
-This formalises the v2.23.2 ad-hoc Tiago risk-accept on macOS smoke. No per-release risk-accept is needed from v2.23.3 onward. The structural fix is in `install-smoke.yml` (`continue-on-error: ${{ !matrix.gates }}` on macOS cells) and in this document.
+This formalises the v2.23.2 ad-hoc engineering risk-accept on macOS smoke. No per-release risk-accept is needed from v2.23.3 onward. The structural fix is in `install-smoke.yml` (`continue-on-error: ${{ !matrix.gates }}` on macOS cells) and in this document.
 
 Artifact retention: **14 days** (install logs per cell, artifact name `install-log-<os>-<runtime>-<sha>`).
 
@@ -199,7 +199,7 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 | 12 | Risk register updated | Compliance Reviewer | exception-register.md | All accepted risks logged |
 | 13 | Maintainer HITL GO | Release Coordinator | Verbal/chat confirmation | "GO release" |
 | 14 | Tag + push | Release Engineer | `git tag v<ver>` | Tag visible on GitHub |
-| G16 | Dep-bump sweep (all types) | Captain (images/Actions/Helm) / Tom (Python/JS) / Maxine (sign-off) | `ci-evidence/<sha>/dep-bump-sweep.txt` | `Dep sweep: PASS` |
+| G16 | Dep-bump sweep (all types) | Container specialist (images/Actions/Helm) / Python specialist (Python/JS) / Release coordinator (sign-off) | `ci-evidence/<sha>/dep-bump-sweep.txt` | `Dep sweep: PASS` |
 
 ---
 
@@ -257,21 +257,21 @@ gh pr view <number> --json reviews | jq '.reviews[] | select(.state=="APPROVED")
 
 **Owner mapping — generative by dep type (applies to ALL Agnostic Security repos, current AND future):**
 
-The owner-by-dep-type mapping is the canonical rule. New repos inherit this mapping by default — no per-repo configuration required. Tiago directive: "for any future projects or products/services" (2026-05-08).
+The owner-by-dep-type mapping is the canonical rule. New repos inherit this mapping by default — no per-repo configuration required.
 
 | Dep type | Default owner |
 |---|---|
-| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Tom |
-| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Captain |
-| Helm chart dependencies (`Chart.yaml`) | Captain |
-| Kubernetes manifest version pins | Captain |
-| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Captain |
-| JS / npm / TypeScript / frontend frameworks | Tom (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
-| Shell / installer / systemd-unit dependencies | Su |
-| Rust packages (`Cargo.toml`) | Tom (interim — Rust specialist gap) |
-| Go modules (`go.mod`) | Tom (interim — Go specialist gap) |
+| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Python specialist |
+| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Container specialist |
+| Helm chart dependencies (`Chart.yaml`) | Container specialist |
+| Kubernetes manifest version pins | Container specialist |
+| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Container specialist |
+| JS / npm / TypeScript / frontend frameworks | Python specialist (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
+| Shell / installer / systemd-unit dependencies | Installer specialist |
+| Rust packages (`Cargo.toml`) | Python specialist (interim — Rust specialist gap) |
+| Go modules (`go.mod`) | Python specialist (interim — Go specialist gap) |
 
-Maxine reviews and signs off in the release evidence directory before Gate 13.
+Release coordinator reviews and signs off in the release evidence directory before Gate 13.
 
 #### Current-state repo coverage (snapshot, not authoritative — rule is the table above)
 
@@ -288,7 +288,7 @@ Maxine reviews and signs off in the release evidence directory before Gate 13.
 
 **FAIL:** any dep >2 minor behind without rationale, OR any open HIGH/CRITICAL Dependabot alert in any Agnostic Security repo (current or future), OR any floating-stub tag in container image pins (see below).
 
-### Command sequence — container images (Captain)
+### Command sequence — container images (container specialist)
 
 ```sh
 # 1. Enumerate every image reference across compose, Helm, and Dockerfiles
@@ -330,7 +330,7 @@ grep -E 'digest:' helm/yashigani/values.release.yaml | wc -l
 # Count must equal number of external images in scope
 ```
 
-### Command sequence — Python packages (Tom)
+### Command sequence — Python packages (Python specialist)
 
 ```sh
 # 1. Check pyproject.toml / requirements files for version pins
@@ -346,7 +346,7 @@ pip index versions <package>   # shows available versions
 # CI pip-audit artifact must show exit 0 (see Gate 6 in §6 table).
 ```
 
-### Command sequence — npm/JS packages (Tom, interim for agnosticsec-website)
+### Command sequence — npm/JS packages (Python specialist, interim for agnosticsec-website)
 
 ```sh
 # Run from the agnosticsec-website repo root:
@@ -365,7 +365,7 @@ git diff package-lock.json  # must be clean (no unstaged lock drift)
 # npm outdated output — "Wanted" vs "Latest" columns. Any gap >2 minor = document rationale.
 ```
 
-### Command sequence — GitHub Actions (Captain)
+### Command sequence — GitHub Actions (container specialist)
 
 ```sh
 # For each Agnostic Security repo with GitHub Actions present (see current-state snapshot above):
@@ -380,7 +380,7 @@ gh api repos/<owner>/<repo>/releases/latest --jq '.tag_name'
 # 3. If a SHA is pinned to a tag >2 minor behind latest: document rationale or bump.
 ```
 
-### Command sequence — Helm chart dependencies (Captain)
+### Command sequence — Helm chart dependencies (container specialist)
 
 ```sh
 # From yashigani repo:
@@ -461,19 +461,19 @@ The dep-bump sweep (§6b / G16) runs at release time. Between releases, Dependab
 
 ### Owner mapping — generative by dep type
 
-The owner-by-dep-type mapping is the canonical rule and applies to ALL current AND future Agnostic Security repos by default. Tiago directive: "for any future projects or products/services" (2026-05-08).
+The owner-by-dep-type mapping is the canonical rule and applies to ALL current AND future Agnostic Security repos by default.
 
 | Dep type | Default owner |
 |---|---|
-| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Tom |
-| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Captain |
-| Helm chart dependencies (`Chart.yaml`) | Captain |
-| Kubernetes manifest version pins | Captain |
-| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Captain |
-| JS / npm / TypeScript / frontend frameworks | Tom (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
-| Shell / installer / systemd-unit dependencies | Su |
-| Rust packages (`Cargo.toml`) | Tom (interim — Rust specialist gap) |
-| Go modules (`go.mod`) | Tom (interim — Go specialist gap) |
+| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Python specialist |
+| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Container specialist |
+| Helm chart dependencies (`Chart.yaml`) | Container specialist |
+| Kubernetes manifest version pins | Container specialist |
+| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Container specialist |
+| JS / npm / TypeScript / frontend frameworks | Python specialist (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
+| Shell / installer / systemd-unit dependencies | Installer specialist |
+| Rust packages (`Cargo.toml`) | Python specialist (interim — Rust specialist gap) |
+| Go modules (`go.mod`) | Python specialist (interim — Go specialist gap) |
 
 #### Current-state repo snapshot (not authoritative — rule is the table above)
 
@@ -488,8 +488,8 @@ The owner-by-dep-type mapping is the canonical rule and applies to ALL current A
 
 1. Enable Dependabot in `.github/dependabot.yml` for every dep type present in that repo.
 2. Confirm the generative owner mapping above covers all alert surfaces — no per-repo owner override required.
-3. If a new dep type appears that is not in the table above, propose an extension to both this doc and `feedback_dependabot_triage_cadence.md`, and flag to Maxine.
-4. Add the repo to the weekly Maxine triage roster — no further onboarding steps required.
+3. If a new dep type appears that is not in the table above, propose an extension to both this doc and `feedback_dependabot_triage_cadence.md`, and flag to the release coordinator.
+4. Add the repo to the weekly release coordinator triage roster — no further onboarding steps required.
 
 ### Workflow
 
@@ -497,8 +497,8 @@ The owner-by-dep-type mapping is the canonical rule and applies to ALL current A
 2. Owner triages within cadence window: confirm impact + plan fix (`immediate` / `next-release` / `accept-risk`).
 3. If **immediate**: branch + PR + CI green + merge within 5 working days (HIGH/CRITICAL).
 4. If **next-release**: tag the alert with `defer:vN.Y.Z` label in GitHub.
-5. If **accept-risk**: document rationale in the exception register and close with `wontfix` or equivalent — requires Maxine sign-off.
-6. Maxine reviews Dependabot alert status weekly (surfaced in release planning check-in).
+5. If **accept-risk**: document rationale in the exception register and close with `wontfix` or equivalent — requires release coordinator sign-off.
+6. Release coordinator reviews Dependabot alert status weekly (surfaced in release planning check-in).
 7. G16 at next release will FAIL if any HIGH/CRITICAL alert remains open without an `accept-risk` exception on record.
 
 ---
