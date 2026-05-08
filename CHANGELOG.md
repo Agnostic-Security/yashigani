@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
 
 # Changelog
 
@@ -24,7 +24,9 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ## [Unreleased]
 
-No unreleased changes yet for the next version.
+### Security (v2.23.3)
+
+- **fix/auth-logout-audit-emit** — `routes/auth.py logout()` now emits an `AdminLoginEvent(outcome="logout")` audit event before returning. Every other auth lifecycle outcome (login success/failure, totp_provision, stepup, self_reset) was already audited; logout was the only gap (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1). Guarded by `if state.audit_writer is not None` for partial-init safety.
 
 ---
 
