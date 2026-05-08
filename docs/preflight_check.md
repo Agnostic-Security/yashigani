@@ -4,16 +4,6 @@
 **Last updated:** 2026-05-07
 **Purpose:** Everything you must gather, configure, or verify *before* running `install.sh` or `docker compose up`. The automated installer handles software installation and secret generation — but it cannot know your infrastructure topology, DNS records, upstream server addresses, or credentials for external services. Collect all items marked **Required** before you start.
 
-> **Last public release — v2.23.2**
->
-> v2.23.2 is the final public release of Yashigani. Future development moves to a private tier.
->
-> - **Existing public users:** this release will remain available; no automatic deprecation.
-> - **Continued updates (v2.23.3+):** require a paid licence — see [agnosticsec.com/yashigani/licensing](https://agnosticsec.com/yashigani/licensing).
-> - **Free tier (Community):** continues with v2.23.2; security patches delivered under the published support window.
-> - **Non-profit and education:** access remains free forever — see [agnosticsec.com/yashigani/non-profit](https://agnosticsec.com/yashigani/non-profit).
-> - **Public repository:** transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation.
-
 ---
 
 ## How to Use This Document
