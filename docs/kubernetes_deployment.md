@@ -1,6 +1,6 @@
 # Yashigani — Kubernetes Deployment Guide
 
-Version: v2.23.2 | Chart version: 2.23.2 | Last updated: 2026-05-07T00:00:00+01:00
+Version: v2.23.3 | Chart version: 2.23.3 | Last updated: 2026-05-08T00:00:00+01:00
 
 > **Last public release — v2.23.2**
 >
@@ -138,8 +138,15 @@ helm install yashigani helm/yashigani/ \
   --namespace yashigani \
   --set global.tlsDomain=yashigani.example.com \
   --set global.acmeEmail=admin@example.com \
-  --wait
+  --wait \
+  --wait-for-jobs \
+  --timeout 10m \
+  --atomic \
+  --burst-limit 1000 \
+  --qps 500
 ```
+
+> **Timeout guidance (v2.23.3+):** fresh installs use `--timeout 10m`; upgrades use `--timeout 5m`. Images must be pre-pulled into the node's containerd cache before installing — see the Docker Desktop preflight above. Override with `HELM_TIMEOUT=20m` when using `scripts/k8s-install.sh` on air-gap or slow-pull clusters.
 
 ### 3. Verify the release
 
