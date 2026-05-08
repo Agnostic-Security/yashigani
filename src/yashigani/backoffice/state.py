@@ -55,6 +55,7 @@ class BackofficeState:
     event_bus: Optional[Any] = None                      # EventBus (v0.9.0)
     response_inspection_pipeline: Optional[Any] = None   # ResponseInspectionPipeline (v1.0)
     model_alias_store: Optional[Any] = None               # ModelAliasStore (v2.3)
+    auth_settings_store: Optional[Any] = None             # AuthSettingsStore (v2.23.3)
     # SIEM sink runtime config (updated via /admin/audit/siem/config)
     siem_backend: str = "none"
     siem_endpoint: Optional[str] = None

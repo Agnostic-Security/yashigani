@@ -84,6 +84,8 @@ from yashigani.backoffice.routes import (
     backup_router,
     # v2.23.3 — Admin-triggered secret rotation
     secrets_router,
+    # v2.23.3 — HIBP API key admin panel (#59)
+    hibp_router,
     # v2.23.3 — WebAuthn v1 API (public login + step-up revoke)
     webauthn_v1_router,
 )
@@ -218,6 +220,26 @@ async def lifespan(app: FastAPI):
 
             auth_service = PostgresLocalAuthService(pool=get_pool())
             backoffice_state.auth_service = auth_service
+
+            # v2.23.3 (#59): auth_settings_store for encrypted operator config
+            # (e.g. HIBP API key). Initialised after the pool is ready.
+            # B2 fail-fast: YASHIGANI_DB_AES_KEY MUST be set; an empty or
+            # missing key causes pgp_sym_encrypt to encrypt with an empty
+            # passphrase, which is a silent data-security failure. We reject
+            # at startup rather than allowing a degraded-but-running state.
+            _aes_key = os.environ.get("YASHIGANI_DB_AES_KEY", "")
+            if not _aes_key:
+                raise RuntimeError(
+                    "YASHIGANI_DB_AES_KEY is not set. "
+                    "This key is required to encrypt auth_settings values at rest "
+                    "using pgcrypto pgp_sym_encrypt. "
+                    "Generate a 32-byte hex key (64 chars) with: "
+                    "openssl rand -hex 32 "
+                    "and add it to your .env file or Helm values secret."
+                )
+            from yashigani.auth.settings_store import AuthSettingsStore
+            backoffice_state.auth_settings_store = AuthSettingsStore(pool=get_pool())
+            _log.info("auth_settings_store initialised (pgcrypto-backed encrypted store)")
 
             import asyncio as _asyncio
             from yashigani.db.postgres import connect_with_retry_sync as _connect_retry
@@ -480,6 +502,7 @@ def create_backoffice_app() -> FastAPI:
         ("/admin/license", 4 * 1024),  # confirm flag or small LIC
         ("/api/v1/license", 256),  # status GET only, no body
         ("/api/v1/admin/secrets", 256),  # secret name only (ASVS 4.3.1)
+        ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
         ("/admin/ratelimit", 8 * 1024),
         ("/admin/rbac", 32 * 1024),
         ("/admin/alerts", 32 * 1024),
@@ -668,6 +691,13 @@ def create_backoffice_app() -> FastAPI:
 
     # v2.23.3 — Admin-triggered secret rotation
     app.include_router(secrets_router, tags=["secrets"])
+
+    # v2.23.3 — HIBP API key admin panel (#59)
+    app.include_router(
+        hibp_router,
+        prefix="/api/v1/admin/auth/hibp",
+        tags=["hibp-config"],
+    )
     # v2.23.3 — WebAuthn v1 API (Postgres+Redis backed, public login endpoints)
     # Routes carry full /api/v1/admin/webauthn/ path — no prefix stripping.
     app.include_router(webauthn_v1_router, tags=["webauthn-v1"])

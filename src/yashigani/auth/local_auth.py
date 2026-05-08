@@ -96,7 +96,9 @@ class LocalAuthService:
         record = AccountRecord(
             account_id=_new_id(),
             username=username,
-            password_hash=hash_password(plaintext),
+            # check_breach=False: system-generated password, not user-chosen.
+            # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+            password_hash=hash_password(plaintext, check_breach=False),
             totp_secret="",              # set at first login via provisioning
             recovery_codes=None,
             account_tier="admin",
@@ -116,7 +118,9 @@ class LocalAuthService:
         record = AccountRecord(
             account_id=_new_id(),
             username=username,
-            password_hash=hash_password(plaintext_password),
+            # check_breach=False: admin-generated temp password, not user-chosen.
+            # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+            password_hash=hash_password(plaintext_password, check_breach=False),
             totp_secret="",
             recovery_codes=None,
             account_tier="user",
@@ -318,9 +322,10 @@ class LocalAuthService:
         record.force_totp_provision = True
         record.failed_attempts = 0
         record.locked_until = 0.0
-        # Password is reset by generating a new temporary one
+        # Password is reset by generating a new temporary one.
+        # check_breach=False: system-generated temp password, not user-chosen.
         temp_password = generate_password(36)
-        record.password_hash = hash_password(temp_password)
+        record.password_hash = hash_password(temp_password, check_breach=False)
 
         return True, "ok"
 

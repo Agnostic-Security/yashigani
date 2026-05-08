@@ -696,6 +696,10 @@ async function loadSettings() {
     }
     // Crypto inventory (ASVS 11.1.3)
     loadCryptoInventory();
+    // v2.23.3 (#59) — HIBP API key status panel
+    if (typeof window.loadHibpStatus === 'function') {
+        window.loadHibpStatus();
+    }
 }
 
 async function loadCryptoInventory() {
