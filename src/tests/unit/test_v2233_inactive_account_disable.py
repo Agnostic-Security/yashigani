@@ -11,8 +11,9 @@ Test cases:
   7. InactiveAccountDisabledEvent contains all AU-3.F required fields.
   8. env-var defaults parse correctly.
 
-Last updated: 2026-05-08T00:00:00+00:00
+Last updated: 2026-05-08T12:00:00+00:00
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -27,6 +28,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Stubs
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _StubRecord:
@@ -50,9 +52,7 @@ class _StubAuthService:
         self.disabled_ids: list[str] = []
         self.disable_returns: dict[str, bool] = {}  # account_id → return value
 
-    async def list_inactive_accounts(
-        self, threshold_days: int, exempt_ids: frozenset
-    ) -> list:
+    async def list_inactive_accounts(self, threshold_days: int, exempt_ids: frozenset) -> list:
         return [r for r in self._candidates if r.account_id not in exempt_ids]
 
     async def disable_inactive(self, account_id: str) -> bool:
@@ -77,6 +77,7 @@ class _StubAuditWriter:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_record(
     account_id: str,
     username: str,
@@ -93,7 +94,7 @@ def _make_record(
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +112,7 @@ from yashigani.backoffice.inactive_account_task import (
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestConfigHelpers:
     def test_threshold_days_default(self, monkeypatch):
@@ -159,6 +161,7 @@ class TestRunInactiveAccountDisable:
     def _patch_state(self, auth_service, audit_writer=None):
         """Context manager: patch backoffice_state with stubs."""
         from unittest.mock import patch as _patch
+
         state = MagicMock()
         state.auth_service = auth_service
         state.audit_writer = audit_writer or _StubAuditWriter()
@@ -203,6 +206,7 @@ class TestRunInactiveAccountDisable:
         assert len(writer.events) == 1
         ev = writer.events[0]
         from yashigani.audit.schema import EventType
+
         assert ev.event_type == EventType.INACTIVE_ACCOUNT_DISABLED
         assert ev.disabled_account_id == "id-001"
         assert ev.disabled_username == "alice"
@@ -217,9 +221,7 @@ class TestRunInactiveAccountDisable:
         """Task skips exempt account IDs."""
         monkeypatch.setenv("YASHIGANI_INACTIVE_DISABLE_DAYS", "90")
         monkeypatch.setenv("YASHIGANI_INACTIVE_DISABLE_MAX_PERCENT", "50")
-        monkeypatch.setenv(
-            "YASHIGANI_INACTIVE_DISABLE_EXEMPT_ACCOUNTS", "id-002, id-003"
-        )
+        monkeypatch.setenv("YASHIGANI_INACTIVE_DISABLE_EXEMPT_ACCOUNTS", "id-002, id-003")
 
         candidates = [
             _make_record("id-001", "alice", days_inactive=120),
@@ -277,9 +279,7 @@ class TestRunInactiveAccountDisable:
 
     def test_auth_service_none_returns_early(self):
         """Task returns early if auth_service is not yet initialised."""
-        with patch(
-            "yashigani.backoffice.inactive_account_task.backoffice_state"
-        ) as mock_state:
+        with patch("yashigani.backoffice.inactive_account_task.backoffice_state") as mock_state:
             mock_state.auth_service = None
             # Should not raise
             _run(run_inactive_account_disable())
@@ -290,6 +290,7 @@ class TestSafetyRail:
 
     def _patch_state(self, auth_service, audit_writer=None):
         from unittest.mock import patch as _patch
+
         state = MagicMock()
         state.auth_service = auth_service
         state.audit_writer = audit_writer or _StubAuditWriter()
@@ -344,13 +345,11 @@ class TestSafetyRail:
         writer = _StubAuditWriter()
 
         with self._patch_state(svc, writer):
-            with patch(
-                "yashigani.backoffice.inactive_account_task._fire_safety_rail_alert"
-            ) as mock_alert:
+            with patch("yashigani.backoffice.inactive_account_task._fire_safety_rail_alert") as mock_alert:
                 _run(run_inactive_account_disable())
                 mock_alert.assert_called_once()
                 args = mock_alert.call_args[0]
-                assert args[0] == 5   # candidate_count
+                assert args[0] == 5  # candidate_count
                 assert args[2] == 10  # max_pct
 
 
@@ -359,6 +358,7 @@ class TestAuditSchema:
 
     def test_event_instantiates(self):
         from yashigani.audit.schema import InactiveAccountDisabledEvent, EventType, AccountTier
+
         ev = InactiveAccountDisabledEvent(
             disabled_account_id="abc-123",
             disabled_username="testuser",
@@ -378,6 +378,7 @@ class TestAuditSchema:
 
     def test_event_to_dict_has_all_au3f_fields(self):
         from yashigani.audit.schema import InactiveAccountDisabledEvent
+
         ev = InactiveAccountDisabledEvent(
             disabled_account_id="abc-123",
             disabled_username="testuser",
@@ -390,20 +391,22 @@ class TestAuditSchema:
         )
         d = ev.to_dict()
         # AU-3.F mandatory fields
-        assert "timestamp" in d              # timestamp
-        assert "disabled_account_id" in d   # user identity
-        assert "event_type" in d            # event type
-        assert "outcome" in d              # success/failure
-        assert "source_ip" in d            # source IP
-        assert "target_resource" in d      # target resource
+        assert "timestamp" in d  # timestamp
+        assert "disabled_account_id" in d  # user identity
+        assert "event_type" in d  # event type
+        assert "outcome" in d  # success/failure
+        assert "source_ip" in d  # source IP
+        assert "target_resource" in d  # target resource
 
     def test_event_type_in_enum(self):
         from yashigani.audit.schema import EventType
+
         assert hasattr(EventType, "INACTIVE_ACCOUNT_DISABLED")
         assert EventType.INACTIVE_ACCOUNT_DISABLED == "INACTIVE_ACCOUNT_DISABLED"
 
     def test_event_exported_from_audit_package(self):
         from yashigani.audit import InactiveAccountDisabledEvent
+
         assert InactiveAccountDisabledEvent is not None
 
 

@@ -178,16 +178,16 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 
 ## 6a. Specialist PR Review Gate
 
-**Rationale:** F-T10-001 (2026-05-06) — Captain authored Python `gateway/` code that shipped two correctness bugs (`math.isfinite` NaN clamp, `float(os.getenv(...))` DoS on bad env value). Tom caught both on review. Root cause: wrong specialist dispatched for the language domain. Rule codified in `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`.
+**Rationale:** F-T10-001 (2026-05-06) — the container specialist authored Python `gateway/` code that shipped two correctness bugs (`math.isfinite` NaN clamp, `float(os.getenv(...))` DoS on bad env value). The Python specialist caught both on review. Root cause: wrong specialist dispatched for the language domain. Rule codified in `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`.
 
 **Domain-to-specialist mapping (MUST have approval before merge):**
 
 | Files changed | Required reviewer | Identity |
 |---|---|---|
-| `src/yashigani/gateway/**/*.py` | Tom | `tom@agnosticsec.com` |
-| Any other `**/*.py` (services, tests, migrations) | Tom | `tom@agnosticsec.com` |
-| `install.sh`, `uninstall.sh`, `restore.sh`, `update.sh`, `scripts/*.sh`, `*.sh` entrypoints | Su | `su@agnosticsec.com` |
-| `Dockerfile*`, `docker-compose*.yml`, `helm/**`, `**/*.yaml` K8s manifests | Captain | `captain@agnosticsec.com` |
+| `src/yashigani/gateway/**/*.py` | Python specialist | `tom@agnosticsec.com` |
+| Any other `**/*.py` (services, tests, migrations) | Python specialist | `tom@agnosticsec.com` |
+| `install.sh`, `uninstall.sh`, `restore.sh`, `update.sh`, `scripts/*.sh`, `*.sh` entrypoints | Installer specialist | `su@agnosticsec.com` |
+| `Dockerfile*`, `docker-compose*.yml`, `helm/**`, `**/*.yaml` K8s manifests | Container specialist | `captain@agnosticsec.com` |
 
 **Hard rule:** A PR touching files in one of the above domains MUST carry an approved review from the listed specialist before it is counted as merged for the purposes of this gate. An approval from any other reviewer does not substitute.
 
@@ -201,18 +201,18 @@ gh pr list --state merged --base 2.23.x --limit 100 --json number,title,mergedAt
 
 # For each PR touching gateway/ Python:
 gh pr view <number> --json reviews | jq '.reviews[] | select(.state=="APPROVED") | .author.login'
-# Must include "tom" or "tomYSG" (check team slug for the repo).
+# Must include the Python specialist account (tom@agnosticsec.com).
 
 # For each PR touching install.sh / scripts/:
-# Must include "su" or "suYSG".
+# Must include the installer specialist account (su@agnosticsec.com).
 
 # For each PR touching Dockerfiles / helm/:
-# Must include "captain" or "captainYSG".
+# Must include the container specialist account (captain@agnosticsec.com).
 ```
 
 **Evidence format:** paste the `gh pr view` output per PR (or the `gh pr list` JSON) into the release evidence directory as `ci-evidence/<sha>/specialist-review-gate.txt`. Gate 6a is GREEN only when every in-scope PR has the required approval recorded in that file.
 
-**Cross-domain PRs:** decompose at review time — a PR touching Python and Helm needs both Tom and Captain approvals. A PR touching Python and shell needs both Tom and Su approvals.
+**Cross-domain PRs:** decompose at review time — a PR touching Python and Helm needs both the Python specialist and container specialist approvals. A PR touching Python and shell needs both the Python specialist and installer specialist approvals.
 
 **Rule reference:** `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`
 
