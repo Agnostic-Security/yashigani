@@ -1,23 +1,45 @@
-# Last updated: 2026-05-05T14:00:00+01:00 (v2.23.2: add httpx to pip install — conftest collection fix V232-CSCAN-01i)
-# install-smoke.yml — Install smoke-test matrix (V232-P1)
+# Last updated: 2026-05-08T00:00:00+01:00 (v2.23.3: formally mark macOS smoke as INFORMATIONAL; update triggers for v2.23.3 branch)
+# install-smoke.yml — Install smoke-test matrix
 #
-# Matrix: ubuntu-latest × (docker|podman) — GATE
-#         macos-latest  × (docker|podman) — INFORMATIONAL (self-hosted required)
+# Matrix: ubuntu-latest × (docker|podman) — GATE (required for merge)
+#         macos-latest  × (docker|podman) — INFORMATIONAL ONLY (never blocks)
 #
-# GH hosted macOS runners (macos-latest = Sonoma/Sequoia arm64) do NOT support
-# the Apple Virtualization Framework (VZ) or nested virtualization. Both Colima
-# (Docker on macOS) and Podman machine (Podman on macOS) require VZ to start a
-# VM-backed daemon. GH hosted runners fail at `colima start` / `podman machine
-# start` with "exiting, status={Exiting:true}" / "Setting up Rosetta share".
-# macOS cells are therefore set continue-on-error: true and excluded from the
-# smoke-gate. They are retained in the matrix so they run automatically when
-# self-hosted macOS runners are available (set runs-on to the self-hosted label
-# and remove continue-on-error: true from macOS cells).
+# =============================================================================
+# INFORMATIONAL — macOS smoke cells
+# =============================================================================
+# macOS smoke cells are set continue-on-error: true and are EXCLUDED from the
+# smoke-gate. They do NOT block PRs or releases. They are retained in the
+# matrix for diagnostic signal only.
+#
+# Root cause: GH hosted macOS runners (macos-latest = Sonoma/Sequoia arm64)
+# do NOT support the Apple Virtualization Framework (VZ) or nested
+# virtualization. Both Colima (Docker on macOS) and Podman machine (Podman on
+# macOS) require a VZ-backed VM to start their daemons. GH hosted runners fail
+# non-deterministically at `colima start` / `podman machine start` with errors
+# such as "exiting, status={Exiting:true}" or "Setting up Rosetta share".
+#
+# This is a GitHub Actions infrastructure constraint, not a Yashigani bug.
+# Customer-facing macOS installs use self-hosted hardware (Apple Silicon or
+# Intel) where VZ is available. Those paths are validated by the team's own
+# Mac runners, not GH hosted runners.
+#
+# v2.23.2 context: macOS smoke pre-existing failures were accepted via ad-hoc
+# Tiago risk-accept during the v2.23.2 release. v2.23.3 formalises that
+# acceptance structurally in the workflow file and release-process.md so no
+# further per-release ad-hoc accept is needed.
+#
+# How to promote macOS cells to GATE when self-hosted runners are available:
+#   1. Set runs-on for macos cells to the self-hosted runner label.
+#   2. Change `gates: false` to `gates: true` in the macos matrix entries.
+#   3. Remove this INFORMATIONAL block (or update it to reflect the new status).
+#   4. Remove continue-on-error: ${{ !matrix.gates }} (or leave it in place as
+#      a no-op — it evaluates to false when gates: true).
+# =============================================================================
 #
 # Runner cost (GH hosted):
 #   Linux cells: 2 × ~12 min × 1× = ~24 Linux-equivalent minutes per run.
-#   macOS cells: run but don't block (expected to fail during setup).
-#   Runs only on PRs/pushes to 2.23.x — not on every branch push.
+#   macOS cells: run but don't block (expected to fail during daemon setup).
+#   Runs only on PRs/pushes to v2.23.3 / 2.23.x — not on every branch push.
 #
 # WORK_DIR note:
 #   YSG_INSTALL_DIR is intentionally NOT set. The installer resolves WORK_DIR
@@ -29,9 +51,9 @@ name: Install Smoke Matrix
 
 on:
   push:
-    branches: ["2.23.x", "feat/v232-install-smoke-matrix*"]
+    branches: ["v2.23.3", "2.23.x", "feat/v232-install-smoke-matrix*", "chore/macos-smoke-informational"]
   pull_request:
-    branches: ["2.23.x"]
+    branches: ["v2.23.3", "2.23.x"]
   workflow_dispatch: {}
 
 concurrency:
@@ -418,22 +440,38 @@ jobs:
           retention-days: 14
 
 # ---------------------------------------------------------------------------
-# Gate summary: all smoke cells + mutation must pass before merge
+# Gate summary: Linux smoke cells + mutation must pass before merge.
+#
+# macOS smoke cells (macos/docker, macos/podman) are INFORMATIONAL.
+# They run with continue-on-error: true and do NOT contribute to the gate
+# verdict. GitHub Actions sets needs.smoke.result to "success" when all
+# cells with continue-on-error: false pass, regardless of the outcome of
+# cells with continue-on-error: true. macOS failures are therefore visible
+# in the workflow run UI but do not fail smoke-gate.
+#
+# This is the formalised structural replacement for the v2.23.2 ad-hoc
+# Tiago risk-accept on macOS smoke. No per-release risk-accept is needed.
+# See release-process.md §2.3 for pre-flight interpretation guidance.
 # ---------------------------------------------------------------------------
   smoke-gate:
-    name: "smoke-gate (all cells)"
+    name: "smoke-gate (Linux + mutation only)"
     needs: [smoke, mutation]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: "Check all jobs passed"
+      - name: "Check required cells passed (Linux + mutation)"
         run: |
           smoke_result="${{ needs.smoke.result }}"
           mutation_result="${{ needs.mutation.result }}"
-          echo "smoke matrix: ${smoke_result}"
-          echo "mutation:     ${mutation_result}"
+          echo "smoke matrix result: ${smoke_result}"
+          echo "  (note: macOS cells are INFORMATIONAL — continue-on-error: true)"
+          echo "  (note: smoke result is 'success' when all GATE cells pass)"
+          echo "mutation result:     ${mutation_result}"
           if [ "$smoke_result" != "success" ] || [ "$mutation_result" != "success" ]; then
-            echo "GATE FAIL: one or more cells did not pass"
+            echo "GATE FAIL: one or more required cells did not pass"
+            echo "  If macOS cells failed: this is expected on GH hosted runners (VZ not available)."
+            echo "  If Linux cells failed: this is a real gate failure — investigate before merging."
             exit 1
           fi
-          echo "GATE PASS: all smoke cells and mutation test passed"
+          echo "GATE PASS: Linux smoke cells and mutation test passed"
+          echo "  macOS smoke results are diagnostic only — check the matrix for detail."
