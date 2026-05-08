@@ -1,6 +1,6 @@
 # Yashigani Release Process
 
-**Last updated:** 2026-05-06T00:00:00+01:00
+**Last updated:** 2026-05-08T00:00:00+01:00
 
 This document covers the end-to-end process for cutting a Yashigani release from a clean branch tip to a signed, published GitHub release with full evidence archive. It is the authoritative source for M7 gate-check procedures.
 
@@ -175,6 +175,7 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 | 15 | Public-doc hygiene grep | Release Engineer | `grep -rn -E '(tiago\|rosado\|maxine\|tom\|su\|captain\|iris\|laura\|ava\|ogen\|rhea\|nora\|nico\|lior\|petra\|reel)' docs/` | Zero matches |
 | 16 | Public-doc internal-strategy grep | Release Engineer | `grep -rn -i -E 'private programme\|customer programme\|cutover\|last public\|going private\|private tier' docs/` | Zero matches |
 | 17 | Compliance reports regenerated | Compliance Auditor | `docs/compliance-reports/` regenerated from canonical sources; aggregate.md PASS-rate and last-updated timestamp match the v<ver> tag SHA | All per-framework files dated current release; aggregate.md headline rate present |
+| 18 | Host NTP sync verified | Release Engineer | `timedatectl status` or `chronyc tracking` output captured in evidence dir as `ntp-sync-<sha>.txt` | `NTP service: active` + `System clock synchronized: yes` (timedatectl), OR `Stratum` 1–3 + offset < 100 ms (chronyc). Absent or drifted NTP breaks TLS validation, JWT/OIDC exp claims, TOTP windows, mTLS, and audit log timestamps. See `docs/preflight_check.md` §18. CMMC AU.L2-3.3.7 / NIST AU-8 evidence. |
 
 ---
 

@@ -1,7 +1,7 @@
 # Yashigani Pre-Installation Checklist
 
 **Version:** v2.23.2
-**Last updated:** 2026-05-07
+**Last updated:** 2026-05-08
 **Purpose:** Everything you must gather, configure, or verify *before* running `install.sh` or `docker compose up`. The automated installer handles software installation and secret generation — but it cannot know your infrastructure topology, DNS records, upstream server addresses, or credentials for external services. Collect all items marked **Required** before you start.
 
 ---
@@ -813,6 +813,95 @@ To skip the interactive confirmation:
 
 ---
 
+## Section 18 — NTP / System Clock Synchronisation (All Deployments)
+
+A host with an unsynchronised or drifted clock silently breaks multiple security-critical subsystems:
+
+| Affected subsystem | Failure mode |
+|---|---|
+| TLS certificate validation | Certificates appear expired or not-yet-valid if clock skew exceeds the cert validity window |
+| JWT / OIDC token validation | Clock skew > 5 minutes invalidates `exp` and `nbf` claims; OIDC ID tokens rejected |
+| TOTP (2FA) | Code windows are ±30 s; skew > 60 s causes consistent TOTP failures for all admin accounts |
+| mTLS handshakes | Client certificate validity checks fail on large skews |
+| Audit log timestamps | Log entries become uncorrelatable across services; forensic timeline is untrustworthy |
+
+**Requirement:** the host clock MUST be synchronised to an NTP source with stratum 1–3 and drift < 100 ms before go-live. Verify using one of the methods below that matches your OS.
+
+### 18.1 Verify NTP Sync — Linux (systemd-timesyncd or chrony)
+
+```bash
+# Option A — systemd-timesyncd (most Ubuntu/Debian/RHEL systems):
+timedatectl status
+# Required output lines:
+#   NTP service: active
+#   System clock synchronized: yes
+
+# Option B — chrony:
+chronyc tracking
+# Required: Reference ID not "7F7F0101" (127.127.1.1 = local clock fallback)
+# Required: Stratum between 1 and 3
+# Required: System time offset < 100 ms (shown as "System time" row)
+```
+
+If `NTP service: inactive`, enable it:
+
+```bash
+sudo timedatectl set-ntp true
+# or for chrony:
+sudo systemctl enable --now chronyd
+```
+
+### 18.2 Verify NTP Sync — macOS (host deployments)
+
+```bash
+sntp -S time.cloudflare.com
+# or:
+systemsetup -getnetworktimeserver   # confirm an NTP server is configured
+```
+
+### 18.3 Recommended NTP Servers
+
+**Tier-0 (preferred for production — well-maintained, geo-distributed, anycast):**
+
+| Server | Operator | Notes |
+|---|---|---|
+| `time.cloudflare.com` | Cloudflare | Anycast; supports NTS (NTP with TLS authentication) |
+| `time.nist.gov` | NIST (US gov) | Authoritative US time source |
+| `time.google.com` | Google | Anycast; wide global coverage |
+
+**Tier-1 (community pool — acceptable for most self-hosted deployments):**
+
+```
+0.pool.ntp.org
+1.pool.ntp.org
+2.pool.ntp.org
+3.pool.ntp.org
+```
+
+Configure at least two servers. A single-server configuration is a single point of failure — if the server is unreachable, the clock can drift without detection.
+
+**Avoid:** vendor-default sources that have had documented outages or do not use pool-based redundancy. Configure explicit servers in `/etc/chrony.conf` or `/etc/systemd/timesyncd.conf` rather than relying on DHCP-pushed NTP.
+
+### 18.4 Auditor Note (CMMC / NIST 800-53)
+
+The operator's NTP configuration is part of the evidence package for:
+
+- **CMMC AU.L2-3.3.7** (system clock synchronisation for audit log integrity)
+- **NIST SP 800-53 AU-8** (time stamps — requires synchronisation to an authoritative time source)
+
+Without verifiable NTP sync, audit log timestamps cannot be treated as reliable forensic evidence. Capture the output of `timedatectl status` or `chronyc tracking` before go-live and retain it in your deployment evidence record.
+
+### Checklist — Section 18
+
+```
+[ ] NTP service active on host (timedatectl: NTP service active, OR chronyc: Stratum 1–3)
+[ ] System clock offset < 100 ms confirmed
+[ ] At least two NTP servers configured (not single-server or DHCP-default only)
+[ ] NTP sync output captured and retained for compliance evidence (CMMC AU.L2-3.3.7 / NIST AU-8)
+```
+
+---
+
 ## Master Pre-Installation Summary Checklist
 
 Print this page and tick every item before running the installer.
@@ -943,6 +1032,7 @@ The current agent lineup is: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 [ ] Pre-release OWASP review completed (manual review of ASVS, API Security, Agentic AI controls against current code)
 [ ] Fail2ban auth throttle verified (x5 escalation -> permanent IP block)
 [ ] IP allowlist + blocklist configured (IPv4/IPv6/CIDR)
+[ ] NTP verified: NTP service active, clock offset < 100 ms, ≥ 2 servers configured (Section 18)
 ```
 
 ---
