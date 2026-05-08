@@ -2,7 +2,7 @@
 # rotate-secret.sh — Yashigani operator CLI for admin-triggered secret rotation.
 #
 # Usage:
-#   scripts/rotate-secret.sh <secret-name> [--host <backoffice-host>] [--session-token <token>]
+#   scripts/rotate-secret.sh <secret-name> [options]
 #
 # secret-name: postgres_password | redis_password | jwt_signing_key | hmac_key | all
 #
@@ -11,23 +11,42 @@
 #     1. A valid admin session cookie (__Host-yashigani_admin_session).
 #     2. A fresh step-up TOTP (POST /auth/stepup first, or use --totp-code).
 #
+#   Passing the session token (choose ONE method — ordered by preference):
+#
+#     Method 1 (preferred — no process-table leak):
+#       export YASHIGANI_SESSION_TOKEN="eyJhbGci..."
+#       scripts/rotate-secret.sh postgres_password --totp-code 123456
+#
+#     Method 2 (stdin — useful in automated pipelines):
+#       echo "eyJhbGci..." | scripts/rotate-secret.sh postgres_password --totp-code 123456
+#       (script reads token from stdin if YASHIGANI_SESSION_TOKEN is not set)
+#
+#     Method 3 (0600 temp file — for scripted non-interactive use):
+#       echo "eyJhbGci..." > /tmp/token && chmod 0600 /tmp/token
+#       YASHIGANI_SESSION_TOKEN="$(cat /tmp/token)" scripts/rotate-secret.sh ...
+#       rm /tmp/token
+#
+#   NOTE: --session-token CLI arg was REMOVED (B3 fix, Iris audit 2026-05-08).
+#   Passing credentials as CLI args exposes them in /proc/<pid>/cmdline (visible
+#   to all users via `ps aux` for the duration of the curl call). Use env var
+#   or stdin instead. Per feedback_security_company_no_shortcuts.md.
+#
 #   Options:
 #     --host <url>           Backoffice base URL (default: https://localhost:8443)
-#     --session-token <tok>  Session token value (sets cookie header)
 #     --totp-code <code>     Performs step-up first, then rotation
 #     --ca-cert <path>       CA cert for TLS verification (default: docker/secrets/ca_root.crt)
 #     --dry-run              Print the request without sending it
 #
 # Example:
+#   export YASHIGANI_SESSION_TOKEN="$(cat /run/secrets/session_token)"
 #   scripts/rotate-secret.sh postgres_password \
 #     --host https://yashigani.local:8443 \
-#     --session-token eyJhbGci... \
 #     --totp-code 123456
 #
-# After rotation, the script runs docker compose restart for the affected service
-# (requires docker/podman access from the host where this script runs).
+# After rotation, the script runs docker/podman compose restart for the affected
+# service (requires docker/podman access from the host where this script runs).
 #
-# Last updated: 2026-05-07T00:00:00+01:00
+# Last updated: 2026-05-08T00:00:00+01:00
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -57,11 +76,17 @@ usage() {
     echo "Secrets: ${VALID_SECRETS}"
     echo ""
     echo "Options:"
-    echo "  --host <url>           Backoffice base URL (default: https://localhost:8443)"
-    echo "  --session-token <tok>  Admin session token"
-    echo "  --totp-code <code>     TOTP code for step-up (required before rotation)"
-    echo "  --ca-cert <path>       CA cert path (default: docker/secrets/ca_root.crt)"
-    echo "  --dry-run              Print request without sending"
+    echo "  --host <url>       Backoffice base URL (default: https://localhost:8443)"
+    echo "  --totp-code <code> TOTP code for step-up (required before rotation)"
+    echo "  --ca-cert <path>   CA cert path (default: docker/secrets/ca_root.crt)"
+    echo "  --dry-run          Print request without sending"
+    echo ""
+    echo "Session token (required — choose one method):"
+    echo "  export YASHIGANI_SESSION_TOKEN=<token>     (preferred)"
+    echo "  echo <token> | rotate-secret.sh ...         (stdin)"
+    echo ""
+    echo "  --session-token was REMOVED: CLI credential args are visible in"
+    echo "  'ps aux' for all users. Use env var or stdin instead."
     exit 1
 }
 
@@ -87,17 +112,43 @@ fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)           HOST="$2";          shift 2 ;;
-        --session-token)  SESSION_TOKEN="$2"; shift 2 ;;
-        --totp-code)      TOTP_CODE="$2";     shift 2 ;;
-        --ca-cert)        CA_CERT="$2";       shift 2 ;;
-        --dry-run)        DRY_RUN=1;          shift ;;
+        --host)           HOST="$2";      shift 2 ;;
+        --totp-code)      TOTP_CODE="$2"; shift 2 ;;
+        --ca-cert)        CA_CERT="$2";   shift 2 ;;
+        --dry-run)        DRY_RUN=1;      shift ;;
+        --session-token)
+            echo "ERROR: --session-token was removed (B3 security fix, 2026-05-08)." >&2
+            echo "  Passing credentials as CLI args exposes them in 'ps aux'." >&2
+            echo "  Use: export YASHIGANI_SESSION_TOKEN=<token>" >&2
+            echo "  Or:  echo <token> | $0 ${SECRET_NAME} [options]" >&2
+            exit 1
+            ;;
         *) echo "Unknown option: $1" >&2; usage ;;
     esac
 done
 
+# ---------------------------------------------------------------------------
+# Resolve session token — env var (preferred) or stdin
+# ---------------------------------------------------------------------------
+# B3 fix: never accept token as CLI arg (visible in ps aux / /proc/cmdline).
+# Priority: YASHIGANI_SESSION_TOKEN env var > stdin pipe.
+if [[ -n "${YASHIGANI_SESSION_TOKEN:-}" ]]; then
+    SESSION_TOKEN="${YASHIGANI_SESSION_TOKEN}"
+elif [[ ! -t 0 ]]; then
+    # stdin is a pipe (not a terminal) — read token from it
+    SESSION_TOKEN="$(cat)"
+    SESSION_TOKEN="${SESSION_TOKEN//[$'\n\r']/}"  # strip newlines
+fi
+
 if [[ -z "${SESSION_TOKEN}" ]]; then
-    echo "ERROR: --session-token is required" >&2
+    echo "ERROR: No session token provided." >&2
+    echo "" >&2
+    echo "  Set YASHIGANI_SESSION_TOKEN env var (preferred):" >&2
+    echo "    export YASHIGANI_SESSION_TOKEN=<token>" >&2
+    echo "    ${0##*/} ${SECRET_NAME} [options]" >&2
+    echo "" >&2
+    echo "  Or pipe it via stdin:" >&2
+    echo "    echo <token> | ${0##*/} ${SECRET_NAME} [options]" >&2
     exit 1
 fi
 

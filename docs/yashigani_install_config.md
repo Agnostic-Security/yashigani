@@ -2608,15 +2608,15 @@ curl -X POST https://backoffice.example.com/auth/stepup \
   -d '{"code": "123456"}'
 
 # Rotate via CLI (wraps the API + restarts affected services)
+# Pass session token via env var (NOT CLI arg — CLI args are visible in ps aux)
+export YASHIGANI_SESSION_TOKEN=<admin-session-token>
 bash scripts/rotate-secret.sh postgres_password \
   --host https://backoffice.example.com \
-  --session-token <admin-session-token> \
   --totp-code 123456
 
 # Rotate all secrets (includes host-side restarts)
 bash scripts/rotate-secret.sh all \
-  --host https://backoffice.example.com \
-  --session-token <admin-session-token>
+  --host https://backoffice.example.com
 ```
 
 The CLI performs the step-up automatically when `--totp-code` is supplied,
@@ -2663,8 +2663,10 @@ Recovery steps:
   readers always see a complete secret.
 - The `YASHIGANI_DB_DSN_DIRECT` environment variable must point directly to
   PostgreSQL (not pgbouncer) for `postgres_password` rotation. This is already
-  set in the Helm chart; for Compose deployments, set it in `docker/.env` if
-  using an external Postgres.
+  set in both the Helm chart (`backoffice.yaml`) and the Compose file
+  (`docker/docker-compose.yml`, since v2.23.3). Operators using an external
+  Postgres instance should override `YASHIGANI_DB_DSN_DIRECT` in `docker/.env`
+  to point at their external instance directly.
 
 ---
 
