@@ -1,7 +1,7 @@
 """v2.23.3 — FedRAMP AC-2(F2) inactive-account disable columns.
 
-Revision ID: 0007
-Revises: 0006
+Revision ID: 0009
+Revises: 0008
 Create Date: 2026-05-08
 
 Rationale:
@@ -28,7 +28,7 @@ Backfill strategy:
 
 FedRAMP evidence:
     This migration is evidence artefact for LU-YSG-002 AC-2(F2).
-    Lu: reference this migration SHA + 0007 revision in the v2.23.3 evidence pack.
+    Lu: reference this migration SHA + 0009 revision in the v2.23.3 evidence pack.
 """
 # Last updated: 2026-05-08T00:00:00+00:00
 from __future__ import annotations
@@ -37,8 +37,8 @@ from typing import Sequence, Union
 
 from alembic import op
 
-revision: str = "0007"
-down_revision: Union[str, None] = "0006"
+revision: str = "0009"
+down_revision: Union[str, None] = "0008"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
