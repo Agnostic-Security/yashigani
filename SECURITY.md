@@ -65,3 +65,41 @@ We follow a **90-day coordinated disclosure** policy. After a fix is released we
 ## Recognition
 
 Agnostic Security does not operate a paid bug bounty programme. Researchers who report valid, in-scope vulnerabilities will be credited in the security advisory (with their consent).
+
+## Release signing
+
+Version tags and release artifacts are GPG-signed by the Agnostic Security release key.
+
+**Required repository secrets** (configure in Settings → Secrets → Actions):
+
+| Secret | Description |
+|--------|-------------|
+| `GPG_PRIVATE_KEY` | ASCII-armored RSA 4096 signing subkey, exported via `gpg --armor --export-secret-subkeys <subkey-id>!` |
+| `GPG_PASSPHRASE` | Passphrase protecting the signing subkey |
+
+**Graceful degradation:** if `GPG_PRIVATE_KEY` is not set, the release pipeline emits a `::warning::` annotation and the tag ships unsigned. No build step fails. Populate the secrets and re-run the release workflow to produce a signed tag.
+
+**Verifying a signed tag:**
+
+```sh
+gpg --import docs/release-signing-key.asc
+git fetch --tags --force origin
+git tag -v vX.Y.Z
+```
+
+**Public key fingerprint:** TBD — populate `docs/release-signing-key.asc` and update this file after key generation.
+
+**Key generation (one-time setup):**
+
+```sh
+# Generate a dedicated release signing subkey (RSA 4096)
+gpg --full-generate-key
+
+# Export the private signing subkey (subkey-id! notation selects subkey only)
+gpg --armor --export-secret-subkeys <subkey-id>!
+
+# Export the public key for repository consumers
+gpg --armor --export releases@agnosticsec.com > docs/release-signing-key.asc
+```
+
+**Scope note:** for FedRAMP High/strict paths, a hardware-backed key (FIPS 140-2 token) is required. This pipeline supports software keys for standard releases; hardware key integration is a separate workstream.

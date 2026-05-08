@@ -1,4 +1,4 @@
-# Last updated: 2026-05-02T10:00:00+01:00
+# Last updated: 2026-05-08T12:00:00+01:00
 name: Tag — GPG Sign & Verify
 
 # Triggered when a version tag is pushed (e.g. v2.23.2).
@@ -113,19 +113,29 @@ jobs:
           echo "To re-sign, first delete the tag on origin and re-run."
 
       # -----------------------------------------------------------------------
-      # 5. Import GPG release signing key
+      # 5. Graceful degradation guard — warn and skip if secret is absent.
+      #    The signing infrastructure is wired; populate GPG_PRIVATE_KEY in
+      #    repository or organisation secrets to enable signing on the next
+      #    release. See SECURITY.md § Release signing for setup instructions.
+      # -----------------------------------------------------------------------
+      - name: Warn if GPG signing skipped
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY == ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "::warning::GPG_PRIVATE_KEY secret is not set — tag will ship unsigned."
+          echo "::warning::Populate GPG_PRIVATE_KEY and GPG_PASSPHRASE in repository secrets to enable signing."
+          echo "::warning::See SECURITY.md § Release signing for key generation and export instructions."
+
+      # -----------------------------------------------------------------------
+      # 5b. Import GPG release signing key
       # -----------------------------------------------------------------------
       - name: Import GPG key
-        if: steps.sig_check.outputs.already_signed == 'false'
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY != ''
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          if [[ -z "${GPG_PRIVATE_KEY}" ]]; then
-            echo "ERROR: GitHub secret GPG_PRIVATE_KEY is not set." >&2
-            echo "See docs/release-process.md §9 for key setup instructions." >&2
-            exit 1
-          fi
           echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
           # Retrieve the imported key fingerprint
           KEY_FP=$(gpg --list-secret-keys --with-colons 'releases@agnosticsec.com' \
@@ -140,7 +150,9 @@ jobs:
       # 6. Configure git identity for the signed tag
       # -----------------------------------------------------------------------
       - name: Configure git
-        if: steps.sig_check.outputs.already_signed == 'false'
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           git config user.name  "Agnostic Security Releases"
           git config user.email "releases@agnosticsec.com"
@@ -151,24 +163,24 @@ jobs:
       # 7. Capture existing tag message (to preserve on re-sign)
       # -----------------------------------------------------------------------
       - name: Capture tag message
-        if: steps.sig_check.outputs.already_signed == 'false'
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY != ''
         id: tag_msg
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           TAG="${{ steps.resolve.outputs.tag }}"
-          COMMIT="${{ steps.resolve.outputs.commit }}"
 
           # Extract the body of the existing tag object (strip header lines)
           MSG=$(git cat-file tag "${TAG}" 2>/dev/null | sed '1,/^$/d' || echo "Yashigani ${TAG}")
-          echo "msg<<MSG_EOF" >> "$GITHUB_OUTPUT"
-          echo "${MSG}"      >> "$GITHUB_OUTPUT"
-          echo "MSG_EOF"     >> "$GITHUB_OUTPUT"
+          { echo "msg<<MSG_EOF"; echo "${MSG}"; echo "MSG_EOF"; } >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
       # 8. Delete the unsigned tag locally and re-create as signed
       # -----------------------------------------------------------------------
       - name: Create signed tag
-        if: steps.sig_check.outputs.already_signed == 'false'
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY != ''
         env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           TAG="${{ steps.resolve.outputs.tag }}"
@@ -178,7 +190,9 @@ jobs:
           # Delete the existing (unsigned) local tag
           git tag -d "${TAG}" 2>/dev/null || true
 
-          # Re-create as signed annotated tag
+          # Pre-unlock the key agent via a no-op sign so git tag -s does not
+          # prompt interactively. Errors suppressed; the tag step will fail hard
+          # if the passphrase is wrong.
           echo "${GPG_PASSPHRASE}" | gpg --batch --yes \
             --pinentry-mode loopback \
             --passphrase-fd 0 \
@@ -194,7 +208,9 @@ jobs:
       # 9. Verify the signature locally before pushing
       # -----------------------------------------------------------------------
       - name: Verify signature
-        if: steps.sig_check.outputs.already_signed == 'false'
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           TAG="${{ steps.resolve.outputs.tag }}"
           VERIFY_OUT=$(git tag -v "${TAG}" 2>&1)
@@ -209,7 +225,9 @@ jobs:
       # 10. Force-push the signed tag to origin
       # -----------------------------------------------------------------------
       - name: Push signed tag
-        if: steps.sig_check.outputs.already_signed == 'false'
+        if: steps.sig_check.outputs.already_signed == 'false' && env.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           TAG="${{ steps.resolve.outputs.tag }}"
           git push origin "refs/tags/${TAG}" --force
@@ -219,28 +237,43 @@ jobs:
       # 11. Summary
       # -----------------------------------------------------------------------
       - name: Summary
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           TAG="${{ steps.resolve.outputs.tag }}"
           COMMIT="${{ steps.resolve.outputs.commit }}"
           ALREADY="${{ steps.sig_check.outputs.already_signed }}"
 
           if [[ "${ALREADY}" == "true" ]]; then
-            echo "## Tag Signing — Skipped (already signed)" >> "$GITHUB_STEP_SUMMARY"
-            echo "Tag \`${TAG}\` was already GPG-signed. No action taken." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## Tag Signing — Skipped (already signed)"
+              echo "Tag \`${TAG}\` was already GPG-signed. No action taken."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -z "${GPG_PRIVATE_KEY}" ]]; then
+            {
+              echo "## Tag Signing — Skipped (GPG_PRIVATE_KEY not set)"
+              echo ""
+              echo "Tag \`${TAG}\` shipped **unsigned**. Populate the \`GPG_PRIVATE_KEY\`"
+              echo "and \`GPG_PASSPHRASE\` repository secrets and re-run the release to sign."
+              echo ""
+              echo "See SECURITY.md § Release signing for key setup instructions."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## Tag Signing — Success" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Tag | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Commit | \`${COMMIT}\` |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Signer | releases@agnosticsec.com |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Method | GPG (git tag -s) |" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Verify the signature:**" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`sh" >> "$GITHUB_STEP_SUMMARY"
-            echo "gpg --import docs/release-signing-key.asc" >> "$GITHUB_STEP_SUMMARY"
-            echo "git fetch --tags --force origin" >> "$GITHUB_STEP_SUMMARY"
-            echo "git tag -v ${TAG}" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## Tag Signing — Success"
+              echo ""
+              echo "| Field | Value |"
+              echo "|-------|-------|"
+              echo "| Tag | \`${TAG}\` |"
+              echo "| Commit | \`${COMMIT}\` |"
+              echo "| Signer | releases@agnosticsec.com |"
+              echo "| Method | GPG (git tag -s) |"
+              echo ""
+              echo "**Verify the signature:**"
+              echo "\`\`\`sh"
+              echo "gpg --import docs/release-signing-key.asc"
+              echo "git fetch --tags --force origin"
+              echo "git tag -v ${TAG}"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
