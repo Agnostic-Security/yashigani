@@ -82,7 +82,12 @@ helm upgrade --install yashigani helm/yashigani/ \
   --create-namespace \
   --values helm/yashigani/values.yaml \
   --set global.tlsDomain=staging.yashigani.example.com \
-  --wait --timeout 10m
+  --wait \
+  --wait-for-jobs \
+  --timeout 10m \
+  --atomic \
+  --burst-limit 1000 \
+  --qps 500
 ```
 
 After the install completes, retrieve the bootstrap material:
@@ -172,7 +177,11 @@ helm upgrade --install yashigani helm/yashigani/ \
   --set global.certManagerIssuer=letsencrypt-staging \
   --set global.environment=staging \
   --wait \
-  --timeout 10m
+  --wait-for-jobs \
+  --timeout 10m \
+  --atomic \
+  --burst-limit 1000 \
+  --qps 500
 ```
 
 ### Production
@@ -187,7 +196,11 @@ helm upgrade --install yashigani helm/yashigani/ \
   --set global.certManagerIssuer=letsencrypt-prod \
   --set global.environment=production \
   --wait \
-  --timeout 10m
+  --wait-for-jobs \
+  --timeout 10m \
+  --atomic \
+  --burst-limit 1000 \
+  --qps 500
 ```
 
 ---
@@ -202,7 +215,14 @@ helm upgrade --install yashigani helm/yashigani/ \
    ```
 4. Apply the upgrade:
    ```bash
-   helm upgrade yashigani helm/yashigani/ --namespace yashigani --wait --timeout 10m
+   helm upgrade yashigani helm/yashigani/ \
+     --namespace yashigani \
+     --wait \
+     --wait-for-jobs \
+     --timeout 5m \
+     --atomic \
+     --burst-limit 1000 \
+     --qps 500
    ```
 5. The `pre-upgrade` hook (`delete-legacy-hpa`) will run automatically to remove native HPAs before KEDA ScaledObjects are applied.
 

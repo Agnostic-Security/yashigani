@@ -461,6 +461,42 @@ The following tables document every significant variable, grouped by category.
 
 ---
 
+#### Compliance — Inactive Account Disable (FedRAMP AC-2(F2), since v2.23.3)
+
+Yashigani automatically disables accounts that have not logged in for the
+configured number of days. This satisfies FedRAMP Moderate baseline
+control AC-2(F2). All disables are recorded in the audit log as
+`INACTIVE_ACCOUNT_DISABLED` events.
+
+| Variable | Required | Valid Values | Notes |
+|---|---|---|---|
+| `YASHIGANI_INACTIVE_DISABLE_DAYS` | No | integer ≥ 1 | Inactivity threshold in days. Default `90`. FedRAMP Moderate baseline: `90`. |
+| `YASHIGANI_INACTIVE_DISABLE_INTERVAL_HOURS` | No | integer ≥ 1 | How often the disable task runs, in hours. Default `24`. |
+| `YASHIGANI_INACTIVE_DISABLE_MAX_PERCENT` | No | integer 1–100 | Safety rail: refuse to disable more than this percentage of all accounts in a single run. Default `50`. If the rail is exceeded, an alert is fired and no accounts are disabled — operator investigation required. |
+| `YASHIGANI_INACTIVE_DISABLE_EXEMPT_ACCOUNTS` | No | comma-separated UUIDs | Account UUIDs exempt from automated disable (e.g. service accounts, break-glass accounts). No default. |
+
+**Re-enabling an automatically-disabled account:**
+
+```bash
+# Via admin API (requires authenticated admin session):
+curl -X PATCH https://<host>/admin/accounts/<username>/enable \
+     -H "Cookie: __Host-yashigani_admin_session=<session>"
+
+# Via CLI (inside the backoffice container):
+docker exec -it yashigani-backoffice \
+    yashigani-admin enable-account <username>
+```
+
+After re-enabling, the `inactive_disabled_at` column retains the timestamp
+of when the account was automatically disabled (audit trail). The account's
+`last_login_at` is reset on next successful login.
+
+**Break-glass accounts:** Always add break-glass account UUIDs to
+`YASHIGANI_INACTIVE_DISABLE_EXEMPT_ACCOUNTS`. Break-glass accounts do not
+log in interactively and would otherwise be disabled after the threshold.
+
+---
+
 ### 4.3 TLS Configuration
 
 > **Post-quantum TLS (since v0.9.0):** A hybrid X25519+ML-KEM-768 Caddyfile configuration is included in the repository as a commented block (`caddy/Caddyfile.pq`). This requires Caddy 2.10 (not yet released). Enable it once Caddy 2.10 ships to provide quantum-resistant key exchange while maintaining full backward compatibility with classical TLS clients.
