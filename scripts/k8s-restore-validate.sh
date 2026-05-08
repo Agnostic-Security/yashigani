@@ -131,21 +131,24 @@ if ! command -v kubectl &>/dev/null; then
   exit 2
 fi
 
-# Optional: set context — build an array so empty arg is never passed
-KUBECTL_CTX_ARGS=()
-if [[ -n "${KUBECTL_CONTEXT:-}" ]]; then
-  KUBECTL_CTX_ARGS=( "--context=${KUBECTL_CONTEXT}" )
-fi
+# Optional: set context. Kept as a plain string for bash 3.2 (macOS system
+# bash) compatibility — empty-array expansions with set -u cause "unbound
+# variable" errors on bash <4.4. kctl() conditionally includes the flag.
+KUBECTL_CTX_FLAG="${KUBECTL_CONTEXT:-}"
 
-# Convenience wrapper — every kubectl call goes through this
+# Convenience wrapper — every kubectl call goes through this.
 kctl() {
-  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "${KUBECTL_NAMESPACE}" "$@"
+  if [[ -n "$KUBECTL_CTX_FLAG" ]]; then
+    kubectl "--context=${KUBECTL_CTX_FLAG}" -n "${KUBECTL_NAMESPACE}" "$@"
+  else
+    kubectl -n "${KUBECTL_NAMESPACE}" "$@"
+  fi
 }
 
 # ---------------------------------------------------------------------------
 # Verify namespace exists
 # ---------------------------------------------------------------------------
-if ! kubectl "${KUBECTL_CTX_ARGS[@]}" get namespace "${KUBECTL_NAMESPACE}" &>/dev/null; then
+if ! kctl get namespace "${KUBECTL_NAMESPACE}" &>/dev/null; then
   printf "ERROR: namespace '%s' not found. Check KUBECTL_NAMESPACE.\n" "${KUBECTL_NAMESPACE}" >&2
   exit 2
 fi
@@ -157,69 +160,80 @@ printf "  Timeout   : %ss per check\n" "${KUBECTL_TIMEOUT}"
 printf "\n"
 
 # ---------------------------------------------------------------------------
-# CHECK 1 — All core deployments Running + Ready
+# CHECK 1 — All core workloads Running + Ready
 # ---------------------------------------------------------------------------
 log_section "1. Pod Readiness"
 
-# Deployments that must be Ready after a restore
-CORE_DEPLOYMENTS=(
-  yashigani-gateway
-  yashigani-backoffice
-  yashigani-caddy
-  yashigani-redis
-  yashigani-postgres
-  yashigani-pgbouncer
+# Core workloads — FAIL if not ready.
+# Format: "name:kind" — Deployments and StatefulSets share rollout status.
+# Kind verified against helm/yashigani/templates/*.yaml:
+#   gateway=Deployment, backoffice=Deployment, caddy=Deployment,
+#   pgbouncer=Deployment, redis=StatefulSet, postgres=StatefulSet.
+CORE_WORKLOADS=(
+  "yashigani-gateway:deployment"
+  "yashigani-backoffice:deployment"
+  "yashigani-caddy:deployment"
+  "yashigani-pgbouncer:deployment"
+  "yashigani-redis:statefulset"
+  "yashigani-postgres:statefulset"
 )
 
-# Optional deployments — warn but do not fail if absent
-OPTIONAL_DEPLOYMENTS=(
-  yashigani-loki
-  yashigani-grafana
-  yashigani-budget-redis
+# Optional workloads — warn but do not fail if absent.
+# loki=StatefulSet, grafana=StatefulSet (values.yaml / templates).
+OPTIONAL_WORKLOADS=(
+  "yashigani-loki:statefulset"
+  "yashigani-grafana:statefulset"
+  "yashigani-budget-redis:statefulset"
 )
 
-check_deployment_ready() {
-  local deploy="$1"
-  local optional="${2:-false}"
-  local label="Pod ready: ${deploy}"
+check_workload_ready() {
+  local name="$1"
+  local kind="$2"
+  local optional="${3:-false}"
+  local label="Pod ready: ${name}"
 
-  # Check deployment exists
-  if ! kctl get deployment "${deploy}" &>/dev/null; then
+  # Check workload exists
+  if ! kctl get "${kind}" "${name}" &>/dev/null; then
     if [[ "$optional" == "true" ]]; then
-      log_warn "${deploy} not found (optional — skipped)"
+      log_warn "${name} not found (optional — skipped)"
       return 0
     fi
-    record_fail "$label" "deployment not found"
+    record_fail "$label" "${kind} not found"
     return 1
   fi
 
-  log_verbose "kubectl wait deployment/${deploy} --for=condition=available --timeout=${KUBECTL_TIMEOUT}s"
+  # kubectl rollout status works for both Deployment and StatefulSet.
+  # --timeout accepts a Go duration string; append 's' to the integer value.
+  log_verbose "kubectl rollout status ${kind}/${name} --timeout=${KUBECTL_TIMEOUT}s"
 
-  local wait_out
-  if wait_out=$(kctl wait deployment/"${deploy}" \
-      --for=condition=available \
+  local rollout_out
+  if rollout_out=$(kctl rollout status "${kind}/${name}" \
       --timeout="${KUBECTL_TIMEOUT}s" 2>&1); then
-    log_verbose "$wait_out"
+    log_verbose "$rollout_out"
     record_ok "$label"
   else
     local pod_status
-    pod_status=$(kctl get pods -l "app.kubernetes.io/name=${deploy}" \
+    pod_status=$(kctl get pods -l "app.kubernetes.io/name=${name}" \
         --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,READY:.status.containerStatuses[0].ready 2>/dev/null || echo "unable to list pods")
     log_verbose "Pod status: $pod_status"
     if [[ "$optional" == "true" ]]; then
-      log_warn "${deploy} not Ready within ${KUBECTL_TIMEOUT}s (optional)"
+      log_warn "${name} not Ready within ${KUBECTL_TIMEOUT}s (optional)"
     else
-      record_fail "$label" "not Ready within ${KUBECTL_TIMEOUT}s — ${pod_status}"
+      record_fail "$label" "rollout not ready within ${KUBECTL_TIMEOUT}s — ${pod_status}"
     fi
   fi
 }
 
-for dep in "${CORE_DEPLOYMENTS[@]}"; do
-  check_deployment_ready "$dep" false
+for entry in "${CORE_WORKLOADS[@]}"; do
+  wl_name="${entry%%:*}"
+  wl_kind="${entry##*:}"
+  check_workload_ready "$wl_name" "$wl_kind" false
 done
 
-for dep in "${OPTIONAL_DEPLOYMENTS[@]}"; do
-  check_deployment_ready "$dep" true
+for entry in "${OPTIONAL_WORKLOADS[@]}"; do
+  wl_name="${entry%%:*}"
+  wl_kind="${entry##*:}"
+  check_workload_ready "$wl_name" "$wl_kind" true
 done
 
 # ---------------------------------------------------------------------------
