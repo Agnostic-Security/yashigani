@@ -2,12 +2,15 @@
 Yashigani Licensing — Gateway grace-period enforcement (v2.23.3).
 
 Provides:
-  - check_gateway_access()  — called from gateway middleware; raises GatewayBlockedError
-                              or GatewayReadOnlyError when the licence has expired past
-                              the grace threshold.
-  - emit_grace_period_audit()  — daily audit-log emitter; called from the expiry monitor.
-  - is_write_operation()    — classifies an HTTP method/path as a "write" operation
-                              for read-only mode enforcement.
+  - check_gateway_access()        — called from LicenseEnforcementMiddleware;
+                                    raises GatewayBlockedError or GatewayReadOnlyError
+                                    when the licence has expired past the grace threshold.
+  - LicenseEnforcementMiddleware  — ASGI middleware wired into the gateway stack;
+                                    converts GatewayBlockedError → HTTP 503 and
+                                    GatewayReadOnlyError → HTTP 403.
+  - emit_grace_period_audit()     — daily audit-log emitter; called from the expiry monitor.
+  - is_write_operation()          — classifies an HTTP method/path as a "write" operation
+                                    for read-only mode enforcement.
 
 Grace-period model (v2.23.3 canonical):
   ACTIVE / WARNING / CRITICAL — no restriction; gateway serves normally.
@@ -17,9 +20,17 @@ Grace-period model (v2.23.3 canonical):
                               new agent-runs blocked; in-flight runs complete.
   BLOCKED (day 30+ past expiry) — HTTP 503 + Retry-After + renewal URL.
 
+Multi-pod / K8s note (known gap, v2.23.3):
+  _last_grace_audit_date is a process-level guard.  In a K8s multi-pod deployment
+  each pod emits the daily grace-period audit event independently.  GRC tooling that
+  expects exactly one event per calendar day will see one event per running pod.
+  This is a known gap to be addressed in a future release via a Redis-backed
+  distributed dedup key.  Pod count is bounded by the Helm `replicaCount`, so the
+  event volume is bounded and predictable.
+
 Per feedback_zero_trust_default.md: secure-by-default, fail-explicit not fail-silent.
 
-Last updated: 2026-05-07T00:00:00+01:00
+Last updated: 2026-05-08T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -247,3 +258,89 @@ async def emit_grace_period_audit() -> None:
             )
     except Exception as exc:
         logger.error("emit_grace_period_audit: failed to write audit event: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# ASGI Middleware
+# ---------------------------------------------------------------------------
+
+import json
+
+
+class LicenseEnforcementMiddleware:
+    """
+    ASGI middleware that enforces the licence grace-period model on every
+    gateway request.
+
+    Converts:
+      GatewayBlockedError  → HTTP 503 with Retry-After: 3600 and JSON body.
+      GatewayReadOnlyError → HTTP 403 with JSON body.
+
+    Placement in the middleware stack (gateway/entrypoint.py):
+      Runs AFTER SpiffePeerCertMiddleware and CaddyVerifiedMiddleware (i.e. the
+      request has been verified as coming from a legitimate Caddy/mesh peer) and
+      BEFORE AgentAuthMiddleware (no point authenticating a request that will be
+      blocked by licence enforcement).
+
+    This middleware is intentionally fail-open on licence-read errors — the same
+    policy as check_gateway_access() itself — so that a licence-enforcer import
+    failure does not take the gateway down.
+
+    Readonly-safe whitelist (requests that pass in READONLY mode):
+      /healthz, /internal/metrics, /admin/license/status, /api/v1/license/status.
+      See _READONLY_SAFE_PREFIXES.
+
+    K8s multi-pod note: this middleware is stateless per-request; no process-level
+    state is held here.  The daily audit dedup is in emit_grace_period_audit().
+    """
+
+    def __init__(self, app) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+
+        try:
+            check_gateway_access(method=method, path=path)
+        except GatewayBlockedError as exc:
+            await self._send_json(
+                send,
+                status=503,
+                body={
+                    "error": "licence_blocked",
+                    "detail": str(exc),
+                    "renewal_url": "https://agnosticsec.com/pricing",
+                },
+                extra_headers=[(b"retry-after", b"3600")],
+            )
+            return
+        except GatewayReadOnlyError as exc:
+            await self._send_json(
+                send,
+                status=403,
+                body={
+                    "error": "licence_readonly",
+                    "detail": str(exc),
+                    "renewal_url": "https://agnosticsec.com/pricing",
+                },
+            )
+            return
+
+        await self._app(scope, receive, send)
+
+    @staticmethod
+    async def _send_json(send, status: int, body: dict, extra_headers: list | None = None) -> None:
+        payload = json.dumps(body).encode()
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ]
+        if extra_headers:
+            headers.extend(extra_headers)
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": payload, "more_body": False})

@@ -17,6 +17,14 @@ from yashigani.licensing.enforcer import (
     get_license,
     set_license,
 )
+from yashigani.licensing.grace_period import (
+    GatewayBlockedError,
+    GatewayReadOnlyError,
+    LicenseEnforcementMiddleware,
+    check_gateway_access,
+    is_write_operation,
+    emit_grace_period_audit,
+)
 
 __all__ = [
     "LicenseTier",
@@ -34,4 +42,10 @@ __all__ = [
     "check_org_limit",
     "get_license",
     "set_license",
+    "GatewayBlockedError",
+    "GatewayReadOnlyError",
+    "LicenseEnforcementMiddleware",
+    "check_gateway_access",
+    "is_write_operation",
+    "emit_grace_period_audit",
 ]

@@ -11,12 +11,14 @@ Covers:
   - grace_period.is_write_operation() classifier
   - grace_period.check_gateway_access() raises/passes per mode
   - GatewayBlockedError / GatewayReadOnlyError message content
+  - LicenseEnforcementMiddleware ASGI responses (W12 regression)
+  - Readonly-safe whitelist exhaustiveness (W13 regression)
   - /admin/license/status route response shape (no live HTTP)
   - Boundary: 0 days remaining → CRITICAL (not EXPIRED)
   - Boundary: exactly 7 days → WARNING (not CRITICAL)
   - Boundary: exactly 30 days → ACTIVE (not WARNING)
 
-Last updated: 2026-05-07T00:00:00+01:00
+Last updated: 2026-05-08T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -41,6 +43,8 @@ from yashigani.licensing.model import (
 from yashigani.licensing.grace_period import (
     GatewayBlockedError,
     GatewayReadOnlyError,
+    LicenseEnforcementMiddleware,
+    _READONLY_SAFE_PREFIXES,
     check_gateway_access,
     is_write_operation,
 )
@@ -589,3 +593,145 @@ class TestLicenseStatusRouteShape:
         resp = self._run(self._real_now_lic(20))
         required = {"valid", "expires_at", "days_remaining", "grace_period_active", "mode"}
         assert required.issubset(resp.keys())
+
+
+# ---------------------------------------------------------------------------
+# LicenseEnforcementMiddleware — ASGI response tests (W12 regression)
+# ---------------------------------------------------------------------------
+
+class TestLicenseEnforcementMiddleware:
+    """
+    Regression tests for Warning 12: confirm LicenseEnforcementMiddleware
+    correctly converts GatewayBlockedError → 503 and GatewayReadOnlyError → 403,
+    and passes through valid requests.
+
+    Uses a lightweight ASGI test harness (no live HTTP server required).
+    """
+
+    @staticmethod
+    async def _run_middleware(check_raises, method: str = "POST", path: str = "/admin/users"):
+        """
+        Run LicenseEnforcementMiddleware over a synthetic ASGI scope.
+
+        check_raises: None | GatewayBlockedError | GatewayReadOnlyError — what
+                      check_gateway_access() should raise (or not) for this call.
+
+        Returns (status_code, body_bytes).
+        """
+        responses = []
+
+        async def mock_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        async def mock_receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def mock_send(msg):
+            responses.append(msg)
+
+        scope = {"type": "http", "method": method, "path": path}
+
+        middleware = LicenseEnforcementMiddleware(mock_app)
+
+        with patch(
+            "yashigani.licensing.grace_period.check_gateway_access",
+            side_effect=check_raises() if check_raises else None,
+        ):
+            await middleware(scope, mock_receive, mock_send)
+
+        start = next(r for r in responses if r["type"] == "http.response.start")
+        body_msg = next(r for r in responses if r["type"] == "http.response.body")
+        return start["status"], body_msg["body"]
+
+    def test_blocked_returns_503(self):
+        import asyncio
+        status, body = asyncio.get_event_loop().run_until_complete(
+            self._run_middleware(GatewayBlockedError)
+        )
+        assert status == 503
+        import json
+        data = json.loads(body)
+        assert data["error"] == "licence_blocked"
+        assert "renewal_url" in data
+
+    def test_readonly_returns_403(self):
+        import asyncio
+        status, body = asyncio.get_event_loop().run_until_complete(
+            self._run_middleware(GatewayReadOnlyError)
+        )
+        assert status == 403
+        import json
+        data = json.loads(body)
+        assert data["error"] == "licence_readonly"
+        assert "renewal_url" in data
+
+    def test_active_passes_through(self):
+        import asyncio
+        status, body = asyncio.get_event_loop().run_until_complete(
+            self._run_middleware(None)
+        )
+        assert status == 200
+        assert body == b"ok"
+
+    def test_non_http_scope_bypasses(self):
+        """Websocket / lifespan scopes must not be affected."""
+        import asyncio
+
+        responses = []
+
+        async def mock_app(scope, receive, send):
+            await send({"type": "websocket.connect"})
+
+        async def mock_receive():
+            return {}
+
+        async def mock_send(msg):
+            responses.append(msg)
+
+        scope = {"type": "websocket", "path": "/ws"}
+        middleware = LicenseEnforcementMiddleware(mock_app)
+        asyncio.get_event_loop().run_until_complete(
+            middleware(scope, mock_receive, mock_send)
+        )
+        assert responses == [{"type": "websocket.connect"}]
+
+
+# ---------------------------------------------------------------------------
+# Readonly-safe whitelist exhaustiveness (W13 regression)
+# ---------------------------------------------------------------------------
+
+class TestReadonlySafeWhitelist:
+    """
+    Warning 13 regression: verify the _READONLY_SAFE_PREFIXES whitelist covers
+    the paths that must remain accessible in READONLY mode.
+    """
+
+    def test_health_endpoint_is_safe(self):
+        assert is_write_operation("POST", "/healthz") is False
+        assert is_write_operation("GET", "/healthz") is False
+
+    def test_prometheus_metrics_is_safe(self):
+        assert is_write_operation("GET", "/internal/metrics") is False
+
+    def test_license_status_admin_is_safe(self):
+        assert is_write_operation("GET", "/admin/license/status") is False
+
+    def test_license_status_api_is_safe(self):
+        assert is_write_operation("GET", "/api/v1/license/status") is False
+
+    def test_all_readonly_safe_prefixes_covered(self):
+        """Enumerate _READONLY_SAFE_PREFIXES and confirm each passes is_write_operation."""
+        for prefix in _READONLY_SAFE_PREFIXES:
+            assert is_write_operation("GET", prefix) is False, (
+                f"_READONLY_SAFE_PREFIXES entry {prefix!r} is not safe under is_write_operation"
+            )
+            assert is_write_operation("POST", prefix) is False, (
+                f"_READONLY_SAFE_PREFIXES entry {prefix!r} blocks POST but should be safe"
+            )
+
+    def test_write_operations_still_blocked(self):
+        """Non-whitelisted write paths must still return True."""
+        assert is_write_operation("POST", "/admin/users") is True
+        assert is_write_operation("DELETE", "/admin/agents/123") is True
+        assert is_write_operation("PATCH", "/admin/config") is True
