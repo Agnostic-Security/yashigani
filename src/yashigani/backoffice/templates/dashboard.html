@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-04-27T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-07T01:00:00+01:00 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -560,6 +560,55 @@
                     <button data-action="exportCryptoJson" style="margin-top:12px;padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Export JSON</button>
                 </div>
             </div>
+
+            <!-- Authentication &gt; HIBP — v2.23.3 (#59) -->
+            <div class="panel" style="margin-top:16px;">
+                <div class="panel-header">Authentication &gt; HIBP API Key</div>
+                <div class="panel-body">
+                    <p style="font-size:0.8rem;color:#64748b;margin-bottom:12px;">
+                        The HIBP k-Anonymity breach check works anonymously (no key required) for most deployments.
+                        Set an API key here if you want the commercial-tier rate-limit lift or if you run a
+                        self-hosted HIBP mirror that requires authentication.
+                        <br>
+                        <strong>Resolution priority:</strong> admin-panel key &rarr; env var
+                        <code style="font-size:0.75rem;background:#f1f5f9;padding:1px 4px;border-radius:3px;">YASHIGANI_HIBP_API_KEY</code>
+                        &rarr; anonymous.
+                    </p>
+
+                    <!-- Current status -->
+                    <div id="hibp-status-container" style="margin-bottom:14px;"><span class="loading">Loading…</span></div>
+
+                    <!-- Set key form -->
+                    <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:8px;">
+                        <div>
+                            <label style="font-size:0.75rem;color:#64748b;display:block;margin-bottom:3px;">API Key (never echoed back)</label>
+                            <input id="hibp-key-input" type="password"
+                                   autocomplete="new-password"
+                                   placeholder="Enter HIBP API key (8–128 chars, alphanumeric + hyphens)"
+                                   style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:340px;max-width:100%;">
+                        </div>
+                        <button id="hibp-btn-save"
+                                style="padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">
+                            Save Key
+                        </button>
+                        <button id="hibp-btn-clear"
+                                style="padding:6px 16px;background:#dc2626;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem"
+                                disabled>
+                            Clear Key
+                        </button>
+                        <button id="hibp-btn-test"
+                                style="padding:6px 16px;background:#64748b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">
+                            Test
+                        </button>
+                    </div>
+                    <div id="hibp-key-result" style="font-size:0.8rem;min-height:1.2em;margin-bottom:4px;"></div>
+                    <div id="hibp-probe-result" style="font-size:0.8rem;min-height:1.2em;color:#334155;"></div>
+                    <p style="font-size:0.75rem;color:#94a3b8;margin-top:8px;margin-bottom:0;">
+                        Save and Clear require step-up TOTP re-verification (ASVS V6.8.4).
+                        The key is encrypted at rest with the deployment AES key and is never returned by the API.
+                    </p>
+                </div>
+            </div>
         </div>
     </main>
 
@@ -591,5 +640,6 @@
     </div>
 
     <script src="/static/js/dashboard.js"></script>
+    <script src="/static/js/hibp.js" defer></script>
 </body>
 </html>

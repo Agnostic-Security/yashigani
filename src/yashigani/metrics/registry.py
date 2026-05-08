@@ -220,6 +220,13 @@ kms_rotation_last_success_timestamp = _G(
 # Auth / admin metrics
 # ---------------------------------------------------------------------------
 
+hibp_check_api_unavailable_total = _C(
+    "yashigani_hibp_check_api_unavailable_total",
+    "HIBP breach-check API calls that failed (network error / timeout / 5xx). "
+    "Password change proceeded (fail-open). Alert if sustained over time — "
+    "may indicate loss of outbound HTTPS access on the edge network.",
+)
+
 auth_login_attempts_total = _C(
     "yashigani_auth_login_attempts_total",
     "Admin login attempts by outcome.",

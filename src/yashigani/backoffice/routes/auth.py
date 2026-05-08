@@ -450,7 +450,9 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
     from yashigani.auth.password import generate_password, hash_password
     temp_password = generate_password(36)
     try:
-        new_hash = hash_password(temp_password)
+        # check_breach=False: temp password is system-generated, not user-chosen.
+        # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+        new_hash = hash_password(temp_password, check_breach=False)
     except (ValueError, TypeError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -531,7 +533,7 @@ async def change_password(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail={"error": "account_not_found"})
 
-    from yashigani.auth.password import verify_password, hash_password
+    from yashigani.auth.password import verify_password, hash_password, PasswordBreachedError
     if not verify_password(body.current_password, record.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail={"error": "invalid_current_password"})
@@ -539,6 +541,16 @@ async def change_password(
     old_hash_tail = record.password_hash[-8:] if record.password_hash else ""
     try:
         new_hash = hash_password(body.new_password)
+    except PasswordBreachedError as exc:
+        # ASVS V2.1.7: breached passwords are rejected with a clear user-facing message.
+        # 422 Unprocessable Entity — the request is structurally valid but semantically rejected.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "password_breached",
+                "message": str(exc),
+            },
+        )
     except (ValueError, TypeError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail={"error": "password_rejected"})

@@ -114,6 +114,9 @@ class EventType(str, Enum):
     # type so forensic queries can easily filter by protocol)
     SSO_SAML_LOGIN_SUCCESS = "SSO_SAML_LOGIN_SUCCESS"
     SSO_SAML_LOGIN_FAILURE = "SSO_SAML_LOGIN_FAILURE"
+    # v2.23.3 — HIBP API key management
+    HIBP_API_KEY_UPDATED = "HIBP_API_KEY_UPDATED"
+    HIBP_API_KEY_CLEARED = "HIBP_API_KEY_CLEARED"
     # v2.23.3 — FedRAMP AC-2(F2) automated inactive-account disable (LU-YSG-002)
     INACTIVE_ACCOUNT_DISABLED = "INACTIVE_ACCOUNT_DISABLED"
 
@@ -882,6 +885,42 @@ class SAMLLoginFailureEvent(AuditEvent):
     idp_name: str = ""
     failure_reason: str = ""
     client_ip_prefix: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v2.23.3 — HIBP API key management events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HibpApiKeyUpdatedEvent(AuditEvent):
+    """
+    Written when an admin sets or updates the HIBP API key via admin panel.
+
+    Security invariants:
+      - The key value is NEVER stored in this event (not even masked).
+      - masked_key_hint carries only first-3 + '…' + last-3 chars so there
+        is confirmation in the audit trail that a key was set, without
+        exposing the full value.
+      - masking_applied is always True (immutable floor).
+    """
+    event_type: str = EventType.HIBP_API_KEY_UPDATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True                    # immutable floor
+    admin_account: str = ""
+    masked_key_hint: str = ""                        # e.g. "abc…xyz" — never full key
+
+
+@dataclass
+class HibpApiKeyClearedEvent(AuditEvent):
+    """
+    Written when an admin clears the HIBP API key (reverts to env-var or anon).
+
+    masking_applied is always True (immutable floor).
+    """
+    event_type: str = EventType.HIBP_API_KEY_CLEARED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True                    # immutable floor
+    admin_account: str = ""
 
 
 # ---------------------------------------------------------------------------

@@ -302,6 +302,14 @@ backoffice:
     port: 8443
     type: ClusterIP
   existingSecretName: ""
+  # v2.23.3 (#59): the backoffice K8s Secret (existingSecretName / default
+  # "yashigani-backoffice-secrets") must contain the following keys:
+  #   db_aes_key  — 64-char hex (32 bytes) or 44-char base64; used by
+  #                 pgcrypto pgp_sym_encrypt to encrypt auth_settings values
+  #                 (including the HIBP API key) at rest.  install.sh generates
+  #                 this key automatically; for Helm-only deployments, generate
+  #                 with: openssl rand -hex 32
+  #   Missing key → RuntimeError at backoffice startup (fail-closed, SOP 1).
   hpa:
     enabled: true
     minReplicas: 2

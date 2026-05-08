@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import secrets
 import string
 from typing import Optional
@@ -83,7 +84,8 @@ def hash_password(password: str, *, check_breach: bool = True) -> str:
         check_breach: If True (default), checks password against HIBP
             breach database before hashing. Raises PasswordBreachedError
             if the password has been compromised. Set to False for
-            bootstrap/migration paths where the check was already done.
+            bootstrap/migration paths where the check was already done,
+            or when YASHIGANI_HIBP_CHECK_ENABLED=false disables the check.
 
     Raises:
         ValueError: Password too short.
@@ -94,7 +96,7 @@ def hash_password(password: str, *, check_breach: bool = True) -> str:
             f"Password must be at least {_MIN_PASSWORD_LENGTH} characters"
         )
     validate_password_context(password)
-    if check_breach:
+    if check_breach and hibp_check_enabled():
         validate_password_not_breached(password)
     return _hasher().hash(password)
 
@@ -137,10 +139,21 @@ def generate_password(length: int = 36) -> str:
 # HIBP Passwords API, receive all matching suffixes, check locally.
 # The actual password NEVER leaves the system.
 #
+# Operator controls (env vars):
+#   YASHIGANI_HIBP_CHECK_ENABLED  — "true" (default) / "false" to opt out.
+#     Opting out is intended for air-gapped deployments or environments where
+#     the outbound HTTPS requirement cannot be met. The check is a
+#     defense-in-depth layer (ASVS V2.1.7); disabling it is a risk-accept
+#     that operators must document. The default is fail-open (not fail-closed)
+#     on API unreachability; disabling removes the check entirely.
+#   YASHIGANI_HIBP_API_URL        — override API base URL (default:
+#     "https://api.pwnedpasswords.com/range/"). Set to your own HIBP mirror
+#     for air-gapped deployments. Must include the trailing slash.
+#
 # See: https://haveibeenpwned.com/API/v3#SearchingPwnedPasswordsByRange
 # =========================================================================
 
-_HIBP_API_URL = "https://api.pwnedpasswords.com/range/"
+_HIBP_DEFAULT_API_URL = "https://api.pwnedpasswords.com/range/"
 _HIBP_TIMEOUT = 5  # seconds
 
 # SSRF guardrail: route HIBP calls through the centralised HttpClient.
@@ -164,18 +177,39 @@ def _hibp_http_client():
     return _HIBP_HTTP_CLIENT
 
 
+def hibp_check_enabled() -> bool:
+    """
+    Return True if the HIBP breach check is enabled.
+
+    Reads YASHIGANI_HIBP_CHECK_ENABLED at call time (not module load) so
+    tests can override it via monkeypatch without import-time side effects.
+    Default: True (secure default — operators must explicitly opt out).
+    """
+    raw = os.environ.get("YASHIGANI_HIBP_CHECK_ENABLED", "true").strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+def hibp_api_url() -> str:
+    """
+    Return the HIBP API base URL to use for range queries.
+
+    Reads YASHIGANI_HIBP_API_URL at call time so tests can override it.
+    Default: https://api.pwnedpasswords.com/range/
+    """
+    return os.environ.get("YASHIGANI_HIBP_API_URL", _HIBP_DEFAULT_API_URL)
+
+
 class PasswordBreachedError(ValueError):
     """Raised when a password is found in the HIBP breach database."""
 
     def __init__(self, breach_count: int):
         self.breach_count = breach_count
         super().__init__(
-            f"This password has appeared in {breach_count:,} data breach(es). "
-            "Choose a different password."
+            "This password has appeared in known data breaches; choose another."
         )
 
 
-def check_hibp(password: str) -> Optional[int]:
+def check_hibp(password: str, *, api_key: Optional[str] = None) -> Optional[int]:
     """
     Check a password against the HIBP Passwords API using k-Anonymity.
 
@@ -191,8 +225,26 @@ def check_hibp(password: str) -> Optional[int]:
     The password is NEVER transmitted. Only the first 5 characters of its
     SHA-1 hash are sent to the API. All matching is done locally.
 
-    Returns None (clean) if the API is unreachable (fail-open — never
-    blocks authentication due to a third-party API outage).
+    Args:
+        password: Plaintext password to check.
+        api_key: Optional HIBP API key for rate-limit lift or mirror auth.
+            If non-empty, injects ``hibp-api-key: <key>`` header. If None or
+            empty, the request is sent without the header (anonymous — works
+            for the free range endpoint). Resolve this value via
+            ``hibp_config.resolve_hibp_api_key()`` to apply the
+            admin-panel → env-var → anon priority chain.
+            The key is NEVER logged at any level.
+
+    Failure mode (fail-open): if the HIBP API is unreachable (network
+    timeout, 5xx, DNS failure), this function logs a WARNING, increments
+    the ``yashigani_hibp_api_unavailable_total`` metric, and returns None
+    (clean — the caller proceeds). This is intentional: the HIBP check is a
+    defense-in-depth layer; operator password changes must never be blocked
+    by a third-party API outage.
+
+    Does NOT check YASHIGANI_HIBP_CHECK_ENABLED — callers must check that
+    separately (see hibp_check_enabled()). This function always performs the
+    check when called.
     """
     # HIBP k-Anonymity protocol mandates SHA-1 as the wire format (NIST SP 800-63B §5.1.1.2).
     # usedforsecurity=False: signals to hashlib/Bandit that this is a protocol requirement,
@@ -204,7 +256,12 @@ def check_hibp(password: str) -> Optional[int]:
     prefix = sha1_hash[:5]
     suffix = sha1_hash[5:]
 
-    request_url = f"{_HIBP_API_URL}{prefix}"
+    request_url = f"{hibp_api_url()}{prefix}"
+
+    # Build request headers — api_key is never logged (security invariant).
+    headers = {"User-Agent": "Yashigani-PasswordCheck/1.0"}
+    if api_key:
+        headers["hibp-api-key"] = api_key
 
     # --- SSRF policy check via HttpClient (defence-in-depth) ----------------
     # _check_policy() is synchronous (pure URL validation, no I/O). This
@@ -228,14 +285,19 @@ def check_hibp(password: str) -> Optional[int]:
         response = httpx.get(
             request_url,
             timeout=_HIBP_TIMEOUT,
-            headers={"User-Agent": "Yashigani-PasswordCheck/1.0"},
+            headers=headers,
         )
         response.raise_for_status()
     except ImportError:
         # httpx not available — fall back to stdlib urllib (same policy already checked)
-        return _check_hibp_urllib(password)
-    except Exception:
-        logger.debug("HIBP API unreachable — skipping breach check (fail-open)")
+        return _check_hibp_urllib(password, api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "HIBP API unreachable — skipping breach check (fail-open). "
+            "Network requirement: outbound HTTPS to api.pwnedpasswords.com. Error: %s",
+            type(exc).__name__,
+        )
+        _increment_hibp_unavailable()
         return None
 
     for line in response.text.splitlines():
@@ -246,12 +308,21 @@ def check_hibp(password: str) -> Optional[int]:
     return None
 
 
-def _check_hibp_urllib(password: str) -> Optional[int]:
+def _check_hibp_urllib(
+    password: str,
+    *,
+    api_key: Optional[str] = None,
+) -> Optional[int]:
     """Fallback HIBP check using stdlib urllib (no httpx dependency).
 
     The SSRF policy check is applied by the caller (check_hibp) before
     this function is invoked, so we do NOT re-check here — policy is
     enforced exactly once, as close to the decision point as possible.
+
+    Args:
+        password: Plaintext password to check.
+        api_key: Optional HIBP API key. If non-empty, injects
+            ``hibp-api-key: <key>`` header. Never logged.
     """
     import urllib.request
     import urllib.error
@@ -265,16 +336,25 @@ def _check_hibp_urllib(password: str) -> Optional[int]:
     prefix = sha1_hash[:5]
     suffix = sha1_hash[5:]
 
+    headers = {"User-Agent": "Yashigani-PasswordCheck/1.0"}
+    if api_key:
+        # api_key deliberately not logged — security invariant
+        headers["hibp-api-key"] = api_key
+
     req = urllib.request.Request(
-        f"{_HIBP_API_URL}{prefix}",
-        headers={"User-Agent": "Yashigani-PasswordCheck/1.0"},
+        f"{hibp_api_url()}{prefix}",
+        headers=headers,
     )
 
     try:
         with urllib.request.urlopen(req, timeout=_HIBP_TIMEOUT) as resp:  # noqa: S310
             body = resp.read().decode("utf-8")
-    except (urllib.error.URLError, OSError):
-        logger.debug("HIBP API unreachable (urllib) — skipping breach check")
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning(
+            "HIBP API unreachable (urllib fallback) — skipping breach check. "
+            "Error: %s", type(exc).__name__,
+        )
+        _increment_hibp_unavailable()
         return None
 
     for line in body.splitlines():
@@ -285,9 +365,21 @@ def _check_hibp_urllib(password: str) -> Optional[int]:
     return None
 
 
+def _increment_hibp_unavailable() -> None:
+    """Increment the HIBP API unavailability metric. Fails silently if prometheus_client not installed."""
+    try:
+        from yashigani.metrics.registry import hibp_check_api_unavailable_total
+        hibp_check_api_unavailable_total.inc()
+    except Exception:
+        pass  # Metric unavailable — non-fatal
+
+
 def validate_password_not_breached(password: str, *, raise_on_breach: bool = True) -> Optional[int]:
     """
     Check a password against HIBP and optionally raise PasswordBreachedError.
+
+    Respects YASHIGANI_HIBP_CHECK_ENABLED — if the check is disabled, returns
+    None immediately without contacting the API.
 
     Args:
         password: The plaintext password to check.
@@ -296,11 +388,16 @@ def validate_password_not_breached(password: str, *, raise_on_breach: bool = Tru
             count silently.
 
     Returns:
-        None if clean, int (breach count) if compromised and raise_on_breach=False.
+        None if clean or check disabled; int (breach count) if compromised
+        and raise_on_breach=False.
 
     Raises:
         PasswordBreachedError if the password is compromised and raise_on_breach=True.
     """
+    if not hibp_check_enabled():
+        logger.debug("HIBP check skipped — YASHIGANI_HIBP_CHECK_ENABLED=false")
+        return None
+
     breach_count = check_hibp(password)
     if breach_count is not None and breach_count > 0:
         logger.warning(

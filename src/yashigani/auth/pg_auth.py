@@ -83,7 +83,9 @@ class PostgresLocalAuthService:
         record = AccountRecord(
             account_id=str(uuid.uuid4()),
             username=username,
-            password_hash=hash_password(plaintext),
+            # check_breach=False: system-generated password, not user-chosen.
+            # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+            password_hash=hash_password(plaintext, check_breach=False),
             totp_secret="",
             recovery_codes=None,
             account_tier="admin",
@@ -102,7 +104,9 @@ class PostgresLocalAuthService:
         record = AccountRecord(
             account_id=str(uuid.uuid4()),
             username=username,
-            password_hash=hash_password(plaintext_password),
+            # check_breach=False: admin-generated temp password, not user-chosen.
+            # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+            password_hash=hash_password(plaintext_password, check_breach=False),
             totp_secret="",
             recovery_codes=None,
             account_tier="user",
@@ -275,8 +279,9 @@ class PostgresLocalAuthService:
             record.force_totp_provision = True
             record.failed_attempts = 0
             record.locked_until = 0.0
+            # check_breach=False: system-generated temp password, not user-chosen.
             temp_password = generate_password(36)
-            record.password_hash = hash_password(temp_password)
+            record.password_hash = hash_password(temp_password, check_breach=False)
             await self._update(conn, record)
             return True, "ok"
 
