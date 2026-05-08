@@ -69,7 +69,7 @@ During M7 pre-flight, interpret macOS smoke as follows:
 - `smoke-gate (Linux + mutation only)` RED = **real gate failure.** A Linux cell or the mutation test failed. Investigate before proceeding with the release.
 - macOS cells GREEN = unexpected positive signal (VZ happened to be available on the runner). Do not rely on it; note in the release retro if it occurs.
 
-This formalises the v2.23.2 ad-hoc Tiago risk-accept on macOS smoke. No per-release risk-accept is needed from v2.23.3 onward. The structural fix is in `install-smoke.yml` (`continue-on-error: ${{ !matrix.gates }}` on macOS cells) and in this document.
+This formalises the v2.23.2 ad-hoc engineering risk-accept on macOS smoke. No per-release risk-accept is needed from v2.23.3 onward. The structural fix is in `install-smoke.yml` (`continue-on-error: ${{ !matrix.gates }}` on macOS cells) and in this document.
 
 Artifact retention: **14 days** (install logs per cell, artifact name `install-log-<os>-<runtime>-<sha>`).
 
