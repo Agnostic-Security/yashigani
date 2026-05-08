@@ -484,3 +484,37 @@ kubectl logs job/yashigani-delete-legacy-hpa -n yashigani
 ```
 
 The Job requires the `yashigani` ServiceAccount to have `delete` on `horizontalpodautoscalers`. If RBAC is locked down, grant it temporarily or delete HPAs manually before upgrading.
+
+### Re-install: stale PersistentVolume cleanup (local-path-provisioner)
+
+On Docker Desktop K8s, kind, and k3s single-node clusters, PVs backed by local-path-provisioner may linger after `helm uninstall` or namespace deletion. On a subsequent `helm install`, Postgres can start against the old data directory with a mismatched password, causing `password authentication failed` on first startup.
+
+**Before re-installing**, check for stale PVs:
+
+```bash
+kubectl get pv | grep yashigani
+```
+
+If any PVs remain in `Released` or `Bound` state referencing the old namespace, they must be deleted before re-installing.
+
+> **Internal operator runbook:** Agnostic Security operators have a detailed step-by-step cleanup guide at `Internal/Compliance/yashigani/install-runbooks/k8s-pv-stale-data-cleanup.md` covering: how to identify stale PVs, when it is safe to delete, what data is permanently lost, how to confirm cleanup, and known failure modes (stuck `Terminating` namespaces, finalizer removal, local-path-provisioner backing directory cleanup).
+
+A safe abbreviated flow for development clusters where all data is expendable:
+
+```bash
+NAMESPACE=yashigani
+
+# Delete namespace (and its PVCs)
+kubectl delete namespace ${NAMESPACE} --ignore-not-found
+kubectl wait --for=delete namespace/${NAMESPACE} --timeout=120s 2>/dev/null || true
+
+# Delete any lingering PVs that referenced this namespace
+kubectl get pv -o custom-columns='NAME:.metadata.name,NS:.spec.claimRef.namespace' \
+  --no-headers | awk -v ns="${NAMESPACE}" '$2==ns {print $1}' \
+  | xargs -r kubectl delete pv
+
+# Confirm clean state
+kubectl get pv | grep yashigani || echo "No stale PVs — safe to re-install"
+```
+
+**This permanently destroys all data in those PVs.** Always take a backup first if the data is recoverable. See `restore.sh --k8s` for K8s-aware restore.
