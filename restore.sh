@@ -57,6 +57,7 @@ WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUPS_DIR="${WORK_DIR}/backups"
 K8S_MODE=false
 K8S_NAMESPACE="yashigani"
+RUN_VALIDATE=false
 
 log_info()    { printf "    --> %s\n" "$*"; }
 log_success() { printf "    ${C_GREEN}ok${C_RESET}  %s\n" "$*"; }
@@ -1177,6 +1178,13 @@ while [[ $# -gt 0 ]]; do
       FORCE=true
       shift
       ;;
+    --validate)
+      # Opt-in: after K8s restore completes, invoke scripts/k8s-restore-validate.sh.
+      # Default is off so the restore completes quickly without requiring kubectl
+      # port-forward access from the operator's terminal.
+      RUN_VALIDATE=true
+      shift
+      ;;
     --help|-h)
       cat <<'EOF'
 Yashigani Restore Script
@@ -1186,12 +1194,14 @@ Usage:
   bash restore.sh <backup_dir>                 Restore from specific backup
   bash restore.sh --latest                     Restore most recent backup
   bash restore.sh --latest --k8s -n yashigani  Restore into Kubernetes
+  bash restore.sh --latest --k8s --validate    Restore + run k8s-restore-validate.sh
 
 Options:
   --k8s, --kubernetes   Restore into a Kubernetes cluster
   -n, --namespace NS    Kubernetes namespace (default: yashigani)
   --latest              Use most recent backup
   --force               Skip validation warnings
+  --validate            (K8s only) Run k8s-restore-validate.sh after restore (default: off)
   --help                Show this help
 
 Supported platforms:
@@ -1234,3 +1244,23 @@ case "${RESTORE_TARGET}" in
     fi
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Optional post-restore K8s validation (opt-in via --validate)
+# ---------------------------------------------------------------------------
+if [[ "$RUN_VALIDATE" == "true" ]]; then
+  if [[ "$K8S_MODE" != "true" ]]; then
+    log_warn "--validate is only meaningful with --k8s. Skipping."
+  else
+    VALIDATE_SCRIPT="${WORK_DIR}/scripts/k8s-restore-validate.sh"
+    if [[ ! -x "$VALIDATE_SCRIPT" ]]; then
+      log_warn "--validate specified but ${VALIDATE_SCRIPT} not found or not executable. Skipping."
+    else
+      log_info "Running K8s restore validation (scripts/k8s-restore-validate.sh)..."
+      KUBECTL_NAMESPACE="${K8S_NAMESPACE}" bash "${VALIDATE_SCRIPT}" || {
+        log_error "K8s restore validation reported failures — see output above."
+        exit 1
+      }
+    fi
+  fi
+fi
