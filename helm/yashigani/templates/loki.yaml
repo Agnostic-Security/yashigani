@@ -1,3 +1,8 @@
+{{- /* Last updated: 2026-05-07T00:00:00+01:00 */ -}}
+{{- /* retro #84 (v2.23.2): mTLS for Loki ingest + query. */ -}}
+{{- /* Server cert: loki_client.crt/key (PKI Secret). */ -}}
+{{- /* Trust anchor: ca_intermediate.crt (Pattern B). */ -}}
+{{- /* Clients: Promtail, Grafana, otel-collector — all require leaf certs. */ -}}
 {{- if .Values.loki.enabled }}
 ---
 apiVersion: apps/v1
@@ -21,11 +26,19 @@ spec:
       labels:
         app.kubernetes.io/name: yashigani-loki
         app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- if .Values.mtls.enabled }}
+      annotations:
+        # Trigger rolling update when PKI Secret resourceVersion changes.
+        # Ensures Loki picks up rotated certs on the next rollout.
+        checksum/pki-certs: {{ lookup "v1" "Secret" .Release.Namespace .Values.mtls.secretName | default dict | dig "metadata" "resourceVersion" "" | quote }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
+        runAsGroup: 10001
         fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
@@ -34,15 +47,48 @@ spec:
           image: "{{ .Values.loki.image.repository }}:{{ .Values.loki.image.tag }}"
           imagePullPolicy: {{ .Values.loki.image.pullPolicy }}
           securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           args: ["-config.file=/etc/loki/loki.yml"]
           ports:
-            - name: http
+            - name: https
               containerPort: 3100
               protocol: TCP
+          {{- if .Values.mtls.enabled }}
+          # retro #84: Loki listens on HTTPS with RequireAndVerifyClientCert.
+          # The probe is intra-pod (localhost → self). BusyBox wget does NOT
+          # support --certificate/--private-key for TLS client certs. Using
+          # --no-check-certificate here is deliberate and safe: the probe
+          # verifies only that the Loki PROCESS is responding on :3100. mTLS
+          # enforcement for external clients is verified by those clients at
+          # connect time (they must present a valid leaf cert). TA-1..4 cannot
+          # intercept a localhost probe inside a Pod. K8s kubelet healthchecks
+          # also cannot present client certs, making this the only viable probe.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          {{- else }}
           readinessProbe:
             httpGet:
               path: /ready
@@ -59,6 +105,7 @@ spec:
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
+          {{- end }}
           resources:
             {{- toYaml .Values.loki.resources | nindent 12 }}
           volumeMounts:
@@ -67,12 +114,26 @@ spec:
               readOnly: true
             - name: data
               mountPath: /loki
+            {{- if .Values.mtls.enabled }}
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: yashigani-loki-config
+        {{- if .Values.mtls.enabled }}
+        # PKI certs: loki server cert + ca_intermediate.crt for client-cert auth.
+        # loki is mtls_capable:true in service_identities.yaml so the bootstrap
+        # job issues loki_client.crt/key into this Secret.
+        - name: secrets
+          secret:
+            secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
+            defaultMode: 0440
+        {{- end }}
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
@@ -106,7 +167,7 @@ spec:
     app.kubernetes.io/name: yashigani-loki
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
-    - name: http
+    - name: https
       port: {{ .Values.loki.service.port }}
       targetPort: 3100
       protocol: TCP

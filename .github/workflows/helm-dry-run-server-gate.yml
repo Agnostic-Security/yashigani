@@ -1,0 +1,183 @@
+# Last updated: 2026-05-08T00:00:00+01:00
+# v2.23.3 retro action — adds kubectl apply --dry-run=server to the
+# helm-template-parity gate.
+#
+# Motivation: PR #68 introduced a ConfigMap with forward-slash keys
+# (datasources/prometheus.yml) that the K8s API rejects but helm lint +
+# helm template both accept silently.  The dry-run server-side gate would
+# have caught this at lint time instead of failing G9 K8s live verify.
+#
+# Design:
+#   1. Spin up a kind cluster (kind v0.31.0 / kindest/node:v1.35.0 — pinned).
+#   2. Run `helm template ... | kubectl apply --dry-run=server -f -` against
+#      the live K8s API (server-side validation includes ConfigMap key schema).
+#   3. Self-test fixture: apply a ConfigMap with a `/`-key first — the gate
+#      MUST fire RED.  Then run the chart — gate MUST be GREEN.
+#   4. Skip clause: if helm template produces empty output the dry-run step
+#      is skipped (prevents flake on misconfigured --set sequences).
+#
+# Values overrides for CI:
+#   global.environment=ci   — bypasses the production/staging mtls.enabled
+#                             guard in validate-security.yaml (LIC-006).
+#                             The guard only fires on production/staging, so
+#                             mtls.enabled remains at its default (true) to
+#                             maximise template coverage — notably this renders
+#                             yashigani-grafana-provisioning (the PR #68 bug
+#                             template) which is only emitted when mtls=true.
+#   admissionPolicies.enabled=false — skips Kyverno ClusterPolicy CRDs not
+#                             present in a plain kind cluster.
+#   cert-manager ClusterIssuer objects are auto-skipped by the
+#   .Capabilities.APIVersions.Has "cert-manager.io/v1" guard in the template.
+#
+# Permissions: read-only on contents — no writes to the repo or registry.
+name: Helm dry-run server gate
+
+on:
+  push:
+    branches: ["v2.23.*", "2.23.x", "feat/**", "fix/**"]
+    paths:
+      - "helm/**"
+      - ".github/workflows/helm-dry-run-server-gate.yml"
+  pull_request:
+    branches: ["v2.23.*", "2.23.x"]
+    paths:
+      - "helm/**"
+      - ".github/workflows/helm-dry-run-server-gate.yml"
+
+concurrency:
+  group: helm-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  helm-dry-run-server-gate:
+    name: kubectl apply --dry-run=server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # -----------------------------------------------------------------------
+      # Tool setup — all versions pinned to digest/SHA per feedback_image_pinning.md
+      # -----------------------------------------------------------------------
+
+      - name: Set up Helm v3.14.0
+        uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78 # v3
+        with:
+          version: v3.14.0
+
+      - name: Create kind cluster (kind v0.31.0 / k8s v1.35.0)
+        # kind v0.31.0 is the default bundled with helm/kind-action v1.14.0.
+        # Node image pinned to digest for reproducibility; pull happens inside
+        # the action via docker pull — the digest guarantees bit-exact node.
+        # wait: 60s is the default; kind control-plane is typically ready in
+        # <20s on ubuntu-latest, well within the 30s target from the brief.
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.31.0
+          node_image: "kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f"
+          cluster_name: ysg-dry-run
+          wait: 60s
+
+      # -----------------------------------------------------------------------
+      # Self-test: fixture MUST fail
+      # Reproduces the PR #68 forward-slash ConfigMap key bug.
+      # kubectl apply --dry-run=server should exit non-zero; if it exits 0
+      # the gate is broken and we abort.
+      # -----------------------------------------------------------------------
+
+      - name: Self-test — fixture with forward-slash ConfigMap key MUST fail dry-run
+        # K8s ConfigMap data keys must match [-._a-zA-Z0-9]+.
+        # A key containing '/' (e.g. "datasources/prometheus.yml") is invalid
+        # and the API server MUST reject it.  This step asserts the gate fires.
+        run: |
+          cat > "${RUNNER_TEMP}/fixture-bad-configmap.yaml" <<'FIXTURE'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ysg-dryrun-fixture-bad
+            namespace: default
+          data:
+            datasources/prometheus.yml: |
+              apiVersion: 1
+              datasources: []
+          FIXTURE
+
+          echo "--- Applying bad-key fixture (expect non-zero exit) ---"
+          if kubectl apply --dry-run=server -f "${RUNNER_TEMP}/fixture-bad-configmap.yaml" 2>&1; then
+            echo "GATE FAILURE: kubectl accepted a ConfigMap with a forward-slash key."
+            echo "The dry-run server-side gate is NOT working as expected."
+            exit 1
+          else
+            echo "OK: kubectl correctly rejected the forward-slash key fixture (exit $?)."
+          fi
+
+      # -----------------------------------------------------------------------
+      # Main gate: helm template | kubectl apply --dry-run=server
+      # -----------------------------------------------------------------------
+
+      - name: Render chart (helm template)
+        id: helm_template
+        # CI values overrides (see file header comments for rationale):
+        #   global.environment=ci          — bypass LIC-006 production guard
+        #                                    (guard only fires on production/staging)
+        #   admissionPolicies.enabled=false — no Kyverno CRDs in kind
+        #   mtls.enabled kept at default (true) to render mTLS-gated ConfigMaps,
+        #   notably yashigani-grafana-provisioning (the PR #68 bug template).
+        # Output is written to a workspace subdirectory so the upload-artifact
+        # step can reference it via a static path expression.
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.dry-run-artifacts"
+
+          helm template ysg-dryrun helm/yashigani/ \
+            --namespace yashigani-dryrun \
+            --set global.environment=ci \
+            --set admissionPolicies.enabled=false \
+            > "$GITHUB_WORKSPACE/.dry-run-artifacts/helm-template-output.yaml"
+
+          LINE_COUNT=$(wc -l < "$GITHUB_WORKSPACE/.dry-run-artifacts/helm-template-output.yaml")
+          echo "template_lines=${LINE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Rendered ${LINE_COUNT} lines from helm template."
+
+      - name: Skip check — abort dry-run if template output is empty
+        # Defensive: an empty helm template output would make kubectl apply
+        # exit 0 trivially, producing a false-green.  Catch and fail explicitly.
+        if: steps.helm_template.outputs.template_lines == '0'
+        run: |
+          echo "ERROR: helm template produced empty output."
+          echo "This indicates a misconfigured --set sequence or a chart bug."
+          echo "Dry-run gate skipped to prevent a false-green result."
+          exit 1
+
+      - name: Create namespace for dry-run
+        # kubectl apply --dry-run=server requires the target namespace to exist
+        # in the cluster even for a dry run (the API server validates namespace
+        # existence for namespaced resources).
+        run: kubectl create namespace yashigani-dryrun
+
+      - name: kubectl apply --dry-run=server (K8s API schema validation)
+        # This is the load-bearing gate.  Server-side dry-run sends the rendered
+        # manifests to the K8s API server for full schema + admission validation
+        # without persisting any objects.  Catches ConfigMap key violations,
+        # unknown field names, missing required fields, and other schema errors
+        # that helm lint and helm template do not detect.
+        #
+        # Exit codes:
+        #   0 — all manifests accepted by the K8s API (gate passes)
+        #   non-zero — at least one manifest rejected (gate fires, PR blocked)
+        run: |
+          echo "--- Applying helm template output via kubectl dry-run=server ---"
+          kubectl apply --dry-run=server \
+            -f "$GITHUB_WORKSPACE/.dry-run-artifacts/helm-template-output.yaml"
+          echo "--- Gate passed: all manifests accepted by K8s API ---"
+
+      - name: Upload rendered template (diagnostic artifact)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: helm-dry-run-output-${{ github.sha }}
+          path: .dry-run-artifacts/helm-template-output.yaml
+          retention-days: 14

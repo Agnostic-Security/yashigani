@@ -1,6 +1,6 @@
 # Podman rootless overrides — applied automatically by install.sh when RUNTIME=podman
 # Usage: podman compose -f docker/docker-compose.yml -f docker/docker-compose.podman-override.yml up -d
-# Last updated: 2026-05-06T20:00:00+01:00 (P-9 note: healthcheck strategy documented)
+# Last updated: 2026-05-07T00:00:00+01:00 (fix: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES parity with docker-compose.yml)
 #
 # P-9 healthcheck strategy (podman-healthcheck-silent-drop):
 #   Podman silently drops image-baked OCI HEALTHCHECK directives when compose
@@ -45,6 +45,12 @@ services:
   backoffice:
     security_opt:
       - label=disable
+    # Parity with docker-compose.yml: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES must be
+    # set on both runtimes so the SSRF guard permits canonical bundle registrations
+    # on Podman rootless (Compose service names resolve via aardvark-dns, same as
+    # Docker's embedded DNS). Value must match docker-compose.yml exactly.
+    environment:
+      YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
 
   # --- Root-running services — NO keep-id ---
   policy:

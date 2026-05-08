@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
 
 # Changelog
 
@@ -24,7 +24,9 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ## [Unreleased]
 
-No unreleased changes yet for the next version.
+### Security (v2.23.3)
+
+- **fix/break-glass-audit-writer-required** — `auth/break_glass.py init_break_glass(audit_writer=None)` default removed; `audit_writer` is now a required positional argument. Calling without it raises `TypeError` at startup rather than silently creating an audit-silent break-glass manager. The one call site (`backoffice/entrypoint.py:474`) already passes `audit_writer` explicitly — no functional change there. `_emit_activated` and `_emit_expired` None-guards preserved for defence-in-depth (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1).
 
 ---
 
@@ -91,6 +93,7 @@ Full release narrative: [`docs/release-notes/v2.23.2.md`](docs/release-notes/v2.
 
 ### Bug Fixes
 
+- **Agent bundle SSRF guard wiring** — Optional agent bundles (Langflow, Letta, OpenClaw) silently failed to register on canonical install because `YASHIGANI_AGENT_UPSTREAM_HOSTNAMES` was empty and not pre-populated. The default is now `langflow,letta,openclaw` in Compose and Helm; SSRF guard code unchanged. (fix/v232-openclaw-upstream-hostnames-default)
 - **str(exc) information disclosure** — `str(exc)` calls in internal result fields and error responses migrated to `safe_error_envelope` to prevent exception-class name leakage.
 - **Agent-name path injection** — Regex + resolve guard prevents path traversal via crafted agent names.
 - **CI workflow injection** — `env` indirection on `head_branch` + regex guard closes the GitHub Actions `workflow_run` injection vector.

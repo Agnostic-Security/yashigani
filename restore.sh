@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Last updated: 2026-05-03T14:00:00+01:00 (V232-NEG04: replace /tmp mktemp in MANIFEST sig verify with BACKUP_DIR-local path)
+# Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
+# Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
 # Last updated: 2026-05-03T12:45:00+01:00 (V232-SMOKE-010: exclude .gitkeep from empty-file check; V232-SMOKE-011: podman unshare chown -R before cp restore; V232-SMOKE-012: secrets dir 0751→0755)
 
 # Tight umask so any files/dirs created during restore inherit 0600/0700.
@@ -57,6 +58,7 @@ WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUPS_DIR="${WORK_DIR}/backups"
 K8S_MODE=false
 K8S_NAMESPACE="yashigani"
+RUN_VALIDATE=false
 
 log_info()    { printf "    --> %s\n" "$*"; }
 log_success() { printf "    ${C_GREEN}ok${C_RESET}  %s\n" "$*"; }
@@ -357,7 +359,7 @@ validate_backup() {
       # openssl dgst -verify reads a raw public key PEM file (not a cert).
       local _pubkey_file
       # V232-NEG04: never use /tmp — place temp pubkey alongside backup dir
-      _pubkey_file=$(mktemp "${BACKUP_DIR}/.ysg-pubkey-XXXXXXXX.pem" 2>/dev/null \
+      _pubkey_file=$(mktemp "${backup_dir}/.ysg-pubkey-XXXXXXXX.pem" 2>/dev/null \
         || mktemp "${HOME}/.ysg-pubkey-XXXXXXXX.pem")
       trap 'rm -f "$_pubkey_file"' RETURN
       if ! openssl x509 -in "$_ca_cert" -noout -pubkey > "$_pubkey_file" 2>/dev/null; then
@@ -585,6 +587,12 @@ restore_backup() {
     #     password remains live and every post-restore pod startup fails with
     #     "password authentication failed". (retro #3ca)
     _restore_k8s_postgres_secrets "${backup_dir}/secrets"
+    # 6c. PR #67 K8s verify path (v2.23.3 retro gap):
+    #     Restart all Yashigani deployments so pods pick up the restored K8s
+    #     secrets, then wait for rollout + probe /healthz. Previously this was
+    #     only printed as "next steps" — operators forgot to run it and ran into
+    #     auth failures with a nominally-successful restore.
+    _k8s_post_restore_verify
   fi
 
   printf "\n${C_GREEN}${C_BOLD}Restore complete.${C_RESET}\n\n"
@@ -604,10 +612,14 @@ restore_backup() {
       printf "    3. Log in to admin UI and verify credentials work\n"
       ;;
     k8s)
-      printf "  Next steps:\n"
-      printf "    1. Restart pods: kubectl rollout restart deployment -n ${K8S_NAMESPACE}\n"
-      printf "    2. Verify: kubectl exec -n ${K8S_NAMESPACE} deploy/gateway -- curl -s http://localhost:8080/healthz\n"
-      printf "    3. Log in to admin UI and verify credentials work\n"
+      printf "  K8s restore steps completed automatically:\n"
+      printf "    - Secrets updated: kubectl rollout restart deployment -n ${K8S_NAMESPACE} (done)\n"
+      printf "    - Rollout awaited: kubectl rollout status deployment --timeout=300s (done)\n"
+      printf "    - Gateway healthz probed (see output above)\n"
+      printf "  If healthz probe was empty or a deployment timed out above:\n"
+      printf "    kubectl get pods -n ${K8S_NAMESPACE}\n"
+      printf "    kubectl exec -n ${K8S_NAMESPACE} deployment/yashigani-gateway -- curl -sf http://localhost:8080/healthz\n"
+      printf "  Then log in to admin UI and verify credentials work.\n"
       ;;
     *)
       printf "  Secrets and .env restored. Start your services manually.\n"
@@ -1154,6 +1166,89 @@ _restore_k8s_postgres_secrets() {
 }
 
 # ---------------------------------------------------------------------------
+# PR #67 K8s verify path (retro K8s gap, v2.23.3):
+#
+# After _restore_k8s_secrets + _restore_k8s_postgres_secrets update the K8s
+# secrets and patch pgbouncer's DATABASE_URL, the running pods still have the
+# OLD secret values in their environment (K8s does not hot-reload secrets into
+# running pods unless the pods are restarted). Without an explicit rollout
+# restart + wait, the restore "succeeds" while every pod continues to use the
+# pre-restore credentials → auth failures on the next request.
+#
+# This function:
+#   1. Triggers `kubectl rollout restart deployment` across all Yashigani
+#      deployments in the namespace.
+#   2. Waits for each deployment to reach its desired state with a 300s
+#      timeout (enough for rolling restart on Docker Desktop / kind; extend
+#      with KUBECTL_ROLLOUT_TIMEOUT if needed).
+#   3. Probes the gateway's /healthz endpoint via `kubectl exec` to confirm
+#      the restored pod is serving. A non-200 response is surfaced as a
+#      warning — the restore is already committed, but the operator must
+#      investigate before declaring success.
+# ---------------------------------------------------------------------------
+_k8s_post_restore_verify() {
+  local _ns="${K8S_NAMESPACE}"
+  local _timeout="${KUBECTL_ROLLOUT_TIMEOUT:-300s}"
+
+  log_info "K8s post-restore: restarting deployments in namespace '${_ns}'..."
+
+  # Collect all Yashigani-owned deployments.
+  local _deployments
+  _deployments=$(kubectl get deployments -n "${_ns}" \
+    -l "app.kubernetes.io/instance=yashigani" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "${_deployments}" ]]; then
+    # Fall back to all deployments in the namespace if the label selector
+    # returns nothing (e.g. label not present on all resources).
+    _deployments=$(kubectl get deployments -n "${_ns}" \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+  fi
+
+  if [[ -z "${_deployments}" ]]; then
+    log_warn "No deployments found in namespace '${_ns}' — skipping rollout restart"
+    return 0
+  fi
+
+  if ! kubectl rollout restart deployment -n "${_ns}" >/dev/null 2>&1; then
+    log_warn "kubectl rollout restart failed — pods may still carry pre-restore credentials. Manual: kubectl rollout restart deployment -n ${_ns}"
+  else
+    log_info "Rollout restart triggered. Waiting for deployments to become ready (timeout: ${_timeout})..."
+  fi
+
+  # Wait for each deployment individually so we can report per-deployment failures.
+  local _failed=0
+  for _dep in ${_deployments}; do
+    if ! kubectl rollout status deployment/"${_dep}" \
+        --namespace "${_ns}" \
+        --timeout="${_timeout}" >/dev/null 2>&1; then
+      log_warn "Deployment ${_dep} did not reach Ready within ${_timeout} — check: kubectl get pods -n ${_ns} -l app.kubernetes.io/name=${_dep}"
+      _failed=$((_failed + 1))
+    else
+      log_info "  deployment/${_dep}: Ready"
+    fi
+  done
+
+  if [[ "${_failed}" -gt 0 ]]; then
+    log_warn "${_failed} deployment(s) did not stabilise — restore committed but service may be degraded. Investigate before use."
+    return 0  # non-fatal: restore data is already in place
+  fi
+
+  log_info "All deployments ready. Probing gateway /healthz..."
+
+  # Probe via kubectl exec to avoid network dependency (no port-forward required).
+  local _healthz
+  _healthz=$(kubectl exec -n "${_ns}" deployment/yashigani-gateway -- \
+    curl -sf --max-time 5 http://localhost:8080/healthz 2>/dev/null || true)
+
+  if [[ -z "${_healthz}" ]]; then
+    log_warn "Gateway /healthz probe returned no output — service may be starting up. Retry: kubectl exec -n ${_ns} deployment/yashigani-gateway -- curl -sf http://localhost:8080/healthz"
+  else
+    log_success "Gateway /healthz OK: ${_healthz}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Parse args
 # ---------------------------------------------------------------------------
 RESTORE_TARGET=""
@@ -1177,6 +1272,13 @@ while [[ $# -gt 0 ]]; do
       FORCE=true
       shift
       ;;
+    --validate)
+      # Opt-in: after K8s restore completes, invoke scripts/k8s-restore-validate.sh.
+      # Default is off so the restore completes quickly without requiring kubectl
+      # port-forward access from the operator's terminal.
+      RUN_VALIDATE=true
+      shift
+      ;;
     --help|-h)
       cat <<'EOF'
 Yashigani Restore Script
@@ -1186,12 +1288,14 @@ Usage:
   bash restore.sh <backup_dir>                 Restore from specific backup
   bash restore.sh --latest                     Restore most recent backup
   bash restore.sh --latest --k8s -n yashigani  Restore into Kubernetes
+  bash restore.sh --latest --k8s --validate    Restore + run k8s-restore-validate.sh
 
 Options:
   --k8s, --kubernetes   Restore into a Kubernetes cluster
   -n, --namespace NS    Kubernetes namespace (default: yashigani)
   --latest              Use most recent backup
   --force               Skip validation warnings
+  --validate            (K8s only) Run k8s-restore-validate.sh after restore (default: off)
   --help                Show this help
 
 Supported platforms:
@@ -1234,3 +1338,23 @@ case "${RESTORE_TARGET}" in
     fi
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Optional post-restore K8s validation (opt-in via --validate)
+# ---------------------------------------------------------------------------
+if [[ "$RUN_VALIDATE" == "true" ]]; then
+  if [[ "$K8S_MODE" != "true" ]]; then
+    log_warn "--validate is only meaningful with --k8s. Skipping."
+  else
+    VALIDATE_SCRIPT="${WORK_DIR}/scripts/k8s-restore-validate.sh"
+    if [[ ! -x "$VALIDATE_SCRIPT" ]]; then
+      log_warn "--validate specified but ${VALIDATE_SCRIPT} not found or not executable. Skipping."
+    else
+      log_info "Running K8s restore validation (scripts/k8s-restore-validate.sh)..."
+      KUBECTL_NAMESPACE="${K8S_NAMESPACE}" bash "${VALIDATE_SCRIPT}" || {
+        log_error "K8s restore validation reported failures — see output above."
+        exit 1
+      }
+    fi
+  fi
+fi

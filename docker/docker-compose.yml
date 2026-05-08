@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Docker Compose stack
-# Last updated: 2026-05-06T20:00:00+01:00 (P-9 fix: redis healthcheck YAML block scalar → list form; add start_period to redis)
+# Last updated: 2026-05-07T12:05:00+01:00 (retro #83: Grafana mTLS ingress + Prometheus TLS server + datasource mTLS; image-bump: caddy 2.11.2/redis 7.4.9/ollama 0.23.1/pgvector 0.8.2)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -87,7 +87,7 @@ services:
   # ---------------------------------------------------------------------------
   caddy:
     dns_search: ["."]
-    image: docker.io/library/caddy:2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    image: docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
     restart: unless-stopped
     mem_limit: ${YASHIGANI_CADDY_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_CADDY_CPU_LIMIT:-0.5}
@@ -341,6 +341,20 @@ services:
       # ${INSTALL_DIR}/backups on the host. The :ro flag prevents the
       # backoffice container from modifying backup files.
       YASHIGANI_BACKUPS_DIR: /data/backups
+      # v2.23.2 fix — SSRF guard hostname allowlist (TM-V231-004 / Pentest #95).
+      # _assert_safe_upstream_url() blocks loopback/RFC1918/link-local by default.
+      # These three Compose service names are the canonical Yashigani-internal agent
+      # bundle hostnames; they resolve to Docker-bridge IPs on the `data` network.
+      # Adding a hostname here means trusting that host as a legitimate internal mesh
+      # service — the SSRF guard still blocks all other private IPs and all non-HTTP(S)
+      # schemes. Agent registration remains admin-gated (TOTP step-up + audit log).
+      # TM trade-off: TA-3 (insider admin SSRF) / TA-2 (admin compromise) — attacker
+      # who can both compromise an admin account AND point the `langflow`, `letta`, or
+      # `openclaw` hostname to a private IP bypasses the IP-class check. Compensating
+      # controls: TOTP step-up on every registration, OPA-gated invocation, audit trail.
+      # Operators extending with custom agents: append comma-separated names to this value.
+      # Example: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,letta,openclaw,custom-agent
+      YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -458,7 +472,7 @@ services:
   # ---------------------------------------------------------------------------
   budget-redis:
     dns_search: ["."]
-    image: docker.io/library/redis:7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
     # gate V232-SMOKE-018: redis:7-alpine has no USER directive (defaults to root).
     # With cap_drop: [ALL], root has no DAC_OVERRIDE → cannot read TLS keys
     # chowned to 999:999 by `_pki_chown_client_keys`. Pin to UID 999:999 (the
@@ -552,7 +566,7 @@ services:
   # ---------------------------------------------------------------------------
   redis:
     dns_search: ["."]
-    image: docker.io/library/redis:7-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
     # gate V232-SMOKE-018 — see budget-redis above for rationale.
     user: "999:999"
     restart: unless-stopped
@@ -602,7 +616,7 @@ services:
   # ---------------------------------------------------------------------------
   ollama:
     dns_search: ["."]
-    image: docker.io/ollama/ollama:0.23.0@sha256:5600a652d1081050f398152127c584222546354491f27fe47ccbc6351bc870bd
+    image: docker.io/ollama/ollama:0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
     # gate V232-SMOKE-018: bbd556e set user: "1000:1000" with HOME=/data
     # (verified working on macOS Podman where vfs initialises the volume
     # owned by the caller UID). On Linux Docker, named volumes are
@@ -646,7 +660,7 @@ services:
   # Model bootstrap — pull classifier model on first start
   ollama-init:
     dns_search: ["."]
-    image: docker.io/ollama/ollama:0.23.0@sha256:5600a652d1081050f398152127c584222546354491f27fe47ccbc6351bc870bd
+    image: docker.io/ollama/ollama:0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
     # gate V232-SMOKE-018 — same rationale as `ollama` service above.
     user: "0:0"
     restart: on-failure:3
@@ -699,6 +713,9 @@ services:
       - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}"
       - "--web.enable-remote-write-receiver"
       - "--web.listen-address=0.0.0.0:9090"
+      # retro #83: enable TLS on Prometheus port 9090 (Pattern B mTLS).
+      # Grafana datasource calls now use https://prometheus:9090 with mutual TLS.
+      - "--web.config.file=/etc/prometheus/web-config.yml"
     # Internal security finding (EX-231-10 closure): Prometheus runs as uid 65534
     # (nobody) but needs to read prometheus_client.{crt,key} from /run/secrets.
     # Fix: add GID 1001 (yashigani app group) so Prometheus can read the
@@ -715,9 +732,15 @@ services:
       # :8444 (gateway) + :8445 (backoffice) listeners for SPIFFE-URI-gated
       # scrapes of /internal/metrics. Split-listener design replaced the prior
       # Host-header matcher (Prom v3 forbids setting Host via http_headers).
+      # retro #83: web-config.yml enables TLS + mTLS on port 9090 so Grafana
+      # → Prometheus datasource calls use mutual TLS (Pattern B).
+      - ../config/prometheus-web-config.yml:/etc/prometheus/web-config.yml:ro
       - ./secrets:/run/secrets:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      # retro #83: Prometheus now serves HTTPS. Use --no-check-certificate so
+      # the self-signed internal CA is trusted without mounting the CA into wget.
+      # wget inside the prom/prometheus image supports --no-check-certificate.
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://localhost:9090/-/healthy"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -748,13 +771,26 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
       GF_SERVER_ROOT_URL: "https://${YASHIGANI_TLS_DOMAIN}/admin/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # retro #83: Grafana ingress mTLS.
+      # Grafana serves HTTPS on port 3443. Caddy proxies /admin/grafana/* over
+      # mTLS using import internal-mtls (caddy_client.crt → ca_intermediate verify).
+      # TA-3 (network observer): without server TLS on Grafana, HTTPS only
+      # existed from the browser → Caddy; the Caddy → Grafana leg was plaintext
+      # HTTP on the obs bridge network. Any process on that bridge could read
+      # dashboard session traffic. mTLS closes both eavesdrop and MITM.
+      GF_SERVER_PROTOCOL: "https"
+      GF_SERVER_HTTP_PORT: "3443"
+      GF_SERVER_CERT_FILE: "/run/secrets/grafana_client.crt"
+      GF_SERVER_CERT_KEY: "/run/secrets/grafana_client.key"
     volumes:
       - grafana_data:/var/lib/grafana
       - ../config/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../config/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - ./secrets:/run/secrets:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      # retro #83: Grafana now serves HTTPS on 3443. wget --no-check-certificate
+      # skips CA verification for localhost-only healthcheck (no SPIFFE needed).
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:3443/api/health | grep -q ok"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -776,7 +812,7 @@ services:
   # ---------------------------------------------------------------------------
   postgres:
     dns_search: ["."]
-    image: docker.io/pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
     # gate V232-SMOKE-018: pgvector/pgvector has no USER directive (defaults to
     # root). The postgres entrypoint then runs gosu/setpriv to switch from root
     # → postgres user, but `cap_drop: [ALL]` strips CAP_SETUID/SETGID/FOWNER —
@@ -903,6 +939,10 @@ services:
   # ---------------------------------------------------------------------------
   # Loki — log aggregation backend
   # ---------------------------------------------------------------------------
+  # retro #84 (v2.23.2): mTLS enabled on port 3100.
+  # Server cert: loki_client.crt/key (issued by install.sh PKI bootstrap).
+  # Trust anchor: ca_intermediate.crt (Pattern B).
+  # Clients: Promtail, Grafana, otel-collector — all must present leaf certs.
   loki:
     dns_search: ["."]
     image: docker.io/grafana/loki:3.7.1@sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4
@@ -913,8 +953,20 @@ services:
     volumes:
       - ../config/loki/loki.yml:/etc/loki/loki.yml:ro
       - loki_data:/loki
+      # PKI certs: loki server cert + CA intermediate for client-cert auth.
+      # loki is mtls_capable:true in service_identities.yaml so the bootstrap
+      # issues loki_client.crt/key. /run/secrets is read-only (RO bind-mount).
+      - ./secrets:/run/secrets:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready"]
+      # retro #84: Loki now listens on HTTPS with RequireAndVerifyClientCert.
+      # The probe is intra-container (localhost → self). BusyBox wget does NOT
+      # support --certificate / --private-key for TLS client certs. Using
+      # --no-check-certificate here is deliberate and safe: the probe verifies
+      # only that the Loki PROCESS is responding on :3100. mTLS enforcement for
+      # external clients (Promtail, Grafana, otel-collector) is tested separately
+      # at connect time — those clients send a full TLS client cert; Loki rejects
+      # connections without one. TA-1..4 cannot intercept a localhost probe.
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -928,6 +980,11 @@ services:
   # ---------------------------------------------------------------------------
   # Promtail — ships Docker container logs to Loki
   # ---------------------------------------------------------------------------
+  # retro #84 (v2.23.2): Promtail presents its leaf cert to Loki (mTLS client).
+  # promtail_client.crt/key issued by install.sh PKI bootstrap.
+  # Trust anchor for verifying Loki's server cert: ca_intermediate.crt (Pattern B).
+  # Promtail itself does not terminate TLS (mtls_capable: true in manifest means
+  # it gets a client cert, NOT that it runs a TLS server). Port 9080 remains HTTP.
   promtail:
     dns_search: ["."]
     image: docker.io/grafana/promtail:3.6.10@sha256:2a0f5e3e160ee5d549c585f6cc4f4e1c566ff783324a424bd75bc16503fc660e
@@ -939,13 +996,16 @@ services:
       - ../config/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # PKI certs: promtail client cert for mTLS push to Loki.
+      - ./secrets:/run/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9080' || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
     depends_on:
-      - loki
+      loki:
+        condition: service_healthy
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart for promtail.
     # No cap_add: promtail binds port 9080 (non-privileged). Docker socket access
     # is via bind mount (read-only), not a capability.
@@ -1211,7 +1271,7 @@ services:
   # Integration: OpenClaw (:18789) → Yashigani Gateway (:8080) → Ollama/LLM
   openclaw:
     dns_search: ["."]
-    image: ghcr.io/openclaw/openclaw:2026.3.1@sha256:dcf11a3a97a9b0e42dd41fcd4891533e77ff72e7b0380c743177bfbfd6f38b2d
+    image: ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc
     restart: unless-stopped
     mem_limit: ${YASHIGANI_OPENCLAW_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_OPENCLAW_CPU_LIMIT:-1.0}

@@ -1,4 +1,11 @@
 {{- if .Values.grafana.enabled }}
+# Last updated: 2026-05-07T09:00:00+01:00
+# retro #83: Grafana mTLS ingress + datasource mTLS (Pattern B).
+# fix(helm): G9 blocker: volume items: mapping restores in-pod path after ConfigMap key rename.
+# - GF_SERVER_PROTOCOL=https, port 3443, cert from yashigani-pki-certs secret.
+# - Datasource calls (Prometheus, Loki) use grafana_client.crt for mTLS.
+# - Readiness/liveness probes updated to HTTPS port 3443 with insecureSkipVerify
+#   (localhost-only probe; no SPIFFE validation needed for K8s probe path).
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -41,8 +48,10 @@ spec:
             capabilities:
               drop: ["ALL"]
           ports:
-            - name: http
-              containerPort: 3000
+            # retro #83: Grafana serves HTTPS on 3443 (mTLS, Pattern B).
+            # Port renamed from `http` to `https` to reflect the protocol change.
+            - name: https
+              containerPort: 3443
               protocol: TCP
           env:
             - name: GF_SECURITY_ADMIN_USER
@@ -62,18 +71,49 @@ spec:
               value: "https://{{ .Values.global.tlsDomain }}/admin/grafana"
             - name: GF_SERVER_SERVE_FROM_SUB_PATH
               value: "true"
+            {{- if .Values.mtls.enabled }}
+            # retro #83: enable mTLS server on Grafana.
+            # TA-3 (network observer): closes plaintext Caddy→Grafana leg on obs network.
+            - name: GF_SERVER_PROTOCOL
+              value: "https"
+            - name: GF_SERVER_HTTP_PORT
+              value: "3443"
+            - name: GF_SERVER_CERT_FILE
+              value: "/run/secrets/grafana_client.crt"
+            - name: GF_SERVER_CERT_KEY
+              value: "/run/secrets/grafana_client.key"
+            {{- end }}
           readinessProbe:
+            {{- if .Values.mtls.enabled }}
+            # retro #83: Grafana serves HTTPS. K8s httpGet probe sends plain HTTP
+            # which Grafana rejects. Use exec+wget with --no-check-certificate
+            # (localhost probe — no mTLS client cert needed for healthcheck path).
+            exec:
+              command:
+                - sh
+                - -c
+                - "wget -qO- --no-check-certificate https://localhost:3443/api/health | grep -q ok"
+            {{- else }}
             httpGet:
               path: /api/health
               port: 3000
+            {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
           livenessProbe:
+            {{- if .Values.mtls.enabled }}
+            exec:
+              command:
+                - sh
+                - -c
+                - "wget -qO- --no-check-certificate https://localhost:3443/api/health | grep -q ok"
+            {{- else }}
             httpGet:
               path: /api/health
               port: 3000
+            {{- end }}
             initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: 5
@@ -87,10 +127,38 @@ spec:
             # is true. Grafana writes PID files and temp buffers here.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.mtls.enabled }}
+            # retro #83: mount PKI certs so Grafana can serve mTLS and the
+            # datasource provisioning YAMLs can reference $__file{} paths.
+            # grafana_client.crt / grafana_client.key — Grafana server cert + datasource client cert.
+            # ca_intermediate.crt — trust anchor for Prometheus + Loki datasource TLS verification.
+            - name: pki-certs
+              mountPath: /run/secrets
+              readOnly: true
+            - name: grafana-provisioning
+              mountPath: /etc/grafana/provisioning
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
+        {{- if .Values.mtls.enabled }}
+        - name: pki-certs
+          secret:
+            secretName: {{ .Values.mtls.secretName }}
+            defaultMode: 0440
+        - name: grafana-provisioning
+          configMap:
+            name: yashigani-grafana-provisioning
+            items:
+              - key: datasources_prometheus.yml
+                path: datasources/prometheus.yml
+              - key: datasources_loki.yml
+                path: datasources/loki.yml
+              - key: datasources_jaeger.yml
+                path: datasources/jaeger.yml
+        {{- end }}
   {{- if .Values.grafana.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
@@ -121,8 +189,15 @@ spec:
     app.kubernetes.io/name: yashigani-grafana
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
+    {{- if .Values.mtls.enabled }}
+    - name: https
+      port: {{ .Values.grafana.service.port }}
+      targetPort: 3443
+      protocol: TCP
+    {{- else }}
     - name: http
       port: {{ .Values.grafana.service.port }}
       targetPort: 3000
       protocol: TCP
+    {{- end }}
 {{- end }}

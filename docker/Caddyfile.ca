@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (CA-signed certificate mode)
-# Last updated: 2026-05-03T00:00:00+01:00
+# Last updated: 2026-05-07T01:00:00+01:00 (retro #83: Grafana mTLS — proxy to grafana:3443)
 # Use this for enterprise / on-prem deployments with an internal CA.
 #
 # Before starting:
@@ -216,6 +216,9 @@ Hiring: https://agnosticsec.com/careers
     }
 
     # ── Grafana — admin-authenticated access via /admin/grafana/* ──────────
+    # retro #83: Grafana now serves HTTPS on port 3443 with mTLS (Pattern B).
+    # Caddy presents caddy_client.crt to Grafana; Grafana verifies via
+    # ca_intermediate.crt. The forward_auth check still applies (admin only).
     handle_path /admin/grafana/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
@@ -226,7 +229,8 @@ Hiring: https://agnosticsec.com/careers
                 redir * /admin/login?next=/admin/grafana/ 302
             }
         }
-        reverse_proxy grafana:3000 {
+        reverse_proxy https://grafana:3443 {
+            import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
@@ -250,6 +254,7 @@ Hiring: https://agnosticsec.com/careers
     }
 
     # ── Prometheus — admin-authenticated access via /admin/prometheus/* ───
+    # retro #83: Prometheus now serves HTTPS on port 9090 (Pattern B mTLS).
     handle_path /admin/prometheus/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
@@ -260,7 +265,8 @@ Hiring: https://agnosticsec.com/careers
                 redir * /admin/login 302
             }
         }
-        reverse_proxy prometheus:9090 {
+        reverse_proxy https://prometheus:9090 {
+            import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
@@ -287,18 +293,16 @@ Hiring: https://agnosticsec.com/careers
     }
 
     # ── Prometheus federation — admin-authenticated ─────────────────────────
+    # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
     handle /metrics-federate* {
         basic_auth {
             {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
         }
         # inject-caddy-verified: prometheus does not validate the header but
-
         # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
-
-        reverse_proxy prometheus:9090 {
-
+        reverse_proxy https://prometheus:9090 {
+            import internal-mtls
             import inject-caddy-verified
-
         }
     }
 
