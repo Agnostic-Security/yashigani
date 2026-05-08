@@ -276,13 +276,27 @@ async def lifespan(app: FastAPI):
             raise
 
     # Startup — schedule daily licence expiry check (v0.7.1)
+    # and inactive-account disable (v2.23.3, FedRAMP AC-2(F2) / LU-YSG-002).
     scheduler = None
     try:
+        import asyncio
+        import logging as _sched_log
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from yashigani.licensing.expiry_monitor import check_and_alert_licence_expiry
+        from yashigani.backoffice.inactive_account_task import run_inactive_account_disable
+
+        _inactive_interval_hours: int = 24
+        try:
+            _inactive_interval_hours = int(
+                os.getenv("YASHIGANI_INACTIVE_DISABLE_INTERVAL_HOURS", "24")
+            )
+            if _inactive_interval_hours < 1:
+                _inactive_interval_hours = 24
+        except (ValueError, TypeError):
+            pass
 
         scheduler = AsyncIOScheduler()
-        # Run once at startup, then every 24 hours
+        # Licence expiry — every 24 hours
         scheduler.add_job(
             check_and_alert_licence_expiry,
             trigger="interval",
@@ -290,16 +304,24 @@ async def lifespan(app: FastAPI):
             id="licence_expiry_check",
             replace_existing=True,
         )
+        # Inactive-account disable — configurable interval (default 24h)
+        scheduler.add_job(
+            run_inactive_account_disable,
+            trigger="interval",
+            hours=_inactive_interval_hours,
+            id="inactive_account_disable",
+            replace_existing=True,
+        )
         scheduler.start()
-        # Fire immediately so the first check happens at startup, not 24h later
-        import asyncio
+        # Fire both immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
+        asyncio.ensure_future(run_inactive_account_disable())
     except ImportError:
-        pass  # apscheduler not installed — expiry alerts disabled
+        pass  # apscheduler not installed — expiry alerts + inactive-disable disabled
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning(
-            "Could not start licence expiry scheduler: %s", exc
+            "Could not start backoffice scheduler: %s", exc
         )
 
     yield
