@@ -201,10 +201,11 @@ adminBootstrap:
   # it avoids another image pull.
   image:
     # Resolves to global.imageRegistry/global.imageOwner/<repo>:<tag>.
-    # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
-    # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
+    # Digest pinned per project image-pinning policy — rebuilt at tip 4ff2dd5
+    # (2026-05-08T00:00+00:00) v2.23.2 GA: post-tag fast-follow digest pin.
+    # Multi-arch INDEX digest (linux/amd64 + linux/arm64), run 25536099398.
     repository: yashigani-gateway
-    tag: "2.23.1@sha256:e3dfc6b4a38f44ccbf6ec965d32140ab621bc15cd360c2953c9a2545962a630a"
+    tag: "2.23.2@sha256:7ffe5b92b23224a5fdcf86bf2570345d979ca2f9f06beda52447efc6ef5b688c"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -220,10 +221,11 @@ adminBootstrap:
 gateway:
   enabled: true
   image:
-    # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
-    # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
+    # Digest pinned per project image-pinning policy — rebuilt at tip 4ff2dd5
+    # (2026-05-08T00:00+00:00) v2.23.2 GA: post-tag fast-follow digest pin.
+    # Multi-arch INDEX digest (linux/amd64 + linux/arm64), run 25536099398.
     repository: yashigani-gateway
-    tag: "2.23.1@sha256:e3dfc6b4a38f44ccbf6ec965d32140ab621bc15cd360c2953c9a2545962a630a"
+    tag: "2.23.2@sha256:7ffe5b92b23224a5fdcf86bf2570345d979ca2f9f06beda52447efc6ef5b688c"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -284,10 +286,11 @@ backoffice:
     - letta
     - openclaw
   image:
-    # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
-    # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
+    # Digest pinned per project image-pinning policy — rebuilt at tip 4ff2dd5
+    # (2026-05-08T00:00+00:00) v2.23.2 GA: post-tag fast-follow digest pin.
+    # Multi-arch INDEX digest (linux/amd64 + linux/arm64), run 25536099398.
     repository: yashigani-backoffice
-    tag: "2.23.1@sha256:542680c17071e15e8f9453fd7e676d9f15e67655e45143f6be2f62b5f131e153"
+    tag: "2.23.2@sha256:34f4e68dac35f6e045bfe6277cd9725340e0e662361cdfb81b2057d3a0ebd0dc"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
