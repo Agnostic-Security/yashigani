@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _backup_existing_data — add K8s pg_dump path via kubectl exec; pod runs as UID 70, no root needed)
 # last-updated: 2026-05-07T12:05:00+01:00 (retro #83: add grafana:472 to _pki_chown_client_keys; retro #84: loki:10001+promtail:0 added)
 # last-updated: 2026-05-07T10:00:00+01:00 (retro #84: loki+promtail added to _pki_chown_client_keys UID map for mTLS cert issuance)
 # last-updated: 2026-05-06T20:00:00+01:00 (P-9 fix: _podman_verify_healthchecks() post-compose-up gate; called on Podman path in compose_up())
@@ -1762,12 +1763,48 @@ _backup_existing_data() {
     log_info "  Audit volume detected: ${audit_volume} (preserved in named volume)"
   fi
 
-  # Backup Postgres data (dump if possible)
-  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
-  if $_runtime_cmd exec docker-postgres-1 pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
-    log_info "  postgres_dump.sql backed up"
+  # Backup Postgres data (dump if possible).
+  # K8s path: find the running postgres pod and exec pg_dump via kubectl.
+  # The postgres pod runs as runAsUser: 70 (postgres on Alpine), so kubectl exec
+  # arrives as UID 70 — the postgres superuser for this cluster. No root needed;
+  # pg_dump -U yashigani_app connects via the local Unix socket (trust auth).
+  # Compose/Podman path: exec into the named container. Container name varies by
+  # runtime and install order, so detect via docker/podman ps rather than
+  # hardcoding 'docker-postgres-1'.
+  if [[ "${MODE:-compose}" == "k8s" ]] || [[ "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    local _pg_pod
+    _pg_pod=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=postgres \
+      --field-selector=status.phase=Running \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [[ -n "$_pg_pod" ]]; then
+      if kubectl exec -i -n "${NAMESPACE}" "$_pg_pod" -- \
+           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+        log_info "  postgres_dump.sql backed up (K8s: pod ${_pg_pod})"
+      else
+        log_info "  Postgres K8s dump skipped (pod not ready or auth failed)"
+        rm -f "${backup_dir}/postgres_dump.sql"
+      fi
+    else
+      log_info "  Postgres dump skipped (no running postgres pod in namespace ${NAMESPACE})"
+    fi
   else
-    log_info "  Postgres dump skipped (not accessible)"
+    # Compose / Podman path: locate the running postgres container by name pattern.
+    # Avoid hardcoding 'docker-postgres-1' — name varies by compose project name,
+    # runtime (podman-compose uses underscores), and container restart count.
+    local _pg_container
+    _pg_container=$($_runtime_cmd ps --format '{{.Names}}' 2>/dev/null \
+      | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
+    if [[ -n "$_pg_container" ]]; then
+      if $_runtime_cmd exec "$_pg_container" \
+           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+        log_info "  postgres_dump.sql backed up (${RUNTIME:-compose}: container ${_pg_container})"
+      else
+        log_info "  Postgres dump failed for container ${_pg_container} — dump skipped"
+        rm -f "${backup_dir}/postgres_dump.sql"
+      fi
+    else
+      log_info "  Postgres dump skipped (no running postgres container found)"
+    fi
   fi
 
   # BUG-58B-04a (v2.23.1): do NOT use 'chmod -R 600' on the backup dir.
