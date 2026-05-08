@@ -2084,57 +2084,151 @@ YASHIGANI_RESPONSE_THRESHOLD=0.85       # Suspicion threshold for response class
 
 ---
 
-## 19. WebAuthn / Passkeys Configuration (since v0.9.0)
+## 19. WebAuthn / FIDO2 Hardware-Key Admin Login (v2.23.3)
 
-v0.9.0 adds phishing-resistant WebAuthn/Passkey MFA for backoffice admin accounts. Supported authenticators include: Face ID, Touch ID, Windows Hello, Android biometrics, YubiKey (FIDO2), and other FIDO2-compatible hardware tokens.
+v2.23.3 upgrades the WebAuthn subsystem to Postgres + Redis backed durable
+storage and adds a proper FIDO2 hardware-key login flow (YubiKey 5, Security
+Key NFC, and any FIDO2-certified authenticator). The credential store is now
+persistent across container restarts. Supported authenticators include:
+YubiKey 5 series, Security Key by Yubico, FIDO2 hardware tokens, Face ID,
+Touch ID, Windows Hello, and Android FIDO2 biometrics.
 
-### 19.1 Registration
+**TLS is required.** WebAuthn ceremonies are rejected by all modern browsers
+on non-HTTPS origins. Configure TLS via Caddy (the default reverse proxy)
+before enabling WebAuthn.
 
-Admin users register a passkey via the backoffice:
-
-1. Log in with username + password (and TOTP if enrolled).
-2. Navigate to Admin → Account → Security → Passkeys → Register New Passkey.
-3. The browser presents the platform authenticator (Face ID / Windows Hello) or prompts for a hardware key.
-4. On success, the credential is stored encrypted with `pgp_sym_encrypt` in the `webauthn_credentials` table.
-
-The following audit event is emitted: `WEBAUTHN_CREDENTIAL_REGISTERED`.
-
-### 19.2 Authentication
-
-Once a passkey is registered:
-
-1. The login form presents a **Use Passkey** button alongside the password field.
-2. The browser's platform authenticator handles the challenge locally — no credential material leaves the device.
-3. The server verifies the assertion via `py_webauthn`.
-4. Session is established. TOTP is not required if authentication succeeded via WebAuthn.
-
-The following audit event is emitted: `WEBAUTHN_CREDENTIAL_USED`.
-
-### 19.3 Credential Management
-
-View and delete credentials: Admin → Account → Security → Passkeys.
-
-```bash
-# List credentials via API:
-curl -H "Authorization: Bearer $TOKEN" \
-  https://your-domain/auth/webauthn/credentials
-
-# Delete a credential:
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
-  https://your-domain/auth/webauthn/credentials/{credential_id}
-```
-
-Deleting the last registered passkey falls back to TOTP (if enrolled) or password-only. The audit event `WEBAUTHN_CREDENTIAL_DELETED` is emitted on deletion.
-
-### 19.4 `.env` Settings
+### 19.1 Environment Variables
 
 ```dotenv
-YASHIGANI_WEBAUTHN_RP_ID=your-domain.example.com   # Relying Party ID (must match FQDN)
-YASHIGANI_WEBAUTHN_RP_NAME=Yashigani               # Human-readable RP name shown in authenticator dialogs
-YASHIGANI_WEBAUTHN_ORIGIN=https://your-domain.example.com  # Must match the exact origin of the backoffice
+# Relying Party ID — must match your backoffice domain exactly (no port, no scheme).
+# Example: admin.example.com  NOT  https://admin.example.com:8443
+YASHIGANI_WEBAUTHN_RP_ID=admin.example.com
+
+# Human-readable name shown in authenticator dialogs (optional).
+YASHIGANI_WEBAUTHN_RP_NAME=Yashigani Backoffice
+
+# User verification: preferred (default) | required | discouraged.
+# Use "required" for high-assurance deployments (forces biometric/PIN on every login).
+YASHIGANI_WEBAUTHN_USER_VERIFICATION=preferred
+
+# Attestation: none (default) | indirect | direct | enterprise.
+# "none" is appropriate for most deployments; "direct" enables AAGUID-based
+# device attestation verification.
+YASHIGANI_WEBAUTHN_ATTESTATION=none
+
+# Whether to require resident keys (discoverable credentials).
+# false = compatible with all FIDO2 keys; true = requires FIDO2 resident-key support.
+YASHIGANI_WEBAUTHN_REQUIRE_RESIDENT_KEY=false
 ```
 
-> **Note:** `YASHIGANI_WEBAUTHN_RP_ID` and `YASHIGANI_WEBAUTHN_ORIGIN` must be set to your actual domain. Passkey registration and authentication will fail if these values do not match the browser's current origin.
+> **Critical:** `YASHIGANI_WEBAUTHN_RP_ID` must match the eTLD+1 of the backoffice
+> origin. If the backoffice runs at `https://admin.example.com:8443`, set
+> `YASHIGANI_WEBAUTHN_RP_ID=admin.example.com` (no port, no scheme). Mismatches
+> cause all WebAuthn ceremonies to fail with an origin error.
+
+### 19.2 Registration Flow
+
+To register a new FIDO2 credential (YubiKey, built-in authenticator, etc.):
+
+1. Log in to the backoffice with username + password + TOTP (existing method).
+2. Navigate to **Admin → Account → Security → Passkeys → Register New Security Key**.
+3. The backoffice calls `POST /api/v1/admin/webauthn/register/start` to obtain a
+   challenge (returns `PublicKeyCredentialCreationOptions`).
+4. The browser calls `navigator.credentials.create()` — insert/touch the hardware key.
+5. The backoffice calls `POST /api/v1/admin/webauthn/register/finish` to verify
+   attestation and persist the credential.
+6. One admin can have multiple credentials registered (one per physical key).
+
+Audit event emitted: `WEBAUTHN_CREDENTIAL_REGISTERED`.
+
+The following columns are stored per credential in `webauthn_credentials`:
+
+| Column | Description |
+|---|---|
+| `id` | UUID (primary key) |
+| `admin_id` | FK to `admin_accounts.account_id` |
+| `credential_id` | Raw FIDO2 credential ID (bytes, unique) |
+| `public_key` | COSE public key (encrypted via `pgp_sym_encrypt`) |
+| `sign_count` | BIGINT — monotonic counter; 0 = not tracked |
+| `transports` | CTAP transport hints (e.g. `{usb, nfc}`) |
+| `friendly_name` | Operator label (e.g. "YubiKey 5 Nano work") |
+| `aaguid` | Authenticator AAGUID for attestation |
+| `created_at` | TIMESTAMPTZ |
+| `last_used_at` | TIMESTAMPTZ (NULL until first use) |
+
+### 19.3 Login Flow
+
+Once at least one FIDO2 credential is registered, the admin login page
+(`/admin/login`) presents a **Sign in with Security Key** button below the
+existing password+TOTP form.
+
+**WebAuthn login steps:**
+
+1. Admin enters username and clicks **Sign in with Security Key**.
+2. Browser calls `POST /api/v1/admin/webauthn/login/start` (public endpoint —
+   no session required) with the username.
+3. Server looks up the admin's registered credential IDs and returns a challenge.
+4. Browser calls `navigator.credentials.get()` — admin touches the hardware key.
+5. Browser POSTs the assertion to `POST /api/v1/admin/webauthn/login/finish`
+   (public endpoint) along with the username.
+6. Server verifies assertion + sign_count; sets admin session cookie; returns 200.
+
+Audit events emitted: `WEBAUTHN_LOGIN_SUCCESS` or `WEBAUTHN_LOGIN_FAILURE`.
+
+### 19.4 Recovery — Fallback to Password + TOTP
+
+**Password + TOTP login is never disabled** when WebAuthn is configured. If all
+hardware keys are lost or unavailable:
+
+1. Use the standard TOTP form at `/admin/login`.
+2. Enter username + password + TOTP code as normal.
+
+This is the recovery escape hatch. It cannot be disabled while WebAuthn is
+active. To remove FIDO2 credentials that belong to a locked-out admin, a second
+admin must revoke them via the Credential Management API (step-up required).
+
+### 19.5 Credential Management
+
+```bash
+# List your registered credentials (authenticated session required):
+curl -b "cookie-jar" https://admin.example.com/api/v1/admin/webauthn/credentials
+
+# Delete a credential (authenticated session + TOTP step-up required):
+# First perform step-up: POST /auth/stepup with current TOTP code.
+curl -b "cookie-jar" -X DELETE \
+  https://admin.example.com/api/v1/admin/webauthn/credentials/{credential_uuid}
+```
+
+Credential deletion requires a TOTP step-up (fresh TOTP within 5 minutes,
+configurable via `YASHIGANI_STEPUP_TTL_SECONDS`). This prevents a stolen
+session cookie from silently removing all keys.
+
+Audit event: `WEBAUTHN_CREDENTIAL_REVOKED`.
+
+### 19.6 API Reference (v2.23.3)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/v1/admin/webauthn/register/start` | Session | Begin registration ceremony |
+| POST | `/api/v1/admin/webauthn/register/finish` | Session | Complete registration |
+| POST | `/api/v1/admin/webauthn/login/start` | **Public** | Begin authentication ceremony |
+| POST | `/api/v1/admin/webauthn/login/finish` | **Public** | Complete authentication, issue session |
+| GET | `/api/v1/admin/webauthn/credentials` | Session | List credentials |
+| DELETE | `/api/v1/admin/webauthn/credentials/{id}` | Session + Step-up | Revoke credential |
+
+### 19.7 Security Notes
+
+- **TLS required.** All WebAuthn ceremonies must occur over HTTPS. Caddy handles
+  this by default; do not expose the backoffice on plain HTTP.
+- **sign_count enforcement.** Each successful authentication must advance the
+  sign_count. A rollback (or equal count when non-zero) is rejected as a possible
+  cloned-authenticator attack (ASVS V2.8).
+- **Challenge lifetime.** Challenges expire after 5 minutes (Redis TTL). Starting
+  a ceremony and completing it more than 5 minutes later will return 400.
+- **Origin binding.** The expected origin is derived from the `Host` and
+  `X-Forwarded-Proto` headers. Ensure Caddy forwards these headers faithfully.
+- **Cross-origin attestation.** The `py_webauthn` library rejects attestation
+  from a different origin than the one registered.
 
 ---
 
@@ -2740,6 +2834,7 @@ The `sign_image.sh` script detects signing mode automatically: if `COSIGN_PRIVAT
 
 ---
 
+<<<<<<< HEAD
 ## 28. Operational — Rotating Secrets (v2.23.3)
 
 Yashigani v2.23.3 introduces admin-triggered secret rotation for infrastructure

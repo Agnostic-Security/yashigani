@@ -47,10 +47,25 @@
             <button type="submit" id="pw-btn">Change Password</button>
         </form>
 
-        <p class="footer">Yashigani v2.1 &mdash; Agnostic Security</p>
+        <!-- WebAuthn / FIDO2 hardware key option
+             Hidden until JS confirms browser support (via webauthn_login.js).
+             Username field is shared with the TOTP form above. -->
+        <div id="webauthn-section">
+            <div class="divider"><span>or</span></div>
+            <button type="button" id="webauthn-login-btn" class="btn-secondary">
+                Sign in with Security Key
+            </button>
+            <p class="hint webauthn-hint">
+                Touch your FIDO2 / YubiKey when prompted.
+                If you have lost all keys, use the password + TOTP form above.
+            </p>
+        </div>
+
+        <p class="footer">Yashigani v2.23.3 &mdash; Agnostic Security</p>
     </div>
 
     <script src="/static/js/login.js"></script>
+    <script src="/static/js/webauthn_login.js"></script>
     <div class="powered-by">Powered by <a href="https://agnosticsec.com" target="_blank">Agnostic Security</a></div>
 </body>
 </html>
