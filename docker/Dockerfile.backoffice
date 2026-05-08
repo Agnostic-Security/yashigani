@@ -26,9 +26,11 @@ RUN groupadd --gid 1001 yashigani \
  && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false yashigani
 
 # libpq5 for asyncpg/psycopg2, xmlsec1 for python3-saml SAML assertion signing
+# age (v1.2.1-1+b5, debian bookworm) for MP.L2-3.8.9 backup encryption — CWE-312
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
         libxmlsec1-openssl \
+        age=1.2.1-1+b5 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
