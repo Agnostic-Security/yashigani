@@ -103,7 +103,7 @@ Full release narrative: [`docs/release-notes/v2.23.2.md`](docs/release-notes/v2.
 
 ### Compliance
 
-- **OWASP ASVS v5 L3: 92% (166/180)** — Zero release-blocking FAILs. All six v2.23.1 FAILs remain closed. Per-chapter rates available at `docs/yashigani_owasp.md`.
+- **OWASP ASVS v5 L3: 92% (166/180)** — Zero release-blocking FAILs. All six v2.23.1 FAILs remain closed. Full per-framework breakdown at [`docs/compliance-reports/`](docs/compliance-reports/aggregate.md).
 - **OWASP API Security Top 10**: 9/10 PASS, 1/10 PARTIAL — no failures.
 - **OWASP Agentic AI + LLM Top 10**: 22/25 PASS, 2/25 PARTIAL, 1/25 N/A (out-of-architecture) — no failures.
 

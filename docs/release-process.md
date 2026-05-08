@@ -172,6 +172,9 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 | 12 | Risk register updated | Compliance Reviewer | exception-register.md | All accepted risks logged |
 | 13 | Maintainer HITL GO | Release Coordinator | Verbal/chat confirmation | "GO release" |
 | 14 | Tag + push | Release Engineer | `git tag v<ver>` | Tag visible on GitHub |
+| 15 | Public-doc hygiene grep | Release Engineer | `grep -rn -E '(tiago\|rosado\|maxine\|tom\|su\|captain\|iris\|laura\|ava\|ogen\|rhea\|nora\|nico\|lior\|petra\|reel)' docs/` | Zero matches |
+| 16 | Public-doc internal-strategy grep | Release Engineer | `grep -rn -i -E 'private programme\|customer programme\|cutover\|last public\|going private\|private tier' docs/` | Zero matches |
+| 17 | Compliance reports regenerated | Compliance Auditor | `docs/compliance-reports/` regenerated from canonical sources; aggregate.md PASS-rate and last-updated timestamp match the v<ver> tag SHA | All per-framework files dated current release; aggregate.md headline rate present |
 
 ---
 
