@@ -396,8 +396,27 @@ class BreakGlassManager:
 _manager: Optional[BreakGlassManager] = None
 
 
-def init_break_glass(redis_client, audit_writer=None) -> BreakGlassManager:
-    """Initialise the module-level BreakGlassManager. Call once at startup."""
+def init_break_glass(redis_client, audit_writer) -> BreakGlassManager:
+    """Initialise the module-level BreakGlassManager. Call once at startup.
+
+    Parameters
+    ----------
+    redis_client:
+        A configured Redis client (any redis-py compatible client).
+    audit_writer:
+        Required. An :class:`~yashigani.audit.writer.AuditLogWriter` instance
+        that receives ``BreakGlassActivatedEvent`` and ``BreakGlassExpiredEvent``
+        records. Break-glass sessions MUST be audited; a silent audit-writer
+        default (``None``) was the gap closed by yashigani-retro#95 / OWASP A09.
+        Pass ``audit_writer`` explicitly — the entrypoint always has one.
+
+    Raises
+    ------
+    TypeError
+        If called without ``audit_writer`` (enforced by Python's required-arg
+        semantics — no default). This converts a runtime silent-failure into a
+        startup-time crash that surfaces immediately.
+    """
     global _manager
     _manager = BreakGlassManager(redis_client, audit_writer)
     return _manager
