@@ -207,6 +207,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.redis.existingSecretName | default "yashigani-redis-secrets" }}
                   key: redis_password
+            # v2.23.3 (#59) — W6 fix: YASHIGANI_DB_AES_KEY required for pgcrypto
+            # pgp_sym_encrypt on auth_settings table (HIBP API key at rest).
+            # Sourced from backoffice secret (same secret as install.sh writes).
+            # Key format: 64-char hex (32 bytes) or 44-char base64.
+            # Missing key → RuntimeError at lifespan startup (fail-closed per SOP 1).
+            - name: YASHIGANI_DB_AES_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backoffice.existingSecretName | default "yashigani-backoffice-secrets" }}
+                  key: db_aes_key
             {{- if .Values.mtls.enabled }}
             # EX-231-10 Layer B: backoffice middleware reads CADDY_INTERNAL_HMAC at
             # lifespan startup and rejects requests without a matching

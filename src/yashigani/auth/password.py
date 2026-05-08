@@ -223,6 +223,12 @@ def check_hibp(password: str, *, api_key: Optional[str] = None) -> Optional[int]
     """
     _api_url = hibp_api_url()
 
+    # SSRF gate (PR #81 / W5): when PR #81 merges it re-routes this call through
+    # the centralised HttpClient which enforces the SSRF allowlist.  At that point
+    # the import below changes from `httpx.get` (direct) to HttpClient.get (gated).
+    # Unit tests that mock `httpx.get` must be updated to mock the HttpClient call
+    # path instead.  The urllib fallback path also moves through HttpClient then.
+    # Until PR #81 merges, this is the direct-httpx path (no SSRF gate).
     try:
         import httpx
     except ImportError:

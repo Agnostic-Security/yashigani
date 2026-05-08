@@ -143,13 +143,19 @@ async def set_hibp_key(body: HibpKeyRequest, session: StepUpAdminSession):
         masked,
     )
 
+    # Audit is best-effort: if write() raises (e.g. audit sink unavailable) we
+    # must NOT propagate the exception — the key was already written to the DB.
+    # W4 fix: wrap in try/except consistent with _write_audit() in webauthn.py.
     audit_writer = _get_audit_writer()
     if audit_writer is not None:
-        from yashigani.audit.schema import HibpApiKeyUpdatedEvent
-        audit_writer.write(HibpApiKeyUpdatedEvent(
-            admin_account=session.account_id,
-            masked_key_hint=masked or "",
-        ))
+        try:
+            from yashigani.audit.schema import HibpApiKeyUpdatedEvent
+            audit_writer.write(HibpApiKeyUpdatedEvent(
+                admin_account=session.account_id,
+                masked_key_hint=masked or "",
+            ))
+        except Exception as _exc:
+            _log.error("HIBP audit write failed (best-effort, key was saved): %s", _exc)
 
     # Return updated status
     status_data = await get_hibp_key_status(settings_store=store)
@@ -173,12 +179,16 @@ async def clear_hibp_key(session: StepUpAdminSession):
 
     _log.info("HIBP_API_KEY_CLEARED admin=%r", session.account_id)
 
+    # Audit is best-effort: same pattern as PUT /key above.
     audit_writer = _get_audit_writer()
     if audit_writer is not None:
-        from yashigani.audit.schema import HibpApiKeyClearedEvent
-        audit_writer.write(HibpApiKeyClearedEvent(
-            admin_account=session.account_id,
-        ))
+        try:
+            from yashigani.audit.schema import HibpApiKeyClearedEvent
+            audit_writer.write(HibpApiKeyClearedEvent(
+                admin_account=session.account_id,
+            ))
+        except Exception as _exc:
+            _log.error("HIBP audit write failed (best-effort, key was cleared): %s", _exc)
 
     # Return updated status
     status_data = await get_hibp_key_status(settings_store=store)
