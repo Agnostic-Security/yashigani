@@ -172,22 +172,22 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 | 12 | Risk register updated | Compliance Reviewer | exception-register.md | All accepted risks logged |
 | 13 | Maintainer HITL GO | Release Coordinator | Verbal/chat confirmation | "GO release" |
 | 14 | Tag + push | Release Engineer | `git tag v<ver>` | Tag visible on GitHub |
-| G16 | Dep-bump sweep (all types) | Captain (images/Actions/Helm) / Tom (Python/JS) / Maxine (sign-off) | `ci-evidence/<sha>/dep-bump-sweep.txt` | `Dep sweep: PASS` |
+| G16 | Dep-bump sweep (all types) | Container specialist (images/Actions/Helm) / Python specialist (Python/JS) / Release coordinator (sign-off) | `ci-evidence/<sha>/dep-bump-sweep.txt` | `Dep sweep: PASS` |
 
 ---
 
 ## 6a. Specialist PR Review Gate
 
-**Rationale:** F-T10-001 (2026-05-06) — Captain authored Python `gateway/` code that shipped two correctness bugs (`math.isfinite` NaN clamp, `float(os.getenv(...))` DoS on bad env value). Tom caught both on review. Root cause: wrong specialist dispatched for the language domain. Rule codified in `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`.
+**Rationale:** F-T10-001 (2026-05-06) — the container specialist authored Python `gateway/` code that shipped two correctness bugs (`math.isfinite` NaN clamp, `float(os.getenv(...))` DoS on bad env value). The Python specialist caught both on review. Root cause: wrong specialist dispatched for the language domain. Rule codified in `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`.
 
 **Domain-to-specialist mapping (MUST have approval before merge):**
 
 | Files changed | Required reviewer | Identity |
 |---|---|---|
-| `src/yashigani/gateway/**/*.py` | Tom | `tom@agnosticsec.com` |
-| Any other `**/*.py` (services, tests, migrations) | Tom | `tom@agnosticsec.com` |
-| `install.sh`, `uninstall.sh`, `restore.sh`, `update.sh`, `scripts/*.sh`, `*.sh` entrypoints | Su | `su@agnosticsec.com` |
-| `Dockerfile*`, `docker-compose*.yml`, `helm/**`, `**/*.yaml` K8s manifests | Captain | `captain@agnosticsec.com` |
+| `src/yashigani/gateway/**/*.py` | Python specialist | `tom@agnosticsec.com` |
+| Any other `**/*.py` (services, tests, migrations) | Python specialist | `tom@agnosticsec.com` |
+| `install.sh`, `uninstall.sh`, `restore.sh`, `update.sh`, `scripts/*.sh`, `*.sh` entrypoints | Installer specialist | `su@agnosticsec.com` |
+| `Dockerfile*`, `docker-compose*.yml`, `helm/**`, `**/*.yaml` K8s manifests | Container specialist | `captain@agnosticsec.com` |
 
 **Hard rule:** A PR touching files in one of the above domains MUST carry an approved review from the listed specialist before it is counted as merged for the purposes of this gate. An approval from any other reviewer does not substitute.
 
@@ -201,18 +201,18 @@ gh pr list --state merged --base 2.23.x --limit 100 --json number,title,mergedAt
 
 # For each PR touching gateway/ Python:
 gh pr view <number> --json reviews | jq '.reviews[] | select(.state=="APPROVED") | .author.login'
-# Must include "tom" or "tomYSG" (check team slug for the repo).
+# Must include the Python specialist account (tom@agnosticsec.com).
 
 # For each PR touching install.sh / scripts/:
-# Must include "su" or "suYSG".
+# Must include the installer specialist account (su@agnosticsec.com).
 
 # For each PR touching Dockerfiles / helm/:
-# Must include "captain" or "captainYSG".
+# Must include the container specialist account (captain@agnosticsec.com).
 ```
 
 **Evidence format:** paste the `gh pr view` output per PR (or the `gh pr list` JSON) into the release evidence directory as `ci-evidence/<sha>/specialist-review-gate.txt`. Gate 6a is GREEN only when every in-scope PR has the required approval recorded in that file.
 
-**Cross-domain PRs:** decompose at review time — a PR touching Python and Helm needs both Tom and Captain approvals. A PR touching Python and shell needs both Tom and Su approvals.
+**Cross-domain PRs:** decompose at review time — a PR touching Python and Helm needs both the Python specialist and container specialist approvals. A PR touching Python and shell needs both the Python specialist and installer specialist approvals.
 
 **Rule reference:** `~/.claude/projects/-Users-max-Documents-Claude/memory/feedback_right_specialist_per_language.md`
 
@@ -230,21 +230,21 @@ gh pr view <number> --json reviews | jq '.reviews[] | select(.state=="APPROVED")
 
 **Owner mapping — generative by dep type (applies to ALL Agnostic Security repos, current AND future):**
 
-The owner-by-dep-type mapping is the canonical rule. New repos inherit this mapping by default — no per-repo configuration required. Tiago directive: "for any future projects or products/services" (2026-05-08).
+The owner-by-dep-type mapping is the canonical rule. New repos inherit this mapping by default — no per-repo configuration required.
 
 | Dep type | Default owner |
 |---|---|
-| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Tom |
-| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Captain |
-| Helm chart dependencies (`Chart.yaml`) | Captain |
-| Kubernetes manifest version pins | Captain |
-| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Captain |
-| JS / npm / TypeScript / frontend frameworks | Tom (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
-| Shell / installer / systemd-unit dependencies | Su |
-| Rust packages (`Cargo.toml`) | Tom (interim — Rust specialist gap) |
-| Go modules (`go.mod`) | Tom (interim — Go specialist gap) |
+| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Python specialist |
+| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Container specialist |
+| Helm chart dependencies (`Chart.yaml`) | Container specialist |
+| Kubernetes manifest version pins | Container specialist |
+| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Container specialist |
+| JS / npm / TypeScript / frontend frameworks | Python specialist (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
+| Shell / installer / systemd-unit dependencies | Installer specialist |
+| Rust packages (`Cargo.toml`) | Python specialist (interim — Rust specialist gap) |
+| Go modules (`go.mod`) | Python specialist (interim — Go specialist gap) |
 
-Maxine reviews and signs off in the release evidence directory before Gate 13.
+Release coordinator reviews and signs off in the release evidence directory before Gate 13.
 
 #### Current-state repo coverage (snapshot, not authoritative — rule is the table above)
 
@@ -261,7 +261,7 @@ Maxine reviews and signs off in the release evidence directory before Gate 13.
 
 **FAIL:** any dep >2 minor behind without rationale, OR any open HIGH/CRITICAL Dependabot alert in any Agnostic Security repo (current or future), OR any floating-stub tag in container image pins (see below).
 
-### Command sequence — container images (Captain)
+### Command sequence — container images (container specialist)
 
 ```sh
 # 1. Enumerate every image reference across compose, Helm, and Dockerfiles
@@ -303,7 +303,7 @@ grep -E 'digest:' helm/yashigani/values.release.yaml | wc -l
 # Count must equal number of external images in scope
 ```
 
-### Command sequence — Python packages (Tom)
+### Command sequence — Python packages (Python specialist)
 
 ```sh
 # 1. Check pyproject.toml / requirements files for version pins
@@ -319,7 +319,7 @@ pip index versions <package>   # shows available versions
 # CI pip-audit artifact must show exit 0 (see Gate 6 in §6 table).
 ```
 
-### Command sequence — npm/JS packages (Tom, interim for agnosticsec-website)
+### Command sequence — npm/JS packages (Python specialist, interim for agnosticsec-website)
 
 ```sh
 # Run from the agnosticsec-website repo root:
@@ -338,7 +338,7 @@ git diff package-lock.json  # must be clean (no unstaged lock drift)
 # npm outdated output — "Wanted" vs "Latest" columns. Any gap >2 minor = document rationale.
 ```
 
-### Command sequence — GitHub Actions (Captain)
+### Command sequence — GitHub Actions (container specialist)
 
 ```sh
 # For each Agnostic Security repo with GitHub Actions present (see current-state snapshot above):
@@ -353,7 +353,7 @@ gh api repos/<owner>/<repo>/releases/latest --jq '.tag_name'
 # 3. If a SHA is pinned to a tag >2 minor behind latest: document rationale or bump.
 ```
 
-### Command sequence — Helm chart dependencies (Captain)
+### Command sequence — Helm chart dependencies (container specialist)
 
 ```sh
 # From yashigani repo:
@@ -434,19 +434,19 @@ The dep-bump sweep (§6b / G16) runs at release time. Between releases, Dependab
 
 ### Owner mapping — generative by dep type
 
-The owner-by-dep-type mapping is the canonical rule and applies to ALL current AND future Agnostic Security repos by default. Tiago directive: "for any future projects or products/services" (2026-05-08).
+The owner-by-dep-type mapping is the canonical rule and applies to ALL current AND future Agnostic Security repos by default.
 
 | Dep type | Default owner |
 |---|---|
-| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Tom |
-| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Captain |
-| Helm chart dependencies (`Chart.yaml`) | Captain |
-| Kubernetes manifest version pins | Captain |
-| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Captain |
-| JS / npm / TypeScript / frontend frameworks | Tom (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
-| Shell / installer / systemd-unit dependencies | Su |
-| Rust packages (`Cargo.toml`) | Tom (interim — Rust specialist gap) |
-| Go modules (`go.mod`) | Tom (interim — Go specialist gap) |
+| Python packages (`pyproject.toml`, `requirements*.txt`, lock files) | Python specialist |
+| Container / OCI images (Dockerfile, docker-compose, Helm `image:`) | Container specialist |
+| Helm chart dependencies (`Chart.yaml`) | Container specialist |
+| Kubernetes manifest version pins | Container specialist |
+| GitHub Actions (`.github/workflows/*.yml` `uses:`) | Container specialist |
+| JS / npm / TypeScript / frontend frameworks | Python specialist (interim — frontend specialist gap per `project_team_gaps_cto_coo.md`) |
+| Shell / installer / systemd-unit dependencies | Installer specialist |
+| Rust packages (`Cargo.toml`) | Python specialist (interim — Rust specialist gap) |
+| Go modules (`go.mod`) | Python specialist (interim — Go specialist gap) |
 
 #### Current-state repo snapshot (not authoritative — rule is the table above)
 
@@ -461,8 +461,8 @@ The owner-by-dep-type mapping is the canonical rule and applies to ALL current A
 
 1. Enable Dependabot in `.github/dependabot.yml` for every dep type present in that repo.
 2. Confirm the generative owner mapping above covers all alert surfaces — no per-repo owner override required.
-3. If a new dep type appears that is not in the table above, propose an extension to both this doc and `feedback_dependabot_triage_cadence.md`, and flag to Maxine.
-4. Add the repo to the weekly Maxine triage roster — no further onboarding steps required.
+3. If a new dep type appears that is not in the table above, propose an extension to both this doc and `feedback_dependabot_triage_cadence.md`, and flag to the release coordinator.
+4. Add the repo to the weekly release coordinator triage roster — no further onboarding steps required.
 
 ### Workflow
 
@@ -470,8 +470,8 @@ The owner-by-dep-type mapping is the canonical rule and applies to ALL current A
 2. Owner triages within cadence window: confirm impact + plan fix (`immediate` / `next-release` / `accept-risk`).
 3. If **immediate**: branch + PR + CI green + merge within 5 working days (HIGH/CRITICAL).
 4. If **next-release**: tag the alert with `defer:vN.Y.Z` label in GitHub.
-5. If **accept-risk**: document rationale in the exception register and close with `wontfix` or equivalent — requires Maxine sign-off.
-6. Maxine reviews Dependabot alert status weekly (surfaced in release planning check-in).
+5. If **accept-risk**: document rationale in the exception register and close with `wontfix` or equivalent — requires release coordinator sign-off.
+6. Release coordinator reviews Dependabot alert status weekly (surfaced in release planning check-in).
 7. G16 at next release will FAIL if any HIGH/CRITICAL alert remains open without an `accept-risk` exception on record.
 
 ---
