@@ -226,13 +226,46 @@ ROTATE_RESPONSE=$(curl "${CURL_OPTS[@]}" \
 
 echo "${ROTATE_RESPONSE}"
 
-# Parse success from JSON (basic grep; jq not required)
+# ---------------------------------------------------------------------------
+# Parse result — enhanced for rotate_all (W9 fix, Iris audit 2026-05-08).
+# The 'all' secret returns child_results with per-secret success/error fields.
+# Older behaviour: grep outer "success": true only → non-specific failure msg.
+# New behaviour: for 'all', emit a per-child summary so the operator knows
+# exactly which secrets rotated and which failed (incident surface reduction).
+# ---------------------------------------------------------------------------
 if echo "${ROTATE_RESPONSE}" | grep -q '"success": true'; then
     echo "" >&2
     echo "[3/3] Rotation reported SUCCESS." >&2
+
+    # For rotate_all, also enumerate child results (informational)
+    if [[ "${SECRET_NAME}" == "all" ]]; then
+        echo "  Child results:" >&2
+        # Extract per-child name/success pairs using awk (no jq needed).
+        # The JSON format is: [{"secret":"postgres_password","success":true,...},...]
+        # awk: print each secret + success field from child_results array.
+        echo "${ROTATE_RESPONSE}" | awk '
+            /"secret"/ { gsub(/[",]/, ""); split($0, a, ": "); secret=a[2] }
+            /"success":/ { gsub(/[",]/, ""); split($0, a, ": "); printf "    %-20s %s\n", secret":", a[2] }
+        ' >&2 || true
+    fi
 else
     echo "" >&2
-    echo "WARNING: Rotation reported failure. Check response above." >&2
+    if [[ "${SECRET_NAME}" == "all" ]]; then
+        # W9 fix: for rotate_all, show per-child status so operator knows
+        # which secrets succeeded before the abort, and which failed.
+        echo "WARNING: rotate_all reported failure. Per-child status:" >&2
+        echo "${ROTATE_RESPONSE}" | awk '
+            /"secret"/ { gsub(/[",]/, ""); split($0, a, ": "); secret=a[2] }
+            /"success":/ { gsub(/[",]/, ""); split($0, a, ": "); printf "    %-20s %s\n", secret":", a[2] }
+            /"error":/ && $0 !~ /null/ { gsub(/[",]/, ""); split($0, a, ": "); printf "      error: %s\n", a[2] }
+        ' >&2 || true
+        echo "" >&2
+        echo "  RUNBOOK: Check which child_results have success=false above." >&2
+        echo "  Partial rotations that succeeded are already active — do NOT" >&2
+        echo "  re-rotate those secrets without confirming service state first." >&2
+    else
+        echo "WARNING: Rotation reported failure for '${SECRET_NAME}'. Check response above." >&2
+    fi
     # Exit 1 so CI pipelines detect failure
     exit 1
 fi

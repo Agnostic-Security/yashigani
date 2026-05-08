@@ -671,3 +671,55 @@ class TestAuditNeverStoresSecretValue:
                     f"{cls.__name__} must not have a '{bad}' field "
                     "— secret values must never be stored in audit events"
                 )
+
+
+# ---------------------------------------------------------------------------
+# W9 regression: rotate_all partial failure response includes child detail
+# ---------------------------------------------------------------------------
+
+class TestW9PartialFailureDetail:
+    """
+    W9 regression: when rotate_all aborts after a child failure, the RotationResult
+    must carry enough per-child detail in child_results that the CLI (or an operator)
+    can identify which secrets succeeded and which failed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_w9_child_results_on_partial_failure(self, tmp_path):
+        """
+        Simulate postgres_password failure (first child).  The result must have:
+        - success=False on the parent
+        - child_results with at least 1 entry (the failed child)
+        - The failed child has success=False
+        """
+        from unittest.mock import patch, AsyncMock
+        from yashigani.secrets.rotator import SecretRotator, SecretName
+
+        rotator = SecretRotator(
+            secrets_dir=str(tmp_path),
+            db_dsn_direct=None,
+            redis_client=None,
+        )
+
+        # Make _rotate_postgres_password raise to trigger abort
+        async def _fail_pg(ts):
+            from yashigani.secrets.rotator import RotationResult
+            return RotationResult(
+                secret="postgres_password",
+                success=False,
+                rotated_at=ts,
+                error="simulated postgres failure",
+            )
+
+        with patch.object(rotator, "_rotate_postgres_password", side_effect=_fail_pg):
+            result = await rotator.rotate(SecretName.ALL)
+
+        assert result.success is False, "W9: outer result must be False on child failure"
+        assert len(result.child_results) >= 1, "W9: child_results must not be empty"
+        failed_child = result.child_results[0]
+        assert failed_child.success is False, "W9: failed child must have success=False"
+        assert failed_child.secret == "postgres_password", "W9: failed child must identify itself"
+        # The error field in the parent must reference the failed secret
+        assert result.error is not None and "postgres_password" in result.error, (
+            "W9: parent error must name the failing secret for operator diagnosis"
+        )

@@ -2636,6 +2636,13 @@ Every rotation produces immutable audit events in the SHA-384 hash chain:
 All rotation events have `masking_applied=true` (immutable floor). Secret
 values are **never** stored in audit events or log files.
 
+**Incomplete audit chain (W11):** If the audit log shows `SECRET_ROTATION_REQUESTED`
+without a paired `SECRET_ROTATION_SUCCEEDED` or `SECRET_ROTATION_FAILED`, this
+indicates the backoffice service crashed during rotation (before the outcome event
+could be written). Recovery: check container logs for the crash cause, verify secret
+state on disk and in Postgres/Redis, then follow §28.5 (Failure recovery) as
+appropriate. GRC tools should alert on unpaired `REQUESTED` events older than 60 seconds.
+
 ### 28.5 Failure recovery
 
 **Scenario A — Rotation failed, revert succeeded** (`reverted=true, revert_failed=false`):
@@ -2655,8 +2662,15 @@ Recovery steps:
 ### 28.6 Security considerations
 
 - The HMAC key rotation (`hmac_key`) has a brief window (~1-2 requests) where
-  Caddy and the backend services hold different secrets. Schedule during
-  low-traffic windows.
+  Caddy and the backend services hold different secrets (Compose/Podman). Schedule
+  during low-traffic windows.
+  **K8s multi-pod note (W10):** In a Kubernetes deployment with multiple Caddy or
+  gateway pods, this window extends across the rolling restart duration.  After
+  rotating `hmac_key`, trigger an immediate rolling restart:
+  `kubectl rollout restart deployment/yashigani-caddy deployment/yashigani-gateway deployment/yashigani-backoffice`
+  and monitor with `kubectl rollout status`. The inconsistency window is bounded
+  by `maxUnavailable * podStartupSeconds`. Contact Captain for Helm `rollingUpdate`
+  strategy tuning appropriate to your traffic profile.
 - JWT token rotation does not invalidate existing tokens. Existing tokens
   remain valid until their `exp` claim; new tokens are signed with the new key.
 - Rotation secrets are written atomically (temp file + `rename(2)`). Concurrent
@@ -2670,4 +2684,4 @@ Recovery steps:
 
 ---
 
-*Yashigani v2.23.2 — Installation and Configuration Guide — 2026-05-03T00:00:00+01:00*
+*Yashigani v2.23.3 — Installation and Configuration Guide — 2026-05-08T00:00:00+01:00*
