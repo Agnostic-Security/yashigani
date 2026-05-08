@@ -46,6 +46,15 @@ from yashigani.backoffice.middleware import (
 )
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
+# W20 fix (Iris PR #62): import auth throttle helpers so that the public
+# login/start and login/finish endpoints are guarded by the same per-IP
+# blocklist + progressive-delay throttle as the password login route.
+from yashigani.backoffice.routes.auth import (
+    _check_ip_access,
+    _apply_auth_throttle,
+    _record_auth_failure,
+    _reset_ip_auth_failures,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,14 +204,23 @@ async def register_finish(
     tags=["webauthn"],
     summary="Begin WebAuthn authentication (public endpoint)",
 )
-async def login_start(body: LoginStartRequest, request: Request):
+async def login_start(body: LoginStartRequest, request: Request, response: Response):
     """
     Begin the WebAuthn authentication ceremony.
     PUBLIC endpoint — does not require a session cookie.
 
     Looks up the admin's account_id by username, then generates a challenge.
     Returns allow_credentials list and challenge for navigator.credentials.get().
+
+    W20 (Iris PR #62): applies the same per-IP blocklist + progressive-delay
+    throttle as the password login route.  An unauthenticated DB-query endpoint
+    without a rate gate is an invitation to enumerate admin usernames at scale.
     """
+    # W20: apply per-IP blocklist + throttle BEFORE any DB query.
+    client_ip = _client_ip(request)
+    _check_ip_access(client_ip)
+    _apply_auth_throttle(client_ip, response)
+
     # Resolve username → account_id via Postgres
     admin_id = await _resolve_admin_id(body.username)
     if admin_id is None:
@@ -246,10 +264,21 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
     On failure: WEBAUTHN_LOGIN_FAILURE audit event + 401.
 
     Audit events: WEBAUTHN_LOGIN_SUCCESS | WEBAUTHN_LOGIN_FAILURE.
+
+    W20 (Iris PR #62): applies the same per-IP blocklist + progressive-delay
+    throttle as login/start and the password login route.  Records auth failure
+    on bad assertion (sign_count rollback, wrong key, bad challenge) so that
+    automated probing accumulates throttle delay across attempts.
     """
+    # W20: apply per-IP blocklist + throttle BEFORE any DB query or assertion.
+    client_ip = _client_ip(request)
+    _check_ip_access(client_ip)
+    _apply_auth_throttle(client_ip, response)
+
     # Resolve username → account_id
     admin_id = await _resolve_admin_id(body.username)
     if admin_id is None:
+        _record_auth_failure(client_ip)
         _write_audit(
             body.username,
             "WEBAUTHN_LOGIN_FAILURE",
@@ -274,6 +303,7 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
         logger.warning(
             "WebAuthn login/finish failed for %s: %s", body.username, exc
         )
+        _record_auth_failure(client_ip)
         _write_audit(
             admin_id,
             "WEBAUTHN_LOGIN_FAILURE",
@@ -290,6 +320,9 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "webauthn_login_finish_failed"},
         )
+
+    # Success: clear failure counter for this IP before issuing session.
+    _reset_ip_auth_failures(client_ip)
 
     # Issue admin session
     store = get_session_store()

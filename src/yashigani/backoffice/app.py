@@ -282,9 +282,13 @@ async def lifespan(app: FastAPI):
                 _log.info("PgWebAuthnService initialised (v2.23.3 FIDO2)")
             except Exception as _wa_exc:
                 # Non-fatal: WebAuthn is optional.  Routes return 503 if pg_webauthn_service is None.
+                # W19 fix: log with exc_info=True so the full traceback is captured (not just
+                # str(exc)) — Iris integration-audit warning on PR #62.  Without exc_info the
+                # stack frame that caused the failure is lost, making mis-config hard to diagnose.
                 _log.warning(
                     "PgWebAuthnService init failed (%s) — /api/v1/admin/webauthn/* will return 503",
                     _wa_exc,
+                    exc_info=True,
                 )
         except Exception as exc:
             # Retro #3ar — fail-closed on lifespan init failure (CLAUDE.md §3).

@@ -12,10 +12,14 @@ S06 — Step-up required on DELETE credential (HTTP 401 without step-up)
 S07 — Unknown username on login/start returns 400 without revealing user existence
 S08 — Disabled admin account: login/start returns no credentials
 
+W18 regression — YASHIGANI_WEBAUTHN_ORIGIN removal documented in upgrade notes
+W19 regression — PgWebAuthnService init failure logs full traceback (exc_info=True)
+W20 regression — login/start and login/finish apply per-IP throttle + blocklist
+
 Tests S01–S05 operate on the in-memory WebAuthnService (no external deps).
 Tests S06–S08 use FastAPI TestClient with mocked state.
 
-Last updated: 2026-05-07T00:00:00+00:00
+Last updated: 2026-05-08T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -362,3 +366,126 @@ class TestUsernameEnumeration:
 
         assert resp.status_code == 400
         assert resp.json()["detail"]["error"] == "no_credentials_registered"
+
+
+# ---------------------------------------------------------------------------
+# W18 regression: YASHIGANI_WEBAUTHN_ORIGIN removal documented
+# ---------------------------------------------------------------------------
+
+class TestW18OriginDeprecation:
+    """
+    W18 regression: confirm that YASHIGANI_WEBAUTHN_ORIGIN is not read anywhere
+    in the webauthn_v1 route code (it was removed; origin is derived from headers).
+    The presence of this test documents the removal and catches accidental re-introduction.
+    """
+
+    def test_origin_not_read_from_env(self):
+        """YASHIGANI_WEBAUTHN_ORIGIN must not appear in webauthn_v1 source."""
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1)
+        assert "YASHIGANI_WEBAUTHN_ORIGIN" not in source, (
+            "W18: YASHIGANI_WEBAUTHN_ORIGIN must not be read in webauthn_v1.py — "
+            "origin is derived from X-Forwarded-Proto + Host headers."
+        )
+
+    def test_expected_origin_uses_headers(self):
+        """_expected_origin() must derive origin from request headers, not env."""
+        from unittest.mock import MagicMock
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+
+        mock_request = MagicMock()
+        mock_request.headers = {"x-forwarded-proto": "https", "host": "admin.example.com"}
+        mock_request.url.scheme = "http"
+        mock_request.url.netloc = "localhost:8443"
+
+        origin = _expected_origin(mock_request)
+        assert origin == "https://admin.example.com"
+        # Must NOT fall back to env var
+        assert "WEBAUTHN_ORIGIN" not in origin
+
+
+# ---------------------------------------------------------------------------
+# W19 regression: PgWebAuthnService init failure logs full traceback
+# ---------------------------------------------------------------------------
+
+class TestW19ExcInfo:
+    """
+    W19 regression: when PgWebAuthnService fails to init, the lifespan must
+    log with exc_info=True so the full traceback is captured.
+    """
+
+    def test_app_py_logs_exc_info_on_webauthn_init_failure(self):
+        """Confirm exc_info=True is present in the webauthn init except block."""
+        import inspect
+        from yashigani.backoffice import app as backoffice_app
+        source = inspect.getsource(backoffice_app)
+        assert "exc_info=True" in source, (
+            "W19: app.py must log PgWebAuthnService init failure with exc_info=True"
+        )
+
+
+# ---------------------------------------------------------------------------
+# W20 regression: login/start and login/finish apply per-IP throttle
+# ---------------------------------------------------------------------------
+
+class TestW20RateGate:
+    """
+    W20 regression: login/start and login/finish are PUBLIC endpoints that accept
+    a username and query the DB.  They must apply the per-IP blocklist and throttle
+    checks from auth.py (_check_ip_access, _apply_auth_throttle).
+    """
+
+    def test_login_start_imports_throttle(self):
+        """webauthn_v1 must import _check_ip_access and _apply_auth_throttle."""
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1)
+        assert "_check_ip_access" in source, (
+            "W20: webauthn_v1 must import and call _check_ip_access"
+        )
+        assert "_apply_auth_throttle" in source, (
+            "W20: webauthn_v1 must import and call _apply_auth_throttle"
+        )
+
+    def test_login_finish_records_failure(self):
+        """webauthn_v1 must call _record_auth_failure on bad assertions."""
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1)
+        assert "_record_auth_failure" in source, (
+            "W20: webauthn_v1 must call _record_auth_failure on credential check failure"
+        )
+
+    def test_login_finish_resets_on_success(self):
+        """webauthn_v1 must call _reset_ip_auth_failures on successful WebAuthn login."""
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1)
+        assert "_reset_ip_auth_failures" in source, (
+            "W20: webauthn_v1 must call _reset_ip_auth_failures on success"
+        )
+
+    def test_blocked_ip_rejected_on_login_start(self):
+        """A blocked IP must receive 403 on login/start (via _check_ip_access)."""
+        from fastapi import FastAPI, HTTPException
+        from fastapi.testclient import TestClient
+        from unittest.mock import patch
+        from yashigani.backoffice.routes.webauthn_v1 import router
+        import yashigani.backoffice.routes.webauthn_v1 as wv1
+
+        app = FastAPI()
+        app.include_router(router)
+
+        def blocked_check(ip):
+            raise HTTPException(status_code=403, detail={"error": "ip_blocked", "message": "blocked"})
+
+        with patch.object(wv1, "_check_ip_access", side_effect=blocked_check):
+            with patch.object(wv1, "_apply_auth_throttle"):
+                client = TestClient(app, raise_server_exceptions=False)
+                resp = client.post(
+                    "/api/v1/admin/webauthn/login/start",
+                    json={"username": "admin@yashigani.local"},
+                )
+
+        assert resp.status_code == 403
