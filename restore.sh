@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
 # Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
 # Last updated: 2026-05-03T12:45:00+01:00 (V232-SMOKE-010: exclude .gitkeep from empty-file check; V232-SMOKE-011: podman unshare chown -R before cp restore; V232-SMOKE-012: secrets dir 0751→0755)
 
@@ -585,6 +586,12 @@ restore_backup() {
     #     password remains live and every post-restore pod startup fails with
     #     "password authentication failed". (retro #3ca)
     _restore_k8s_postgres_secrets "${backup_dir}/secrets"
+    # 6c. PR #67 K8s verify path (v2.23.3 retro gap):
+    #     Restart all Yashigani deployments so pods pick up the restored K8s
+    #     secrets, then wait for rollout + probe /healthz. Previously this was
+    #     only printed as "next steps" — operators forgot to run it and ran into
+    #     auth failures with a nominally-successful restore.
+    _k8s_post_restore_verify
   fi
 
   printf "\n${C_GREEN}${C_BOLD}Restore complete.${C_RESET}\n\n"
@@ -604,10 +611,14 @@ restore_backup() {
       printf "    3. Log in to admin UI and verify credentials work\n"
       ;;
     k8s)
-      printf "  Next steps:\n"
-      printf "    1. Restart pods: kubectl rollout restart deployment -n ${K8S_NAMESPACE}\n"
-      printf "    2. Verify: kubectl exec -n ${K8S_NAMESPACE} deploy/gateway -- curl -s http://localhost:8080/healthz\n"
-      printf "    3. Log in to admin UI and verify credentials work\n"
+      printf "  K8s restore steps completed automatically:\n"
+      printf "    - Secrets updated: kubectl rollout restart deployment -n ${K8S_NAMESPACE} (done)\n"
+      printf "    - Rollout awaited: kubectl rollout status deployment --timeout=300s (done)\n"
+      printf "    - Gateway healthz probed (see output above)\n"
+      printf "  If healthz probe was empty or a deployment timed out above:\n"
+      printf "    kubectl get pods -n ${K8S_NAMESPACE}\n"
+      printf "    kubectl exec -n ${K8S_NAMESPACE} deployment/yashigani-gateway -- curl -sf http://localhost:8080/healthz\n"
+      printf "  Then log in to admin UI and verify credentials work.\n"
       ;;
     *)
       printf "  Secrets and .env restored. Start your services manually.\n"
@@ -1150,6 +1161,89 @@ _restore_k8s_postgres_secrets() {
     log_success "pgbouncer DATABASE_URL updated (restored password)"
   else
     log_warn "kubectl set env on pgbouncer failed — pgbouncer may not accept restored password. Manual: kubectl set env deployment/yashigani-pgbouncer -n ${K8S_NAMESPACE} 'DATABASE_URL=${new_db_url}'"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# PR #67 K8s verify path (retro K8s gap, v2.23.3):
+#
+# After _restore_k8s_secrets + _restore_k8s_postgres_secrets update the K8s
+# secrets and patch pgbouncer's DATABASE_URL, the running pods still have the
+# OLD secret values in their environment (K8s does not hot-reload secrets into
+# running pods unless the pods are restarted). Without an explicit rollout
+# restart + wait, the restore "succeeds" while every pod continues to use the
+# pre-restore credentials → auth failures on the next request.
+#
+# This function:
+#   1. Triggers `kubectl rollout restart deployment` across all Yashigani
+#      deployments in the namespace.
+#   2. Waits for each deployment to reach its desired state with a 300s
+#      timeout (enough for rolling restart on Docker Desktop / kind; extend
+#      with KUBECTL_ROLLOUT_TIMEOUT if needed).
+#   3. Probes the gateway's /healthz endpoint via `kubectl exec` to confirm
+#      the restored pod is serving. A non-200 response is surfaced as a
+#      warning — the restore is already committed, but the operator must
+#      investigate before declaring success.
+# ---------------------------------------------------------------------------
+_k8s_post_restore_verify() {
+  local _ns="${K8S_NAMESPACE}"
+  local _timeout="${KUBECTL_ROLLOUT_TIMEOUT:-300s}"
+
+  log_info "K8s post-restore: restarting deployments in namespace '${_ns}'..."
+
+  # Collect all Yashigani-owned deployments.
+  local _deployments
+  _deployments=$(kubectl get deployments -n "${_ns}" \
+    -l "app.kubernetes.io/instance=yashigani" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "${_deployments}" ]]; then
+    # Fall back to all deployments in the namespace if the label selector
+    # returns nothing (e.g. label not present on all resources).
+    _deployments=$(kubectl get deployments -n "${_ns}" \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+  fi
+
+  if [[ -z "${_deployments}" ]]; then
+    log_warn "No deployments found in namespace '${_ns}' — skipping rollout restart"
+    return 0
+  fi
+
+  if ! kubectl rollout restart deployment -n "${_ns}" >/dev/null 2>&1; then
+    log_warn "kubectl rollout restart failed — pods may still carry pre-restore credentials. Manual: kubectl rollout restart deployment -n ${_ns}"
+  else
+    log_info "Rollout restart triggered. Waiting for deployments to become ready (timeout: ${_timeout})..."
+  fi
+
+  # Wait for each deployment individually so we can report per-deployment failures.
+  local _failed=0
+  for _dep in ${_deployments}; do
+    if ! kubectl rollout status deployment/"${_dep}" \
+        --namespace "${_ns}" \
+        --timeout="${_timeout}" >/dev/null 2>&1; then
+      log_warn "Deployment ${_dep} did not reach Ready within ${_timeout} — check: kubectl get pods -n ${_ns} -l app.kubernetes.io/name=${_dep}"
+      _failed=$((_failed + 1))
+    else
+      log_info "  deployment/${_dep}: Ready"
+    fi
+  done
+
+  if [[ "${_failed}" -gt 0 ]]; then
+    log_warn "${_failed} deployment(s) did not stabilise — restore committed but service may be degraded. Investigate before use."
+    return 0  # non-fatal: restore data is already in place
+  fi
+
+  log_info "All deployments ready. Probing gateway /healthz..."
+
+  # Probe via kubectl exec to avoid network dependency (no port-forward required).
+  local _healthz
+  _healthz=$(kubectl exec -n "${_ns}" deployment/yashigani-gateway -- \
+    curl -sf --max-time 5 http://localhost:8080/healthz 2>/dev/null || true)
+
+  if [[ -z "${_healthz}" ]]; then
+    log_warn "Gateway /healthz probe returned no output — service may be starting up. Retry: kubectl exec -n ${_ns} deployment/yashigani-gateway -- curl -sf http://localhost:8080/healthz"
+  else
+    log_success "Gateway /healthz OK: ${_healthz}"
   fi
 }
 
