@@ -27,7 +27,7 @@ Audit events emitted:
   WEBAUTHN_LOGIN_FAILURE          — failed assertion (wrong key, sign_count rollback, etc.)
   WEBAUTHN_CREDENTIAL_REVOKED     — credential deleted by admin
 
-Last updated: 2026-05-07T00:00:00+00:00
+Last updated: 2026-05-08T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -452,11 +452,17 @@ def _write_audit(
     try:
         from yashigani.audit.schema import (
             WebAuthnCredentialRegisteredEvent,
-            WebAuthnCredentialUsedEvent,
-            WebAuthnCredentialDeletedEvent,
+            WebAuthnLoginSuccessEvent,
+            WebAuthnLoginFailureEvent,
+            WebAuthnCredentialRevokedEvent,
         )
         from yashigani.audit.schema import AuditEvent as _AuditEvent
 
+        # B5 fix (Iris audit): use v2.23.3 event classes with correct wire-format
+        # event_type values. The v0.9.0 classes (WebAuthnCredentialUsedEvent,
+        # WebAuthnCredentialDeletedEvent) carried WEBAUTHN_CREDENTIAL_USED and
+        # WEBAUTHN_CREDENTIAL_DELETED — not the semantically correct labels for
+        # login and revocation events.
         event: _AuditEvent
         if event_label == "WEBAUTHN_CREDENTIAL_REGISTERED":
             event = WebAuthnCredentialRegisteredEvent(
@@ -464,14 +470,17 @@ def _write_audit(
                 outcome=outcome,
                 credential_name=detail,
             )
-        elif event_label in ("WEBAUTHN_LOGIN_SUCCESS", "WEBAUTHN_LOGIN_FAILURE"):
-            event = WebAuthnCredentialUsedEvent(
+        elif event_label == "WEBAUTHN_LOGIN_SUCCESS":
+            event = WebAuthnLoginSuccessEvent(
                 admin_account=account_id,
-                outcome=outcome,
-                failure_reason=detail if outcome == "failure" else "",
+            )
+        elif event_label == "WEBAUTHN_LOGIN_FAILURE":
+            event = WebAuthnLoginFailureEvent(
+                admin_account=account_id,
+                failure_reason=detail,
             )
         elif event_label == "WEBAUTHN_CREDENTIAL_REVOKED":
-            event = WebAuthnCredentialDeletedEvent(
+            event = WebAuthnCredentialRevokedEvent(
                 admin_account=account_id,
                 credential_uuid=detail.replace("credential_id=", ""),
             )
