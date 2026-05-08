@@ -4209,7 +4209,7 @@ k8s_helm_dep_update() {
 }
 
 # STEP 8 (k8s): helm upgrade --install
-# Last updated (k8s_helm_install): 2026-04-27T06:05:04Z
+# Last updated (k8s_helm_install): 2026-05-08T00:00:00+01:00
 k8s_helm_install() {
   set_step "8" "helm upgrade --install"
   log_step "8/${TOTAL_STEPS}" "Deploying via Helm..."
@@ -4228,17 +4228,28 @@ k8s_helm_install() {
     return 0
   fi
 
-  # v2.23.1 task #94 — flag set tuned for the umbrella chart's ~97 rendered
-  # resources + slow-booting open-webui pod:
+  # v2.23.3 retro K8s gap — differentiate fresh-install vs upgrade timeout.
+  #
+  # Fresh install: 10m — pre-flight image pull (scripts/k8s-install.sh or
+  #   operator pre-pull step in kubernetes_deployment.md) is expected before
+  #   helm install. With images already present in the node's containerd
+  #   cache, 10m is sufficient for all hook jobs + pod ready transitions on
+  #   Docker Desktop and kind clusters.
+  #
+  # Upgrade: 5m — pods are already running; only rolling restarts are needed.
+  #   New images should be pre-pulled before upgrading. 5m is tight enough to
+  #   surface stuck rollouts quickly rather than letting operators wait 20m.
+  #
+  # Override: set HELM_TIMEOUT env var before calling install.sh to force a
+  #   specific value (e.g. HELM_TIMEOUT=20m for air-gap first-installs where
+  #   image pull cannot be pre-staged).
+  #
+  # v2.23.1 task #94 — flag set rationale (unchanged):
   #   --wait              block until all Deployments/StatefulSets Available so
   #                       the next install step (rollout status) doesn't race.
   #   --wait-for-jobs     pre-install hooks (admin-bootstrap, mtls-bootstrap)
   #                       must finish before main resources, otherwise the
   #                       backoffice starts without the bootstrap secret.
-  #   --timeout 20m       cold pull of open-webui:main (~2 GiB) + first-boot
-  #                       SvelteKit migration + qwen2.5:3b ollama warm-up can
-  #                       collectively take 12-15 min on Docker Desktop /
-  #                       laptop hardware. 5m default is too tight.
   #   --atomic            on failure, helm rolls back; avoids leaving the
   #                       release in pending-install state which then blocks
   #                       a subsequent helm install with "cannot re-use a
@@ -4249,13 +4260,28 @@ k8s_helm_install() {
   #                       client-go rate limiter and spuriously raise
   #                       "client rate limiter Wait returned an error:
   #                       context deadline exceeded".
+
+  local _helm_timeout
+  if [[ -n "${HELM_TIMEOUT:-}" ]]; then
+    _helm_timeout="${HELM_TIMEOUT}"
+    log_info "Using HELM_TIMEOUT override: ${_helm_timeout}"
+  elif helm status yashigani --namespace "$NAMESPACE" >/dev/null 2>&1; then
+    # Release already exists — this is an upgrade.
+    _helm_timeout="5m"
+    log_info "Existing Helm release detected — using upgrade timeout: ${_helm_timeout}"
+  else
+    # Fresh install.
+    _helm_timeout="10m"
+    log_info "No existing Helm release — using fresh-install timeout: ${_helm_timeout}"
+  fi
+
   local helm_args=(
     upgrade --install yashigani "$chart_dir"
     --namespace "$NAMESPACE"
     --create-namespace
     --wait
     --wait-for-jobs
-    --timeout 20m
+    --timeout "${_helm_timeout}"
     --atomic
     --burst-limit 1000
     --qps 500

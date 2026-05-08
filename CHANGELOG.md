@@ -27,6 +27,7 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ### Security (v2.23.3)
 
 - **fix/agents-urllib-through-httpclient** — `backoffice/routes/agents.py _push_openwebui_model()` previously used a hand-rolled `_assert_safe_owui_url()` with an inline SSRF allowlist (scheme check + `YASHIGANI_OWUI_HOSTNAMES` host allowlist). Replaced with a lazy singleton `_owui_http_client()` (HttpClient, `allow_http=True`, `YASHIGANI_OWUI_HOSTNAMES`-driven allowlist). `BlockedByPolicy` is caught and converted to `RuntimeError` (non-fatal). The hand-rolled helper is removed (yashigani-retro#95 / OWASP A10 / API7 SSRF).
+- **fix/break-glass-audit-writer-required** — `auth/break_glass.py init_break_glass(audit_writer=None)` default removed; `audit_writer` is now a required positional argument. Calling without it raises `TypeError` at startup rather than silently creating an audit-silent break-glass manager. The one call site (`backoffice/entrypoint.py:474`) already passes `audit_writer` explicitly — no functional change there. `_emit_activated` and `_emit_expired` None-guards preserved for defence-in-depth (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1).
 
 ---
 
