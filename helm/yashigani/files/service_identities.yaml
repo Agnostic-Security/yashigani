@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Yashigani — Service Identity Manifest (IaC-declared ecosystem allowlist)
-# Last updated: 2026-05-02T01:00:00+01:00
+# Last updated: 2026-05-07T10:00:00+01:00 (retro #84: promtail mtls_capable: true for Loki mTLS client cert issuance)
 #
 # Every container that speaks inside the Yashigani mesh MUST have an entry
 # here. Services not in this file cannot obtain an internal-CA-signed client
@@ -151,8 +151,12 @@ services:
   - name: promtail
     dns_sans: [promtail, promtail.internal, yashigani-promtail]
     spiffe_id: spiffe://yashigani.internal/promtail
-    purpose: "Docker container log shipper → Loki"
-    mtls_capable: false       # promtail is a client of Loki, no inbound TLS
+    purpose: "Docker container log shipper → Loki (mTLS client, retro #84)"
+    # retro #84 (v2.23.2): flipped to true so install.sh PKI bootstrap issues
+    # promtail_client.crt/key. Promtail does NOT terminate inbound TLS (port 9080
+    # remains plain HTTP for the local healthcheck). mtls_capable:true here means
+    # only that the issuer must produce a client cert for this service.
+    mtls_capable: true
     bootstrap_token_sha256: "b3a01667ae4abdb3ead44bc7cf4d0bd5500fa67f0ae18d690df0c56321df476a"
     revoked: false
 

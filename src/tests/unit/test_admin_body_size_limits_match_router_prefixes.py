@@ -18,8 +18,9 @@ route path. The test fails if any limit entry does not correspond to a real
 route — catching the class of bug where a path is renamed or mistyped and
 the limit entry is left behind.
 
-Last updated: 2026-05-02T19:17:04+01:00
+Last updated: 2026-05-08T12:00:00+01:00
 """
+
 from __future__ import annotations
 
 import re
@@ -39,6 +40,7 @@ _ROUTES_DIR = _BACKOFFICE_DIR / "routes"
 # ---------------------------------------------------------------------------
 # Helpers: extract data from source
 # ---------------------------------------------------------------------------
+
 
 def _read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -77,16 +79,33 @@ def _extract_apirouter_prefixes_from_routes_dir() -> list[str]:
     return prefixes
 
 
+def _extract_add_api_route_paths(source: str) -> list[str]:
+    """
+    Parse paths from app.add_api_route("path", ...) calls in app.py.
+    These are direct single-endpoint registrations that bypass include_router
+    and therefore carry no router prefix — only the literal path string.
+    A body-size limit entry that narrows one of these paths must be matched
+    against the literal path, not a router prefix.
+
+    v2.23.3 example: app.add_api_route("/api/v1/license/status", ...) is
+    covered by _BODY_LIMITS entry ("/api/v1/license", 256).
+    """
+    pattern = re.compile(r'app\.add_api_route\(\s*"(/[^"]+)"', re.DOTALL)
+    return pattern.findall(source)
+
+
 def _collect_all_known_route_prefixes() -> set[str]:
     """
     Union of:
     - Prefixes passed to app.include_router(prefix=...)
     - APIRouter(prefix=...) from every routes/*.py module
+    - Literal paths from app.add_api_route("path", ...) in app.py
     """
     app_source = _read_source(_APP_PY)
     prefixes: set[str] = set()
     prefixes.update(_extract_include_router_prefixes(app_source))
     prefixes.update(_extract_apirouter_prefixes_from_routes_dir())
+    prefixes.update(_extract_add_api_route_paths(app_source))
     return prefixes
 
 
@@ -116,6 +135,7 @@ def _limit_entry_is_covered(limit_prefix: str, route_prefixes: set[str]) -> bool
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestBodySizeLimitsMatchRouterPrefixes:
     """
     Each entry in _BODY_LIMITS must correspond to a real mounted route.
@@ -132,8 +152,7 @@ class TestBodySizeLimitsMatchRouterPrefixes:
         source = _read_source(_APP_PY)
         prefixes = _extract_body_limit_prefixes(source)
         assert len(prefixes) > 0, (
-            "_BODY_LIMITS appears to be empty or the regex failed to parse it. "
-            "Check the source format in app.py."
+            "_BODY_LIMITS appears to be empty or the regex failed to parse it. Check the source format in app.py."
         )
 
     def test_each_body_limit_prefix_matches_a_mounted_route(self):
@@ -148,10 +167,7 @@ class TestBodySizeLimitsMatchRouterPrefixes:
         limit_prefixes = _extract_body_limit_prefixes(source)
         route_prefixes = _collect_all_known_route_prefixes()
 
-        orphans = [
-            p for p in limit_prefixes
-            if not _limit_entry_is_covered(p, route_prefixes)
-        ]
+        orphans = [p for p in limit_prefixes if not _limit_entry_is_covered(p, route_prefixes)]
 
         assert orphans == [], (
             f"Body-size limit entries with no matching mounted router prefix:\n"

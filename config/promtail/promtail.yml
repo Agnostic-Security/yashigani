@@ -1,4 +1,10 @@
 # Promtail — ships Docker container logs to Loki
+#
+# retro #84 (v2.23.2): Promtail→Loki path upgraded to mTLS.
+# Promtail presents its own leaf cert (promtail_client.crt/key) so Loki can
+# verify the ingest client. The CA trust anchor is ca_intermediate.crt
+# (Pattern B — never ca_root.crt). Plain HTTP to port 3100 is rejected by
+# Loki's RequireAndVerifyClientCert policy.
 server:
   http_listen_port: 9080
   grpc_listen_port: 0
@@ -8,7 +14,7 @@ positions:
   filename: /tmp/positions.yaml
 
 clients:
-  - url: http://loki:3100/loki/api/v1/push
+  - url: https://loki:3100/loki/api/v1/push
     batchwait: 1s
     batchsize: 1048576
     timeout: 10s
@@ -16,6 +22,12 @@ clients:
       min_period: 100ms
       max_period: 10s
       max_retries: 10
+    # retro #84: mTLS — Promtail presents its own leaf cert to Loki.
+    # Trust anchor: ca_intermediate.crt (Pattern B).
+    tls_config:
+      cert_file: /run/secrets/promtail_client.crt
+      key_file:  /run/secrets/promtail_client.key
+      ca_file:   /run/secrets/ca_intermediate.crt
 
 scrape_configs:
   - job_name: containers

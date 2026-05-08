@@ -1,7 +1,7 @@
 enabled: true
 image:
   repository: redis
-  tag: "7-alpine"
+  tag: "7.4.9-alpine"
   pullPolicy: IfNotPresent
 replicaCount: 1
 resources:

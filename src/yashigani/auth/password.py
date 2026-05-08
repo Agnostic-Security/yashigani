@@ -3,7 +3,7 @@ Yashigani Auth — Argon2id password hashing + HIBP breach check.
 OWASP ASVS V2.4: m=65536, t=3, p=4 minimum parameters.
 OWASP ASVS V2.1.7: Passwords must be checked against breach databases.
 
-Last updated: 2026-05-03T00:00:00+01:00
+Last updated: 2026-05-08T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -143,6 +143,26 @@ def generate_password(length: int = 36) -> str:
 _HIBP_API_URL = "https://api.pwnedpasswords.com/range/"
 _HIBP_TIMEOUT = 5  # seconds
 
+# SSRF guardrail: route HIBP calls through the centralised HttpClient.
+# api.pwnedpasswords.com is public HTTPS-only — no SSRF risk in practice,
+# but defence-in-depth: all outbound HTTP must pass through the policy
+# gate so future changes to _HIBP_API_URL are automatically enforced.
+# OWASP A10 / API7 / yashigani-retro#95.
+_HIBP_HTTP_CLIENT = None   # lazy-initialised on first use
+
+
+def _hibp_http_client():
+    """Return a singleton HttpClient scoped to the HIBP allowlist."""
+    global _HIBP_HTTP_CLIENT
+    if _HIBP_HTTP_CLIENT is None:
+        from yashigani.net import HttpClient
+        _HIBP_HTTP_CLIENT = HttpClient(
+            allowlist=["api.pwnedpasswords.com"],
+            allow_http=False,   # HTTPS-only; HIBP never needs plain HTTP
+            timeout_s=float(_HIBP_TIMEOUT),
+        )
+    return _HIBP_HTTP_CLIENT
+
 
 class PasswordBreachedError(ValueError):
     """Raised when a password is found in the HIBP breach database."""
@@ -159,6 +179,11 @@ def check_hibp(password: str) -> Optional[int]:
     """
     Check a password against the HIBP Passwords API using k-Anonymity.
 
+    Routes through the centralised :class:`~yashigani.net.HttpClient` with
+    an HTTPS-only allowlist scoped to ``api.pwnedpasswords.com``. This
+    enforces scheme + allowlist checks via the shared SSRF-guardrail policy
+    before any outbound request is issued (OWASP A10 / API7 / retro#95).
+
     Returns:
         None if the password is clean (not found in any breach).
         int (breach count) if the password has been compromised.
@@ -169,16 +194,6 @@ def check_hibp(password: str) -> Optional[int]:
     Returns None (clean) if the API is unreachable (fail-open — never
     blocks authentication due to a third-party API outage).
     """
-    try:
-        import httpx
-    except ImportError:
-        try:
-            import urllib.request
-            return _check_hibp_urllib(password)
-        except Exception:
-            logger.debug("HIBP check skipped — no HTTP client available")
-            return None
-
     # HIBP k-Anonymity protocol mandates SHA-1 as the wire format (NIST SP 800-63B §5.1.1.2).
     # usedforsecurity=False: signals to hashlib/Bandit that this is a protocol requirement,
     # not a security primitive. The actual password is stored with Argon2id. Closes B324.
@@ -189,13 +204,36 @@ def check_hibp(password: str) -> Optional[int]:
     prefix = sha1_hash[:5]
     suffix = sha1_hash[5:]
 
+    request_url = f"{_HIBP_API_URL}{prefix}"
+
+    # --- SSRF policy check via HttpClient (defence-in-depth) ----------------
+    # _check_policy() is synchronous (pure URL validation, no I/O). This
+    # ensures scheme and allowlist are enforced even if _HIBP_API_URL is
+    # ever changed to a non-HTTPS or non-allowlisted value.
     try:
+        from yashigani.net import BlockedByPolicy
+        _hibp_http_client()._check_policy(request_url)
+    except BlockedByPolicy as exc:
+        logger.error(
+            "HIBP request blocked by SSRF policy — check_hibp disabled: %s", exc
+        )
+        return None
+    except Exception as exc:
+        logger.debug("HIBP policy check failed (%s) — skipping breach check", exc)
+        return None
+
+    # --- Outbound request ----------------------------------------------------
+    try:
+        import httpx
         response = httpx.get(
-            f"{_HIBP_API_URL}{prefix}",
+            request_url,
             timeout=_HIBP_TIMEOUT,
             headers={"User-Agent": "Yashigani-PasswordCheck/1.0"},
         )
         response.raise_for_status()
+    except ImportError:
+        # httpx not available — fall back to stdlib urllib (same policy already checked)
+        return _check_hibp_urllib(password)
     except Exception:
         logger.debug("HIBP API unreachable — skipping breach check (fail-open)")
         return None
@@ -209,7 +247,12 @@ def check_hibp(password: str) -> Optional[int]:
 
 
 def _check_hibp_urllib(password: str) -> Optional[int]:
-    """Fallback HIBP check using stdlib urllib (no httpx dependency)."""
+    """Fallback HIBP check using stdlib urllib (no httpx dependency).
+
+    The SSRF policy check is applied by the caller (check_hibp) before
+    this function is invoked, so we do NOT re-check here — policy is
+    enforced exactly once, as close to the decision point as possible.
+    """
     import urllib.request
     import urllib.error
 

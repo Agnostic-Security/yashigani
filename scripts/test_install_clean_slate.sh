@@ -67,7 +67,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.2
-# Last-Updated: 2026-05-06T23:30:26+01:00
+# Last-Updated: 2026-05-07T00:00:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -630,6 +630,70 @@ if [[ "${TOTP_OK}" != "true" ]]; then
   exit 1
 fi
 _ok "Bootstrap evidence confirmed (TOTP secret files present)"
+
+# ---------------------------------------------------------------------------
+# PHASE 8b: SSRF guard env var assertion (v2.23.2 fix — TM-V231-004)
+# Verify YASHIGANI_AGENT_UPSTREAM_HOSTNAMES is set on the backoffice container
+# so canonical agent bundles (langflow/letta/openclaw) can register without
+# hitting the RFC1918-private SSRF block. Absence = bundles silently broken.
+# ---------------------------------------------------------------------------
+_section "Phase 8b: SSRF guard env var (YASHIGANI_AGENT_UPSTREAM_HOSTNAMES)"
+
+_ev_section "SSRF guard env var check"
+
+# Determine backoffice container name — Podman and Docker differ only in prefix.
+# docker compose names: docker-backoffice-1 (docker) or <compose-project>_backoffice_1 (podman-compose).
+# Use `<runtime> ps --format` to find the running backoffice container name.
+BACKOFFICE_CONTAINER="$(_vm_ssh "
+  ${RUNTIME} ps --format '{{.Names}}' 2>/dev/null | grep -E 'backoffice' | head -1 || true
+" 2>/dev/null | tr -d '[:space:]')"
+
+if [[ -z "${BACKOFFICE_CONTAINER}" ]]; then
+  _ev "SSRF guard env var: FAIL — could not determine backoffice container name"
+  _fail "Backoffice container not found; cannot verify YASHIGANI_AGENT_UPSTREAM_HOSTNAMES"
+  _ev "CLEAN SLATE FAIL — SSRF guard env var assertion failed"
+  exit 1
+fi
+
+_ev "Backoffice container: ${BACKOFFICE_CONTAINER}"
+
+UPSTREAM_HOSTNAMES_VALUE="$(_vm_ssh "
+  ${RUNTIME} exec '${BACKOFFICE_CONTAINER}' env 2>/dev/null \
+    | grep '^YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=' \
+    | cut -d= -f2- \
+    | tr -d '[:space:]' \
+    || true
+" 2>/dev/null | tr -d '[:space:]')"
+
+_ev "YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=${UPSTREAM_HOSTNAMES_VALUE:-<not set>}"
+
+if [[ -z "${UPSTREAM_HOSTNAMES_VALUE}" ]]; then
+  _ev "SSRF guard env var: FAIL — YASHIGANI_AGENT_UPSTREAM_HOSTNAMES is empty or unset"
+  _fail "Agent bundles (langflow/letta/openclaw) will be silently broken — var not propagated"
+  _ev "CLEAN SLATE FAIL — SSRF guard env var not set on backoffice"
+  exit 1
+fi
+
+# Verify the three canonical bundle hostnames are present
+UPSTREAM_OK=true
+for hostname in langflow letta openclaw; do
+  if printf '%s' "${UPSTREAM_HOSTNAMES_VALUE}" | tr ',' '\n' | grep -qx "${hostname}"; then
+    _ev "  ${hostname}: present"
+  else
+    _ev "  ${hostname}: MISSING from YASHIGANI_AGENT_UPSTREAM_HOSTNAMES"
+    UPSTREAM_OK=false
+  fi
+done
+
+if [[ "${UPSTREAM_OK}" != "true" ]]; then
+  _ev "SSRF guard env var: FAIL — one or more canonical bundle hostnames missing"
+  _fail "Agent bundle hostname allowlist incomplete"
+  _ev "CLEAN SLATE FAIL — SSRF guard env var incomplete"
+  exit 1
+fi
+
+_ev "SSRF guard env var: PASS"
+_ok "YASHIGANI_AGENT_UPSTREAM_HOSTNAMES set correctly (langflow,letta,openclaw)"
 
 # ---------------------------------------------------------------------------
 # PHASE 9: Verdict

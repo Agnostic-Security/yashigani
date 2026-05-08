@@ -10,11 +10,14 @@ First-run behaviour:
     - Redis
   Prints all credentials once to stdout in a clearly delimited block.
   Marks bootstrap complete via sentinel file so this never repeats.
+
+Last updated: 2026-05-07T00:00:00+01:00
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
@@ -426,13 +429,52 @@ def _bootstrap():
         logger.warning("Identity registry init failed (%s) — SSO identity resolution disabled", exc)
 
     # v2.1 — Break glass emergency access
+    # ROOTFUL-P2-001: break-glass redis client now carries socket_timeout +
+    # socket_connect_timeout (5 s each) plus retry-with-backoff on ping().
+    # Break-glass is ADVISORY — failure degrades gracefully (warning + skip).
+    # Max retry window: 6 attempts × 5 s timeout + (1+2+4+8+16) s backoff = 61 s.
+    # This stays well inside the 90 s bootstrap probe / 120 s healthcheck window
+    # even on slow GHA runners.  Ref: Captain PR #52 debug.
+    _BG_SOCKET_TIMEOUT = 5.0       # per-operation cap (incl. ping)
+    _BG_CONNECT_TIMEOUT = 5.0      # TCP + TLS handshake cap
+    _BG_MAX_ATTEMPTS = 6           # total ping attempts before giving up
     try:
         from yashigani.auth.break_glass import init_break_glass
         import redis as _redis
-        redis_bg = _redis.from_url(_backoffice_redis_url(0), decode_responses=True)
-        redis_bg.ping()
-        backoffice_state.break_glass_manager = init_break_glass(redis_bg, audit_writer)
-        logger.info("Break glass manager initialized")
+        redis_bg = _redis.from_url(
+            _backoffice_redis_url(0),
+            decode_responses=True,
+            socket_timeout=_BG_SOCKET_TIMEOUT,
+            socket_connect_timeout=_BG_CONNECT_TIMEOUT,
+            retry_on_timeout=True,
+            health_check_interval=30,
+        )
+        # Retry-with-backoff ping: 1 s, 2 s, 4 s, 8 s, 16 s between attempts.
+        _ping_ok = False
+        _backoff = 1.0
+        for _attempt in range(1, _BG_MAX_ATTEMPTS + 1):
+            try:
+                redis_bg.ping()
+                _ping_ok = True
+                break
+            except Exception as _ping_exc:
+                if _attempt < _BG_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Break glass Redis ping attempt %d/%d failed (%s) — retrying in %.0f s",
+                        _attempt, _BG_MAX_ATTEMPTS, _ping_exc, _backoff,
+                    )
+                    time.sleep(_backoff)
+                    _backoff = min(_backoff * 2, 16.0)
+                else:
+                    logger.warning(
+                        "Break glass Redis ping attempt %d/%d failed (%s) — giving up",
+                        _attempt, _BG_MAX_ATTEMPTS, _ping_exc,
+                    )
+        if _ping_ok:
+            backoffice_state.break_glass_manager = init_break_glass(redis_bg, audit_writer)
+            logger.info("Break glass manager initialized")
+        else:
+            logger.warning("Break glass unavailable — Redis unreachable after %d attempts", _BG_MAX_ATTEMPTS)
     except Exception as exc:
         logger.warning("Break glass unavailable (%s)", exc)
 

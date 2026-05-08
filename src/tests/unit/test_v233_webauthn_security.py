@@ -320,6 +320,10 @@ class TestUsernameEnumeration:
         login/start for an unknown username returns 400 with
         error=no_credentials_registered (same as known user with no creds).
         Does NOT reveal whether the user exists.
+
+        W20 added _check_ip_access + _apply_auth_throttle to login/start (both
+        require a live Redis connection). Patched here so the unit test remains
+        Redis-free and focused solely on the enumerate-safe behaviour.
         """
         from yashigani.backoffice.routes.webauthn_v1 import router, _resolve_admin_id
         from fastapi import FastAPI
@@ -328,7 +332,9 @@ class TestUsernameEnumeration:
 
         import yashigani.backoffice.routes.webauthn_v1 as wv1
 
-        with patch.object(wv1, "_resolve_admin_id", new_callable=AsyncMock, return_value=None):
+        with patch.object(wv1, "_resolve_admin_id", new_callable=AsyncMock, return_value=None), \
+             patch.object(wv1, "_check_ip_access", return_value=None), \
+             patch.object(wv1, "_apply_auth_throttle", return_value=None):
             client = TestClient(app, raise_server_exceptions=False)
             resp = client.post(
                 "/api/v1/admin/webauthn/login/start",
@@ -341,6 +347,9 @@ class TestUsernameEnumeration:
     def test_s07_real_user_with_no_creds_same_response(self):
         """
         Known user with no credentials: same 400 response as unknown user.
+
+        W20 added _check_ip_access + _apply_auth_throttle (require live Redis).
+        Patched here so the unit test stays Redis-free.
         """
         from yashigani.backoffice.routes.webauthn_v1 import router
         from fastapi import FastAPI
@@ -354,15 +363,17 @@ class TestUsernameEnumeration:
             side_effect=ValueError("No registered WebAuthn credentials for this user.")
         )
 
-        with patch.object(wv1, "_resolve_admin_id", new_callable=AsyncMock, return_value="admin-uuid"):
-            with patch.object(wv1, "backoffice_state") as mock_state:
-                mock_state.pg_webauthn_service = mock_svc
+        with patch.object(wv1, "_resolve_admin_id", new_callable=AsyncMock, return_value="admin-uuid"), \
+             patch.object(wv1, "_check_ip_access", return_value=None), \
+             patch.object(wv1, "_apply_auth_throttle", return_value=None), \
+             patch.object(wv1, "backoffice_state") as mock_state:
+            mock_state.pg_webauthn_service = mock_svc
 
-                client = TestClient(app, raise_server_exceptions=False)
-                resp = client.post(
-                    "/api/v1/admin/webauthn/login/start",
-                    json={"username": "admin@yashigani.local"},
-                )
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.post(
+                "/api/v1/admin/webauthn/login/start",
+                json={"username": "admin@yashigani.local"},
+            )
 
         assert resp.status_code == 400
         assert resp.json()["detail"]["error"] == "no_credentials_registered"

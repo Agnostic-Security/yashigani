@@ -1,18 +1,8 @@
 # Yashigani — Installation and Configuration Guide
 
 **Version:** 2.23.2
-**Last updated:** 2026-05-07T00:00:00+01:00
+**Last updated:** 2026-05-07T01:00:00+01:00
 **Applies to:** Docker Compose and Kubernetes (Helm) deployments
-
-> **Last public release — v2.23.2**
->
-> v2.23.2 is the final public release of Yashigani. Future development moves to a private tier.
->
-> - **Existing public users:** this release will remain available; no automatic deprecation.
-> - **Continued updates (v2.23.3+):** require a paid licence — see [agnosticsec.com/yashigani/licensing](https://agnosticsec.com/yashigani/licensing).
-> - **Free tier (Community):** continues with v2.23.2; security patches delivered under the published support window.
-> - **Non-profit and education:** access remains free forever — see [agnosticsec.com/yashigani/non-profit](https://agnosticsec.com/yashigani/non-profit).
-> - **Public repository:** transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation.
 
 ---
 
@@ -461,6 +451,42 @@ The following tables document every significant variable, grouped by category.
 
 ---
 
+#### Compliance — Inactive Account Disable (FedRAMP AC-2(F2), since v2.23.3)
+
+Yashigani automatically disables accounts that have not logged in for the
+configured number of days. This satisfies FedRAMP Moderate baseline
+control AC-2(F2). All disables are recorded in the audit log as
+`INACTIVE_ACCOUNT_DISABLED` events.
+
+| Variable | Required | Valid Values | Notes |
+|---|---|---|---|
+| `YASHIGANI_INACTIVE_DISABLE_DAYS` | No | integer ≥ 1 | Inactivity threshold in days. Default `90`. FedRAMP Moderate baseline: `90`. |
+| `YASHIGANI_INACTIVE_DISABLE_INTERVAL_HOURS` | No | integer ≥ 1 | How often the disable task runs, in hours. Default `24`. |
+| `YASHIGANI_INACTIVE_DISABLE_MAX_PERCENT` | No | integer 1–100 | Safety rail: refuse to disable more than this percentage of all accounts in a single run. Default `50`. If the rail is exceeded, an alert is fired and no accounts are disabled — operator investigation required. |
+| `YASHIGANI_INACTIVE_DISABLE_EXEMPT_ACCOUNTS` | No | comma-separated UUIDs | Account UUIDs exempt from automated disable (e.g. service accounts, break-glass accounts). No default. |
+
+**Re-enabling an automatically-disabled account:**
+
+```bash
+# Via admin API (requires authenticated admin session):
+curl -X PATCH https://<host>/admin/accounts/<username>/enable \
+     -H "Cookie: __Host-yashigani_admin_session=<session>"
+
+# Via CLI (inside the backoffice container):
+docker exec -it yashigani-backoffice \
+    yashigani-admin enable-account <username>
+```
+
+After re-enabling, the `inactive_disabled_at` column retains the timestamp
+of when the account was automatically disabled (audit trail). The account's
+`last_login_at` is reset on next successful login.
+
+**Break-glass accounts:** Always add break-glass account UUIDs to
+`YASHIGANI_INACTIVE_DISABLE_EXEMPT_ACCOUNTS`. Break-glass accounts do not
+log in interactively and would otherwise be disabled after the threshold.
+
+---
+
 ### 4.3 TLS Configuration
 
 > **Post-quantum TLS (since v0.9.0):** A hybrid X25519+ML-KEM-768 Caddyfile configuration is included in the repository as a commented block (`caddy/Caddyfile.pq`). This requires Caddy 2.10 (not yet released). Enable it once Caddy 2.10 ships to provide quantum-resistant key exchange while maintaining full backward compatibility with classical TLS clients.
@@ -683,6 +709,69 @@ YASHIGANI_LICENSE_FILE=/absolute/path/to/license.ysg
 | Audit log export | No | Yes | Yes | Yes | Yes |
 | Annual price | Free | See agnosticsec.com/pricing | See agnosticsec.com/pricing | See agnosticsec.com/pricing | Custom |
 | SLA support | Community (Apache 2.0) | Email | Business hours | Business hours+ | 24/7 named |
+
+### 5.4 Licence Renewal and Expiry Behaviour (since v2.23.3)
+
+Yashigani tracks licence expiry and degrades service progressively to avoid surprise service interruption.
+
+#### Renewal notification cadence
+
+Renewal invoices and notifications are sent **30 days before the paid term ends**. Optional courtesy reminders are sent at 60 and 90 days if configured in your account portal.
+
+To renew:
+
+1. Log in to your account portal at [agnosticsec.com](https://agnosticsec.com).
+2. Select your deployment and click **Renew Licence**.
+3. Complete payment via your configured payment gateway.
+4. Download the new `.ysg` licence file and activate it via any method in §5.2.
+
+For Enterprise deals (Net-30 invoicing) or any renewal query: **sales@agnosticsec.com**.
+
+#### Expiry mode table
+
+When a licence expires, Yashigani enters a grace period then progressively restricts service. Operators are notified via the admin panel banner and (if alert sinks are configured) via the alert system.
+
+| Days relative to expiry | Mode | Banner | Gateway behaviour |
+|---|---|---|---|
+| >30 days until expiry | `active` | None | Full service |
+| 7–30 days until expiry | `warning` | Yellow | Full service |
+| 1–7 days until expiry | `critical` | Orange | Full service |
+| 0–14 days **past** expiry | `expired` | Red | Full service (grace period). Daily audit log entry. |
+| 14–30 days past expiry | `readonly` | Red | Admin view-only. New agent-runs and config changes blocked. In-flight agent runs complete. |
+| 30+ days past expiry | `blocked` | Red | HTTP 503 on all data-plane requests. Retry-After header included. |
+
+Community tier (`expires_at = null`) is always `active` — it never expires.
+
+#### Machine-readable expiry status
+
+Operators and monitoring scripts can query licence expiry state without parsing the full `/admin/license` response:
+
+```
+GET /api/v1/license/status
+Authorization: (admin session cookie)
+```
+
+Response:
+
+```json
+{
+  "valid": true,
+  "expires_at": "2026-12-01T00:00:00+00:00",
+  "days_remaining": 208,
+  "grace_period_active": false,
+  "mode": "active"
+}
+```
+
+`mode` values: `"active"` | `"warning"` | `"critical"` | `"expired"` | `"readonly"` | `"blocked"`.
+
+`grace_period_active` is `true` only when `mode == "expired"` (days 0–14 past expiry).
+
+This endpoint is also available as `GET /admin/license/status`. Authentication (admin session) is required.
+
+#### Configuring warning thresholds
+
+The `license_expiry_warning_days` field in the alert-sinks configuration (§10a) controls when push-notification alerts fire. The admin banner thresholds (30/7 days) are fixed.
 
 ---
 
@@ -1490,6 +1579,86 @@ Run through this checklist before exposing Yashigani to production traffic.
 - [ ] Jaeger trace UI loads at `https://your-domain/admin/jaeger`
 - [ ] Alertmanager receivers are configured (not just the default null receiver)
 - [ ] A test alert has been sent to verify each notification channel
+- [ ] Loki ingest mTLS verified: `docker compose logs promtail | grep -i 'connected\|push\|sending'` shows successful HTTPS pushes to Loki
+- [ ] Loki query mTLS verified: Grafana Explore → Loki datasource shows live logs (if Grafana returns an error about TLS, check that `grafana_client.crt/key` are present in `docker/secrets/`)
+- [ ] Plain HTTP to Loki rejected: `curl http://localhost:3100/loki/api/v1/push` from inside the `obs` network returns a TLS error (connection closed by server)
+
+#### Loki mTLS (retro #84, v2.23.2)
+
+Loki now requires mutual TLS on port 3100 for both ingest (Promtail → Loki) and query (Grafana → Loki) paths. The internal PKI bootstrap (run by `install.sh` at first install) issues leaf certificates for `loki`, `promtail`, `grafana`, and `otel-collector` — all signed by the internal intermediate CA.
+
+**Verification — ingest path (Promtail → Loki):**
+
+```bash
+# Inside a running stack:
+docker compose logs promtail | grep -i 'sent\|push\|error'
+# Expected: lines containing "successfully sent batch" or "Sending batch"
+# No lines containing "TLS handshake" errors
+
+# Manual mTLS push test (from the Docker host, using certs in docker/secrets/):
+curl --cert docker/secrets/promtail_client.crt \
+     --key  docker/secrets/promtail_client.key \
+     --cacert docker/secrets/ca_intermediate.crt \
+     -X POST https://loki:3100/loki/api/v1/push \
+     -H 'Content-Type: application/json' \
+     -d '{"streams":[{"stream":{"service":"test"},"values":[["'"$(date +%s%N)"'","mTLS smoke test"]]}]}'
+# Expected: HTTP 204 No Content
+```
+
+**Verification — plain HTTP rejected:**
+
+```bash
+# Plain HTTP must be refused (connection reset / TLS error):
+curl http://loki:3100/loki/api/v1/push 2>&1 | grep -i 'EOF\|reset\|tls\|refused'
+# Expected: non-200 + connection error (not a 200 or 204)
+```
+
+**Verification — Grafana → Loki query path:**
+Open Grafana → Explore → select the "Loki" datasource → run `{service="backoffice"}`. Live logs should appear. If the datasource shows a red error, check:
+1. `docker/secrets/grafana_client.crt` and `grafana_client.key` exist and are readable by the Grafana container (UID 472 on official Grafana images).
+2. The Grafana container was restarted after the cert files were created (`docker compose restart grafana`).
+
+**Trust model:**
+All Loki clients (Promtail, Grafana, otel-collector) present leaf certs issued by the Yashigani internal intermediate CA (`ca_intermediate.crt`). Loki's `RequireAndVerifyClientCert` policy rejects any connection without a valid client cert. The intermediate CA is Pattern B per the PKI trust pattern — the root CA is never exposed to workloads.
+
+#### Observability mTLS (v2.23.2 retro #83)
+
+All internal observability plane connections now use mutual TLS (Pattern B — intermediate CA as trust anchor, never root):
+
+| Connection | Protocol | Port | Notes |
+|---|---|---|---|
+| Browser → Caddy → Grafana | HTTPS + mTLS | 443 → 3443 | Caddy forward_auth gate + internal mTLS to Grafana |
+| Grafana → Prometheus datasource | mTLS | 9090 | Grafana presents `grafana_client.crt`; Prometheus requires it |
+| Grafana → Loki datasource | mTLS | 3100 | Enabled alongside PR #84 (Loki mTLS) |
+| Prometheus scrape (self) | mTLS | 9090 | `prometheus_client.crt` used as both server and client |
+| Prometheus → Caddy internal listeners | mTLS | 8444/8445 | Unchanged from v2.23.1 — Caddy SPIFFE gate |
+| Grafana → Jaeger UI | HTTP | 16686 | Internal obs network only; TLS deferred to v2.24 (RETRO-84) |
+
+**Key files:** All certs live in `docker/secrets/` and are issued at install time by `install.sh bootstrap_internal_pki`. No manual cert management is required.
+
+**Verification** (run after `docker compose up`):
+
+```bash
+# 1. Confirm Grafana rejects plain HTTP
+curl http://grafana:3000/api/health  # → connection refused (no plain HTTP listener)
+
+# 2. Confirm mTLS handshake works (from a machine with the client cert)
+curl --cert docker/secrets/grafana_client.crt \
+     --key  docker/secrets/grafana_client.key \
+     --cacert docker/secrets/ca_intermediate.crt \
+     https://grafana:3443/api/health
+# → {"commit":"...","database":"ok","version":"..."}
+
+# 3. Confirm Prometheus rejects requests without client cert
+curl --cacert docker/secrets/ca_intermediate.crt \
+     https://prometheus:9090/-/healthy
+# → TLS error: certificate required
+
+# 4. Confirm Grafana → Prometheus datasource via admin API
+curl -u admin:<grafana_password> \
+     https://<your-domain>/admin/grafana/api/datasources
+# → datasource "Prometheus" with type "prometheus" present
+```
 
 > **WARNING — Jaeger In-Memory Storage (EX-231-06 / ASVS V7.3.1):** The default Jaeger deployment (`jaeger` service in `docker-compose.yml`) uses in-memory storage. **All distributed traces are lost when the Jaeger container restarts.** This is acceptable for development and non-regulated environments. For production deployments where trace retention is required (audit trail, incident investigation, compliance), replace the default Jaeger all-in-one container with a persistent backend before go-live:
 >
@@ -1823,6 +1992,52 @@ The installer auto-registers agent bundles via the backoffice API at install tim
 - **Helm:** Kubernetes Secret `yashigani-{name}-token` (must be pre-created before install)
 
 Each bundle is assigned a **restricted RBAC policy** by default — it can only reach LLM provider paths and is not granted access to internal Yashigani management endpoints. The OPA data document is pre-populated with the bundle agent entries immediately after bootstrap. In v2.0, routing decisions for agent bundles are also governed by `policy/v1_routing.rego` and the Optimization Engine's 4-signal routing logic (P1-P9 priority levels).
+
+### 17.5 SSRF Guard and Upstream Hostname Allowlist
+
+#### Why the allowlist exists
+
+Yashigani's backoffice includes an SSRF guard (`_assert_safe_upstream_url()`, TM-V231-004 / Pentest #95 / 2026-04-29) that blocks agent upstream URL registrations pointing at loopback, RFC 1918 private, link-local, or multicast addresses. This prevents an authenticated admin from registering an agent whose upstream URL points to an internal metadata endpoint (e.g., `http://169.254.169.254/`) or internal service (e.g., `gopher://redis:6380/`).
+
+Because the canonical agent bundles (Langflow, Letta, OpenClaw) run on the **internal Docker/Kubernetes network** and resolve to RFC 1918 addresses, they would be rejected by the SSRF guard unless their hostnames are explicitly allowed.
+
+#### Environment variable
+
+```
+YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,letta,openclaw
+```
+
+Set on the **backoffice** container environment. Comma-separated, case-insensitive. Hostnames in this list bypass the IP-class check and are permitted to resolve to internal (loopback / RFC 1918 / link-local) addresses.
+
+**Default (v2.23.2+):** `langflow,letta,openclaw` — the three canonical Yashigani-internal agent bundle service names. This is pre-populated in `docker/docker-compose.yml` and the Helm chart (`agentBundles.upstreamHostnames`) and requires no operator action.
+
+#### Extending for custom agents
+
+If you run a custom internal agent (e.g., `my-custom-agent`) that registers with a private-network upstream URL, add its service name to the allowlist:
+
+**Compose** (`docker/.env` or direct override):
+```bash
+# Append to the compose env block or set in docker/.env:
+YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,letta,openclaw,my-custom-agent
+```
+
+**Helm** (`values.yaml` override):
+```yaml
+backoffice:
+  agentUpstreamHostnames:
+    - langflow
+    - letta
+    - openclaw
+    - my-custom-agent
+```
+
+#### Security implications
+
+Adding a hostname to this list **trusts that host as a legitimate internal mesh service**. The SSRF guard still enforces:
+- Scheme restriction: only `http` and `https` are allowed (no `file://`, `gopher://`, `dict://`, etc.).
+- All other private IPs not matched by a hostname in the list remain blocked.
+
+Agent registration remains **admin-gated** (TOTP step-up required, full audit log entry created). An attacker who compromises an admin account and also controls DNS resolution for a hostname in this list could bypass the IP-class check — this is documented in the risk register as an accepted residual risk under TA-2 (admin account compromise) / TA-3 (insider admin SSRF), with TOTP step-up and OPA invocation-gate as compensating controls.
 
 ---
 
