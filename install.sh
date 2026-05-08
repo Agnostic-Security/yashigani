@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _backup_existing_data — add K8s pg_dump path via kubectl exec; pod runs as UID 70, no root needed)
+# last-updated: 2026-05-07T12:05:00+01:00 (retro #83: add grafana:472 to _pki_chown_client_keys; retro #84: loki:10001+promtail:0 added)
+# last-updated: 2026-05-07T10:00:00+01:00 (retro #84: loki+promtail added to _pki_chown_client_keys UID map for mTLS cert issuance)
 # last-updated: 2026-05-06T20:00:00+01:00 (P-9 fix: _podman_verify_healthchecks() post-compose-up gate; called on Podman path in compose_up())
 # last-updated: 2026-05-06T12:00:00+01:00 (fix #85: bind-mount dirs auto-created for all runtimes incl. rootless Podman; sudo mkdir removed from promtail path; fail-loud on backups/tls mkdir)
 # last-updated: 2026-05-04T19:30:00+01:00 (v2.23.2: chown caddy_client.key to UID 0 — cap_drop ALL strips DAC_OVERRIDE; gate V232-SMOKE-019. sudo mkdir promtail dir; gate V232-SMOKE-020)
@@ -1760,12 +1763,48 @@ _backup_existing_data() {
     log_info "  Audit volume detected: ${audit_volume} (preserved in named volume)"
   fi
 
-  # Backup Postgres data (dump if possible)
-  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
-  if $_runtime_cmd exec docker-postgres-1 pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
-    log_info "  postgres_dump.sql backed up"
+  # Backup Postgres data (dump if possible).
+  # K8s path: find the running postgres pod and exec pg_dump via kubectl.
+  # The postgres pod runs as runAsUser: 70 (postgres on Alpine), so kubectl exec
+  # arrives as UID 70 — the postgres superuser for this cluster. No root needed;
+  # pg_dump -U yashigani_app connects via the local Unix socket (trust auth).
+  # Compose/Podman path: exec into the named container. Container name varies by
+  # runtime and install order, so detect via docker/podman ps rather than
+  # hardcoding 'docker-postgres-1'.
+  if [[ "${MODE:-compose}" == "k8s" ]] || [[ "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    local _pg_pod
+    _pg_pod=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=postgres \
+      --field-selector=status.phase=Running \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [[ -n "$_pg_pod" ]]; then
+      if kubectl exec -i -n "${NAMESPACE}" "$_pg_pod" -- \
+           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+        log_info "  postgres_dump.sql backed up (K8s: pod ${_pg_pod})"
+      else
+        log_info "  Postgres K8s dump skipped (pod not ready or auth failed)"
+        rm -f "${backup_dir}/postgres_dump.sql"
+      fi
+    else
+      log_info "  Postgres dump skipped (no running postgres pod in namespace ${NAMESPACE})"
+    fi
   else
-    log_info "  Postgres dump skipped (not accessible)"
+    # Compose / Podman path: locate the running postgres container by name pattern.
+    # Avoid hardcoding 'docker-postgres-1' — name varies by compose project name,
+    # runtime (podman-compose uses underscores), and container restart count.
+    local _pg_container
+    _pg_container=$($_runtime_cmd ps --format '{{.Names}}' 2>/dev/null \
+      | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
+    if [[ -n "$_pg_container" ]]; then
+      if $_runtime_cmd exec "$_pg_container" \
+           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+        log_info "  postgres_dump.sql backed up (${RUNTIME:-compose}: container ${_pg_container})"
+      else
+        log_info "  Postgres dump failed for container ${_pg_container} — dump skipped"
+        rm -f "${backup_dir}/postgres_dump.sql"
+      fi
+    else
+      log_info "  Postgres dump skipped (no running postgres container found)"
+    fi
   fi
 
   # BUG-58B-04a (v2.23.1): do NOT use 'chmod -R 600' on the backup dir.
@@ -4207,7 +4246,7 @@ k8s_helm_dep_update() {
 }
 
 # STEP 8 (k8s): helm upgrade --install
-# Last updated (k8s_helm_install): 2026-04-27T06:05:04Z
+# Last updated (k8s_helm_install): 2026-05-08T00:00:00+01:00
 k8s_helm_install() {
   set_step "8" "helm upgrade --install"
   log_step "8/${TOTAL_STEPS}" "Deploying via Helm..."
@@ -4226,17 +4265,28 @@ k8s_helm_install() {
     return 0
   fi
 
-  # v2.23.1 task #94 — flag set tuned for the umbrella chart's ~97 rendered
-  # resources + slow-booting open-webui pod:
+  # v2.23.3 retro K8s gap — differentiate fresh-install vs upgrade timeout.
+  #
+  # Fresh install: 10m — pre-flight image pull (scripts/k8s-install.sh or
+  #   operator pre-pull step in kubernetes_deployment.md) is expected before
+  #   helm install. With images already present in the node's containerd
+  #   cache, 10m is sufficient for all hook jobs + pod ready transitions on
+  #   Docker Desktop and kind clusters.
+  #
+  # Upgrade: 5m — pods are already running; only rolling restarts are needed.
+  #   New images should be pre-pulled before upgrading. 5m is tight enough to
+  #   surface stuck rollouts quickly rather than letting operators wait 20m.
+  #
+  # Override: set HELM_TIMEOUT env var before calling install.sh to force a
+  #   specific value (e.g. HELM_TIMEOUT=20m for air-gap first-installs where
+  #   image pull cannot be pre-staged).
+  #
+  # v2.23.1 task #94 — flag set rationale (unchanged):
   #   --wait              block until all Deployments/StatefulSets Available so
   #                       the next install step (rollout status) doesn't race.
   #   --wait-for-jobs     pre-install hooks (admin-bootstrap, mtls-bootstrap)
   #                       must finish before main resources, otherwise the
   #                       backoffice starts without the bootstrap secret.
-  #   --timeout 20m       cold pull of open-webui:main (~2 GiB) + first-boot
-  #                       SvelteKit migration + qwen2.5:3b ollama warm-up can
-  #                       collectively take 12-15 min on Docker Desktop /
-  #                       laptop hardware. 5m default is too tight.
   #   --atomic            on failure, helm rolls back; avoids leaving the
   #                       release in pending-install state which then blocks
   #                       a subsequent helm install with "cannot re-use a
@@ -4247,13 +4297,28 @@ k8s_helm_install() {
   #                       client-go rate limiter and spuriously raise
   #                       "client rate limiter Wait returned an error:
   #                       context deadline exceeded".
+
+  local _helm_timeout
+  if [[ -n "${HELM_TIMEOUT:-}" ]]; then
+    _helm_timeout="${HELM_TIMEOUT}"
+    log_info "Using HELM_TIMEOUT override: ${_helm_timeout}"
+  elif helm status yashigani --namespace "$NAMESPACE" >/dev/null 2>&1; then
+    # Release already exists — this is an upgrade.
+    _helm_timeout="5m"
+    log_info "Existing Helm release detected — using upgrade timeout: ${_helm_timeout}"
+  else
+    # Fresh install.
+    _helm_timeout="10m"
+    log_info "No existing Helm release — using fresh-install timeout: ${_helm_timeout}"
+  fi
+
   local helm_args=(
     upgrade --install yashigani "$chart_dir"
     --namespace "$NAMESPACE"
     --create-namespace
     --wait
     --wait-for-jobs
-    --timeout 20m
+    --timeout "${_helm_timeout}"
     --atomic
     --burst-limit 1000
     --qps 500
@@ -4637,6 +4702,27 @@ _pki_chown_client_keys() {
     # V232-SMOKE-002 — caught by Linux smoke gate 2026-05-03.
     "otel-collector:10001"
     "jaeger:10001"
+    # loki runs as UID 10001 (grafana/loki Dockerfile: USER 10001).
+    # retro #84 (v2.23.2): loki now terminates mTLS on port 3100; it reads
+    # loki_client.crt/key from /run/secrets. Without chown the startup fails
+    # with "open /run/secrets/loki_client.key: permission denied".
+    "loki:10001"
+    # promtail runs as UID 0 (root) inside the container — it needs to access
+    # /var/run/docker.sock and /var/lib/docker/containers. Root inside the
+    # container (with cap_drop: [ALL]) can still read a file owned by root
+    # without DAC_OVERRIDE, so the chown here is a no-op (file was already
+    # written by the installer running as root on Docker hosts). On rootless
+    # Podman hosts the effective UID inside the container maps to the subuid-
+    # remapped installer UID; the file is already accessible. We include
+    # promtail in the list so the issuer always generates promtail_client.crt/key
+    # (mtls_capable:true in service_identities.yaml) and the key is set 0600.
+    # retro #84 (v2.23.2).
+    "promtail:0"
+    # Grafana runs as UID 472 (grafana/grafana upstream Dockerfile: USER 472).
+    # retro #83: Grafana now reads grafana_client.crt + grafana_client.key to
+    # serve mTLS on port 3443 and to authenticate datasource calls.
+    # Without chown, Grafana crashes with "permission denied" on the key file.
+    "grafana:472"
   )
 
   # Determine chown strategy for this runtime.

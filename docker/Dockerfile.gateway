@@ -11,8 +11,8 @@
 #   runtime  — minimal image with wheel + baked model
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
-# Base image: python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS builder
+# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
+FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS builder
 
 WORKDIR /build
 
@@ -29,7 +29,7 @@ RUN python -m build --wheel --outdir /dist
 # Trains the FastText binary classifier (CLEAN vs INJECTION) from the
 # committed training corpus. Model is baked into the runtime image.
 # fasttext-wheel ships pre-built wheels — no C compiler required.
-FROM python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS trainer
+FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS trainer
 
 WORKDIR /train
 
@@ -51,8 +51,8 @@ RUN mkdir -p models && \
 
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────────
-# Base image: python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS runtime
+# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
+FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS runtime
 
 # Non-root user
 RUN groupadd --gid 1001 yashigani \

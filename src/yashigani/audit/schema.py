@@ -114,6 +114,8 @@ class EventType(str, Enum):
     # type so forensic queries can easily filter by protocol)
     SSO_SAML_LOGIN_SUCCESS = "SSO_SAML_LOGIN_SUCCESS"
     SSO_SAML_LOGIN_FAILURE = "SSO_SAML_LOGIN_FAILURE"
+    # v2.23.3 — FedRAMP AC-2(F2) automated inactive-account disable (LU-YSG-002)
+    INACTIVE_ACCOUNT_DISABLED = "INACTIVE_ACCOUNT_DISABLED"
 
 
 # ---------------------------------------------------------------------------
@@ -880,3 +882,44 @@ class SAMLLoginFailureEvent(AuditEvent):
     idp_name: str = ""
     failure_reason: str = ""
     client_ip_prefix: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v2.23.3 — FedRAMP AC-2(F2) inactive-account disable events (LU-YSG-002)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InactiveAccountDisabledEvent(AuditEvent):
+    """
+    Written by the automated inactive-account cron task (FedRAMP AC-2(F2))
+    each time an account is disabled due to inactivity.
+
+    FedRAMP AU-3.F field coverage:
+    - timestamp          — inherited from AuditEvent (default_factory=_now_iso)
+    - user identity      — disabled_account_id (UID of the disabled account)
+    - event type         — INACTIVE_ACCOUNT_DISABLED
+    - success/failure    — outcome field (always "success" from the cron task;
+                           the task either disables the account or it doesn't)
+    - source IP          — source_ip = "system" (cron context; no client IP)
+    - target resource    — target_resource = "admin_accounts/<account_id>"
+
+    Lu evidence note: this event class satisfies AU-3.F requirements for the
+    automated-disable audit record.  Cross-reference v2.23.3 evidence pack
+    item LU-YSG-002.
+    """
+    event_type: str = EventType.INACTIVE_ACCOUNT_DISABLED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    # AU-3.F: user identity (the account being acted upon)
+    disabled_account_id: str = ""       # UUID of the disabled admin_accounts row
+    disabled_username: str = ""         # username — masked in lower-assurance sinks
+    # AU-3.F: source IP (no client IP in cron context)
+    source_ip: str = "system"
+    # AU-3.F: target resource
+    target_resource: str = ""           # "admin_accounts/<account_id>"
+    # AU-3.F: success/failure
+    outcome: str = "success"
+    # Additional context for forensic queries
+    days_inactive: int = 0              # days since last_login_at at time of disable
+    threshold_days: int = 90            # configured YASHIGANI_INACTIVE_DISABLE_DAYS
+    last_login_at: str = ""             # ISO-8601 UTC of last login (or backfilled created_at)
