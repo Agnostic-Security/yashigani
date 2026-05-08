@@ -18,16 +18,6 @@
 ---
 **Latest Tagged Release:** v2.23.2.1 (`2.23.x` branch, 2026-05-08) — Helm chart digest pin fix (chart-only patch over v2.23.2; code unchanged); see [v2.23.2.1 release notes](docs/release-notes/v2.23.2.1.md)
 
-> **Last public release — v2.23.2**
->
-> v2.23.2 is the final public release of Yashigani. Future development moves to a private tier.
->
-> - **Existing public users:** this release will remain available; no automatic deprecation.
-> - **Continued updates (v2.23.3+):** require a paid licence — see [agnosticsec.com/yashigani/licensing](https://agnosticsec.com/yashigani/licensing).
-> - **Free tier (Community):** continues with v2.23.2; security patches delivered under the published support window.
-> - **Non-profit and education:** access remains free forever — see [agnosticsec.com/yashigani/non-profit](https://agnosticsec.com/yashigani/non-profit).
-> - **Public repository:** transitions to a private programme **by end of Q2 2026 (2026-06-30)**, subject to Petra IP review milestone confirmation.
-
 > **Upgrade notice:** v2.23.2 ships a security hardening batch. Existing v2.23.1 deployments should upgrade.
 
 > **Notable behaviour changes in v2.23.2:**
