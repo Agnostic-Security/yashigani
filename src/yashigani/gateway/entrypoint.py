@@ -3,7 +3,7 @@ Yashigani Gateway — ASGI entrypoint.
 Wires all services together and creates the FastAPI app.
 Environment variables configure service endpoints and behaviour.
 
-Last updated: 2026-05-07T00:00:00+00:00
+Last updated: 2026-05-08T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from yashigani.gateway.openai_router import router as openai_router, configure a
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
 from yashigani.auth.caddy_verified import CaddyVerifiedMiddleware
+from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -401,6 +402,13 @@ def _build_app():
     # that cannot be forged by the client, closing the direct-to-gateway bypass.
     # Must run outermost (added last = executed first in starlette middleware stack).
     gateway_app.add_middleware(SpiffePeerCertMiddleware)
+
+    # Licence enforcement middleware — converts GatewayBlockedError → 503 and
+    # GatewayReadOnlyError → 403.  Runs AFTER Spiffe+Caddy verification (inbound
+    # request is from a legitimate peer) and BEFORE AgentAuth (blocked requests
+    # do not reach auth).  Added AFTER CaddyVerifiedMiddleware in code so that
+    # in Starlette LIFO execution order it runs third (after Spiffe and Caddy).
+    gateway_app.add_middleware(LicenseEnforcementMiddleware)
 
     # Agent auth middleware — must run before Prometheus middleware so agent
     # requests are authenticated before metrics are emitted.

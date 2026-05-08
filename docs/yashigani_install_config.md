@@ -710,6 +710,69 @@ YASHIGANI_LICENSE_FILE=/absolute/path/to/license.ysg
 | Annual price | Free | See agnosticsec.com/pricing | See agnosticsec.com/pricing | See agnosticsec.com/pricing | Custom |
 | SLA support | Community (Apache 2.0) | Email | Business hours | Business hours+ | 24/7 named |
 
+### 5.4 Licence Renewal and Expiry Behaviour (since v2.23.3)
+
+Yashigani tracks licence expiry and degrades service progressively to avoid surprise service interruption.
+
+#### Renewal notification cadence
+
+Renewal invoices and notifications are sent **30 days before the paid term ends**. Optional courtesy reminders are sent at 60 and 90 days if configured in your account portal.
+
+To renew:
+
+1. Log in to your account portal at [agnosticsec.com](https://agnosticsec.com).
+2. Select your deployment and click **Renew Licence**.
+3. Complete payment via your configured payment gateway.
+4. Download the new `.ysg` licence file and activate it via any method in §5.2.
+
+For Enterprise deals (Net-30 invoicing) or any renewal query: **sales@agnosticsec.com**.
+
+#### Expiry mode table
+
+When a licence expires, Yashigani enters a grace period then progressively restricts service. Operators are notified via the admin panel banner and (if alert sinks are configured) via the alert system.
+
+| Days relative to expiry | Mode | Banner | Gateway behaviour |
+|---|---|---|---|
+| >30 days until expiry | `active` | None | Full service |
+| 7–30 days until expiry | `warning` | Yellow | Full service |
+| 1–7 days until expiry | `critical` | Orange | Full service |
+| 0–14 days **past** expiry | `expired` | Red | Full service (grace period). Daily audit log entry. |
+| 14–30 days past expiry | `readonly` | Red | Admin view-only. New agent-runs and config changes blocked. In-flight agent runs complete. |
+| 30+ days past expiry | `blocked` | Red | HTTP 503 on all data-plane requests. Retry-After header included. |
+
+Community tier (`expires_at = null`) is always `active` — it never expires.
+
+#### Machine-readable expiry status
+
+Operators and monitoring scripts can query licence expiry state without parsing the full `/admin/license` response:
+
+```
+GET /api/v1/license/status
+Authorization: (admin session cookie)
+```
+
+Response:
+
+```json
+{
+  "valid": true,
+  "expires_at": "2026-12-01T00:00:00+00:00",
+  "days_remaining": 208,
+  "grace_period_active": false,
+  "mode": "active"
+}
+```
+
+`mode` values: `"active"` | `"warning"` | `"critical"` | `"expired"` | `"readonly"` | `"blocked"`.
+
+`grace_period_active` is `true` only when `mode == "expired"` (days 0–14 past expiry).
+
+This endpoint is also available as `GET /admin/license/status`. Authentication (admin session) is required.
+
+#### Configuring warning thresholds
+
+The `license_expiry_warning_days` field in the alert-sinks configuration (§10a) controls when push-notification alerts fire. The admin banner thresholds (30/7 days) are fixed.
+
 ---
 
 ## 5a. Operator Helper Scripts

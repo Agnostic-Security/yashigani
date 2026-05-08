@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Last updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _refresh_pgdata_ca — replace install -o (root-only) with cp+chmod; pg_ctl now called directly; K8s exec privilege model corrected)
 # Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
 # Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
 # Last updated: 2026-05-03T12:45:00+01:00 (V232-SMOKE-010: exclude .gitkeep from empty-file check; V232-SMOKE-011: podman unshare chown -R before cp restore; V232-SMOKE-012: secrets dir 0751→0755)
@@ -803,11 +804,13 @@ _refresh_pgdata_ca() {
 
   if [[ -z "$pg_target" ]]; then
     log_warn "Postgres not running -- PGDATA CA refresh deferred."
-    log_warn "  After bringing postgres up, exec into the postgres container and run:"
+    log_warn "  After bringing postgres up, exec into the postgres container/pod as the postgres user"
+    log_warn "  (K8s: kubectl exec -n <ns> <pod> -- sh; Compose: docker/podman exec <container> sh)"
+    log_warn "  then run:"
     log_warn "    cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > \${PGDATA}/root.crt"
-    log_warn "    chown postgres:postgres \${PGDATA}/root.crt && chmod 0640 \${PGDATA}/root.crt"
-    log_warn "    install -m0644 -o postgres -g postgres /run/secrets/postgres_client.crt \${PGDATA}/server.crt"
-    log_warn "    install -m0600 -o postgres -g postgres /run/secrets/postgres_client.key \${PGDATA}/server.key"
+    log_warn "    chmod 0640 \${PGDATA}/root.crt"
+    log_warn "    cp /run/secrets/postgres_client.crt \${PGDATA}/server.crt && chmod 0644 \${PGDATA}/server.crt"
+    log_warn "    cp /run/secrets/postgres_client.key \${PGDATA}/server.key && chmod 0600 \${PGDATA}/server.key"
     log_warn "    pg_ctl -D \${PGDATA} reload"
     return 0
   fi
@@ -820,6 +823,18 @@ _refresh_pgdata_ca() {
   # trust store missing the intermediate. pgbouncer presents leaves signed
   # by the intermediate; postgres's ssl_ca_file rejects them because the
   # chain is incomplete. Fix: match install.sh exactly — cat both PEMs.
+  # K8s privilege model: the postgres pod runs as runAsUser: 70 (postgres user on
+  # Alpine). kubectl exec inherits that UID — it does NOT arrive as root.
+  # Compose/Podman paths: exec -T postgres also runs as the postgres user because
+  # the container drops to postgres after entrypoint init.
+  #
+  # Consequence: `install -o postgres` and `gosu postgres` are unavailable here —
+  # both require root (install -o changes file ownership; gosu does setuid).
+  # su -s /bin/sh postgres also requires root (setuid to another user).
+  #
+  # Correct approach: since we are already running as the postgres UID (70), use
+  # cp + chmod to install files we own. pg_ctl is called directly without any
+  # user-switch wrapper.
   if ! pg_exec "$pg_target" sh -c '
     set -e
     PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
@@ -827,26 +842,28 @@ _refresh_pgdata_ca() {
     # Trust bundle: root + intermediate concatenated (must match install.sh line that
     # does: cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > ${PGDATA}/root.crt)
     cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > "${PGDATA}/root.crt"
-    chown postgres:postgres "${PGDATA}/root.crt"
+    # chown to ourselves is a no-op on Linux; chmod is valid as owner regardless of root.
+    # DO NOT use install -o / -g here: that requires root privilege. We are running as
+    # the postgres UID (70) and can chmod files we own without root.
     chmod 0640 "${PGDATA}/root.crt"
-    install -m 0644 -o postgres -g postgres /run/secrets/postgres_client.crt "${PGDATA}/server.crt"
-    install -m 0600 -o postgres -g postgres /run/secrets/postgres_client.key "${PGDATA}/server.key"
-    # pg_ctl cannot run as root. Use gosu if available (official postgres image),
-    # fall back to su -s /bin/sh postgres for other distros. Both drop to the
-    # postgres UID before invoking pg_ctl. Compose/VM paths exec as the postgres
-    # user natively; only K8s kubectl exec arrives as root.
-    if command -v gosu >/dev/null 2>&1; then
-      gosu postgres pg_ctl -D "${PGDATA}" reload
-    else
-      su -s /bin/sh postgres -c "pg_ctl -D \"${PGDATA}\" reload"
-    fi
+    # cp preserves the source file; chmod to the required mode after copy.
+    # install -m -o is intentionally avoided: it requires CAP_CHOWN / root.
+    cp /run/secrets/postgres_client.crt "${PGDATA}/server.crt"
+    chmod 0644 "${PGDATA}/server.crt"
+    cp /run/secrets/postgres_client.key "${PGDATA}/server.key"
+    chmod 0600 "${PGDATA}/server.key"
+    # pg_ctl requires the postgres UID — which we already are. Do NOT use gosu or
+    # su: gosu is a setuid helper (unavailable to non-root), su requires CAP_SETUID.
+    # Direct invocation is correct here for both K8s (runAsUser: 70) and Compose
+    # (entrypoint drops to postgres before any exec command).
+    pg_ctl -D "${PGDATA}" reload
   '; then
     log_error "PGDATA CA refresh failed. mTLS between pgbouncer and postgres may be broken."
-    log_error "  Manual recovery: exec into postgres, run:"
+    log_error "  Manual recovery: exec into postgres pod/container as the postgres user, then run:"
     log_error "    cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > \${PGDATA}/root.crt"
-    log_error "    chown postgres:postgres \${PGDATA}/root.crt && chmod 0640 \${PGDATA}/root.crt"
-    log_error "    install -m0644 -o postgres -g postgres /run/secrets/postgres_client.crt \${PGDATA}/server.crt"
-    log_error "    install -m0600 -o postgres -g postgres /run/secrets/postgres_client.key \${PGDATA}/server.key"
+    log_error "    chmod 0640 \${PGDATA}/root.crt"
+    log_error "    cp /run/secrets/postgres_client.crt \${PGDATA}/server.crt && chmod 0644 \${PGDATA}/server.crt"
+    log_error "    cp /run/secrets/postgres_client.key \${PGDATA}/server.key && chmod 0600 \${PGDATA}/server.key"
     log_error "    pg_ctl -D \${PGDATA} reload"
     return 1
   fi
