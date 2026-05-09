@@ -67,7 +67,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-09T15:10:00+01:00
+# Last-Updated: 2026-05-09T15:20:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -222,10 +222,16 @@ _vm_cleanup() {
       cd '${VM_CLONE_DIR}' && \
       YSG_RUNTIME=${RUNTIME} bash uninstall.sh --remove-volumes --yes 2>&1 || true
     fi
-    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' || true
+    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true
     ${RUNTIME} system prune -f 2>/dev/null || true
     ${RUNTIME} volume prune -f 2>/dev/null || true
   " 2>&1 || _warn "VM cleanup had errors (non-fatal)"
+  # For Docker: install.sh chowns docker/data/audit and docker/secrets to UID 1001
+  # via ephemeral containers. Plain rm -rf as su (UID 1004) fails on these dirs.
+  # Use sudo rm -rf to ensure the clone dir is fully removed.
+  if [[ "${RUNTIME}" == "docker" ]]; then
+    _vm_sudo "rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true" 2>&1 || true
+  fi
   _ok "VM teardown complete"
 }
 
@@ -333,16 +339,19 @@ _vm_ssh "
 " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
 
 _info "Removing clone directory (podman unshare rm for namespace-owned files)..."
-# install.sh uses 'podman unshare chown 1001:1001' on bind-mount dirs, so secret
-# files and data dirs are owned by subuid-mapped uids (mode 0400). Plain rm -rf
-# as the host user fails with EPERM. Running rm inside the user namespace via
-# 'podman unshare rm -rf' works because the uid mapping makes the files appear
-# owned by the process.
+# install.sh chowns bind-mount dirs and secret files to UID 1001 (subuid-mapped
+# for Podman rootless, plain UID 1001 for Docker). Plain rm -rf as host user
+# (UID 1004) fails on these files with EPERM. Strategies by runtime:
+#   Podman: 'podman unshare rm -rf' maps through user namespace — works for subuid UIDs
+#   Docker: plain rm -rf fails on UID-1001 files; sudo rm -rf works (su has sudo)
 _vm_ssh "
   if [[ -d '${VM_CLONE_DIR}' ]]; then
-    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' || true
+    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true
   fi
 " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+if [[ "${RUNTIME}" == "docker" ]]; then
+  _vm_sudo "rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+fi
 
 _info "Removing \$HOME/.yashigani install dir..."
 _vm_ssh "
