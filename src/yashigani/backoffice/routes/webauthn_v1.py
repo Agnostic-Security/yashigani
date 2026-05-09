@@ -29,6 +29,7 @@ Audit events emitted:
 
 Last updated: 2026-05-08T00:00:00+00:00
 """
+
 from __future__ import annotations
 
 import logging
@@ -46,6 +47,7 @@ from yashigani.backoffice.middleware import (
 )
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
+
 # W20 fix (Iris PR #62): import auth throttle helpers so that the public
 # login/start and login/finish endpoints are guarded by the same per-IP
 # blocklist + progressive-delay throttle as the password login route.
@@ -66,6 +68,7 @@ _PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
+
 
 class RegisterStartRequest(BaseModel):
     credential_name: str = Field(
@@ -102,6 +105,7 @@ class LoginFinishRequest(BaseModel):
 # Registration (requires authenticated admin session)
 # ---------------------------------------------------------------------------
 
+
 @router.post(
     "/api/v1/admin/webauthn/register/start",
     tags=["webauthn"],
@@ -124,9 +128,7 @@ async def register_start(
             user_name=session.account_id,  # use account_id as display name
         )
     except Exception as exc:
-        logger.error(
-            "WebAuthn register/start error for admin %s: %s", session.account_id, exc
-        )
+        logger.error("WebAuthn register/start error for admin %s: %s", session.account_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "webauthn_register_start_failed"},
@@ -160,18 +162,14 @@ async def register_finish(
             credential_name=body.credential_name,
         )
     except ValueError as exc:
-        logger.warning(
-            "WebAuthn register/finish failed for admin %s: %s", session.account_id, exc
-        )
+        logger.warning("WebAuthn register/finish failed for admin %s: %s", session.account_id, exc)
         _write_audit(
             session.account_id,
             "WEBAUTHN_CREDENTIAL_REGISTERED",
             outcome="failure",
             detail=str(exc),
         )
-        payload, _ = safe_error_envelope(
-            exc, public_message="webauthn registration failed", status=400
-        )
+        payload, _ = safe_error_envelope(exc, public_message="webauthn registration failed", status=400)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=payload)
     except Exception as exc:
         logger.error("WebAuthn register/finish error: %s", exc)
@@ -198,6 +196,7 @@ async def register_finish(
 # ---------------------------------------------------------------------------
 # Authentication (PUBLIC — admin not yet authenticated)
 # ---------------------------------------------------------------------------
+
 
 @router.post(
     "/api/v1/admin/webauthn/login/start",
@@ -300,9 +299,7 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
             expected_origin=origin,
         )
     except ValueError as exc:
-        logger.warning(
-            "WebAuthn login/finish failed for %s: %s", body.username, exc
-        )
+        logger.warning("WebAuthn login/finish failed for %s: %s", body.username, exc)
         _record_auth_failure(client_ip)
         _write_audit(
             admin_id,
@@ -357,6 +354,7 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
 # ---------------------------------------------------------------------------
 # Credential management (requires session; DELETE also requires step-up)
 # ---------------------------------------------------------------------------
+
 
 @router.get(
     "/api/v1/admin/webauthn/credentials",
@@ -427,6 +425,7 @@ async def revoke_credential(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_pg_service():
     """Return the PgWebAuthnService from backoffice state, or raise 503."""
     svc = getattr(backoffice_state, "pg_webauthn_service", None)
@@ -450,7 +449,7 @@ def _client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
-    return request.client.host if request.client else "0.0.0.0"
+    return request.client.host if request.client else "0.0.0.0"  # nosec B104 — fallback string returned as IP label, not a bind address
 
 
 async def _resolve_admin_id(username: str) -> Optional[str]:
@@ -459,6 +458,7 @@ async def _resolve_admin_id(username: str) -> Optional[str]:
     Returns None if not found or account is disabled.
     """
     from yashigani.db.postgres import tenant_transaction
+
     try:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             row = await conn.fetchrow(
