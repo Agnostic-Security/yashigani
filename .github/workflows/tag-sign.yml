@@ -138,7 +138,11 @@ jobs:
         run: |
           echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
           # Retrieve the imported key fingerprint
-          KEY_FP=$(gpg --list-secret-keys --with-colons 'releases@agnosticsec.com' \
+          # Extract first secret-key fingerprint regardless of UID email — the
+          # key Tiago generated has UID `tr@agnosticsec.com`, not the original
+          # `releases@agnosticsec.com` placeholder. Filtering by UID was the
+          # bug that broke v2.23.2 + v2.23.2.1 + v2.23.3 signing.
+          KEY_FP=$(gpg --list-secret-keys --with-colons \
             | awk -F: '/^sec/ { print $5 }' | head -1)
           echo "KEY_FP=${KEY_FP}" >> "$GITHUB_ENV"
           echo "[INFO] Imported key fingerprint: ${KEY_FP}"
@@ -155,7 +159,7 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           git config user.name  "Agnostic Security Releases"
-          git config user.email "releases@agnosticsec.com"
+          git config user.email "tr@agnosticsec.com"
           git config user.signingkey "${KEY_FP}"
           git config tag.gpgsign true
 
@@ -199,7 +203,7 @@ jobs:
             --armor --output /dev/null --sign /dev/null 2>/dev/null || true
 
           git -c "gpg.program=gpg" tag -s "${TAG}" "${COMMIT}" \
-            --local-user "releases@agnosticsec.com" \
+            --local-user "${KEY_FP}" \
             -m "${MSG}"
 
           echo "[INFO] Signed tag created: ${TAG} -> ${COMMIT}"
@@ -266,7 +270,7 @@ jobs:
               echo "|-------|-------|"
               echo "| Tag | \`${TAG}\` |"
               echo "| Commit | \`${COMMIT}\` |"
-              echo "| Signer | releases@agnosticsec.com |"
+              echo "| Signer | tr@agnosticsec.com |"
               echo "| Method | GPG (git tag -s) |"
               echo ""
               echo "**Verify the signature:**"
