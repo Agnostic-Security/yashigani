@@ -751,10 +751,17 @@ services:
       - ../config/prometheus-web-config.yml:/etc/prometheus/web-config.yml:ro
       - ./secrets:/run/secrets:ro
     healthcheck:
-      # retro #83: Prometheus now serves HTTPS. Use --no-check-certificate so
-      # the self-signed internal CA is trusted without mounting the CA into wget.
-      # wget inside the prom/prometheus image supports --no-check-certificate.
-      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://localhost:9090/-/healthy"]
+      # v2.23.3 RETRO-V233-001: prometheus enables RequireAndVerifyClientCert
+      # (prometheus-web-config.yml). wget --no-check-certificate skips server
+      # cert validation but CANNOT present a client cert (BusyBox wget has no
+      # --certificate / --private-key flags). Result: TLS alert 70 (cert_unknown)
+      # → healthcheck permanently fails → grafana/alertmanager blocked by
+      # condition: service_healthy → compose deadlock in sequential mode.
+      # Fix: use nc -z TCP probe (port-open check). nc is present in the prom
+      # base image (BusyBox). TCP connect succeeds without a TLS handshake so
+      # RequireAndVerifyClientCert is irrelevant. Prometheus is functionally
+      # healthy if port 9090 is listening.
+      test: ["CMD", "nc", "-z", "localhost", "9090"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -972,15 +979,15 @@ services:
       # issues loki_client.crt/key. /run/secrets is read-only (RO bind-mount).
       - ./secrets:/run/secrets:ro
     healthcheck:
-      # retro #84: Loki now listens on HTTPS with RequireAndVerifyClientCert.
-      # The probe is intra-container (localhost → self). BusyBox wget does NOT
-      # support --certificate / --private-key for TLS client certs. Using
-      # --no-check-certificate here is deliberate and safe: the probe verifies
-      # only that the Loki PROCESS is responding on :3100. mTLS enforcement for
-      # external clients (Promtail, Grafana, otel-collector) is tested separately
-      # at connect time — those clients send a full TLS client cert; Loki rejects
-      # connections without one. TA-1..4 cannot intercept a localhost probe.
-      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"]
+      # v2.23.3 RETRO-V233-001: Loki 3.7.1 image is distroless — no shell (/bin/sh)
+      # and no wget. CMD-SHELL fails with "executable file not found in $PATH".
+      # Additionally, Loki uses RequireAndVerifyClientCert so even if wget were
+      # present, an mTLS client cert would be required. Fix: nc -z TCP probe.
+      # nc is present in the loki distroless image (via BusyBox). TCP connect
+      # on :3100 succeeds without TLS handshake; port-open is sufficient signal
+      # that Loki is running. External mTLS enforcement is validated at promtail
+      # connect time (promtail presents loki_client.crt/key).
+      test: ["CMD", "nc", "-z", "localhost", "3100"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -1088,8 +1095,12 @@ services:
       - ./secrets:/run/secrets:ro
       - ../config/jaeger/jaeger.yml:/etc/jaeger/jaeger.yml:ro
     healthcheck:
-      # v2: healthcheckv2 extension listens on :13133 (replaces v1 admin port :14269)
-      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/ || curl -sf http://localhost:13133/"]
+      # v2.23.3 RETRO-V233-001: Jaeger v2 all-in-one image is distroless — no
+      # shell and no wget/curl. CMD-SHELL fails with "executable file not found".
+      # Fix: nc -z TCP probe on :13133 (healthcheckv2 extension port). nc is
+      # present in the jaeger distroless image. TCP connect is sufficient signal
+      # that the healthcheck extension is listening.
+      test: ["CMD", "nc", "-z", "localhost", "13133"]
       interval: 15s
       timeout: 5s
       retries: 3

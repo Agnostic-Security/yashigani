@@ -140,37 +140,21 @@ spec:
               containerPort: 9090
               protocol: TCP
           readinessProbe:
-            {{- if .Values.mtls.enabled }}
-            # retro #83: Prometheus now serves HTTPS. K8s httpGet probe sends
-            # plain HTTP which Prometheus rejects. Use exec+wget with
-            # --no-check-certificate (localhost probe — no mTLS client cert
-            # needed for healthcheck path; server TLS is what we verify).
-            exec:
-              command:
-                - sh
-                - -c
-                - "wget -qO- --no-check-certificate https://localhost:9090/-/healthy"
-            {{- else }}
-            httpGet:
-              path: /-/healthy
+            # v2.23.3 RETRO-V233-001: RequireAndVerifyClientCert means all
+            # callers including localhost must present a client cert. wget
+            # --no-check-certificate skips server cert check but cannot send
+            # a client cert → TLS alert 70 → probe fails. Use tcpSocket
+            # (port-open check, no TLS handshake) for both mTLS and non-mTLS.
+            # This is safe: port :9090 is only open when prometheus is running.
+            tcpSocket:
               port: 9090
-            {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
-            {{- if .Values.mtls.enabled }}
-            exec:
-              command:
-                - sh
-                - -c
-                - "wget -qO- --no-check-certificate https://localhost:9090/-/healthy"
-            {{- else }}
-            httpGet:
-              path: /-/healthy
+            tcpSocket:
               port: 9090
-            {{- end }}
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 5

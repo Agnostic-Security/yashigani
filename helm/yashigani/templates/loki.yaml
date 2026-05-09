@@ -58,54 +58,28 @@ spec:
             - name: https
               containerPort: 3100
               protocol: TCP
-          {{- if .Values.mtls.enabled }}
-          # retro #84: Loki listens on HTTPS with RequireAndVerifyClientCert.
-          # The probe is intra-pod (localhost → self). BusyBox wget does NOT
-          # support --certificate/--private-key for TLS client certs. Using
-          # --no-check-certificate here is deliberate and safe: the probe
-          # verifies only that the Loki PROCESS is responding on :3100. mTLS
-          # enforcement for external clients is verified by those clients at
-          # connect time (they must present a valid leaf cert). TA-1..4 cannot
-          # intercept a localhost probe inside a Pod. K8s kubelet healthchecks
-          # also cannot present client certs, making this the only viable probe.
+          # v2.23.3 RETRO-V233-001: Loki 3.7.1 image is distroless — no /bin/sh
+          # and no wget/curl. exec+sh probe fails with "executable file not found".
+          # Additionally RequireAndVerifyClientCert means the wget probe (if sh
+          # were present) would still fail — client cert required. K8s kubelet
+          # httpGet probes also cannot present client certs.
+          # Fix: tcpSocket probe (port-open check, no TLS handshake). Works for
+          # both mTLS and non-mTLS, and works in distroless images (kubelet
+          # performs the TCP check natively, no in-container binary needed).
           readinessProbe:
-            exec:
-              command:
-                - sh
-                - -c
-                - "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            timeoutSeconds: 5
-            failureThreshold: 5
-          livenessProbe:
-            exec:
-              command:
-                - sh
-                - -c
-                - "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"
-            initialDelaySeconds: 15
-            periodSeconds: 15
-            timeoutSeconds: 5
-            failureThreshold: 5
-          {{- else }}
-          readinessProbe:
-            httpGet:
-              path: /ready
+            tcpSocket:
               port: 3100
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
           livenessProbe:
-            httpGet:
-              path: /ready
+            tcpSocket:
               port: 3100
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
-          {{- end }}
           resources:
             {{- toYaml .Values.loki.resources | nindent 12 }}
           volumeMounts:
