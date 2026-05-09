@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Last updated: 2026-05-09T00:00:00+01:00 (feat: MP.L2-3.8.9 — add --encrypted path for age-encrypted .tar.gz.age backups)
 # Last updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _refresh_pgdata_ca — replace install -o (root-only) with cp+chmod; pg_ctl now called directly; K8s exec privilege model corrected)
 # Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
 # Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
@@ -60,6 +61,13 @@ BACKUPS_DIR="${WORK_DIR}/backups"
 K8S_MODE=false
 K8S_NAMESPACE="yashigani"
 RUN_VALIDATE=false
+
+# ---------------------------------------------------------------------------
+# Encrypted restore state (MP.L2-3.8.9)
+# Set by --encrypted <identity-file>; also honoured from env.
+# ---------------------------------------------------------------------------
+ENCRYPTED_MODE=false
+IDENTITY_FILE="${YASHIGANI_BACKUP_IDENTITY_FILE:-/etc/yashigani/backup-identity.age}"
 
 log_info()    { printf "    --> %s\n" "$*"; }
 log_success() { printf "    ${C_GREEN}ok${C_RESET}  %s\n" "$*"; }
@@ -1289,6 +1297,27 @@ while [[ $# -gt 0 ]]; do
       FORCE=true
       shift
       ;;
+    --encrypted)
+      # --encrypted IDENTITY FILE  — identity key then archive path
+      # --encrypted FILE           — identity from env/default, archive is $2
+      ENCRYPTED_MODE=true
+      shift
+      # Check whether next arg looks like an age identity file (ends .age) or
+      # is the archive itself (.tar.gz.age). Accept either order:
+      #   --encrypted /etc/yashigani/backup-identity.age /path/to/backup.tar.gz.age
+      #   --encrypted /path/to/backup.tar.gz.age         (identity from env/default)
+      if [[ "${1:-}" == *.age && "${1:-}" != *.tar.gz.age ]]; then
+        # First positional arg looks like an identity key
+        IDENTITY_FILE="$1"
+        shift
+        RESTORE_TARGET="${1:-}"
+        [[ -n "${RESTORE_TARGET}" ]] && shift
+      else
+        # No identity arg — use default/env; next arg is the archive
+        RESTORE_TARGET="${1:-}"
+        [[ -n "${RESTORE_TARGET}" ]] && shift
+      fi
+      ;;
     --validate)
       # Opt-in: after K8s restore completes, invoke scripts/k8s-restore-validate.sh.
       # Default is off so the restore completes quickly without requiring kubectl
@@ -1301,24 +1330,39 @@ while [[ $# -gt 0 ]]; do
 Yashigani Restore Script
 
 Usage:
-  bash restore.sh                              List available backups
-  bash restore.sh <backup_dir>                 Restore from specific backup
-  bash restore.sh --latest                     Restore most recent backup
-  bash restore.sh --latest --k8s -n yashigani  Restore into Kubernetes
-  bash restore.sh --latest --k8s --validate    Restore + run k8s-restore-validate.sh
+  bash restore.sh                                       List available backups
+  bash restore.sh <backup_dir>                          Restore from specific backup
+  bash restore.sh --latest                              Restore most recent backup
+  bash restore.sh --latest --k8s -n yashigani          Restore into Kubernetes
+  bash restore.sh --latest --k8s --validate            Restore + run k8s-restore-validate.sh
+  bash restore.sh --encrypted <identity.age> <file.tar.gz.age>  Decrypt + restore encrypted backup
 
 Options:
-  --k8s, --kubernetes   Restore into a Kubernetes cluster
-  -n, --namespace NS    Kubernetes namespace (default: yashigani)
-  --latest              Use most recent backup
-  --force               Skip validation warnings
-  --validate            (K8s only) Run k8s-restore-validate.sh after restore (default: off)
-  --help                Show this help
+  --k8s, --kubernetes      Restore into a Kubernetes cluster
+  -n, --namespace NS       Kubernetes namespace (default: yashigani)
+  --latest                 Use most recent backup
+  --force                  Skip validation warnings
+  --validate               (K8s only) Run k8s-restore-validate.sh after restore (default: off)
+  --encrypted IDENTITY FILE  Decrypt FILE using age IDENTITY then restore (MP.L2-3.8.9)
+                           IDENTITY defaults to YASHIGANI_BACKUP_IDENTITY_FILE or
+                           /etc/yashigani/backup-identity.age when only FILE is given
+  --help                   Show this help
 
 Supported platforms:
   - Docker Compose (Linux/macOS)
   - Podman Compose (Linux/macOS rootless)
   - Kubernetes (via kubectl)
+
+Encrypted backups (age):
+  Produced by scripts/backup.sh. Decrypt + restore in one step:
+    bash restore.sh --encrypted /etc/yashigani/backup-identity.age \
+      /var/lib/yashigani/backups/20260509_120000.tar.gz.age
+
+  Or set YASHIGANI_BACKUP_IDENTITY_FILE and pass the archive path directly:
+    YASHIGANI_BACKUP_IDENTITY_FILE=/etc/yashigani/backup-identity.age \
+      bash restore.sh /var/lib/yashigani/backups/20260509_120000.tar.gz.age
+
+  Legacy unencrypted backups (.tar.gz or directory) are still accepted with a warning.
 EOF
       exit 0
       ;;
@@ -1329,10 +1373,166 @@ EOF
   esac
 done
 
+# ---------------------------------------------------------------------------
+# decrypt_and_restore — MP.L2-3.8.9
+#
+# Decrypts a .tar.gz.age file produced by scripts/backup.sh using the
+# operator's age identity key, extracts the tarball to a temporary directory,
+# then delegates to restore_backup() for the standard secrets/env/DB restore
+# flow.  Works on Docker, Podman, and K8s (same runtime detection as the
+# directory-based path).
+#
+# Temporary extraction is placed under BACKUPS_DIR (same filesystem as the
+# archive for efficient rename) and is cleaned up on exit regardless of
+# success/failure.
+# ---------------------------------------------------------------------------
+decrypt_and_restore() {
+  local archive_file="$1"
+
+  # Validate age binary
+  if ! command -v age >/dev/null 2>&1; then
+    log_error "age binary not found — cannot decrypt backup."
+    log_error "  On Debian/Ubuntu: apt-get install -y age"
+    log_error "  On Alpine:        apk add age"
+    log_error "  From upstream:    https://age-encryption.org/"
+    exit 1
+  fi
+
+  # Validate identity file
+  if [[ ! -f "${IDENTITY_FILE}" ]]; then
+    log_error "age identity (private key) file not found: ${IDENTITY_FILE}"
+    log_error "  Set YASHIGANI_BACKUP_IDENTITY_FILE or pass: --encrypted <identity.age> <archive.tar.gz.age>"
+    log_error "  See docs/operations/backup.md — 'Encryption' section."
+    exit 1
+  fi
+  # Identity file must not be world/group-readable (CWE-732)
+  local _id_perm
+  _id_perm=$(stat -c '%a' "${IDENTITY_FILE}" 2>/dev/null || stat -f '%OLp' "${IDENTITY_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${_id_perm}" && "${_id_perm}" != "400" && "${_id_perm}" != "600" ]]; then
+    log_warn "Identity file permissions are ${_id_perm} — should be 400 or 600 (CWE-732)."
+    log_warn "  Fix: chmod 0400 ${IDENTITY_FILE}"
+  fi
+
+  if [[ ! -f "${archive_file}" ]]; then
+    log_error "Encrypted archive not found: ${archive_file}"
+    exit 1
+  fi
+
+  if [[ "${archive_file}" != *.tar.gz.age ]]; then
+    log_warn "Archive does not have .tar.gz.age extension: ${archive_file}"
+    log_warn "  Attempting decryption anyway — file may still be age-encrypted."
+  fi
+
+  log_info "Decrypting: ${archive_file}"
+  log_info "  Identity:  ${IDENTITY_FILE}"
+
+  # Create temp extraction directory under BACKUPS_DIR (same filesystem).
+  # umask 077 at script top ensures it is created 0700.
+  local _ts
+  _ts="$(date -u +%Y%m%d_%H%M%S)"
+  local _extract_dir="${BACKUPS_DIR}/.age-extract-${_ts}-$$"
+  mkdir -p "${_extract_dir}"
+
+  # Register cleanup on any exit
+  # shellcheck disable=SC2064
+  trap 'rm -rf "${_extract_dir}" 2>/dev/null; exit 1' INT TERM
+  # shellcheck disable=SC2064
+  trap 'rm -rf "${_extract_dir}" 2>/dev/null' EXIT
+
+  log_info "Decrypting and extracting archive..."
+  if ! age --decrypt --identity "${IDENTITY_FILE}" "${archive_file}" \
+         | tar --extract --gzip --directory "${_extract_dir}" 2>/dev/null; then
+    log_error "Decryption or extraction failed."
+    log_error "  Verify the identity key matches the recipient key used during backup."
+    log_error "  Verify the archive is not truncated: ls -lh ${archive_file}"
+    rm -rf "${_extract_dir}" 2>/dev/null || true
+    trap - INT TERM EXIT
+    exit 1
+  fi
+
+  log_success "Archive decrypted and extracted to ${_extract_dir}"
+
+  # Locate the actual backup directory inside the extraction root.
+  # backup.sh archives SOURCE_DIR (e.g. /var/lib/yashigani), so extracted
+  # root contains a single subdirectory named after the source base.
+  # We also support the legacy pattern where the tarball root IS the backup dir
+  # (i.e. contains secrets/ and .env directly).
+  local _backup_dir=""
+  if [[ -d "${_extract_dir}/secrets" || -f "${_extract_dir}/.env" ]]; then
+    # Tarball root is the backup dir
+    _backup_dir="${_extract_dir}"
+  else
+    # Look for the first subdirectory
+    local _sub
+    _sub=$(find "${_extract_dir}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [[ -n "${_sub}" ]]; then
+      _backup_dir="${_sub}"
+    fi
+  fi
+
+  if [[ -z "${_backup_dir}" || ( ! -d "${_backup_dir}/secrets" && ! -f "${_backup_dir}/.env" ) ]]; then
+    log_error "Could not locate backup data (secrets/ or .env) inside extracted archive."
+    log_error "  Extraction root: ${_extract_dir}"
+    rm -rf "${_extract_dir}" 2>/dev/null || true
+    trap - INT TERM EXIT
+    exit 1
+  fi
+
+  log_info "Backup data located at: ${_backup_dir}"
+
+  # Delegate to standard restore_backup() flow
+  restore_backup "${_backup_dir}"
+
+  # Cleanup extraction temp
+  rm -rf "${_extract_dir}" 2>/dev/null || true
+  trap - INT TERM EXIT
+}
+
 detect_runtime
+
+# ---------------------------------------------------------------------------
+# Handle encrypted archive (.tar.gz.age) when passed as RESTORE_TARGET
+# without --encrypted flag but with YASHIGANI_BACKUP_IDENTITY_FILE set.
+# Also handle legacy unencrypted .tar.gz tarballs with a warning.
+# ---------------------------------------------------------------------------
+if [[ "${ENCRYPTED_MODE}" == "false" && "${RESTORE_TARGET}" == *.tar.gz.age ]]; then
+  log_warn "Archive appears to be age-encrypted (.tar.gz.age). Enabling encrypted restore path."
+  log_warn "  Using identity: ${IDENTITY_FILE}"
+  ENCRYPTED_MODE=true
+fi
+if [[ "${ENCRYPTED_MODE}" == "false" && "${RESTORE_TARGET}" == *.tar.gz ]]; then
+  log_warn "LEGACY: Unencrypted .tar.gz backup detected. Backups created by scripts/backup.sh"
+  log_warn "  (v2.23.3+) are encrypted with age (MP.L2-3.8.9). This backup predates encryption."
+  log_warn "  Extracting for restore — recommend re-creating this backup with encryption."
+  if ! command -v tar >/dev/null 2>&1; then
+    log_error "tar not found — cannot extract legacy backup"
+    exit 1
+  fi
+  _ts_legacy="$(date -u +%Y%m%d_%H%M%S)"
+  _extract_legacy="${BACKUPS_DIR}/.legacy-extract-${_ts_legacy}-$$"
+  mkdir -p "${_extract_legacy}"
+  # shellcheck disable=SC2064
+  trap 'rm -rf "${_extract_legacy}" 2>/dev/null; exit 1' INT TERM
+  if ! tar --extract --gzip --directory "${_extract_legacy}" --file "${RESTORE_TARGET}" 2>/dev/null; then
+    log_error "tar extraction failed for legacy archive: ${RESTORE_TARGET}"
+    rm -rf "${_extract_legacy}" 2>/dev/null || true
+    trap - INT TERM
+    exit 1
+  fi
+  _legacy_dir=$(find "${_extract_legacy}" -mindepth 0 -maxdepth 1 \( -name "secrets" -o -name ".env" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "${_extract_legacy}")
+  restore_backup "${_legacy_dir:-${_extract_legacy}}"
+  rm -rf "${_extract_legacy}" 2>/dev/null || true
+  trap - INT TERM
+  exit 0
+fi
 
 case "${RESTORE_TARGET}" in
   "")
+    if [[ "${ENCRYPTED_MODE}" == "true" ]]; then
+      log_error "--encrypted specified but no archive path given."
+      log_error "  Usage: bash restore.sh --encrypted [identity.age] <archive.tar.gz.age>"
+      exit 1
+    fi
     list_backups
     ;;
   --latest)
@@ -1344,7 +1544,9 @@ case "${RESTORE_TARGET}" in
     restore_backup "$latest"
     ;;
   *)
-    if [[ -d "$RESTORE_TARGET" ]]; then
+    if [[ "${ENCRYPTED_MODE}" == "true" ]]; then
+      decrypt_and_restore "${RESTORE_TARGET}"
+    elif [[ -d "$RESTORE_TARGET" ]]; then
       restore_backup "$RESTORE_TARGET"
     elif [[ -d "${BACKUPS_DIR}/${RESTORE_TARGET}" ]]; then
       restore_backup "${BACKUPS_DIR}/${RESTORE_TARGET}"

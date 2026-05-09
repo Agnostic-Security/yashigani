@@ -326,6 +326,70 @@ backoffice:
   backupsHostPath: ""
 
 # ---------------------------------------------------------------------------
+# Backup — age-encrypted CronJob (MP.L2-3.8.9 / CMMC L2)
+# Last updated: 2026-05-09T00:00:00+01:00
+# ---------------------------------------------------------------------------
+# Operator pre-requisites (see docs/operations/backup.md — Encryption section):
+#
+#   1. Generate key pair on the operator host (NOT inside the cluster):
+#        age-keygen -o /tmp/backup-identity.age
+#        chmod 0400 /tmp/backup-identity.age
+#
+#   2. Extract recipient public key:
+#        age-keygen -y /tmp/backup-identity.age   # prints: age1...
+#
+#   3. Create ConfigMap with the recipient public key:
+#        kubectl create configmap yashigani-backup-recipient \
+#          --from-literal=recipient.age.pub="age1<your-public-key>" \
+#          -n yashigani
+#
+#   4. Create Secret with the identity private key (for restore access — store
+#      a copy offline, do NOT keep only in-cluster):
+#        kubectl create secret generic yashigani-backup-identity \
+#          --from-file=identity.age=/tmp/backup-identity.age \
+#          -n yashigani
+#        rm /tmp/backup-identity.age  # shred the original
+#
+#   Encryption-only backup job does NOT require the identity Secret.
+#   The identity Secret is only needed by the restore path.
+#
+backup:
+  enabled: false  # set to true after provisioning recipientKeyConfigMap
+  schedule: "0 2 * * *"  # 02:00 UTC daily
+  # Name of ConfigMap holding the age recipient public key.
+  # ConfigMap key must be named exactly: recipient.age.pub
+  # Contents: a single line starting with 'age1' (bech32 X25519 public key).
+  recipientKeyConfigMap: "yashigani-backup-recipient"
+  # Name of Secret holding the age identity (private key) — used by restore path only.
+  # Secret key must be named exactly: identity.age
+  # This Secret is NOT mounted by the backup CronJob (encryption uses the public key only).
+  identitySecret: "yashigani-backup-identity"
+  # Output directory inside the CronJob pod. This path must be backed by a
+  # PersistentVolume or hostPath so that encrypted archives survive pod restarts.
+  outputDir: "/var/lib/yashigani/backups"
+  # Source directory inside the pod to archive.
+  sourceDir: "/var/lib/yashigani"
+  # PersistentVolumeClaim to mount at outputDir. If empty, no PVC is created
+  # and the operator must supply a hostPath or other volume via extraVolumes.
+  pvcName: ""
+  # If pvcName is empty and you want the chart to create a PVC, set these:
+  pvc:
+    create: false
+    storageClassName: ""
+    size: "10Gi"
+    accessMode: ReadWriteOnce
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  # History limits
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 3
+
+# ---------------------------------------------------------------------------
 # Policy — Open Policy Agent
 # ---------------------------------------------------------------------------
 policy:
