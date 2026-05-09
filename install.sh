@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
 # last-updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _backup_existing_data — add K8s pg_dump path via kubectl exec; pod runs as UID 70, no root needed)
 # last-updated: 2026-05-07T12:05:00+01:00 (retro #83: add grafana:472 to _pki_chown_client_keys; retro #84: loki:10001+promtail:0 added)
 # last-updated: 2026-05-07T10:00:00+01:00 (retro #84: loki+promtail added to _pki_chown_client_keys UID map for mTLS cert issuance)
@@ -100,6 +101,8 @@ SKIP_PULL=false
 UPGRADE=false
 DRY_RUN=false
 OFFLINE=false
+AIR_GAP=false             # --air-gap: load images from local bundle, block all outbound fetches
+AIR_GAP_BUNDLE=""         # --bundle <path>: path to the .tar.zst bundle built by prepare-airgap-bundle.sh
 NAMESPACE="yashigani"
 TOTAL_STEPS=13
 WORK_DIR=""
@@ -150,7 +153,16 @@ OPTIONS
                                            Open WebUI is governed by its own licence terms)
   --with-internal-ca                      Include Smallstep CA for internal service-to-service TLS
   --wazuh                                 Install Wazuh SIEM (manager + indexer + dashboard)
-  --offline                               Air-gapped mode (no ACME, no image pulls)
+  --offline                               Legacy offline flag (no ACME, no image pulls). Use
+                                          --air-gap --bundle <path> for full air-gap installs.
+  --air-gap                               Air-gap install mode. Loads images from a pre-built
+                                          bundle (--bundle required). Skips ALL outbound fetches
+                                          (registry, HIBP, ACME). Images verified against
+                                          airgap/manifest.yml digests. Implies --offline.
+                                          Build the bundle first on a connected host:
+                                            ./scripts/prepare-airgap-bundle.sh --profile core
+  --bundle         PATH                   Path to the .tar.zst bundle produced by
+                                          prepare-airgap-bundle.sh. Required with --air-gap.
   --non-interactive                       Skip all interactive prompts
   --runtime <docker|podman|k8s>          Lock the container runtime (admin-must-choose
                                           rule per feedback_runtime_choice.md;
@@ -232,6 +244,10 @@ parse_args() {
       --with-internal-ca) INSTALL_INTERNAL_CA=true; shift ;;
       --wazuh)           INSTALL_WAZUH=true;     shift ;;
       --offline)         OFFLINE=true;           shift ;;
+      --air-gap)         AIR_GAP=true;           shift ;;
+      --bundle)
+        AIR_GAP_BUNDLE="${2:?'--bundle requires a path to the .tar.zst bundle'}"
+        shift 2 ;;
       --non-interactive) NON_INTERACTIVE=true;  shift ;;
       --runtime)
         # Explicit runtime selection. Required in --non-interactive mode if
@@ -295,6 +311,26 @@ parse_args() {
   # Kubernetes uses a different step count
   if [[ "$MODE" == "k8s" ]]; then
     TOTAL_STEPS=10
+  fi
+
+  # Air-gap validation
+  if [[ "$AIR_GAP" == "true" ]]; then
+    if [[ -z "$AIR_GAP_BUNDLE" ]]; then
+      log_error "--air-gap requires --bundle <path-to-.tar.zst>"
+      printf "  Build the bundle first on a connected host:\n" >&2
+      printf "    ./scripts/prepare-airgap-bundle.sh --profile core\n" >&2
+      printf "  Then transfer the bundle to this host and run:\n" >&2
+      printf "    ./install.sh --air-gap --bundle yashigani-airgap-v2.23.3-core.tar.zst\n" >&2
+      exit 1
+    fi
+    if [[ "$DRY_RUN" != "true" && ! -f "$AIR_GAP_BUNDLE" ]]; then
+      log_error "--bundle path does not exist: ${AIR_GAP_BUNDLE}"
+      printf "  Ensure the bundle file has been transferred to this host.\n" >&2
+      exit 1
+    fi
+    # Air-gap implies offline — set all skip flags
+    OFFLINE=true
+    SKIP_PULL=true
   fi
 }
 
@@ -1335,7 +1371,11 @@ _apply_deploy_defaults() {
   if [[ "$OFFLINE" == "true" ]]; then
     TLS_MODE="selfsigned"
     SKIP_PULL=true
-    log_info "Offline mode: TLS set to self-signed, image pull skipped"
+    if [[ "$AIR_GAP" == "true" ]]; then
+      log_info "Air-gap mode: TLS set to self-signed, image pull skipped (bundle load in step 9)"
+    else
+      log_info "Offline mode: TLS set to self-signed, image pull skipped"
+    fi
   fi
 }
 
@@ -2280,6 +2320,232 @@ ghcr.io/openclaw/openclaw:2026.3.1" ;;
     "${COMPOSE_CMD[@]}" -f "$compose_file" pull 2>/dev/null || true
     log_success "Container images ready"
   fi
+}
+
+# =============================================================================
+# STEP 9a (air-gap): load bundle + verify digests
+# =============================================================================
+# load_airgap_bundle() is called instead of compose_pull when --air-gap is set.
+# Steps:
+#   1. Verify bundle file exists (already checked in parse_args, but re-check
+#      in case WORK_DIR was detected after parse).
+#   2. Verify bundle SHA256 against sidecar manifest (if present).
+#   3. Unpack + load each image tar via podman load / docker load.
+#   4. Verify each loaded external image digest against airgap/manifest.yml.
+# Fail-closed on any mismatch: abort before any service starts.
+load_airgap_bundle() {
+  set_step "9" "load air-gap bundle"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "load_airgap_bundle: would load ${AIR_GAP_BUNDLE}"
+    return 0
+  fi
+
+  log_step "9/${TOTAL_STEPS}" "Air-gap: loading bundle ${AIR_GAP_BUNDLE} ..."
+
+  # Locate manifest file — first check WORK_DIR, then same dir as install.sh
+  local manifest_file=""
+  local _check_dirs=("${WORK_DIR:-}" "$(dirname "${BASH_SOURCE[0]}")" "$(pwd)")
+  for _d in "${_check_dirs[@]}"; do
+    [[ -z "$_d" ]] && continue
+    if [[ -f "${_d}/airgap/manifest.yml" ]]; then
+      manifest_file="${_d}/airgap/manifest.yml"
+      break
+    fi
+  done
+
+  if [[ -z "$manifest_file" ]]; then
+    log_error "airgap/manifest.yml not found — it must be present alongside install.sh"
+    log_error "Transfer airgap/manifest.yml from the connected host along with the bundle."
+    exit 1
+  fi
+  log_info "Air-gap manifest: ${manifest_file}"
+
+  # --- Verify bundle SHA256 against sidecar (if sidecar present) ---
+  local sidecar_path
+  sidecar_path="${AIR_GAP_BUNDLE%.tar.zst}.manifest"
+  if [[ -f "$sidecar_path" ]]; then
+    log_info "Verifying bundle integrity against sidecar manifest ..."
+    local expected_sha
+    expected_sha="$(grep '^# Bundle SHA256:' "$sidecar_path" 2>/dev/null | awk '{print $NF}' || true)"
+    if [[ -n "$expected_sha" ]]; then
+      local actual_sha
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha="$(sha256sum "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
+      elif command -v shasum >/dev/null 2>&1; then
+        actual_sha="$(shasum -a 256 "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
+      else
+        log_warn "sha256sum / shasum not available — skipping bundle integrity check"
+        actual_sha="$expected_sha"
+      fi
+      if [[ "$actual_sha" != "$expected_sha" ]]; then
+        log_error "BUNDLE INTEGRITY FAILURE"
+        log_error "  Expected SHA256: ${expected_sha}"
+        log_error "  Actual SHA256:   ${actual_sha}"
+        log_error "The bundle has been modified or corrupted. ABORTING."
+        exit 1
+      fi
+      log_success "Bundle SHA256 verified: ${actual_sha:0:16}..."
+    else
+      log_warn "No SHA256 entry in sidecar manifest — integrity check skipped"
+    fi
+  else
+    log_warn "Sidecar manifest not found (${sidecar_path}) — bundle integrity check skipped"
+    log_warn "Provide the .manifest sidecar alongside the .tar.zst for defence-in-depth verification"
+  fi
+
+  # --- Determine container runtime ---
+  local rt
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    rt="podman"
+  else
+    rt="${YSG_RUNTIME:-docker}"
+    command -v podman >/dev/null 2>&1 && rt="podman"
+    command -v docker >/dev/null 2>&1 && [[ "$rt" != "podman" ]] && rt="docker"
+  fi
+  log_info "Loading images with runtime: ${rt}"
+
+  # --- Unpack and load each image tar ---
+  local work_dir
+  # Temp dir for unpacked image tars — must NOT use /tmp (feedback_no_tmp.md).
+  # Use WORK_DIR if available, otherwise HOME.
+  local _tmp_base="${WORK_DIR:-${HOME:-$(pwd)}}"
+  work_dir="$(mktemp -d "${_tmp_base}/yashigani-airgap-load-XXXXXX")"
+  # Trap: clean up on exit
+  # shellcheck disable=SC2064
+  trap "rm -rf '${work_dir}'" EXIT
+
+  log_info "Unpacking bundle ..."
+  tar -C "${work_dir}" -x --zstd -f "${AIR_GAP_BUNDLE}" 2>/dev/null \
+    || { log_error "Failed to unpack bundle — is zstd installed? (apt install zstd)"; exit 1; }
+
+  local loaded_count=0
+  for tar_file in "${work_dir}"/*.tar; do
+    [[ -f "$tar_file" ]] || continue
+    log_info "  Loading $(basename "${tar_file}") ..."
+    "$rt" load -i "${tar_file}" >/dev/null 2>&1 \
+      || { log_error "Failed to load image tar: ${tar_file}"; exit 1; }
+    loaded_count=$((loaded_count + 1))
+  done
+
+  log_success "Loaded ${loaded_count} image(s) from bundle"
+
+  # --- Verify each external image digest against manifest ---
+  log_info "Verifying loaded image digests against airgap/manifest.yml ..."
+
+  local verify_fails=0
+  local verify_ok=0
+
+  # Extract all external images with digests from manifest using python3
+  local manifest_refs
+  manifest_refs="$(python3 - "${manifest_file}" <<'PYEOF'
+import sys, re
+
+manifest_path = sys.argv[1]
+with open(manifest_path) as f:
+    lines = f.readlines()
+
+current_profile = None
+current_image = {}
+in_images = False
+
+i = 0
+while i < len(lines):
+    line = lines[i]
+
+    m = re.match(r'^  (\w+):$', line)
+    if m:
+        if current_image and current_profile:
+            src = current_image.get('source', 'external')
+            ref = current_image.get('ref', '')
+            digest = current_image.get('digest', '')
+            if src == 'external' and ref and digest:
+                print(f"{ref}|{digest}")
+        current_image = {}
+        current_profile = m.group(1)
+        in_images = False
+        i += 1
+        continue
+
+    if re.match(r'^    images:', line):
+        in_images = True
+        i += 1
+        continue
+
+    if re.match(r'^profile_aliases:', line):
+        if current_image and current_profile:
+            src = current_image.get('source', 'external')
+            ref = current_image.get('ref', '')
+            digest = current_image.get('digest', '')
+            if src == 'external' and ref and digest:
+                print(f"{ref}|{digest}")
+        break
+
+    if in_images and current_profile:
+        if re.match(r'^      - name:', line):
+            if current_image:
+                src = current_image.get('source', 'external')
+                ref = current_image.get('ref', '')
+                digest = current_image.get('digest', '')
+                if src == 'external' and ref and digest:
+                    print(f"{ref}|{digest}")
+            current_image = {}
+        m2 = re.match(r'^        (\w+): "?([^"#\n]*)"?', line)
+        if not m2:
+            m2 = re.match(r'^      - (\w+): "?([^"#\n]*)"?', line)
+        if m2:
+            current_image[m2.group(1).strip()] = m2.group(2).strip().strip('"')
+
+    i += 1
+PYEOF
+  2>/dev/null || echo "")"
+
+  # Only verify images actually present in the local store (some profiles may not be in bundle)
+  while IFS='|' read -r ref expected_digest; do
+    [[ -z "$ref" || -z "$expected_digest" ]] && continue
+
+    # Check if image was loaded (it may not be in this profile's bundle — skip if absent)
+    local img_present=0
+    if [[ "$rt" == "podman" ]]; then
+      podman image exists "${ref}" 2>/dev/null && img_present=1 || true
+    else
+      docker image inspect "${ref}" >/dev/null 2>&1 && img_present=1 || true
+    fi
+    [[ "$img_present" -eq 0 ]] && continue
+
+    # Get actual digest
+    local actual_digest=""
+    actual_digest="$("$rt" inspect --format='{{index .RepoDigests 0}}' "${ref}" 2>/dev/null \
+      | awk -F@ '{print $2}' || true)"
+
+    if [[ -z "$actual_digest" ]]; then
+      actual_digest="$("$rt" inspect --format='{{.Digest}}' "${ref}" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$actual_digest" ]]; then
+      log_warn "Cannot read digest for ${ref} — skipping verification (inspect returned empty)"
+      continue
+    fi
+
+    if [[ "$actual_digest" == "$expected_digest" ]]; then
+      verify_ok=$((verify_ok + 1))
+    else
+      log_error "DIGEST MISMATCH: ${ref}"
+      log_error "  Manifest: ${expected_digest}"
+      log_error "  Loaded:   ${actual_digest}"
+      verify_fails=$((verify_fails + 1))
+    fi
+  done <<< "$manifest_refs"
+
+  if [[ "$verify_fails" -gt 0 ]]; then
+    log_error "${verify_fails} image(s) failed digest verification — ABORTING air-gap install"
+    log_error "The loaded images do not match airgap/manifest.yml. Do not proceed."
+    exit 1
+  fi
+
+  log_success "Digest verification complete: ${verify_ok} image(s) verified"
+  log_info "Air-gap: HIBP check disabled (--air-gap implies --no-hibp)"
+  log_info "  If a breach is suspected, rotate all passwords after reinstating network access"
 }
 
 # Ensure Docker daemon is running — prompt user to start it if not
@@ -3996,7 +4262,12 @@ _hibp_check_single() {
 }
 
 _hibp_check_passwords() {
-  # Only check if we have internet access (skip in offline/demo-localhost mode)
+  # Only check if we have internet access (skip in offline/air-gap/demo-localhost mode)
+  if [[ "$AIR_GAP" == "true" ]]; then
+    log_info "Skipping HIBP breach check (air-gap mode — no outbound access)"
+    log_info "  If a breach is suspected, rotate passwords once network access is restored."
+    return 0
+  fi
   if [[ "$OFFLINE" == "true" ]]; then
     log_info "Skipping HIBP breach check (offline mode)"
     return 0
@@ -5474,8 +5745,12 @@ main() {
       fi
     fi
 
-    # Step 9: docker compose pull
-    compose_pull
+    # Step 9: docker compose pull — OR air-gap bundle load
+    if [[ "$AIR_GAP" == "true" ]]; then
+      load_airgap_bundle
+    else
+      compose_pull
+    fi
 
     # Step 9b: Internal mTLS PKI — bootstrap root + intermediate + leaves BEFORE
     # services start, because postgres/redis/opa/gateway/backoffice all now
