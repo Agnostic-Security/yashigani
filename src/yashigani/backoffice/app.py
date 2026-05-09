@@ -88,6 +88,8 @@ from yashigani.backoffice.routes import (
     hibp_router,
     # v2.23.3 — WebAuthn v1 API (public login + step-up revoke)
     webauthn_v1_router,
+    # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
+    pki_v1_router,
 )
 
 
@@ -503,6 +505,7 @@ def create_backoffice_app() -> FastAPI:
         ("/api/v1/license", 256),  # status GET only, no body
         ("/api/v1/admin/secrets", 256),  # secret name only (ASVS 4.3.1)
         ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
+        ("/api/v1/admin/pki", 256),        # PKI rotate body (service name in URL, no body)
         ("/admin/ratelimit", 8 * 1024),
         ("/admin/rbac", 32 * 1024),
         ("/admin/alerts", 32 * 1024),
@@ -701,6 +704,10 @@ def create_backoffice_app() -> FastAPI:
     # v2.23.3 — WebAuthn v1 API (Postgres+Redis backed, public login endpoints)
     # Routes carry full /api/v1/admin/webauthn/ path — no prefix stripping.
     app.include_router(webauthn_v1_router, tags=["webauthn-v1"])
+
+    # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
+    # Routes carry /api/v1/admin/pki/ prefix defined in the router itself.
+    app.include_router(pki_v1_router, tags=["pki"])
 
     # v0.9.0 — Phase 6: WebAuthn/Passkeys
     # webauthn_router carries its own full path segments (no prefix stripping needed)

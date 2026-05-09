@@ -1,0 +1,215 @@
+# airgap/manifest.yml — Yashigani v2.23.3 air-gap image manifest
+# last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
+#
+# PURPOSE
+# -------
+# This manifest is the single source of truth for every container image required
+# by a Yashigani installation.  It is used by two parties:
+#
+#   1. Customer (connected host): scripts/prepare-airgap-bundle.sh reads this
+#      file to pull, verify, and save images into a tar.zst bundle.
+#
+#   2. Installer (isolated host): install.sh --air-gap reads this file to
+#      verify that every image loaded from the bundle matches the pinned digest
+#      before any service starts.
+#
+# SUPPLY-CHAIN NOTE
+# -----------------
+# The customer builds the bundle from their own connected host using their own
+# registry credentials and their own supply-chain attestation tooling.
+# Agnostic Security ships this manifest (kilobytes) only — no images, no blobs.
+# Customers retain their own audit trail (e.g. SBOM generated from this manifest).
+#
+# DIGEST FORMAT
+# -------------
+# Every image is pinned as name:tag@sha256:digest following feedback_image_pinning.md.
+# Digests are multi-arch manifest INDEX digests verified at v2.23.3 branch cut.
+# If your registry mirrors use different digests, update this file before building.
+#
+# PROFILES
+# --------
+# core         — Required for every deployment (gateway, backoffice, supporting services)
+# observability — Prometheus, Grafana, Loki, Promtail, Alertmanager, Jaeger, OTel
+# agents       — Optional LangFlow, Letta, OpenClaw agent bundles
+# openwebui    — Open WebUI browser-based chat interface (pull-unmodified, own licence)
+# wazuh        — Wazuh SIEM (Manager + Indexer + Dashboard)
+# spire        — Smallstep CA for internal service-to-service TLS (--with-internal-ca)
+# full         — Alias that includes core + observability + openwebui
+
+version: "2.23.3"
+
+profiles:
+
+  core:
+    description: "Required for all deployments"
+    images:
+      - name: "docker.io/library/caddy"
+        tag: "2.11.2-alpine"
+        digest: "sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+        ref: "docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+        note: "TLS edge proxy"
+
+      - name: "docker.io/library/redis"
+        tag: "7.4.9-alpine"
+        digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+        ref: "docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+        note: "Rate-limit and session store (redis + budget-redis — same image)"
+
+      - name: "docker.io/openpolicyagent/opa"
+        tag: "1.16.1"
+        digest: "sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02"
+        ref: "docker.io/openpolicyagent/opa:1.16.1@sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02"
+        note: "Policy engine"
+
+      - name: "docker.io/pgvector/pgvector"
+        tag: "0.8.2-pg16"
+        digest: "sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+        ref: "docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+        note: "PostgreSQL 16 + pgvector — primary datastore"
+
+      - name: "docker.io/edoburu/pgbouncer"
+        tag: "v1.25.1-p0"
+        digest: "sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        ref: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        note: "Connection pooler"
+
+      - name: "docker.io/ollama/ollama"
+        tag: "0.23.1"
+        digest: "sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
+        ref: "docker.io/ollama/ollama:0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
+        note: "LLM inference (ollama + ollama-init — same image)"
+
+      # yashigani/gateway and yashigani/backoffice are built from source in this
+      # repo and loaded via 'docker build' / 'podman build' inside the bundle
+      # builder.  They are not pulled from an external registry.
+      # The Dockerfiles are included in the bundle tarball automatically by
+      # prepare-airgap-bundle.sh.
+      # These entries document the expected digest after the isolated-host build;
+      # they are verified by install.sh --air-gap against the sidecar manifest.
+      - name: "yashigani/gateway"
+        tag: "2.23.3"
+        digest: ""
+        ref: "yashigani/gateway:2.23.3"
+        note: "Built from source — digest populated by prepare-airgap-bundle.sh after build"
+        source: "in-tree"
+
+      - name: "yashigani/backoffice"
+        tag: "2.23.3"
+        digest: ""
+        ref: "yashigani/backoffice:2.23.3"
+        note: "Built from source — digest populated by prepare-airgap-bundle.sh after build"
+        source: "in-tree"
+
+  observability:
+    description: "Metrics, logs, traces, and alerting (optional but recommended)"
+    images:
+      - name: "docker.io/prom/prometheus"
+        tag: "v3.11.3"
+        digest: "sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3"
+        ref: "docker.io/prom/prometheus:v3.11.3@sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3"
+        note: "Metrics collection"
+
+      - name: "docker.io/grafana/grafana"
+        tag: "13.0.1"
+        digest: "sha256:0f86bada30d65ef9d0183b90c1e2682ac92d53d95da8bed322b984ea78a4a73a"
+        ref: "docker.io/grafana/grafana:13.0.1@sha256:0f86bada30d65ef9d0183b90c1e2682ac92d53d95da8bed322b984ea78a4a73a"
+        note: "Dashboards"
+
+      - name: "docker.io/grafana/loki"
+        tag: "3.7.1"
+        digest: "sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4"
+        ref: "docker.io/grafana/loki:3.7.1@sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4"
+        note: "Log aggregation"
+
+      - name: "docker.io/grafana/promtail"
+        tag: "3.6.10"
+        digest: "sha256:2a0f5e3e160ee5d549c585f6cc4f4e1c566ff783324a424bd75bc16503fc660e"
+        ref: "docker.io/grafana/promtail:3.6.10@sha256:2a0f5e3e160ee5d549c585f6cc4f4e1c566ff783324a424bd75bc16503fc660e"
+        note: "Log shipping"
+
+      - name: "docker.io/prom/alertmanager"
+        tag: "v0.32.1"
+        digest: "sha256:51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286"
+        ref: "docker.io/prom/alertmanager:v0.32.1@sha256:51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286"
+        note: "Alert routing"
+
+      - name: "docker.io/otel/opentelemetry-collector-contrib"
+        tag: "0.151.0"
+        digest: "sha256:d57bfe8eee2378f31cb1193239fbcac521d54a5a071fca2bfc106916a32b892d"
+        ref: "docker.io/otel/opentelemetry-collector-contrib:0.151.0@sha256:d57bfe8eee2378f31cb1193239fbcac521d54a5a071fca2bfc106916a32b892d"
+        note: "OpenTelemetry collector"
+
+      - name: "docker.io/jaegertracing/jaeger"
+        tag: "2.17.0"
+        digest: "sha256:6266573208d665ce5c17483bce0a75d0806480d92c84766d288d0aee885ce708"
+        ref: "docker.io/jaegertracing/jaeger:2.17.0@sha256:6266573208d665ce5c17483bce0a75d0806480d92c84766d288d0aee885ce708"
+        note: "Distributed tracing"
+
+  openwebui:
+    description: "Open WebUI browser-based chat interface (optional; own licence terms)"
+    images:
+      - name: "ghcr.io/open-webui/open-webui"
+        tag: "v0.9.2"
+        digest: "sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49"
+        ref: "ghcr.io/open-webui/open-webui:v0.9.2@sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49"
+        note: "Open WebUI — pulled unmodified; governed by its own licence"
+
+  agents:
+    description: "Optional agent bundles: LangFlow, Letta, OpenClaw"
+    images:
+      - name: "docker.io/langflowai/langflow"
+        tag: "1.9.2"
+        digest: "sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+        ref: "docker.io/langflowai/langflow:1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+        note: "LangFlow agent orchestration"
+
+      - name: "docker.io/letta/letta"
+        tag: "0.16.7"
+        digest: "sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+        ref: "docker.io/letta/letta:0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+        note: "Letta agent runtime"
+
+      - name: "ghcr.io/openclaw/openclaw"
+        tag: "2026.5.6"
+        digest: "sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
+        ref: "ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
+        note: "OpenClaw legal agent"
+
+  wazuh:
+    description: "Wazuh SIEM — Manager, Indexer, Dashboard (optional; --wazuh)"
+    images:
+      - name: "docker.io/wazuh/wazuh-manager"
+        tag: "4.14.5"
+        digest: "sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109"
+        ref: "docker.io/wazuh/wazuh-manager:4.14.5@sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109"
+        note: "Wazuh Manager"
+
+      - name: "docker.io/wazuh/wazuh-indexer"
+        tag: "4.14.5"
+        digest: "sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c"
+        ref: "docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c"
+        note: "Wazuh Indexer (OpenSearch)"
+
+      - name: "docker.io/wazuh/wazuh-dashboard"
+        tag: "4.14.5"
+        digest: "sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af"
+        ref: "docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af"
+        note: "Wazuh Dashboard"
+
+  spire:
+    description: "Smallstep CA for internal service-to-service TLS (--with-internal-ca)"
+    images:
+      - name: "docker.io/smallstep/step-ca"
+        tag: "0.30.2"
+        digest: "sha256:a2b17872915c193259b75a5474c398326f41bd199f0842093e52cf4182bc8270"
+        ref: "docker.io/smallstep/step-ca:0.30.2@sha256:a2b17872915c193259b75a5474c398326f41bd199f0842093e52cf4182bc8270"
+        note: "Smallstep CA"
+
+# Profile aliases — expand to explicit profile lists in scripts
+profile_aliases:
+  full:
+    - core
+    - observability
+    - openwebui
+  core:
+    - core
