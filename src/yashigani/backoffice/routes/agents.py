@@ -17,8 +17,9 @@ Routes:
   DELETE /admin/agents/{agent_id}               — deactivate (soft delete)
   POST   /admin/agents/{agent_id}/token/rotate  — rotate PSK, return new token once
 
-Last updated: 2026-05-08T00:00:00+01:00
+Last updated: 2026-05-09T00:00:00+01:00
 """
+
 from __future__ import annotations
 
 import logging
@@ -28,7 +29,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # AVA-2026-04-29-001 — Stored XSS: reject HTML tags in free-text agent fields
@@ -69,7 +70,7 @@ logger = logging.getLogger(__name__)
 # is now centralised in HttpClient._check_policy().
 # ---------------------------------------------------------------------------
 
-_OWUI_HTTP_CLIENT = None   # lazy-initialised on first use
+_OWUI_HTTP_CLIENT = None  # lazy-initialised on first use
 
 
 def _owui_http_client():
@@ -77,6 +78,7 @@ def _owui_http_client():
     global _OWUI_HTTP_CLIENT
     if _OWUI_HTTP_CLIENT is None:
         from yashigani.net import HttpClient
+
         raw_allowlist = os.getenv(
             "YASHIGANI_OWUI_HOSTNAMES",
             "open-webui,127.0.0.1,localhost",
@@ -84,7 +86,7 @@ def _owui_http_client():
         allowlist = [h.strip() for h in raw_allowlist.split(",") if h.strip()]
         _OWUI_HTTP_CLIENT = HttpClient(
             allowlist=allowlist,
-            allow_http=True,    # OWUI runs on plain HTTP inside the Docker mesh
+            allow_http=True,  # OWUI runs on plain HTTP inside the Docker mesh
             timeout_s=10.0,
         )
     return _OWUI_HTTP_CLIENT
@@ -96,6 +98,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # SSRF / scheme allowlist for agent upstream_url (TM-V231-004, Pentest #95 2026-04-29)
 # ---------------------------------------------------------------------------
+
 
 def _assert_safe_upstream_url(url: str) -> str:
     """Assert that ``url`` is safe to store as an agent's upstream_url.
@@ -133,8 +136,7 @@ def _assert_safe_upstream_url(url: str) -> str:
 
     if scheme not in ("http", "https"):
         raise ValueError(
-            f"upstream_url scheme {scheme!r} not allowed — only http and https "
-            f"are accepted (CWE-918 / TM-V231-004)"
+            f"upstream_url scheme {scheme!r} not allowed — only http and https are accepted (CWE-918 / TM-V231-004)"
         )
 
     if not host:
@@ -194,10 +196,7 @@ def _assert_safe_upstream_url(url: str) -> str:
                 "intentional (CWE-918 / TM-V231-004)"
             )
         if ip.is_reserved:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to reserved {addr_str} "
-                "(CWE-918 / TM-V231-004)"
-            )
+            raise ValueError(f"upstream_url host {host!r} resolves to reserved {addr_str} (CWE-918 / TM-V231-004)")
 
     return url
 
@@ -205,6 +204,7 @@ def _assert_safe_upstream_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
+
 
 class AgentRegisterRequest(BaseModel):
     name: str = Field(
@@ -316,12 +316,15 @@ class AgentRotateResponse(BaseModel):
 
 class AgentQuickStartResponse(BaseModel):
     agent_id: str
-    quick_start: dict = Field(description="Copy-paste integration snippets (token placeholder — use your stored token).")
+    quick_start: dict = Field(
+        description="Copy-paste integration snippets (token placeholder — use your stored token)."
+    )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_registry():
     reg = backoffice_state.agent_registry
@@ -358,7 +361,7 @@ def _build_quick_start(agent_id: str, token: str) -> dict:
             f"curl -X POST https://{gw}/mcp \\\n"
             f"  -H 'Authorization: Bearer {token}' \\\n"
             f"  -H 'Content-Type: application/json' \\\n"
-            f"  -d '{{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}}'"
+            f'  -d \'{{"jsonrpc":"2.0","method":"tools/list","id":1}}\''
         ),
         "python_httpx": (
             f"import httpx\n"
@@ -366,43 +369,67 @@ def _build_quick_start(agent_id: str, token: str) -> dict:
             f"    base_url='https://{gw}',\n"
             f"    headers={{'Authorization': 'Bearer {token}'}}\n"
             f")\n"
-            f"resp = client.post('/mcp', json={{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}})\n"
+            f'resp = client.post(\'/mcp\', json={{"jsonrpc":"2.0","method":"tools/list","id":1}})\n'
             f"print(resp.json())"
         ),
-        "health_check": (
-            f"curl https://{gw}/health -H 'Authorization: Bearer {token}'"
-        ),
+        "health_check": (f"curl https://{gw}/health -H 'Authorization: Bearer {token}'"),
         "note": (
-            f"Replace '{gw}' with your actual gateway URL. "
-            f"Token shown once — store it securely. Agent ID: {agent_id}"
+            f"Replace '{gw}' with your actual gateway URL. Token shown once — store it securely. Agent ID: {agent_id}"
         ),
     }
 
 
-def _push_openwebui_model(agent_name: str, upstream_url: str) -> None:
+async def _push_openwebui_model(agent_name: str, upstream_url: str) -> None:
     """
     Register agent as a selectable model in Open WebUI via its REST API.
     Non-fatal: logs on failure. Idempotent — skips if already exists.
 
-    SSRF guard: OWUI_API_URL is validated through the centralised HttpClient
-    before any outbound request is issued (yashigani-retro#95 / OWASP A10 / API7).
-    The prior hand-rolled helper has been removed; policy is now enforced by
-    HttpClient._check_policy() via _owui_http_client().
+    DNS-rebinding defence (extend-pr-112-owui-wrap / OWASP API7 / issue #91):
+    OWUI hostnames are admin-configurable and can be attacker-influenced via
+    licence-key compromise or admin-account takeover (TA-3 insider). The prior
+    implementation ran a pre-flight _check_policy() and then made outbound
+    requests via urllib.request.urlopen() — leaving a DNS-rebinding window
+    between the policy check and the TCP connect. This version replaces
+    urllib.request entirely with pinned_resolver, which resolves the OWUI
+    hostname once, verifies the IP, and pins the transport for all requests
+    inside the context block. Subsequent DNS changes cannot redirect the
+    connection to an internal address.
+
+    SSRF guard chain:
+      1. _owui_http_client()._check_policy() — scheme + allowlist pre-flight
+         (kept for non-async callers that may inspect policy without connecting)
+      2. pinned_resolver(...) — resolves, verifies, pins IP; replaces urllib
+
+    Every successful pin emits SSRF_PINNED_RESOLVER_USED at DEBUG level
+    (emitted internally by pinned_resolver).
     """
     try:
-        import json
-        import urllib.request
-        import urllib.error
-        from yashigani.net import BlockedByPolicy
+        import time as _time
+        import jwt as _pyjwt
+        from urllib.parse import urlparse as _urlparse
+
+        from yashigani.net import BlockedByPolicy, pinned_resolver
 
         raw_owui_url = os.getenv("OWUI_API_URL", "http://open-webui:8080")
+
+        # Pre-flight: scheme + allowlist check (fast path before DNS lookup).
         try:
             _owui_http_client()._check_policy(raw_owui_url)
         except BlockedByPolicy as _bp_exc:
-            raise RuntimeError(
-                f"owui_url_blocked: {_bp_exc} (CWE-918, YSG-RISK-007.A)"
-            ) from _bp_exc
+            raise RuntimeError(f"owui_url_blocked: {_bp_exc} (CWE-918, YSG-RISK-007.A)") from _bp_exc
+
         owui_url = raw_owui_url
+        parsed_owui = _urlparse(owui_url)
+        owui_hostname = parsed_owui.hostname or ""
+        owui_port = parsed_owui.port or (443 if parsed_owui.scheme == "https" else 80)
+
+        # Build OWUI allowlist from env — same source as _owui_http_client().
+        raw_allowlist = os.getenv(
+            "YASHIGANI_OWUI_HOSTNAMES",
+            "open-webui,127.0.0.1,localhost",
+        )
+        owui_allowlist = [h.strip() for h in raw_allowlist.split(",") if h.strip()]
+
         owui_secret = os.getenv("OWUI_SECRET_KEY")
         if not owui_secret:
             # Fail-closed: OWUI integration requires an explicit secret. The
@@ -422,60 +449,76 @@ def _push_openwebui_model(agent_name: str, upstream_url: str) -> None:
         # security track record, validates header shape, and avoids any
         # chance of alg-confusion from hand-rolled JSON encoding. Internal
         # P2 observation (re-audit reference held in compliance archive).
-        import time as _time
-        import jwt as _pyjwt
         payload_data = {
             "id": "00000000-0000-0000-0000-000000000000",
             "sub": "admin",
             "role": "admin",
             "exp": int(_time.time()) + 300,
         }
-        token = _pyjwt.encode(payload_data, owui_secret, algorithm="HS256")
+        owui_jwt = _pyjwt.encode(payload_data, owui_secret, algorithm="HS256")
         # PyJWT ≥2 returns str; older returned bytes. Normalise.
-        if isinstance(token, bytes):
-            token = token.decode()
+        if isinstance(owui_jwt, bytes):
+            owui_jwt = owui_jwt.decode()
 
         model_id = "@" + agent_name
-        headers = {
-            "Authorization": f"Bearer {token}",
+        req_headers = {
+            "Authorization": f"Bearer {owui_jwt}",
             "Content-Type": "application/json",
         }
 
-        # Check if model already exists
-        try:
-            req = urllib.request.Request(
+        # All outbound OWUI requests go through the pinned-resolver transport.
+        # DNS is resolved and verified once at context entry; every HTTP call
+        # inside the block uses the cached IP — DNS changes mid-block are ignored.
+        # verify=use_tls: False for http:// (OWUI on plain HTTP inside Docker mesh);
+        # httpx will not attempt TLS for http:// URLs regardless of the flag value.
+        # True for https:// deployments — certificate validation is preserved.
+        use_tls = parsed_owui.scheme == "https"
+        async with pinned_resolver(
+            owui_hostname,
+            port=owui_port,
+            allowlist=owui_allowlist,
+            verify=use_tls,
+            timeout_s=10.0,
+        ) as session:
+            # Check if model already exists
+            check_resp = await session.get(
                 f"{owui_url}/api/v1/models/{model_id}",
-                headers=headers,
+                headers=req_headers,
             )
-            urllib.request.urlopen(req, timeout=5)
-            logger.info("Open WebUI: model %s already exists", model_id)
-            return
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                logger.warning("Open WebUI: model check failed (%s)", e.code)
+            if check_resp.status_code == 200:
+                logger.info("Open WebUI: model %s already exists", model_id)
+                return
+            if check_resp.status_code != 404:
+                logger.warning(
+                    "Open WebUI: model check returned unexpected status %s",
+                    check_resp.status_code,
+                )
 
-        # Create model
-        body = json.dumps({
-            "id": model_id,
-            "name": agent_name + " Agent",
-            "base_model_id": os.getenv("OLLAMA_MODEL", "qwen2.5:3b"),
-            "meta": {
-                "description": f"Yashigani agent: {agent_name} @ {upstream_url}",
-                "profile_image_url": "",
-                "capabilities": {"usage": True},
-            },
-            "params": {},
-            "is_active": True,
-        }).encode()
-
-        req = urllib.request.Request(
-            f"{owui_url}/api/v1/models/create",
-            data=body,
-            headers=headers,
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=10)
-        logger.info("Open WebUI: registered model %s via API", model_id)
+            # Create model
+            create_body = {
+                "id": model_id,
+                "name": agent_name + " Agent",
+                "base_model_id": os.getenv("OLLAMA_MODEL", "qwen2.5:3b"),
+                "meta": {
+                    "description": f"Yashigani agent: {agent_name} @ {upstream_url}",
+                    "profile_image_url": "",
+                    "capabilities": {"usage": True},
+                },
+                "params": {},
+                "is_active": True,
+            }
+            create_resp = await session.post(
+                f"{owui_url}/api/v1/models/create",
+                headers=req_headers,
+                json=create_body,
+            )
+            if create_resp.status_code in (200, 201):
+                logger.info("Open WebUI: registered model %s via pinned-resolver", model_id)
+            else:
+                logger.warning(
+                    "Open WebUI: model create returned status %s",
+                    create_resp.status_code,
+                )
     except Exception as exc:
         logger.warning("_push_openwebui_model failed: %s", exc)
 
@@ -487,6 +530,7 @@ def _push_opa() -> None:
     """
     try:
         from yashigani.rbac.opa_push import push_rbac_data
+
         rbac_store = backoffice_state.rbac_store
         if rbac_store is None:
             logger.warning("_push_opa: rbac_store not available — skipping OPA push")
@@ -503,6 +547,7 @@ def _push_opa() -> None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @router.get("/admin/agents", response_model=list[AgentResponse])
 async def list_agents(session: AdminSession):
@@ -524,6 +569,7 @@ async def register_agent(
     # had a TOCTOU race and is removed here. LicenseLimitExceeded is raised by
     # the Lua path on breach and caught below.
     from yashigani.licensing.enforcer import LicenseLimitExceeded
+
     try:
         agent_id, plaintext_token = registry.register(
             name=body.name,
@@ -551,20 +597,23 @@ async def register_agent(
     if audit is not None:
         try:
             from yashigani.audit.schema import AgentRegisteredEvent
-            audit.write(AgentRegisteredEvent(
-                agent_id=agent_id,
-                agent_name=body.name,
-                upstream_url=body.upstream_url,
-                groups=body.groups,
-                allowed_caller_groups=body.allowed_caller_groups,
-                allowed_paths=body.allowed_paths,
-                admin_account=session.account_id,
-            ))
+
+            audit.write(
+                AgentRegisteredEvent(
+                    agent_id=agent_id,
+                    agent_name=body.name,
+                    upstream_url=body.upstream_url,
+                    groups=body.groups,
+                    allowed_caller_groups=body.allowed_caller_groups,
+                    allowed_paths=body.allowed_paths,
+                    admin_account=session.account_id,
+                )
+            )
         except Exception as exc:
             logger.error("Failed to write AgentRegisteredEvent: %s", exc)
 
     _push_opa()
-    _push_openwebui_model(body.name, body.upstream_url)
+    await _push_openwebui_model(body.name, body.upstream_url)
 
     return AgentRegisterResponse(
         agent_id=agent_id,
@@ -637,11 +686,14 @@ async def update_agent(
     if audit is not None and changed_fields:
         try:
             from yashigani.audit.schema import AgentUpdatedEvent
-            audit.write(AgentUpdatedEvent(
-                agent_id=agent_id,
-                changed_fields=changed_fields,
-                admin_account=session.account_id,
-            ))
+
+            audit.write(
+                AgentUpdatedEvent(
+                    agent_id=agent_id,
+                    changed_fields=changed_fields,
+                    admin_account=session.account_id,
+                )
+            )
         except Exception as exc:
             logger.error("Failed to write AgentUpdatedEvent: %s", exc)
 
@@ -674,11 +726,14 @@ async def deactivate_agent(
     if audit is not None:
         try:
             from yashigani.audit.schema import AgentDeactivatedEvent
-            audit.write(AgentDeactivatedEvent(
-                agent_id=agent_id,
-                admin_account=session.account_id,
-                reason=reason,
-            ))
+
+            audit.write(
+                AgentDeactivatedEvent(
+                    agent_id=agent_id,
+                    admin_account=session.account_id,
+                    reason=reason,
+                )
+            )
         except Exception as exc:
             logger.error("Failed to write AgentDeactivatedEvent: %s", exc)
 
@@ -703,10 +758,13 @@ async def rotate_agent_token(
     if audit is not None:
         try:
             from yashigani.audit.schema import AgentTokenRotatedEvent
-            audit.write(AgentTokenRotatedEvent(
-                agent_id=agent_id,
-                admin_account=session.account_id,
-            ))
+
+            audit.write(
+                AgentTokenRotatedEvent(
+                    agent_id=agent_id,
+                    admin_account=session.account_id,
+                )
+            )
         except Exception as exc:
             logger.error("Failed to write AgentTokenRotatedEvent: %s", exc)
 

@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-09T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-09T12:00:00+01:00 -->
 
 # SSRF Defences in Yashigani
 
@@ -122,26 +122,30 @@ log-level override map.
 
 ---
 
+## Protected Call Sites
+
+| Call site | Current guard | Pinned resolver? | Rationale |
+|---|---|---|---|
+| **Open WebUI model push** | `HttpClient` pre-flight + `pinned_resolver` | **Yes** (v2.23.3, extend-pr-112-owui-wrap) | OWUI hostnames are admin-configurable **per agent** and can be influenced by licence-key compromise or admin-account takeover (TA-3 insider). Highest rebinding risk. |
+
 ## Remaining Attack Surface
 
-| Call site | Current guard | Pinned resolver? |
-|---|---|---|
-| HIBP (password breach) | `HttpClient`, allowlist `api.pwnedpasswords.com` | No — hardcoded URL; risk is theoretical |
-| Open WebUI model push | `HttpClient`, `YASHIGANI_OWUI_HOSTNAMES` | No — admin-configured at deploy time |
-| OIDC token exchange | `HttpClient`, OIDC discovery URL validation | No — operator-configured, validated at startup |
-| OPA policy push | `HttpClient`, OPA URL schema check | No — internal sidecar; no public DNS |
-| SIEM forwarding | `validate_siem_url()` allowlist | No — operator-configured at deploy time |
-| Alert sinks (Slack/Teams/PagerDuty) | `HttpClient` | No — webhook URLs are operator-configured |
-| Gateway upstream proxy | Admin-configured allowlist, `_assert_safe_upstream_url` | No — admin-controlled |
+| Call site | Current guard | Pinned resolver? | Rationale |
+|---|---|---|---|
+| HIBP (password breach) | `HttpClient`, allowlist `api.pwnedpasswords.com` | No | Hardcoded URL — no attacker-controlled hostname component. |
+| OIDC token exchange | `HttpClient`, OIDC discovery URL validation | No | Operator-configured at deploy time; validated once at startup, not per-request. |
+| OPA policy push | `HttpClient`, OPA URL schema check | No | Internal sidecar; not exposed to public DNS. |
+| SIEM forwarding | `validate_siem_url()` allowlist | No | Operator-configured at deploy time; not request-time-computed. |
+| Alert sinks (Slack/Teams/PagerDuty) | `HttpClient` | No | Webhook URLs are operator-configured at deploy time. |
+| Gateway upstream proxy | Admin-configured allowlist, `_assert_safe_upstream_url` | No | Admin-controlled and validated at agent registration. |
 
-Sites marked "No" carry low DNS-rebinding risk because either:
-- the URL is fully hardcoded (no attacker-controlled hostname component), or
-- the hostname is operator-configured at deploy time and validated once at
-  startup (not per-request).
+The OWUI model push is the highest-risk surface because the OWUI hostname is
+admin-configurable per-agent. All other surfaces use URLs that are fully
+hardcoded or operator-configured at deploy time and validated at startup —
+not computed at request time from attacker-influenceable inputs.
 
-`pinned_resolver` is available for any call site where the URL target is
-computed at request time and the hostname could theoretically be influenced by
-external data.
+`pinned_resolver` is available for any future call site where the URL target is
+computed at request time and the hostname could be influenced by external data.
 
 ---
 
