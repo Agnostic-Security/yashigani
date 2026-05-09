@@ -141,11 +141,11 @@ class TestOwuiDnsRebindingDefence:
             pinned_resolver_calls.append({"hostname": hostname, "allowlist": allowlist})
             yield fake_client
 
-        # Patch the attribute on yashigani.net so the in-function `from yashigani.net
-        # import pinned_resolver` binds to our fake.
-        import yashigani.net as _net_mod
-
-        with patch.object(_net_mod, "pinned_resolver", _fake_pinned_resolver):
+        # agents.py now does `from yashigani.net.pinned_resolver import pinned_resolver`
+        # inside the function body (direct submodule import — required so mypy resolves
+        # the callable type; lazy because it's function-scoped).  Patch at the source
+        # so the in-function import picks up the fake.
+        with patch("yashigani.net.pinned_resolver.pinned_resolver", _fake_pinned_resolver):
             from yashigani.backoffice.routes.agents import _push_openwebui_model
 
             await _push_openwebui_model("test-agent", "http://open-webui:8080")
@@ -343,9 +343,10 @@ class TestOwuiPinnedResolverAllowlistPropagation:
             captured_allowlist.append(list(allowlist or []))
             yield fake_client
 
-        import yashigani.net as _net_mod
-
-        with patch.object(_net_mod, "pinned_resolver", _capture_pinned_resolver):
+        # agents.py now does `from yashigani.net.pinned_resolver import pinned_resolver`
+        # inside the function body — patch at the source submodule so the in-function
+        # import picks up the fake.
+        with patch("yashigani.net.pinned_resolver.pinned_resolver", _capture_pinned_resolver):
             from yashigani.backoffice.routes.agents import _push_openwebui_model
 
             await _push_openwebui_model("custom-agent", "http://custom-owui:8080")

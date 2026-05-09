@@ -83,8 +83,16 @@ from __future__ import annotations
 
 import sys
 import types
+from typing import TYPE_CHECKING
 
 from .http_client import HttpClient, BlockedByPolicy
+
+if TYPE_CHECKING:
+    # Type-check-time only: gives mypy the correct callable type for
+    # `pinned_resolver` when imported via `from yashigani.net import
+    # pinned_resolver`.  At runtime the lazy _NetModule.__getattribute__ trick
+    # handles the redirect; this block is never executed.
+    from .pinned_resolver import pinned_resolver as pinned_resolver  # noqa: F401
 
 __all__ = ["HttpClient", "BlockedByPolicy", "pinned_resolver"]
 

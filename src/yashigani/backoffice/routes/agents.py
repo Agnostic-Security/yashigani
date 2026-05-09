@@ -408,7 +408,8 @@ async def _push_openwebui_model(agent_name: str, upstream_url: str) -> None:
         import jwt as _pyjwt
         from urllib.parse import urlparse as _urlparse
 
-        from yashigani.net import BlockedByPolicy, pinned_resolver
+        from yashigani.net import BlockedByPolicy
+        from yashigani.net.pinned_resolver import pinned_resolver
 
         raw_owui_url = os.getenv("OWUI_API_URL", "http://open-webui:8080")
 
