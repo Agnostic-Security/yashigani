@@ -14,7 +14,12 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ### Added (v2.23.3)
 
-- **feat/v233-pki-bundle** — PKI admin UI + BYO-CA driver (#51 + #53): New `pki/drivers/` abstraction (`InternalCADriver`, `ByoCADriver`, `CADriver` base) selected via `YASHIGANI_PKI_CA_MODE=internal|byo` (default: `internal`, preserving current behaviour). Admin UI: `GET /api/v1/admin/pki/chain/{service}` (issuer, subject, SANs, NotBefore/NotAfter, serial, SHA-256 fingerprint), `POST /api/v1/admin/pki/rotate/{service}` (re-issue via configured driver, step-up TOTP required), `GET /api/v1/admin/pki/bundle/{service}` (PEM download: leaf + intermediates, private key never transmitted), `GET /api/v1/admin/pki/status` (all services health summary). BYO-CA mode submits PEM CSRs to a customer HTTPS signing endpoint (step-ca / Vault PKI / any RFC endpoint), supports token or mTLS auth, validates chain back to provided CA cert, fails closed on any error (never silently falls back to internal CA). New dashboard panel under "PKI" nav tab + external `pki.js` (CSP-compliant, no inline JS). Audit events `PKI_CERT_ROTATED` / `PKI_CERT_ROTATION_FAILED` on all rotations. 23 new unit tests.
+- **feat/v233-pki-bundle** — PKI admin UI (`/api/v1/admin/pki/*`) and BYO-CA driver (`YASHIGANI_PKI_CA_MODE=byo`). Closes #51 + #53.
+  - Admin endpoints: `GET /chain/{service}` (cert detail + SHA-256 fingerprint), `POST /rotate/{service}` (step-up TOTP, ASVS V6.8.4), `GET /bundle/{service}` (PEM download, private key never included / CWE-200), `GET /status` (all-services overview).
+  - BYO-CA driver: EC P-256 CSR generation → HTTPS signing endpoint (step-ca / Vault PKI) → chain validation → atomic key install. Auth modes: `token`, `mtls`, `none`. Fail-closed: `DriverError` on any failure — no silent fallback to internal issuer.
+  - Service name regex `[a-z][a-z0-9_\-]{0,63}$` — path traversal prevention. Body limit 256 bytes (ASVS 4.3.1). Audit events: `PKI_CERT_ROTATED`, `PKI_CERT_ROTATION_FAILED`.
+  - 23 new unit tests (PKI-D-01…12, PKI-R-01…11). 10 Playwright e2e tests (PW-PKI-01…10).
+  - Driver abstraction: `yashigani.pki.drivers.{base,internal_ca,byo_ca}` + `yashigani.pki.driver_factory`.
 
 ### Security (v2.23.3)
 
