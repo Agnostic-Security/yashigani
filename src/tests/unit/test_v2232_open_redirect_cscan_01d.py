@@ -20,8 +20,9 @@ References:
   - CWE-601 URL Redirection to Untrusted Site ('Open Redirect')
   - CodeQL js/client-side-unvalidated-url-redirection alerts #25, #26
 
-Last updated: 2026-05-03
+Last updated: 2026-05-09
 """
+
 from __future__ import annotations
 
 import json
@@ -35,15 +36,14 @@ import pytest
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-_STATIC_JS = (
-    Path(__file__).parent.parent.parent / "yashigani" / "backoffice" / "static" / "js"
-)
+_STATIC_JS = Path(__file__).parent.parent.parent / "yashigani" / "backoffice" / "static" / "js"
 _LOGIN_JS = _STATIC_JS / "login.js"
 _USER_LOGIN_JS = _STATIC_JS / "user_login.js"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _extract_safe_next(js_path: Path) -> str:
     """
@@ -124,15 +124,14 @@ process.stdout.write(JSON.stringify(result));
             text=True,
             timeout=10,
         )
-    assert result.returncode == 0, (
-        f"node exited {result.returncode}; stderr: {result.stderr[:400]}"
-    )
+    assert result.returncode == 0, f"node exited {result.returncode}; stderr: {result.stderr[:400]}"
     return json.loads(result.stdout)
 
 
 # ---------------------------------------------------------------------------
 # Parametrised helpers — same cases exercised against BOTH files
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(params=[_LOGIN_JS, _USER_LOGIN_JS], ids=["login.js", "user_login.js"])
 def js_file(request):
@@ -143,6 +142,7 @@ def js_file(request):
 # ---------------------------------------------------------------------------
 # DETERMINISTIC GATE — 8 test cases from V232-CSCAN-01d work spec
 # ---------------------------------------------------------------------------
+
 
 class TestSafeNextRejectsOffOriginCases:
     """
@@ -174,9 +174,7 @@ class TestSafeNextRejectsOffOriginCases:
         Expected: '/'.
         """
         result = _run_safe_next(js_file, "//attacker.com/path")
-        assert result == "/", (
-            f"({js_file.name}): `//attacker.com` was accepted (returned {result!r})"
-        )
+        assert result == "/", f"({js_file.name}): `//attacker.com` was accepted (returned {result!r})"
 
     def test_case3_javascript_scheme(self, js_file):
         """
@@ -185,9 +183,7 @@ class TestSafeNextRejectsOffOriginCases:
         Expected: '/'.
         """
         result = _run_safe_next(js_file, "javascript:alert(1)")
-        assert result == "/", (
-            f"({js_file.name}): `javascript:alert(1)` was accepted (returned {result!r})"
-        )
+        assert result == "/", f"({js_file.name}): `javascript:alert(1)` was accepted (returned {result!r})"
 
     def test_case4_https_absolute(self, js_file):
         """
@@ -196,9 +192,7 @@ class TestSafeNextRejectsOffOriginCases:
         Expected: '/'.
         """
         result = _run_safe_next(js_file, "https://evil.com/path")
-        assert result == "/", (
-            f"({js_file.name}): `https://evil.com/path` was accepted (returned {result!r})"
-        )
+        assert result == "/", f"({js_file.name}): `https://evil.com/path` was accepted (returned {result!r})"
 
     def test_case6_url_encoded_backslash(self, js_file):
         """
@@ -251,23 +245,17 @@ class TestSafeNextRejectsOffOriginCases:
         Expected: '/'.
         """
         result = _run_safe_next(js_file, "///attacker.com")
-        assert result == "/", (
-            f"({js_file.name}): `///attacker.com` was accepted (returned {result!r})"
-        )
+        assert result == "/", f"({js_file.name}): `///attacker.com` was accepted (returned {result!r})"
 
     def test_null_input(self, js_file):
         """None/null input must return '/'."""
         result = _run_safe_next(js_file, None)
-        assert result == "/", (
-            f"({js_file.name}): null input returned {result!r}, expected '/'"
-        )
+        assert result == "/", f"({js_file.name}): null input returned {result!r}, expected '/'"
 
     def test_empty_string(self, js_file):
         """Empty string must return '/'."""
         result = _run_safe_next(js_file, "")
-        assert result == "/", (
-            f"({js_file.name}): empty string returned {result!r}, expected '/'"
-        )
+        assert result == "/", f"({js_file.name}): empty string returned {result!r}, expected '/'"
 
 
 class TestSafeNextAcceptsLegitimatePaths:
@@ -300,21 +288,18 @@ class TestSafeNextAcceptsLegitimatePaths:
     def test_legitimate_path_with_hash(self, js_file):
         """On-origin path with hash fragment must be accepted."""
         result = _run_safe_next(js_file, "/dashboard#health")
-        assert result == "/dashboard#health", (
-            f"({js_file.name}): hash fragment path rejected; returned {result!r}"
-        )
+        assert result == "/dashboard#health", f"({js_file.name}): hash fragment path rejected; returned {result!r}"
 
     def test_root_slash(self, js_file):
         """Bare '/' must be accepted."""
         result = _run_safe_next(js_file, "/")
-        assert result == "/", (
-            f"({js_file.name}): bare '/' rejected; returned {result!r}"
-        )
+        assert result == "/", f"({js_file.name}): bare '/' rejected; returned {result!r}"
 
 
 # ---------------------------------------------------------------------------
 # Static source checks — belt-and-braces (no Node required)
 # ---------------------------------------------------------------------------
+
 
 class TestSourceGuardPresent:
     """
@@ -330,8 +315,7 @@ class TestSourceGuardPresent:
         """safeNext function must be present in the file."""
         src = js_path.read_text(encoding="utf-8")
         assert "function safeNext(" in src, (
-            f"V232-CSCAN-01d FAIL: safeNext() not found in {js_path.name} — "
-            "fix was not applied"
+            f"V232-CSCAN-01d FAIL: safeNext() not found in {js_path.name} — fix was not applied"
         )
 
     @pytest.mark.parametrize("js_path", [_LOGIN_JS, _USER_LOGIN_JS])
@@ -364,10 +348,9 @@ class TestSourceGuardPresent:
     @pytest.mark.parametrize("js_path", [_LOGIN_JS, _USER_LOGIN_JS])
     def test_regex_layer_present(self, js_path):
         """safeNext body must contain the ^/[^/\\\\] regex (Layer 1)."""
-        src = js_path.read_text(encoding="utf-8")
         fn_src = _extract_safe_next(js_path)
         # Regex pattern for backslash+double-slash rejection
-        assert r"^\/[^/\\]" in fn_src or r'^/[^/\\]' in fn_src, (
+        assert r"^\/[^/\\]" in fn_src or r"^/[^/\\]" in fn_src, (
             f"V232-CSCAN-01d FAIL ({js_path.name}): Layer-1 regex `^/[^/\\]` not found "
             "inside safeNext(). Backslash bypass may not be closed."
         )
@@ -376,17 +359,21 @@ class TestSourceGuardPresent:
     def test_url_parse_layer_present(self, js_path):
         """safeNext body must contain URL parse + origin check (Layer 2)."""
         fn_src = _extract_safe_next(js_path)
-        assert "new URL(" in fn_src, (
-            f"V232-CSCAN-01d FAIL ({js_path.name}): Layer-2 URL parse not found in safeNext()"
-        )
+        assert "new URL(" in fn_src, f"V232-CSCAN-01d FAIL ({js_path.name}): Layer-2 URL parse not found in safeNext()"
         assert "parsed.origin" in fn_src, (
             f"V232-CSCAN-01d FAIL ({js_path.name}): origin comparison not found in safeNext()"
         )
 
     @pytest.mark.parametrize("js_path", [_LOGIN_JS, _USER_LOGIN_JS])
     def test_last_updated_comment_present(self, js_path):
-        """File must carry a Last updated: 2026-05-03 comment (CLAUDE.md §6)."""
+        """
+        File must carry a Last updated: comment.
+
+        login.js was last touched 2026-05-09 (BUG-LOGIN-REDIRECT-01 regression fix).
+        user_login.js was last touched 2026-05-03 (V232-CSCAN-01d original fix).
+        """
         src = js_path.read_text(encoding="utf-8")
-        assert "Last updated: 2026-05-03" in src, (
-            f"CLAUDE.md §6 FAIL ({js_path.name}): missing 'Last updated: 2026-05-03' comment"
+        expected = "2026-05-09" if js_path.name == "login.js" else "2026-05-03"
+        assert f"Last updated: {expected}" in src, (
+            f"CLAUDE.md §6 FAIL ({js_path.name}): missing 'Last updated: {expected}' comment"
         )

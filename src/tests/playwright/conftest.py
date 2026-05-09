@@ -11,6 +11,7 @@ Run with:
 
 Last updated: 2026-05-09 (v2.23.3: fix parents[4]→[3] path bug; add TOTP helpers)
 """
+
 from __future__ import annotations
 
 import os
@@ -23,6 +24,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # CA cert resolution (mirrors e2e/conftest.py Pattern A)
 # ---------------------------------------------------------------------------
+
 
 def _resolve_ca_cert() -> Optional[str]:
     explicit = os.getenv("YASHIGANI_CA_CERT")
@@ -45,6 +47,7 @@ _CA_CERT_PATH: str | None = _resolve_ca_cert()
 # Base URL resolution
 # ---------------------------------------------------------------------------
 
+
 def _resolve_base_url() -> str:
     override = os.getenv("YASHIGANI_ADMIN_URL")
     if override:
@@ -57,6 +60,7 @@ def _resolve_base_url() -> str:
     ]
     try:
         import httpx
+
         for url in candidates:
             verify: bool | str = _CA_CERT_PATH if url.startswith("https://") else False  # type: ignore[assignment]
             try:
@@ -78,13 +82,18 @@ ADMIN_LOGIN_URL: str = f"{BASE_URL}/admin/login"
 # Stack-running check
 # ---------------------------------------------------------------------------
 
+
 def _stack_running() -> bool:
     try:
         import httpx
     except ImportError:
         return False
-    candidates = [BASE_URL + "/healthz", "https://localhost/healthz",
-                  "https://localhost:8443/healthz", "http://localhost:8080/healthz"]
+    candidates = [
+        BASE_URL + "/healthz",
+        "https://localhost/healthz",
+        "https://localhost:8443/healthz",
+        "http://localhost:8080/healthz",
+    ]
     for url in candidates:
         try:
             verify: bool | str = _CA_CERT_PATH if url.startswith("https://") else False  # type: ignore[assignment]
@@ -107,6 +116,7 @@ _SKIP_NO_STACK = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # Admin credential helpers
 # ---------------------------------------------------------------------------
+
 
 def _read_secret(name: str) -> str:
     """Read a secret from docker/secrets/. Raises FileNotFoundError if absent."""
@@ -142,6 +152,7 @@ def get_admin_totp_code() -> str:
     """
     import hashlib
     import pyotp
+
     secret = _read_secret("admin1_totp_secret")
     return pyotp.TOTP(secret, digest=hashlib.sha256).now()
 
@@ -150,6 +161,7 @@ def get_admin2_totp_code() -> str:
     """Return a current SHA-256 TOTP code for admin2 (orchid)."""
     import hashlib
     import pyotp
+
     secret = _read_secret("admin2_totp_secret")
     return pyotp.TOTP(secret, digest=hashlib.sha256).now()
 
@@ -167,31 +179,57 @@ def clear_auth_throttle() -> int:
     Last updated: 2026-05-09 (v2.23.3: new helper)
     """
     import subprocess
+
     try:
         # Read Redis password from the backoffice container's secret
         pw_result = subprocess.run(
             ["docker", "exec", "docker-redis-1", "cat", "/run/secrets/redis_password"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if pw_result.returncode != 0:
             return 0
         redis_pw = pw_result.stdout.strip()
 
         del_result = subprocess.run(
-            ["docker", "exec", "docker-redis-1", "redis-cli",
-             "-p", "6380", "--tls",
-             "--cert", "/run/secrets/redis_client.crt",
-             "--key", "/run/secrets/redis_client.key",
-             "--cacert", "/run/secrets/ca_root.crt",
-             "--user", "default", "--pass", redis_pw,
-             "-n", "1",
-             "DEL",
-             "auth:fail:global", "auth:fail:ip:172.23.0.2",
-             "auth:throttle:global", "auth:throttle:ip:172.23.0.2",
-             ],
-            capture_output=True, text=True, timeout=5,
+            [
+                "docker",
+                "exec",
+                "docker-redis-1",
+                "redis-cli",
+                "-p",
+                "6380",
+                "--tls",
+                "--cert",
+                "/run/secrets/redis_client.crt",
+                "--key",
+                "/run/secrets/redis_client.key",
+                "--cacert",
+                "/run/secrets/ca_root.crt",
+                "--user",
+                "default",
+                "--pass",
+                redis_pw,
+                "-n",
+                "1",
+                "DEL",
+                "auth:fail:global",
+                "auth:fail:ip:172.23.0.2",
+                "auth:throttle:global",
+                "auth:throttle:ip:172.23.0.2",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        output = del_result.stdout.strip().replace("Warning: Using a password with '-a' or '-u' option on the command line interface may not be safe.", "").strip()
+        output = (
+            del_result.stdout.strip()
+            .replace(
+                "Warning: Using a password with '-a' or '-u' option on the command line interface may not be safe.", ""
+            )
+            .strip()
+        )
         return int(output) if output.isdigit() else 0
     except Exception:
         return 0
@@ -258,18 +296,17 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
     verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
 
     with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
-        r = c.post(f"{BASE_URL}/auth/login", json={
-            "username": username,
-            "password": password,
-            "totp_code": totp_code,
-        })
-    assert r.status_code == 200, (
-        f"API login failed for admin{admin}: {r.status_code} {r.text[:200]}"
-    )
+        r = c.post(
+            f"{BASE_URL}/auth/login",
+            json={
+                "username": username,
+                "password": password,
+                "totp_code": totp_code,
+            },
+        )
+    assert r.status_code == 200, f"API login failed for admin{admin}: {r.status_code} {r.text[:200]}"
     data = r.json()
-    assert not data.get("force_password_change"), (
-        f"admin{admin}: force_password_change=True — complete bootstrap first"
-    )
+    assert not data.get("force_password_change"), f"admin{admin}: force_password_change=True — complete bootstrap first"
     result = dict(r.cookies)
     _session_cookie_cache[admin] = result
     return result
@@ -283,12 +320,15 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
     Waits for a fresh TOTP window if one was used recently (within 62s) to
     prevent TOTP replay rejection across multiple Playwright tests.
 
-    After login, navigates directly to /admin/ (working around BUG-LOGIN-REDIRECT-01
-    where safeNext(null) returns '/' instead of '/admin/').
+    After login, navigates to /admin/. BUG-LOGIN-REDIRECT-01 was fixed in
+    v2.23.3: `(next && safeNext(next)) || '/admin/'` at the call site means
+    login without a ?next= param now correctly lands on /admin/ directly.
+    The direct navigate below is retained as a belt-and-braces guard in case
+    of Playwright timing on the fetch() completion.
 
     Raises AssertionError if admin dashboard is not reached.
 
-    Last updated: 2026-05-09 (v2.23.3: wait for fresh TOTP window between tests)
+    Last updated: 2026-05-09 (v2.23.3: BUG-LOGIN-REDIRECT-01 fixed)
     """
     import hashlib
     import time
@@ -340,16 +380,14 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
     if page.locator("#pw-form").is_visible():
         import secrets as _secrets
         import string as _string
-        new_pw = "".join(
-            _secrets.choice(_string.ascii_letters + _string.digits + "!*-._~,") for _ in range(42)
-        )
+
+        new_pw = "".join(_secrets.choice(_string.ascii_letters + _string.digits + "!*-._~,") for _ in range(42))
         page.fill("#new_password", new_pw)
         page.fill("#confirm_password", new_pw)
         page.click("#pw-change-btn, button[type='submit']")
         page.wait_for_timeout(2000)
 
-    # BUG-LOGIN-REDIRECT-01: login.js safeNext(null) returns '/' (truthy),
-    # so the fallback '/admin/' never triggers. Navigate directly.
+    # Belt-and-braces: if login didn't redirect to /admin/ (e.g. timing), navigate directly.
     if "/admin/" not in page.url or "login" in page.url:
         page.goto(f"{BASE_URL}/admin/")
         page.wait_for_timeout(3000)
@@ -367,6 +405,7 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
 # ---------------------------------------------------------------------------
 # pytest_configure — register markers
 # ---------------------------------------------------------------------------
+
 
 def pytest_configure(config):
     config.addinivalue_line(
@@ -387,11 +426,10 @@ def pytest_configure(config):
 # pytest_collection_modifyitems — auto-skip when stack not running
 # ---------------------------------------------------------------------------
 
+
 def pytest_collection_modifyitems(config, items):
     if not STACK_RUNNING:
-        skip = pytest.mark.skip(
-            reason="Yashigani stack not running — start with docker/podman compose up"
-        )
+        skip = pytest.mark.skip(reason="Yashigani stack not running — start with docker/podman compose up")
         for item in items:
             if "playwright" in str(item.fspath):
                 item.add_marker(skip)
