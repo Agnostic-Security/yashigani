@@ -376,6 +376,37 @@ _check_secrets() {
   esac
 }
 
+# G19. Backup encryption — age binary + recipient key (MP.L2-3.8.9 / CMMC L2)
+# Warn (not fail) if age is absent: operators may not yet have provisioned keys.
+# Hard-fail if the recipient file exists but is unreadable or malformed.
+_check_backup_encryption() {
+  local recipient_file="${YASHIGANI_BACKUP_RECIPIENT:-/etc/yashigani/backup-recipient.age.pub}"
+
+  # age binary
+  if ! command -v age >/dev/null 2>&1; then
+    _warn_check "Backup encryption (G19)" "age binary not found — install age before enabling backups (MP.L2-3.8.9)"
+  else
+    local _age_ver
+    _age_ver="$(age --version 2>/dev/null || echo "unknown")"
+    _pass "Backup encryption (G19)" "age present (${_age_ver})"
+  fi
+
+  # Recipient public key file — hard-fail if it exists but is wrong
+  if [[ -f "${recipient_file}" ]]; then
+    local _key
+    _key="$(head -1 "${recipient_file}" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "${_key}" ]]; then
+      _fail "Backup recipient key (G19)" "${recipient_file} is empty — backup.sh will refuse to run"
+    elif [[ "${_key}" != age1* ]]; then
+      _fail "Backup recipient key (G19)" "${recipient_file} does not contain a valid age public key (must start with 'age1')"
+    else
+      _pass "Backup recipient key (G19)" "${recipient_file} — ${_key:0:16}..."
+    fi
+  else
+    _warn_check "Backup recipient key (G19)" "${recipient_file} not found — provision before running backup.sh (see docs/operations/backup.md)"
+  fi
+}
+
 # 10. DNS check (conditional on TLS_MODE=acme)
 _check_dns() {
   local tls_mode="${TLS_MODE:-}"
@@ -463,6 +494,7 @@ _check_disk
 _check_ram
 _check_gpu
 _check_secrets
+_check_backup_encryption
 _check_dns
 
 # ---------------------------------------------------------------------------
