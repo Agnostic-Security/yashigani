@@ -2,7 +2,7 @@
 Yashigani Audit — Event schema definitions.
 All audit events extend AuditEvent. Fields are immutable after creation.
 
-Last updated: 2026-05-08T00:00:00+01:00
+Last updated: 2026-05-09T00:00:00+01:00
 """
 
 from __future__ import annotations
@@ -38,6 +38,20 @@ class EventType(str, Enum):
     ADMIN_SESSION_INVALIDATED = "ADMIN_SESSION_INVALIDATED"
     FULL_RESET_TOTP_FAILURE = "FULL_RESET_TOTP_FAILURE"
     ADMIN_SESSION_INVALIDATED_TOTP_LOCKOUT = "ADMIN_SESSION_INVALIDATED_TOTP_LOCKOUT"
+    # v2.23.3 — ACS gap #95: auth_log missing events
+    # AUTH_LOGIN_ATTEMPT: emitted at the start of every login handler call
+    # (before auth result) to provide a complete attempt timeline for forensics
+    # and CMMC AU.L2-3.3.1 / ASVS V7.2.1.
+    AUTH_LOGIN_ATTEMPT = "AUTH_LOGIN_ATTEMPT"
+    # ACCOUNT_LOCKOUT: emitted when an account is locked out due to failed
+    # password or TOTP attempts (ASVS V2.1.5 / NIST 800-63B §5.2.2).
+    ACCOUNT_LOCKOUT = "ACCOUNT_LOCKOUT"
+    # PASSWORD_CHANGED: distinct from CONFIG_CHANGED — dedicated event for
+    # self-service and forced password changes with audit-trail clarity.
+    PASSWORD_CHANGED = "PASSWORD_CHANGED"
+    # SESSIONS_INVALIDATED: emitted when all sessions for an account are
+    # bulk-invalidated (password change, admin full-reset, etc.)
+    SESSIONS_INVALIDATED = "SESSIONS_INVALIDATED"
     # Auth — user
     USER_LOGIN = "USER_LOGIN"
     TOTP_RESET_CONSOLE = "TOTP_RESET_CONSOLE"
@@ -240,6 +254,106 @@ class AdminSessionTotpLockoutEvent(AuditEvent):
     admin_account: str = ""
     endpoint: str = ""
     consecutive_failures: int = 0
+
+
+# ---------------------------------------------------------------------------
+# v2.23.3 — ACS gap #95: auth_log missing event dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AuthLoginAttemptEvent(AuditEvent):
+    """
+    Written at the very start of every login handler call — before auth result.
+
+    Provides a complete attempt timeline for CMMC AU.L2-3.3.1 / ASVS V7.2.1.
+    The admin_account field is populated from the user-supplied username;
+    masking_applied=True suppresses it in lower-assurance sinks.
+    outcome is always "attempt" on this event — the follow-up AdminLoginEvent
+    carries the final "success" | "failure" | "totp_provision_restricted".
+
+    Security invariant: password is NEVER stored or referenced in this event.
+    """
+
+    event_type: str = EventType.AUTH_LOGIN_ATTEMPT
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""  # user-supplied username (masked in lower-assurance sinks)
+    client_ip_prefix: str = ""  # last octet masked for IPv4; last group masked for IPv6
+    outcome: str = "attempt"  # always "attempt"
+
+
+@dataclass
+class AccountLockoutEvent(AuditEvent):
+    """
+    Written when an account is locked out after exceeding the maximum allowed
+    consecutive failed authentication attempts (password or TOTP).
+
+    ASVS V2.1.5 / NIST SP 800-63B §5.2.2 — account lockout policy.
+    masking_applied=True: admin_account is suppressed in lower-assurance sinks.
+
+    lockout_type: "password" | "totp" — distinguishes the failure mode.
+    failed_attempts: the count at the moment of lockout (at least 5).
+    lockout_duration_seconds: configured lockout window (default 1800 s / 30 min).
+    """
+
+    event_type: str = EventType.ACCOUNT_LOCKOUT
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    lockout_type: str = ""  # "password" | "totp"
+    failed_attempts: int = 0
+    lockout_duration_seconds: int = 0
+
+
+@dataclass
+class PasswordChangedEvent(AuditEvent):
+    """
+    Written on every successful password change (self-service or forced).
+
+    Distinct from ConfigChangedEvent — dedicated event for password lifecycle
+    events provides cleaner forensic queries and separation from config changes.
+
+    Security invariants (immutable floors):
+    - Neither old nor new password values are ever stored here.
+    - old_hash_tail / new_hash_tail carry only the last 8 chars of the
+      respective Argon2id hashes — enough for audit correlation without
+      exposing the full hash.
+    - masking_applied is always True.
+
+    change_type: "forced" (first-login / admin reset) | "self_service"
+    """
+
+    event_type: str = EventType.PASSWORD_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True  # immutable floor
+    admin_account: str = ""  # account whose password changed
+    change_type: str = ""  # "forced" | "self_service"
+    old_hash_tail: str = ""  # last 8 chars of the previous Argon2id hash
+    new_hash_tail: str = ""  # last 8 chars of the new Argon2id hash
+    sessions_invalidated: bool = True  # always True on password change
+
+
+@dataclass
+class SessionsInvalidatedEvent(AuditEvent):
+    """
+    Written when all sessions for an account are bulk-invalidated.
+
+    Covers: password change, admin full-reset, account disable.
+    Provides a clear session-lifecycle record for CMMC AU.L2-3.3.1.
+
+    reason: human-readable description of why sessions were invalidated,
+    e.g. "password_change" | "admin_full_reset" | "account_disabled".
+    sessions_count: number of sessions revoked (-1 if unknown, e.g. Redis flush).
+    """
+
+    event_type: str = EventType.SESSIONS_INVALIDATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""  # account whose sessions were invalidated
+    acting_admin: str = ""  # admin who triggered the invalidation (empty = self-service)
+    reason: str = ""  # "password_change" | "admin_full_reset" | "account_disabled"
+    sessions_count: int = -1  # number of sessions revoked (-1 if unknown)
 
 
 # ---------------------------------------------------------------------------
