@@ -110,7 +110,7 @@ spec:
           resources:
             {{- toYaml .Values.mtls.bootstrapResources | nindent 12 }}
         - name: issuer
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.global.imageOwner }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.gateway.image.repository "tag" .Values.gateway.image.tag) }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           securityContext:
             runAsUser: 1001

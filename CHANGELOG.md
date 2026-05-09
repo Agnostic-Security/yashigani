@@ -30,12 +30,15 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   - 23 new unit tests (PKI-D-01…12, PKI-R-01…11). 10 Playwright e2e tests (PW-PKI-01…10).
   - Driver abstraction: `yashigani.pki.drivers.{base,internal_ca,byo_ca}` + `yashigani.pki.driver_factory`.
 
-- **chore(helm): pre-tag digest bump** — `helm/yashigani/values.yaml` `adminBootstrap.image`,
-  `gateway.image`, and `backoffice.image` tags updated from `2.23.1` to `2.23.3` with pinned
-  manifest-list digests built from HEAD `50b0755`. Eliminates the post-tag fast-follow PR
-  pattern: the v2.23.3 git tag is now self-consistent. Branch-cut note: v2.23.3 was cut before
-  `a4f29fd` (the v2.23.2 GA digest pin commit), so this PR bumps directly from `2.23.1` to
-  `2.23.3` — the v2.23.2 intermediate was never on this branch.
+- **chore(helm): customer-builds pattern for own images** — `helm/yashigani/values.yaml`
+  `adminBootstrap.image`, `gateway.image`, and `backoffice.image` now use tag-only references
+  (`yashigani-gateway:2.23.3`, `yashigani-backoffice:2.23.3`) with no registry prefix and no
+  digest pin. Agnostic Security does not build or distribute gateway/backoffice images;
+  operators build locally via `install.sh` from the v2.23.3 tagged source (compose path), or
+  build and push to their own private registry for K8s deployments — matching the air-gap
+  design from PR #114. Operators running K8s should update the `repository` field to their
+  registry path and add `@sha256:<digest>` for supply-chain attestation. Third-party images
+  (caddy, redis, opa, grafana, etc.) remain pinned to `name:tag@sha256:<digest>` as before.
 
 ### Security (v2.23.3)
 

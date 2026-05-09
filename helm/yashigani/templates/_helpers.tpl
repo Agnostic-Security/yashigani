@@ -68,3 +68,32 @@ ServiceAccount name — uses the chart's own SA unless overridden.
 yashigani
 {{- end -}}
 {{- end }}
+
+{{/*
+yashigani.ownImage — render an image ref for a customer-built image
+(gateway, backoffice, adminBootstrap).
+
+Agnostic Security does not distribute these images. Operators build
+locally from tagged source (compose path) or push to their own private
+registry (K8s path) and override global.imageRegistry / global.imageOwner.
+
+Call with a dict of: registry, owner, repo, tag.
+  - When global.imageRegistry is non-empty: "<registry>/<owner>/<repo>:<tag>"
+  - When global.imageRegistry is empty:     "<repo>:<tag>"
+    (image resolves from the node's local cache or the operator-configured
+     imagePullSecrets / pull-through registry — no vendor-hosted registry assumed)
+
+For supply-chain attestation, operators are encouraged to append
+"@sha256:<digest>" to their tag value after building.
+*/}}
+{{- define "yashigani.ownImage" -}}
+{{- $registry := index . "registry" -}}
+{{- $owner    := index . "owner" -}}
+{{- $repo     := index . "repo" -}}
+{{- $tag      := index . "tag" -}}
+{{- if $registry -}}
+{{- printf "%s/%s/%s:%s" $registry $owner $repo $tag -}}
+{{- else -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- end -}}
+{{- end }}

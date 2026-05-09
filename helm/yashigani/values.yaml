@@ -1,10 +1,17 @@
 # Yashigani v2.23.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-07 (chore: convert floating-tag stubs to specific verified-existing versions)
+# Last updated: 2026-05-09 (chore: tag-only refs for own images — customer-builds pattern)
 
 global:
-  imageRegistry: "ghcr.io"
-  imageOwner: "agnosticsec-com"
+  # imageRegistry and imageOwner are used only for gateway / backoffice /
+  # adminBootstrap (images you build from source). Leave both empty for
+  # local Docker/Podman deployments where images are built by install.sh and
+  # already present on the node. For K8s: set these to your private registry
+  # and namespace, then push your locally-built images there before deploying.
+  # Example: imageRegistry: "registry.example.com", imageOwner: "myorg"
+  # Agnostic Security does not host or distribute these images.
+  imageRegistry: ""
+  imageOwner: ""
   # REQUIRED: Replace with your actual domain before deployment
   tlsDomain: "yashigani.example.com"
   # tlsMode: caddy | nginx (cert-manager + nginx-ingress)
@@ -200,11 +207,12 @@ adminBootstrap:
   # bundles python3 + pyotp + secrets which is everything we need; reusing
   # it avoids another image pull.
   image:
-    # Resolves to global.imageRegistry/global.imageOwner/<repo>:<tag>.
-    # Digest pinned per project image-pinning policy — rebuilt at tip 50b0755
-    # (2026-05-09T00:00+01:00) v2.23.3 pre-tag in-branch digest bump.
+    # Built locally by install.sh from the v2.23.3 tagged source.
+    # For K8s deployments: push to your own private registry and update
+    # the repository field accordingly. Pin your post-build digest with
+    # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.23.3@sha256:4b4368f32bc166fb525a0d6b46a4b436026941b44afb9088f4bebc35d24d0d65"
+    tag: "2.23.3"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -220,10 +228,12 @@ adminBootstrap:
 gateway:
   enabled: true
   image:
-    # Digest pinned per project image-pinning policy — rebuilt at tip 50b0755
-    # (2026-05-09T00:00+01:00) v2.23.3 pre-tag in-branch digest bump.
+    # Built locally by install.sh from the v2.23.3 tagged source.
+    # For K8s deployments: push to your own private registry and update
+    # the repository field accordingly. Pin your post-build digest with
+    # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.23.3@sha256:4b4368f32bc166fb525a0d6b46a4b436026941b44afb9088f4bebc35d24d0d65"
+    tag: "2.23.3"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -284,10 +294,12 @@ backoffice:
     - letta
     - openclaw
   image:
-    # Digest pinned per project image-pinning policy — rebuilt at tip 50b0755
-    # (2026-05-09T00:00+01:00) v2.23.3 pre-tag in-branch digest bump.
+    # Built locally by install.sh from the v2.23.3 tagged source.
+    # For K8s deployments: push to your own private registry and update
+    # the repository field accordingly. Pin your post-build digest with
+    # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "2.23.3@sha256:2e0c423f4cfe6e93b61cc4feb5013416dc69124863c8c58797423b8e2c04d05a"
+    tag: "2.23.3"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
