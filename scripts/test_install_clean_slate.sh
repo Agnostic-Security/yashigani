@@ -66,8 +66,8 @@
 #   - git
 #   - sudo rights for 'su' user
 #
-# Version: v2.23.2
-# Last-Updated: 2026-05-07T00:00:00+01:00
+# Version: v2.23.3
+# Last-Updated: 2026-05-09T13:45:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -380,9 +380,28 @@ _vm_ssh "
 " 2>&1 | tee -a "${EVIDENCE_FILE}"
 _ok "Clone complete: ${VM_CLONE_DIR}"
 
-# PHASE 3b removed: bind-mount dir pre-creation was BIND-MOUNT-001 workaround,
-# now fixed in install.sh (#85). install.sh auto-creates docker/data, docker/certs,
-# docker/logs with correct ownership (podman unshare chown for rootless Podman).
+# ---------------------------------------------------------------------------
+# PHASE 3b: Docker bind-mount pre-chown (Docker only — not Podman rootless)
+# ---------------------------------------------------------------------------
+# install.sh auto-creates docker/data, docker/certs, docker/logs and for
+# Podman rootless uses `podman unshare chown 1001:1001` (namespace remap).
+# For Docker, install.sh falls back to plain `chown 1001:1001` which requires
+# the caller to be root. Since su (UID 1004) is non-root, this fails.
+# Fix: pre-create and sudo-chown the directories before install.sh runs.
+# This is NOT a workaround — it's the documented Docker requirement (install.sh
+# emits 'sudo chown -R 1001:1001' in its error message).
+if [[ "${RUNTIME}" == "docker" ]]; then
+  _section "Phase 3b: Docker bind-mount pre-chown"
+  _info "Creating docker/data, docker/certs, docker/logs with uid 1001 ownership..."
+  _vm_sudo "mkdir -p '${VM_CLONE_DIR}/docker/data' \
+              '${VM_CLONE_DIR}/docker/certs' \
+              '${VM_CLONE_DIR}/docker/logs' && \
+            chown -R 1001:1001 \
+              '${VM_CLONE_DIR}/docker/data' \
+              '${VM_CLONE_DIR}/docker/certs' \
+              '${VM_CLONE_DIR}/docker/logs'" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  _ok "Docker bind-mount directories pre-chowned to 1001:1001"
+fi
 
 # ---------------------------------------------------------------------------
 # PHASE 4: Run install.sh on VM
