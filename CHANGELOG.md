@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-09T00:01:00+01:00 -->
+<!-- last-updated: 2026-05-09T12:00:00+01:00 -->
 
 # Changelog
 
@@ -29,6 +29,13 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   - Service name regex `[a-z][a-z0-9_\-]{0,63}$` — path traversal prevention. Body limit 256 bytes (ASVS 4.3.1). Audit events: `PKI_CERT_ROTATED`, `PKI_CERT_ROTATION_FAILED`.
   - 23 new unit tests (PKI-D-01…12, PKI-R-01…11). 10 Playwright e2e tests (PW-PKI-01…10).
   - Driver abstraction: `yashigani.pki.drivers.{base,internal_ca,byo_ca}` + `yashigani.pki.driver_factory`.
+
+- **chore(helm): pre-tag digest bump** — `helm/yashigani/values.yaml` `adminBootstrap.image`,
+  `gateway.image`, and `backoffice.image` tags updated from `2.23.1` to `2.23.3` with pinned
+  manifest-list digests built from HEAD `50b0755`. Eliminates the post-tag fast-follow PR
+  pattern: the v2.23.3 git tag is now self-consistent. Branch-cut note: v2.23.3 was cut before
+  `a4f29fd` (the v2.23.2 GA digest pin commit), so this PR bumps directly from `2.23.1` to
+  `2.23.3` — the v2.23.2 intermediate was never on this branch.
 
 ### Security (v2.23.3)
 
