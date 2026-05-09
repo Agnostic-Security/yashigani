@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T01:00:00+01:00 -->
+<!-- last-updated: 2026-05-09T12:00:00+01:00 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -22,6 +22,7 @@
                 <button data-action="showPage" data-param="audit">Audit Log</button>
                 <button data-action="showPage" data-param="monitoring">Monitoring</button>
                 <button data-action="showPage" data-param="backup">Backup</button>
+                <button data-action="showPage" data-param="pki">PKI</button>
                 <button data-action="showPage" data-param="settings">Settings</button>
             </div>
         </div>
@@ -470,6 +471,60 @@
             </div>
         </div>
 
+        <!-- PKI Admin Page — v2.23.3 (#51 + #53) -->
+        <div class="page" id="page-pki">
+            <h2>PKI Certificate Management</h2>
+
+            <!-- Status Overview -->
+            <div class="panel" style="margin-bottom:16px;">
+                <div class="panel-header">Certificate Status</div>
+                <div class="panel-body">
+                    <p style="font-size:0.8rem;color:#64748b;margin-bottom:8px;">
+                        Leaf certificate status for all internal services.
+                        Certificates flagged <strong>Needs Renewal</strong> should be rotated before expiry.
+                        Rotation requires a TOTP step-up.
+                    </p>
+                    <div id="pki-status-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+
+            <!-- Rotate result -->
+            <div id="pki-rotate-result" style="font-size:0.85rem;min-height:1.2em;margin-bottom:8px;display:none;"></div>
+
+            <!-- Chain Detail (hidden until a service is selected) -->
+            <div id="pki-chain-detail" style="display:none;">
+                <div class="panel" style="margin-bottom:16px;">
+                    <div class="panel-header">Certificate Chain Detail — <span id="pki-chain-service-name"></span></div>
+                    <div class="panel-body">
+                        <table style="font-size:0.82rem;width:100%;border-collapse:collapse;">
+                            <tbody id="pki-chain-table-body"></tbody>
+                        </table>
+                        <button onclick="hidePkiChain()"
+                                style="margin-top:12px;padding:6px 16px;background:#f1f5f9;color:#334155;border:none;border-radius:4px;cursor:pointer;font-size:0.82rem;">
+                            Close
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- BYO-CA documentation panel -->
+            <div class="panel" style="margin-bottom:16px;">
+                <div class="panel-header">CA Mode</div>
+                <div class="panel-body" style="font-size:0.82rem;color:#334155;">
+                    <p>
+                        <strong>Internal CA (default):</strong> certificates are issued by the built-in two-tier PKI
+                        (root → intermediate → per-service leaf). No external dependency.
+                    </p>
+                    <p style="margin-top:8px;">
+                        <strong>BYO-CA mode:</strong> set <code>YASHIGANI_PKI_CA_MODE=byo</code> to use an external
+                        signing endpoint (step-ca, Vault PKI, etc.). Requires
+                        <code>YASHIGANI_BYO_SIGNING_ENDPOINT</code> and <code>YASHIGANI_BYO_CA_CERT_PATH</code>.
+                        See documentation for full configuration reference.
+                    </p>
+                </div>
+            </div>
+        </div>
+
         <!-- Settings Page -->
         <div class="page" id="page-settings">
             <h2>Settings</h2>
@@ -641,5 +696,6 @@
 
     <script src="/static/js/dashboard.js"></script>
     <script src="/static/js/hibp.js" defer></script>
+    <script src="/static/js/pki.js" defer></script>
 </body>
 </html>

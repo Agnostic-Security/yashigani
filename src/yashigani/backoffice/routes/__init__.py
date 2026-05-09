@@ -44,6 +44,8 @@ from yashigani.backoffice.routes.secrets import router as secrets_router
 from yashigani.backoffice.routes.hibp import router as hibp_router
 # v2.23.3 — WebAuthn v1 API with public login + step-up revoke
 from yashigani.backoffice.routes.webauthn_v1 import router as webauthn_v1_router
+# v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
+from yashigani.backoffice.routes.pki_v1 import router as pki_v1_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -75,4 +77,6 @@ __all__ = [
     "hibp_router",
     # v2.23.3 — WebAuthn v1 API
     "webauthn_v1_router",
+    # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
+    "pki_v1_router",
 ]
