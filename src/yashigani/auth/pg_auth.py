@@ -130,7 +130,17 @@ class PostgresLocalAuthService:
         username: str,
         password: str,
         totp_code: str,
+        *,
+        audit_writer=None,
     ) -> tuple[bool, Optional[AccountRecord], str]:
+        """
+        Authenticate an admin account with password + TOTP.
+
+        audit_writer — optional AuditLogWriter instance. When supplied, emits
+        an ACCOUNT_LOCKOUT event whenever a lockout is triggered by this call.
+        ACS gap #95: lockout events were previously only logged (logger.warning)
+        with no structured audit trail.
+        """
         generic_fail = "invalid_credentials"
 
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
@@ -150,6 +160,8 @@ class PostgresLocalAuthService:
                         _MAX_FAILED_ATTEMPTS,
                         username,
                     )
+                    # ACS gap #95: emit structured ACCOUNT_LOCKOUT event.
+                    _emit_lockout_event(audit_writer, username, "password", record.failed_attempts)
                 await self._update(conn, record)
                 return False, None, generic_fail
 
@@ -175,6 +187,8 @@ class PostgresLocalAuthService:
                         _MAX_FAILED_ATTEMPTS,
                         username,
                     )
+                    # ACS gap #95: emit structured ACCOUNT_LOCKOUT event.
+                    _emit_lockout_event(audit_writer, username, "totp", _MAX_FAILED_ATTEMPTS)
                 else:
                     delay = _TOTP_BACKOFF_SECONDS[min(n, len(_TOTP_BACKOFF_SECONDS) - 1)]
                     record.totp_backoff_until = time.time() + delay
@@ -827,3 +841,32 @@ def _row_to_record(row) -> AccountRecord:
 
 def _is_locked(record: AccountRecord) -> bool:
     return record.locked_until > time.time()
+
+
+def _emit_lockout_event(
+    audit_writer,
+    username: str,
+    lockout_type: str,
+    failed_attempts: int,
+) -> None:
+    """
+    Emit an ACCOUNT_LOCKOUT audit event.  ACS gap #95 (auth_log).
+
+    Called inside authenticate() when a lockout is triggered.  Swallows
+    exceptions so an audit failure never blocks the auth response.
+    """
+    if audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import AccountLockoutEvent
+
+        evt = AccountLockoutEvent(
+            account_tier="admin",
+            admin_account=username,
+            lockout_type=lockout_type,
+            failed_attempts=failed_attempts,
+            lockout_duration_seconds=_LOCKOUT_SECONDS,
+        )
+        audit_writer.write(evt)
+    except Exception:
+        logger.warning("Failed to emit ACCOUNT_LOCKOUT audit event", exc_info=True)

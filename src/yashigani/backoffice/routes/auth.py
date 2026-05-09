@@ -7,7 +7,7 @@ POST /auth/password/change  — forced change on first login
 POST /auth/totp/provision   — TOTP + recovery codes provisioning
 POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value flows
 
-Last updated: 2026-05-08T00:00:00+01:00
+Last updated: 2026-05-09T00:00:00+01:00
 """
 
 from __future__ import annotations
@@ -15,14 +15,12 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Annotated, Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from yashigani.backoffice.middleware import AdminSession, AnySession, get_session_store, _SESSION_COOKIE
 from yashigani.backoffice.state import backoffice_state
-from yashigani.auth.totp import verify_totp, generate_provisioning, generate_recovery_code_set
 from yashigani.db.postgres import tenant_transaction as _pg_tenant_transaction_impl
 
 _PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
@@ -275,8 +273,19 @@ async def login(body: LoginRequest, request: Request, response: Response):
     assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
     assert state.audit_writer is not None  # set unconditionally at startup
+
+    # ACS gap #95 (auth_log): emit AUTH_LOGIN_ATTEMPT before result so forensic
+    # queries can reconstruct the full attempt timeline even when the outcome is
+    # not yet known. CMMC AU.L2-3.3.1 / ASVS V7.2.1.
+    state.audit_writer.write(_make_login_attempt_event(body.username, client_ip))
+
     try:
-        success, record, reason = await state.auth_service.authenticate(body.username, body.password, body.totp_code)
+        success, record, reason = await state.auth_service.authenticate(
+            body.username,
+            body.password,
+            body.totp_code,
+            audit_writer=state.audit_writer,  # ACS gap #95: propagate for ACCOUNT_LOCKOUT
+        )
     except (ValueError, TypeError):
         _record_auth_failure(client_ip)
         raise HTTPException(
@@ -474,6 +483,14 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
     state.session_store.invalidate_all_for_account(record.account_id)
 
     state.audit_writer.write(_make_login_event(body.username, "self_reset", None))
+    # ACS gap #95 (auth_log): SESSIONS_INVALIDATED event for session lifecycle audit.
+    state.audit_writer.write(
+        _make_sessions_invalidated_event(
+            admin_account=body.username,
+            acting_admin="",  # self-service reset
+            reason="self_reset",
+        )
+    )
 
     return {
         "status": "ok",
@@ -647,13 +664,23 @@ async def change_password(
     store.invalidate_all_for_account(session.account_id)
     response.delete_cookie(_SESSION_COOKIE)
 
-    # ASVS 6.3.7: audit event with hash tails for forensics / reuse detection
+    # ACS gap #95 (auth_log): dedicated PASSWORD_CHANGED event replaces the
+    # generic ConfigChangedEvent, providing cleaner forensic queries.
+    # ASVS 6.3.7: hash tails for forensics / reuse detection.
     state.audit_writer.write(
-        _make_config_event(
+        _make_password_changed_event(
             record.username,
-            "password_change",
-            f"old_hash_tail={old_hash_tail}",
-            f"new_hash_tail={new_hash_tail}",
+            change_type="forced" if record.force_password_change else "self_service",
+            old_hash_tail=old_hash_tail,
+            new_hash_tail=new_hash_tail,
+        )
+    )
+    # ACS gap #95 (auth_log): SESSIONS_INVALIDATED event for session lifecycle audit.
+    state.audit_writer.write(
+        _make_sessions_invalidated_event(
+            admin_account=record.username,
+            acting_admin="",  # self-service password change
+            reason="password_change",
         )
     )
     return {"status": "ok", "sessions_invalidated": True, "re_authentication_required": True}
@@ -1087,4 +1114,59 @@ def _make_stepup_event(username: str, outcome: str):
         admin_account=username,
         outcome=f"stepup_{outcome}",
         failure_reason=None if outcome == "success" else "invalid_totp",
+    )
+
+
+def _make_login_attempt_event(username: str, client_ip: str):
+    """ACS gap #95: emit AUTH_LOGIN_ATTEMPT before auth result."""
+    from yashigani.audit.schema import AuthLoginAttemptEvent
+
+    # Mask the last octet of the IP for lower-assurance sinks.
+    # IPv4: a.b.c.d → a.b.c.0   IPv6: strip last group.
+    parts = client_ip.rsplit(".", 1)
+    ip_prefix = f"{parts[0]}.0" if len(parts) == 2 else client_ip
+    return AuthLoginAttemptEvent(
+        account_tier="admin",
+        admin_account=username,
+        client_ip_prefix=ip_prefix,
+        outcome="attempt",
+    )
+
+
+def _make_password_changed_event(
+    username: str,
+    *,
+    change_type: str,
+    old_hash_tail: str,
+    new_hash_tail: str,
+):
+    """ACS gap #95: dedicated PASSWORD_CHANGED event."""
+    from yashigani.audit.schema import PasswordChangedEvent
+
+    return PasswordChangedEvent(
+        account_tier="admin",
+        admin_account=username,
+        change_type=change_type,
+        old_hash_tail=old_hash_tail,
+        new_hash_tail=new_hash_tail,
+        sessions_invalidated=True,
+    )
+
+
+def _make_sessions_invalidated_event(
+    *,
+    admin_account: str,
+    acting_admin: str,
+    reason: str,
+    sessions_count: int = -1,
+):
+    """ACS gap #95: SESSIONS_INVALIDATED event for session lifecycle audit."""
+    from yashigani.audit.schema import SessionsInvalidatedEvent
+
+    return SessionsInvalidatedEvent(
+        account_tier="admin",
+        admin_account=admin_account,
+        acting_admin=acting_admin,
+        reason=reason,
+        sessions_count=sessions_count,
     )
