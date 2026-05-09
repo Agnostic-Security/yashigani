@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-09T14:40:00+01:00 (fix: Docker non-root PKI — _pki_run_issuer uses ephemeral container chown; compose_up tolerates already-chowned secrets_dir)
 # last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
 # last-updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _backup_existing_data — add K8s pg_dump path via kubectl exec; pod runs as UID 70, no root needed)
 # last-updated: 2026-05-07T12:05:00+01:00 (retro #83: add grafana:472 to _pki_chown_client_keys; retro #84: loki:10001+promtail:0 added)
@@ -2892,14 +2893,27 @@ compose_up() {
     # Deferred to _prepare_secrets_dir_for_pki() — see comment above.
     log_info "secrets_dir chown deferred to PKI bootstrap (Podman rootless)"
   else
-    if chown 1001:1001 "$secrets_dir" 2>/dev/null; then
-      log_info "secrets_dir chown 1001:1001 applied"
+    # For Docker (non-root caller): _pki_run_issuer() already chowned secrets_dir
+    # to UID 1001 via an ephemeral docker container. Attempting chown here again
+    # from a non-root installer uid (e.g. 1004) would fail with EPERM because
+    # only the owner can re-chown a file they don't own, and UID 1004 no longer
+    # owns the dir. So: try chown; if it fails, verify the dir is already owned
+    # by UID 1001 (set by _pki_run_issuer). If already correct, this is safe to
+    # continue — PKI bootstrap already ran successfully.
+    if ! chown 1001:1001 "$secrets_dir" 2>/dev/null; then
+      # shellcheck disable=SC2012
+      _actual_uid=$(ls -nd "$secrets_dir" 2>/dev/null | awk '{print $3}')
+      if [[ "$_actual_uid" == "1001" ]]; then
+        log_info "secrets_dir already owned by UID 1001 (set by PKI bootstrap) — chown no-op"
+      else
+        log_error "Cannot chown ${secrets_dir} to UID 1001:1001."
+        log_error "The PKI issuer container (UID 1001) cannot write certs to this directory."
+        log_error "Fix (run once as root, then re-run installer as your user):"
+        log_error "  sudo chown 1001:1001 \"${secrets_dir}\""
+        exit 1
+      fi
     else
-      log_error "Cannot chown ${secrets_dir} to UID 1001:1001."
-      log_error "The PKI issuer container (UID 1001) cannot write certs to this directory."
-      log_error "Fix (run once as root, then re-run installer as your user):"
-      log_error "  sudo chown 1001:1001 \"${secrets_dir}\""
-      exit 1
+      log_info "secrets_dir chown 1001:1001 applied"
     fi
     # Defensive assertion: secrets dir must be owned by UID 1001 before proceeding.
     # (Skipped for Podman rootless — subuid remapping means host UID != 1001.)
@@ -4839,16 +4853,41 @@ _pki_run_issuer() {
       chown 1001:1001 "$manifest_in" 2>/dev/null || true
     fi
   else
-    # Docker: no :U support — manually chown the secrets dir to the container
-    # UID (1001 = yashigani user in our image) so the issuer can write.
-    # mkdir -p above may have created it as root when install runs via sudo.
-    # Retro v2.23.1 item #3ad (Docker path).
-    chown 1001:1001 "$secrets_in" 2>/dev/null || true
+    # Docker: no :U support — chown the secrets dir + manifest to UID 1001 so
+    # the issuer (USER yashigani = UID 1001) can write certs/keys into /secrets
+    # and write back bootstrap_token_sha256 to the manifest.
+    #
+    # The previous approach — plain `chown 1001:1001 "$secrets_in" 2>/dev/null || true`
+    # — silently no-ops when the installer runs as a non-root uid (e.g. 1004) that
+    # lacks CAP_CHOWN on the host. The PKI container then starts with secrets_dir
+    # still owned by the installer uid, gets EACCES, and aborts with PermissionError.
+    #
+    # Fix: use an ephemeral Docker container running as root (Docker daemon = root
+    # internally, so it can chown inside the container regardless of host caller uid).
+    # Same pattern as _pki_chown_client_keys() docker_run mode.
+    # alpine:3 digest (amd64+arm64 manifest list — 2026-04-29; rotate each release):
+    local _alpine_chown="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+    if ! docker run --rm \
+           --volume "${secrets_in}:/s:rw" \
+           "$_alpine_chown" \
+           chown 1001:1001 /s 2>/dev/null; then
+      # Fallback to plain chown (works when installer runs as root / id -u == 0)
+      chown 1001:1001 "$secrets_in" 2>/dev/null || true
+    fi
     # Retro #3ah (v2.23.1): the issuer also writes back to
     # service_identities.yaml (bootstrap_token_sha256 fields) via the
     # /manifest.yaml bind mount. Without ownership match the write fails
     # with PermissionError and the whole PKI bootstrap aborts.
-    chown 1001:1001 "$manifest_in" 2>/dev/null || true
+    # Same ephemeral-container pattern for non-root Docker callers.
+    # We bind-mount the parent dir and chown the file inside the container.
+    local _manifest_dir; _manifest_dir="$(dirname "$manifest_in")"
+    local _manifest_base; _manifest_base="$(basename "$manifest_in")"
+    if ! docker run --rm \
+           --volume "${_manifest_dir}:/m:rw" \
+           "$_alpine_chown" \
+           chown 1001:1001 "/m/${_manifest_base}" 2>/dev/null; then
+      chown 1001:1001 "$manifest_in" 2>/dev/null || true
+    fi
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then

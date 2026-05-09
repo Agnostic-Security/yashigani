@@ -67,7 +67,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-09T14:15:00+01:00
+# Last-Updated: 2026-05-09T14:35:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -392,24 +392,21 @@ _ok "Clone complete: ${VM_CLONE_DIR}"
 # emits 'sudo chown -R 1001:1001' in its error message).
 if [[ "${RUNTIME}" == "docker" ]]; then
   _section "Phase 3b: Docker bind-mount pre-chown"
-  _info "Creating docker/data, docker/certs, docker/logs, docker/secrets with uid 1001 ownership..."
-  # docker/secrets must be pre-created with UID 1001 ownership:
-  # install.sh Step 6/13 creates docker/secrets (owned by su UID 1004) then
-  # calls `chown 1001:1001 docker/secrets` which fails for a non-root user
-  # (install.sh line ~2895 — exits 1 on failure). Pre-creating the directory
-  # here with the correct ownership causes install.sh's `mkdir -p` to be a
-  # no-op and the subsequent `chown 1001:1001` to succeed (the dir is already
-  # owned by 1001, chown of own dir is a no-op when caller is root — we ran
-  # it as root via sudo). — ea344b4 extended for RETRO-V233-001 Docker gate.
+  _info "Creating docker/data, docker/certs, docker/logs with uid 1001 ownership..."
+  # docker/secrets is intentionally NOT pre-chowned here:
+  # install.sh Step 6/13 creates docker/secrets (su UID 1004 ownership) and writes
+  # admin passwords into it as the installer user before the PKI bootstrap.
+  # Pre-chowning to UID 1001 would block the installer from writing passwords.
+  # Instead, install.sh _pki_run_issuer() uses an ephemeral docker container
+  # (running as root inside the container) to chown docker/secrets to UID 1001
+  # just before the PKI container starts. See install.sh _pki_run_issuer() ~L4846.
   _vm_sudo "mkdir -p '${VM_CLONE_DIR}/docker/data' \
               '${VM_CLONE_DIR}/docker/certs' \
-              '${VM_CLONE_DIR}/docker/logs' \
-              '${VM_CLONE_DIR}/docker/secrets' && \
+              '${VM_CLONE_DIR}/docker/logs' && \
             chown -R 1001:1001 \
               '${VM_CLONE_DIR}/docker/data' \
               '${VM_CLONE_DIR}/docker/certs' \
-              '${VM_CLONE_DIR}/docker/logs' \
-              '${VM_CLONE_DIR}/docker/secrets'" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+              '${VM_CLONE_DIR}/docker/logs'" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
   _ok "Docker bind-mount directories pre-chowned to 1001:1001"
 fi
 
