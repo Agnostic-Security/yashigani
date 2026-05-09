@@ -94,7 +94,7 @@ spec:
       {{- end }}
       containers:
         - name: backoffice
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.global.imageOwner }}/{{ .Values.backoffice.image.repository }}:{{ .Values.backoffice.image.tag }}"
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.backoffice.image.repository "tag" .Values.backoffice.image.tag) }}"
           imagePullPolicy: {{ .Values.backoffice.image.pullPolicy }}
           securityContext:
             runAsUser: 1001

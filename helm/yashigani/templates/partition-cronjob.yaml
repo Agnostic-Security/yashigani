@@ -69,7 +69,7 @@ spec:
             - name: partition-maintenance
               # Reuse the gateway image — partition_maintenance.py is part of the
               # same Python package. Override the entrypoint to run the script directly.
-              image: "{{ .Values.global.imageRegistry }}/{{ .Values.global.imageOwner }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
+              image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.gateway.image.repository "tag" (.Values.gateway.image.tag | default .Chart.AppVersion)) }}"
               imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default "IfNotPresent" }}
               # Script is NOT baked into the gateway image — mounted via ConfigMap.
               # Finding D regression fix 2026-05-01.

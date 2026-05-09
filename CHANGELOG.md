@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-09T00:01:00+01:00 -->
+<!-- last-updated: 2026-05-09T12:00:00+01:00 -->
 
 # Changelog
 
@@ -29,6 +29,16 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   - Service name regex `[a-z][a-z0-9_\-]{0,63}$` — path traversal prevention. Body limit 256 bytes (ASVS 4.3.1). Audit events: `PKI_CERT_ROTATED`, `PKI_CERT_ROTATION_FAILED`.
   - 23 new unit tests (PKI-D-01…12, PKI-R-01…11). 10 Playwright e2e tests (PW-PKI-01…10).
   - Driver abstraction: `yashigani.pki.drivers.{base,internal_ca,byo_ca}` + `yashigani.pki.driver_factory`.
+
+- **chore(helm): customer-builds pattern for own images** — `helm/yashigani/values.yaml`
+  `adminBootstrap.image`, `gateway.image`, and `backoffice.image` now use tag-only references
+  (`yashigani-gateway:2.23.3`, `yashigani-backoffice:2.23.3`) with no registry prefix and no
+  digest pin. Agnostic Security does not build or distribute gateway/backoffice images;
+  operators build locally via `install.sh` from the v2.23.3 tagged source (compose path), or
+  build and push to their own private registry for K8s deployments — matching the air-gap
+  design from PR #114. Operators running K8s should update the `repository` field to their
+  registry path and add `@sha256:<digest>` for supply-chain attestation. Third-party images
+  (caddy, redis, opa, grafana, etc.) remain pinned to `name:tag@sha256:<digest>` as before.
 
 ### Security (v2.23.3)
 
