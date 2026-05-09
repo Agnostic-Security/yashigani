@@ -8,16 +8,18 @@ POST /admin/jwt/config/test         — test a token
 
 Last updated: 2026-05-03
 """
+
 from __future__ import annotations
 
 import logging
 import os
-from typing import Literal, Optional
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import require_admin_session, require_stepup_admin_session
+from yashigani.backoffice.schemas.bopla import JWTConfigPublic, JWTTestResultPublic, SAFE_JWT_CLAIMS
 from yashigani.common.error_envelope import safe_error_envelope
 
 logger = logging.getLogger(__name__)
@@ -45,13 +47,25 @@ async def list_jwt_configs(session=Depends(require_admin_session)):
     deployment_stream = os.getenv("YASHIGANI_DEPLOYMENT_STREAM", "opensource")
     try:
         from yashigani.db.postgres import get_pool
+
         pool = get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT tenant_id::text, jwks_url, issuer, audience, fail_closed, scope "
                 "FROM jwt_config ORDER BY scope DESC, tenant_id"
             )
-            configs = [dict(row) for row in rows]
+            # BOPLA allowlist (#90): JWTConfigPublic enforces the allowed field set.
+            configs = [
+                JWTConfigPublic(
+                    tenant_id=row["tenant_id"],
+                    jwks_url=row["jwks_url"],
+                    issuer=row["issuer"],
+                    audience=row["audience"],
+                    fail_closed=row["fail_closed"],
+                    scope=row["scope"],
+                ).model_dump()
+                for row in rows
+            ]
     except Exception as exc:
         logger.warning("jwt_config list failed: %s", exc)
         configs = []
@@ -75,6 +89,7 @@ async def set_jwt_config(body: JWTConfigRequest, session=Depends(require_stepup_
     try:
         import uuid
         from yashigani.db.postgres import get_pool
+
         pool = get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -86,8 +101,12 @@ async def set_jwt_config(body: JWTConfigRequest, session=Depends(require_stepup_
                     audience=EXCLUDED.audience, fail_closed=EXCLUDED.fail_closed,
                     updated_at=now()
                 """,
-                uuid.UUID(body.tenant_id), body.jwks_url, body.issuer,
-                body.audience, body.fail_closed, body.scope,
+                uuid.UUID(body.tenant_id),
+                body.jwks_url,
+                body.issuer,
+                body.audience,
+                body.fail_closed,
+                body.scope,
             )
     except Exception as exc:
         payload, _ = safe_error_envelope(exc, public_message="jwt config update failed", status=500)
@@ -100,6 +119,7 @@ async def delete_jwt_config(tenant_id: str, session=Depends(require_stepup_admin
     try:
         import uuid
         from yashigani.db.postgres import get_pool
+
         pool = get_pool()
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM jwt_config WHERE tenant_id = $1", uuid.UUID(tenant_id))
@@ -112,9 +132,20 @@ async def delete_jwt_config(tenant_id: str, session=Depends(require_stepup_admin
 @jwt_config_router.post("/admin/jwt/config/test")
 async def test_jwt_config(body: JWTTestRequest, session=Depends(require_admin_session)):
     from yashigani.backoffice.state import backoffice_state
+
     jwt_inspector = getattr(backoffice_state, "jwt_inspector", None)
     if jwt_inspector is None:
         raise HTTPException(status_code=503, detail="JWT inspector not initialised")
     result = await jwt_inspector.inspect(body.token, tenant_id=body.tenant_id)
-    return {"valid": result.valid, "sub": result.sub, "tenant_id": result.tenant_id,
-            "error": result.error, "claims": result.claims}
+    # BOPLA allowlist (#90): JWTTestResultPublic + SAFE_JWT_CLAIMS filter strips
+    # sensitive identity claims (email, phone_number, address, etc.) from the
+    # test response. Only structural/integrity claims are returned.
+    raw_claims: dict = result.claims or {}
+    safe_claims = {k: v for k, v in raw_claims.items() if k in SAFE_JWT_CLAIMS}
+    return JWTTestResultPublic(
+        valid=result.valid,
+        sub=result.sub,
+        tenant_id=result.tenant_id,
+        error=result.error,
+        claims=safe_claims,
+    ).model_dump()
