@@ -111,10 +111,10 @@ class TestHibpPolicyEnforcement:
 
     def test_https_to_pwnedpasswords_passes_policy(self):
         """The default HIBP URL must pass the HttpClient policy check."""
-        from yashigani.auth.password import _hibp_http_client, _HIBP_API_URL
+        from yashigani.auth.password import _hibp_http_client, _HIBP_DEFAULT_API_URL
         client = _hibp_http_client()
         # Should not raise
-        client._check_policy(f"{_HIBP_API_URL}ABCDE")
+        client._check_policy(f"{_HIBP_DEFAULT_API_URL}ABCDE")
 
     def test_http_scheme_rejected_by_policy(self):
         """Plain HTTP must be rejected — HIBP allowlist is HTTPS-only."""

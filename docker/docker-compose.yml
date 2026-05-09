@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Docker Compose stack
-# Last updated: 2026-05-07T12:05:00+01:00 (retro #83: Grafana mTLS ingress + Prometheus TLS server + datasource mTLS; image-bump: caddy 2.11.2/redis 7.4.9/ollama 0.23.1/pgvector 0.8.2)
+# Last updated: 2026-05-09T00:00:00+01:00 (fix/v233-base-regressions: add YASHIGANI_DB_AES_KEY to backoffice env — smoke fix)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -348,6 +348,13 @@ services:
       # ${INSTALL_DIR}/backups on the host. The :ro flag prevents the
       # backoffice container from modifying backup files.
       YASHIGANI_BACKUPS_DIR: /data/backups
+      # v2.23.3 (#60 fix) — AES-256 key for pgcrypto pgp_sym_encrypt (W6/B2).
+      # install.sh writes this to docker/.env via _write_aes_key_to_env(); the
+      # value must also appear in the container environment block so Compose
+      # passes it through into the running container. Helm sources this from
+      # the yashigani-backoffice-secrets Secret (backoffice.yaml:222).
+      # Missing key → RuntimeError at lifespan startup (fail-closed per SOP 1).
+      YASHIGANI_DB_AES_KEY: ${YASHIGANI_DB_AES_KEY:?YASHIGANI_DB_AES_KEY must be set — run install.sh to generate}
       # v2.23.2 fix — SSRF guard hostname allowlist (TM-V231-004 / Pentest #95).
       # _assert_safe_upstream_url() blocks loopback/RFC1918/link-local by default.
       # These three Compose service names are the canonical Yashigani-internal agent

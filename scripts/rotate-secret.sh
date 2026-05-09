@@ -22,9 +22,14 @@
 #       (script reads token from stdin if YASHIGANI_SESSION_TOKEN is not set)
 #
 #     Method 3 (0600 temp file — for scripted non-interactive use):
-#       echo "eyJhbGci..." > /tmp/token && chmod 0600 /tmp/token
-#       YASHIGANI_SESSION_TOKEN="$(cat /tmp/token)" scripts/rotate-secret.sh ...
-#       rm /tmp/token
+#       Create a 0600 temporary file (use mktemp from a secure directory),
+#       write the token to it, then read it into YASHIGANI_SESSION_TOKEN.
+#       Remove the temporary file immediately after reading.
+#       Example: TOKEN_FILE="$(mktemp -p "${TMPDIR:-/var/tmp}")"
+#                chmod 0600 "${TOKEN_FILE}"
+#                echo "eyJhbGci..." > "${TOKEN_FILE}"
+#                YASHIGANI_SESSION_TOKEN="$(cat "${TOKEN_FILE}")" scripts/rotate-secret.sh ...
+#                rm -f "${TOKEN_FILE}"
 #
 #   NOTE: --session-token CLI arg was REMOVED (B3 fix, Iris audit 2026-05-08).
 #   Passing credentials as CLI args exposes them in /proc/<pid>/cmdline (visible
