@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T12:35:00+01:00
+# Last-Updated: 2026-05-10T13:30:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -485,8 +485,17 @@ VM_IDENTITY_FILE="${VM_HARNESS_IDENTITY}"
 BACKUP_EXIT=0
 BACKUP_FILE=""
 
+# backup.sh must run with elevated privileges: docker/secrets/ contains files
+# owned by UID 1001 (maxine) with mode 0600 — the su user (UID 1004) cannot read
+# private key files via tar even though su is in ysgteam.  Always run via sudo
+# so root can read all files.  The harness-generated age identity (chmod 400,
+# owned by su/root) is still readable by root.
+# Pre-create the backups dir as su so the harness-age dir is accessible.
+_vm_ssh "mkdir -p '${VM_BACKUPS_DIR}'" 2>/dev/null || true
+
 BACKUP_OUTPUT="$(
-  _vm_run "
+  _vm_sudo "
+    export HISTFILE=/dev/null
     mkdir -p '${VM_BACKUPS_DIR}'
     cd '${VM_CLONE_DIR}'
     bash scripts/backup.sh \
@@ -503,9 +512,14 @@ if [[ "${BACKUP_EXIT}" != "0" ]]; then
   _record_fail "backup.sh exited ${BACKUP_EXIT}"
 fi
 
+# Chown backup outputs back to su — backup ran as root (sudo) so the .age file
+# is root-owned (chmod 0400).  restore.sh runs zero-sudo as the su user and
+# must be able to read the file.  The identity key stays su-owned.
+_vm_sudo "chown -R '${VM_USER}:${VM_USER}' '${VM_BACKUPS_DIR}' 2>/dev/null || true" 2>/dev/null || true
+
 # Find the backup file
 BACKUP_FILE="$(
-  _vm_run "ls -1t '${VM_BACKUPS_DIR}'/*.tar.gz.age 2>/dev/null | head -1" 2>/dev/null || echo ""
+  _vm_ssh "ls -1t '${VM_BACKUPS_DIR}'/*.tar.gz.age 2>/dev/null | head -1" 2>/dev/null || echo ""
 )"
 BACKUP_FILE="${BACKUP_FILE%%$'\n'*}"
 _ev "Backup file: ${BACKUP_FILE:-NOT_FOUND}"
@@ -571,9 +585,18 @@ else
     _ev "restore.sh --encrypted ${VM_IDENTITY_FILE} ${BACKUP_FILE}"
     _ev ""
 
-    # Stop and restart stack after restore
+    # Pre-restore: chown docker/secrets/ and docker/.env to the su user so
+    # restore.sh (which runs zero-sudo per P0-14) can write to them.
+    # install.sh leaves secrets owned by UID 1001 (maxine); the su user (UID 1004)
+    # cannot chmod/overwrite them without this step.
+    _vm_sudo "
+      chown -R '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
+      chown '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+
+    # Run restore.sh as su user (zero-sudo contract per P0-14)
     RESTORE_OUTPUT="$(
-      _vm_run "
+      _vm_ssh "
         set -euo pipefail
         cd '${VM_CLONE_DIR}' && \
         bash restore.sh --encrypted '${VM_IDENTITY_FILE}' '${BACKUP_FILE}' 2>&1
