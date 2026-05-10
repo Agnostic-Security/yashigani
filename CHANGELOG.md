@@ -56,7 +56,7 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [v2.23.2.1] — 2026-05-08 — Helm chart digest pin fix **[LAST PUBLIC RELEASE]**
+## [v2.23.2.1] — 2026-05-08 — Helm chart digest pin fix
 
 > **Chart-only patch. Code (gateway + backoffice binaries) is identical to v2.23.2.**
 >
