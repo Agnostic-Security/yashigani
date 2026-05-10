@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-11T00:30:00+01:00 (fix: macOS+Docker Colima virtiofs — skip host-UID chown assertions in check_installer_preflight + compose_up; YSG_OS==macos gated)
 # last-updated: 2026-05-10T21:30:00+01:00 (fix: _pki_chown_client_keys || return 1 at both call sites — fail-closed on chown failure, not silent continue)
 # last-updated: 2026-05-10T13:00:00+01:00 (fix: BUG-AG-001 --pull never for air-gap compose up; BUG-AG-005 bump YASHIGANI_VERSION to 2.23.3)
 # last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; upgrade no-rotation path stops touching keys; Tiago directive 2026-05-10)
@@ -1230,15 +1231,26 @@ check_installer_preflight() {
       fi
     else
       # Docker / rootful Podman: direct chown to container UID 1001.
-      # shellcheck disable=SC2012
-      local _dir_uid
-      _dir_uid="$(ls -nd "$_bm_dir" 2>/dev/null | awk '{print $3}')"
-      if [[ "$_dir_uid" != "1001" ]]; then
-        if chown 1001:1001 "$_bm_dir" 2>/dev/null; then
-          log_info "chown 1001:1001 applied to $_bm_dir"
-        else
-          log_error "Cannot chown $_bm_dir to 1001:1001 — run: sudo chown 1001:1001 \"$_bm_dir\""
-          _bm_failed=1
+      # macOS+Docker (Colima virtiofs): host-side chown to arbitrary UIDs is
+      # restricted by macOS kernel — only root can chown to non-self UIDs.
+      # Colima's virtiofs UID mapping means containers already see bind-mounted
+      # dirs as root:root inside the VM; after an ephemeral-container chown the
+      # container view reflects UID 1001 even though the macOS host still shows
+      # the installer UID. Do not attempt host chown on macOS — it will always
+      # fail with EPERM, and the failure is spurious (PKI writes succeed).
+      if [[ "${YSG_OS:-}" == "macos" ]]; then
+        log_info "macOS+Docker: skipping host chown for $_bm_dir (virtiofs UID mapping — PKI container will see UID 1001)"
+      else
+        # shellcheck disable=SC2012
+        local _dir_uid
+        _dir_uid="$(ls -nd "$_bm_dir" 2>/dev/null | awk '{print $3}')"
+        if [[ "$_dir_uid" != "1001" ]]; then
+          if chown 1001:1001 "$_bm_dir" 2>/dev/null; then
+            log_info "chown 1001:1001 applied to $_bm_dir"
+          else
+            log_error "Cannot chown $_bm_dir to 1001:1001 — run: sudo chown 1001:1001 \"$_bm_dir\""
+            _bm_failed=1
+          fi
         fi
       fi
     fi
@@ -1249,6 +1261,13 @@ check_installer_preflight() {
     if [[ ! -d "$_bm_dir" ]]; then
       _bm_failed=1
       break
+    fi
+    # macOS+Docker (Colima virtiofs): host UID will never show 1001 because
+    # macOS restricts chown to non-self UIDs. virtiofs handles the mapping at
+    # mount time — containers see UID 1001. Skip the host-UID assertion.
+    if [[ "${YSG_OS:-}" == "macos" ]]; then
+      log_info "macOS+Docker: bind-mount UID assertion skipped for $_bm_dir (virtiofs UID mapping)"
+      continue
     fi
     # shellcheck disable=SC2012
     local _uid
@@ -2998,6 +3017,19 @@ compose_up() {
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     # Deferred to _prepare_secrets_dir_for_pki() — see comment above.
     log_info "secrets_dir chown deferred to PKI bootstrap (Podman rootless)"
+  elif [[ "${YSG_OS:-}" == "macos" ]]; then
+    # macOS + Docker (Colima virtiofs): host-side chown to UID 1001 is not
+    # possible without root. macOS restricts chown to non-self UIDs regardless
+    # of file ownership. This is NOT a problem: Colima's virtiofs maps the
+    # host user (e.g. UID 502) → UID 0 inside the VM, and the ephemeral
+    # Docker chown in _pki_run_issuer() changed the inode's owner to UID 1001
+    # from inside the container. Subsequent containers (PKI issuer, backoffice)
+    # running as UID 1001 can write to the directory because virtiofs maintains
+    # the UID 1001 mapping persistently in the container namespace.
+    # Verified empirically: `docker run --user 1001:1001` can write to a
+    # directory chowned via ephemeral container even though `ls -nd` on the
+    # macOS host still shows the installer UID. (2026-05-11, M4, Colima 0.x)
+    log_info "macOS+Docker: secrets_dir host-UID assertion skipped (Colima virtiofs — container sees UID 1001 from ephemeral chown)"
   else
     # For Docker (non-root caller): _pki_run_issuer() already chowned secrets_dir
     # to UID 1001 via an ephemeral docker container. Attempting chown here again
@@ -3023,6 +3055,7 @@ compose_up() {
     fi
     # Defensive assertion: secrets dir must be owned by UID 1001 before proceeding.
     # (Skipped for Podman rootless — subuid remapping means host UID != 1001.)
+    # (Skipped for macOS — virtiofs UID mapping; see elif branch above.)
     # shellcheck disable=SC2012
     _actual_uid=$(ls -nd "$secrets_dir" 2>/dev/null | awk '{print $3}')
     if [[ "$_actual_uid" != "1001" ]]; then
