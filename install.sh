@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-10T21:30:00+01:00 (fix: _pki_chown_client_keys || return 1 at both call sites — fail-closed on chown failure, not silent continue)
 # last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; upgrade no-rotation path stops touching keys; Tiago directive 2026-05-10)
 # last-updated: 2026-05-09T15:00:00+01:00 (fix: Docker non-root — compose_up data/audit mkdir uses ephemeral container when data_dir owned by UID 1001)
 # last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
@@ -5541,7 +5542,7 @@ bootstrap_internal_pki() {
       # Tiago directive 2026-05-10: upgrade path that does NOT rotate keys must
       # NOT sweep-chmod existing keys. Ownership is applied only when new key
       # material has actually been written. GATE5-BUG-01.
-      _pki_chown_client_keys
+      _pki_chown_client_keys || return 1
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
@@ -5568,7 +5569,7 @@ bootstrap_internal_pki() {
 
   _pki_persist_env
 
-  _pki_chown_client_keys   # re-own service keys to container UIDs (see helper above)
+  _pki_chown_client_keys || return 1  # re-own service keys to container UIDs; fail-closed
 
   log_success "Internal CA + per-service leaf certs generated"
   log_info "  CA root:      docker/secrets/ca_root.crt"
