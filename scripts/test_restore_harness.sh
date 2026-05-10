@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T20:30:00+01:00
+# Last-Updated: 2026-05-10T21:30:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -479,9 +479,22 @@ except Exception:
           # parser expects a flat tar with manifest.json at root, not the
           # OCI layout directory structure. Force docker-archive for
           # cross-privilege-boundary compatibility (Step A su -> Step B root).
+          #
+          # IMPORTANT: docker-archive load strips the manifest-list digest from
+          # RepoDigests (stores only the platform-specific digest). Without the
+          # manifest-list digest, podman-compose up cannot find the image by the
+          # compose reference (name:tag@sha256:<manifest-list-digest>) and tries
+          # to pull from Docker Hub → rate-limit hit. Fix: write digest_map so
+          # Step B can patch /var/lib/containers/storage/overlay-images/images.json
+          # to add the original manifest-list ref as a name alias.
           podman image save --format docker-archive \"\${_name_tag}\" -o \"\${_tarball}\" 2>/dev/null && \
             echo \"  saved: \${_safe_name}.tar\" || \
             { echo \"  WARNING: save failed for \${_name_tag}\"; rm -f \"\${_tarball}\"; }
+        fi
+        # Write digest_map entry: name_tag<TAB>full_digest_ref (if ref has @sha256:)
+        # Step B reads this to add manifest-list digest as name alias in images.json.
+        if [[ \"\${_ref}\" == *'@'* ]]; then
+          printf '%s\t%s\n' \"\${_name_tag}\" \"\${_ref}\" >> \"\${_PRELOAD_TMPDIR}/digest_map.tsv\"
         fi
       done < '${_COMPOSE_IMGS_FILE}'
 
@@ -536,6 +549,72 @@ except Exception:
       done
       echo \"Loaded \${_loaded} image tarballs\"
 
+      # Conflict 1 fix — patch images.json to add manifest-list digest as name alias.
+      #
+      # docker-archive format (used in Step A) does NOT preserve the manifest-list
+      # digest in the loaded image's RepoDigests — only the platform-specific digest
+      # (e.g. sha256:035ba3...) is stored. But docker-compose.yml references images
+      # as name:tag@sha256:<manifest-list-digest>, so podman-compose up cannot find
+      # the image by the compose reference and tries to pull → Docker Hub rate limit.
+      #
+      # Fix: read the digest_map written by Step A and add each
+      # <full-name>@sha256:<manifest-list-digest> as a name alias in
+      # /var/lib/containers/storage/overlay-images/images.json. Podman's image
+      # lookup scans the names array; adding the manifest-list digest as a name
+      # makes 'podman image exists name:tag@sha256:<manifest-list-digest>' return
+      # true, preventing podman-compose up from pulling.
+      _DIGEST_MAP=\"\${_TMPDIR}/digest_map.tsv\"
+      if [[ -f \"\${_DIGEST_MAP}\" ]] && command -v python3 >/dev/null 2>&1; then
+        _IMAGES_JSON='/var/lib/containers/storage/overlay-images/images.json'
+        # Patch images.json: add manifest-list digest as name alias for each compose
+        # image loaded from docker-archive. The patch is atomic (write tmp + rename).
+        # Uses the _PY_SCRIPT variable pattern (same as the compose image extraction
+        # above) to embed multi-line Python inside the _vm_sudo bash -c string.
+        _PATCH_PY='
+import json,os,sys
+j,m=sys.argv[1],sys.argv[2]
+dm={}
+for line in open(m):
+    p=line.strip().split(chr(9),1)
+    if len(p)==2: dm[p[0]]=p[1]
+d=json.load(open(j))
+n=0
+for img in d:
+    ns=img.get(\"names\") or []
+    for nt,fr in dm.items():
+        if any(nt==x or nt.split(\"/\")[-1].split(\":\")[0] in x for x in ns):
+            # Podman normalises name:tag@sha256:DIGEST to name@sha256:DIGEST
+            # for digest-reference lookups. We must add the tag-stripped form
+            # (name@sha256:DIGEST) so podman image exists returns true.
+            # Also add the full form (name:tag@sha256:DIGEST) for completeness.
+            name_base=nt.split(\":\")[0] if \":\" in nt else nt
+            digest_part=\"sha256:\"+fr.split(\"sha256:\",1)[1] if \"sha256:\" in fr else \"\"
+            digest_only=name_base+\"@\"+digest_part if digest_part else \"\"
+            added=0
+            if fr not in ns:
+                ns=ns+[fr]
+                added+=1
+            if digest_only and digest_only not in ns:
+                ns=ns+[digest_only]
+                added+=1
+            if added:
+                img[\"names\"]=ns
+                print(\"Patched:\",nt,\"->\",fr)
+                n+=1
+            break
+t=j+\".tmp\"
+json.dump(d,open(t,\"w\"),separators=(\",\",\":\"))
+os.rename(t,j)
+print(\"images.json patched:\",n,\"aliases added\")
+'
+        python3 -c \"\${_PATCH_PY}\" \"\${_IMAGES_JSON}\" \"\${_DIGEST_MAP}\" && \
+          echo \"images.json patch: OK\" || \
+          echo \"WARNING: images.json patch failed\"
+      else
+        echo 'WARNING: digest_map.tsv missing or python3 unavailable — manifest-list digest aliases not added'
+        echo '  podman-compose up may pull from Docker Hub if rate limit is not exhausted'
+      fi
+
       # Cleanup tarballs (total can be 3-5 GB for a full yashigani image set)
       rm -rf \"\${_TMPDIR}\"
 
@@ -585,6 +664,29 @@ except Exception:
     else
       _ev "Podman socket: active (linger + keepalive enabled)"
     fi
+  fi
+
+  # Conflict 2 fix — pre-pull alpine PKI helper image for Docker runtime.
+  # install.sh uses alpine:3@sha256:5b10f432... as an ephemeral container in
+  # _pki_chown_client_keys (docker_run mode) and _pki_run_issuer for Docker.
+  # alpine is NOT a compose service, so 'docker compose pull' never pre-fetches
+  # it. If it is absent and Docker Hub rate limit is exhausted, the PKI bootstrap
+  # fails with 'pull access denied' and install.sh exits 1.
+  # Fix: pull alpine before install.sh runs. The harness's pre-pull quota is
+  # separate from install.sh's compose pull quota (different timeline / IP).
+  if [[ "${RUNTIME}" == "docker" ]]; then
+    _ALPINE_PRELOAD="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+    _info "Pre-pulling alpine PKI helper image for Docker runtime..."
+    # Docker runtime: install.sh runs as the su user (docker group), not root.
+    # Use _vm_ssh (not _vm_sudo) since su can run docker without sudo.
+    _vm_ssh "
+      if docker image inspect '${_ALPINE_PRELOAD}' >/dev/null 2>&1; then
+        echo 'alpine already present — skipping pull'
+      else
+        docker pull '${_ALPINE_PRELOAD}' 2>&1 && echo 'alpine pre-pulled OK' || \
+          echo 'WARNING: alpine pre-pull failed — PKI bootstrap may fail if rate-limited'
+      fi
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
   fi
 
   _info "Running install.sh (timeout: ${TIMEOUT}s)..."
