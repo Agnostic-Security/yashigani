@@ -2301,6 +2301,11 @@ compose_pull() {
   if _local_images_cached; then
     log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}) — skipping build"
     log_success "Local images ready (cached)"
+    # Signal compose_up() to use --pull never so digest-pinned compose image refs
+    # don't trigger registry round-trips for pre-seeded images. Only safe when
+    # images are pre-seeded by a trusted source (harness tarball cache, airgap
+    # bundle); fresh installs build+pull with digest verification as usual.
+    YASHIGANI_COMPOSE_PULL_POLICY="never"
   else
     log_info "Building gateway and backoffice images from source..."
     "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
@@ -3251,11 +3256,28 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     # healthy. With set -euo pipefail this caused install to abort before
     # bootstrap_postgres, leaving admin accounts unseeded. Core service health is
     # validated by run_health_check (step 12); this non-zero is non-fatal here.
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up -d --remove-orphans || true
+    # v2.23.3: when images were pre-seeded (YASHIGANI_COMPOSE_PULL_POLICY=never),
+    # pass --pull never to Docker Compose so digest-pinned image refs don't
+    # trigger registry round-trips for locally-cached images. Only safe here
+    # because the tarball cache is trusted (same path as --air-gap bundle).
+    # podman-compose does not support --pull; this flag only applies on Docker.
+    local _compose_up_pull_args=()
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
+       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      log_info "Using --pull never (images pre-seeded from trusted cache)"
+      _compose_up_pull_args=(--pull never)
+    fi
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up -d --remove-orphans ${_compose_up_pull_args[@]+"${_compose_up_pull_args[@]}"} || true
   else
     log_info "Starting services..."
     # ROOTLESS-9: same rationale as upgrade path above.
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up -d || true
+    local _compose_up_pull_args2=()
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
+       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      log_info "Using --pull never (images pre-seeded from trusted cache)"
+      _compose_up_pull_args2=(--pull never)
+    fi
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up -d ${_compose_up_pull_args2[@]+"${_compose_up_pull_args2[@]}"} || true
   fi
 
   log_success "Services started"
