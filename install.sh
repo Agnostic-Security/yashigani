@@ -5378,9 +5378,15 @@ _pki_chown_client_keys() {
         local _rel_pw="${_pwpath#"${_secrets_dir}/"}"
         case "$_chown_mode" in
           docker_run)
-            docker run --rm --volume "${_secrets_dir}:/s:rw" \
-              "$_alpine_image" sh -c "chmod 0644 /s/${_rel_pw}" 2>/dev/null \
-              || { log_error "docker_run chmod 0644 failed on ${_shared_pw}"; return 1; }
+            # v2.23.3: try --pull=never with tag-only alpine:3 first to avoid
+            # Docker Hub rate-limit hits; fall back to digest-pinned pull if needed.
+            if ! docker run --rm --pull=never \
+                   --volume "${_secrets_dir}:/s:rw" \
+                   "alpine:3" sh -c "chmod 0644 /s/${_rel_pw}" 2>/dev/null; then
+              docker run --rm --volume "${_secrets_dir}:/s:rw" \
+                "$_alpine_image" sh -c "chmod 0644 /s/${_rel_pw}" 2>/dev/null \
+                || { log_error "docker_run chmod 0644 failed on ${_shared_pw}"; return 1; }
+            fi
             ;;
           podman_run)
             podman run --rm --volume "${_secrets_dir}:/s:rw" \
