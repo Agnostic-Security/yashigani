@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-07T09:00:00+01:00 — fix(helm): G9 blocker: rename grafana-provisioning ConfigMap keys (forward-slash → underscore) so K8s API accepts them */ -}}
+{{- /* Last updated: 2026-05-10T00:00:00+01:00 — fix(helm): jaeger healthcheckv2 use_v2:false (B-K8S-5 follow-up) */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -156,7 +156,11 @@ data:
 
     extensions:
       healthcheckv2:
-        use_v2: true
+        # use_v2: false is required. When use_v2: true, healthcheckv2 does NOT expose
+        # HTTP routes — every path (including /health/status) returns 404 or no response.
+        # use_v2: false enables the HTTP server on :13133 serving /health/status (JSON 200).
+        # Su verified live: patched true→false, pod served health correctly. B-K8S-5 follow-up.
+        use_v2: false
         http:
           endpoint: 0.0.0.0:13133
 
