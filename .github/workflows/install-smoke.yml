@@ -1,4 +1,5 @@
-# Last updated: 2026-05-10T00:00:00+01:00 (v2.23.3: bump macOS install step timeout 18→35 min, job ceiling 25→45 min)
+# Last updated: 2026-05-10T22:40:00+01:00 (v2.23.3 task #39: codify M7 G16 image-bump-sweep gate; carries macOS timeout bumps from #128)
+# Last updated: 2026-05-08T00:00:00+01:00 (v2.23.3: formally mark macOS smoke as INFORMATIONAL; update triggers for v2.23.3 branch)
 # install-smoke.yml — Install smoke-test matrix
 #
 # Matrix: ubuntu-latest × (docker|podman) — GATE (required for merge)

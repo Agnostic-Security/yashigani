@@ -2858,7 +2858,6 @@ The `sign_image.sh` script detects signing mode automatically: if `COSIGN_PRIVAT
 
 ---
 
-<<<<<<< HEAD
 ## 28. Operational — Rotating Secrets (v2.23.3)
 
 Yashigani v2.23.3 introduces admin-triggered secret rotation for infrastructure

@@ -1,6 +1,6 @@
 # Yashigani Release Process
 
-**Last updated:** 2026-05-08T16:00:00+01:00
+**Last updated:** 2026-05-10T22:40:00+01:00 (task #39: codify M7 G16 image-bump-sweep gate)
 
 This document covers the end-to-end process for cutting a Yashigani release from a clean branch tip to a signed, published GitHub release with full evidence archive. It is the authoritative source for M7 gate-check procedures.
 
@@ -199,7 +199,100 @@ Execute in order. Gate N does not start until Gate N-1 is GREEN.
 | 12 | Risk register updated | Compliance Reviewer | exception-register.md | All accepted risks logged |
 | 13 | Maintainer HITL GO | Release Coordinator | Verbal/chat confirmation | "GO release" |
 | 14 | Tag + push | Release Engineer | `git tag v<ver>` | Tag visible on GitHub |
-| G16 | Dep-bump sweep (all types) | Container specialist (images/Actions/Helm) / Python specialist (Python/JS) / Release coordinator (sign-off) | `ci-evidence/<sha>/dep-bump-sweep.txt` | `Dep sweep: PASS` |
+| G16 | Image-bump sweep | Container specialist (sweep) / Release coordinator (sign-off) | `ci-evidence/<sha>/image-bump-sweep.txt` | `Image sweep: PASS` |
+
+---
+
+## 6b. Image-Bump Sweep Gate (G16) — HARD STOP
+
+**Rule source:** `feedback_every_release_refresh_base_images.md` + `feedback_image_pinning.md`.
+
+**When to run:** at the start of every release cycle, immediately after the release branch is cut, before any feature work or pre-tag activity. If the sweep was not run at branch-cut time, it must be run and cleared before Gate 13 (HITL GO).
+
+**Failure mode:** HARD STOP — no merge to main, no release tag, until every image passes.
+
+**Owner:** The container specialist runs the sweep and writes the evidence file. The release coordinator reviews and signs off in the release evidence directory before Gate 13.
+
+### What to check
+
+1. Every base image referenced in:
+   - `docker/docker-compose.yml` and `docker/docker-compose.*.yml`
+   - `helm/yashigani/values.yaml` and `helm/yashigani/values.release.yaml`
+   - All `Dockerfile.*` files (`FROM` lines)
+2. For each image: confirm the pin is at the **latest published stable** upstream tag (not a floating stub; not a dated-but-behind pin).
+3. For each image: confirm the release overlay (`docker-compose.release.yml`, `values.release.yaml`) uses `name:tag@sha256:<digest>` form.
+
+### Command sequence (container specialist runs at branch-cut)
+
+```sh
+# 1. Enumerate every image reference
+grep -E '^\s+image:|^FROM ' \
+  docker/docker-compose.yml \
+  docker/docker-compose.*.yml \
+  docker/Dockerfile.* \
+  2>/dev/null | sort -u
+
+grep -E 'tag:|repository:' \
+  helm/yashigani/values.yaml \
+  helm/yashigani/values.release.yaml \
+  2>/dev/null | sort -u
+
+# 2. For each GitHub-hosted image, query upstream latest stable:
+gh api "/repos/<owner>/<repo>/releases/latest" --jq '.tag_name'
+
+# 3. For Docker Hub images, query current tags:
+curl -s "https://registry.hub.docker.com/v2/repositories/<owner>/<repo>/tags/?page_size=20&ordering=last_updated" \
+  | jq -r '.results[].name' | head -10
+
+# 4. Resolve digest for each image being pinned (release overlay):
+docker buildx imagetools inspect <registry>/<name>:<tag> \
+  --format '{{json .Manifest}}' | jq -r '.digest'
+# or: crane digest <registry>/<name>:<tag>
+
+# 5. Verify no floating-stub tags remain in dev compose (post-2026-05-07 rule):
+# Forbidden patterns: image:7-alpine, image:2-alpine, image:16-alpine, image:latest
+grep -rE 'image: .+:(latest|[0-9]+-[a-z]+|[a-z]+-[0-9]+)\s*$' \
+  docker/docker-compose.yml docker/docker-compose.*.yml \
+  helm/yashigani/values.yaml
+# Any output = FAIL (floating-stub pin found)
+
+# 6. Verify release overlay: every image ref must contain '@sha256:'
+grep -E '^\s+image:' docker/docker-compose.release.yml \
+  | grep -v '@sha256:' && echo "FAIL: unpinned image(s) in release overlay" \
+  || echo "Release overlay: all images digest-pinned"
+
+grep -E 'digest:' helm/yashigani/values.release.yaml | wc -l
+# Count must equal number of external images in scope
+```
+
+### Evidence file format
+
+The container specialist writes `ci-evidence/<sha>/image-bump-sweep.txt` with the following structure:
+
+```
+Image sweep: PASS
+Date: <ISO-8601>
+Release: v<ver>
+Commit: <sha>
+Checked by: captain@agnosticsec.com
+Signed off by: maxine@agnosticsec.com
+
+Images checked (<n> total):
+  postgres:<tag>@sha256:<digest>         upstream-latest: <tag>  status: CURRENT
+  redis:<tag>@sha256:<digest>            upstream-latest: <tag>  status: CURRENT
+  caddy:<tag>@sha256:<digest>            upstream-latest: <tag>  status: CURRENT
+  ...
+
+Hold-backs (if any):
+  <image>  held at <tag>  reason: <CVE/regression>  planned-bump: <date>
+
+Floating-stub check: PASS (zero matches)
+Release-overlay digest-pin check: PASS (all <n> images carry @sha256:)
+```
+
+Any image not at upstream-latest stable (without a documented hold-back) or any image missing `@sha256:` in the release overlay produces `Image sweep: FAIL`.
+
+Hold-backs are permitted only when upstream-latest has an active CVE or confirmed regression. Each hold-back must carry a planned-bump date and must be logged in the release retro.
 
 ---
 
