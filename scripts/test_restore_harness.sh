@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T19:15:00+01:00
+# Last-Updated: 2026-05-10T20:30:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -473,7 +473,13 @@ except Exception:
         _tarball=\"\${_PRELOAD_TMPDIR}/img_\${_safe_name}.tar\"
         if [[ ! -f \"\${_tarball}\" ]]; then
           echo \"Saving \${_name_tag} ...\"
-          podman image save \"\${_name_tag}\" -o \"\${_tarball}\" 2>/dev/null && \
+          # --format docker-archive: podman >= 4.x defaults to OCI-archive.
+          # 'podman image load' fails on OCI-archive with
+          # 'manifest.json: no such file or directory' because docker-archive
+          # parser expects a flat tar with manifest.json at root, not the
+          # OCI layout directory structure. Force docker-archive for
+          # cross-privilege-boundary compatibility (Step A su -> Step B root).
+          podman image save --format docker-archive \"\${_name_tag}\" -o \"\${_tarball}\" 2>/dev/null && \
             echo \"  saved: \${_safe_name}.tar\" || \
             { echo \"  WARNING: save failed for \${_name_tag}\"; rm -f \"\${_tarball}\"; }
         fi
@@ -484,7 +490,7 @@ except Exception:
         if podman image exists \"\${img}\" 2>/dev/null; then
           _safe=\$(printf '%s' \"\${img}\" | tr -c 'a-zA-Z0-9.' '_')
           echo \"Saving \${img} ...\"
-          podman image save \"\${img}\" -o \"\${_PRELOAD_TMPDIR}/img_\${_safe}.tar\" 2>/dev/null && \
+          podman image save --format docker-archive \"\${img}\" -o \"\${_PRELOAD_TMPDIR}/img_\${_safe}.tar\" 2>/dev/null && \
             echo \"  saved\" || echo \"  WARNING: save failed for \${img}\"
         fi
       done
