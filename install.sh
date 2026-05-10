@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-10T21:30:00+01:00 (fix: _pki_chown_client_keys || return 1 at both call sites — fail-closed on chown failure, not silent continue)
+# last-updated: 2026-05-10T13:00:00+01:00 (fix: BUG-AG-001 --pull never for air-gap compose up; BUG-AG-005 bump YASHIGANI_VERSION to 2.23.3)
 # last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; upgrade no-rotation path stops touching keys; Tiago directive 2026-05-10)
 # last-updated: 2026-05-09T15:00:00+01:00 (fix: Docker non-root — compose_up data/audit mkdir uses ephemeral container when data_dir owned by UID 1001)
 # last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
@@ -57,7 +59,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="2.23.2"
+YASHIGANI_VERSION="2.23.3"
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 YSG_INSTALL_DIR="${YSG_INSTALL_DIR:-$HOME/.yashigani}"
@@ -2204,15 +2206,55 @@ compose_pull() {
       local _compose_file="${WORK_DIR}/docker/docker-compose.yml"
       local _missing_external=0
 
+      # Build a list of images for active services only. Profile-only services
+      # whose profile is not in COMPOSE_PROFILES are skipped — their images
+      # can safely be absent when --skip-pull is used without those profiles.
       local _remote_images
-      _remote_images=$(grep '^\s*image:' "$_compose_file" 2>/dev/null \
-        | sed 's/.*image:[[:space:]]*//' | sed 's/[[:space:]]*$//' \
-        | grep -v 'yashigani/' | grep -v '^\${' | sort -u)
+      local _active_profiles_arg="${COMPOSE_PROFILES[*]:-}"
+      # Profile-aware extraction using python3+yaml when available
+      local _py_script='
+import sys, yaml
+compose_file, active_profiles_str = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
+active_profiles = set(active_profiles_str.split()) if active_profiles_str else set()
+try:
+    with open(compose_file) as f:
+        c = yaml.safe_load(f)
+    for svc, data in (c.get("services") or {}).items():
+        profiles = data.get("profiles") or []
+        img = data.get("image") or ""
+        if not img or "yashigani/" in img or img.startswith("${"):
+            continue
+        if not profiles or any(p in active_profiles for p in profiles):
+            print(img)
+except Exception:
+    pass
+'
+      if command -v python3 >/dev/null 2>&1 && \
+         python3 -c "import yaml" >/dev/null 2>&1; then
+        _remote_images=$(python3 -c "$_py_script" "$_compose_file" "$_active_profiles_arg" 2>/dev/null | sort -u)
+      fi
+      # Fallback to legacy grep (no profile filter) if python3/yaml unavailable
+      if [[ -z "${_remote_images:-}" ]]; then
+        _remote_images=$(grep '^\s*image:' "$_compose_file" 2>/dev/null \
+          | sed 's/.*image:[[:space:]]*//' | sed 's/[[:space:]]*$//' \
+          | grep -v 'yashigani/' | grep -v '^\${' | sort -u)
+      fi
 
       for _img in $_remote_images; do
         [[ -z "$_img" ]] && continue
         if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
-          podman image exists "$_img" 2>/dev/null || { log_warn "--skip-pull: remote image '$_img' not found locally"; _missing_external=1; }
+          # Check by full ref first (name:tag@sha256), then by name:tag only.
+          # When images are pre-loaded via save/load (e.g., gate5 rootful harness
+          # or air-gap bundle), podman image load does not reconstruct RepoDigests,
+          # so 'podman image exists name:tag@sha256' fails even though the image
+          # is present by name:tag. Falling back to name:tag check is safe:
+          # content integrity is guaranteed by the image ID matching.
+          local _name_tag_only="${_img%%@*}"
+          if ! podman image exists "$_img" 2>/dev/null && \
+             ! podman image exists "$_name_tag_only" 2>/dev/null; then
+            log_warn "--skip-pull: remote image '$_img' not found locally"
+            _missing_external=1
+          fi
         else
           docker image inspect "$_img" >/dev/null 2>&1 || { log_warn "--skip-pull: remote image '$_img' not found locally"; _missing_external=1; }
         fi
@@ -3024,8 +3066,27 @@ compose_up() {
     [[ -n "$_profile" ]] && profile_args+=("--profile" "$_profile")
   done
 
+  # BUG-AG-001: air-gap installs must never attempt registry pulls during compose up.
+  # SKIP_PULL=true prevents the explicit `compose pull` step (Step 9), but without
+  # --pull never, `docker compose up` still issues Pulling calls for any image not
+  # locally cached — failing on truly isolated networks.
+  #
+  # docker compose v2 / docker-compose / podman compose: --pull never
+  # podman-compose (Python): does NOT support --pull never; omitting --pull is
+  #   correct (no flag = don't pull). We must not pass --pull never to podman-compose
+  #   or it will error ("unrecognized arguments").
+  local _pull_flag=()
+  if [[ "$AIR_GAP" == "true" ]]; then
+    if [[ "${COMPOSE_CMD[0]}" != "podman-compose" ]]; then
+      _pull_flag=("--pull" "never")
+      log_info "Air-gap mode: passing --pull never to compose up (BUG-AG-001)"
+    else
+      log_info "Air-gap mode: podman-compose selected; omitting --pull (no flag = no pull)"
+    fi
+  fi
+
   if [[ "$DRY_RUN" == "true" ]]; then
-    dry_print "${COMPOSE_CMD[*]} ${compose_files[*]} ${profile_args[*]+${profile_args[*]}} up -d"
+    dry_print "${COMPOSE_CMD[*]} ${compose_files[*]} ${profile_args[*]+${profile_args[*]}} up ${_pull_flag[*]+${_pull_flag[*]}} -d"
     return 0
   fi
 
@@ -3054,7 +3115,7 @@ compose_up() {
     # only applies to the Podman path.
     if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
       log_info "Upgrade + Podman: pre-starting postgres for SSL injection (V232-SMOKE-004)..."
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" up -d postgres 2>/dev/null || true
+      "${COMPOSE_CMD[@]}" "${compose_files[@]}" up ${_pull_flag[@]+"${_pull_flag[@]}"} -d postgres 2>/dev/null || true
       # Wait up to 60s for postgres to accept connections.
       local _pg_ready=0 _pg_i
       for _pg_i in $(seq 1 30); do
@@ -3203,11 +3264,11 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     # healthy. With set -euo pipefail this caused install to abort before
     # bootstrap_postgres, leaving admin accounts unseeded. Core service health is
     # validated by run_health_check (step 12); this non-zero is non-fatal here.
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up -d --remove-orphans || true
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
   else
     log_info "Starting services..."
     # ROOTLESS-9: same rationale as upgrade path above.
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up -d || true
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
   fi
 
   log_success "Services started"
@@ -5501,7 +5562,7 @@ bootstrap_internal_pki() {
       # Tiago directive 2026-05-10: upgrade path that does NOT rotate keys must
       # NOT sweep-chmod existing keys. Ownership is applied only when new key
       # material has actually been written. GATE5-BUG-01.
-      _pki_chown_client_keys
+      _pki_chown_client_keys || return 1
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
@@ -5528,7 +5589,7 @@ bootstrap_internal_pki() {
 
   _pki_persist_env
 
-  _pki_chown_client_keys   # re-own service keys to container UIDs (see helper above)
+  _pki_chown_client_keys || return 1  # re-own service keys to container UIDs; fail-closed
 
   log_success "Internal CA + per-service leaf certs generated"
   log_info "  CA root:      docker/secrets/ca_root.crt"

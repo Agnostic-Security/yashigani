@@ -3,7 +3,7 @@ Yashigani Backoffice — FastAPI admin portal.
 Isolated on port 8443. Local auth only (username + password + TOTP).
 No data-plane access. TLS required.
 
-Last updated: 2026-05-07T00:00:00+01:00
+Last updated: 2026-05-10T00:00:00+01:00
 """
 
 from __future__ import annotations
@@ -188,7 +188,16 @@ async def lifespan(app: FastAPI):
             # its own psycopg2 connection. Multi-replica safety: alembic
             # acquires a postgres advisory lock internally — see
             # yashigani/db/__init__.py:run_migrations() (Platform gate #58c #3bv).
-            run_migrations()
+            #
+            # v2.23.3 fix: run_migrations() is sync (psycopg2 + alembic). Calling
+            # it directly on the async event loop blocks the loop for the full
+            # migration duration (~1-3 s on cold DB). Docker's first healthcheck
+            # fires at T+start_period (was 30 s); if migrations exhaust that window
+            # the container is marked unhealthy before /healthz can respond.
+            # Wrapping in asyncio.to_thread() offloads the blocking work to the
+            # default ThreadPoolExecutor, keeping the event loop responsive.
+            import asyncio as _asyncio  # noqa: PLC0415 — inline; _asyncio re-used below
+            await _asyncio.to_thread(run_migrations)
 
             await create_pool()
 

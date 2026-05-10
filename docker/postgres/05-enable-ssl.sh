@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Yashigani v2.23.2 — enable TLS + client-cert verification on Postgres.
+# Yashigani v2.23.3 — enable TLS + client-cert verification on Postgres.
 # Last updated: 2026-04-27T20:40:49Z (BUG-59-01: trust intermediate CA, not root)
 #
 # This init script runs ONCE on first initdb of the postgres container (the

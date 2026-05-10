@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-09T12:00:00+01:00 -->
+<!-- last-updated: 2026-05-10T22:30:00+01:00 (cherry-pick v2.23.2.1 release notes from 2.23.x → v2.23.3) -->
 
 # Changelog
 
@@ -53,6 +53,24 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 - **fix/auth-logout-audit-emit** — `routes/auth.py logout()` now emits an `AdminLoginEvent(outcome="logout")` audit event before returning. Every other auth lifecycle outcome (login success/failure, totp_provision, stepup, self_reset) was already audited; logout was the only gap (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1). Guarded by `if state.audit_writer is not None` for partial-init safety.
 - **fix/break-glass-audit-writer-required** — `auth/break_glass.py init_break_glass(audit_writer=None)` default removed; `audit_writer` is now a required positional argument. Calling without it raises `TypeError` at startup rather than silently creating an audit-silent break-glass manager. The one call site (`backoffice/entrypoint.py:474`) already passes `audit_writer` explicitly — no functional change there. `_emit_activated` and `_emit_expired` None-guards preserved for defence-in-depth (yashigani-retro#95 / OWASP A09 / CMMC AU.L2-3.3.1).
 - **feat/v233-issue-95-product-gaps** (#95) — 5 ACS-surfaced product gaps closed: (1) *auth_log*: four new `EventType` variants (`AUTH_LOGIN_ATTEMPT`, `ACCOUNT_LOCKOUT`, `PASSWORD_CHANGED`, `SESSIONS_INVALIDATED`) + matching dataclasses in `audit/schema.py`; login-attempt events emitted at the route layer, lockout events emitted from `pg_auth.authenticate()` via a non-blocking `_emit_lockout_event()` helper; password-change and session-invalidation events emitted in `routes/auth.py change_password()` and `self_service_password_reset()`. (2) *Injection (SCIM)*: SCIM `?filter=` param now declared as typed `Query(max_length=256)` — FastAPI enforces length at the framework layer before any Python code runs; `_parse_filter_email()` enhanced with an explicit email regex (`_EMAIL_RE`) rejecting any value that is not a valid RFC 5321 address. (3) *BFLA*: `manage_service()` re-parameterised from `AdminSession` → `StepUpAdminSession`; enabling or disabling a compose-profile service now requires a fresh TOTP step-up (ASVS V6.8.4 / CMMC AC.L2-3.1.1). (4) *3rd-party response validation*: HIBP k-Anonymity response lines validated against `_HIBP_LINE_RE` (`^[0-9A-F]{35}:[0-9]+$`) before `int()` conversion — malformed lines logged and skipped rather than raising `ValueError`; OIDC discovery documents validated by `_validate_oidc_metadata()` (required fields: `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri`; all must be non-empty `https://` strings) before being cached. (5) *CMMC AC.L2-3.1.1*: same root-cause fix as Gap 3 — `StepUpAdminSession` on `manage_service()`. 65 new unit tests in `tests/unit/test_v2233_acs_product_gaps.py`.
+
+---
+
+## [v2.23.2.1] — 2026-05-08 — Helm chart digest pin fix **[LAST PUBLIC RELEASE]**
+
+> **Chart-only patch. Code (gateway + backoffice binaries) is identical to v2.23.2.**
+>
+> **Tag:** `v2.23.2.1` → SHA `49b80fd` — [GitHub Release](https://github.com/agnosticsec-com/yashigani/releases/tag/v2.23.2.1)
+
+### Fixed
+
+- **(#77) Helm chart — image digest pointers corrected** — `helm/yashigani/values.yaml` referenced v2.23.1 image digests for `yashigani-gateway` and `yashigani-backoffice` after the v2.23.2 GA tag was cut. This caused Kubernetes Helm deployments to pull the v2.23.1 container images when running the v2.23.2 chart, producing a chart/binary version mismatch that was invisible to operators. The patch pins both images to the correct v2.23.2 GA digests:
+  - `yashigani-gateway:2.23.2@sha256:7ffe5b92b23224a5fdcf86bf2570345d979ca2f9f06beda52447efc6ef5b688c`
+  - `yashigani-backoffice:2.23.2@sha256:34f4e68dac35f6e045bfe6277cd9725340e0e662361cdfb81b2057d3a0ebd0dc`
+
+  **Upgrade path:** Helm users on v2.23.2 should upgrade to v2.23.2.1 immediately (`helm upgrade --version 2.23.2.1`). No image rebuild or config change needed. Docker / Podman Compose deployments are unaffected (image pins in `docker-compose.release.yml` were already correct).
+
+Full release narrative: [`docs/release-notes/v2.23.2.1.md`](docs/release-notes/v2.23.2.1.md)
 
 ---
 

@@ -3,7 +3,7 @@ set -euo pipefail
 # Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): PR#122 — replace blanket CWE-732 find assertion with per-service pki_key_mode check; eliminates false-positive on prometheus_client.key 0640)
 # Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; restore stops blanket-chmod; per-key ownership on written keys only; Tiago directive 2026-05-10)
 # Last updated: 2026-05-09T00:00:00+01:00 (feat: MP.L2-3.8.9 — add --encrypted path for age-encrypted .tar.gz.age backups)
-# Last updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _refresh_pgdata_ca — replace install -o (root-only) with cp+chmod; pg_ctl now called directly; K8s exec privilege model corrected)
+# Last updated: 2026-05-10T18:30:00+01:00 (fix(gate5): global _DECRYPT_EXTRACT_DIR for EXIT trap — local var inaccessible in EXIT trap when set -e triggers early script exit)
 # Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
 # Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
 # Last updated: 2026-05-03T12:45:00+01:00 (V232-SMOKE-010: exclude .gitkeep from empty-file check; V232-SMOKE-011: podman unshare chown -R before cp restore; V232-SMOKE-012: secrets dir 0751→0755)
@@ -1551,16 +1551,22 @@ decrypt_and_restore() {
 
   # Create temp extraction directory under BACKUPS_DIR (same filesystem).
   # umask 077 at script top ensures it is created 0700.
+  # NOTE: _DECRYPT_EXTRACT_DIR is intentionally NOT declared local — bash EXIT
+  # traps run in the main shell scope, not the function scope, so local variables
+  # from decrypt_and_restore() are inaccessible there. Using a script-global
+  # variable ensures the cleanup trap can always expand the path even if
+  # restore_backup() exits non-zero (triggering set -e and bypassing the
+  # explicit trap - INT TERM EXIT at the end of this function).
   local _ts
   _ts="$(date -u +%Y%m%d_%H%M%S)"
-  local _extract_dir="${BACKUPS_DIR}/.age-extract-${_ts}-$$"
-  mkdir -p "${_extract_dir}"
+  _DECRYPT_EXTRACT_DIR="${BACKUPS_DIR}/.age-extract-${_ts}-$$"
+  mkdir -p "${_DECRYPT_EXTRACT_DIR}"
+  # local alias for readability within this function
+  local _extract_dir="${_DECRYPT_EXTRACT_DIR}"
 
   # Register cleanup on any exit
-  # shellcheck disable=SC2064
-  trap 'rm -rf "${_extract_dir}" 2>/dev/null; exit 1' INT TERM
-  # shellcheck disable=SC2064
-  trap 'rm -rf "${_extract_dir}" 2>/dev/null' EXIT
+  trap 'rm -rf "${_DECRYPT_EXTRACT_DIR}" 2>/dev/null; exit 1' INT TERM
+  trap 'rm -rf "${_DECRYPT_EXTRACT_DIR}" 2>/dev/null' EXIT
 
   log_info "Decrypting and extracting archive..."
   if ! age --decrypt --identity "${IDENTITY_FILE}" "${archive_file}" \

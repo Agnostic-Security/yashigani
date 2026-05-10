@@ -272,7 +272,7 @@ gateway:
     # M-01 fix: overridden to grpcs:// by gateway.yaml when mtls.enabled=true.
     # This value applies only when mTLS is disabled (non-default, testing only).
     otelEndpoint: "http://otel-collector:4317"
-    fasttextModelPath: "/app/models/fasttext_classifier.bin"
+    sklearnModelPath: "/app/models/sensitivity_classifier.joblib"
 
 # ---------------------------------------------------------------------------
 # Backoffice — Admin control plane
