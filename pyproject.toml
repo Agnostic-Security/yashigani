@@ -1,11 +1,11 @@
-# Last updated: 2026-05-10T00:00:00+01:00
+# Last updated: 2026-05-10T12:00:00+01:00 (fix: BUG-AG-005 bump version to 2.23.3)
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "yashigani"
-version = "2.23.2"
+version = "2.23.3"
 description = "Security enforcement gateway for MCP servers and agentic AI systems"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
