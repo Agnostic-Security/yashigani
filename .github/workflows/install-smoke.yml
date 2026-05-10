@@ -292,8 +292,10 @@ jobs:
           # httpx is required by src/tests/conftest.py (imported during pytest collection).
           # Without it, collection fails with ImportError and pytest exits 4.
           # V232-CSCAN-01i: httpx added 2026-05-05.
-          pip install pytest httpx --quiet
-          python -m pytest src/tests/unit/test_v2232_open_redirect_cscan_01d.py \
+          # Use python3 -m pip / python3 -m pytest for cross-platform compat:
+          # macOS (M4 runner) has python3 but not bare `pip` / `python` on PATH.
+          python3 -m pip install pytest httpx --quiet
+          python3 -m pytest src/tests/unit/test_v2232_open_redirect_cscan_01d.py \
             -v --tb=short 2>&1 | tee cscan01d-results.txt
           pytest_exit="${PIPESTATUS[0]}"
           # Fail if any test was skipped — a skip means Node is still missing
