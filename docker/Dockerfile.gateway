@@ -1,5 +1,5 @@
 # Yashigani Gateway — multi-stage build
-# Python 3.12, non-root UID 1001, minimal attack surface
+# Python 3.14, non-root UID 1001, minimal attack surface
 #
 # v2.23.3: fasttext-wheel (last upload 2020-09-03, archived 2024-03-22,
 #         Python ≤3.12 ABI pin) replaced with scikit-learn.
@@ -12,8 +12,8 @@
 #   runtime  — minimal image with wheel + baked model
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
-# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS builder
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS builder
 
 WORKDIR /build
 
@@ -27,11 +27,12 @@ RUN python -m build --wheel --outdir /dist
 
 
 # ── Stage 2: model trainer ───────────────────────────────────────────────────
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
 # Trains the sklearn sensitivity classifier (TF-IDF + LogisticRegression) from
 # the committed training corpus. Model is baked into the runtime image.
 # scikit-learn ships pre-built wheels for Python 3.12/3.13/3.14 — no C compiler.
 # Quality bar: macro F1 >= 0.90 (measured 0.9545 on 220-example corpus).
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS trainer
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS trainer
 
 WORKDIR /train
 
@@ -53,8 +54,8 @@ RUN mkdir -p data && \
 
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────────
-# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS runtime
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS runtime
 
 # Non-root user
 RUN groupadd --gid 1001 yashigani \
@@ -98,7 +99,7 @@ EXPOSE 8080
 # Image-level healthcheck — talks through the mTLS port using the container's
 # own client cert (same material the service presents for inbound mTLS).
 # Pattern A for Python ssl: trust anchor is the public ca_root.crt. Python
-# 3.12/OpenSSL 3.0 strict-chain validation rejects intermediate-only anchors
+# 3.14/OpenSSL 3.0 strict-chain validation rejects intermediate-only anchors
 # (gate #58a evidence, 2026-04-28). Private ca_root.key never enters workload.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import ssl, urllib.request; c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); urllib.request.urlopen('https://localhost:8080/healthz', context=c)"
