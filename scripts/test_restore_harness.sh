@@ -491,17 +491,35 @@ except Exception:
 
       rm -f '${_COMPOSE_IMGS_FILE}'
       echo \"Export complete: \$(ls -1 \"\${_PRELOAD_TMPDIR}\" | wc -l) tarballs\"
+      # Write sentinel so Step B finds the exact dir for THIS run, not an orphaned one.
+      echo \"\${_PRELOAD_TMPDIR}\" > \"/home/${VM_USER}/.preload_active_dir\"
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
 
     # Step B: as root, load all tarballs. Tags are preserved by 'podman image load'
     # when the tarball was saved by name:tag reference (not by ID).
+    # Reads the sentinel file written by Step A to find the exact tarball dir,
+    # avoiding the head-1 glob race that picks orphaned dirs from prior failed runs.
     _vm_sudo "
       set -euo pipefail
-      _TMPDIR=\$(ls -d '/home/${VM_USER}/.preload_imgs_'* 2>/dev/null | head -1 || echo '')
+      _SENTINEL='/home/${VM_USER}/.preload_active_dir'
+      _TMPDIR=''
+      if [[ -f \"\${_SENTINEL}\" ]]; then
+        _TMPDIR=\$(cat \"\${_SENTINEL}\" 2>/dev/null | tr -d '[:space:]')
+        rm -f \"\${_SENTINEL}\" 2>/dev/null || true
+      fi
+      # Fallback: glob (keeps backward compat if sentinel missing), but log a warning
+      if [[ -z \"\${_TMPDIR}\" || ! -d \"\${_TMPDIR}\" ]]; then
+        echo 'WARNING: sentinel missing or invalid — falling back to glob (may pick wrong dir)'
+        _TMPDIR=\$(ls -d '/home/${VM_USER}/.preload_imgs_'* 2>/dev/null | head -1 || echo '')
+      fi
       if [[ -z \"\${_TMPDIR}\" ]]; then
         echo 'WARNING: no pre-load tarball dir found — skipping'
         exit 0
       fi
+      # Cleanup any other orphaned preload dirs (left by prior failed runs)
+      for _d in '/home/${VM_USER}'/.preload_imgs_*; do
+        [[ -d \"\${_d}\" && \"\${_d}\" != \"\${_TMPDIR}\" ]] && rm -rf \"\${_d}\" && echo \"Cleaned orphaned dir: \${_d}\" || true
+      done
 
       echo \"Loading from \${_TMPDIR}...\"
       _loaded=0
