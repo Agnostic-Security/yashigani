@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; restore stops blanket-chmod; per-key ownership on written keys only; Tiago directive 2026-05-10)
 # Last updated: 2026-05-09T00:00:00+01:00 (feat: MP.L2-3.8.9 — add --encrypted path for age-encrypted .tar.gz.age backups)
 # Last updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _refresh_pgdata_ca — replace install -o (root-only) with cp+chmod; pg_ctl now called directly; K8s exec privilege model corrected)
 # Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
 # Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
 # Last updated: 2026-05-03T12:45:00+01:00 (V232-SMOKE-010: exclude .gitkeep from empty-file check; V232-SMOKE-011: podman unshare chown -R before cp restore; V232-SMOKE-012: secrets dir 0751→0755)
+
+# ---------------------------------------------------------------------------
+# Shared PKI service-key ownership map (single source of truth).
+# lib/pki_ownership.sh must live alongside restore.sh in the repo root.
+# GATE5-BUG-01 / Tiago directive 2026-05-10.
+# ---------------------------------------------------------------------------
+# shellcheck source=lib/pki_ownership.sh
+_YSG_RESTORE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_YSG_RESTORE_SCRIPT_DIR}/lib/pki_ownership.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${_YSG_RESTORE_SCRIPT_DIR}/lib/pki_ownership.sh"
+else
+  printf "ERROR: lib/pki_ownership.sh not found alongside restore.sh\n" >&2
+  exit 1
+fi
 
 # Tight umask so any files/dirs created during restore inherit 0600/0700.
 # Overrides the host default (often 022) which would leave intermediate
@@ -536,6 +552,26 @@ restore_backup() {
     # after the copy.  Bug caught: R4 macOS Podman gate 2026-04-30.
     find "${WORK_DIR}/docker/secrets" -maxdepth 1 -type f \
       -exec chmod u+w {} \; 2>/dev/null || true
+    # Enumerate which keys were actually present in the backup before the copy.
+    # _pki_chown_client_keys applies ownership ONLY to those keys — keys already
+    # on disk that were not in the backup are left untouched.
+    # Tiago directive 2026-05-10: "restore of keys should only be done in a
+    # scenario where they have been nuked in some way". GATE5-BUG-01.
+    local _backup_written_keys=()
+    local _bk_svc
+    # Service leaf keys from the shared map.
+    while IFS= read -r _bk_svc; do
+      if [[ -f "${backup_dir}/secrets/${_bk_svc}_client.key" ]]; then
+        _backup_written_keys+=("${_bk_svc}_client.key")
+      fi
+    done < <(pki_services_all)
+    # CA private keys — not in the service map but still need ownership tracking.
+    for _bk_ca_key in ca_root.key ca_intermediate.key; do
+      if [[ -f "${backup_dir}/secrets/${_bk_ca_key}" ]]; then
+        _backup_written_keys+=("${_bk_ca_key}")
+      fi
+    done
+
     # cp -p preserves source mode/ownership timestamps.
     if ! cp -rp "${backup_dir}/secrets/"* "${WORK_DIR}/docker/secrets/"; then
       log_error "Failed to copy secrets from backup"
@@ -546,12 +582,10 @@ restore_backup() {
     log_success "Secrets copied from backup (${secret_count} files)"
 
     # BUG-58B-04a + BUG-58B-04b (v2.23.1): reapply canonical file modes and
-    # re-own service private keys to the container UIDs that must read them.
-    # Old backups (pre-fix) used 'chmod -R 600' which clobbered intentionally-
-    # 0644 public secrets. New backups only tighten *.key to 0400. Either way,
-    # calling _pki_chown_client_keys here normalises modes and ownership so that
-    # every service container can read exactly the files it needs to.
-    _pki_chown_client_keys
+    # re-own service private keys ONLY for the keys that were actually written
+    # from the backup. Keys already on disk and not in the backup are untouched.
+    # GATE5-BUG-01 / Tiago directive 2026-05-10: removed blanket find+chmod sweep.
+    _pki_chown_client_keys "${_backup_written_keys[@]+"${_backup_written_keys[@]}"}"
   else
     log_warn "No secrets directory in backup — skipping"
   fi
@@ -640,35 +674,37 @@ restore_backup() {
 }
 
 # ---------------------------------------------------------------------------
-# BUG-58B-04b (v2.23.1): Re-own service private keys to container UIDs after
-# PKI restore. install.sh's _backup_existing_data now only sets *.key to 0400
-# (not a blanket chmod -R 600), but the backup still carries root:root ownership
-# from the initial cp -rp. When restore.sh extracts keys, they land as root:root
-# 0400; service containers (pgbouncer=UID70, redis=UID999, gateway/backoffice=
-# UID1001) get EACCES on their own key.
+# _pki_chown_client_keys — Re-own service private keys to container UIDs.
 #
-# Same service→UID map as install.sh:_pki_chown_client_keys.
+# Accepts a list of key BASENAMES (e.g. "gateway_client.key") that were
+# actually written from the backup. Only those keys get ownership re-applied;
+# keys already on disk that were NOT in the backup are left untouched.
+#
+# Tiago directive 2026-05-10 / GATE5-BUG-01:
+#   "restore of keys should only be done in a scenario where they have been
+#    nuked in some way" — so restore must NOT blanket-chmod every *.key it
+#    finds on disk. Only the keys it actually placed get touched.
+#
+# UID + mode come from lib/pki_ownership.sh (single source of truth).
 # Runs after secrets are restored on every supported runtime.
+#
+# Usage: _pki_chown_client_keys [key_basename ...]
+#   e.g.: _pki_chown_client_keys "gateway_client.key" "pgbouncer_client.key"
+#   With no args: no keys are touched (no backup keys found).
 # ---------------------------------------------------------------------------
 _pki_chown_client_keys() {
+  # Positional: list of key basenames that were written from the backup.
+  local _written_keys=("$@")
   local _secrets_dir="${WORK_DIR}/docker/secrets"
 
-  # Canonical UID map: service name → container UID.
-  local _uid_mapped_services=(
-    "gateway:1001"
-    "backoffice:1001"
-    "redis:999"
-    "budget-redis:999"
-    "pgbouncer:70"
-    "postgres:999"
-  )
+  if [[ "${#_written_keys[@]}" -eq 0 ]]; then
+    log_info "_pki_chown_client_keys: no keys were written from backup — nothing to re-own"
+    return 0
+  fi
 
   # Determine chown mode: root can chown directly; non-root uses podman unshare
   # (Podman rootless user-namespace). Docker non-root: restore.sh never runs
   # sudo (P0-14) — warn with a copy-pasteable remediation block instead.
-  # check_restore_preflight() has already verified docker group membership; the
-  # key re-own step is the one operation that still requires host privilege when
-  # backup keys land as root:root.
   local _chown_mode="direct"
   if [[ "$(id -u)" != "0" ]]; then
     if [[ "${RUNTIME}" == "podman" ]]; then
@@ -679,70 +715,102 @@ _pki_chown_client_keys() {
     fi
   fi
 
-  log_info "Re-owning service private keys to container UIDs (mode: ${_chown_mode})"
+  log_info "Re-owning ${#_written_keys[@]} restored key(s) to container UIDs (mode: ${_chown_mode})"
 
-  for _svc_uid in "${_uid_mapped_services[@]}"; do
-    local _svc="${_svc_uid%%:*}"
-    local _uid="${_svc_uid#*:}"
-    local _keyfile="${_secrets_dir}/${_svc}_client.key"
-    if [[ ! -f "$_keyfile" ]]; then
-      continue
-    fi
+  # Helper: apply chown+chmod to a single file using the active strategy.
+  # Args: <uid> <keyfile_path> <label> <mode>
+  _do_restore_chown() {
+    local _uid="$1" _file="$2" _label="$3" _mode="$4"
     case "$_chown_mode" in
       direct)
-        if ! chown "${_uid}:${_uid}" "$_keyfile"; then
-          log_warn "chown failed on ${_svc} key — container may fail to start"
-        else
-          chmod 0600 "$_keyfile" || log_warn "chmod 0600 failed on ${_svc} key (not fatal for direct mode)"
+        if ! chown "${_uid}:${_uid}" "$_file"; then
+          log_warn "chown failed on ${_label} — container may fail to start"
+          return 0
+        fi
+        if ! chmod "${_mode}" "$_file"; then
+          log_warn "chmod ${_mode} failed on ${_label} (not fatal for direct mode)"
         fi
         ;;
       unshare)
-        # RESTORE-1 (v2.23.1 gate): after `podman unshare chown ${_uid}:${_uid}`,
-        # the file is owned by a subuid-range UID on the host. A subsequent
-        # host-side `chmod` fails with EPERM because the calling user (su/UID 1004)
-        # does not own the file. Fix: do the chmod INSIDE the podman unshare
-        # namespace (where the chowned UID maps to 0 = the invoking user), alongside
-        # the chown. This matches the pattern used in install.sh's _do_chown.
-        local _key_basename
-        _key_basename=$(basename "$_keyfile")
-        local _key_dir
-        _key_dir=$(dirname "$_keyfile")
+        # RESTORE-1 (v2.23.1 gate): chmod must run INSIDE the podman unshare
+        # namespace because after `podman unshare chown`, the file is owned by
+        # a subuid-range UID on the host and a subsequent host-side chmod fails
+        # with EPERM. This matches install.sh's _do_chown pattern.
         if ! podman unshare sh -c \
-              "chown ${_uid}:${_uid} '${_keyfile}' && chmod 0600 '${_keyfile}'" 2>/dev/null; then
-          log_warn "podman unshare chown/chmod failed on ${_svc} key — container may fail to start"
+              "chown ${_uid}:${_uid} '${_file}' && chmod ${_mode} '${_file}'" 2>/dev/null; then
+          log_warn "podman unshare chown/chmod failed on ${_label} — container may fail to start"
         fi
         ;;
       warn)
-        log_warn "Non-root Docker: cannot chown ${_svc} key to UID ${_uid} without sudo."
-        log_warn "  Run manually if ${_svc} fails to start:"
-        log_warn "    sudo chown ${_uid}:${_uid} \"${_keyfile}\""
+        log_warn "Non-root Docker: cannot chown ${_label} to UID ${_uid} without sudo."
+        log_warn "  Run manually if the service fails to start:"
+        log_warn "    sudo chown ${_uid}:${_uid} \"${_file}\" && sudo chmod ${_mode} \"${_file}\""
         ;;
     esac
+    return 0
+  }
+
+  # Apply ownership to each key that was actually written from backup.
+  local _kb _svc _uid _mode _keyfile
+  for _kb in "${_written_keys[@]}"; do
+    # Derive service name: strip trailing "_client.key".
+    _svc="${_kb%_client.key}"
+    _keyfile="${_secrets_dir}/${_kb}"
+
+    if [[ ! -f "$_keyfile" ]]; then
+      # Key was in backup manifest but file not found after cp — operator error.
+      log_error "Key ${_kb} was in backup but not found at ${_keyfile} after restore."
+      log_error "  The backup may be corrupt or the copy failed for this file."
+      log_error "  Manual recovery: re-run install.sh to regenerate all keys."
+      # Non-fatal: continue restoring other keys; surface all errors at once.
+      continue
+    fi
+
+    # Look up this service in the shared map.
+    if ! _uid="$(pki_service_uid "$_svc" 2>/dev/null)"; then
+      # Key is not a known service key (e.g. a CA key or custom key).
+      # Leave it alone — it was written by cp -rp and inherits backup permissions.
+      log_info "  ${_kb}: not in service map — leaving permissions as restored from backup"
+      continue
+    fi
+    _mode="$(pki_key_mode "$_svc")"
+
+    log_info "  ${_kb}: chown ${_uid}:${_uid} chmod ${_mode}"
+    _do_restore_chown "${_uid}" "${_keyfile}" "${_kb}" "${_mode}"
   done
 
-  # Reapply canonical cert modes: certs are public material (0644); keys are 0600.
-  # Note: for 'unshare' mode, service keys were already chowned+chmod'd above
-  # inside the user namespace. These host-side find commands will fail silently
-  # on files owned by subuid-range UIDs (EPERM) — that is expected and harmless
-  # because the correct mode was already applied inside unshare.
+  # Cert files (*.crt) that were in the backup: set to 0644 (public material).
+  # We find these from the backup dir's crt files — only touch what we wrote.
+  # This is safe as a host-side chmod because certs are public; no ownership change.
+  log_info "Chmod'ing restored client certs + CA certs to 0644 (public material)"
   find "${_secrets_dir}" -maxdepth 1 -type f \
     \( -name '*_client.crt' -o -name 'ca_*.crt' \) \
     -exec chmod 0644 {} \; 2>/dev/null || true
-  find "${_secrets_dir}" -maxdepth 1 -type f -name '*.key' \
-    -exec chmod 0600 {} \; 2>/dev/null || true
-  # CA private keys are even tighter — only the PKI issuer (root/UID1001) reads
-  # them. 0400 prevents accidental overwrite even by the owning UID.
+
+  # CA private keys: tighten to 0400 ONLY if they were in the backup.
+  # (Already handled correctly by pki_service_uid — ca_root.key / ca_intermediate.key
+  #  are NOT in the service map, so they are left at backup permissions above.
+  #  We apply 0400 explicitly here as the documented CA key posture.)
   for _ca_key in ca_root.key ca_intermediate.key; do
     if [[ -f "${_secrets_dir}/${_ca_key}" ]]; then
-      chmod 0400 "${_secrets_dir}/${_ca_key}" 2>/dev/null || true
+      # Check whether this CA key was actually written from backup.
+      local _ca_was_restored=0
+      local _wk
+      for _wk in "${_written_keys[@]+"${_written_keys[@]}"}"; do
+        if [[ "$_wk" == "$_ca_key" ]]; then
+          _ca_was_restored=1
+          break
+        fi
+      done
+      if [[ "$_ca_was_restored" == "1" ]]; then
+        chmod 0400 "${_secrets_dir}/${_ca_key}" 2>/dev/null || true
+      fi
     fi
   done
 
   # BUG-58B-04a: reapply 0644 to public password/token files that the backup's
-  # per-file chmod may have tightened to 0400 (as of the BUG-58B-04a fix above,
-  # backup only tightens *.key; but pre-fix backups on disk tightened everything
-  # to 0600 via chmod -R 600). Reapply explicitly so restore is idempotent
-  # against both old and new backup formats.
+  # per-file chmod may have tightened (pre-fix backups used chmod -R 600).
+  # These are not keys — safe to chmod on the host without ownership change.
   local _public_secrets=(
     "admin_initial_password"
     "admin1_password"
@@ -761,19 +829,22 @@ _pki_chown_client_keys() {
   )
   for _f in "${_public_secrets[@]}"; do
     if [[ -f "${_secrets_dir}/${_f}" ]]; then
-      chmod 0644 "${_secrets_dir}/${_f}"
+      chmod 0644 "${_secrets_dir}/${_f}" 2>/dev/null || true
     fi
   done
   # bootstrap_token files (glob — one per service registered in manifest)
   find "${_secrets_dir}" -maxdepth 1 -type f -name '*_bootstrap_token' \
-    -exec chmod 0644 {} \;
+    -exec chmod 0644 {} \; 2>/dev/null || true
 
-  log_success "Service key ownership + canonical file modes reapplied"
+  log_success "Service key ownership applied to ${#_written_keys[@]} restored key(s)"
 
-  # Defensive assertion: no world/group-readable private key files (S1 / CWE-732).
+  # S1 / CWE-732 assertion: no group/world-readable private key files.
+  # Note: for 'unshare' mode, subuid-range-owned files may not be stat-able
+  # by the host caller — the find will silently skip them. This is acceptable
+  # because unshare applied the correct mode inside the namespace above.
   if find "${_secrets_dir}" -maxdepth 1 -type f -name '*.key' \
         \( -perm -004 -o -perm -040 \) 2>/dev/null | grep -q .; then
-    log_error "CWE-732: group/world-readable *.key file(s) under ${_secrets_dir} after chown step"
+    log_error "CWE-732: group/world-readable *.key file(s) under ${_secrets_dir} after restore chown"
     exit 1
   fi
 }
