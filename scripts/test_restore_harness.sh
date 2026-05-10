@@ -357,63 +357,112 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
     _PRELOAD_VERSION="$(_vm_sudo "grep -m1 '^YASHIGANI_VERSION=' '${VM_CLONE_DIR}/install.sh' 2>/dev/null | cut -d'\"' -f2 || echo '2.23.2'" 2>/dev/null || echo "2.23.2")"
     _info "Detected YASHIGANI_VERSION=${_PRELOAD_VERSION} for pre-load"
 
-    # Step A: export images from su user-space store to temp tarballs
+    # Step A: tag all images from su's store using compose file references, then
+    # save by full name:tag. When loaded into root's store, podman image load
+    # preserves the name:tag, making 'podman image exists <compose-ref>' succeed.
+    #
+    # The compose file is in VM_CLONE_DIR (/root/...) so we read it via _vm_sudo
+    # and write the image list to a file su can read.
+    _COMPOSE_IMGS_FILE="/home/${VM_USER}/.preload_compose_imgs_$$"
+    _vm_sudo "
+      grep '^\s*image:' '${VM_CLONE_DIR}/docker/docker-compose.yml' 2>/dev/null \
+        | sed 's/.*image:[[:space:]]*//' | sed 's/[[:space:]]*//' | sort -u \
+        > '${_COMPOSE_IMGS_FILE}' 2>/dev/null
+      chown '${VM_USER}:${VM_USER}' '${_COMPOSE_IMGS_FILE}' 2>/dev/null || true
+      chmod 644 '${_COMPOSE_IMGS_FILE}' 2>/dev/null || true
+      echo \"Compose images written: \$(wc -l < '${_COMPOSE_IMGS_FILE}')\"
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+
     _vm_ssh "
       set -euo pipefail
       _PRELOAD_TMPDIR=\"/home/${VM_USER}/.preload_imgs_\${$}\"
       mkdir -p \"\${_PRELOAD_TMPDIR}\"
       chmod 700 \"\${_PRELOAD_TMPDIR}\"
 
-      # yashigani/gateway + yashigani/backoffice
-      for img in yashigani/gateway yashigani/backoffice; do
-        imgname=\"\${img//\//___}\"
-        for tag in '${_PRELOAD_VERSION}' latest; do
-          if podman image inspect \"localhost/\${img}:\${tag}\" >/dev/null 2>&1 || \
-             podman image inspect \"\${img}:\${tag}\" >/dev/null 2>&1; then
-            echo \"Saving \${img}:\${tag} to tarball...\"
-            podman image save \"\${img}:\${tag}\" -o \"\${_PRELOAD_TMPDIR}/\${imgname}.tar\" 2>/dev/null && \
-              echo \"saved:\${imgname}.tar\" || true
-            break
-          fi
-        done
+      # For each compose image reference, find it in the local store by digest
+      # and save it tagged with the full reference (name:tag, omitting @sha256 suffix
+      # because 'podman image save' does not support digest in the output name).
+      # On load, podman will create the image with the name:tag preserved.
+      while IFS= read -r _ref; do
+        [[ -z \"\${_ref}\" ]] && continue
+        # Extract name:tag (strip @sha256:... suffix) for tagging and saving
+        _name_tag=\"\${_ref%%@*}\"
+        # Extract digest for local lookup
+        _digest=\"\${_ref##*@}\"
+        # Try to find this image locally by checking if it matches any known digest.
+        # 'podman image exists' with digest ref works if the image has that digest
+        # recorded. For images pulled with a digest ref, RepoDigests may be set.
+        # Try: inspect by full ref (sometimes works), else find by iterating.
+        if podman image exists \"\${_ref}\" 2>/dev/null; then
+          _img_ref=\"\${_ref}\"
+        elif podman image exists \"\${_name_tag}\" 2>/dev/null; then
+          _img_ref=\"\${_name_tag}\"
+        else
+          # Dig through all images looking for a digest match
+          _img_ref=''
+          while IFS=' ' read -r _id _repo _rtag; do
+            _img_digests=\$(podman image inspect \"\${_id}\" 2>/dev/null \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(x) for x in d[0].get(\"RepoDigests\",[])]' 2>/dev/null || true)
+            if echo \"\${_img_digests}\" | grep -qF \"\${_digest}\"; then
+              _img_ref=\"\${_id}\"
+              break
+            fi
+          done < <(podman image list --format '{{.ID}} {{.Repository}} {{.Tag}}' 2>/dev/null)
+        fi
+        if [[ -z \"\${_img_ref}\" ]]; then
+          echo \"WARNING: cannot find local image for \${_ref} — skipping\"
+          continue
+        fi
+        # Tag with the name:tag form so save preserves the reference
+        podman tag \"\${_img_ref}\" \"\${_name_tag}\" 2>/dev/null || true
+        _safe_name=\"\$(printf '%s' \"\${_name_tag}\" | tr -c 'a-zA-Z0-9.' '_')\"
+        _tarball=\"\${_PRELOAD_TMPDIR}/img_\${_safe_name}.tar\"
+        if [[ ! -f \"\${_tarball}\" ]]; then
+          echo \"Saving \${_name_tag} ...\"
+          podman image save \"\${_name_tag}\" -o \"\${_tarball}\" 2>/dev/null && \
+            echo \"  saved: \${_safe_name}.tar\" || \
+            { echo \"  WARNING: save failed for \${_name_tag}\"; rm -f \"\${_tarball}\"; }
+        fi
+      done < '${_COMPOSE_IMGS_FILE}'
+
+      # Also save yashigani/gateway + yashigani/backoffice (built locally, not in compose pull list)
+      for img in 'localhost/yashigani/gateway:latest' 'localhost/yashigani/backoffice:latest'; do
+        if podman image exists \"\${img}\" 2>/dev/null; then
+          _safe=\$(printf '%s' \"\${img}\" | tr -c 'a-zA-Z0-9.' '_')
+          echo \"Saving \${img} ...\"
+          podman image save \"\${img}\" -o \"\${_PRELOAD_TMPDIR}/img_\${_safe}.tar\" 2>/dev/null && \
+            echo \"  saved\" || echo \"  WARNING: save failed for \${img}\"
+        fi
       done
 
-      # python base image — may be untagged (stored by digest only after build).
-      # 'podman image inspect docker.io/library/python' fails for untagged images.
-      # Instead, find the image ID by filtering the image list by repository name,
-      # then save by ID. This works regardless of whether the image has a tag.
-      _PYTHON_ID=\$(podman image list --format '{{.ID}} {{.Repository}}' 2>/dev/null \
-        | awk '/library\/python/ || /^[^ ]+ python$/ { print \$1; exit }' || echo '')
-      if [[ -n \"\${_PYTHON_ID}\" ]]; then
-        echo \"Saving python base image (ID=\${_PYTHON_ID}) to tarball...\"
-        podman image save \"\${_PYTHON_ID}\" -o \"\${_PRELOAD_TMPDIR}/python_base.tar\" 2>/dev/null && \
-          echo \"saved:python_base.tar\" || true
-      else
-        echo 'WARNING: python base image not found in user store — will pull from registry'
-      fi
-
+      rm -f '${_COMPOSE_IMGS_FILE}'
       echo \"Export complete: \$(ls -1 \"\${_PRELOAD_TMPDIR}\" | wc -l) tarballs\"
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
 
-    # Step B: as root, load each tarball into root podman store
-    _PRELOAD_TMPDIR="/home/${VM_USER}/.preload_imgs_"  # prefix — root globs for it
+    # Step B: as root, load all tarballs. Tags are preserved by 'podman image load'
+    # when the tarball was saved by name:tag reference (not by ID).
     _vm_sudo "
       set -euo pipefail
-      # Find the temp dir su just created (contains only one matching dir)
       _TMPDIR=\$(ls -d '/home/${VM_USER}/.preload_imgs_'* 2>/dev/null | head -1 || echo '')
       if [[ -z \"\${_TMPDIR}\" ]]; then
         echo 'WARNING: no pre-load tarball dir found — skipping'
         exit 0
       fi
+
       echo \"Loading from \${_TMPDIR}...\"
-      for tar_file in \"\${_TMPDIR}\"/*.tar; do
+      _loaded=0
+      for tar_file in \"\${_TMPDIR}\"/img_*.tar; do
         [[ -f \"\${tar_file}\" ]] || continue
-        echo \"Loading \${tar_file} into root podman store...\"
         podman image load -i \"\${tar_file}\" 2>&1 | tail -1 || true
+        _loaded=\$((_loaded+1))
       done
-      # Cleanup tarballs (they can be large — gateway+backoffice ~500 MB each)
+      echo \"Loaded \${_loaded} image tarballs\"
+
+      # Cleanup tarballs (total can be 3-5 GB for a full yashigani image set)
       rm -rf \"\${_TMPDIR}\"
+
       echo 'Pre-load complete'
+      echo \"Root store image count: \$(podman image list 2>/dev/null | tail -n +2 | wc -l)\"
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
   fi
 
@@ -423,7 +472,7 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
   _section "Phase 3: install.sh"
   _ev_section "install.sh"
   _ev "install.sh --non-interactive --deploy demo --domain localhost --tls-mode selfsigned"
-  _ev "           --admin-email ${INSTALL_ADMIN_EMAIL} --runtime ${RUNTIME}"
+  _ev "           --admin-email ${INSTALL_ADMIN_EMAIL} --runtime ${RUNTIME}${_SKIP_PULL_FLAG:+ ${_SKIP_PULL_FLAG}}"
   _ev ""
 
   INSTALL_LOG="${EVIDENCE_DIR}/install-${TIMESTAMP}.log"
@@ -461,6 +510,14 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
   fi
 
   _info "Running install.sh (timeout: ${TIMEOUT}s)..."
+  # Rootful: pass --skip-pull so compose_pull() returns early and does NOT call
+  # 'compose build gateway backoffice'. The build step pulls the python base image
+  # (docker.io/library/python@sha256:...) which fails on Docker Hub's 100-req/6h
+  # anonymous rate limit. With --skip-pull, install.sh uses the pre-loaded images
+  # from root's podman store (populated by the pre-load block above).
+  # Rootless: no rate-limit issue (su user pulls once; reused in subsequent runs).
+  _SKIP_PULL_FLAG=""
+  [[ "${ROOTFUL}" == "true" ]] && _SKIP_PULL_FLAG="--skip-pull"
   INSTALL_CMD="export HISTFILE=/dev/null; export YSG_RUNTIME=${RUNTIME}; \
     cd ${VM_CLONE_DIR} && \
     timeout ${TIMEOUT} bash install.sh \
@@ -469,7 +526,7 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
       --domain ${INSTALL_DOMAIN} \
       --tls-mode selfsigned \
       --admin-email ${INSTALL_ADMIN_EMAIL} \
-      --runtime ${RUNTIME} 2>&1; \
+      --runtime ${RUNTIME} ${_SKIP_PULL_FLAG} 2>&1; \
     echo \$? > ${VM_EXITCODE_FILE}"
 
   if [[ "${ROOTFUL}" == "true" ]]; then
