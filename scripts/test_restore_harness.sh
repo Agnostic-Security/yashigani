@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T15:10:00+01:00
+# Last-Updated: 2026-05-10T15:45:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -561,14 +561,16 @@ VM_CORRUPT_FILE="${VM_BACKUPS_DIR}/test_corrupt_$(date +%s).tar.gz.age"
 
 NEGATIVE_EXIT=0
 if [[ -n "${BACKUP_FILE}" && -n "${VM_IDENTITY_FILE}" ]]; then
-  # Corrupt the backup: overwrite the age header magic bytes (offset 0) with random
-  # bytes. The age format starts with "age-encryption.org/v1\n" at byte 0; corrupting
-  # from offset 0 ensures age decryption fails deterministically regardless of payload
-  # size. Corrupting at offset 100 (previous approach) fell inside the age header on
-  # small files but the header parser may still succeed if only payload bytes differ.
+  # Create a corrupt backup: write pure random bytes of the same size as the real
+  # backup. This is NOT a copy of the real backup with some bytes replaced — it is
+  # entirely random data with no age header at all. age --decrypt on a random byte
+  # stream will fail at the magic bytes ("age-encryption.org/v1") guarantee.
+  # Previous approaches (seek=100 or seek=0 with conv=notrunc) still copied the
+  # real age file and relied on header byte corruption — age 1.1.1 proved tolerant
+  # of partial header corruption on small files. A fully-fabricated file is definitive.
   _vm_run "
-    cp '${BACKUP_FILE}' '${VM_CORRUPT_FILE}'
-    dd if=/dev/urandom of='${VM_CORRUPT_FILE}' bs=1 count=32 seek=0 conv=notrunc 2>/dev/null
+    _real_size=\$(stat -c '%s' '${BACKUP_FILE}' 2>/dev/null || stat -f '%z' '${BACKUP_FILE}' 2>/dev/null || echo 81920)
+    dd if=/dev/urandom of='${VM_CORRUPT_FILE}' bs=1 count=\${_real_size} 2>/dev/null
   " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
 
   NEGATIVE_OUTPUT="$(
@@ -728,13 +730,27 @@ else
     fi
 
     if [[ "${RESTORE_EXIT}" == "0" ]]; then
-      # Restart the stack after restore
+      # Restart the stack after restore.
+      # For Podman rootless: use podman-compose (Python package) directly.
+      # 'podman compose' on some VM configurations delegates to the docker-compose
+      # binary (/usr/libexec/docker/cli-plugins/docker-compose) which rejects
+      # Podman-managed networks ("incorrect label com.docker.compose.network").
+      # podman-compose (Python) creates and manages the same network labels it
+      # creates and therefore handles restarts cleanly.
+      # For Docker: use 'docker compose' (compose plugin).
       _ev ""
       _ev "=== Restarting stack post-restore ==="
-      _vm_run "
-        cd '${VM_CLONE_DIR}' && \
-        ${RUNTIME} compose -f docker/docker-compose.yml up -d 2>&1 || true
-      " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+      if [[ "${RUNTIME}" == "podman" ]]; then
+        _vm_run "
+          cd '${VM_CLONE_DIR}' && \
+          podman-compose -f docker/docker-compose.yml up -d 2>&1 || true
+        " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+      else
+        _vm_run "
+          cd '${VM_CLONE_DIR}' && \
+          docker compose -f docker/docker-compose.yml up -d 2>&1 || true
+        " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+      fi
 
       # Wait for services to come up
       _info "Waiting 30s for services to restart post-restore..."
