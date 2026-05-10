@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T14:30:00+01:00
+# Last-Updated: 2026-05-10T15:10:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -561,10 +561,14 @@ VM_CORRUPT_FILE="${VM_BACKUPS_DIR}/test_corrupt_$(date +%s).tar.gz.age"
 
 NEGATIVE_EXIT=0
 if [[ -n "${BACKUP_FILE}" && -n "${VM_IDENTITY_FILE}" ]]; then
-  # Corrupt the backup: inject random bytes at offset 100
+  # Corrupt the backup: overwrite the age header magic bytes (offset 0) with random
+  # bytes. The age format starts with "age-encryption.org/v1\n" at byte 0; corrupting
+  # from offset 0 ensures age decryption fails deterministically regardless of payload
+  # size. Corrupting at offset 100 (previous approach) fell inside the age header on
+  # small files but the header parser may still succeed if only payload bytes differ.
   _vm_run "
     cp '${BACKUP_FILE}' '${VM_CORRUPT_FILE}'
-    dd if=/dev/urandom of='${VM_CORRUPT_FILE}' bs=1 count=128 seek=100 conv=notrunc 2>/dev/null
+    dd if=/dev/urandom of='${VM_CORRUPT_FILE}' bs=1 count=32 seek=0 conv=notrunc 2>/dev/null
   " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
 
   NEGATIVE_OUTPUT="$(
@@ -586,6 +590,26 @@ if [[ -n "${BACKUP_FILE}" && -n "${VM_IDENTITY_FILE}" ]]; then
     _record_fail "Negative test FAIL — corrupt backup was NOT rejected (exit 0)"
     _ev "Negative test: FAIL — corrupt backup accepted (should have failed)"
   fi
+
+  # Reset secrets dir ownership after negative test — the negative test's restore.sh
+  # may have partially modified secrets dir ownership (e.g. podman unshare chown).
+  # A full reset here ensures Phase 7 starts from a clean state regardless of
+  # whether the negative test passed or failed.
+  _ev "Resetting secrets dir ownership post-negative-test..."
+  if [[ "${RUNTIME}" == "docker" ]]; then
+    _vm_sudo "
+      chown -R '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
+      chown '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  else
+    # Podman rootless: use podman unshare to chown back to host UID 0
+    # (which maps to the su user inside the user namespace, i.e. owned by su on host).
+    _vm_ssh "
+      podman unshare chown -R 0:0 '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
+      podman unshare chown 0:0 '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  fi
+  _ev "Post-negative-test secrets dir reset complete"
 else
   _ev "Negative test: SKIPPED — backup file or identity not found"
   _warn "Negative test skipped — backup file or identity file missing"
