@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T18:10:00+01:00
+# Last-Updated: 2026-05-10T18:30:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -600,25 +600,26 @@ if [[ -n "${BACKUP_FILE}" && -n "${VM_IDENTITY_FILE}" ]]; then
     _ev "Negative test: FAIL — corrupt backup accepted (should have failed)"
   fi
 
-  # Reset secrets dir ownership after negative test — the negative test's restore.sh
-  # may have partially modified secrets dir ownership (e.g. podman unshare chown).
-  # A full reset here ensures Phase 7 starts from a clean state regardless of
-  # whether the negative test passed or failed.
-  _ev "Resetting secrets dir ownership post-negative-test..."
-  if [[ "${RUNTIME}" == "docker" ]]; then
-    _vm_sudo "
-      chown -R '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
-      chown '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
-    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
-  else
-    # Podman rootless: use podman unshare to chown back to host UID 0
-    # (which maps to the su user inside the user namespace, i.e. owned by su on host).
-    _vm_ssh "
-      podman unshare chown -R 0:0 '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
-      podman unshare chown 0:0 '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
-    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
-  fi
-  _ev "Post-negative-test secrets dir reset complete"
+  # POST-NEGATIVE-TEST OWNERSHIP RESET — INTENTIONALLY OMITTED.
+  #
+  # The negative test's restore.sh fails at age --decrypt on the corrupt backup.
+  # The failure path (restore.sh line 1568-1573) removes the temp extract dir and
+  # exits 1 WITHOUT touching docker/secrets/ or calling restore_backup(). No
+  # ownership changes occur; a reset is unnecessary.
+  #
+  # Critically, a blanket 'podman unshare chown -R 0:0 docker/secrets' here is
+  # HARMFUL: it resets all container-owned keys (e.g. backoffice_client.key,
+  # gateway_client.key owned by sub-UIDs) to su ownership. Running containers
+  # lose access to their key files, crash, and are down when the real restore
+  # runs (Phase 7). This caused a chain failure: Postgres down → _restore_pg_role_password
+  # psql fails → restore.sh exits 1 → harness RED.
+  #
+  # The real restore (Phase 7) calls restore_backup() which runs
+  # 'podman unshare chown -R 0:0 docker/secrets' itself (line 526) as part of
+  # its own pre-copy reset, followed immediately by _pki_chown_client_keys to
+  # reapply canonical sub-UID ownership. That ordering is safe because restore.sh
+  # does both steps atomically before containers re-read the files.
+  _ev "Post-negative-test: no ownership reset needed (restore.sh exits before touching secrets)"
 else
   _ev "Negative test: SKIPPED — backup file or identity not found"
   _warn "Negative test skipped — backup file or identity file missing"
