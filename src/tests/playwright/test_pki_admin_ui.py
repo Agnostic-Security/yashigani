@@ -25,12 +25,24 @@ from __future__ import annotations
 
 import pytest
 
+import time as _time
+
 from tests.playwright.conftest import (
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
     get_admin_credentials,
+    playwright_login_admin,
+    _api_get_session_cookies,
+    _api_totp_last_used,
 )
+
+# Pessimistically assume a TOTP code was used just before this module loaded
+# (e.g. from a prior pytest invocation or diagnostic subprocess in the same
+# 60s replay-cache window). This forces _api_get_session_cookies() to wait
+# for a fresh window on the first call, preventing TOTP replay 401.
+if 1 not in _api_totp_last_used:
+    _api_totp_last_used[1] = _time.time()
 
 pytestmark = pytest.mark.skipif(
     not STACK_RUNNING,
@@ -58,20 +70,49 @@ _ADMIN_DASHBOARD = f"{BASE_URL}/admin/"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _login(page, username: str, password: str) -> None:
-    """Complete the admin login flow (username + password; TOTP via UI if enrolled)."""
-    page.goto(f"{BASE_URL}/admin/login")
-    page.fill("#username", username)
-    page.fill("#password", password)
-    page.click("[data-action='login'], button[type='submit']")
-    page.wait_for_timeout(1500)
+def _login(page, username: str = "", password: str = "") -> None:
+    """Inject a valid admin1 session cookie into the page's browser context.
+
+    Uses _api_get_session_cookies to obtain session cookies via the API (TOTP
+    handled, result cached) and injects them via add_cookies. Then navigates to
+    /admin/ to activate the session.
+
+    The username/password args are kept for API compatibility but are ignored.
+    Fix: v2.23.3 — original helper didn't supply TOTP, causing silent auth failure.
+    """
+    cookies = _api_get_session_cookies(admin=1)
+    ctx = page.context
+    for name, value in cookies.items():
+        # __Host- cookies require Secure=True, Path=/ and no explicit Domain.
+        # Playwright requires either 'url' OR ('domain'+'path'). We use 'url'
+        # so that Playwright infers domain+secure from the BASE_URL.
+        # Do NOT include 'path' when 'url' is specified (mutually exclusive).
+        ctx.add_cookies([{
+            "name": name, "value": value,
+            "url": BASE_URL,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Strict",
+        }])
+    page.goto(f"{BASE_URL}/admin/")
+    page.wait_for_timeout(2000)
 
 
 def _navigate_to_pki(page) -> None:
-    """Click the PKI nav button and wait for panel to load."""
+    """Click the PKI nav button and wait for panel to load with service rows.
+
+    The PKI panel fires an async loadPkiStatus() which fetches /api/v1/admin/pki/status.
+    We wait for either a View button (success) or an error paragraph to appear
+    in the container, with a generous timeout to allow the API round-trip.
+    """
     page.click("button[data-param='pki']")
     page.wait_for_selector("#pki-status-container", timeout=8000)
-    page.wait_for_timeout(1500)
+    # Wait for the async API response to render: either buttons or error text
+    page.wait_for_selector(
+        "#pki-status-container button, #pki-status-container p",
+        timeout=12000,
+    )
+    page.wait_for_timeout(500)
 
 
 # ---------------------------------------------------------------------------
