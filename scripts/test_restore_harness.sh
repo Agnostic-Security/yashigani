@@ -293,13 +293,35 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
   _section "Phase 1: Wipe previous state"
   _ev_section "Wipe"
 
-  _vm_run "
-    if [[ -f '${VM_CLONE_DIR}/uninstall.sh' ]]; then
-      cd '${VM_CLONE_DIR}' && YSG_RUNTIME=${RUNTIME} bash uninstall.sh --remove-volumes --yes 2>&1 || true
-    fi
-    ${RUNTIME} system prune -f 2>/dev/null || true
-    ${RUNTIME} volume prune -f 2>/dev/null || true
-  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  # Rootful: must stop BOTH su's containers (which hold ports 80/443) AND
+  # root's containers. 'sudo podman system prune' only affects root's store.
+  # If su's containers are running from a previous install, ports 80/443 stay
+  # bound and install.sh preflight fails with "Port 80/443 IN USE".
+  if [[ "${ROOTFUL}" == "true" ]]; then
+    # Step 1: stop su's containers via podman (as su user, no sudo needed)
+    _vm_ssh "
+      if [[ -f '${VM_CLONE_DIR}/uninstall.sh' ]]; then
+        cd '${VM_CLONE_DIR}' && YSG_RUNTIME=podman bash uninstall.sh --remove-volumes --yes 2>&1 || true
+      fi
+      podman stop -a 2>/dev/null || true
+      podman system prune -f 2>/dev/null || true
+      podman volume prune -f 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+    # Step 2: prune root's containers/images
+    _vm_sudo "
+      podman stop -a 2>/dev/null || true
+      podman system prune -f 2>/dev/null || true
+      podman volume prune -f 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  else
+    _vm_run "
+      if [[ -f '${VM_CLONE_DIR}/uninstall.sh' ]]; then
+        cd '${VM_CLONE_DIR}' && YSG_RUNTIME=${RUNTIME} bash uninstall.sh --remove-volumes --yes 2>&1 || true
+      fi
+      ${RUNTIME} system prune -f 2>/dev/null || true
+      ${RUNTIME} volume prune -f 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  fi
 
   # Remove clone dir
   if [[ "${ROOTFUL}" == "true" ]]; then
@@ -1142,13 +1164,26 @@ _vm_ssh "rm -f '/home/${VM_USER}/release_gate_probe_restore_${TIMESTAMP}.sh'" 2>
 # ---------------------------------------------------------------------------
 if [[ "${KEEP_INSTALL}" != "true" ]]; then
   _section "Phase 10: Teardown"
-  _vm_run "
-    if [[ -f '${VM_CLONE_DIR}/uninstall.sh' ]]; then
-      cd '${VM_CLONE_DIR}' && YSG_RUNTIME=${RUNTIME} bash uninstall.sh --remove-volumes --yes 2>&1 || true
-    fi
-    ${RUNTIME} system prune -f 2>/dev/null || true
-    ${RUNTIME} volume prune -f 2>/dev/null || true
-  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  if [[ "${ROOTFUL}" == "true" ]]; then
+    _vm_ssh "
+      podman stop -a 2>/dev/null || true
+      podman system prune -f 2>/dev/null || true
+      podman volume prune -f 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+    _vm_sudo "
+      podman stop -a 2>/dev/null || true
+      podman system prune -f 2>/dev/null || true
+      podman volume prune -f 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  else
+    _vm_run "
+      if [[ -f '${VM_CLONE_DIR}/uninstall.sh' ]]; then
+        cd '${VM_CLONE_DIR}' && YSG_RUNTIME=${RUNTIME} bash uninstall.sh --remove-volumes --yes 2>&1 || true
+      fi
+      ${RUNTIME} system prune -f 2>/dev/null || true
+      ${RUNTIME} volume prune -f 2>/dev/null || true
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  fi
 
   if [[ "${ROOTFUL}" == "true" ]]; then
     _vm_sudo "rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
