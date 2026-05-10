@@ -19,7 +19,7 @@
 #
 # Runner registration: launchd service
 #   actions.runner.agnosticsec-com-yashigani.max-m4-yashigani
-#   located at /Users/max/Documents/Claude/actions-runner-yashigani
+#   located at /Users/Shared/actions-runner-yashigani
 #   labels: self-hosted, macos, arm64, m-chip
 #
 # Resource impact when CI fires: ~2 CPU + 4 GB RAM for ~10 min per cell.
