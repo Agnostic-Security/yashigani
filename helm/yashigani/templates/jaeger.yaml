@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-05T20:30:00+01:00 */ -}}
+{{- /* Last updated: 2026-05-09T10:00:00+01:00 */ -}}
 {{- /* EX-231-09 fix (v2.23.2): Jaeger OTLP gRPC collector port mTLS-enabled. */ -}}
 {{- /* v2.23.2 Phase 3b: Jaeger v2 migration. Image renamed all-in-one→jaeger; env-var */ -}}
 {{- /* TLS config replaced by YAML config file (yashigani-jaeger-config ConfigMap). */ -}}
@@ -66,8 +66,11 @@ spec:
           args:
             - "--config=/etc/jaeger/jaeger.yml"
           readinessProbe:
+            # B-K8S-5: Jaeger v2 (otelcol-based healthcheckv2 extension) serves
+            # health at /health/status, not /. Using / returns 404 on port 13133
+            # and causes CrashLoopBackOff.
             httpGet:
-              path: /
+              path: /health/status
               port: 13133
             initialDelaySeconds: 5
             periodSeconds: 15
@@ -75,7 +78,7 @@ spec:
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /
+              path: /health/status
               port: 13133
             initialDelaySeconds: 10
             periodSeconds: 15

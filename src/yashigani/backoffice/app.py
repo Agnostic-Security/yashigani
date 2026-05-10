@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -621,6 +621,24 @@ def create_backoffice_app() -> FastAPI:
 
         @app.get("/admin/", include_in_schema=False)
         async def admin_dashboard_page(request: Request):
+            # Server-side session-presence check before serving the dashboard HTML.
+            # ASVS V1.4.1: access control enforced at trusted enforcement point.
+            # A missing cookie means no valid session → redirect to login.
+            # Note: cryptographic validation of the session token happens in the
+            # API layer (SessionStore.get()) on every subsequent API call; this
+            # check is a lightweight pre-flight to avoid serving the SPA shell to
+            # unauthenticated clients (closes SWEEP-06 / OWASP A07 finding).
+            # Fix: 2026-05-09 (v2.23.3).
+            _admin_cookies = (
+                "__Host-yashigani_admin_session",
+                "__Host-yashigani_session",
+            )
+            if not any(request.cookies.get(k) for k in _admin_cookies):
+                next_path = request.url.path
+                return RedirectResponse(
+                    url=f"/admin/login?next={next_path}",
+                    status_code=302,
+                )
             return _templates.TemplateResponse(request, "dashboard.html")
 
     # Routers

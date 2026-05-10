@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # last-updated: 2026-05-10T13:00:00+01:00 (fix: BUG-AG-001 --pull never for air-gap compose up; BUG-AG-005 bump YASHIGANI_VERSION to 2.23.3)
+# last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; upgrade no-rotation path stops touching keys; Tiago directive 2026-05-10)
 # last-updated: 2026-05-09T15:00:00+01:00 (fix: Docker non-root — compose_up data/audit mkdir uses ephemeral container when data_dir owned by UID 1001)
 # last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
 # last-updated: 2026-05-08T12:00:00+01:00 (fix/k8s-postgres-exec-privilege-flow: _backup_existing_data — add K8s pg_dump path via kubectl exec; pod runs as UID 70, no root needed)
@@ -30,6 +31,21 @@
 # 2026-05-02: step-7 license_key placeholder write made non-fatal when secrets_dir owned by stale UID (gate #ROOTLESS-8 blocker)
 # 2026-05-02: edited for OWUI integrator-framing per Legal audit; cross-ref /Internal/IP/shared/owui_licence_correspondence_2026-05-02.md
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Shared PKI service-key ownership map (single source of truth).
+# lib/pki_ownership.sh must live alongside install.sh in the repo root.
+# GATE5-BUG-01 / Tiago directive 2026-05-10.
+# ---------------------------------------------------------------------------
+# shellcheck source=lib/pki_ownership.sh
+_YSG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_YSG_SCRIPT_DIR}/lib/pki_ownership.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${_YSG_SCRIPT_DIR}/lib/pki_ownership.sh"
+else
+  printf "ERROR: lib/pki_ownership.sh not found alongside install.sh\n" >&2
+  exit 1
+fi
 
 # =============================================================================
 # Yashigani Installer
@@ -5012,63 +5028,9 @@ _pki_chown_client_keys() {
     return 0
   fi
 
-  local _uid_mapped_services=(
-    # Caddy runs as UID 0 (root) inside the container but has cap_drop: [ALL].
-    # Without CAP_DAC_OVERRIDE, UID 0 cannot read a 0o400 file owned by the
-    # installer user (e.g. UID 1000 on the GitHub runner). The PKI issuer writes
-    # caddy_client.key as 0o400 owned by the installer; without this chown
-    # Caddy crashes at startup with "open /run/secrets/caddy_client.key:
-    # permission denied". cap_drop removes DAC_OVERRIDE — the same issue that
-    # affected postgres/redis in V232-SMOKE-018. chown 0:0 restores access
-    # while keeping the key unreadable by other UIDs inside the container.
-    # V232-SMOKE-019 — caught by linux/docker smoke gate 2026-05-04.
-    "caddy:0"
-    "gateway:1001"
-    "backoffice:1001"
-    "redis:999"
-    "budget-redis:999"
-    "pgbouncer:70"
-    # postgres (UID 999) needs to read its own key inside the read-only
-    # /run/secrets bind-mount so that 05-enable-ssl.sh can `install` it
-    # into PGDATA. Without this chown the `install` call fails with
-    # "Permission denied" and postgres starts with ssl=off, causing
-    # pgbouncer verify-ca to refuse the plaintext upstream.
-    # Retro #3ad — v2.23.1.
-    "postgres:999"
-    # OPA runs as UID 1000 (openpolicyagent/opa Dockerfile: ARG USER=1000:1000).
-    # Without this chown, OPA crashes on startup: "open /run/secrets/policy_client.key:
-    # permission denied". The gateway depends on OPA for policy decisions, so OPA
-    # startup failure cascades to a gateway healthcheck timeout.
-    # V232-SMOKE-002 — caught by Linux smoke gate 2026-05-03.
-    "policy:1000"
-    # otel-collector and jaeger both run as UID 10001 (upstream Dockerfile:
-    # ARG USER_UID=10001; USER ${USER_UID}). Without chown they crash with
-    # "open /run/secrets/*_client.key: permission denied".
-    # V232-SMOKE-002 — caught by Linux smoke gate 2026-05-03.
-    "otel-collector:10001"
-    "jaeger:10001"
-    # loki runs as UID 10001 (grafana/loki Dockerfile: USER 10001).
-    # retro #84 (v2.23.2): loki now terminates mTLS on port 3100; it reads
-    # loki_client.crt/key from /run/secrets. Without chown the startup fails
-    # with "open /run/secrets/loki_client.key: permission denied".
-    "loki:10001"
-    # promtail runs as UID 0 (root) inside the container — it needs to access
-    # /var/run/docker.sock and /var/lib/docker/containers. Root inside the
-    # container (with cap_drop: [ALL]) can still read a file owned by root
-    # without DAC_OVERRIDE, so the chown here is a no-op (file was already
-    # written by the installer running as root on Docker hosts). On rootless
-    # Podman hosts the effective UID inside the container maps to the subuid-
-    # remapped installer UID; the file is already accessible. We include
-    # promtail in the list so the issuer always generates promtail_client.crt/key
-    # (mtls_capable:true in service_identities.yaml) and the key is set 0600.
-    # retro #84 (v2.23.2).
-    "promtail:0"
-    # Grafana runs as UID 472 (grafana/grafana upstream Dockerfile: USER 472).
-    # retro #83: Grafana now reads grafana_client.crt + grafana_client.key to
-    # serve mTLS on port 3443 and to authenticate datasource calls.
-    # Without chown, Grafana crashes with "permission denied" on the key file.
-    "grafana:472"
-  )
+  # Service→UID map sourced from lib/pki_ownership.sh (single source of truth).
+  # GATE5-BUG-01 / Tiago directive 2026-05-10: adding a new service updates
+  # lib/pki_ownership.sh only; install.sh + restore.sh inherit automatically.
 
   # Determine chown strategy for this runtime.
   # "direct"      — plain chown(1); Podman local root caller.
@@ -5268,45 +5230,32 @@ _pki_chown_client_keys() {
     return 0
   }
 
-  for _svc_uid in "${_uid_mapped_services[@]}"; do
-    local _svc="${_svc_uid%%:*}"; local _uid="${_svc_uid#*:}"
-    local _keyfile="${_secrets_dir}/${_svc}_client.key"
+  # Iterate all services from the shared map (lib/pki_ownership.sh).
+  # pki_service_uid + pki_key_mode replace the inline array and the prometheus
+  # special-case. Adding a new service updates lib/pki_ownership.sh only.
+  # GATE5-BUG-01 / Tiago directive 2026-05-10.
+  local _svc _uid _mode _keyfile
+  while IFS= read -r _svc; do
+    _uid="$(pki_service_uid "$_svc")"
+    _mode="$(pki_key_mode "$_svc")"
+    _keyfile="${_secrets_dir}/${_svc}_client.key"
     if [[ -f "$_keyfile" ]]; then
-      # #3d-fix: pass "0600" as 4th arg so every service key is set to owner-read-write
-      # (not 0400 from issuer). Postgres in particular: 05-enable-ssl.sh runs `install`
-      # as root to copy the key into PGDATA at 0600; psycopg2/postgres itself also
-      # requires the key be accessible to the postgres user (UID 999 after chown).
-      # 0600 owner-read-write is the canonical mode for service TLS keys (#3d-fix).
-      _do_chown "${_uid}" "$_keyfile" "${_svc}_client.key" "0600" || return 1
+      # #3d-fix: mode from shared map (0600 default, 0640 for prometheus).
+      # chmod runs inside the container alongside chown so a non-root installer
+      # (e.g. uid 1003) doesn't get EPERM trying to chmod a file it no longer owns.
+      _do_chown "${_uid}" "$_keyfile" "${_svc}_client.key" "${_mode}" || return 1
     fi
-  done
+  done < <(pki_services_all)
 
   # Chmod all certificate files to 0644. Certs are public material and must
   # be readable by every container that verifies peer identity (pgbouncer,
-  # gateway, backoffice, postgres, redis, etc.). Keys are 0600 (set above via
-  # _do_chown 4th arg — #3d-fix closes the 0o400 issuer-default → 0600 gap).
+  # gateway, backoffice, postgres, redis, etc.). Keys are owned+chmod'd above.
   # This find+chmod is runtime-agnostic — it runs as the host caller and only
   # changes mode bits (not ownership), so it works for both root and non-root.
   log_info "Chmod'ing client certs + CA certs to 0644 (public material)"
   find "${_secrets_dir}" -maxdepth 1 -type f \
     \( -name '*_client.crt' -o -name 'ca_*.crt' \) \
     -exec chmod 0644 {} \; 2>/dev/null || true
-
-  # Pentest bonus finding (EX-231-10 closure): Prometheus container runs as
-  # uid 65534 (nobody). The secrets dir is owned by uid 1001, mode drwxr-x--x
-  # (traversable by others via o+x). Prometheus needs to read its own
-  # prometheus_client.{crt,key} for SPIFFE-gated /internal/metrics scrapes.
-  # Fix: chown prometheus_client.key to 1001:1001, chmod to 0640.
-  # Prometheus gets group_add: ["1001"] in docker-compose.yml so GID 1001
-  # membership grants read access to the 0640 key.
-  log_info "Setting prometheus_client.key to 0640 (group 1001 — Pentest EX-231-10 fix)"
-  local _prom_key="${_secrets_dir}/prometheus_client.key"
-  if [[ -f "$_prom_key" ]]; then
-    # BUG-2 fix: pass "0640" as the 4th arg so chmod runs inside the container
-    # alongside chown. A non-root installer (e.g. uid 1003) cannot chmod a file
-    # owned by uid 1001 from the host shell after the in-container chown exits.
-    _do_chown "1001" "$_prom_key" "prometheus_client.key" "0640" || return 1
-  fi
 
   # gate #ROOTLESS-11: password files, bootstrap tokens, and HMAC secret are
   # written by generate_secrets() as the installer user (e.g. UID 1005 on Podman
@@ -5567,11 +5516,20 @@ bootstrap_internal_pki() {
         return 1
       fi
       log_success "Leaf certs rotated"
+      _pki_persist_env
+      # New keys generated by rotate-leaves — apply service ownership atomically.
+      # Tiago directive 2026-05-10: upgrade path that does NOT rotate keys must
+      # NOT sweep-chmod existing keys. Ownership is applied only when new key
+      # material has actually been written. GATE5-BUG-01.
+      _pki_chown_client_keys
     else
       log_success "Certs current — no rotation needed"
+      _pki_persist_env
+      # No new keys generated. Existing keys are already correctly owned from the
+      # previous install/rotate step. Do NOT re-apply chown (upgrade no-touch rule).
+      # Tiago directive 2026-05-10 / GATE5-BUG-01.
+      log_info "Existing key ownership preserved (no rotation — upgrade no-touch rule)"
     fi
-    _pki_persist_env
-    _pki_chown_client_keys   # always re-apply — chown no-ops if already correct
     return 0
   fi
 

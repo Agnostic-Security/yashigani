@@ -90,10 +90,12 @@ data:
         tls:
           insecure: true
         {{- end }}
-      loki:
-        # retro #84: endpoint switched to https; otel-collector presents its
-        # own leaf cert to Loki. Trust anchor: ca_intermediate.crt (Pattern B).
-        endpoint: "https://yashigani-loki:3100/loki/api/v1/push"
+      # v2.23.3: otelcol-contrib 0.151.0 removed the 'loki' exporter type.
+      # Loki 3.x accepts OTLP natively at /otlp/v1/logs — use otlphttp instead.
+      # Resource attributes (service.name, deployment.environment) map to Loki
+      # stream labels automatically via Loki 3.x OTLP label discovery.
+      otlphttp/loki:
+        endpoint: "https://yashigani-loki:3100"
         {{- if .Values.mtls.enabled }}
         tls:
           cert_file: /run/secrets/otel-collector_client.crt
@@ -113,7 +115,7 @@ data:
         logs:
           receivers: [otlp]
           processors: [memory_limiter, batch]
-          exporters: [loki]
+          exporters: [otlphttp/loki]
 {{- end }}
 
 {{- if .Values.jaeger.enabled }}
@@ -804,34 +806,11 @@ data:
     if __name__ == "__main__":
         main()
 
-{{- if and .Values.prometheus.enabled .Values.mtls.enabled }}
-{{/*
-── Prometheus TLS web-config ConfigMap ────────────────────────────────────────
-  retro #83: enables HTTPS on Prometheus port 9090 (Pattern B mTLS).
-  Grafana datasource calls and Prometheus self-scrape use mutual TLS.
-  Mounted at /etc/prometheus/web-config.yml via subPath in prometheus.yaml.
-*/}}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: yashigani-prometheus-web-config
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/name: yashigani-prometheus-web-config
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
-data:
-  web-config.yml: |
-    # retro #83: Prometheus TLS web config — Pattern B (intermediate as trust anchor).
-    # TA-1/TA-2: mTLS on port 9090 prevents impersonation and eavesdropping.
-    tls_server_config:
-      cert_file: /run/secrets/prometheus_client.crt
-      key_file:  /run/secrets/prometheus_client.key
-      client_ca_file: /run/secrets/ca_intermediate.crt
-      client_auth_type: RequireAndVerifyClientCert
-      min_version: TLS13
-{{- end }}
+{{- /* B-K8S-4: yashigani-prometheus-web-config ConfigMap removed.
+  web-config.yml is now a second key in yashigani-prometheus-config (prometheus.yaml),
+  served via the whole-dir /etc/prometheus mount. Separate ConfigMap + subPath
+  is blocked on containerd: subPath into an already-mounted dir is not allowed.
+*/ -}}
 
 {{- if and .Values.grafana.enabled .Values.mtls.enabled }}
 {{/*

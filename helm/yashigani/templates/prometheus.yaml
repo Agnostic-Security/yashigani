@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-07T01:00:00+01:00 — retro #83: add Prometheus TLS web-config (mTLS on port 9090 for Grafana datasource) */ -}}
+{{- /* Last updated: 2026-05-09T10:00:00+01:00 — B-K8S-4: merge web-config.yml into yashigani-prometheus-config; remove subPath mount (containerd blocks subPath into already-mounted dir) */ -}}
 {{- if .Values.prometheus.enabled }}
 ---
 apiVersion: v1
@@ -79,6 +79,21 @@ data:
         {{- end }}
         static_configs:
           - targets: ["localhost:9090"]
+  {{- if .Values.mtls.enabled }}
+  # B-K8S-4: web-config.yml co-located in yashigani-prometheus-config so it is
+  # accessible at /etc/prometheus/web-config.yml via the whole-dir mount.
+  # Separate ConfigMap + subPath is forbidden on containerd: subPath into an
+  # already-mounted directory is not allowed (only allowed for the first mount).
+  # retro #83: enables HTTPS/mTLS on Prometheus port 9090 (Pattern B).
+  # TA-1/TA-2: mTLS prevents impersonation and eavesdropping.
+  web-config.yml: |
+    tls_server_config:
+      cert_file: /run/secrets/prometheus_client.crt
+      key_file:  /run/secrets/prometheus_client.key
+      client_ca_file: /run/secrets/ca_intermediate.crt
+      client_auth_type: RequireAndVerifyClientCert
+      min_version: TLS13
+  {{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -175,11 +190,10 @@ spec:
             - name: pki-certs
               mountPath: /run/secrets
               readOnly: true
-            - name: prometheus-web-config
-              mountPath: /etc/prometheus/web-config.yml
-              subPath: web-config.yml
-              readOnly: true
             {{- end }}
+            # B-K8S-4: no separate subPath mount needed — web-config.yml is now
+            # a key inside yashigani-prometheus-config, so the whole-dir `config`
+            # mount at /etc/prometheus already exposes it at the correct path.
       {{- if .Values.mtls.enabled }}
       # /run/secrets PKI mount collides with SA-token at
       # /var/run/secrets/kubernetes.io/serviceaccount (since /var/run→/run).
@@ -195,10 +209,9 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
-        - name: prometheus-web-config
-          configMap:
-            name: yashigani-prometheus-web-config
         {{- end }}
+        # B-K8S-4: prometheus-web-config volume removed; web-config.yml is now
+        # a key in yashigani-prometheus-config, served via the `config` volume.
   {{- if .Values.prometheus.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
