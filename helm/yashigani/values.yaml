@@ -1,10 +1,17 @@
 # Yashigani v2.23.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-07 (chore: convert floating-tag stubs to specific verified-existing versions)
+# Last updated: 2026-05-09 (chore: tag-only refs for own images — customer-builds pattern)
 
 global:
-  imageRegistry: "ghcr.io"
-  imageOwner: "agnosticsec-com"
+  # imageRegistry and imageOwner are used only for gateway / backoffice /
+  # adminBootstrap (images you build from source). Leave both empty for
+  # local Docker/Podman deployments where images are built by install.sh and
+  # already present on the node. For K8s: set these to your private registry
+  # and namespace, then push your locally-built images there before deploying.
+  # Example: imageRegistry: "registry.example.com", imageOwner: "myorg"
+  # Agnostic Security does not host or distribute these images.
+  imageRegistry: ""
+  imageOwner: ""
   # REQUIRED: Replace with your actual domain before deployment
   tlsDomain: "yashigani.example.com"
   # tlsMode: caddy | nginx (cert-manager + nginx-ingress)
@@ -200,11 +207,12 @@ adminBootstrap:
   # bundles python3 + pyotp + secrets which is everything we need; reusing
   # it avoids another image pull.
   image:
-    # Resolves to global.imageRegistry/global.imageOwner/<repo>:<tag>.
-    # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
-    # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
+    # Built locally by install.sh from the v2.23.3 tagged source.
+    # For K8s deployments: push to your own private registry and update
+    # the repository field accordingly. Pin your post-build digest with
+    # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.23.1@sha256:e3dfc6b4a38f44ccbf6ec965d32140ab621bc15cd360c2953c9a2545962a630a"
+    tag: "2.23.3"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -220,10 +228,12 @@ adminBootstrap:
 gateway:
   enabled: true
   image:
-    # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
-    # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
+    # Built locally by install.sh from the v2.23.3 tagged source.
+    # For K8s deployments: push to your own private registry and update
+    # the repository field accordingly. Pin your post-build digest with
+    # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.23.1@sha256:e3dfc6b4a38f44ccbf6ec965d32140ab621bc15cd360c2953c9a2545962a630a"
+    tag: "2.23.3"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -262,7 +272,7 @@ gateway:
     # M-01 fix: overridden to grpcs:// by gateway.yaml when mtls.enabled=true.
     # This value applies only when mTLS is disabled (non-default, testing only).
     otelEndpoint: "http://otel-collector:4317"
-    fasttextModelPath: "/app/models/fasttext_classifier.bin"
+    sklearnModelPath: "/app/models/sensitivity_classifier.joblib"
 
 # ---------------------------------------------------------------------------
 # Backoffice — Admin control plane
@@ -284,10 +294,12 @@ backoffice:
     - letta
     - openclaw
   image:
-    # Digest pinned per project image-pinning policy — rebuilt at tip c68a6d2
-    # (2026-05-01T09:45+01:00) rc.2: LAURA-V232-002/003, AVA-A006/C006 + licensing canonical.
+    # Built locally by install.sh from the v2.23.3 tagged source.
+    # For K8s deployments: push to your own private registry and update
+    # the repository field accordingly. Pin your post-build digest with
+    # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "2.23.1@sha256:542680c17071e15e8f9453fd7e676d9f15e67655e45143f6be2f62b5f131e153"
+    tag: "2.23.3"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -302,6 +314,14 @@ backoffice:
     port: 8443
     type: ClusterIP
   existingSecretName: ""
+  # v2.23.3 (#59): the backoffice K8s Secret (existingSecretName / default
+  # "yashigani-backoffice-secrets") must contain the following keys:
+  #   db_aes_key  — 64-char hex (32 bytes) or 44-char base64; used by
+  #                 pgcrypto pgp_sym_encrypt to encrypt auth_settings values
+  #                 (including the HIBP API key) at rest.  install.sh generates
+  #                 this key automatically; for Helm-only deployments, generate
+  #                 with: openssl rand -hex 32
+  #   Missing key → RuntimeError at backoffice startup (fail-closed, SOP 1).
   hpa:
     enabled: true
     minReplicas: 2
@@ -316,6 +336,70 @@ backoffice:
   # Empty string = skip the mount (endpoints return empty state gracefully).
   # Example: /opt/yashigani/backups
   backupsHostPath: ""
+
+# ---------------------------------------------------------------------------
+# Backup — age-encrypted CronJob (MP.L2-3.8.9 / CMMC L2)
+# Last updated: 2026-05-09T00:00:00+01:00
+# ---------------------------------------------------------------------------
+# Operator pre-requisites (see docs/operations/backup.md — Encryption section):
+#
+#   1. Generate key pair on the operator host (NOT inside the cluster):
+#        age-keygen -o /tmp/backup-identity.age
+#        chmod 0400 /tmp/backup-identity.age
+#
+#   2. Extract recipient public key:
+#        age-keygen -y /tmp/backup-identity.age   # prints: age1...
+#
+#   3. Create ConfigMap with the recipient public key:
+#        kubectl create configmap yashigani-backup-recipient \
+#          --from-literal=recipient.age.pub="age1<your-public-key>" \
+#          -n yashigani
+#
+#   4. Create Secret with the identity private key (for restore access — store
+#      a copy offline, do NOT keep only in-cluster):
+#        kubectl create secret generic yashigani-backup-identity \
+#          --from-file=identity.age=/tmp/backup-identity.age \
+#          -n yashigani
+#        rm /tmp/backup-identity.age  # shred the original
+#
+#   Encryption-only backup job does NOT require the identity Secret.
+#   The identity Secret is only needed by the restore path.
+#
+backup:
+  enabled: false  # set to true after provisioning recipientKeyConfigMap
+  schedule: "0 2 * * *"  # 02:00 UTC daily
+  # Name of ConfigMap holding the age recipient public key.
+  # ConfigMap key must be named exactly: recipient.age.pub
+  # Contents: a single line starting with 'age1' (bech32 X25519 public key).
+  recipientKeyConfigMap: "yashigani-backup-recipient"
+  # Name of Secret holding the age identity (private key) — used by restore path only.
+  # Secret key must be named exactly: identity.age
+  # This Secret is NOT mounted by the backup CronJob (encryption uses the public key only).
+  identitySecret: "yashigani-backup-identity"
+  # Output directory inside the CronJob pod. This path must be backed by a
+  # PersistentVolume or hostPath so that encrypted archives survive pod restarts.
+  outputDir: "/var/lib/yashigani/backups"
+  # Source directory inside the pod to archive.
+  sourceDir: "/var/lib/yashigani"
+  # PersistentVolumeClaim to mount at outputDir. If empty, no PVC is created
+  # and the operator must supply a hostPath or other volume via extraVolumes.
+  pvcName: ""
+  # If pvcName is empty and you want the chart to create a PVC, set these:
+  pvc:
+    create: false
+    storageClassName: ""
+    size: "10Gi"
+    accessMode: ReadWriteOnce
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  # History limits
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 3
 
 # ---------------------------------------------------------------------------
 # Policy — Open Policy Agent

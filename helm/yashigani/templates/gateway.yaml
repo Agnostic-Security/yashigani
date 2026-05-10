@@ -45,7 +45,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.global.imageOwner }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.gateway.image.repository "tag" .Values.gateway.image.tag) }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           securityContext:
             runAsUser: 1001
@@ -120,8 +120,8 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.gateway.env.otelEndpoint | quote }}
             {{- end }}
-            - name: FASTTEXT_MODEL_PATH
-              value: {{ .Values.gateway.env.fasttextModelPath | quote }}
+            - name: SKLEARN_MODEL_PATH
+              value: {{ .Values.gateway.env.sklearnModelPath | quote }}
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: POSTGRES_PASSWORD

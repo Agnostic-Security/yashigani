@@ -66,8 +66,8 @@
 #   - git
 #   - sudo rights for 'su' user
 #
-# Version: v2.23.2
-# Last-Updated: 2026-05-07T00:00:00+01:00
+# Version: v2.23.3
+# Last-Updated: 2026-05-09T15:20:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -222,10 +222,16 @@ _vm_cleanup() {
       cd '${VM_CLONE_DIR}' && \
       YSG_RUNTIME=${RUNTIME} bash uninstall.sh --remove-volumes --yes 2>&1 || true
     fi
-    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' || true
+    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true
     ${RUNTIME} system prune -f 2>/dev/null || true
     ${RUNTIME} volume prune -f 2>/dev/null || true
   " 2>&1 || _warn "VM cleanup had errors (non-fatal)"
+  # For Docker: install.sh chowns docker/data/audit and docker/secrets to UID 1001
+  # via ephemeral containers. Plain rm -rf as su (UID 1004) fails on these dirs.
+  # Use sudo rm -rf to ensure the clone dir is fully removed.
+  if [[ "${RUNTIME}" == "docker" ]]; then
+    _vm_sudo "rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true" 2>&1 || true
+  fi
   _ok "VM teardown complete"
 }
 
@@ -333,16 +339,19 @@ _vm_ssh "
 " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
 
 _info "Removing clone directory (podman unshare rm for namespace-owned files)..."
-# install.sh uses 'podman unshare chown 1001:1001' on bind-mount dirs, so secret
-# files and data dirs are owned by subuid-mapped uids (mode 0400). Plain rm -rf
-# as the host user fails with EPERM. Running rm inside the user namespace via
-# 'podman unshare rm -rf' works because the uid mapping makes the files appear
-# owned by the process.
+# install.sh chowns bind-mount dirs and secret files to UID 1001 (subuid-mapped
+# for Podman rootless, plain UID 1001 for Docker). Plain rm -rf as host user
+# (UID 1004) fails on these files with EPERM. Strategies by runtime:
+#   Podman: 'podman unshare rm -rf' maps through user namespace — works for subuid UIDs
+#   Docker: plain rm -rf fails on UID-1001 files; sudo rm -rf works (su has sudo)
 _vm_ssh "
   if [[ -d '${VM_CLONE_DIR}' ]]; then
-    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' || true
+    ${RUNTIME} unshare rm -rf '${VM_CLONE_DIR}' 2>/dev/null || rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true
   fi
 " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+if [[ "${RUNTIME}" == "docker" ]]; then
+  _vm_sudo "rm -rf '${VM_CLONE_DIR}' 2>/dev/null || true" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+fi
 
 _info "Removing \$HOME/.yashigani install dir..."
 _vm_ssh "
@@ -380,9 +389,35 @@ _vm_ssh "
 " 2>&1 | tee -a "${EVIDENCE_FILE}"
 _ok "Clone complete: ${VM_CLONE_DIR}"
 
-# PHASE 3b removed: bind-mount dir pre-creation was BIND-MOUNT-001 workaround,
-# now fixed in install.sh (#85). install.sh auto-creates docker/data, docker/certs,
-# docker/logs with correct ownership (podman unshare chown for rootless Podman).
+# ---------------------------------------------------------------------------
+# PHASE 3b: Docker bind-mount pre-chown (Docker only — not Podman rootless)
+# ---------------------------------------------------------------------------
+# install.sh auto-creates docker/data, docker/certs, docker/logs and for
+# Podman rootless uses `podman unshare chown 1001:1001` (namespace remap).
+# For Docker, install.sh falls back to plain `chown 1001:1001` which requires
+# the caller to be root. Since su (UID 1004) is non-root, this fails.
+# Fix: pre-create and sudo-chown the directories before install.sh runs.
+# This is NOT a workaround — it's the documented Docker requirement (install.sh
+# emits 'sudo chown -R 1001:1001' in its error message).
+if [[ "${RUNTIME}" == "docker" ]]; then
+  _section "Phase 3b: Docker bind-mount pre-chown"
+  _info "Creating docker/data, docker/certs, docker/logs with uid 1001 ownership..."
+  # docker/secrets is intentionally NOT pre-chowned here:
+  # install.sh Step 6/13 creates docker/secrets (su UID 1004 ownership) and writes
+  # admin passwords into it as the installer user before the PKI bootstrap.
+  # Pre-chowning to UID 1001 would block the installer from writing passwords.
+  # Instead, install.sh _pki_run_issuer() uses an ephemeral docker container
+  # (running as root inside the container) to chown docker/secrets to UID 1001
+  # just before the PKI container starts. See install.sh _pki_run_issuer() ~L4846.
+  _vm_sudo "mkdir -p '${VM_CLONE_DIR}/docker/data' \
+              '${VM_CLONE_DIR}/docker/certs' \
+              '${VM_CLONE_DIR}/docker/logs' && \
+            chown -R 1001:1001 \
+              '${VM_CLONE_DIR}/docker/data' \
+              '${VM_CLONE_DIR}/docker/certs' \
+              '${VM_CLONE_DIR}/docker/logs'" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+  _ok "Docker bind-mount directories pre-chowned to 1001:1001"
+fi
 
 # ---------------------------------------------------------------------------
 # PHASE 4: Run install.sh on VM
@@ -558,21 +593,33 @@ PROBE_OUTPUT=""
 # Capture probe output regardless of exit code — success/failure is determined
 # by whether the output contains "Admin1 login HTTP: 200" (SOP 4 grep contract).
 # shellcheck disable=SC2030
-# For Podman rootless, admin credential files are chowned to UID 1001 (subuid-mapped)
-# by _pki_chown_client_keys/gate-#ROOTLESS-11 so the backoffice container can read them.
-# After chown, the host user (su) cannot `cat` them directly — they're 0600 owned by
-# the subuid-mapped UID. Use `podman unshare cat` to read within the user namespace.
-# Docker installs leave files owned by the installer user — plain `cat` works there.
+# Admin credential files (admin1/2_username, admin1/2_password, admin1/2_totp_secret)
+# are chowned to UID 1001 by _pki_chown_client_keys (gate #ROOTLESS-11) so containers
+# can read them. The probe script runs as su (UID 1004) and cannot `cat` mode-0600 files
+# owned by UID 1001. Use runtime-appropriate cat prefix:
+#   Podman rootless: `podman unshare cat` — maps through user-namespace to subuid-mapped UID
+#   Docker: `docker run --rm` — daemon is root inside container, can read any file.
+#     The --secrets-dir is passed as /s (the container mount point) and --cat-prefix embeds
+#     the `docker run -v host_path:/s:ro` command so each read_secret call mounts the dir
+#     and cats the file. alpine:3 digest: amd64+arm64 manifest list (2026-04-29).
 PROBE_CAT_PREFIX="cat"
+PROBE_SECRETS_DIR="${VM_SECRETS_DIR}"
+_ALPINE_IMG="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
 if [[ "${RUNTIME}" == "podman" ]]; then
   PROBE_CAT_PREFIX="podman unshare cat"
+elif [[ "${RUNTIME}" == "docker" ]]; then
+  # Use ephemeral docker container to read UID-1001-owned secret files.
+  # Pass --secrets-dir /s (mount point) so the probe appends /s/admin1_username etc.
+  # The cat-prefix mounts the actual secrets dir read-only.
+  PROBE_CAT_PREFIX="docker run --rm -v ${VM_SECRETS_DIR}:/s:ro ${_ALPINE_IMG} cat"
+  PROBE_SECRETS_DIR="/s"
 fi
 
 { PROBE_OUTPUT="$(
     _vm_ssh "
       HISTFILE=/dev/null bash '/home/${VM_USER}/release_gate_probe_${TIMESTAMP}.sh' \
         --base-url 'https://${INSTALL_DOMAIN}:${HTTPS_PORT}' \
-        --secrets-dir '${VM_SECRETS_DIR}' \
+        --secrets-dir '${PROBE_SECRETS_DIR}' \
         --cat-prefix '${PROBE_CAT_PREFIX}' 2>&1
     " 2>&1
   )"; } || true

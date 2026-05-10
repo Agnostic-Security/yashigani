@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): PR#122 — replace blanket CWE-732 find assertion with per-service pki_key_mode check; eliminates false-positive on prometheus_client.key 0640)
+# Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; restore stops blanket-chmod; per-key ownership on written keys only; Tiago directive 2026-05-10)
+# Last updated: 2026-05-09T00:00:00+01:00 (feat: MP.L2-3.8.9 — add --encrypted path for age-encrypted .tar.gz.age backups)
+# Last updated: 2026-05-10T18:30:00+01:00 (fix(gate5): global _DECRYPT_EXTRACT_DIR for EXIT trap — local var inaccessible in EXIT trap when set -e triggers early script exit)
+# Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
 # Last updated: 2026-05-07T09:00:00+01:00 (fix: validate_backup BACKUP_DIR→backup_dir variable mismatch — signed backups failed validation without --force)
 # Last updated: 2026-05-03T12:45:00+01:00 (V232-SMOKE-010: exclude .gitkeep from empty-file check; V232-SMOKE-011: podman unshare chown -R before cp restore; V232-SMOKE-012: secrets dir 0751→0755)
+
+# ---------------------------------------------------------------------------
+# Shared PKI service-key ownership map (single source of truth).
+# lib/pki_ownership.sh must live alongside restore.sh in the repo root.
+# GATE5-BUG-01 / Tiago directive 2026-05-10.
+# ---------------------------------------------------------------------------
+# shellcheck source=lib/pki_ownership.sh
+_YSG_RESTORE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_YSG_RESTORE_SCRIPT_DIR}/lib/pki_ownership.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${_YSG_RESTORE_SCRIPT_DIR}/lib/pki_ownership.sh"
+else
+  printf "ERROR: lib/pki_ownership.sh not found alongside restore.sh\n" >&2
+  exit 1
+fi
 
 # Tight umask so any files/dirs created during restore inherit 0600/0700.
 # Overrides the host default (often 022) which would leave intermediate
@@ -57,6 +77,14 @@ WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUPS_DIR="${WORK_DIR}/backups"
 K8S_MODE=false
 K8S_NAMESPACE="yashigani"
+RUN_VALIDATE=false
+
+# ---------------------------------------------------------------------------
+# Encrypted restore state (MP.L2-3.8.9)
+# Set by --encrypted <identity-file>; also honoured from env.
+# ---------------------------------------------------------------------------
+ENCRYPTED_MODE=false
+IDENTITY_FILE="${YASHIGANI_BACKUP_IDENTITY_FILE:-/etc/yashigani/backup-identity.age}"
 
 log_info()    { printf "    --> %s\n" "$*"; }
 log_success() { printf "    ${C_GREEN}ok${C_RESET}  %s\n" "$*"; }
@@ -525,6 +553,26 @@ restore_backup() {
     # after the copy.  Bug caught: R4 macOS Podman gate 2026-04-30.
     find "${WORK_DIR}/docker/secrets" -maxdepth 1 -type f \
       -exec chmod u+w {} \; 2>/dev/null || true
+    # Enumerate which keys were actually present in the backup before the copy.
+    # _pki_chown_client_keys applies ownership ONLY to those keys — keys already
+    # on disk that were not in the backup are left untouched.
+    # Tiago directive 2026-05-10: "restore of keys should only be done in a
+    # scenario where they have been nuked in some way". GATE5-BUG-01.
+    local _backup_written_keys=()
+    local _bk_svc
+    # Service leaf keys from the shared map.
+    while IFS= read -r _bk_svc; do
+      if [[ -f "${backup_dir}/secrets/${_bk_svc}_client.key" ]]; then
+        _backup_written_keys+=("${_bk_svc}_client.key")
+      fi
+    done < <(pki_services_all)
+    # CA private keys — not in the service map but still need ownership tracking.
+    for _bk_ca_key in ca_root.key ca_intermediate.key; do
+      if [[ -f "${backup_dir}/secrets/${_bk_ca_key}" ]]; then
+        _backup_written_keys+=("${_bk_ca_key}")
+      fi
+    done
+
     # cp -p preserves source mode/ownership timestamps.
     if ! cp -rp "${backup_dir}/secrets/"* "${WORK_DIR}/docker/secrets/"; then
       log_error "Failed to copy secrets from backup"
@@ -535,12 +583,10 @@ restore_backup() {
     log_success "Secrets copied from backup (${secret_count} files)"
 
     # BUG-58B-04a + BUG-58B-04b (v2.23.1): reapply canonical file modes and
-    # re-own service private keys to the container UIDs that must read them.
-    # Old backups (pre-fix) used 'chmod -R 600' which clobbered intentionally-
-    # 0644 public secrets. New backups only tighten *.key to 0400. Either way,
-    # calling _pki_chown_client_keys here normalises modes and ownership so that
-    # every service container can read exactly the files it needs to.
-    _pki_chown_client_keys
+    # re-own service private keys ONLY for the keys that were actually written
+    # from the backup. Keys already on disk and not in the backup are untouched.
+    # GATE5-BUG-01 / Tiago directive 2026-05-10: removed blanket find+chmod sweep.
+    _pki_chown_client_keys "${_backup_written_keys[@]+"${_backup_written_keys[@]}"}"
   else
     log_warn "No secrets directory in backup — skipping"
   fi
@@ -585,6 +631,12 @@ restore_backup() {
     #     password remains live and every post-restore pod startup fails with
     #     "password authentication failed". (retro #3ca)
     _restore_k8s_postgres_secrets "${backup_dir}/secrets"
+    # 6c. PR #67 K8s verify path (v2.23.3 retro gap):
+    #     Restart all Yashigani deployments so pods pick up the restored K8s
+    #     secrets, then wait for rollout + probe /healthz. Previously this was
+    #     only printed as "next steps" — operators forgot to run it and ran into
+    #     auth failures with a nominally-successful restore.
+    _k8s_post_restore_verify
   fi
 
   printf "\n${C_GREEN}${C_BOLD}Restore complete.${C_RESET}\n\n"
@@ -604,10 +656,14 @@ restore_backup() {
       printf "    3. Log in to admin UI and verify credentials work\n"
       ;;
     k8s)
-      printf "  Next steps:\n"
-      printf "    1. Restart pods: kubectl rollout restart deployment -n ${K8S_NAMESPACE}\n"
-      printf "    2. Verify: kubectl exec -n ${K8S_NAMESPACE} deploy/gateway -- curl -s http://localhost:8080/healthz\n"
-      printf "    3. Log in to admin UI and verify credentials work\n"
+      printf "  K8s restore steps completed automatically:\n"
+      printf "    - Secrets updated: kubectl rollout restart deployment -n ${K8S_NAMESPACE} (done)\n"
+      printf "    - Rollout awaited: kubectl rollout status deployment --timeout=300s (done)\n"
+      printf "    - Gateway healthz probed (see output above)\n"
+      printf "  If healthz probe was empty or a deployment timed out above:\n"
+      printf "    kubectl get pods -n ${K8S_NAMESPACE}\n"
+      printf "    kubectl exec -n ${K8S_NAMESPACE} deployment/yashigani-gateway -- curl -sf http://localhost:8080/healthz\n"
+      printf "  Then log in to admin UI and verify credentials work.\n"
       ;;
     *)
       printf "  Secrets and .env restored. Start your services manually.\n"
@@ -619,35 +675,37 @@ restore_backup() {
 }
 
 # ---------------------------------------------------------------------------
-# BUG-58B-04b (v2.23.1): Re-own service private keys to container UIDs after
-# PKI restore. install.sh's _backup_existing_data now only sets *.key to 0400
-# (not a blanket chmod -R 600), but the backup still carries root:root ownership
-# from the initial cp -rp. When restore.sh extracts keys, they land as root:root
-# 0400; service containers (pgbouncer=UID70, redis=UID999, gateway/backoffice=
-# UID1001) get EACCES on their own key.
+# _pki_chown_client_keys — Re-own service private keys to container UIDs.
 #
-# Same service→UID map as install.sh:_pki_chown_client_keys.
+# Accepts a list of key BASENAMES (e.g. "gateway_client.key") that were
+# actually written from the backup. Only those keys get ownership re-applied;
+# keys already on disk that were NOT in the backup are left untouched.
+#
+# Tiago directive 2026-05-10 / GATE5-BUG-01:
+#   "restore of keys should only be done in a scenario where they have been
+#    nuked in some way" — so restore must NOT blanket-chmod every *.key it
+#    finds on disk. Only the keys it actually placed get touched.
+#
+# UID + mode come from lib/pki_ownership.sh (single source of truth).
 # Runs after secrets are restored on every supported runtime.
+#
+# Usage: _pki_chown_client_keys [key_basename ...]
+#   e.g.: _pki_chown_client_keys "gateway_client.key" "pgbouncer_client.key"
+#   With no args: no keys are touched (no backup keys found).
 # ---------------------------------------------------------------------------
 _pki_chown_client_keys() {
+  # Positional: list of key basenames that were written from the backup.
+  local _written_keys=("$@")
   local _secrets_dir="${WORK_DIR}/docker/secrets"
 
-  # Canonical UID map: service name → container UID.
-  local _uid_mapped_services=(
-    "gateway:1001"
-    "backoffice:1001"
-    "redis:999"
-    "budget-redis:999"
-    "pgbouncer:70"
-    "postgres:999"
-  )
+  if [[ "${#_written_keys[@]}" -eq 0 ]]; then
+    log_info "_pki_chown_client_keys: no keys were written from backup — nothing to re-own"
+    return 0
+  fi
 
   # Determine chown mode: root can chown directly; non-root uses podman unshare
   # (Podman rootless user-namespace). Docker non-root: restore.sh never runs
   # sudo (P0-14) — warn with a copy-pasteable remediation block instead.
-  # check_restore_preflight() has already verified docker group membership; the
-  # key re-own step is the one operation that still requires host privilege when
-  # backup keys land as root:root.
   local _chown_mode="direct"
   if [[ "$(id -u)" != "0" ]]; then
     if [[ "${RUNTIME}" == "podman" ]]; then
@@ -658,70 +716,102 @@ _pki_chown_client_keys() {
     fi
   fi
 
-  log_info "Re-owning service private keys to container UIDs (mode: ${_chown_mode})"
+  log_info "Re-owning ${#_written_keys[@]} restored key(s) to container UIDs (mode: ${_chown_mode})"
 
-  for _svc_uid in "${_uid_mapped_services[@]}"; do
-    local _svc="${_svc_uid%%:*}"
-    local _uid="${_svc_uid#*:}"
-    local _keyfile="${_secrets_dir}/${_svc}_client.key"
-    if [[ ! -f "$_keyfile" ]]; then
-      continue
-    fi
+  # Helper: apply chown+chmod to a single file using the active strategy.
+  # Args: <uid> <keyfile_path> <label> <mode>
+  _do_restore_chown() {
+    local _uid="$1" _file="$2" _label="$3" _mode="$4"
     case "$_chown_mode" in
       direct)
-        if ! chown "${_uid}:${_uid}" "$_keyfile"; then
-          log_warn "chown failed on ${_svc} key — container may fail to start"
-        else
-          chmod 0600 "$_keyfile" || log_warn "chmod 0600 failed on ${_svc} key (not fatal for direct mode)"
+        if ! chown "${_uid}:${_uid}" "$_file"; then
+          log_warn "chown failed on ${_label} — container may fail to start"
+          return 0
+        fi
+        if ! chmod "${_mode}" "$_file"; then
+          log_warn "chmod ${_mode} failed on ${_label} (not fatal for direct mode)"
         fi
         ;;
       unshare)
-        # RESTORE-1 (v2.23.1 gate): after `podman unshare chown ${_uid}:${_uid}`,
-        # the file is owned by a subuid-range UID on the host. A subsequent
-        # host-side `chmod` fails with EPERM because the calling user (su/UID 1004)
-        # does not own the file. Fix: do the chmod INSIDE the podman unshare
-        # namespace (where the chowned UID maps to 0 = the invoking user), alongside
-        # the chown. This matches the pattern used in install.sh's _do_chown.
-        local _key_basename
-        _key_basename=$(basename "$_keyfile")
-        local _key_dir
-        _key_dir=$(dirname "$_keyfile")
+        # RESTORE-1 (v2.23.1 gate): chmod must run INSIDE the podman unshare
+        # namespace because after `podman unshare chown`, the file is owned by
+        # a subuid-range UID on the host and a subsequent host-side chmod fails
+        # with EPERM. This matches install.sh's _do_chown pattern.
         if ! podman unshare sh -c \
-              "chown ${_uid}:${_uid} '${_keyfile}' && chmod 0600 '${_keyfile}'" 2>/dev/null; then
-          log_warn "podman unshare chown/chmod failed on ${_svc} key — container may fail to start"
+              "chown ${_uid}:${_uid} '${_file}' && chmod ${_mode} '${_file}'" 2>/dev/null; then
+          log_warn "podman unshare chown/chmod failed on ${_label} — container may fail to start"
         fi
         ;;
       warn)
-        log_warn "Non-root Docker: cannot chown ${_svc} key to UID ${_uid} without sudo."
-        log_warn "  Run manually if ${_svc} fails to start:"
-        log_warn "    sudo chown ${_uid}:${_uid} \"${_keyfile}\""
+        log_warn "Non-root Docker: cannot chown ${_label} to UID ${_uid} without sudo."
+        log_warn "  Run manually if the service fails to start:"
+        log_warn "    sudo chown ${_uid}:${_uid} \"${_file}\" && sudo chmod ${_mode} \"${_file}\""
         ;;
     esac
+    return 0
+  }
+
+  # Apply ownership to each key that was actually written from backup.
+  local _kb _svc _uid _mode _keyfile
+  for _kb in "${_written_keys[@]}"; do
+    # Derive service name: strip trailing "_client.key".
+    _svc="${_kb%_client.key}"
+    _keyfile="${_secrets_dir}/${_kb}"
+
+    if [[ ! -f "$_keyfile" ]]; then
+      # Key was in backup manifest but file not found after cp — operator error.
+      log_error "Key ${_kb} was in backup but not found at ${_keyfile} after restore."
+      log_error "  The backup may be corrupt or the copy failed for this file."
+      log_error "  Manual recovery: re-run install.sh to regenerate all keys."
+      # Non-fatal: continue restoring other keys; surface all errors at once.
+      continue
+    fi
+
+    # Look up this service in the shared map.
+    if ! _uid="$(pki_service_uid "$_svc" 2>/dev/null)"; then
+      # Key is not a known service key (e.g. a CA key or custom key).
+      # Leave it alone — it was written by cp -rp and inherits backup permissions.
+      log_info "  ${_kb}: not in service map — leaving permissions as restored from backup"
+      continue
+    fi
+    _mode="$(pki_key_mode "$_svc")"
+
+    log_info "  ${_kb}: chown ${_uid}:${_uid} chmod ${_mode}"
+    _do_restore_chown "${_uid}" "${_keyfile}" "${_kb}" "${_mode}"
   done
 
-  # Reapply canonical cert modes: certs are public material (0644); keys are 0600.
-  # Note: for 'unshare' mode, service keys were already chowned+chmod'd above
-  # inside the user namespace. These host-side find commands will fail silently
-  # on files owned by subuid-range UIDs (EPERM) — that is expected and harmless
-  # because the correct mode was already applied inside unshare.
+  # Cert files (*.crt) that were in the backup: set to 0644 (public material).
+  # We find these from the backup dir's crt files — only touch what we wrote.
+  # This is safe as a host-side chmod because certs are public; no ownership change.
+  log_info "Chmod'ing restored client certs + CA certs to 0644 (public material)"
   find "${_secrets_dir}" -maxdepth 1 -type f \
     \( -name '*_client.crt' -o -name 'ca_*.crt' \) \
     -exec chmod 0644 {} \; 2>/dev/null || true
-  find "${_secrets_dir}" -maxdepth 1 -type f -name '*.key' \
-    -exec chmod 0600 {} \; 2>/dev/null || true
-  # CA private keys are even tighter — only the PKI issuer (root/UID1001) reads
-  # them. 0400 prevents accidental overwrite even by the owning UID.
+
+  # CA private keys: tighten to 0400 ONLY if they were in the backup.
+  # (Already handled correctly by pki_service_uid — ca_root.key / ca_intermediate.key
+  #  are NOT in the service map, so they are left at backup permissions above.
+  #  We apply 0400 explicitly here as the documented CA key posture.)
   for _ca_key in ca_root.key ca_intermediate.key; do
     if [[ -f "${_secrets_dir}/${_ca_key}" ]]; then
-      chmod 0400 "${_secrets_dir}/${_ca_key}" 2>/dev/null || true
+      # Check whether this CA key was actually written from backup.
+      local _ca_was_restored=0
+      local _wk
+      for _wk in "${_written_keys[@]+"${_written_keys[@]}"}"; do
+        if [[ "$_wk" == "$_ca_key" ]]; then
+          _ca_was_restored=1
+          break
+        fi
+      done
+      if [[ "$_ca_was_restored" == "1" ]]; then
+        chmod 0400 "${_secrets_dir}/${_ca_key}" 2>/dev/null || true
+      fi
     fi
   done
 
   # BUG-58B-04a: reapply 0644 to public password/token files that the backup's
-  # per-file chmod may have tightened to 0400 (as of the BUG-58B-04a fix above,
-  # backup only tightens *.key; but pre-fix backups on disk tightened everything
-  # to 0600 via chmod -R 600). Reapply explicitly so restore is idempotent
-  # against both old and new backup formats.
+  # per-file chmod may have tightened (pre-fix backups used chmod -R 600).
+  # These are not keys — safe to chmod on the host without ownership change.
   local _public_secrets=(
     "admin_initial_password"
     "admin1_password"
@@ -740,19 +830,73 @@ _pki_chown_client_keys() {
   )
   for _f in "${_public_secrets[@]}"; do
     if [[ -f "${_secrets_dir}/${_f}" ]]; then
-      chmod 0644 "${_secrets_dir}/${_f}"
+      chmod 0644 "${_secrets_dir}/${_f}" 2>/dev/null || true
     fi
   done
   # bootstrap_token files (glob — one per service registered in manifest)
   find "${_secrets_dir}" -maxdepth 1 -type f -name '*_bootstrap_token' \
-    -exec chmod 0644 {} \;
+    -exec chmod 0644 {} \; 2>/dev/null || true
 
-  log_success "Service key ownership + canonical file modes reapplied"
+  log_success "Service key ownership applied to ${#_written_keys[@]} restored key(s)"
 
-  # Defensive assertion: no world/group-readable private key files (S1 / CWE-732).
+  # S1 / CWE-732 assertion — data-driven per-service mode check.
+  #
+  # Replaces the previous blanket `find -perm -040` which fired a false-positive
+  # on prometheus_client.key (legitimately 0640 per EX-231-10).
+  #
+  # Two sub-checks:
+  #   A) Per-service: actual mode must match pki_key_mode() for every written key
+  #      that is in the shared map. This catches silent chmod regression on any
+  #      service, including future 0640 services.
+  #   B) World-readable sweep: any *.key file with the world-read bit (004) is
+  #      always wrong — no service requires world-readable private keys.
+  #
+  # Note: for 'unshare' mode, subuid-range-owned files may not be stat-able by
+  # the host caller — stat returns empty. We treat empty-stat as skip (not PASS)
+  # to avoid false-positives; the log makes the skip visible.
+  #
+  # Portable stat: GNU stat -c '%a'; BSD stat -f '%OLp' (macOS).
+  _stat_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1" 2>/dev/null || true
+  }
+
+  local _cwe732_fail=0
+
+  # Sub-check A: per-service mode parity for written keys in the shared map.
+  local _ck _csvc _exp_mode _act_mode _ckfile
+  for _ck in "${_written_keys[@]+"${_written_keys[@]}"}"; do
+    _csvc="${_ck%_client.key}"
+    if ! _exp_mode="$(pki_key_mode "$_csvc" 2>/dev/null)"; then
+      # Not a known service key (CA key or custom) — skip mode check for sub-A;
+      # sub-B world-read sweep covers it.
+      continue
+    fi
+    _ckfile="${_secrets_dir}/${_ck}"
+    if [[ ! -f "$_ckfile" ]]; then
+      continue  # already reported as missing above
+    fi
+    _act_mode="$(_stat_mode "$_ckfile")"
+    if [[ -z "$_act_mode" ]]; then
+      log_warn "CWE-732 check: cannot stat ${_ck} (unshare namespace?) — mode unverified"
+      continue
+    fi
+    # Normalise: strip leading zeros that BSD stat omits (e.g. "640" vs "0640").
+    _exp_mode="${_exp_mode#0}"
+    _act_mode="${_act_mode#0}"
+    if [[ "$_act_mode" != "$_exp_mode" ]]; then
+      log_error "CWE-732: ${_ck} mode is ${_act_mode}, expected ${_exp_mode} (from pki_key_mode)"
+      _cwe732_fail=1
+    fi
+  done
+
+  # Sub-check B: world-readable bit on any *.key is always wrong.
   if find "${_secrets_dir}" -maxdepth 1 -type f -name '*.key' \
-        \( -perm -004 -o -perm -040 \) 2>/dev/null | grep -q .; then
-    log_error "CWE-732: group/world-readable *.key file(s) under ${_secrets_dir} after chown step"
+        -perm -004 2>/dev/null | grep -q .; then
+    log_error "CWE-732: world-readable *.key file(s) under ${_secrets_dir} after restore chown"
+    _cwe732_fail=1
+  fi
+
+  if [[ "$_cwe732_fail" == "1" ]]; then
     exit 1
   fi
 }
@@ -791,11 +935,13 @@ _refresh_pgdata_ca() {
 
   if [[ -z "$pg_target" ]]; then
     log_warn "Postgres not running -- PGDATA CA refresh deferred."
-    log_warn "  After bringing postgres up, exec into the postgres container and run:"
+    log_warn "  After bringing postgres up, exec into the postgres container/pod as the postgres user"
+    log_warn "  (K8s: kubectl exec -n <ns> <pod> -- sh; Compose: docker/podman exec <container> sh)"
+    log_warn "  then run:"
     log_warn "    cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > \${PGDATA}/root.crt"
-    log_warn "    chown postgres:postgres \${PGDATA}/root.crt && chmod 0640 \${PGDATA}/root.crt"
-    log_warn "    install -m0644 -o postgres -g postgres /run/secrets/postgres_client.crt \${PGDATA}/server.crt"
-    log_warn "    install -m0600 -o postgres -g postgres /run/secrets/postgres_client.key \${PGDATA}/server.key"
+    log_warn "    chmod 0640 \${PGDATA}/root.crt"
+    log_warn "    cp /run/secrets/postgres_client.crt \${PGDATA}/server.crt && chmod 0644 \${PGDATA}/server.crt"
+    log_warn "    cp /run/secrets/postgres_client.key \${PGDATA}/server.key && chmod 0600 \${PGDATA}/server.key"
     log_warn "    pg_ctl -D \${PGDATA} reload"
     return 0
   fi
@@ -808,6 +954,18 @@ _refresh_pgdata_ca() {
   # trust store missing the intermediate. pgbouncer presents leaves signed
   # by the intermediate; postgres's ssl_ca_file rejects them because the
   # chain is incomplete. Fix: match install.sh exactly — cat both PEMs.
+  # K8s privilege model: the postgres pod runs as runAsUser: 70 (postgres user on
+  # Alpine). kubectl exec inherits that UID — it does NOT arrive as root.
+  # Compose/Podman paths: exec -T postgres also runs as the postgres user because
+  # the container drops to postgres after entrypoint init.
+  #
+  # Consequence: `install -o postgres` and `gosu postgres` are unavailable here —
+  # both require root (install -o changes file ownership; gosu does setuid).
+  # su -s /bin/sh postgres also requires root (setuid to another user).
+  #
+  # Correct approach: since we are already running as the postgres UID (70), use
+  # cp + chmod to install files we own. pg_ctl is called directly without any
+  # user-switch wrapper.
   if ! pg_exec "$pg_target" sh -c '
     set -e
     PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
@@ -815,26 +973,28 @@ _refresh_pgdata_ca() {
     # Trust bundle: root + intermediate concatenated (must match install.sh line that
     # does: cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > ${PGDATA}/root.crt)
     cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > "${PGDATA}/root.crt"
-    chown postgres:postgres "${PGDATA}/root.crt"
+    # chown to ourselves is a no-op on Linux; chmod is valid as owner regardless of root.
+    # DO NOT use install -o / -g here: that requires root privilege. We are running as
+    # the postgres UID (70) and can chmod files we own without root.
     chmod 0640 "${PGDATA}/root.crt"
-    install -m 0644 -o postgres -g postgres /run/secrets/postgres_client.crt "${PGDATA}/server.crt"
-    install -m 0600 -o postgres -g postgres /run/secrets/postgres_client.key "${PGDATA}/server.key"
-    # pg_ctl cannot run as root. Use gosu if available (official postgres image),
-    # fall back to su -s /bin/sh postgres for other distros. Both drop to the
-    # postgres UID before invoking pg_ctl. Compose/VM paths exec as the postgres
-    # user natively; only K8s kubectl exec arrives as root.
-    if command -v gosu >/dev/null 2>&1; then
-      gosu postgres pg_ctl -D "${PGDATA}" reload
-    else
-      su -s /bin/sh postgres -c "pg_ctl -D \"${PGDATA}\" reload"
-    fi
+    # cp preserves the source file; chmod to the required mode after copy.
+    # install -m -o is intentionally avoided: it requires CAP_CHOWN / root.
+    cp /run/secrets/postgres_client.crt "${PGDATA}/server.crt"
+    chmod 0644 "${PGDATA}/server.crt"
+    cp /run/secrets/postgres_client.key "${PGDATA}/server.key"
+    chmod 0600 "${PGDATA}/server.key"
+    # pg_ctl requires the postgres UID — which we already are. Do NOT use gosu or
+    # su: gosu is a setuid helper (unavailable to non-root), su requires CAP_SETUID.
+    # Direct invocation is correct here for both K8s (runAsUser: 70) and Compose
+    # (entrypoint drops to postgres before any exec command).
+    pg_ctl -D "${PGDATA}" reload
   '; then
     log_error "PGDATA CA refresh failed. mTLS between pgbouncer and postgres may be broken."
-    log_error "  Manual recovery: exec into postgres, run:"
+    log_error "  Manual recovery: exec into postgres pod/container as the postgres user, then run:"
     log_error "    cat /run/secrets/ca_root.crt /run/secrets/ca_intermediate.crt > \${PGDATA}/root.crt"
-    log_error "    chown postgres:postgres \${PGDATA}/root.crt && chmod 0640 \${PGDATA}/root.crt"
-    log_error "    install -m0644 -o postgres -g postgres /run/secrets/postgres_client.crt \${PGDATA}/server.crt"
-    log_error "    install -m0600 -o postgres -g postgres /run/secrets/postgres_client.key \${PGDATA}/server.key"
+    log_error "    chmod 0640 \${PGDATA}/root.crt"
+    log_error "    cp /run/secrets/postgres_client.crt \${PGDATA}/server.crt && chmod 0644 \${PGDATA}/server.crt"
+    log_error "    cp /run/secrets/postgres_client.key \${PGDATA}/server.key && chmod 0600 \${PGDATA}/server.key"
     log_error "    pg_ctl -D \${PGDATA} reload"
     return 1
   fi
@@ -1154,6 +1314,89 @@ _restore_k8s_postgres_secrets() {
 }
 
 # ---------------------------------------------------------------------------
+# PR #67 K8s verify path (retro K8s gap, v2.23.3):
+#
+# After _restore_k8s_secrets + _restore_k8s_postgres_secrets update the K8s
+# secrets and patch pgbouncer's DATABASE_URL, the running pods still have the
+# OLD secret values in their environment (K8s does not hot-reload secrets into
+# running pods unless the pods are restarted). Without an explicit rollout
+# restart + wait, the restore "succeeds" while every pod continues to use the
+# pre-restore credentials → auth failures on the next request.
+#
+# This function:
+#   1. Triggers `kubectl rollout restart deployment` across all Yashigani
+#      deployments in the namespace.
+#   2. Waits for each deployment to reach its desired state with a 300s
+#      timeout (enough for rolling restart on Docker Desktop / kind; extend
+#      with KUBECTL_ROLLOUT_TIMEOUT if needed).
+#   3. Probes the gateway's /healthz endpoint via `kubectl exec` to confirm
+#      the restored pod is serving. A non-200 response is surfaced as a
+#      warning — the restore is already committed, but the operator must
+#      investigate before declaring success.
+# ---------------------------------------------------------------------------
+_k8s_post_restore_verify() {
+  local _ns="${K8S_NAMESPACE}"
+  local _timeout="${KUBECTL_ROLLOUT_TIMEOUT:-300s}"
+
+  log_info "K8s post-restore: restarting deployments in namespace '${_ns}'..."
+
+  # Collect all Yashigani-owned deployments.
+  local _deployments
+  _deployments=$(kubectl get deployments -n "${_ns}" \
+    -l "app.kubernetes.io/instance=yashigani" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "${_deployments}" ]]; then
+    # Fall back to all deployments in the namespace if the label selector
+    # returns nothing (e.g. label not present on all resources).
+    _deployments=$(kubectl get deployments -n "${_ns}" \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+  fi
+
+  if [[ -z "${_deployments}" ]]; then
+    log_warn "No deployments found in namespace '${_ns}' — skipping rollout restart"
+    return 0
+  fi
+
+  if ! kubectl rollout restart deployment -n "${_ns}" >/dev/null 2>&1; then
+    log_warn "kubectl rollout restart failed — pods may still carry pre-restore credentials. Manual: kubectl rollout restart deployment -n ${_ns}"
+  else
+    log_info "Rollout restart triggered. Waiting for deployments to become ready (timeout: ${_timeout})..."
+  fi
+
+  # Wait for each deployment individually so we can report per-deployment failures.
+  local _failed=0
+  for _dep in ${_deployments}; do
+    if ! kubectl rollout status deployment/"${_dep}" \
+        --namespace "${_ns}" \
+        --timeout="${_timeout}" >/dev/null 2>&1; then
+      log_warn "Deployment ${_dep} did not reach Ready within ${_timeout} — check: kubectl get pods -n ${_ns} -l app.kubernetes.io/name=${_dep}"
+      _failed=$((_failed + 1))
+    else
+      log_info "  deployment/${_dep}: Ready"
+    fi
+  done
+
+  if [[ "${_failed}" -gt 0 ]]; then
+    log_warn "${_failed} deployment(s) did not stabilise — restore committed but service may be degraded. Investigate before use."
+    return 0  # non-fatal: restore data is already in place
+  fi
+
+  log_info "All deployments ready. Probing gateway /healthz..."
+
+  # Probe via kubectl exec to avoid network dependency (no port-forward required).
+  local _healthz
+  _healthz=$(kubectl exec -n "${_ns}" deployment/yashigani-gateway -- \
+    curl -sf --max-time 5 http://localhost:8080/healthz 2>/dev/null || true)
+
+  if [[ -z "${_healthz}" ]]; then
+    log_warn "Gateway /healthz probe returned no output — service may be starting up. Retry: kubectl exec -n ${_ns} deployment/yashigani-gateway -- curl -sf http://localhost:8080/healthz"
+  else
+    log_success "Gateway /healthz OK: ${_healthz}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Parse args
 # ---------------------------------------------------------------------------
 RESTORE_TARGET=""
@@ -1177,27 +1420,72 @@ while [[ $# -gt 0 ]]; do
       FORCE=true
       shift
       ;;
+    --encrypted)
+      # --encrypted IDENTITY FILE  — identity key then archive path
+      # --encrypted FILE           — identity from env/default, archive is $2
+      ENCRYPTED_MODE=true
+      shift
+      # Check whether next arg looks like an age identity file (ends .age) or
+      # is the archive itself (.tar.gz.age). Accept either order:
+      #   --encrypted /etc/yashigani/backup-identity.age /path/to/backup.tar.gz.age
+      #   --encrypted /path/to/backup.tar.gz.age         (identity from env/default)
+      if [[ "${1:-}" == *.age && "${1:-}" != *.tar.gz.age ]]; then
+        # First positional arg looks like an identity key
+        IDENTITY_FILE="$1"
+        shift
+        RESTORE_TARGET="${1:-}"
+        [[ -n "${RESTORE_TARGET}" ]] && shift
+      else
+        # No identity arg — use default/env; next arg is the archive
+        RESTORE_TARGET="${1:-}"
+        [[ -n "${RESTORE_TARGET}" ]] && shift
+      fi
+      ;;
+    --validate)
+      # Opt-in: after K8s restore completes, invoke scripts/k8s-restore-validate.sh.
+      # Default is off so the restore completes quickly without requiring kubectl
+      # port-forward access from the operator's terminal.
+      RUN_VALIDATE=true
+      shift
+      ;;
     --help|-h)
       cat <<'EOF'
 Yashigani Restore Script
 
 Usage:
-  bash restore.sh                              List available backups
-  bash restore.sh <backup_dir>                 Restore from specific backup
-  bash restore.sh --latest                     Restore most recent backup
-  bash restore.sh --latest --k8s -n yashigani  Restore into Kubernetes
+  bash restore.sh                                       List available backups
+  bash restore.sh <backup_dir>                          Restore from specific backup
+  bash restore.sh --latest                              Restore most recent backup
+  bash restore.sh --latest --k8s -n yashigani          Restore into Kubernetes
+  bash restore.sh --latest --k8s --validate            Restore + run k8s-restore-validate.sh
+  bash restore.sh --encrypted <identity.age> <file.tar.gz.age>  Decrypt + restore encrypted backup
 
 Options:
-  --k8s, --kubernetes   Restore into a Kubernetes cluster
-  -n, --namespace NS    Kubernetes namespace (default: yashigani)
-  --latest              Use most recent backup
-  --force               Skip validation warnings
-  --help                Show this help
+  --k8s, --kubernetes      Restore into a Kubernetes cluster
+  -n, --namespace NS       Kubernetes namespace (default: yashigani)
+  --latest                 Use most recent backup
+  --force                  Skip validation warnings
+  --validate               (K8s only) Run k8s-restore-validate.sh after restore (default: off)
+  --encrypted IDENTITY FILE  Decrypt FILE using age IDENTITY then restore (MP.L2-3.8.9)
+                           IDENTITY defaults to YASHIGANI_BACKUP_IDENTITY_FILE or
+                           /etc/yashigani/backup-identity.age when only FILE is given
+  --help                   Show this help
 
 Supported platforms:
   - Docker Compose (Linux/macOS)
   - Podman Compose (Linux/macOS rootless)
   - Kubernetes (via kubectl)
+
+Encrypted backups (age):
+  Produced by scripts/backup.sh. Decrypt + restore in one step:
+    bash restore.sh --encrypted /etc/yashigani/backup-identity.age \
+      /var/lib/yashigani/backups/20260509_120000.tar.gz.age
+
+  Or set YASHIGANI_BACKUP_IDENTITY_FILE and pass the archive path directly:
+    YASHIGANI_BACKUP_IDENTITY_FILE=/etc/yashigani/backup-identity.age \
+      bash restore.sh /var/lib/yashigani/backups/20260509_120000.tar.gz.age
+
+  Legacy unencrypted backups (.tar.gz or directory) are still accepted with a warning.
 EOF
       exit 0
       ;;
@@ -1208,10 +1496,172 @@ EOF
   esac
 done
 
+# ---------------------------------------------------------------------------
+# decrypt_and_restore — MP.L2-3.8.9
+#
+# Decrypts a .tar.gz.age file produced by scripts/backup.sh using the
+# operator's age identity key, extracts the tarball to a temporary directory,
+# then delegates to restore_backup() for the standard secrets/env/DB restore
+# flow.  Works on Docker, Podman, and K8s (same runtime detection as the
+# directory-based path).
+#
+# Temporary extraction is placed under BACKUPS_DIR (same filesystem as the
+# archive for efficient rename) and is cleaned up on exit regardless of
+# success/failure.
+# ---------------------------------------------------------------------------
+decrypt_and_restore() {
+  local archive_file="$1"
+
+  # Validate age binary
+  if ! command -v age >/dev/null 2>&1; then
+    log_error "age binary not found — cannot decrypt backup."
+    log_error "  On Debian/Ubuntu: apt-get install -y age"
+    log_error "  On Alpine:        apk add age"
+    log_error "  From upstream:    https://age-encryption.org/"
+    exit 1
+  fi
+
+  # Validate identity file
+  if [[ ! -f "${IDENTITY_FILE}" ]]; then
+    log_error "age identity (private key) file not found: ${IDENTITY_FILE}"
+    log_error "  Set YASHIGANI_BACKUP_IDENTITY_FILE or pass: --encrypted <identity.age> <archive.tar.gz.age>"
+    log_error "  See docs/operations/backup.md — 'Encryption' section."
+    exit 1
+  fi
+  # Identity file must not be world/group-readable (CWE-732)
+  local _id_perm
+  _id_perm=$(stat -c '%a' "${IDENTITY_FILE}" 2>/dev/null || stat -f '%OLp' "${IDENTITY_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${_id_perm}" && "${_id_perm}" != "400" && "${_id_perm}" != "600" ]]; then
+    log_warn "Identity file permissions are ${_id_perm} — should be 400 or 600 (CWE-732)."
+    log_warn "  Fix: chmod 0400 ${IDENTITY_FILE}"
+  fi
+
+  if [[ ! -f "${archive_file}" ]]; then
+    log_error "Encrypted archive not found: ${archive_file}"
+    exit 1
+  fi
+
+  if [[ "${archive_file}" != *.tar.gz.age ]]; then
+    log_warn "Archive does not have .tar.gz.age extension: ${archive_file}"
+    log_warn "  Attempting decryption anyway — file may still be age-encrypted."
+  fi
+
+  log_info "Decrypting: ${archive_file}"
+  log_info "  Identity:  ${IDENTITY_FILE}"
+
+  # Create temp extraction directory under BACKUPS_DIR (same filesystem).
+  # umask 077 at script top ensures it is created 0700.
+  # NOTE: _DECRYPT_EXTRACT_DIR is intentionally NOT declared local — bash EXIT
+  # traps run in the main shell scope, not the function scope, so local variables
+  # from decrypt_and_restore() are inaccessible there. Using a script-global
+  # variable ensures the cleanup trap can always expand the path even if
+  # restore_backup() exits non-zero (triggering set -e and bypassing the
+  # explicit trap - INT TERM EXIT at the end of this function).
+  local _ts
+  _ts="$(date -u +%Y%m%d_%H%M%S)"
+  _DECRYPT_EXTRACT_DIR="${BACKUPS_DIR}/.age-extract-${_ts}-$$"
+  mkdir -p "${_DECRYPT_EXTRACT_DIR}"
+  # local alias for readability within this function
+  local _extract_dir="${_DECRYPT_EXTRACT_DIR}"
+
+  # Register cleanup on any exit
+  trap 'rm -rf "${_DECRYPT_EXTRACT_DIR}" 2>/dev/null; exit 1' INT TERM
+  trap 'rm -rf "${_DECRYPT_EXTRACT_DIR}" 2>/dev/null' EXIT
+
+  log_info "Decrypting and extracting archive..."
+  if ! age --decrypt --identity "${IDENTITY_FILE}" "${archive_file}" \
+         | tar --extract --gzip --directory "${_extract_dir}" 2>/dev/null; then
+    log_error "Decryption or extraction failed."
+    log_error "  Verify the identity key matches the recipient key used during backup."
+    log_error "  Verify the archive is not truncated: ls -lh ${archive_file}"
+    rm -rf "${_extract_dir}" 2>/dev/null || true
+    trap - INT TERM EXIT
+    exit 1
+  fi
+
+  log_success "Archive decrypted and extracted to ${_extract_dir}"
+
+  # Locate the actual backup directory inside the extraction root.
+  # backup.sh archives SOURCE_DIR (e.g. /var/lib/yashigani), so extracted
+  # root contains a single subdirectory named after the source base.
+  # We also support the legacy pattern where the tarball root IS the backup dir
+  # (i.e. contains secrets/ and .env directly).
+  local _backup_dir=""
+  if [[ -d "${_extract_dir}/secrets" || -f "${_extract_dir}/.env" ]]; then
+    # Tarball root is the backup dir
+    _backup_dir="${_extract_dir}"
+  else
+    # Look for the first subdirectory
+    local _sub
+    _sub=$(find "${_extract_dir}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [[ -n "${_sub}" ]]; then
+      _backup_dir="${_sub}"
+    fi
+  fi
+
+  if [[ -z "${_backup_dir}" || ( ! -d "${_backup_dir}/secrets" && ! -f "${_backup_dir}/.env" ) ]]; then
+    log_error "Could not locate backup data (secrets/ or .env) inside extracted archive."
+    log_error "  Extraction root: ${_extract_dir}"
+    rm -rf "${_extract_dir}" 2>/dev/null || true
+    trap - INT TERM EXIT
+    exit 1
+  fi
+
+  log_info "Backup data located at: ${_backup_dir}"
+
+  # Delegate to standard restore_backup() flow
+  restore_backup "${_backup_dir}"
+
+  # Cleanup extraction temp
+  rm -rf "${_extract_dir}" 2>/dev/null || true
+  trap - INT TERM EXIT
+}
+
 detect_runtime
+
+# ---------------------------------------------------------------------------
+# Handle encrypted archive (.tar.gz.age) when passed as RESTORE_TARGET
+# without --encrypted flag but with YASHIGANI_BACKUP_IDENTITY_FILE set.
+# Also handle legacy unencrypted .tar.gz tarballs with a warning.
+# ---------------------------------------------------------------------------
+if [[ "${ENCRYPTED_MODE}" == "false" && "${RESTORE_TARGET}" == *.tar.gz.age ]]; then
+  log_warn "Archive appears to be age-encrypted (.tar.gz.age). Enabling encrypted restore path."
+  log_warn "  Using identity: ${IDENTITY_FILE}"
+  ENCRYPTED_MODE=true
+fi
+if [[ "${ENCRYPTED_MODE}" == "false" && "${RESTORE_TARGET}" == *.tar.gz ]]; then
+  log_warn "LEGACY: Unencrypted .tar.gz backup detected. Backups created by scripts/backup.sh"
+  log_warn "  (v2.23.3+) are encrypted with age (MP.L2-3.8.9). This backup predates encryption."
+  log_warn "  Extracting for restore — recommend re-creating this backup with encryption."
+  if ! command -v tar >/dev/null 2>&1; then
+    log_error "tar not found — cannot extract legacy backup"
+    exit 1
+  fi
+  _ts_legacy="$(date -u +%Y%m%d_%H%M%S)"
+  _extract_legacy="${BACKUPS_DIR}/.legacy-extract-${_ts_legacy}-$$"
+  mkdir -p "${_extract_legacy}"
+  # shellcheck disable=SC2064
+  trap 'rm -rf "${_extract_legacy}" 2>/dev/null; exit 1' INT TERM
+  if ! tar --extract --gzip --directory "${_extract_legacy}" --file "${RESTORE_TARGET}" 2>/dev/null; then
+    log_error "tar extraction failed for legacy archive: ${RESTORE_TARGET}"
+    rm -rf "${_extract_legacy}" 2>/dev/null || true
+    trap - INT TERM
+    exit 1
+  fi
+  _legacy_dir=$(find "${_extract_legacy}" -mindepth 0 -maxdepth 1 \( -name "secrets" -o -name ".env" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "${_extract_legacy}")
+  restore_backup "${_legacy_dir:-${_extract_legacy}}"
+  rm -rf "${_extract_legacy}" 2>/dev/null || true
+  trap - INT TERM
+  exit 0
+fi
 
 case "${RESTORE_TARGET}" in
   "")
+    if [[ "${ENCRYPTED_MODE}" == "true" ]]; then
+      log_error "--encrypted specified but no archive path given."
+      log_error "  Usage: bash restore.sh --encrypted [identity.age] <archive.tar.gz.age>"
+      exit 1
+    fi
     list_backups
     ;;
   --latest)
@@ -1223,7 +1673,9 @@ case "${RESTORE_TARGET}" in
     restore_backup "$latest"
     ;;
   *)
-    if [[ -d "$RESTORE_TARGET" ]]; then
+    if [[ "${ENCRYPTED_MODE}" == "true" ]]; then
+      decrypt_and_restore "${RESTORE_TARGET}"
+    elif [[ -d "$RESTORE_TARGET" ]]; then
       restore_backup "$RESTORE_TARGET"
     elif [[ -d "${BACKUPS_DIR}/${RESTORE_TARGET}" ]]; then
       restore_backup "${BACKUPS_DIR}/${RESTORE_TARGET}"
@@ -1234,3 +1686,23 @@ case "${RESTORE_TARGET}" in
     fi
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Optional post-restore K8s validation (opt-in via --validate)
+# ---------------------------------------------------------------------------
+if [[ "$RUN_VALIDATE" == "true" ]]; then
+  if [[ "$K8S_MODE" != "true" ]]; then
+    log_warn "--validate is only meaningful with --k8s. Skipping."
+  else
+    VALIDATE_SCRIPT="${WORK_DIR}/scripts/k8s-restore-validate.sh"
+    if [[ ! -x "$VALIDATE_SCRIPT" ]]; then
+      log_warn "--validate specified but ${VALIDATE_SCRIPT} not found or not executable. Skipping."
+    else
+      log_info "Running K8s restore validation (scripts/k8s-restore-validate.sh)..."
+      KUBECTL_NAMESPACE="${K8S_NAMESPACE}" bash "${VALIDATE_SCRIPT}" || {
+        log_error "K8s restore validation reported failures — see output above."
+        exit 1
+      }
+    fi
+  fi
+fi

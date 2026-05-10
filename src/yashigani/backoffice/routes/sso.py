@@ -27,6 +27,7 @@ V6.8.4 — acr/amr allowlist validation (ASVS V6.3.3):
 
 Last updated: 2026-04-28T23:58:36+01:00
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -44,6 +45,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from yashigani.backoffice.state import backoffice_state
 from yashigani.auth.session import _mask_ip
+from yashigani.backoffice.schemas.bopla import IdPPublic
 from yashigani.licensing.enforcer import (
     require_feature,
     LicenseFeatureGated,
@@ -73,6 +75,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9\-]")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _redis():
     """
     Return a raw Redis client for SSO state storage.
@@ -93,12 +96,14 @@ def _build_redirect_uri(request: Request, idp_id: str) -> str:
 
 def _store_state(r, state: str, idp_id: str, nonce: str, code_verifier: str = "") -> None:
     """Persist state -> {idp_id, nonce, code_verifier, issued_at} in Redis with TTL."""
-    payload = json.dumps({
-        "idp_id": idp_id,
-        "nonce": nonce,
-        "code_verifier": code_verifier,
-        "issued_at": time.time(),
-    })
+    payload = json.dumps(
+        {
+            "idp_id": idp_id,
+            "nonce": nonce,
+            "code_verifier": code_verifier,
+            "issued_at": time.time(),
+        }
+    )
     r.setex(f"{_STATE_KEY_PREFIX}{state}", _STATE_TTL_SECONDS, payload)
 
 
@@ -145,6 +150,7 @@ def _get_hmac_key() -> bytes:
             pass
     if not key:
         import logging as _logging
+
         _crit = _logging.getLogger("yashigani.security")
         _crit.critical(
             "_get_hmac_key: no YASHIGANI_DB_AES_KEY env var AND no "
@@ -169,6 +175,7 @@ def _derive_org_id() -> str:
     license_id = ""
     try:
         from yashigani.licensing.enforcer import get_license
+
         lic = get_license()
         license_id = lic.license_id or lic.org_domain or ""
     except Exception:
@@ -244,14 +251,16 @@ def _resolve_or_create_identity(
         if existing.get("status") in ("suspended", "inactive"):
             logger.warning(
                 "SSO: rejected suspended identity %s (email_hash=%s)",
-                identity_id, _email_hash(email),
+                identity_id,
+                _email_hash(email),
             )
             raise RuntimeError(f"identity_suspended:{identity_id}")
         # Keep groups and last_seen_at fresh.
         registry.update(identity_id, groups=groups)
         logger.info(
             "SSO: resolved existing identity %s (email_hash=%s)",
-            identity_id, _email_hash(email),
+            identity_id,
+            _email_hash(email),
         )
         return identity_id
 
@@ -271,12 +280,15 @@ def _resolve_or_create_identity(
     except LicenseLimitExceeded as exc:
         logger.warning(
             "SSO: end-user seat limit reached for new identity (email_hash=%s): %s",
-            _email_hash(email), exc,
+            _email_hash(email),
+            exc,
         )
         raise RuntimeError(f"end_user_limit_exceeded:{exc.current}:{exc.max_val}") from exc
     logger.info(
         "SSO: created new identity %s slug=%s (email_hash=%s)",
-        identity_id, slug, _email_hash(email),
+        identity_id,
+        slug,
+        _email_hash(email),
     )
     return identity_id
 
@@ -296,6 +308,7 @@ def _write_sso_success_audit(
     iss: str = "",
 ) -> None:
     from yashigani.audit.schema import SSOLoginSuccessEvent
+
     try:
         if backoffice_state.audit_writer is None:
             return
@@ -324,6 +337,7 @@ def _write_sso_failure_audit(
     client_ip: str,
 ) -> None:
     from yashigani.audit.schema import SSOLoginFailureEvent
+
     try:
         if backoffice_state.audit_writer is None:
             return
@@ -353,6 +367,7 @@ def _write_saml_success_audit(
 ) -> None:
     """V6.8.4 — write SAML-specific success event with AuthnContextClassRef."""
     from yashigani.audit.schema import SAMLLoginSuccessEvent
+
     try:
         if backoffice_state.audit_writer is None:
             return
@@ -381,6 +396,7 @@ def _write_saml_failure_audit(
 ) -> None:
     """V6.8.4 — write SAML-specific failure event."""
     from yashigani.audit.schema import SAMLLoginFailureEvent
+
     try:
         if backoffice_state.audit_writer is None:
             return
@@ -400,6 +416,7 @@ def _write_saml_failure_audit(
 # Routes
 # ---------------------------------------------------------------------------
 
+
 @router.get("/sso/select")
 async def list_idps():
     """
@@ -411,17 +428,21 @@ async def list_idps():
         return JSONResponse(content={"idps": []})
 
     idps = broker.list_idps()
-    return JSONResponse(content={
-        "idps": [
-            {
-                "id": idp.id,
-                "name": idp.name,
-                "protocol": idp.protocol,
-                "email_domains": idp.email_domains,
-            }
-            for idp in idps
-        ]
-    })
+    # BOPLA allowlist (#90): IdPPublic strips client_secret, client_id,
+    # private_key, signing_cert, org_id, and default_sensitivity.
+    return JSONResponse(
+        content={
+            "idps": [
+                IdPPublic(
+                    id=idp.id,
+                    name=idp.name,
+                    protocol=idp.protocol,
+                    email_domains=getattr(idp, "email_domains", []) or [],
+                ).model_dump()
+                for idp in idps
+            ]
+        }
+    )
 
 
 @router.get("/sso/oidc/{idp_id}")
@@ -517,7 +538,9 @@ async def oidc_callback(
     if error:
         logger.warning(
             "OIDC callback: IdP returned error for IdP %s: %s — %s",
-            idp_id, error, error_description,
+            idp_id,
+            error,
+            error_description,
         )
         _write_sso_failure_audit(idp_id, idp_id, f"idp_error:{error}", client_ip)
         return RedirectResponse(
@@ -587,9 +610,7 @@ async def oidc_callback(
     )
 
     if not sso_result.success:
-        _write_sso_failure_audit(
-            idp_id, sso_result.idp_name or idp_id, sso_result.error, client_ip
-        )
+        _write_sso_failure_audit(idp_id, sso_result.idp_name or idp_id, sso_result.error, client_ip)
         return RedirectResponse(
             url=f"/login?error=sso_failed&idp={idp_id}",
             status_code=status.HTTP_302_FOUND,
@@ -610,30 +631,27 @@ async def oidc_callback(
         else ([str(_claim_amr_raw)] if _claim_amr_raw else [])
     )
     _claim_auth_time: Optional[int] = (
-        int(_raw_claims["auth_time"])
-        if "auth_time" in _raw_claims and _raw_claims["auth_time"] is not None
-        else None
+        int(_raw_claims["auth_time"]) if "auth_time" in _raw_claims and _raw_claims["auth_time"] is not None else None
     )
     _claim_iss: str = str(_raw_claims.get("iss", "")).strip()
 
     # acr allowlist check: if IdPConfig.required_acr_values is set,
     # the claim MUST appear in the allowlist.
     _idp_cfg = broker.get_idp(idp_id)
-    _required_acr: Optional[list] = (
-        _idp_cfg.required_acr_values if _idp_cfg else None
-    )
-    _required_amr: Optional[list] = (
-        _idp_cfg.required_amr_values if _idp_cfg else None
-    )
+    _required_acr: Optional[list] = _idp_cfg.required_acr_values if _idp_cfg else None
+    _required_amr: Optional[list] = _idp_cfg.required_amr_values if _idp_cfg else None
 
     if _required_acr is not None:
         if not _claim_acr or _claim_acr not in _required_acr:
             logger.warning(
                 "OIDC acr mismatch: IdP %s returned acr=%r, allowed=%r",
-                idp_id, _claim_acr, _required_acr,
+                idp_id,
+                _claim_acr,
+                _required_acr,
             )
             _write_sso_failure_audit(
-                idp_id, sso_result.idp_name or idp_id,
+                idp_id,
+                sso_result.idp_name or idp_id,
                 f"acr_not_in_allowlist:got={_claim_acr!r}:allowed={_required_acr!r}",
                 client_ip,
             )
@@ -647,12 +665,14 @@ async def oidc_callback(
         _missing_amr = sorted(set(_required_amr) - set(_claim_amr))
         if _missing_amr:
             logger.warning(
-                "OIDC amr insufficient: IdP %s returned amr=%r, "
-                "required methods missing: %r",
-                idp_id, _claim_amr, _missing_amr,
+                "OIDC amr insufficient: IdP %s returned amr=%r, required methods missing: %r",
+                idp_id,
+                _claim_amr,
+                _missing_amr,
             )
             _write_sso_failure_audit(
-                idp_id, sso_result.idp_name or idp_id,
+                idp_id,
+                sso_result.idp_name or idp_id,
                 f"amr_methods_missing:got={_claim_amr!r}:missing={_missing_amr!r}",
                 client_ip,
             )
@@ -663,7 +683,10 @@ async def oidc_callback(
 
     logger.info(
         "OIDC acr=%r amr=%r auth_time=%s for IdP %s",
-        _claim_acr or "(none)", _claim_amr or "(none)", _claim_auth_time, idp_id,
+        _claim_acr or "(none)",
+        _claim_amr or "(none)",
+        _claim_auth_time,
+        idp_id,
     )
 
     # Resolve or provision the Yashigani identity.
@@ -675,26 +698,20 @@ async def oidc_callback(
             groups=sso_result.groups,
             idp_name=sso_result.idp_name,
             org_id=_idp_cfg.org_id if _idp_cfg else "",
-            default_sensitivity=(
-                _idp_cfg.default_sensitivity if _idp_cfg else "INTERNAL"
-            ),
+            default_sensitivity=(_idp_cfg.default_sensitivity if _idp_cfg else "INTERNAL"),
         )
     except RuntimeError as exc:
         err_str = str(exc)
         if err_str.startswith("identity_suspended:"):
             # GROUP-2-4: suspended user tried to re-enter via SSO
-            _write_sso_failure_audit(
-                idp_id, sso_result.idp_name, "identity_suspended", client_ip
-            )
+            _write_sso_failure_audit(idp_id, sso_result.idp_name, "identity_suspended", client_ip)
             return RedirectResponse(
                 url="/login?error=account_suspended",
                 status_code=status.HTTP_302_FOUND,
             )
         if err_str.startswith("end_user_limit_exceeded:"):
             # GROUP-2-3: end-user seat limit reached
-            _write_sso_failure_audit(
-                idp_id, sso_result.idp_name, "end_user_limit_exceeded", client_ip
-            )
+            _write_sso_failure_audit(idp_id, sso_result.idp_name, "end_user_limit_exceeded", client_ip)
             return JSONResponse(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 content={
@@ -703,18 +720,14 @@ async def oidc_callback(
                 },
             )
         logger.error("SSO identity resolution failed: %s", exc)
-        _write_sso_failure_audit(
-            idp_id, sso_result.idp_name, "identity_registry_unavailable", client_ip
-        )
+        _write_sso_failure_audit(idp_id, sso_result.idp_name, "identity_registry_unavailable", client_ip)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"error": "identity_registry_unavailable"},
         )
     except Exception as exc:
         logger.error("SSO identity resolution error: %s", exc)
-        _write_sso_failure_audit(
-            idp_id, sso_result.idp_name, "identity_resolution_failed", client_ip
-        )
+        _write_sso_failure_audit(idp_id, sso_result.idp_name, "identity_resolution_failed", client_ip)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "identity_resolution_failed"},
@@ -735,21 +748,23 @@ async def oidc_callback(
         # V6.8.4: persist acr/amr/auth_time/iss so the 2FA-complete path
         # can write a fully-populated audit event.
         pending_token = secrets.token_urlsafe(32)
-        pending_data = json.dumps({
-            "identity_id": identity_id,
-            "email": sso_result.email,
-            "name": sso_result.name,
-            "groups": sso_result.groups,
-            "idp_id": idp_id,
-            "idp_name": sso_result.idp_name,
-            "client_ip": client_ip,
-            "created_at": time.time(),
-            # V6.8.4 — auth-context claims for audit on 2FA completion
-            "acr": _claim_acr,
-            "amr": _claim_amr,
-            "auth_time": _claim_auth_time,
-            "iss": _claim_iss,
-        })
+        pending_data = json.dumps(
+            {
+                "identity_id": identity_id,
+                "email": sso_result.email,
+                "name": sso_result.name,
+                "groups": sso_result.groups,
+                "idp_id": idp_id,
+                "idp_name": sso_result.idp_name,
+                "client_ip": client_ip,
+                "created_at": time.time(),
+                # V6.8.4 — auth-context claims for audit on 2FA completion
+                "acr": _claim_acr,
+                "amr": _claim_amr,
+                "auth_time": _claim_auth_time,
+                "iss": _claim_iss,
+            }
+        )
         r.setex(f"{_PENDING_2FA_PREFIX}{pending_token}", _PENDING_2FA_TTL, pending_data)
 
         response = RedirectResponse(
@@ -817,13 +832,15 @@ async def sso_2fa_page(request: Request):
     if r is None or r.get(f"{_PENDING_2FA_PREFIX}{pending_token}") is None:
         return RedirectResponse(url="/login?error=sso_2fa_expired", status_code=302)
 
-    return JSONResponse(content={
-        "status": "pending_2fa",
-        "message": "SSO authentication successful. Enter your Yashigani TOTP code to complete login.",
-        "endpoint": "/auth/sso/2fa/verify",
-        "method": "POST",
-        "fields": ["totp_code"],
-    })
+    return JSONResponse(
+        content={
+            "status": "pending_2fa",
+            "message": "SSO authentication successful. Enter your Yashigani TOTP code to complete login.",
+            "endpoint": "/auth/sso/2fa/verify",
+            "method": "POST",
+            "fields": ["totp_code"],
+        }
+    )
 
 
 @router.post("/sso/2fa/verify")
@@ -1055,12 +1072,14 @@ async def saml_acs(idp_id: str, request: Request):
         if not _saml_classref or _saml_classref not in _required_saml_acr:
             logger.warning(
                 "SAML AuthnContextClassRef mismatch: IdP %s returned %r, allowed=%r",
-                idp_id, _saml_classref, _required_saml_acr,
+                idp_id,
+                _saml_classref,
+                _required_saml_acr,
             )
             _write_saml_failure_audit(
-                idp_id, idp.name,
-                f"authn_context_class_ref_not_in_allowlist:"
-                f"got={_saml_classref!r}:allowed={_required_saml_acr!r}",
+                idp_id,
+                idp.name,
+                f"authn_context_class_ref_not_in_allowlist:got={_saml_classref!r}:allowed={_required_saml_acr!r}",
                 client_ip,
             )
             return RedirectResponse(
@@ -1070,7 +1089,9 @@ async def saml_acs(idp_id: str, request: Request):
 
     logger.info(
         "SAML AuthnContextClassRef=%r authn_instant=%s for IdP %s",
-        _saml_classref or "(none)", _saml_authn_instant or "(none)", idp_id,
+        _saml_classref or "(none)",
+        _saml_authn_instant or "(none)",
+        idp_id,
     )
 
     # Resolve or create the identity
@@ -1113,27 +1134,33 @@ async def saml_acs(idp_id: str, request: Request):
 
     if sso_2fa_required and r is not None:
         pending_token = secrets.token_urlsafe(32)
-        pending_data = json.dumps({
-            "identity_id": identity_id,
-            "email": sso_result.email,
-            "name": sso_result.name,
-            "groups": sso_result.groups,
-            "idp_id": idp_id,
-            "idp_name": idp.name,
-            "client_ip": client_ip,
-            "created_at": time.time(),
-            # V6.8.4 — persist SAML auth-context for audit on 2FA completion
-            "saml_authn_context_class_ref": _saml_classref,
-            "saml_authn_instant": _saml_authn_instant,
-            "saml_issuer": _saml_issuer,
-        })
+        pending_data = json.dumps(
+            {
+                "identity_id": identity_id,
+                "email": sso_result.email,
+                "name": sso_result.name,
+                "groups": sso_result.groups,
+                "idp_id": idp_id,
+                "idp_name": idp.name,
+                "client_ip": client_ip,
+                "created_at": time.time(),
+                # V6.8.4 — persist SAML auth-context for audit on 2FA completion
+                "saml_authn_context_class_ref": _saml_classref,
+                "saml_authn_instant": _saml_authn_instant,
+                "saml_issuer": _saml_issuer,
+            }
+        )
         r.setex(f"{_PENDING_2FA_PREFIX}{pending_token}", _PENDING_2FA_TTL, pending_data)
 
         response = RedirectResponse(url="/auth/sso/2fa", status_code=status.HTTP_302_FOUND)
         response.set_cookie(
-            key=_PENDING_2FA_COOKIE, value=pending_token,
-            httponly=True, secure=True, samesite="strict",
-            max_age=_PENDING_2FA_TTL, path="/auth",
+            key=_PENDING_2FA_COOKIE,
+            value=pending_token,
+            httponly=True,
+            secure=True,
+            samesite="strict",
+            max_age=_PENDING_2FA_TTL,
+            path="/auth",
         )
         return response
 
@@ -1146,9 +1173,12 @@ async def saml_acs(idp_id: str, request: Request):
     )
 
     _write_saml_success_audit(
-        idp_id=idp_id, idp_name=idp.name,
-        identity_id=identity_id, email=sso_result.email,
-        groups=sso_result.groups, client_ip=client_ip,
+        idp_id=idp_id,
+        idp_name=idp.name,
+        identity_id=identity_id,
+        email=sso_result.email,
+        groups=sso_result.groups,
+        client_ip=client_ip,
         org_id=idp.org_id,
         authn_context_class_ref=_saml_classref,
         authn_instant=_saml_authn_instant,
@@ -1157,8 +1187,12 @@ async def saml_acs(idp_id: str, request: Request):
 
     response = RedirectResponse(url="/chat", status_code=status.HTTP_302_FOUND)
     response.set_cookie(
-        key=_USER_SESSION_COOKIE, value=session.token,
-        httponly=True, secure=True, samesite="strict",
-        max_age=_SESSION_MAX_AGE, path="/",
+        key=_USER_SESSION_COOKIE,
+        value=session.token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=_SESSION_MAX_AGE,
+        path="/",
     )
     return response

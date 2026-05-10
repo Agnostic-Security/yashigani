@@ -3,8 +3,9 @@ Yashigani Backoffice — FastAPI admin portal.
 Isolated on port 8443. Local auth only (username + password + TOTP).
 No data-plane access. TLS required.
 
-Last updated: 2026-05-03T00:00:00+01:00
+Last updated: 2026-05-10T00:00:00+01:00
 """
+
 from __future__ import annotations
 
 import os
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -21,9 +22,12 @@ from yashigani.auth.spiffe import require_spiffe_id
 
 try:
     from prometheus_client import (
-        Counter, Histogram,
-        generate_latest, CONTENT_TYPE_LATEST,
+        Counter,
+        Histogram,
+        generate_latest,
+        CONTENT_TYPE_LATEST,
     )
+
     _PROM_AVAILABLE = True
 except ImportError:
     _PROM_AVAILABLE = False
@@ -38,7 +42,7 @@ if _PROM_AVAILABLE:
         "yashigani_backoffice_request_duration_seconds",
         "Backoffice request latency in seconds.",
         ["method", "path_prefix"],
-        buckets=[.005, .01, .025, .05, .1, .25, .5, 1.0, 2.5, 5.0],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
     )
     _bo_auth_failures_total = Counter(
         "yashigani_backoffice_auth_failures_total",
@@ -78,6 +82,14 @@ from yashigani.backoffice.routes import (
     sso_router,
     # v2.23.2 — Backup status + verify (#47)
     backup_router,
+    # v2.23.3 — Admin-triggered secret rotation
+    secrets_router,
+    # v2.23.3 — HIBP API key admin panel (#59)
+    hibp_router,
+    # v2.23.3 — WebAuthn v1 API (public login + step-up revoke)
+    webauthn_v1_router,
+    # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
+    pki_v1_router,
 )
 
 
@@ -138,12 +150,8 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
             if _os.path.exists(totp2_file):
                 totp2_secret = open(totp2_file).read().strip()
                 if totp2_secret:
-                    await auth_service.set_totp_secret_direct(
-                        admin2_username, totp2_secret
-                    )
-                    _log.info(
-                        "Bootstrap: admin2 TOTP pre-provisioned from installer secret"
-                    )
+                    await auth_service.set_totp_secret_direct(admin2_username, totp2_secret)
+                    _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret")
             _log.info("Bootstrap: backup admin account created — %s", admin2_username)
 
 
@@ -155,6 +163,7 @@ async def lifespan(app: FastAPI):
     # "this event loop is already running" and disables Postgres features.
     import logging as _logging
     import os
+
     _log = _logging.getLogger("yashigani.backoffice.lifespan")
 
     # Layer B: load the per-install caddy_internal_hmac secret.
@@ -162,6 +171,7 @@ async def lifespan(app: FastAPI):
     # CaddyVerifiedMiddleware. Raises RuntimeError if secret is missing
     # (fail-closed per SOP 1 / CLAUDE.md §3).
     from yashigani.auth.caddy_verified import load_caddy_secret as _load_caddy_secret
+
     _load_caddy_secret()
 
     db_dsn = os.getenv("YASHIGANI_DB_DSN", "")
@@ -178,7 +188,16 @@ async def lifespan(app: FastAPI):
             # its own psycopg2 connection. Multi-replica safety: alembic
             # acquires a postgres advisory lock internally — see
             # yashigani/db/__init__.py:run_migrations() (Platform gate #58c #3bv).
-            run_migrations()
+            #
+            # v2.23.3 fix: run_migrations() is sync (psycopg2 + alembic). Calling
+            # it directly on the async event loop blocks the loop for the full
+            # migration duration (~1-3 s on cold DB). Docker's first healthcheck
+            # fires at T+start_period (was 30 s); if migrations exhaust that window
+            # the container is marked unhealthy before /healthz can respond.
+            # Wrapping in asyncio.to_thread() offloads the blocking work to the
+            # default ThreadPoolExecutor, keeping the event loop responsive.
+            import asyncio as _asyncio  # noqa: PLC0415 — inline; _asyncio re-used below
+            await _asyncio.to_thread(run_migrations)
 
             await create_pool()
 
@@ -209,11 +228,33 @@ async def lifespan(app: FastAPI):
             # the K8s Helm chart pointing at yashigani-postgres:5432). Falls
             # back to YASHIGANI_DB_DSN for compose (single-replica = no race).
             from yashigani.auth.pg_auth import PostgresLocalAuthService
+
             auth_service = PostgresLocalAuthService(pool=get_pool())
             backoffice_state.auth_service = auth_service
 
+            # v2.23.3 (#59): auth_settings_store for encrypted operator config
+            # (e.g. HIBP API key). Initialised after the pool is ready.
+            # B2 fail-fast: YASHIGANI_DB_AES_KEY MUST be set; an empty or
+            # missing key causes pgp_sym_encrypt to encrypt with an empty
+            # passphrase, which is a silent data-security failure. We reject
+            # at startup rather than allowing a degraded-but-running state.
+            _aes_key = os.environ.get("YASHIGANI_DB_AES_KEY", "")
+            if not _aes_key:
+                raise RuntimeError(
+                    "YASHIGANI_DB_AES_KEY is not set. "
+                    "This key is required to encrypt auth_settings values at rest "
+                    "using pgcrypto pgp_sym_encrypt. "
+                    "Generate a 32-byte hex key (64 chars) with: "
+                    "openssl rand -hex 32 "
+                    "and add it to your .env file or Helm values secret."
+                )
+            from yashigani.auth.settings_store import AuthSettingsStore
+            backoffice_state.auth_settings_store = AuthSettingsStore(pool=get_pool())
+            _log.info("auth_settings_store initialised (pgcrypto-backed encrypted store)")
+
             import asyncio as _asyncio
             from yashigani.db.postgres import connect_with_retry_sync as _connect_retry
+
             direct_dsn = os.environ.get("YASHIGANI_DB_DSN_DIRECT") or db_dsn
 
             def _acquire_lock_sync():
@@ -249,6 +290,7 @@ async def lifespan(app: FastAPI):
 
             # Anomaly detector Redis client (DB 2), mirrors _bootstrap URL logic.
             from yashigani.gateway._redis_url import build_redis_url
+
             anomaly_redis_url = build_redis_url(
                 2,
                 use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
@@ -257,9 +299,38 @@ async def lifespan(app: FastAPI):
             )
 
             import redis as _redis
+
             anomaly_client = _redis.from_url(anomaly_redis_url, decode_responses=False)
             backoffice_state.anomaly_detector = AnomalyDetector(redis_client=anomaly_client)
             _log.info("Backoffice: DB pool + inference logger + anomaly detector ready (lifespan)")
+
+            # v2.23.3 — PgWebAuthnService: DB+Redis backed FIDO2 service.
+            # Initialised here (after create_pool) so the credential store can
+            # open tenant_transaction()s immediately on first registration.
+            # Shares the session Redis (DB 1) for challenge storage with a
+            # yashigani:webauthn:challenge: namespace.
+            try:
+                from yashigani.auth.pg_webauthn import build_pg_webauthn_service
+                from yashigani.gateway._redis_url import build_redis_url as _build_redis_url
+                _webauthn_redis_url = _build_redis_url(
+                    1,
+                    use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+                    secrets_dir=os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+                    client_cert_name="backoffice_client",
+                )
+                _webauthn_redis = _redis.from_url(_webauthn_redis_url, decode_responses=False)
+                backoffice_state.pg_webauthn_service = build_pg_webauthn_service(_webauthn_redis)
+                _log.info("PgWebAuthnService initialised (v2.23.3 FIDO2)")
+            except Exception as _wa_exc:
+                # Non-fatal: WebAuthn is optional.  Routes return 503 if pg_webauthn_service is None.
+                # W19 fix: log with exc_info=True so the full traceback is captured (not just
+                # str(exc)) — Iris integration-audit warning on PR #62.  Without exc_info the
+                # stack frame that caused the failure is lost, making mis-config hard to diagnose.
+                _log.warning(
+                    "PgWebAuthnService init failed (%s) — /api/v1/admin/webauthn/* will return 503",
+                    _wa_exc,
+                    exc_info=True,
+                )
         except Exception as exc:
             # Retro #3ar — fail-closed on lifespan init failure (CLAUDE.md §3).
             # The previous behaviour was to log a warning and continue with
@@ -270,19 +341,31 @@ async def lifespan(app: FastAPI):
             # Log the full traceback so the failing dependency is identifiable,
             # then re-raise so the container exits non-zero and orchestrator
             # surfaces the real fault instead of the secondary 500.
-            _log.exception(
-                "Backoffice lifespan init FAILED — refusing to start with auth_service=None"
-            )
+            _log.exception("Backoffice lifespan init FAILED — refusing to start with auth_service=None")
             raise
 
-    # Startup — schedule daily licence expiry check (v0.7.1)
+    # Startup — schedule daily licence expiry check (v0.7.1),
+    # grace-period audit emitter (v2.23.3),
+    # and inactive-account disable (v2.23.3, FedRAMP AC-2(F2) / LU-YSG-002).
     scheduler = None
     try:
+        import asyncio
+        import logging as _sched_log
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from yashigani.licensing.expiry_monitor import check_and_alert_licence_expiry
+        from yashigani.licensing.grace_period import emit_grace_period_audit
+        from yashigani.backoffice.inactive_account_task import run_inactive_account_disable
+
+        _inactive_interval_hours: int = 24
+        try:
+            _inactive_interval_hours = int(os.getenv("YASHIGANI_INACTIVE_DISABLE_INTERVAL_HOURS", "24"))
+            if _inactive_interval_hours < 1:
+                _inactive_interval_hours = 24
+        except (ValueError, TypeError):
+            pass
 
         scheduler = AsyncIOScheduler()
-        # Run once at startup, then every 24 hours
+        # Licence expiry — every 24 hours
         scheduler.add_job(
             check_and_alert_licence_expiry,
             trigger="interval",
@@ -290,17 +373,33 @@ async def lifespan(app: FastAPI):
             id="licence_expiry_check",
             replace_existing=True,
         )
+        # Grace-period audit — daily (v2.23.3)
+        scheduler.add_job(
+            emit_grace_period_audit,
+            trigger="interval",
+            hours=24,
+            id="licence_grace_period_audit",
+            replace_existing=True,
+        )
+        # Inactive-account disable — configurable interval (default 24h)
+        scheduler.add_job(
+            run_inactive_account_disable,
+            trigger="interval",
+            hours=_inactive_interval_hours,
+            id="inactive_account_disable",
+            replace_existing=True,
+        )
         scheduler.start()
-        # Fire immediately so the first check happens at startup, not 24h later
-        import asyncio
+        # Fire all immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
+        asyncio.ensure_future(emit_grace_period_audit())
+        asyncio.ensure_future(run_inactive_account_disable())
     except ImportError:
-        pass  # apscheduler not installed — expiry alerts disabled
+        pass  # apscheduler not installed — expiry alerts + inactive-disable disabled
     except Exception as exc:
         import logging
-        logging.getLogger(__name__).warning(
-            "Could not start licence expiry scheduler: %s", exc
-        )
+
+        logging.getLogger(__name__).warning("Could not start backoffice scheduler: %s", exc)
 
     yield
 
@@ -313,9 +412,9 @@ def create_backoffice_app() -> FastAPI:
     app = FastAPI(
         title="Yashigani Backoffice",
         version="2.1.0",
-        docs_url=None,          # disable Swagger in production
+        docs_url=None,  # disable Swagger in production
         redoc_url=None,
-        openapi_url=None,       # never expose schema externally
+        openapi_url=None,  # never expose schema externally
         lifespan=lifespan,
     )
 
@@ -325,6 +424,7 @@ def create_backoffice_app() -> FastAPI:
     # Starlette LIFO order, Spiffe runs outermost and CaddyVerified runs second.
     # load_caddy_secret() is called in lifespan() above.
     from yashigani.auth.caddy_verified import CaddyVerifiedMiddleware
+
     app.add_middleware(CaddyVerifiedMiddleware)
 
     # SPIFFE peer-cert middleware — LF-SPIFFE-FORGE backoffice leg (Compliance F-1B
@@ -346,12 +446,13 @@ def create_backoffice_app() -> FastAPI:
     # Must run outermost (added last = executed first in starlette middleware
     # stack), matching gateway/entrypoint.py placement.
     from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
+
     app.add_middleware(SpiffePeerCertMiddleware)
 
     # CORS: backoffice serves its own frontend — no cross-origin needed
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[],       # no CORS allowed
+        allow_origins=[],  # no CORS allowed
         allow_credentials=False,
         allow_methods=[],
         allow_headers=[],
@@ -406,20 +507,24 @@ def create_backoffice_app() -> FastAPI:
     # production.
     _BODY_LIMITS = [
         # (prefix, max_bytes)
-        ("/admin/audit/search",         64 * 1024),   # JSON search query
-        ("/admin/agents",               16 * 1024),   # agent register metadata
-        ("/admin/users",                4 * 1024),    # username + opt email
-        ("/admin/license",              4 * 1024),    # confirm flag or small LIC
-        ("/admin/ratelimit",            8 * 1024),
-        ("/admin/rbac",                 32 * 1024),
-        ("/admin/alerts",               32 * 1024),
-        ("/admin/budget",               16 * 1024),
-        ("/admin/backup",               256),          # backup_name only (ASVS 4.3.1)
-        ("/auth/login",                 4 * 1024),    # u/p/totp
-        ("/auth/password/change",       8 * 1024),
-        ("/auth/password/self-reset",   4 * 1024),
-        ("/auth/totp/provision",        4 * 1024),    # start + confirm variants
-        ("/auth/stepup",                4 * 1024),    # 6-digit TOTP code only
+        ("/admin/audit/search", 64 * 1024),  # JSON search query
+        ("/admin/agents", 16 * 1024),  # agent register metadata
+        ("/admin/users", 4 * 1024),  # username + opt email
+        ("/admin/license", 4 * 1024),  # confirm flag or small LIC
+        ("/api/v1/license", 256),  # status GET only, no body
+        ("/api/v1/admin/secrets", 256),  # secret name only (ASVS 4.3.1)
+        ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
+        ("/api/v1/admin/pki", 256),        # PKI rotate body (service name in URL, no body)
+        ("/admin/ratelimit", 8 * 1024),
+        ("/admin/rbac", 32 * 1024),
+        ("/admin/alerts", 32 * 1024),
+        ("/admin/budget", 16 * 1024),
+        ("/admin/backup", 256),  # backup_name only (ASVS 4.3.1)
+        ("/auth/login", 4 * 1024),  # u/p/totp
+        ("/auth/password/change", 8 * 1024),
+        ("/auth/password/self-reset", 4 * 1024),
+        ("/auth/totp/provision", 4 * 1024),  # start + confirm variants
+        ("/auth/stepup", 4 * 1024),  # 6-digit TOTP code only
         # /v1/chat/completions is intentionally not limited here — LLM prompts
         # can legitimately be large; the global 4 MB limit still applies.
     ]
@@ -464,9 +569,7 @@ def create_backoffice_app() -> FastAPI:
     async def uniform_admin_404_as_401(request: Request, call_next):
         response = await call_next(request)
         if response.status_code == 404 and request.url.path.startswith("/admin/"):
-            has_session = any(
-                request.cookies.get(k) for k in _ADMIN_SESSION_COOKIES
-            )
+            has_session = any(request.cookies.get(k) for k in _ADMIN_SESSION_COOKIES)
             if not has_session:
                 return JSONResponse(
                     status_code=401,
@@ -507,6 +610,7 @@ def create_backoffice_app() -> FastAPI:
 
     # Static files (CSS/JS for login pages etc.)
     import pathlib
+
     _static_dir = pathlib.Path(__file__).parent / "static"
     if _static_dir.exists():
         app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
@@ -526,6 +630,24 @@ def create_backoffice_app() -> FastAPI:
 
         @app.get("/admin/", include_in_schema=False)
         async def admin_dashboard_page(request: Request):
+            # Server-side session-presence check before serving the dashboard HTML.
+            # ASVS V1.4.1: access control enforced at trusted enforcement point.
+            # A missing cookie means no valid session → redirect to login.
+            # Note: cryptographic validation of the session token happens in the
+            # API layer (SessionStore.get()) on every subsequent API call; this
+            # check is a lightweight pre-flight to avoid serving the SPA shell to
+            # unauthenticated clients (closes SWEEP-06 / OWASP A07 finding).
+            # Fix: 2026-05-09 (v2.23.3).
+            _admin_cookies = (
+                "__Host-yashigani_admin_session",
+                "__Host-yashigani_session",
+            )
+            if not any(request.cookies.get(k) for k in _admin_cookies):
+                next_path = request.url.path
+                return RedirectResponse(
+                    url=f"/admin/login?next={next_path}",
+                    status_code=302,
+                )
             return _templates.TemplateResponse(request, "dashboard.html")
 
     # Routers
@@ -547,11 +669,25 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(audit_sinks_router, tags=["audit-sinks"])
     app.include_router(kms_vault_router, tags=["kms-vault"])
     app.include_router(license_router, prefix="/admin/license", tags=["license"])
+
+    # v2.23.3 — Machine-readable expiry status also available as /api/v1/license/status
+    # so CLI tools and monitoring scripts can query without knowing the /admin/ prefix.
+    # The handler is re-exported from license_router; auth is still required.
+    from yashigani.backoffice.routes.license import get_license_expiry_status
+
+    app.add_api_route(
+        "/api/v1/license/status",
+        get_license_expiry_status,
+        methods=["GET"],
+        tags=["license"],
+        summary="Machine-readable licence expiry status (v2.23.3)",
+    )
     app.include_router(opa_assistant_router, prefix="/admin/opa-assistant", tags=["opa-assistant"])
     app.include_router(alerts_router, prefix="/admin/alerts", tags=["alerts"])
     app.include_router(agent_bundles_router, prefix="/admin/agent-bundles", tags=["agent-bundles"])
     # v1.0 — Budget admin API
     from yashigani.backoffice.routes.budget import router as budget_router
+
     app.include_router(budget_router, tags=["budget"])
 
     # v2.1 — Model alias management + Sensitivity patterns
@@ -562,22 +698,43 @@ def create_backoffice_app() -> FastAPI:
 
     # v2.2 — PII detection admin API
     from yashigani.backoffice.routes.pii import router as pii_router
+
     app.include_router(pii_router, prefix="/admin/pii", tags=["pii"])
 
     # v2.3 — Cryptographic inventory (ASVS 11.1.3)
     from yashigani.backoffice.routes.crypto_inventory import router as crypto_inventory_router
+
     app.include_router(crypto_inventory_router, prefix="/admin", tags=["crypto"])
 
     # ASVS 3.4.7 — CSP violation report endpoint
     from yashigani.backoffice.routes.csp_report import router as csp_report_router
+
     app.include_router(csp_report_router, prefix="/admin", tags=["csp"])
 
     # Service management — enable/disable optional compose profiles from admin panel
     from yashigani.backoffice.routes.services import router as services_router
+
     app.include_router(services_router, tags=["services"])
 
     # v2.23.2 — Backup status + verify (#47)
     app.include_router(backup_router, tags=["backup"])
+
+    # v2.23.3 — Admin-triggered secret rotation
+    app.include_router(secrets_router, tags=["secrets"])
+
+    # v2.23.3 — HIBP API key admin panel (#59)
+    app.include_router(
+        hibp_router,
+        prefix="/api/v1/admin/auth/hibp",
+        tags=["hibp-config"],
+    )
+    # v2.23.3 — WebAuthn v1 API (Postgres+Redis backed, public login endpoints)
+    # Routes carry full /api/v1/admin/webauthn/ path — no prefix stripping.
+    app.include_router(webauthn_v1_router, tags=["webauthn-v1"])
+
+    # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
+    # Routes carry /api/v1/admin/pki/ prefix defined in the router itself.
+    app.include_router(pki_v1_router, tags=["pki"])
 
     # v0.9.0 — Phase 6: WebAuthn/Passkeys
     # webauthn_router carries its own full path segments (no prefix stripping needed)

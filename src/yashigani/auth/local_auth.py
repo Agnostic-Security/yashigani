@@ -9,10 +9,18 @@ TOTP backoff schedule (v0.2.0, ASVS v5 V2 compensating control):
   3rd failure → 4 s
   4th failure → 8 s
   5th failure → 1800 s (30-minute hard lockout, same as password lockout)
+
+v2.23.3 — Password reuse history (CMMC L2 IA.L2-3.5.8 / NIST SP 800-63B §5.1.1.2):
+  PASSWORD_HISTORY_DEPTH (env, default 12, bound 1-24) historical hashes
+  are checked against the new password on every self-service change.
+  Rejection emits a PASSWORD_REUSE_REJECTED audit event.
 """
+
+# Last updated: 2026-05-09T00:00:00+00:00
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -31,11 +39,56 @@ from yashigani.auth.totp import (
 logger = logging.getLogger(__name__)
 
 _MAX_FAILED_ATTEMPTS = 5
-_LOCKOUT_SECONDS = 1800   # 30 minutes
+_LOCKOUT_SECONDS = 1800  # 30 minutes
 
 # TOTP exponential backoff delays (seconds) indexed by failure count 1-4.
 # 5th failure triggers the same hard lockout as password failures.
-_TOTP_BACKOFF_SECONDS = [0, 1, 2, 4, 8]   # index = failure count (0 = unused)
+_TOTP_BACKOFF_SECONDS = [0, 1, 2, 4, 8]  # index = failure count (0 = unused)
+
+# ---------------------------------------------------------------------------
+# Password reuse history — CMMC L2 IA.L2-3.5.8
+# ---------------------------------------------------------------------------
+# NIST SP 800-63B §5.1.1.2: prohibit reuse for a verifier-defined number of
+# previous passwords. Default 12 matches the NIST-recommended minimum depth.
+
+_HISTORY_DEPTH_MIN = 1
+_HISTORY_DEPTH_MAX = 24
+_HISTORY_DEPTH_DEFAULT = 12
+
+
+def _get_history_depth() -> int:
+    """Parse PASSWORD_HISTORY_DEPTH env var. Returns int in [1, 24], default 12."""
+    raw = os.environ.get("PASSWORD_HISTORY_DEPTH", "")
+    if not raw:
+        return _HISTORY_DEPTH_DEFAULT
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning(
+            "PASSWORD_HISTORY_DEPTH=%r is not an integer — using default %d",
+            raw,
+            _HISTORY_DEPTH_DEFAULT,
+        )
+        return _HISTORY_DEPTH_DEFAULT
+    if not (_HISTORY_DEPTH_MIN <= val <= _HISTORY_DEPTH_MAX):
+        logger.warning(
+            "PASSWORD_HISTORY_DEPTH=%d out of range [%d, %d] — clamping",
+            val,
+            _HISTORY_DEPTH_MIN,
+            _HISTORY_DEPTH_MAX,
+        )
+        return max(_HISTORY_DEPTH_MIN, min(_HISTORY_DEPTH_MAX, val))
+    return val
+
+
+class PasswordReuseError(ValueError):
+    """Raised when a new password matches a previously-used hash in history."""
+
+    def __init__(self, depth: int):
+        self.depth = depth
+        super().__init__(
+            f"Password has been used recently. Choose a password not used in the last {depth} password change(s)."
+        )
 
 
 @dataclass
@@ -45,8 +98,8 @@ class AccountRecord:
     password_hash: str
     totp_secret: str
     recovery_codes: Optional[RecoveryCodeSet]
-    account_tier: str                       # "admin" | "user"
-    email: Optional[str] = None             # explicit email; falls back to username@yashigani.local
+    account_tier: str  # "admin" | "user"
+    email: Optional[str] = None  # explicit email; falls back to username@yashigani.local
     force_password_change: bool = True
     force_totp_provision: bool = True
     disabled: bool = False
@@ -57,6 +110,11 @@ class AccountRecord:
     totp_backoff_until: float = 0.0
     created_at: float = field(default_factory=time.time)
     password_changed_at: float = field(default_factory=time.time)
+    # v2.23.3 — FedRAMP AC-2(F2) inactive-account tracking (LU-YSG-002)
+    # last_login_at: None means never logged in (backfilled to created_at on migration).
+    # Use Optional[float] (epoch seconds) for symmetry with other time fields.
+    last_login_at: Optional[float] = None
+    inactive_disabled_at: Optional[float] = None
 
 
 class LocalAuthService:
@@ -67,8 +125,11 @@ class LocalAuthService:
     """
 
     def __init__(self, used_totp_codes: Optional[set] = None) -> None:
-        self._accounts: dict[str, AccountRecord] = {}       # username → record
+        self._accounts: dict[str, AccountRecord] = {}  # username → record
         self._used_totp_codes: set[str] = used_totp_codes or set()
+        # In-memory password history: account_id → list of (hash, changed_at)
+        # sorted oldest-first. Bounded to _get_history_depth() entries.
+        self._password_history: dict[str, list[tuple[str, float]]] = {}
 
     # -- Account lifecycle ---------------------------------------------------
 
@@ -91,11 +152,13 @@ class LocalAuthService:
         record = AccountRecord(
             account_id=_new_id(),
             username=username,
-            password_hash=hash_password(plaintext),
-            totp_secret="",              # set at first login via provisioning
+            # check_breach=False: system-generated password, not user-chosen.
+            # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+            password_hash=hash_password(plaintext, check_breach=False),
+            totp_secret="",  # set at first login via provisioning
             recovery_codes=None,
             account_tier="admin",
-            email=username,              # admin usernames are already emails
+            email=username,  # admin usernames are already emails
             force_password_change=True,
             force_totp_provision=True,
         )
@@ -111,7 +174,9 @@ class LocalAuthService:
         record = AccountRecord(
             account_id=_new_id(),
             username=username,
-            password_hash=hash_password(plaintext_password),
+            # check_breach=False: admin-generated temp password, not user-chosen.
+            # HIBP check applies to user-chosen passwords only (ASVS V2.1.7).
+            password_hash=hash_password(plaintext_password, check_breach=False),
             totp_secret="",
             recovery_codes=None,
             account_tier="user",
@@ -148,8 +213,7 @@ class LocalAuthService:
             record.failed_attempts += 1
             if record.failed_attempts >= _MAX_FAILED_ATTEMPTS:
                 record.locked_until = time.time() + _LOCKOUT_SECONDS
-                logger.warning("Account locked after %d failures: %s",
-                               _MAX_FAILED_ATTEMPTS, username)
+                logger.warning("Account locked after %d failures: %s", _MAX_FAILED_ATTEMPTS, username)
             return False, None, generic_fail
 
         # Password OK — check TOTP
@@ -172,14 +236,17 @@ class LocalAuthService:
                 record.totp_backoff_until = 0.0
                 logger.warning(
                     "Account locked after %d TOTP failures: %s",
-                    _MAX_FAILED_ATTEMPTS, username,
+                    _MAX_FAILED_ATTEMPTS,
+                    username,
                 )
             else:
                 delay = _TOTP_BACKOFF_SECONDS[min(n, len(_TOTP_BACKOFF_SECONDS) - 1)]
                 record.totp_backoff_until = time.time() + delay
                 logger.info(
                     "TOTP backoff applied: %ds for %s (attempt %d)",
-                    delay, username, n,
+                    delay,
+                    username,
+                    n,
                 )
             return False, None, generic_fail
 
@@ -191,9 +258,7 @@ class LocalAuthService:
 
     # -- TOTP provisioning ---------------------------------------------------
 
-    def provision_totp_start(
-        self, username: str
-    ) -> tuple[TotpProvisioning, RecoveryCodeSet]:
+    def provision_totp_start(self, username: str) -> tuple[TotpProvisioning, RecoveryCodeSet]:
         """
         Begin TOTP enrolment. Generates the seed + recovery codes and stores
         them against the account, but leaves ``force_totp_provision=True``
@@ -217,9 +282,7 @@ class LocalAuthService:
         record.force_totp_provision = True
         return prov, code_set
 
-    def provision_totp_confirm(
-        self, username: str, totp_code: str
-    ) -> tuple[bool, str]:
+    def provision_totp_confirm(self, username: str, totp_code: str) -> tuple[bool, str]:
         """
         Finalise TOTP enrolment by verifying the user's code against the
         seed stored during :meth:`provision_totp_start`. On success the
@@ -240,9 +303,7 @@ class LocalAuthService:
         record.force_totp_provision = False
         return True, "ok"
 
-    def provision_totp(
-        self, username: str
-    ) -> tuple[TotpProvisioning, RecoveryCodeSet]:
+    def provision_totp(self, username: str) -> tuple[TotpProvisioning, RecoveryCodeSet]:
         """
         Back-compat wrapper around :meth:`provision_totp_start`.
 
@@ -271,7 +332,10 @@ class LocalAuthService:
     ) -> tuple[bool, str]:
         """
         Self-service password change. All sessions must be invalidated by caller.
-        Returns (success, reason).
+
+        CMMC L2 IA.L2-3.5.8: checks the new password against the last
+        PASSWORD_HISTORY_DEPTH hashes. Rejects on match with reason
+        "password_reuse". Returns (success, reason).
         """
         record = self._accounts.get(username)
         if record is None:
@@ -283,8 +347,32 @@ class LocalAuthService:
         if not verify_totp(record.totp_secret, totp_code, self._used_totp_codes):
             return False, "invalid_totp"
 
+        # -- Password reuse history check (IA.L2-3.5.8) ---------------------
+        depth = _get_history_depth()
+        history = self._password_history.get(record.account_id, [])
+        # Check last `depth` entries (newest-first for early exit on recent reuse).
+        for stored_hash, _ in reversed(history[-depth:]):
+            if verify_password(new_password, stored_hash):
+                logger.info(
+                    "Password change rejected — reuse detected (user_id=%s, depth=%d)",
+                    record.account_id,
+                    depth,
+                )
+                return False, "password_reuse"
+
+        # -- Commit the change ----------------------------------------------
+        old_hash = record.password_hash
         record.password_hash = hash_password(new_password)
         record.force_password_change = False
+
+        # Append old hash to history, then prune to depth.
+        if record.account_id not in self._password_history:
+            self._password_history[record.account_id] = []
+        self._password_history[record.account_id].append((old_hash, time.time()))
+        # Keep only the most recent `depth` entries (oldest first).
+        if len(self._password_history[record.account_id]) > depth:
+            self._password_history[record.account_id] = self._password_history[record.account_id][-depth:]
+
         return True, "ok"
 
     # -- Admin actions -------------------------------------------------------
@@ -313,9 +401,10 @@ class LocalAuthService:
         record.force_totp_provision = True
         record.failed_attempts = 0
         record.locked_until = 0.0
-        # Password is reset by generating a new temporary one
+        # Password is reset by generating a new temporary one.
+        # check_breach=False: system-generated temp password, not user-chosen.
         temp_password = generate_password(36)
-        record.password_hash = hash_password(temp_password)
+        record.password_hash = hash_password(temp_password, check_breach=False)
 
         return True, "ok"
 
@@ -334,27 +423,19 @@ class LocalAuthService:
         return False
 
     def active_admin_count(self) -> int:
-        return sum(
-            1 for r in self._accounts.values()
-            if r.account_tier == "admin" and not r.disabled
-        )
+        return sum(1 for r in self._accounts.values() if r.account_tier == "admin" and not r.disabled)
 
     def total_admin_count(self) -> int:
-        return sum(
-            1 for r in self._accounts.values()
-            if r.account_tier == "admin"
-        )
+        return sum(1 for r in self._accounts.values() if r.account_tier == "admin")
 
     def total_user_count(self) -> int:
-        return sum(
-            1 for r in self._accounts.values()
-            if r.account_tier == "user"
-        )
+        return sum(1 for r in self._accounts.values() if r.account_tier == "user")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_locked(record: AccountRecord) -> bool:
     return record.locked_until > time.time()
@@ -362,4 +443,5 @@ def _is_locked(record: AccountRecord) -> bool:
 
 def _new_id() -> str:
     import uuid
+
     return str(uuid.uuid4())

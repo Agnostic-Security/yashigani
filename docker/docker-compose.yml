@@ -1,6 +1,8 @@
 ---
-# Yashigani v2.23.2 — Docker Compose stack
-# Last updated: 2026-05-07T12:05:00+01:00 (retro #83: Grafana mTLS ingress + Prometheus TLS server + datasource mTLS; image-bump: caddy 2.11.2/redis 7.4.9/ollama 0.23.1/pgvector 0.8.2)
+# Yashigani v2.23.3 — Docker Compose stack
+# Last updated: 2026-05-10T12:00:00+01:00 (fix: BUG-AG-005 bump header to 2.23.3)
+# Last updated: 2026-05-10T00:00:00+01:00 (fix/v233-backoffice-async-migrations: to_thread run_migrations; start_period 30s→60s)
+# Last updated: 2026-05-09T00:00:00+01:00 (fix/v233-base-regressions: add YASHIGANI_DB_AES_KEY to backoffice env — smoke fix)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -186,7 +188,7 @@ services:
       OTEL_EXPORTER_OTLP_CERTIFICATE: /run/secrets/ca_root.crt
       OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE: /run/secrets/gateway_client.crt
       OTEL_EXPORTER_OTLP_CLIENT_KEY: /run/secrets/gateway_client.key
-      FASTTEXT_MODEL_PATH: /app/models/fasttext_classifier.bin
+      SKLEARN_MODEL_PATH: /app/models/sensitivity_classifier.joblib
       # Agent auth tokens for upstream calls
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       # EX-231-10 Layer B — per-install shared secret for X-Caddy-Verified-Secret
@@ -295,6 +297,13 @@ services:
       YASHIGANI_INSPECTION_FALLBACK_CHAIN: ${YASHIGANI_INSPECTION_FALLBACK_CHAIN:-ollama,fail_closed}
       # Postgres via PgBouncer — TLS verify-ca + client cert.
       YASHIGANI_DB_DSN: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@pgbouncer:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
+      # v2.23.3 (B4 fix, PR #60): Direct-to-postgres DSN, bypassing pgbouncer.
+      # Used ONLY by postgres_password rotation (ALTER USER requires a session-mode
+      # postgres connection; pgbouncer transaction-pool mode blocks DDL across
+      # connection hops). Helm sets this automatically via backoffice.yaml; this
+      # line closes the Compose parity gap (Iris blocker 8, 2026-05-08).
+      # POSTGRES_PASSWORD_URLENC is set by install.sh (URL-encoded postgres password).
+      YASHIGANI_DB_DSN_DIRECT: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
       YASHIGANI_DEPLOYMENT_STREAM: ${YASHIGANI_DEPLOYMENT_STREAM:-opensource}
       OWUI_API_URL: http://open-webui:8080
       # OWUI_SECRET_KEY is required — install.sh generates a fresh random
@@ -341,6 +350,13 @@ services:
       # ${INSTALL_DIR}/backups on the host. The :ro flag prevents the
       # backoffice container from modifying backup files.
       YASHIGANI_BACKUPS_DIR: /data/backups
+      # v2.23.3 (#60 fix) — AES-256 key for pgcrypto pgp_sym_encrypt (W6/B2).
+      # install.sh writes this to docker/.env via _write_aes_key_to_env(); the
+      # value must also appear in the container environment block so Compose
+      # passes it through into the running container. Helm sources this from
+      # the yashigani-backoffice-secrets Secret (backoffice.yaml:222).
+      # Missing key → RuntimeError at lifespan startup (fail-closed per SOP 1).
+      YASHIGANI_DB_AES_KEY: ${YASHIGANI_DB_AES_KEY:?YASHIGANI_DB_AES_KEY must be set — run install.sh to generate}
       # v2.23.2 fix — SSRF guard hostname allowlist (TM-V231-004 / Pentest #95).
       # _assert_safe_upstream_url() blocks loopback/RFC1918/link-local by default.
       # These three Compose service names are the canonical Yashigani-internal agent
@@ -392,7 +408,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     depends_on:
       redis:
         condition: service_healthy
@@ -737,10 +753,17 @@ services:
       - ../config/prometheus-web-config.yml:/etc/prometheus/web-config.yml:ro
       - ./secrets:/run/secrets:ro
     healthcheck:
-      # retro #83: Prometheus now serves HTTPS. Use --no-check-certificate so
-      # the self-signed internal CA is trusted without mounting the CA into wget.
-      # wget inside the prom/prometheus image supports --no-check-certificate.
-      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://localhost:9090/-/healthy"]
+      # v2.23.3 RETRO-V233-001: prometheus enables RequireAndVerifyClientCert
+      # (prometheus-web-config.yml). wget --no-check-certificate skips server
+      # cert validation but CANNOT present a client cert (BusyBox wget has no
+      # --certificate / --private-key flags). Result: TLS alert 70 (cert_unknown)
+      # → healthcheck permanently fails → grafana/alertmanager blocked by
+      # condition: service_healthy → compose deadlock in sequential mode.
+      # Fix: use nc -z TCP probe (port-open check). nc is present in the prom
+      # base image (BusyBox). TCP connect succeeds without a TLS handshake so
+      # RequireAndVerifyClientCert is irrelevant. Prometheus is functionally
+      # healthy if port 9090 is listening.
+      test: ["CMD", "nc", "-z", "localhost", "9090"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -958,18 +981,16 @@ services:
       # issues loki_client.crt/key. /run/secrets is read-only (RO bind-mount).
       - ./secrets:/run/secrets:ro
     healthcheck:
-      # retro #84: Loki now listens on HTTPS with RequireAndVerifyClientCert.
-      # The probe is intra-container (localhost → self). BusyBox wget does NOT
-      # support --certificate / --private-key for TLS client certs. Using
-      # --no-check-certificate here is deliberate and safe: the probe verifies
-      # only that the Loki PROCESS is responding on :3100. mTLS enforcement for
-      # external clients (Promtail, Grafana, otel-collector) is tested separately
-      # at connect time — those clients send a full TLS client cert; Loki rejects
-      # connections without one. TA-1..4 cannot intercept a localhost probe.
-      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:3100/ready | grep -q ready"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      # v2.23.3 RETRO-V233-001 (extended): Loki 3.7.1 is fully distroless — the
+      # image contains only the /bin/loki binary. No shell, no wget, and no nc.
+      # nc -z was tried first but "executable file not found" — nc is absent.
+      # The only probing option without adding a tool is disabling the healthcheck.
+      # promtail depends_on changed to service_started (see below) so the compose
+      # dependency chain is not blocked. Loki startup is reliable; promtail retries
+      # on connection failure at the application level.
+      # K8s Helm: tcpSocket probe works because kubelet performs the TCP check
+      # natively (no in-container binary needed) — see loki.yaml.
+      disable: true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (loki.yaml:39).
     # No cap_add: loki binds port 3100 (non-privileged).
     cap_drop: [ALL]
@@ -1005,7 +1026,12 @@ services:
       retries: 3
     depends_on:
       loki:
-        condition: service_healthy
+        # service_started (not service_healthy): loki 3.7.1 is fully distroless
+        # (only /bin/loki binary), so no in-container probe is possible and loki's
+        # healthcheck is disabled. service_started is safe: loki binds :3100 before
+        # accepting connections; promtail retries at the application level on any
+        # connection failure. — RETRO-V233-001 (extended)
+        condition: service_started
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart for promtail.
     # No cap_add: promtail binds port 9080 (non-privileged). Docker socket access
     # is via bind mount (read-only), not a capability.
@@ -1074,8 +1100,12 @@ services:
       - ./secrets:/run/secrets:ro
       - ../config/jaeger/jaeger.yml:/etc/jaeger/jaeger.yml:ro
     healthcheck:
-      # v2: healthcheckv2 extension listens on :13133 (replaces v1 admin port :14269)
-      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/ || curl -sf http://localhost:13133/"]
+      # v2.23.3 RETRO-V233-001: Jaeger v2 all-in-one image is distroless — no
+      # shell and no wget/curl. CMD-SHELL fails with "executable file not found".
+      # Fix: nc -z TCP probe on :13133 (healthcheckv2 extension port). nc is
+      # present in the jaeger distroless image. TCP connect is sufficient signal
+      # that the healthcheck extension is listening.
+      test: ["CMD", "nc", "-z", "localhost", "13133"]
       interval: 15s
       timeout: 5s
       retries: 3

@@ -1,5 +1,5 @@
 {{- if .Values.grafana.enabled }}
-# Last updated: 2026-05-07T09:00:00+01:00
+# Last updated: 2026-05-09T10:00:00+01:00
 # retro #83: Grafana mTLS ingress + datasource mTLS (Pattern B).
 # fix(helm): G9 blocker: volume items: mapping restores in-pod path after ConfigMap key rename.
 # - GF_SERVER_PROTOCOL=https, port 3443, cert from yashigani-pki-certs secret.
@@ -30,6 +30,12 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      # B-K8S-3 / ACS-RISK-008: Grafana makes no K8s API calls in this chart.
+      # Disabling the projected SA token mount removes one attack surface if
+      # Grafana is ever compromised, and eliminates the readOnlyRootFilesystem
+      # CrashLoopBackOff on Docker Desktop arm64 (containerd projects the SA
+      # token into /var/run/secrets which is inside the read-only rootfs).
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 472

@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-05T20:30:00+01:00 */ -}}
+{{- /* Last updated: 2026-05-10T00:00:00+01:00 */ -}}
 {{- /* EX-231-09 fix (v2.23.2): Jaeger OTLP gRPC collector port mTLS-enabled. */ -}}
 {{- /* v2.23.2 Phase 3b: Jaeger v2 migration. Image renamed all-in-one→jaeger; env-var */ -}}
 {{- /* TLS config replaced by YAML config file (yashigani-jaeger-config ConfigMap). */ -}}
@@ -66,17 +66,24 @@ spec:
           args:
             - "--config=/etc/jaeger/jaeger.yml"
           readinessProbe:
-            httpGet:
-              path: /
-              port: 13133
+            # B-K8S-5 follow-up: switch from httpGet on :13133 to tcpSocket on :16686.
+            # Rationale (dual fix):
+            # 1. healthcheckv2 use_v2:false makes :13133 /health/status work, BUT port
+            #    13133 binds IPv4-only by default; Docker Desktop K8s probes prefer IPv6
+            #    and get "connection refused". Port 16686 (UI/query) is dual-stack.
+            # 2. tcpSocket on the UI port is a better cluster-portable health signal —
+            #    it fires as soon as Jaeger is accepting connections, works across
+            #    IPv4-only, IPv6-only, and dual-stack cluster configurations.
+            # Su verified live: tcpSocket :16686 resolves the probe connection-refused.
+            tcpSocket:
+              port: 16686
             initialDelaySeconds: 5
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /
-              port: 13133
+            tcpSocket:
+              port: 16686
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5

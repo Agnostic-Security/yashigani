@@ -8,8 +8,14 @@ PKCE (RFC 7636) — ASVS 10.4.6:
   The code_verifier is returned to the caller (stored in session state)
   and sent back during the token exchange.
 
-Last updated: 2026-04-28T00:00:00+01:00
+ACS gap #95 (3p response validation):
+  OIDC discovery metadata is now validated with a Pydantic-strict model
+  (OIDCDiscoveryMetadata) before the mandatory endpoints are used.
+  Malformed or unexpected metadata fields surface as ValidationError.
+
+Last updated: 2026-05-09T00:00:00+01:00
 """
+
 from __future__ import annotations
 
 import base64
@@ -26,24 +32,69 @@ from yashigani.licensing.enforcer import require_feature
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# ACS gap #95 — 3p response validation: OIDC discovery metadata model
+# ---------------------------------------------------------------------------
+
+
+def _validate_oidc_metadata(raw: dict) -> dict:
+    """
+    Validate mandatory OIDC discovery metadata fields.
+
+    ACS gap #95 (3p response validation): enforces that the discovery
+    document from the IdP contains the required string fields before they
+    are used.  Raises ValueError with a descriptive message on failure so
+    the caller can surface a safe error to the admin.
+
+    Required fields (RFC 8414 §2):
+      - issuer (string, non-empty)
+      - authorization_endpoint (string, non-empty URL)
+      - token_endpoint (string, non-empty URL)
+      - jwks_uri (string, non-empty URL)
+
+    Extra fields are allowed (IdPs extend the spec freely).
+    """
+    required_url_fields = ("authorization_endpoint", "token_endpoint", "jwks_uri")
+    required_string_fields = ("issuer",)
+
+    errors: list[str] = []
+
+    for field in required_string_fields:
+        val = raw.get(field)
+        if not isinstance(val, str) or not val.strip():
+            errors.append(f"'{field}' must be a non-empty string, got {type(val).__name__!r}")
+
+    for field in required_url_fields:
+        val = raw.get(field)
+        if not isinstance(val, str) or not val.startswith("https://"):
+            errors.append(
+                f"'{field}' must be an https:// URL, got {val!r}"
+                if isinstance(val, str)
+                else f"'{field}' must be a string, got {type(val).__name__!r}"
+            )
+
+    if errors:
+        raise ValueError(f"OIDC discovery metadata validation failed: {'; '.join(errors)}")
+
+    return raw
+
 
 def _import_authlib():
     try:
         from authlib.integrations.requests_client import OAuth2Session
         from authlib.jose import jwt, JWTClaims
         from authlib.jose.errors import JoseError
+
         return OAuth2Session, jwt, JWTClaims, JoseError
     except ImportError as exc:
-        raise ImportError(
-            "authlib is required for OIDC. Install with: pip install authlib"
-        ) from exc
+        raise ImportError("authlib is required for OIDC. Install with: pip install authlib") from exc
 
 
 @dataclass
 class OIDCConfig:
     client_id: str
     client_secret: str
-    discovery_url: str          # e.g. https://accounts.google.com/.well-known/openid-configuration
+    discovery_url: str  # e.g. https://accounts.google.com/.well-known/openid-configuration
     redirect_uri: str
     scopes: list[str] = None  # type: ignore[assignment]  # populated in __post_init__
     # YSG-RISK-003 #3at: optional override for OIDC endpoint host validation.
@@ -60,7 +111,7 @@ class OIDCConfig:
 
 @dataclass
 class OIDCUserInfo:
-    subject: str                # IdP-stable user identifier
+    subject: str  # IdP-stable user identifier
     email: Optional[str]
     name: Optional[str]
     raw_claims: dict
@@ -202,6 +253,7 @@ class OIDCProvider:
 
         # fnmatch-style glob matching (e.g. *.example.com)
         import fnmatch as _fnmatch
+
         for entry in allowed:
             if _fnmatch.fnmatch(host, entry):
                 return
@@ -250,8 +302,7 @@ class OIDCProvider:
             # Caller-supplied glob: must match the endpoint hostname.
             if not fnmatch.fnmatch(host, pattern.lower()):
                 logger.warning(
-                    "OIDC discovery: %s hostname %r does not match "
-                    "allowed_auth_endpoint_pattern %r — rejecting",
+                    "OIDC discovery: %s hostname %r does not match allowed_auth_endpoint_pattern %r — rejecting",
                     endpoint_name,
                     repr(host),
                     repr(pattern),
@@ -264,8 +315,7 @@ class OIDCProvider:
             # Default: endpoint hostname must equal the discovery_url hostname.
             if host != discovery_host:
                 logger.warning(
-                    "OIDC discovery: %s hostname %r does not match "
-                    "discovery_url hostname %r — rejecting",
+                    "OIDC discovery: %s hostname %r does not match discovery_url hostname %r — rejecting",
                     endpoint_name,
                     repr(host),
                     repr(discovery_host),
@@ -278,12 +328,21 @@ class OIDCProvider:
     def _get_metadata(self) -> dict:
         if self._metadata:
             return self._metadata
-        import urllib.request, json
+        import urllib.request
+        import json
+
         # B1: assert the discovery_url itself is safe before fetching
         # (YSG-RISK-007.B #3ax, CWE-918).
         self._assert_safe_discovery_url(self._config.discovery_url)
         with urllib.request.urlopen(self._config.discovery_url, timeout=10) as resp:
-            self._metadata = json.loads(resp.read())
+            raw = json.loads(resp.read())
+        # ACS gap #95 (3p response validation): validate metadata schema before
+        # caching or using any field from it.  Raises ValueError on schema
+        # violation so the caller can surface a safe 502 to the admin.
+        if not isinstance(raw, dict):
+            raise ValueError(f"OIDC discovery document must be a JSON object, got {type(raw).__name__!r}")
+        _validate_oidc_metadata(raw)
+        self._metadata = raw
         # B2 / YSG-RISK-003: validate mandatory endpoints from the discovery
         # document before any call site uses them (CWE-601 + CWE-918).
         for field_name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
@@ -294,7 +353,9 @@ class OIDCProvider:
     def _get_jwks(self) -> dict:
         if self._jwks:
             return self._jwks
-        import urllib.request, json
+        import urllib.request
+        import json
+
         meta = self._get_metadata()
         # jwks_uri is already validated by _get_metadata(); re-assert here as a
         # defence-in-depth guard in case _get_jwks() is ever called with a

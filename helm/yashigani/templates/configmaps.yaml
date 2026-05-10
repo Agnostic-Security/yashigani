@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-07T09:00:00+01:00 — fix(helm): G9 blocker: rename grafana-provisioning ConfigMap keys (forward-slash → underscore) so K8s API accepts them */ -}}
+{{- /* Last updated: 2026-05-10T00:00:00+01:00 — fix(helm): jaeger healthcheckv2 use_v2:false (B-K8S-5 follow-up) */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -90,10 +90,12 @@ data:
         tls:
           insecure: true
         {{- end }}
-      loki:
-        # retro #84: endpoint switched to https; otel-collector presents its
-        # own leaf cert to Loki. Trust anchor: ca_intermediate.crt (Pattern B).
-        endpoint: "https://yashigani-loki:3100/loki/api/v1/push"
+      # v2.23.3: otelcol-contrib 0.151.0 removed the 'loki' exporter type.
+      # Loki 3.x accepts OTLP natively at /otlp/v1/logs — use otlphttp instead.
+      # Resource attributes (service.name, deployment.environment) map to Loki
+      # stream labels automatically via Loki 3.x OTLP label discovery.
+      otlphttp/loki:
+        endpoint: "https://yashigani-loki:3100"
         {{- if .Values.mtls.enabled }}
         tls:
           cert_file: /run/secrets/otel-collector_client.crt
@@ -113,7 +115,7 @@ data:
         logs:
           receivers: [otlp]
           processors: [memory_limiter, batch]
-          exporters: [loki]
+          exporters: [otlphttp/loki]
 {{- end }}
 
 {{- if .Values.jaeger.enabled }}
@@ -154,7 +156,11 @@ data:
 
     extensions:
       healthcheckv2:
-        use_v2: true
+        # use_v2: false is required. When use_v2: true, healthcheckv2 does NOT expose
+        # HTTP routes — every path (including /health/status) returns 404 or no response.
+        # use_v2: false enables the HTTP server on :13133 serving /health/status (JSON 200).
+        # Su verified live: patched true→false, pod served health correctly. B-K8S-5 follow-up.
+        use_v2: false
         http:
           endpoint: 0.0.0.0:13133
 
@@ -804,34 +810,11 @@ data:
     if __name__ == "__main__":
         main()
 
-{{- if and .Values.prometheus.enabled .Values.mtls.enabled }}
-{{/*
-── Prometheus TLS web-config ConfigMap ────────────────────────────────────────
-  retro #83: enables HTTPS on Prometheus port 9090 (Pattern B mTLS).
-  Grafana datasource calls and Prometheus self-scrape use mutual TLS.
-  Mounted at /etc/prometheus/web-config.yml via subPath in prometheus.yaml.
-*/}}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: yashigani-prometheus-web-config
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/name: yashigani-prometheus-web-config
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
-data:
-  web-config.yml: |
-    # retro #83: Prometheus TLS web config — Pattern B (intermediate as trust anchor).
-    # TA-1/TA-2: mTLS on port 9090 prevents impersonation and eavesdropping.
-    tls_server_config:
-      cert_file: /run/secrets/prometheus_client.crt
-      key_file:  /run/secrets/prometheus_client.key
-      client_ca_file: /run/secrets/ca_intermediate.crt
-      client_auth_type: RequireAndVerifyClientCert
-      min_version: TLS13
-{{- end }}
+{{- /* B-K8S-4: yashigani-prometheus-web-config ConfigMap removed.
+  web-config.yml is now a second key in yashigani-prometheus-config (prometheus.yaml),
+  served via the whole-dir /etc/prometheus mount. Separate ConfigMap + subPath
+  is blocked on containerd: subPath into an already-mounted dir is not allowed.
+*/ -}}
 
 {{- if and .Values.grafana.enabled .Values.mtls.enabled }}
 {{/*
@@ -925,4 +908,86 @@ data:
             queries:
               - name: "Request Rate"
                 query: "rate(yashigani_gateway_requests_total[$__rate_interval])"
+{{- end }}
+{{- /*
+  Backup script ConfigMap (MP.L2-3.8.9)
+  Embeds scripts/backup.sh so the backup CronJob can invoke it without
+  requiring a custom image build. The gateway image already carries the
+  age binary (installed in Dockerfile.gateway).
+  See: backup-cronjob.yaml for mount and command usage.
+  Last updated: 2026-05-09T00:00:00+01:00
+*/}}
+{{- if .Values.backup.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "yashigani.fullname" . }}-backup-script
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+  annotations:
+    yashigani.io/finding: "MP.L2-3.8.9"
+    yashigani.io/cwe: "CWE-312"
+data:
+  backup.sh: |
+    #!/usr/bin/env bash
+    # Yashigani backup.sh — age-encrypted backup (MP.L2-3.8.9 / CMMC L2)
+    # Helm-embedded copy of scripts/backup.sh.
+    # Last updated: 2026-05-09T00:00:00+01:00
+    set -euo pipefail
+    umask 077
+    RECIPIENT_KEY_FILE="${YASHIGANI_BACKUP_RECIPIENT:-/etc/yashigani/backup-recipient.age.pub}"
+    OUTPUT_DIR="${YASHIGANI_BACKUP_OUTPUT_DIR:-/var/lib/yashigani/backups}"
+    SOURCE_DIR="${YASHIGANI_BACKUP_SOURCE_DIR:-/var/lib/yashigani}"
+    log_info()    { printf "    --> %s\n" "$*"; }
+    log_success() { printf "    ok  %s\n" "$*"; }
+    log_error()   { printf "    !!  ERROR: %s\n" "$*" >&2; }
+    if ! command -v age >/dev/null 2>&1; then
+      log_error "age binary not found. Install: apt-get install -y age (or apk add age)"
+      exit 1
+    fi
+    if [[ ! -f "${RECIPIENT_KEY_FILE}" ]]; then
+      log_error "Recipient public key not found: ${RECIPIENT_KEY_FILE}"
+      log_error "Provision ConfigMap '${YASHIGANI_BACKUP_RECIPIENT_CONFIGMAP:-yashigani-backup-recipient}' with key recipient.age.pub"
+      log_error "See docs/operations/backup.md"
+      exit 1
+    fi
+    RECIPIENT_KEY="$(< "${RECIPIENT_KEY_FILE}")"
+    RECIPIENT_KEY="${RECIPIENT_KEY%%$'\n'*}"
+    RECIPIENT_KEY="${RECIPIENT_KEY%"${RECIPIENT_KEY##*[![:space:]]}"}"
+    if [[ -z "${RECIPIENT_KEY}" || "${RECIPIENT_KEY}" != age1* ]]; then
+      log_error "Invalid recipient key in ${RECIPIENT_KEY_FILE} — must start with 'age1'"
+      exit 1
+    fi
+    if [[ ! -d "${SOURCE_DIR}" ]]; then
+      log_error "Source directory not found: ${SOURCE_DIR}"
+      exit 1
+    fi
+    mkdir -p "${OUTPUT_DIR}"
+    chmod 0700 "${OUTPUT_DIR}"
+    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+    OUTPUT_FILE="${OUTPUT_DIR}/${TIMESTAMP}.tar.gz.age"
+    TMP_OUTPUT="${OUTPUT_DIR}/.tmp-${TIMESTAMP}-$$.tar.gz.age"
+    trap 'rm -f "${TMP_OUTPUT}" 2>/dev/null; exit 1' INT TERM
+    TAR_STATUS=0
+    ENCRYPT_STATUS=0
+    { tar --create --gzip --directory "$(dirname "${SOURCE_DIR}")" "$(basename "${SOURCE_DIR}")" 2>/dev/null; TAR_STATUS=$?; } \
+      | age --encrypt --recipient "${RECIPIENT_KEY}" --output "${TMP_OUTPUT}" 2>/dev/null
+    ENCRYPT_STATUS=$?
+    if [[ "${TAR_STATUS}" -ne 0 ]]; then
+      rm -f "${TMP_OUTPUT}" 2>/dev/null || true; trap - INT TERM
+      log_error "tar failed (exit ${TAR_STATUS})"
+      exit 1
+    fi
+    if [[ "${ENCRYPT_STATUS}" -ne 0 ]]; then
+      rm -f "${TMP_OUTPUT}" 2>/dev/null || true; trap - INT TERM
+      log_error "age encryption failed (exit ${ENCRYPT_STATUS})"
+      exit 1
+    fi
+    mv "${TMP_OUTPUT}" "${OUTPUT_FILE}"
+    trap - INT TERM
+    chmod 0400 "${OUTPUT_FILE}"
+    log_success "Encrypted backup: ${OUTPUT_FILE} ($(du -sh "${OUTPUT_FILE}" | awk '{print $1}'))"
 {{- end }}

@@ -19,6 +19,11 @@
 # Values overrides for CI:
 #   global.environment=ci   — bypasses the production/staging mtls.enabled
 #                             guard in validate-security.yaml (LIC-006).
+#                             The guard only fires on production/staging, so
+#                             mtls.enabled remains at its default (true) to
+#                             maximise template coverage — notably this renders
+#                             yashigani-grafana-provisioning (the PR #68 bug
+#                             template) which is only emitted when mtls=true.
 #   admissionPolicies.enabled=false — skips Kyverno ClusterPolicy CRDs not
 #                             present in a plain kind cluster.
 #   cert-manager ClusterIssuer objects are auto-skipped by the
@@ -118,8 +123,10 @@ jobs:
         id: helm_template
         # CI values overrides (see file header comments for rationale):
         #   global.environment=ci          — bypass LIC-006 production guard
+        #                                    (guard only fires on production/staging)
         #   admissionPolicies.enabled=false — no Kyverno CRDs in kind
-        #   mtls.enabled=false             — no PKI bootstrap in dry-run
+        #   mtls.enabled kept at default (true) to render mTLS-gated ConfigMaps,
+        #   notably yashigani-grafana-provisioning (the PR #68 bug template).
         # Output is written to a workspace subdirectory so the upload-artifact
         # step can reference it via a static path expression.
         run: |
@@ -129,7 +136,6 @@ jobs:
             --namespace yashigani-dryrun \
             --set global.environment=ci \
             --set admissionPolicies.enabled=false \
-            --set mtls.enabled=false \
             > "$GITHUB_WORKSPACE/.dry-run-artifacts/helm-template-output.yaml"
 
           LINE_COUNT=$(wc -l < "$GITHUB_WORKSPACE/.dry-run-artifacts/helm-template-output.yaml")

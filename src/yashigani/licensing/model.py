@@ -1,5 +1,5 @@
 """License model — tiers, state, community defaults."""
-# Last updated: 2026-05-06T00:00:00+01:00 (retro #42 website-truth alignment + LIC-001..007 hardening rebased)
+# Last updated: 2026-05-07T00:00:00+01:00 (v2.23.3 expiry UX: LicenseExpiryMode + expiry_status())
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +19,74 @@ class LicenseTier(str, Enum):
     # If verify_license() accepts a CANARY token, the verifier has been patched
     # to remove tier filtering. Tested by canary-token integration test.
     CANARY             = "canary"
+
+
+class LicenseExpiryMode(str, Enum):
+    """
+    Operational mode derived from licence expiry state.
+
+    v2.23.3 expiry UX — canonical thresholds:
+      ACTIVE    — more than 30 days until expiry (or no expiry date)
+      WARNING   — 7–30 days remaining (yellow banner)
+      CRITICAL  — 1–7 days remaining (orange banner)
+      EXPIRED   — expired, within 14-day grace period (red banner, continues serving)
+      READONLY  — 14–30 days past expiry (admin view-only; new agent-runs blocked)
+      BLOCKED   — more than 30 days past expiry (HTTP 503)
+    """
+    ACTIVE   = "active"
+    WARNING  = "warning"
+    CRITICAL = "critical"
+    EXPIRED  = "expired"    # grace period active (days 0–14 past expiry)
+    READONLY = "readonly"   # read-only mode (days 14–30 past expiry)
+    BLOCKED  = "blocked"    # full block (day 30+ past expiry)
+
+
+# Grace-period configuration (v2.23.3).
+# Days past expiry before mode escalates.
+GRACE_PERIOD_DAYS: int = 14         # EXPIRED → READONLY transition
+READONLY_PERIOD_DAYS: int = 30      # READONLY → BLOCKED transition
+
+# Warning window thresholds (days remaining, inclusive boundary).
+WARN_YELLOW_DAYS: int = 30          # >7 and <=30 days remaining
+WARN_ORANGE_DAYS: int = 7           # >0 and <=7 days remaining
+
+
+def compute_expiry_mode(expires_at: Optional[datetime], now: Optional[datetime] = None) -> LicenseExpiryMode:
+    """
+    Compute the operational mode for a given expiry timestamp.
+
+    Args:
+        expires_at: UTC datetime when the licence expires; None means perpetual (ACTIVE).
+        now:        UTC datetime representing 'now'; defaults to datetime.now(timezone.utc).
+                    Injected in tests to avoid time-dependent failures.
+
+    Returns:
+        LicenseExpiryMode appropriate for the current instant.
+
+    This function is pure (no I/O, no state) and safe to call from any context.
+    """
+    if expires_at is None:
+        return LicenseExpiryMode.ACTIVE
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    delta = expires_at - now
+    days_remaining = delta.days  # negative when past expiry
+
+    if days_remaining > WARN_YELLOW_DAYS:
+        return LicenseExpiryMode.ACTIVE
+    if days_remaining > WARN_ORANGE_DAYS:
+        return LicenseExpiryMode.WARNING
+    if days_remaining >= 0:
+        return LicenseExpiryMode.CRITICAL
+    # Past expiry — days_remaining is negative; days_since_expiry is positive
+    days_since_expiry = -days_remaining
+    if days_since_expiry <= GRACE_PERIOD_DAYS:
+        return LicenseExpiryMode.EXPIRED
+    if days_since_expiry <= READONLY_PERIOD_DAYS:
+        return LicenseExpiryMode.READONLY
+    return LicenseExpiryMode.BLOCKED
 
 
 class LicenseFeature(str, Enum):
@@ -57,6 +125,21 @@ class LicenseState:
         if self.expires_at is None:
             return False
         return datetime.now(timezone.utc) > self.expires_at
+
+    def expiry_mode(self, now: Optional[datetime] = None) -> LicenseExpiryMode:
+        """Return the current LicenseExpiryMode for this licence."""
+        return compute_expiry_mode(self.expires_at, now=now)
+
+    def days_remaining(self, now: Optional[datetime] = None) -> Optional[int]:
+        """
+        Days remaining until expiry, or None if the licence has no expiry date.
+        Negative values indicate days past expiry.
+        """
+        if self.expires_at is None:
+            return None
+        if now is None:
+            now = datetime.now(timezone.utc)
+        return (self.expires_at - now).days
 
 
 # Per-tier limit defaults — used by verifier for backwards-compat with

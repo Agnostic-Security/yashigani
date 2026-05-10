@@ -15,20 +15,30 @@ and trigger an OPA data push.
 Security:
   All endpoints require an admin session.  The SCIM base path is served
   on the backoffice app (port 8443) and is never exposed via Caddy.
+
+  ACS gap #95 (injection): the SCIM filter query param is now a typed
+  FastAPI Query param with max_length=256 instead of being read via
+  request.query_params.get() which bypassed Pydantic validation.
+  _parse_filter_email() additionally validates the extracted value
+  matches the email format before accepting it.
+
+Last updated: 2026-05-09T00:00:00+01:00
 """
+
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Optional, Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import AdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.backoffice.routes.rbac import _push
-from yashigani.rbac.model import RBACGroup, ResourcePattern
+from yashigani.rbac.model import RBACGroup
 from yashigani.licensing.enforcer import (
     require_feature,
     check_end_user_limit,
@@ -44,15 +54,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # SCIM schema URNs
-_URN_USER  = "urn:ietf:params:scim:schemas:core:2.0:User"
+_URN_USER = "urn:ietf:params:scim:schemas:core:2.0:User"
 _URN_GROUP = "urn:ietf:params:scim:schemas:core:2.0:Group"
-_URN_LIST  = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
+_URN_LIST = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
 _URN_PATCH = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
 
 
 # ---------------------------------------------------------------------------
 # SCIM Pydantic models
 # ---------------------------------------------------------------------------
+
 
 class ScimName(BaseModel):
     formatted: Optional[str] = None
@@ -75,7 +86,7 @@ class ScimUserRequest(BaseModel):
 
 
 class ScimGroupMember(BaseModel):
-    value: str          # group_id or user email used as $ref
+    value: str  # group_id or user email used as $ref
     display: Optional[str] = None
 
 
@@ -86,7 +97,7 @@ class ScimGroupRequest(BaseModel):
 
 
 class ScimPatchOperation(BaseModel):
-    op: str                              # "add" | "remove" | "replace"
+    op: str  # "add" | "remove" | "replace"
     path: Optional[str] = None
     value: Optional[Any] = None
 
@@ -99,6 +110,7 @@ class ScimPatchRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_store():
     store = backoffice_state.rbac_store
@@ -127,10 +139,7 @@ def _group_resource(group: RBACGroup) -> dict:
         "schemas": [_URN_GROUP],
         "id": group.id,
         "displayName": group.display_name,
-        "members": [
-            {"value": email, "display": email}
-            for email in sorted(group.members)
-        ],
+        "members": [{"value": email, "display": email} for email in sorted(group.members)],
         "meta": {"resourceType": "Group"},
     }
 
@@ -145,15 +154,34 @@ def _list_response(resources: list[dict]) -> dict:
     }
 
 
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+# ACS gap #95 (injection): max length guard on SCIM filter value.
+_SCIM_FILTER_MAX_LEN = 256
+
+
 def _parse_filter_email(filter_str: str) -> Optional[str]:
     """
     Parse a simple SCIM filter: 'userName eq "user@example.com"'
-    Returns the email value or None if the filter cannot be parsed.
+    Returns the email value or None if the filter cannot be parsed or fails
+    format validation.
+
+    ACS gap #95 (injection): added email regex validation on the extracted
+    value so unsanitised SCIM filter strings cannot propagate into downstream
+    lookups as arbitrary strings.  The filter is not used in SQL (the store
+    uses an in-memory dict), but validating the shape of the extracted value
+    reduces the attack surface for future refactors and satisfies OWASP
+    ASVS V5.1.1 / CWE-20 input validation requirements.
     """
+    if not filter_str or len(filter_str) > _SCIM_FILTER_MAX_LEN:
+        return None
     try:
         parts = filter_str.strip().split()
         if len(parts) == 3 and parts[0].lower() == "username" and parts[1].lower() == "eq":
-            return parts[2].strip('"\'')
+            candidate = parts[2].strip("\"'")
+            # Validate the extracted value matches email format before accepting.
+            if _EMAIL_RE.match(candidate):
+                return candidate
     except Exception:
         pass
     return None
@@ -163,13 +191,26 @@ def _parse_filter_email(filter_str: str) -> Optional[str]:
 # User endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.get("/Users")
 async def scim_list_users(
-    request: Request,
     session: AdminSession,
+    filter: Optional[str] = Query(  # noqa: A002  — SCIM spec uses 'filter'
+        default=None,
+        description="SCIM filter expression, e.g. 'userName eq \"user@example.com\"'",
+        max_length=_SCIM_FILTER_MAX_LEN,
+        alias="filter",
+    ),
 ):
+    """
+    List SCIM users with optional filter.
+
+    ACS gap #95 (injection): filter is now a typed FastAPI Query param with
+    max_length=256, replacing the previous raw request.query_params.get()
+    which bypassed Pydantic/FastAPI input validation (OWASP ASVS V5.1.1).
+    """
     store = _get_store()
-    filter_param = request.query_params.get("filter", "")
+    filter_param = filter or ""
     all_groups = store.list_groups()
 
     # Build an index: email → [group, ...]
@@ -207,6 +248,7 @@ async def scim_provision_user(
         require_feature("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
+
         return JSONResponse(status_code=402, content=license_feature_gated_response(exc))
     store = _get_store()
     email = body.userName
@@ -222,6 +264,7 @@ async def scim_provision_user(
             check_end_user_limit(count_canonical_end_users())
         except LicenseLimitExceeded as exc:
             from fastapi.responses import JSONResponse
+
             return JSONResponse(
                 status_code=402,
                 content=license_limit_exceeded_response(exc),
@@ -243,6 +286,7 @@ async def scim_deprovision_user(
         require_feature("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
+
         return JSONResponse(status_code=402, content=license_feature_gated_response(exc))
     store = _get_store()
     email = user_id
@@ -255,14 +299,17 @@ async def scim_deprovision_user(
             pass
 
     from yashigani.audit.schema import RBACMemberEvent, EventType
+
     assert backoffice_state.audit_writer is not None  # set unconditionally at startup
     for group in groups:
-        backoffice_state.audit_writer.write(RBACMemberEvent(
-            event_type=EventType.RBAC_MEMBER_REMOVED,
-            group_id=group.id,
-            email=email,
-            admin_account=f"scim:{session.account_id}",
-        ))
+        backoffice_state.audit_writer.write(
+            RBACMemberEvent(
+                event_type=EventType.RBAC_MEMBER_REMOVED,
+                group_id=group.id,
+                email=email,
+                admin_account=f"scim:{session.account_id}",
+            )
+        )
 
     if groups:
         _push(store, f"scim:{session.account_id}")
@@ -271,6 +318,7 @@ async def scim_deprovision_user(
 # ---------------------------------------------------------------------------
 # Group endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.get("/Groups")
 async def scim_list_groups(session: AdminSession):
@@ -287,6 +335,7 @@ async def scim_create_group(
         require_feature("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
+
         return JSONResponse(status_code=402, content=license_feature_gated_response(exc))
     store = _get_store()
 
@@ -302,19 +351,22 @@ async def scim_create_group(
         id=str(uuid.uuid4()),
         display_name=body.displayName,
         members=initial_members,
-        allowed_resources=[],   # patterns must be configured via the RBAC admin API
+        allowed_resources=[],  # patterns must be configured via the RBAC admin API
     )
     store.add_group(group)
 
     from yashigani.audit.schema import RBACGroupEvent, EventType
+
     assert backoffice_state.audit_writer is not None  # set unconditionally at startup
-    backoffice_state.audit_writer.write(RBACGroupEvent(
-        event_type=EventType.RBAC_GROUP_CREATED,
-        group_id=group.id,
-        group_name=group.display_name,
-        admin_account=f"scim:{session.account_id}",
-        change_detail=f"created via SCIM with {len(initial_members)} initial members",
-    ))
+    backoffice_state.audit_writer.write(
+        RBACGroupEvent(
+            event_type=EventType.RBAC_GROUP_CREATED,
+            group_id=group.id,
+            group_name=group.display_name,
+            admin_account=f"scim:{session.account_id}",
+            change_detail=f"created via SCIM with {len(initial_members)} initial members",
+        )
+    )
     _push(store, f"scim:{session.account_id}")
     return _group_resource(group)
 
@@ -335,6 +387,7 @@ async def scim_patch_group(
         require_feature("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
+
         return JSONResponse(status_code=402, content=license_feature_gated_response(exc))
     store = _get_store()
     group = store.get_group(group_id)
@@ -400,15 +453,18 @@ async def scim_patch_group(
     group = store.get_group(group_id)
 
     from yashigani.audit.schema import RBACGroupEvent, EventType
+
     assert backoffice_state.audit_writer is not None  # set unconditionally at startup
     if added or removed:
-        backoffice_state.audit_writer.write(RBACGroupEvent(
-            event_type=EventType.RBAC_GROUP_UPDATED,
-            group_id=group_id,
-            group_name=group.display_name if group else group_id,
-            admin_account=f"scim:{session.account_id}",
-            change_detail=f"SCIM PATCH: +{len(added)} members, -{len(removed)} members",
-        ))
+        backoffice_state.audit_writer.write(
+            RBACGroupEvent(
+                event_type=EventType.RBAC_GROUP_UPDATED,
+                group_id=group_id,
+                group_name=group.display_name if group else group_id,
+                admin_account=f"scim:{session.account_id}",
+                change_detail=f"SCIM PATCH: +{len(added)} members, -{len(removed)} members",
+            )
+        )
         _push(store, f"scim:{session.account_id}")
 
     return _group_resource(group) if group else {}
@@ -423,6 +479,7 @@ async def scim_delete_group(
         require_feature("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
+
         return JSONResponse(status_code=402, content=license_feature_gated_response(exc))
     store = _get_store()
     group = store.get_group(group_id)
@@ -432,12 +489,15 @@ async def scim_delete_group(
     store.remove_group(group_id)
 
     from yashigani.audit.schema import RBACGroupEvent, EventType
+
     assert backoffice_state.audit_writer is not None  # set unconditionally at startup
-    backoffice_state.audit_writer.write(RBACGroupEvent(
-        event_type=EventType.RBAC_GROUP_DELETED,
-        group_id=group_id,
-        group_name=group.display_name,
-        admin_account=f"scim:{session.account_id}",
-        change_detail=f"deleted via SCIM (had {len(group.members)} members)",
-    ))
+    backoffice_state.audit_writer.write(
+        RBACGroupEvent(
+            event_type=EventType.RBAC_GROUP_DELETED,
+            group_id=group_id,
+            group_name=group.display_name,
+            admin_account=f"scim:{session.account_id}",
+            change_detail=f"deleted via SCIM (had {len(group.members)} members)",
+        )
+    )
     _push(store, f"scim:{session.account_id}")

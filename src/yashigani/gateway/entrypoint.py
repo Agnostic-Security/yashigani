@@ -3,7 +3,7 @@ Yashigani Gateway — ASGI entrypoint.
 Wires all services together and creates the FastAPI app.
 Environment variables configure service endpoints and behaviour.
 
-Last updated: 2026-05-07T00:00:00+00:00
+Last updated: 2026-05-08T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from yashigani.gateway.openai_router import router as openai_router, configure a
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
 from yashigani.auth.caddy_verified import CaddyVerifiedMiddleware
+from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -81,14 +82,14 @@ def _build_app():
         response_pipeline = ResponseInspectionPipeline(classifier=classifier)
         logger.info("Response inspection pipeline enabled")
 
-    # FastText first-pass classifier — Phase 12
-    fasttext_backend = None
+    # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
+    fasttext_backend = None  # legacy name retained; wired into SensitivityClassifier below
     try:
-        from yashigani.inspection.backends.fasttext_backend import FastTextBackend
-        fasttext_backend = FastTextBackend()
-        logger.info("FastText backend loaded: %s", fasttext_backend.model_path)
+        from yashigani.inspection.backends.sklearn_backend import SklearnBackend
+        fasttext_backend = SklearnBackend()
+        logger.info("sklearn sensitivity backend loaded: %s", fasttext_backend.model_path)
     except Exception as exc:
-        logger.warning("FastText backend unavailable (%s) — LLM-only inspection", exc)
+        logger.warning("sklearn backend unavailable (%s) — LLM-only inspection", exc)
 
     # Gateway config
     upstream_url = os.environ["YASHIGANI_UPSTREAM_URL"]
@@ -264,9 +265,9 @@ def _build_app():
     try:
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
         sensitivity_classifier = SensitivityClassifier(
-            enable_fasttext=fasttext_backend is not None,
+            enable_sklearn=fasttext_backend is not None,
             enable_ollama=True,
-            fasttext_backend=fasttext_backend,
+            sklearn_backend=fasttext_backend,
             ollama_url=ollama_url,
             ollama_model=model,
         )
@@ -401,6 +402,13 @@ def _build_app():
     # that cannot be forged by the client, closing the direct-to-gateway bypass.
     # Must run outermost (added last = executed first in starlette middleware stack).
     gateway_app.add_middleware(SpiffePeerCertMiddleware)
+
+    # Licence enforcement middleware — converts GatewayBlockedError → 503 and
+    # GatewayReadOnlyError → 403.  Runs AFTER Spiffe+Caddy verification (inbound
+    # request is from a legitimate peer) and BEFORE AgentAuth (blocked requests
+    # do not reach auth).  Added AFTER CaddyVerifiedMiddleware in code so that
+    # in Starlette LIFO execution order it runs third (after Spiffe and Caddy).
+    gateway_app.add_middleware(LicenseEnforcementMiddleware)
 
     # Agent auth middleware — must run before Prometheus middleware so agent
     # requests are authenticated before metrics are emitted.

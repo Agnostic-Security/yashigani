@@ -1,4 +1,4 @@
-# Last updated: 2026-05-05T20:00:00+01:00
+# Last updated: 2026-05-09T18:00:00+01:00
 # v2.23.2 (phase-3 image bump): otel-collector 0.100.0 → 0.151.0.
 # Breaking change v0.104+: 'logging' exporter removed; replaced by 'debug'.
 # Pipeline updated: traces now export to [otlp/jaeger, debug] instead of [otlp/jaeger, logging].
@@ -52,8 +52,9 @@ processors:
           sampling_percentage: 10
   # Resource attributes → Loki stream labels.
   # Keep label cardinality low: only service.name and deployment.environment.
-  # The `loki.resource.labels` hint tells the loki exporter (v0.100+) which
-  # resource attributes to project as Loki stream labels.
+  # v2.23.3: loki.resource.labels hint removed — it was loki-exporter-specific.
+  # Loki 3.x OTLP ingestion (via otlphttp) auto-maps these resource attributes
+  # to stream labels natively; no hint required.
   resource/loki_labels:
     attributes:
       - key: service.name
@@ -62,9 +63,6 @@ processors:
       - key: deployment.environment
         action: insert
         value: production
-      - key: loki.resource.labels
-        action: insert
-        value: "service.name, deployment.environment"
 
 exporters:
   otlp/jaeger:
@@ -81,21 +79,17 @@ exporters:
   debug:
     verbosity: basic
   # Loki log exporter — ships OTLP log records from gateway and backoffice.
-  # Uses the collector-contrib loki exporter (included in otel/opentelemetry-collector-contrib).
   #
-  # v2.23.1 (retro #3s): the v0.100.0 loki exporter dropped the nested
-  # `labels.resource` / `labels.attributes` config syntax. Label projection
-  # now happens via the `loki.resource.labels` / `loki.attribute.labels`
-  # attribute hints set by the resource/loki_labels processor below.
+  # v2.23.3: otelcol-contrib 0.151.0 removed the 'loki' exporter type.
+  # Replaced with otlphttp pointing to Loki 3.x OTLP ingest endpoint.
+  # otelcol appends /v1/logs automatically to the base endpoint.
+  # Loki 3.x maps service.name + deployment.environment resource attributes
+  # to stream labels natively (set by resource/loki_labels processor).
   #
-  # retro #84 (v2.23.2): endpoint switched to https; otel-collector presents
-  # its own leaf cert (otel-collector_client.crt/key) to Loki for mutual auth.
-  # Trust anchor: ca_intermediate.crt (Pattern B).
-  loki:
-    endpoint: https://loki:3100/loki/api/v1/push
-    default_labels_enabled:
-      exporter: false
-      job: true
+  # retro #84 (v2.23.2): mTLS preserved — otel-collector presents its leaf
+  # cert (otel-collector_client.crt/key) to Loki. Trust anchor: ca_intermediate.crt (Pattern B).
+  otlphttp/loki:
+    endpoint: https://loki:3100
     tls:
       cert_file: /run/secrets/otel-collector_client.crt
       key_file:  /run/secrets/otel-collector_client.key
@@ -119,4 +113,4 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, resource/loki_labels, batch]
-      exporters: [loki]
+      exporters: [otlphttp/loki]
