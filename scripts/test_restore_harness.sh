@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T14:15:00+01:00
+# Last-Updated: 2026-05-10T14:30:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -569,6 +569,7 @@ if [[ -n "${BACKUP_FILE}" && -n "${VM_IDENTITY_FILE}" ]]; then
 
   NEGATIVE_OUTPUT="$(
     _vm_run "
+      export YSG_RUNTIME='${RUNTIME}'
       cd '${VM_CLONE_DIR}' && \
       bash restore.sh --encrypted '${VM_IDENTITY_FILE}' '${VM_CORRUPT_FILE}' 2>&1
     " 2>&1
@@ -606,19 +607,27 @@ else
     _ev "restore.sh --encrypted ${VM_IDENTITY_FILE} ${BACKUP_FILE}"
     _ev ""
 
-    # Pre-restore: chown docker/secrets/ and docker/.env to the su user so
-    # restore.sh (which runs zero-sudo per P0-14) can write to them.
-    # install.sh leaves secrets owned by UID 1001 (maxine); the su user (UID 1004)
-    # cannot chmod/overwrite them without this step.
-    _vm_sudo "
-      chown -R '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
-      chown '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
-    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+    # Pre-restore: for Docker rootless, chown docker/secrets/ and docker/.env to
+    # the su user so restore.sh (zero-sudo per P0-14) can write to them.
+    # install.sh leaves secrets owned by UID 1001 (maxine); su (UID 1004) cannot
+    # chmod/overwrite them without this step.
+    # NOT applied for Podman rootless: restore.sh uses 'podman unshare chown 0:0'
+    # to remap sub-UID ownership — a host-level chown would break the unshare flow.
+    if [[ "${RUNTIME}" == "docker" ]]; then
+      _vm_sudo "
+        chown -R '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/secrets' 2>/dev/null || true
+        chown '${VM_USER}:${VM_USER}' '${VM_CLONE_DIR}/docker/.env' 2>/dev/null || true
+      " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+    fi
 
-    # Run restore.sh as su user (zero-sudo contract per P0-14)
+    # Run restore.sh as su user (zero-sudo contract per P0-14).
+    # Must export YSG_RUNTIME so restore.sh auto-detects the correct runtime —
+    # otherwise restore.sh's detect_runtime() sees 'docker info' succeed (su is
+    # in the docker group) and picks Docker even during a Podman install.
     RESTORE_OUTPUT="$(
       _vm_ssh "
         set -euo pipefail
+        export YSG_RUNTIME='${RUNTIME}'
         cd '${VM_CLONE_DIR}' && \
         bash restore.sh --encrypted '${VM_IDENTITY_FILE}' '${BACKUP_FILE}' 2>&1
       " 2>&1
