@@ -430,17 +430,26 @@ jwks_cache_hits_total = _C(
     ["layer"],  # memory | redis
 )
 
+# v2.23.3: renamed from fasttext_classifications_total / fasttext_latency_ms.
+# Legacy metric names kept for Grafana dashboard backward-compatibility; a
+# `backend` label distinguishes sklearn (current) from fasttext (removed).
+# Existing dashboards that query `yashigani_fasttext_classifications_total`
+# continue to work — they now receive data with `backend="sklearn"`.
 fasttext_classifications_total = _C(
     "yashigani_fasttext_classifications_total",
-    "FastText first-pass classification outcomes.",
-    ["result"],  # clean | unsafe | uncertain
+    "First-pass sensitivity classifier outcomes (backend label distinguishes implementation).",
+    ["result", "backend"],  # result: clean | unsafe | uncertain; backend: sklearn
 )
+# Canonical alias — preferred name for new dashboards.
+sensitivity_classifier_classifications_total = fasttext_classifications_total
 
 fasttext_latency_ms = _H(
     "yashigani_fasttext_latency_ms",
-    "FastText inference latency in milliseconds.",
+    "First-pass sensitivity classifier inference latency in milliseconds.",
     buckets=[0.5, 1, 2, 5, 10, 20, 50],
 )
+# Canonical alias — preferred name for new dashboards.
+sensitivity_classifier_latency_ms = fasttext_latency_ms
 
 trace_spans_total = _C(
     "yashigani_trace_spans_total",
