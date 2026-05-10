@@ -2279,12 +2279,36 @@ compose_pull() {
   # from, and stale :latest tags from prior installs silently get used
   # (which lack new modules like yashigani.pki). Per-run rebuild is cheap
   # thanks to container-layer caching; correctness beats a few saved seconds.
-  log_info "Building gateway and backoffice images from source..."
-  "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
-    log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
-    exit 1
+  #
+  # v2.23.3: Skip build if versioned images are already present in the local
+  # store. This supports airgap installs and CI harnesses where images are
+  # pre-seeded, and avoids unnecessary registry round-trips for the base image.
+  # Check by versioned tag (not :latest) to avoid using stale images.
+  _local_images_cached() {
+    local _gw _bo
+    if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
+      _gw="localhost/yashigani/gateway:${YASHIGANI_VERSION}"
+      _bo="localhost/yashigani/backoffice:${YASHIGANI_VERSION}"
+      podman image inspect "$_gw" >/dev/null 2>&1 && \
+        podman image inspect "$_bo" >/dev/null 2>&1
+    else
+      _gw="yashigani/gateway:${YASHIGANI_VERSION}"
+      _bo="yashigani/backoffice:${YASHIGANI_VERSION}"
+      docker image inspect "$_gw" >/dev/null 2>&1 && \
+        docker image inspect "$_bo" >/dev/null 2>&1
+    fi
   }
-  log_success "Local images built"
+  if _local_images_cached; then
+    log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}) — skipping build"
+    log_success "Local images ready (cached)"
+  else
+    log_info "Building gateway and backoffice images from source..."
+    "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
+      log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
+      exit 1
+    }
+    log_success "Local images built"
+  fi
 
   # Pull all remote images
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
