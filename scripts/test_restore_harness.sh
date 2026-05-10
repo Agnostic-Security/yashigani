@@ -342,33 +342,77 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
   # The save|load pipe is efficient — it bypasses the registry entirely.
   if [[ "${RUNTIME}" == "podman" && "${ROOTFUL}" == "true" ]]; then
     _info "Pre-loading yashigani + base images into root podman storage (avoiding Docker Hub rate limit)..."
-    _vm_ssh "
-      YASHIGANI_VERSION=\$(grep -m1 '^YASHIGANI_VERSION=' '${VM_CLONE_DIR}/install.sh' 2>/dev/null \
-        | cut -d'\"' -f2 || echo '2.23.2')
-      echo \"Detected YASHIGANI_VERSION=\${YASHIGANI_VERSION}\"
+    # Strategy: su user owns the user-space podman store (gateway/backoffice/python
+    # images). Root owns the target store. We need to pipe save(su) | load(root).
+    #
+    # The pipe crosses a privilege boundary, so we cannot do it in a single SSH
+    # command. Instead:
+    #   Step A: as su, export each image to a temp tarball in su's home dir.
+    #   Step B: as root (_vm_sudo), load each tarball into root storage, then delete.
+    #
+    # This avoids: echo-pipe-sudo (visible in ps), nested sudo inside a heredoc
+    # with no tty, and relies only on the established SOP Pattern A (_vm_sudo).
 
-      # Load yashigani/gateway and backoffice (provides build cache layers)
+    # Detect YASHIGANI_VERSION from the cloned repo (as root, since VM_CLONE_DIR=/root/...)
+    _PRELOAD_VERSION="$(_vm_sudo "grep -m1 '^YASHIGANI_VERSION=' '${VM_CLONE_DIR}/install.sh' 2>/dev/null | cut -d'\"' -f2 || echo '2.23.2'" 2>/dev/null || echo "2.23.2")"
+    _info "Detected YASHIGANI_VERSION=${_PRELOAD_VERSION} for pre-load"
+
+    # Step A: export images from su user-space store to temp tarballs
+    _vm_ssh "
+      set -euo pipefail
+      _PRELOAD_TMPDIR=\"/home/${VM_USER}/.preload_imgs_\${$}\"
+      mkdir -p \"\${_PRELOAD_TMPDIR}\"
+      chmod 700 \"\${_PRELOAD_TMPDIR}\"
+
+      # yashigani/gateway + yashigani/backoffice
       for img in yashigani/gateway yashigani/backoffice; do
-        for tag in \"\${YASHIGANI_VERSION}\" latest; do
+        imgname=\"\${img//\//___}\"
+        for tag in '${_PRELOAD_VERSION}' latest; do
           if podman image inspect \"localhost/\${img}:\${tag}\" >/dev/null 2>&1 || \
              podman image inspect \"\${img}:\${tag}\" >/dev/null 2>&1; then
-            echo \"Transferring \${img}:\${tag} to root storage...\"
-            podman image save \"\${img}:\${tag}\" 2>/dev/null | sudo podman image load 2>&1 | tail -1 || true
+            echo \"Saving \${img}:\${tag} to tarball...\"
+            podman image save \"\${img}:\${tag}\" -o \"\${_PRELOAD_TMPDIR}/\${imgname}.tar\" 2>/dev/null && \
+              echo \"saved:\${imgname}.tar\" || true
             break
           fi
         done
       done
 
-      # Load the python base image (avoids Docker Hub rate limit during build).
-      # The Dockerfile FROM line uses a digest; find the matching local image.
-      for python_ref in 'docker.io/library/python' 'python'; do
-        if podman image inspect \"\${python_ref}\" >/dev/null 2>&1; then
-          echo \"Transferring python base image to root storage...\"
-          podman image save \"\${python_ref}\" 2>/dev/null | sudo podman image load 2>&1 | tail -1 || true
-          break
-        fi
-      done
+      # python base image — may be untagged (stored by digest only after build).
+      # 'podman image inspect docker.io/library/python' fails for untagged images.
+      # Instead, find the image ID by filtering the image list by repository name,
+      # then save by ID. This works regardless of whether the image has a tag.
+      _PYTHON_ID=\$(podman image list --format '{{.ID}} {{.Repository}}' 2>/dev/null \
+        | awk '/library\/python/ || /^[^ ]+ python$/ { print \$1; exit }' || echo '')
+      if [[ -n \"\${_PYTHON_ID}\" ]]; then
+        echo \"Saving python base image (ID=\${_PYTHON_ID}) to tarball...\"
+        podman image save \"\${_PYTHON_ID}\" -o \"\${_PRELOAD_TMPDIR}/python_base.tar\" 2>/dev/null && \
+          echo \"saved:python_base.tar\" || true
+      else
+        echo 'WARNING: python base image not found in user store — will pull from registry'
+      fi
 
+      echo \"Export complete: \$(ls -1 \"\${_PRELOAD_TMPDIR}\" | wc -l) tarballs\"
+    " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+
+    # Step B: as root, load each tarball into root podman store
+    _PRELOAD_TMPDIR="/home/${VM_USER}/.preload_imgs_"  # prefix — root globs for it
+    _vm_sudo "
+      set -euo pipefail
+      # Find the temp dir su just created (contains only one matching dir)
+      _TMPDIR=\$(ls -d '/home/${VM_USER}/.preload_imgs_'* 2>/dev/null | head -1 || echo '')
+      if [[ -z \"\${_TMPDIR}\" ]]; then
+        echo 'WARNING: no pre-load tarball dir found — skipping'
+        exit 0
+      fi
+      echo \"Loading from \${_TMPDIR}...\"
+      for tar_file in \"\${_TMPDIR}\"/*.tar; do
+        [[ -f \"\${tar_file}\" ]] || continue
+        echo \"Loading \${tar_file} into root podman store...\"
+        podman image load -i \"\${tar_file}\" 2>&1 | tail -1 || true
+      done
+      # Cleanup tarballs (they can be large — gateway+backoffice ~500 MB each)
+      rm -rf \"\${_TMPDIR}\"
       echo 'Pre-load complete'
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
   fi
