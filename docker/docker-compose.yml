@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.2 — Docker Compose stack
-# Last updated: 2026-05-09T00:00:00+01:00 (fix/v233-base-regressions: add YASHIGANI_DB_AES_KEY to backoffice env — smoke fix)
+# Last updated: 2026-05-10T00:00:00+01:00 (fix: G16 image-pin — replace :-latest fallback with :-2.23.3 on gateway and backoffice)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -154,7 +154,7 @@ services:
   # ---------------------------------------------------------------------------
   gateway:
     dns_search: ["."]
-    image: yashigani/gateway:${YASHIGANI_VERSION:-latest}
+    image: yashigani/gateway:${YASHIGANI_VERSION:-2.23.3}
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
@@ -268,7 +268,7 @@ services:
   # ---------------------------------------------------------------------------
   backoffice:
     dns_search: ["."]
-    image: yashigani/backoffice:${YASHIGANI_VERSION:-latest}
+    image: yashigani/backoffice:${YASHIGANI_VERSION:-2.23.3}
     build:
       context: ..
       dockerfile: docker/Dockerfile.backoffice
