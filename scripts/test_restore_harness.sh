@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T16:05:00+01:00
+# Last-Updated: 2026-05-10T18:10:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -470,6 +470,13 @@ else
   _record_fail "Pre-backup probe failed: Admin1=${PRE_A1_CODE:-MISSING}, Admin2=${PRE_A2_CODE:-MISSING}"
 fi
 
+# Wait 31s after pre-backup probe to guarantee post-restore probe is in a
+# different TOTP window (period=30s). Without this, pre+post probes in the
+# same 30-second window send the same code — the backoffice replay cache
+# rejects it as a replay (401). 31s is the minimum safe gap.
+_info "Waiting 31s to advance TOTP window past pre-backup probe window..."
+sleep 31
+
 # ---------------------------------------------------------------------------
 # Phase 5: Backup
 # ---------------------------------------------------------------------------
@@ -798,6 +805,73 @@ else
       fi
     fi
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 7b: Post-restore diagnostics (credential readability + container state)
+# ---------------------------------------------------------------------------
+_section "Phase 7b: Post-restore diagnostics"
+_ev_section "POST-RESTORE DIAGNOSTICS"
+
+_ev "Container state:"
+_vm_run "
+  ${RUNTIME} ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
+" 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+
+_ev ""
+_ev "Credential file permissions (docker/secrets/):"
+if [[ "${RUNTIME}" == "podman" && "${ROOTFUL}" == "false" ]]; then
+  # Use podman unshare to see the files with their namespace ownership
+  _vm_ssh "
+    podman unshare ls -la '${VM_SECRETS_DIR}/admin1_username' \
+                          '${VM_SECRETS_DIR}/admin1_password' \
+                          '${VM_SECRETS_DIR}/admin1_totp_secret' \
+                          '${VM_SECRETS_DIR}/admin2_username' \
+                          '${VM_SECRETS_DIR}/admin2_password' \
+                          '${VM_SECRETS_DIR}/admin2_totp_secret' 2>/dev/null || true
+  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+else
+  _vm_run "
+    ls -la '${VM_SECRETS_DIR}/admin1_username' \
+           '${VM_SECRETS_DIR}/admin1_password' \
+           '${VM_SECRETS_DIR}/admin1_totp_secret' \
+           '${VM_SECRETS_DIR}/admin2_username' \
+           '${VM_SECRETS_DIR}/admin2_password' \
+           '${VM_SECRETS_DIR}/admin2_totp_secret' 2>/dev/null || true
+  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+fi
+
+_ev ""
+_ev "Credential content check (podman unshare cat — masked):"
+if [[ "${RUNTIME}" == "podman" && "${ROOTFUL}" == "false" ]]; then
+  _vm_ssh "
+    echo 'admin1_username:' \$(podman unshare cat '${VM_SECRETS_DIR}/admin1_username' 2>/dev/null | tr -d '\n' | wc -c) chars: \$(podman unshare cat '${VM_SECRETS_DIR}/admin1_username' 2>/dev/null | tr -d '\n')
+    echo 'admin1_password length:' \$(podman unshare cat '${VM_SECRETS_DIR}/admin1_password' 2>/dev/null | tr -d '\n' | wc -c) chars
+    echo 'admin1_totp_secret:' \$(podman unshare cat '${VM_SECRETS_DIR}/admin1_totp_secret' 2>/dev/null | tr -d '\n' | wc -c) chars: \$(podman unshare cat '${VM_SECRETS_DIR}/admin1_totp_secret' 2>/dev/null | tr -d '\n')
+    echo 'admin2_username:' \$(podman unshare cat '${VM_SECRETS_DIR}/admin2_username' 2>/dev/null | tr -d '\n' | wc -c) chars: \$(podman unshare cat '${VM_SECRETS_DIR}/admin2_username' 2>/dev/null | tr -d '\n')
+    echo 'admin2_totp_secret:' \$(podman unshare cat '${VM_SECRETS_DIR}/admin2_totp_secret' 2>/dev/null | tr -d '\n' | wc -c) chars: \$(podman unshare cat '${VM_SECRETS_DIR}/admin2_totp_secret' 2>/dev/null | tr -d '\n')
+  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+else
+  _vm_run "
+    echo 'admin1_username:' \$(cat '${VM_SECRETS_DIR}/admin1_username' 2>/dev/null | tr -d '\n')
+    echo 'admin1_password length:' \$(cat '${VM_SECRETS_DIR}/admin1_password' 2>/dev/null | tr -d '\n' | wc -c) chars
+    echo 'admin1_totp_secret:' \$(cat '${VM_SECRETS_DIR}/admin1_totp_secret' 2>/dev/null | tr -d '\n')
+    echo 'admin2_username:' \$(cat '${VM_SECRETS_DIR}/admin2_username' 2>/dev/null | tr -d '\n')
+    echo 'admin2_totp_secret:' \$(cat '${VM_SECRETS_DIR}/admin2_totp_secret' 2>/dev/null | tr -d '\n')
+  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+fi
+
+_ev ""
+_ev "Backoffice container logs (last 30 lines, auth-relevant):"
+_BACKOFFICE_CONTAINER="$(_vm_run "
+  ${RUNTIME} ps --format '{{.Names}}' 2>/dev/null | grep -i backoffice | head -1
+" 2>/dev/null | tr -d '[:space:]')" || _BACKOFFICE_CONTAINER=""
+if [[ -n "${_BACKOFFICE_CONTAINER}" ]]; then
+  _vm_run "
+    ${RUNTIME} logs --tail 30 '${_BACKOFFICE_CONTAINER}' 2>&1 | grep -iE 'auth|login|totp|caddy|401|400|error|warn|bootstrap|credential' || true
+  " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+else
+  _ev "backoffice container not found in '${RUNTIME} ps'"
 fi
 
 # ---------------------------------------------------------------------------
