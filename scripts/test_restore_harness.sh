@@ -297,21 +297,26 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
   # root's containers. 'sudo podman system prune' only affects root's store.
   # If su's containers are running from a previous install, ports 80/443 stay
   # bound and install.sh preflight fails with "Port 80/443 IN USE".
+  #
+  # IMPORTANT: Do NOT prune su's IMAGES. Su's images are the source for the
+  # rootful pre-load (Step A: save from su, Step B: load as root). Pruning
+  # su's images removes compose images needed for the pre-load. Only prune
+  # su's CONTAINERS and VOLUMES (to release ports and free volume data).
   if [[ "${ROOTFUL}" == "true" ]]; then
-    # Step 1: stop su's containers via podman (as su user, no sudo needed)
+    # Step 1: stop su's containers and prune volumes — but KEEP su's images
     _vm_ssh "
       if [[ -f '${VM_CLONE_DIR}/uninstall.sh' ]]; then
         cd '${VM_CLONE_DIR}' && YSG_RUNTIME=podman bash uninstall.sh --remove-volumes --yes 2>&1 || true
       fi
       podman stop -a 2>/dev/null || true
-      podman system prune -f 2>/dev/null || true
+      podman container prune -f 2>/dev/null || true
       podman volume prune -f 2>/dev/null || true
+      podman network prune -f 2>/dev/null || true
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
-    # Step 2: prune root's containers/images
+    # Step 2: prune root's containers and images (root's store is expendable)
     _vm_sudo "
       podman stop -a 2>/dev/null || true
-      podman system prune -f 2>/dev/null || true
-      podman volume prune -f 2>/dev/null || true
+      podman system prune -af 2>/dev/null || true
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
   else
     _vm_run "
@@ -1165,15 +1170,17 @@ _vm_ssh "rm -f '/home/${VM_USER}/release_gate_probe_restore_${TIMESTAMP}.sh'" 2>
 if [[ "${KEEP_INSTALL}" != "true" ]]; then
   _section "Phase 10: Teardown"
   if [[ "${ROOTFUL}" == "true" ]]; then
+    # Teardown: stop containers, clean volumes. Preserve su's images for next run.
     _vm_ssh "
       podman stop -a 2>/dev/null || true
-      podman system prune -f 2>/dev/null || true
+      podman container prune -f 2>/dev/null || true
       podman volume prune -f 2>/dev/null || true
+      podman network prune -f 2>/dev/null || true
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
+    # Root's images are expendable — prune all to free disk after test
     _vm_sudo "
       podman stop -a 2>/dev/null || true
-      podman system prune -f 2>/dev/null || true
-      podman volume prune -f 2>/dev/null || true
+      podman system prune -af 2>/dev/null || true
     " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
   else
     _vm_run "
