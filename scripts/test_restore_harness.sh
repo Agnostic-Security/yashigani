@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T21:30:00+01:00
+# Last-Updated: 2026-05-10T22:45:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -803,8 +803,11 @@ _run_probe() {
     " 2>&1
   )" || true
 
-  # Filter sudo prompt lines from output
-  result="$(printf '%s' "$result" | grep -v 'sudo\] password for' || true)"
+  # Strip sudo prompt text — it may appear as a prefix on the same line as probe
+  # output (e.g. "[sudo] password for su: Admin1 login HTTP: 200"), which would
+  # cause grep-v to silently discard the Admin1 line.  Use sed to strip the
+  # prompt text wherever it appears, then drop any lines that became blank.
+  result="$(printf '%s' "$result" | sed 's/\[sudo\] password for [^:]*: //g' | grep -v '^$' || true)"
   # Write to evidence file ONLY (not stdout) — this function's stdout is captured
   # by the caller; tee-ing to stdout here would pollute the captured variable and
   # cause duplicate Admin1/Admin2 lines, breaking the grep-based code extraction.
