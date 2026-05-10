@@ -154,6 +154,18 @@ jobs:
         if: matrix.os-label == 'macos' && matrix.runtime == 'podman'
         run: |
           brew install podman podman-compose 2>/dev/null || true
+          # Apple Silicon (applehv) only allows ONE VM active at a time.
+          # Stop all running Podman machines before starting ysg-smoke.
+          # `podman machine ls -q` returns machine names; `podman machine stop`
+          # is a no-op for already-stopped machines.
+          # This is safe: the Docker/Colima cell runs in a parallel job and uses
+          # a different hypervisor backend (vz, not applehv) — stopping Podman
+          # machines does NOT affect the Colima VM.
+          while IFS= read -r _mname; do
+            _clean="${_mname%\*}"   # strip the trailing '*' that podman adds to the default
+            echo "Ensuring Podman machine stopped: ${_clean}"
+            podman machine stop "${_clean}" 2>/dev/null || true
+          done < <(podman machine ls -q 2>/dev/null)
           # Init and start the Podman machine (VM-backed on macOS)
           podman machine init --cpus 2 --memory 4096 --disk-size 20 ysg-smoke || true
           podman machine start ysg-smoke
