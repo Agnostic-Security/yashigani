@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-07T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
 # Yashigani
 ---
 
@@ -16,7 +16,7 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.2 (`2.23.x` branch, 2026-05-03) — Security hardening, supply-chain hygiene, ASVS L3 92%; all gates GREEN
+**Latest Tagged Release:** v2.23.2.1 (`2.23.x` branch, 2026-05-08) — Helm chart digest pin fix (chart-only patch over v2.23.2; code unchanged); see [v2.23.2.1 release notes](docs/release-notes/v2.23.2.1.md)
 
 > **Upgrade notice:** v2.23.2 ships a security hardening batch. Existing v2.23.1 deployments should upgrade.
 

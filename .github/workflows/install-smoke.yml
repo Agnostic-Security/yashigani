@@ -1,4 +1,4 @@
-# Last updated: 2026-05-08T00:00:00+01:00 (v2.23.3: formally mark macOS smoke as INFORMATIONAL; update triggers for v2.23.3 branch)
+# Last updated: 2026-05-10T00:00:00+01:00 (v2.23.3: bump macOS install step timeout 18→35 min, job ceiling 25→45 min)
 # install-smoke.yml — Install smoke-test matrix
 #
 # Matrix: ubuntu-latest × (docker|podman) — GATE (required for merge)
@@ -51,7 +51,7 @@ name: Install Smoke Matrix
 
 on:
   push:
-    branches: ["v2.23.3", "2.23.x", "feat/v232-install-smoke-matrix*", "chore/macos-smoke-informational"]
+    branches: ["v2.23.3", "2.23.x", "feat/v232-install-smoke-matrix*", "chore/macos-smoke-informational", "chore/v233-macos-install-timeout-bump"]
   pull_request:
     branches: ["v2.23.3", "2.23.x"]
   workflow_dispatch: {}
@@ -97,7 +97,10 @@ jobs:
     # macOS cells continue-on-error because GH hosted runners lack VZ support.
     # Remove continue-on-error when pointing macos cells at self-hosted runners.
     continue-on-error: ${{ !matrix.gates }}
-    timeout-minutes: 25   # hard ceiling: prevents runaway bill if compose hangs
+    timeout-minutes: 45   # hard ceiling: prevents runaway bill if compose hangs
+                          # Raised from 25 to 45: macOS Python image build on Apple Silicon
+                          # consistently exceeds 25 min (step-level timeout was 18 min,
+                          # job-level 25 min — both needed to rise together).
 
     steps:
       - name: Checkout
@@ -221,7 +224,10 @@ jobs:
           cat install.log   # surface output to GH Actions log viewer
           echo "installer exit code: $install_exit"
           exit $install_exit
-        timeout-minutes: 18   # inner timeout; outer job timeout is 25
+        timeout-minutes: 35   # inner timeout; outer job timeout is 45
+                              # Raised from 18: Python image build on M4 Apple Silicon
+                              # routinely exceeds 18 min. Job ceiling raised to 45 to
+                              # accommodate daemon startup + install + healthcheck poll.
 
       # -----------------------------------------------------------------------
       # Smoke assertion: gateway /healthz → HTTP 200

@@ -4,8 +4,8 @@
 # v0.5.0: adds asyncpg, alembic, PyJWT, OTEL, python-json-logger, Vault optional.
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
-# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS builder
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS builder
 
 WORKDIR /build
 
@@ -19,8 +19,8 @@ RUN python -m build --wheel --outdir /dist
 
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
-# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS runtime
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS runtime
 
 RUN groupadd --gid 1001 yashigani \
  && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false yashigani
@@ -47,12 +47,12 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
     pip uninstall -y pip
 
 # Admin UI templates + static assets — copy into installed package
-COPY src/yashigani/backoffice/templates/ /usr/local/lib/python3.12/site-packages/yashigani/backoffice/templates/
-COPY src/yashigani/backoffice/static/ /usr/local/lib/python3.12/site-packages/yashigani/backoffice/static/
+COPY src/yashigani/backoffice/templates/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/templates/
+COPY src/yashigani/backoffice/static/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/static/
 
 # Alembic config — script_location rewritten for installed package path
 COPY alembic.ini /app/alembic.ini
-RUN sed -i 's|script_location = src/yashigani/db/migrations|script_location = /usr/local/lib/python3.12/site-packages/yashigani/db/migrations|' /app/alembic.ini
+RUN sed -i 's|script_location = src/yashigani/db/migrations|script_location = /usr/local/lib/python3.14/site-packages/yashigani/db/migrations|' /app/alembic.ini
 
 # v2.23.1: DB bootstrap script — install.sh runs
 # `docker compose exec backoffice python scripts/bootstrap_postgres.py` after
@@ -67,7 +67,7 @@ USER yashigani
 EXPOSE 8443
 
 # mTLS healthcheck — Pattern A for Python ssl: trust anchor is the PUBLIC
-# ca_root.crt. Python 3.12/OpenSSL 3.0 strict-chain validation rejects
+# ca_root.crt. Python 3.14/OpenSSL 3.0 strict-chain validation rejects
 # intermediate-only anchors (gate #58a evidence, 2026-04-28).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import ssl, urllib.request; c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); c.load_cert_chain('/run/secrets/backoffice_client.crt','/run/secrets/backoffice_client.key'); urllib.request.urlopen('https://localhost:8443/healthz', context=c)"

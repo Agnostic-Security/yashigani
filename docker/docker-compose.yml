@@ -1,6 +1,8 @@
 ---
-# Yashigani v2.23.2 — Docker Compose stack
+# Yashigani v2.23.3 — Docker Compose stack
+# Last updated: 2026-05-10T12:00:00+01:00 (fix: BUG-AG-005 bump header to 2.23.3)
 # Last updated: 2026-05-10T00:00:00+01:00 (fix: G16 image-pin + to_thread run_migrations; start_period 30s→60s)
+# Last updated: 2026-05-09T00:00:00+01:00 (fix/v233-base-regressions: add YASHIGANI_DB_AES_KEY to backoffice env — smoke fix)
 #
 # Services: caddy (TLS edge), gateway, backoffice, policy (OPA),
 #           redis, ollama, prometheus, grafana
@@ -186,7 +188,7 @@ services:
       OTEL_EXPORTER_OTLP_CERTIFICATE: /run/secrets/ca_root.crt
       OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE: /run/secrets/gateway_client.crt
       OTEL_EXPORTER_OTLP_CLIENT_KEY: /run/secrets/gateway_client.key
-      FASTTEXT_MODEL_PATH: /app/models/fasttext_classifier.bin
+      SKLEARN_MODEL_PATH: /app/models/sensitivity_classifier.joblib
       # Agent auth tokens for upstream calls
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       # EX-231-10 Layer B — per-install shared secret for X-Caddy-Verified-Secret

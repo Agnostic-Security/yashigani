@@ -120,8 +120,8 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.gateway.env.otelEndpoint | quote }}
             {{- end }}
-            - name: FASTTEXT_MODEL_PATH
-              value: {{ .Values.gateway.env.fasttextModelPath | quote }}
+            - name: SKLEARN_MODEL_PATH
+              value: {{ .Values.gateway.env.sklearnModelPath | quote }}
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: POSTGRES_PASSWORD
