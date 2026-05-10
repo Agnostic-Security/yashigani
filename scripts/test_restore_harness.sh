@@ -61,7 +61,7 @@
 #   - sudo rights for 'su' user
 #
 # Version: v2.23.3
-# Last-Updated: 2026-05-10T22:45:00+01:00
+# Last-Updated: 2026-05-10T23:00:00+01:00
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -876,8 +876,9 @@ BACKUP_FILE=""
 # private key files via tar even though su is in ysgteam.  Always run via sudo
 # so root can read all files.  The harness-generated age identity (chmod 400,
 # owned by su/root) is still readable by root.
-# Pre-create the backups dir as su so the harness-age dir is accessible.
-_vm_ssh "mkdir -p '${VM_BACKUPS_DIR}'" 2>/dev/null || true
+# Pre-create the backups dir.  For rootful mode the dir is under /root/ which
+# the su user cannot access, so use _vm_run (sudo-backed for rootful).
+_vm_run "mkdir -p '${VM_BACKUPS_DIR}'" 2>/dev/null || true
 
 BACKUP_OUTPUT="$(
   _vm_sudo "
@@ -903,10 +904,13 @@ fi
 # must be able to read the file.  The identity key stays su-owned.
 _vm_sudo "chown -R '${VM_USER}:${VM_USER}' '${VM_BACKUPS_DIR}' 2>/dev/null || true" 2>/dev/null || true
 
-# Find the backup file
+# Find the backup file — use _vm_run (sudo for rootful) because in rootful mode
+# the backups dir is under /root/ which the su user cannot list (drwx------ 700).
 BACKUP_FILE="$(
-  _vm_ssh "ls -1t '${VM_BACKUPS_DIR}'/*.tar.gz.age 2>/dev/null | head -1" 2>/dev/null || echo ""
+  _vm_run "ls -1t '${VM_BACKUPS_DIR}'/*.tar.gz.age 2>/dev/null | head -1" 2>/dev/null || echo ""
 )"
+# Strip sudo prompt prefix if present (same issue as _run_probe output filtering)
+BACKUP_FILE="$(printf '%s' "${BACKUP_FILE}" | sed 's/\[sudo\] password for [^:]*: //g' | grep -v '^$' | head -1 || echo "")"
 BACKUP_FILE="${BACKUP_FILE%%$'\n'*}"
 _ev "Backup file: ${BACKUP_FILE:-NOT_FOUND}"
 _ev "Backup size: $(_vm_run "ls -lh '${BACKUP_FILE:-/dev/null}' 2>/dev/null | awk '{print \$5}'" 2>/dev/null || echo unknown)"
@@ -1012,12 +1016,15 @@ else
       " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
     fi
 
-    # Run restore.sh as su user (zero-sudo contract per P0-14).
+    # Run restore.sh — zero-sudo contract per P0-14 for rootless/Docker modes.
+    # For rootful podman, the clone dir is under /root/ which the su user cannot
+    # access (drwx------ 700), so rootful restore must also run via sudo (_vm_run
+    # dispatches to _vm_sudo when ROOTFUL=true).
     # Must export YSG_RUNTIME so restore.sh auto-detects the correct runtime —
     # otherwise restore.sh's detect_runtime() sees 'docker info' succeed (su is
     # in the docker group) and picks Docker even during a Podman install.
     RESTORE_OUTPUT="$(
-      _vm_ssh "
+      _vm_run "
         set -euo pipefail
         export YSG_RUNTIME='${RUNTIME}'
         cd '${VM_CLONE_DIR}' && \
