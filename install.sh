@@ -2321,12 +2321,41 @@ except Exception:
   # from, and stale :latest tags from prior installs silently get used
   # (which lack new modules like yashigani.pki). Per-run rebuild is cheap
   # thanks to container-layer caching; correctness beats a few saved seconds.
-  log_info "Building gateway and backoffice images from source..."
-  "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
-    log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
-    exit 1
+  #
+  # v2.23.3: Skip build if versioned images are already present in the local
+  # store. This supports airgap installs and CI harnesses where images are
+  # pre-seeded, and avoids unnecessary registry round-trips for the base image.
+  # Check by versioned tag (not :latest) to avoid using stale images.
+  _local_images_cached() {
+    local _gw _bo
+    if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
+      _gw="localhost/yashigani/gateway:${YASHIGANI_VERSION}"
+      _bo="localhost/yashigani/backoffice:${YASHIGANI_VERSION}"
+      podman image inspect "$_gw" >/dev/null 2>&1 && \
+        podman image inspect "$_bo" >/dev/null 2>&1
+    else
+      _gw="yashigani/gateway:${YASHIGANI_VERSION}"
+      _bo="yashigani/backoffice:${YASHIGANI_VERSION}"
+      docker image inspect "$_gw" >/dev/null 2>&1 && \
+        docker image inspect "$_bo" >/dev/null 2>&1
+    fi
   }
-  log_success "Local images built"
+  if _local_images_cached; then
+    log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}) — skipping build"
+    log_success "Local images ready (cached)"
+    # Signal compose_up() to use --pull never so digest-pinned compose image refs
+    # don't trigger registry round-trips for pre-seeded images. Only safe when
+    # images are pre-seeded by a trusted source (harness tarball cache, airgap
+    # bundle); fresh installs build+pull with digest verification as usual.
+    YASHIGANI_COMPOSE_PULL_POLICY="never"
+  else
+    log_info "Building gateway and backoffice images from source..."
+    "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
+      log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
+      exit 1
+    }
+    log_success "Local images built"
+  fi
 
   # Pull all remote images
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
@@ -2372,6 +2401,25 @@ ghcr.io/openclaw/openclaw:2026.3.1" ;;
       wait "${_batch_pids[@]}" 2>/dev/null || true
     fi
     log_success "All $_total remote images pulled"
+    # v2.23.3: After concurrent Podman pulls, the storage may hold a brief lock.
+    # Verify the locally-built images are still visible before proceeding to
+    # PKI bootstrap (_pki_run_issuer requires them). Retry once with 2s backoff
+    # to accommodate any transient storage lock from the parallel pull.
+    local _gw_check=0
+    for _retry in 1 2; do
+      podman image inspect "localhost/yashigani/gateway:${YASHIGANI_VERSION}" >/dev/null 2>&1 \
+        || podman image inspect "yashigani/gateway:${YASHIGANI_VERSION}" >/dev/null 2>&1 \
+        && _gw_check=1 && break
+      log_warn "Gateway image not immediately visible after parallel pull (retry ${_retry}/2)..."
+      sleep 2
+    done
+    if [[ "$_gw_check" == "0" ]]; then
+      log_error "Gateway image not found after parallel pull — rebuilding..."
+      "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway || {
+        log_error "Gateway rebuild failed — cannot continue"
+        exit 1
+      }
+    fi
   else
     log_info "Pulling remote container images..."
     "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-buildable 2>/dev/null || \
@@ -3004,13 +3052,18 @@ compose_up() {
     # ephemeral docker container (daemon = root) to create the subdir in that case.
     # Falls back to plain mkdir if docker is not available or if the call fails.
     if ! mkdir -p "${data_dir}/audit" 2>/dev/null; then
-      local _alpine_mkdir="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
-      if ! docker run --rm \
-             --volume "${data_dir}:/d:rw" \
-             "$_alpine_mkdir" \
-             mkdir -p /d/audit 2>/dev/null; then
-        log_error "Cannot create ${data_dir}/audit — run: sudo mkdir -p \"${data_dir}/audit\""
-        exit 1
+      local _alpine_mkdir_digest="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+      # Prefer --pull=never with cached alpine:3; fall back to digest-pinned pull.
+      if ! docker run --rm --pull=never \
+               --volume "${data_dir}:/d:rw" \
+               "alpine:3" mkdir -p /d/audit 2>/dev/null; then
+        if ! docker run --rm \
+               --volume "${data_dir}:/d:rw" \
+               "$_alpine_mkdir_digest" \
+               mkdir -p /d/audit 2>/dev/null; then
+          log_error "Cannot create ${data_dir}/audit — run: sudo mkdir -p \"${data_dir}/audit\""
+          exit 1
+        fi
       fi
       log_info "Created ${data_dir}/audit via ephemeral docker container (non-root Docker path)"
     fi
@@ -3264,11 +3317,50 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     # healthy. With set -euo pipefail this caused install to abort before
     # bootstrap_postgres, leaving admin accounts unseeded. Core service health is
     # validated by run_health_check (step 12); this non-zero is non-fatal here.
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
+    # v2.23.3: when images were pre-seeded (YASHIGANI_COMPOSE_PULL_POLICY=never),
+    # Docker/Podman's image store has images by name:tag but NOT by digest (the
+    # OCI manifest list digest changes when images are saved/loaded via tarballs).
+    # docker compose up with digest-pinned image refs (image: foo:tag@sha256:...)
+    # fails with "No such image" even with --pull never, because Docker resolves
+    # the image by the full spec including digest. Fix: strip @sha256:... from all
+    # image: lines in a temporary copy of the compose file, then use that for up.
+    # The compose file on disk is NOT modified — the temp file is used only for up.
+    # This is equivalent to the --air-gap bundle behaviour.
+    local _compose_files_up=("${compose_files[@]}")
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
+       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      log_info "Pre-seeded mode: stripping image digests in compose file for local cache lookup"
+      local _digest_stripped_compose
+      _digest_stripped_compose="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
+      sed 's|@sha256:[a-f0-9]\{64\}||g' "${compose_file}" > "$_digest_stripped_compose"
+      _compose_files_up=("-f" "$_digest_stripped_compose")
+      log_info "  temp compose file: $(basename "$_digest_stripped_compose")"
+    fi
+    "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
+    # Clean up temp compose file if it was created
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
+       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      rm -f "${_digest_stripped_compose:-}" 2>/dev/null || true
+    fi
   else
     log_info "Starting services..."
     # ROOTLESS-9: same rationale as upgrade path above.
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
+    # v2.23.3: same digest-strip for pre-seeded images (fresh install path).
+    local _compose_files_up2=("${compose_files[@]}")
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
+       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      log_info "Pre-seeded mode: stripping image digests in compose file for local cache lookup"
+      local _digest_stripped_compose2
+      _digest_stripped_compose2="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
+      sed 's|@sha256:[a-f0-9]\{64\}||g' "${compose_file}" > "$_digest_stripped_compose2"
+      _compose_files_up2=("-f" "$_digest_stripped_compose2")
+      log_info "  temp compose file: $(basename "$_digest_stripped_compose2")"
+    fi
+    "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
+       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      rm -f "${_digest_stripped_compose2:-}" 2>/dev/null || true
+    fi
   fi
 
   log_success "Services started"
@@ -4958,14 +5050,23 @@ _pki_run_issuer() {
     # internally, so it can chown inside the container regardless of host caller uid).
     # Same pattern as _pki_chown_client_keys() docker_run mode.
     # alpine:3 digest (amd64+arm64 manifest list — 2026-04-29; rotate each release):
-    local _alpine_chown="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
-    if ! docker run --rm \
-           --volume "${secrets_in}:/s:rw" \
-           "$_alpine_chown" \
-           chown 1001:1001 /s 2>/dev/null; then
-      # Fallback to plain chown (works when installer runs as root / id -u == 0)
-      chown 1001:1001 "$secrets_in" 2>/dev/null || true
-    fi
+    local _alpine_chown_digest="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+    # Prefer --pull=never with the tag-only ref if alpine:3 is already in the
+    # local Docker store (avoids registry round-trips, including rate-limit hits
+    # on Docker Hub). Fall back to the digest-pinned pull for fresh installs
+    # (supply-chain safe: digest is verified at pull time). Finally fall back to
+    # plain chown as a last resort (only works if installer runs as root).
+    _docker_chown_dir() {
+      local _dir="$1" _target="$2"
+      docker run --rm --pull=never \
+             --volume "${_dir}:${_target}:rw" \
+             "alpine:3" chown 1001:1001 "${_target}" 2>/dev/null && return 0
+      docker run --rm \
+             --volume "${_dir}:${_target}:rw" \
+             "$_alpine_chown_digest" chown 1001:1001 "${_target}" 2>/dev/null && return 0
+      chown 1001:1001 "$_dir" 2>/dev/null || true
+    }
+    _docker_chown_dir "${secrets_in}" /s
     # Retro #3ah (v2.23.1): the issuer also writes back to
     # service_identities.yaml (bootstrap_token_sha256 fields) via the
     # /manifest.yaml bind mount. Without ownership match the write fails
@@ -4974,12 +5075,17 @@ _pki_run_issuer() {
     # We bind-mount the parent dir and chown the file inside the container.
     local _manifest_dir; _manifest_dir="$(dirname "$manifest_in")"
     local _manifest_base; _manifest_base="$(basename "$manifest_in")"
-    if ! docker run --rm \
-           --volume "${_manifest_dir}:/m:rw" \
-           "$_alpine_chown" \
-           chown 1001:1001 "/m/${_manifest_base}" 2>/dev/null; then
-      chown 1001:1001 "$manifest_in" 2>/dev/null || true
-    fi
+    _docker_chown_file() {
+      local _dir="$1" _file="$2"
+      docker run --rm --pull=never \
+             --volume "${_dir}:/m:rw" \
+             "alpine:3" chown 1001:1001 "/m/${_file}" 2>/dev/null && return 0
+      docker run --rm \
+             --volume "${_dir}:/m:rw" \
+             "$_alpine_chown_digest" chown 1001:1001 "/m/${_file}" 2>/dev/null && return 0
+      chown 1001:1001 "${_dir}/${_file}" 2>/dev/null || true
+    }
+    _docker_chown_file "${_manifest_dir}" "${_manifest_base}"
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -5221,17 +5327,24 @@ _pki_chown_client_keys() {
         # Bind-mount the secrets dir into a minimal container; chown+chmod the
         # specific file path relative to the mount root /s.
         # The container is rm'd immediately; no persistent state.
+        # Prefer --pull=never with tag-only ref if alpine:3 is cached locally
+        # (avoids Docker Hub rate-limit hits); fall back to digest-pinned pull.
         local _rel_file="${_file#"${_secrets_dir}/"}"
         local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
         if [[ -n "$_extra_chmod" ]]; then
           _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
         fi
-        if ! docker run --rm \
+        if ! docker run --rm --pull=never \
                --volume "${_secrets_dir}:/s:rw" \
-               "$_alpine_image" \
-               sh -c "$_container_cmd"; then
-          log_error "docker run chown/chmod failed on ${_label} — aborting"
-          return 1
+               "alpine:3" \
+               sh -c "$_container_cmd" 2>/dev/null; then
+          if ! docker run --rm \
+                 --volume "${_secrets_dir}:/s:rw" \
+                 "$_alpine_image" \
+                 sh -c "$_container_cmd"; then
+            log_error "docker run chown/chmod failed on ${_label} — aborting"
+            return 1
+          fi
         fi
         ;;
       podman_run)
@@ -5370,9 +5483,15 @@ _pki_chown_client_keys() {
         local _rel_pw="${_pwpath#"${_secrets_dir}/"}"
         case "$_chown_mode" in
           docker_run)
-            docker run --rm --volume "${_secrets_dir}:/s:rw" \
-              "$_alpine_image" sh -c "chmod 0644 /s/${_rel_pw}" 2>/dev/null \
-              || { log_error "docker_run chmod 0644 failed on ${_shared_pw}"; return 1; }
+            # v2.23.3: try --pull=never with tag-only alpine:3 first to avoid
+            # Docker Hub rate-limit hits; fall back to digest-pinned pull if needed.
+            if ! docker run --rm --pull=never \
+                   --volume "${_secrets_dir}:/s:rw" \
+                   "alpine:3" sh -c "chmod 0644 /s/${_rel_pw}" 2>/dev/null; then
+              docker run --rm --volume "${_secrets_dir}:/s:rw" \
+                "$_alpine_image" sh -c "chmod 0644 /s/${_rel_pw}" 2>/dev/null \
+                || { log_error "docker_run chmod 0644 failed on ${_shared_pw}"; return 1; }
+            fi
             ;;
           podman_run)
             podman run --rm --volume "${_secrets_dir}:/s:rw" \

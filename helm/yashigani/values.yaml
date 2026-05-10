@@ -1,6 +1,6 @@
 # Yashigani v2.23.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-09 (chore: tag-only refs for own images — customer-builds pattern)
+# Last updated: 2026-05-10 (fix: G16 image-pin — langgraph floating-tag stub replaced with not-yet-available hold-back)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -727,11 +727,14 @@ agentBundles:
     enabled: false
     image:
       # ANOMALY 2026-05-02: langchain/langgraph-api is not publicly available on
-      # Docker Hub — pull fails. Agent bundle disabled by default. Pinning deferred
-      # until a stable public tag is confirmed. Do not enable without verifying the
-      # registry source and obtaining a digest. Tracked in v2.23.2 backlog.
+      # Docker Hub — pull fails. Agent bundle disabled by default (enabled: false).
+      # G16 hold-back 2026-05-10 (resolution shipped in v2.23.3): no stable public
+      # tag exists; floating "latest" replaced with "not-yet-available" sentinel
+      # per image-pinning policy. Sentinel is unpullable by design — operators
+      # must supply a real tag+digest before flipping `enabled: true`.
+      # Re-evaluate when langchain/langgraph-api publishes a public tag.
       repository: langchain/langgraph-api
-      tag: "latest"
+      tag: "not-yet-available"
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
