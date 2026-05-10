@@ -82,14 +82,14 @@ def _build_app():
         response_pipeline = ResponseInspectionPipeline(classifier=classifier)
         logger.info("Response inspection pipeline enabled")
 
-    # FastText first-pass classifier — Phase 12
-    fasttext_backend = None
+    # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
+    fasttext_backend = None  # legacy name retained; wired into SensitivityClassifier below
     try:
-        from yashigani.inspection.backends.fasttext_backend import FastTextBackend
-        fasttext_backend = FastTextBackend()
-        logger.info("FastText backend loaded: %s", fasttext_backend.model_path)
+        from yashigani.inspection.backends.sklearn_backend import SklearnBackend
+        fasttext_backend = SklearnBackend()
+        logger.info("sklearn sensitivity backend loaded: %s", fasttext_backend.model_path)
     except Exception as exc:
-        logger.warning("FastText backend unavailable (%s) — LLM-only inspection", exc)
+        logger.warning("sklearn backend unavailable (%s) — LLM-only inspection", exc)
 
     # Gateway config
     upstream_url = os.environ["YASHIGANI_UPSTREAM_URL"]
@@ -265,9 +265,9 @@ def _build_app():
     try:
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
         sensitivity_classifier = SensitivityClassifier(
-            enable_fasttext=fasttext_backend is not None,
+            enable_sklearn=fasttext_backend is not None,
             enable_ollama=True,
-            fasttext_backend=fasttext_backend,
+            sklearn_backend=fasttext_backend,
             ollama_url=ollama_url,
             ollama_model=model,
         )

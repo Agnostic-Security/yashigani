@@ -186,7 +186,7 @@ services:
       OTEL_EXPORTER_OTLP_CERTIFICATE: /run/secrets/ca_root.crt
       OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE: /run/secrets/gateway_client.crt
       OTEL_EXPORTER_OTLP_CLIENT_KEY: /run/secrets/gateway_client.key
-      FASTTEXT_MODEL_PATH: /app/models/fasttext_classifier.bin
+      SKLEARN_MODEL_PATH: /app/models/sensitivity_classifier.joblib
       # Agent auth tokens for upstream calls
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       # EX-231-10 Layer B — per-install shared secret for X-Caddy-Verified-Secret
