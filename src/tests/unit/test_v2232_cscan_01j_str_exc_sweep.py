@@ -69,15 +69,20 @@ def _load_module(filename: str, module_name: str) -> tuple:
 
     mw = stubs["yashigani.backoffice.middleware"]
     mw.AdminSession = object  # type: ignore[attr-defined]
+    mw.AnySession = object  # type: ignore[attr-defined]  # added v2.23.3: auth.py imports AnySession
     mw.require_admin_session = MagicMock()  # type: ignore[attr-defined]
+    mw.require_any_session = MagicMock()  # type: ignore[attr-defined]
     mw.require_stepup_admin_session = MagicMock()  # type: ignore[attr-defined]
     mw.StepUpAdminSession = object  # type: ignore[attr-defined]
+    mw.get_session_store = MagicMock()  # type: ignore[attr-defined]
+    mw._SESSION_COOKIE = "__Host-yashigani_admin_session"  # type: ignore[attr-defined]
 
     state_stub = MagicMock()
     state_stub.kms_provider = None
     state_stub.rotation_scheduler = None
     state_stub.audit_writer = MagicMock()
     stubs["yashigani.backoffice.state"].backoffice_state = state_stub  # type: ignore[attr-defined]
+    stubs["yashigani.backoffice.state"].BackofficeState = MagicMock  # type: ignore[attr-defined]  # v2.23.3: backoffice/__init__.py imports BackofficeState
 
     old: dict = {}
     for k, v in stubs.items():

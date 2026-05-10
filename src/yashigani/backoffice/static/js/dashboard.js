@@ -1,4 +1,4 @@
-// last-updated: 2026-04-27T00:00:00+01:00
+// last-updated: 2026-05-09T00:00:00+01:00 (v2.23.3: add PKI loadPkiStatus() call in showPage)
 // V1.2.1 — HTML output encoding helper (CWE-79 stored XSS prevention).
 // Every user-controlled value rendered into innerHTML MUST pass through
 // escapeHtml().  Stage B audit (§4.1) identified 10 sinks; all are fixed below.
@@ -22,6 +22,10 @@ function showPage(name, triggerEl) {
     if (name === 'sensitivity') loadSensitivity();
     if (name === 'settings') loadSettings();
     if (name === 'backup') loadBackup();
+    // PKI panel — loadPkiStatus is defined in pki.js (loaded defer).
+    // window.loadPkiStatus guard prevents ReferenceError if pki.js not yet parsed.
+    // Bug fix: v2.23.3 — showPage('pki') was missing the loadPkiStatus() call.
+    if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
 }
 
 async function api(path) {
