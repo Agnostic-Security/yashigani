@@ -3492,9 +3492,13 @@ _podman_verify_healthchecks() {
   local _ok_count=0
   local _skip_count=0
 
-  # List all running containers — capture names into an array
-  local _containers
-  mapfile -t _containers < <(podman ps --format '{{.Names}}' 2>/dev/null || true)
+  # List all running containers — capture names into an array.
+  # Use while+read loop rather than bash 4+ array-builders so install.sh runs on
+  # macOS system bash 3.2 (see scripts/test-installer.sh portability gate).
+  local _containers=()
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] && _containers+=("$_line")
+  done < <(podman ps --format '{{.Names}}' 2>/dev/null || true)
 
   if [[ "${#_containers[@]}" -eq 0 ]]; then
     log_warn "P-9: no running containers found via 'podman ps' — skipping healthcheck wiring check"
@@ -6121,10 +6125,12 @@ main() {
       printf "\n${C_BOLD}  Enable Open WebUI integration? [y/N]: ${C_RESET}"
       local owui_choice
       read -r owui_choice </dev/tty 2>/dev/null || owui_choice="n"
-      if [[ "${owui_choice,,}" == "y" || "${owui_choice,,}" == "yes" ]]; then
-        COMPOSE_PROFILES+=("openwebui")
-        log_success "Open WebUI selected"
-      fi
+      case "$owui_choice" in
+        y|Y|yes|YES|Yes)
+          COMPOSE_PROFILES+=("openwebui")
+          log_success "Open WebUI selected"
+          ;;
+      esac
     fi
 
     # Step 8c: Wazuh SIEM (opt-in)
@@ -6138,10 +6144,12 @@ main() {
       printf "\n${C_BOLD}  Install Wazuh? [y/N]: ${C_RESET}"
       local wazuh_choice
       read -r wazuh_choice </dev/tty 2>/dev/null || wazuh_choice="n"
-      if [[ "${wazuh_choice,,}" == "y" || "${wazuh_choice,,}" == "yes" ]]; then
-        COMPOSE_PROFILES+=("wazuh")
-        log_success "Wazuh SIEM selected"
-      fi
+      case "$wazuh_choice" in
+        y|Y|yes|YES|Yes)
+          COMPOSE_PROFILES+=("wazuh")
+          log_success "Wazuh SIEM selected"
+          ;;
+      esac
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load
