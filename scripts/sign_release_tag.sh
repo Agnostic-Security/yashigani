@@ -15,7 +15,7 @@
 # Prerequisites:
 #   1. A GPG signing key for releases@agnosticsec.com must exist:
 #        gpg --list-secret-keys releases@agnosticsec.com
-#      Generate one if missing (see docs/release-process.md §9).
+#      Generate one if missing.
 #   2. Git must be configured to use that key:
 #        git config --global user.signingkey <KEY_ID>
 #      Or set SIGNING_KEY_ID env var before running this script.

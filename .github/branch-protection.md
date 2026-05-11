@@ -22,7 +22,7 @@ All 7 CI jobs must pass before merge is permitted. Enable "Require status checks
 
 Enable "Require branches to be up to date before merging."
 
-**Note — Install Smoke (`install-smoke.yml`):** The `smoke-gate (Linux + mutation only)` job from `install-smoke.yml` is intentionally NOT in the required status checks above. macOS smoke cells are INFORMATIONAL (GH hosted runners lack VZ/Colima/Podman machine support; see `docs/release-process.md §2.3`). The Linux smoke cells and mutation test are enforced inside `smoke-gate` itself, which runs against the release branch (`v2.23.3`, `2.23.x`) during M7 pre-flight — not as a PR merge gate on `main`. Do NOT add `smoke-gate (Linux + mutation only)` as a required status check on `main`.
+**Note — Install Smoke (`install-smoke.yml`):** The `smoke-gate (Linux + mutation only)` job from `install-smoke.yml` is intentionally NOT in the required status checks above. macOS smoke cells run on a self-hosted Apple-Silicon runner (M-chip) and are gated; GH-hosted macOS runners lack VZ/Colima/Podman-machine support. The Linux smoke cells and mutation test are enforced inside `smoke-gate` itself, which runs against the release branch during M7 pre-flight — not as a PR merge gate on `main`. Do NOT add `smoke-gate (Linux + mutation only)` as a required status check on `main`.
 
 ---
 

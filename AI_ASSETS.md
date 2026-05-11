@@ -4,7 +4,7 @@
 **Version:** 2.23.3
 **Last updated:** 2026-05-08T00:00:00+01:00
 **ACS control:** ASSET.1 — AI model inventory file required at repo root
-**Asset owners:** Tom (gateway runtime), Captain (container runtime), Tiago Rosado (product owner)
+**Asset owners:** Gateway engineering, container engineering, and product ownership (Agnostic Security Ltd)
 
 ---
 
@@ -163,9 +163,9 @@ No user prompts, responses, or any operator data are used as training inputs at 
 
 | Domain | Owner |
 |---|---|
-| Gateway runtime (inspection pipeline, agent registry, optimization engine) | Tom (gateway engineering) |
-| Container runtime parity (Docker / Podman / Kubernetes) | Captain (container engineering) |
-| Product strategy and licensing | Tiago Rosado (product owner, Agnostic Security Ltd) |
+| Gateway runtime (inspection pipeline, agent registry, optimization engine) | Gateway engineering team |
+| Container runtime parity (Docker / Podman / Kubernetes) | Container engineering team |
+| Product strategy and licensing | Product ownership (Agnostic Security Ltd) |
 
 ### Update cadence
 

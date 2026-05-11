@@ -128,7 +128,6 @@ jobs:
         run: |
           if [[ -z "${GPG_PRIVATE_KEY}" ]]; then
             echo "ERROR: GitHub secret GPG_PRIVATE_KEY is not set." >&2
-            echo "See docs/release-process.md §9 for key setup instructions." >&2
             exit 1
           fi
 

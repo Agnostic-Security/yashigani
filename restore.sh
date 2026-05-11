@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): PR#122 — replace blanket CWE-732 find assertion with per-service pki_key_mode check; eliminates false-positive on prometheus_client.key 0640)
-# Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; restore stops blanket-chmod; per-key ownership on written keys only; Tiago directive 2026-05-10)
+# Last updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; restore stops blanket-chmod; per-key ownership on written keys only; maintainer directive 2026-05-10)
 # Last updated: 2026-05-09T00:00:00+01:00 (feat: MP.L2-3.8.9 — add --encrypted path for age-encrypted .tar.gz.age backups)
 # Last updated: 2026-05-10T18:30:00+01:00 (fix(gate5): global _DECRYPT_EXTRACT_DIR for EXIT trap — local var inaccessible in EXIT trap when set -e triggers early script exit)
 # Last updated: 2026-05-08T00:00:00+01:00 (fix: K8s verify path — trigger rollout restart + wait + healthz probe after K8s secret restore; PR #67 followup)
@@ -11,7 +11,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Shared PKI service-key ownership map (single source of truth).
 # lib/pki_ownership.sh must live alongside restore.sh in the repo root.
-# GATE5-BUG-01 / Tiago directive 2026-05-10.
+# GATE5-BUG-01 / maintainer directive 2026-05-10.
 # ---------------------------------------------------------------------------
 # shellcheck source=lib/pki_ownership.sh
 _YSG_RESTORE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -556,7 +556,7 @@ restore_backup() {
     # Enumerate which keys were actually present in the backup before the copy.
     # _pki_chown_client_keys applies ownership ONLY to those keys — keys already
     # on disk that were not in the backup are left untouched.
-    # Tiago directive 2026-05-10: "restore of keys should only be done in a
+    # maintainer directive 2026-05-10: "restore of keys should only be done in a
     # scenario where they have been nuked in some way". GATE5-BUG-01.
     local _backup_written_keys=()
     local _bk_svc
@@ -585,7 +585,7 @@ restore_backup() {
     # BUG-58B-04a + BUG-58B-04b (v2.23.1): reapply canonical file modes and
     # re-own service private keys ONLY for the keys that were actually written
     # from the backup. Keys already on disk and not in the backup are untouched.
-    # GATE5-BUG-01 / Tiago directive 2026-05-10: removed blanket find+chmod sweep.
+    # GATE5-BUG-01 / maintainer directive 2026-05-10: removed blanket find+chmod sweep.
     _pki_chown_client_keys "${_backup_written_keys[@]+"${_backup_written_keys[@]}"}"
   else
     log_warn "No secrets directory in backup — skipping"
@@ -681,7 +681,7 @@ restore_backup() {
 # actually written from the backup. Only those keys get ownership re-applied;
 # keys already on disk that were NOT in the backup are left untouched.
 #
-# Tiago directive 2026-05-10 / GATE5-BUG-01:
+# maintainer directive 2026-05-10 / GATE5-BUG-01:
 #   "restore of keys should only be done in a scenario where they have been
 #    nuked in some way" — so restore must NOT blanket-chmod every *.key it
 #    finds on disk. Only the keys it actually placed get touched.

@@ -709,8 +709,8 @@ These are not installer inputs but must be planned before go-live.
 | TOTP enrollment plan | Required | All admin accounts must enroll TOTP before the bootstrap admin password is distributed. |
 | Admin initial password handling | Required | Printed at first run, one-time display. Store in password manager immediately. |
 | Host-level audit logging | Recommended | `/var/log/auth.log` + SSH logging in addition to Yashigani's own audit |
-| Container image pinning | **Required for production** | Every image in `docker-compose.yml`, compose overrides, and `helm/yashigani/values.yaml` must be pinned to a specific stable version tag. The release overlay (`docker-compose.release.yml`, `values.release.yaml`) must use `name:tag@sha256:<digest>` form for every external image. Floating-stub tags (`:latest`, `:7-alpine`, `:16-alpine`) are forbidden. See `docs/release-process.md §6b` (G16 Image-Bump Sweep) for the sweep command sequence and evidence format. |
-| Python / npm / Actions dep currency | **Required for production** | Confirm no dep is >2 minor behind latest stable and zero HIGH/CRITICAL Dependabot alerts are open across all in-scope repos. See §6b G16 dep-bump sweep. |
+| Container image pinning | **Required for production** | Every image in `docker-compose.yml`, compose overrides, and `helm/yashigani/values.yaml` must be pinned to a specific stable version tag. The release overlay (`docker-compose.release.yml`, `values.release.yaml`) must use `name:tag@sha256:<digest>` form for every external image. Floating-stub tags (`:latest`, `:7-alpine`, `:16-alpine`) are forbidden. |
+| Python / npm / Actions dep currency | **Required for production** | Confirm no dep is >2 minor behind latest stable and zero HIGH/CRITICAL Dependabot alerts are open across all in-scope repos. |
 | Seccomp/AppArmor | Recommended | Verify profiles are loading: `docker inspect --format='{{.HostConfig.SecurityOpt}}' yashigani-gateway-1` |
 | Volume encryption | Recommended | For cloud deployments, use encrypted EBS/Persistent Disk/Azure Managed Disk for the Docker data root |
 | Backup encryption | Recommended | Encrypt all Postgres backups at rest |
@@ -724,7 +724,7 @@ These are not installer inputs but must be planned before go-live.
 [ ] Postgres backup strategy decided and scheduled
 [ ] Container image pinning: specific-version tags in docker-compose.yml (no floating stubs)
 [ ] Container image pinning: release overlay uses name:tag@sha256:<digest> for all external images
-[ ] G16 dep-bump sweep completed and signed off (release managers: see docs/release-process.md §6b)
+[ ] G16 dep-bump sweep completed and signed off (release managers)
 [ ] Python packages: zero HIGH/CRITICAL open Dependabot alerts (yashigani + acs repos)
 [ ] npm/JS packages: npm audit --audit-level=high exit 0 (agnosticsec-website repo)
 [ ] GitHub Actions: all workflow-file action refs pinned to SHA at current tagged release

@@ -181,7 +181,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Test 7: Upgrade no-rotation path does not call _pki_chown_client_keys
-#          (Tiago directive 2026-05-10)
+#          (maintainer directive 2026-05-10)
 # ---------------------------------------------------------------------------
 printf "\n--- Test 7: Upgrade no-rotation path does not chown existing keys ---\n"
 # Verify the "Certs current — no rotation needed" branch in install.sh does NOT

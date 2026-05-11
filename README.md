@@ -161,7 +161,7 @@ cosign verify \
   ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
 ```
 
-For the full release verification process and SBOM attestation commands, see [`docs/release-process.md §10`](docs/release-process.md).
+For SBOM attestation, every release artifact carries a Sigstore-signed SBOM published as a GitHub Release asset alongside the tag.
 
 ---
 
@@ -195,7 +195,7 @@ v2.23.2 is a security and quality hardening release on top of v2.23.1. It closes
 
 **Caddy Reverse Proxy Coverage: All 73 Blocks** -- The Caddy verified-secret header (`X-Caddy-Verified-Secret`) is now injected on all 73 `reverse_proxy` blocks across all Caddyfile variants (selfsigned, ACME, CA, WAF) and the Kubernetes ConfigMap. A contract test asserts this on every CI run; a missing injection causes a test failure with a precise diff identifying the missing block.
 
-**GPG Release Tag Signing** -- All releases from v2.23.1 onward are GPG-signed. The signing infrastructure (CI workflow, key ceremony procedure, public key in-repo) is complete and documented in `docs/release-process.md §9`. Verification: `git tag -v v2.23.2`.
+**GPG Release Tag Signing** -- All releases from v2.23.1 onward are GPG-signed. The signing public key is published in-repo at `docs/release-signing-key.asc`. Verification: `git tag -v v2.23.2`.
 
 **Supply-Chain Hardening** -- GitHub Actions workflow steps are pinned to SHA digest (not just tag). The `pip` package manager is removed from runtime images to reduce the CVE surface. A CI job annotates every Trivy scan with the exact image digest that was scanned. SBOM generation includes a service-identity SHA gate.
 

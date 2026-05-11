@@ -25,6 +25,11 @@
 # Resource impact when CI fires: ~2 CPU + 4 GB RAM for ~10 min per cell.
 # Idle: ~50 MB RAM, no CPU.
 #
+# v2.23.2 context: macOS smoke pre-existing failures were accepted via ad-hoc
+# engineering risk-accept during the v2.23.2 release. v2.23.3 formalises that
+# acceptance structurally in the workflow file so no further per-release ad-hoc
+# accept is needed.
+#
 # Security note: Yashigani goes private post-v2.23.3 — until then, only PRs from
 # trusted actors should be allowed to run on the self-hosted runner. Configure
 # repo settings → Actions → "Require approval for all outside collaborators"
@@ -549,8 +554,7 @@ jobs:
 # in the workflow run UI but do not fail smoke-gate.
 #
 # This is the formalised structural replacement for the v2.23.2 ad-hoc
-# Tiago risk-accept on macOS smoke. No per-release risk-accept is needed.
-# See release-process.md §2.3 for pre-flight interpretation guidance.
+# engineering risk-accept on macOS smoke. No per-release risk-accept is needed.
 # ---------------------------------------------------------------------------
   smoke-gate:
     name: "smoke-gate (Linux + mutation only)"

@@ -123,7 +123,7 @@ def count_canonical_end_users() -> int:
       2. IdentityRegistry — Redis identity:index:kind:human members
       3. RBAC store — all group members via RBACStore.list_groups()
 
-    Design note (Tiago 2026-05-05): canonical count = union(auth_service users,
+    Design note (2026-05-05): canonical count = union(auth_service users,
     IdentityRegistry HUMAN, RBAC users), deduped by lowercase email.
 
     Async caveat: auth_service uses async Postgres. When called from within a
