@@ -132,13 +132,9 @@ jobs:
             exit 1
           fi
 
-          # Import the armored private key.
-          # --batch --no-tty: non-interactive; suppress any interactive prompts.
-          # The key in GPG_PRIVATE_KEY has UID `tr@agnosticsec.com`.
-          # GnuPG 2.1+ stores secret keys in private-keys-v1.d/; --batch import
-          # without --passphrase-fd may silently skip migration on passphrase-
-          # protected keys.  Provide passphrase via --passphrase-fd so the key
-          # is fully stored and queryable via --list-secret-keys.
+          # Step A: Import the armored private key.
+          # Passphrase provided via fd3 for fully non-interactive operation.
+          # The key UID is `tr@agnosticsec.com`.
           printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg \
             --batch --yes --no-tty \
             --pinentry-mode loopback \
@@ -146,30 +142,44 @@ jobs:
             --import \
             3< <(printf '%s' "${GPG_PASSPHRASE}")
 
-          # Retrieve the full 40-char fingerprint.
+          # Step B: Force migration of legacy secring.gpg → private-keys-v1.d/.
+          # On GnuPG 2.1+, importing a legacy-format private key puts secret
+          # material in ~/.gnupg/secring.gpg instead of the new keybox.
+          # The migration to private-keys-v1.d/ is triggered by running any
+          # gpg-agent operation with the passphrase supplied.  We do it here
+          # explicitly so --list-secret-keys becomes populated before step C.
+          if [[ -f "${GNUPGHOME:-$HOME/.gnupg}/secring.gpg" ]]; then
+            gpg \
+              --batch --yes --no-tty \
+              --pinentry-mode loopback \
+              --passphrase-fd 3 \
+              --import "${GNUPGHOME:-$HOME/.gnupg}/secring.gpg" \
+              3< <(printf '%s' "${GPG_PASSPHRASE}") || true
+          fi
+
+          # Step C: Extract the full 40-char fingerprint.
           # GnuPG 2.1+ --with-colons: fpr: record field 10 is the fingerprint.
+          # Try --list-secret-keys first; fall back to --list-keys (public ring).
           KEY_FP=$(gpg --list-secret-keys --with-colons \
             | awk -F: '/^fpr/ { print $10; exit }')
-
-          # Fallback: extract from --fingerprint output if --with-colons is empty
-          # (happens with some key formats on certain GnuPG builds).
           if [[ -z "${KEY_FP}" ]]; then
-            KEY_FP=$(gpg --list-secret-keys --fingerprint --with-colons \
+            KEY_FP=$(gpg --list-keys --with-colons \
               | awk -F: '/^fpr/ { print $10; exit }')
           fi
 
           if [[ -z "${KEY_FP}" ]]; then
-            echo "ERROR: Could not extract GPG key fingerprint after import." >&2
-            echo "--- gpg --list-secret-keys --with-colons ---" >&2
+            echo "ERROR: Could not extract GPG fingerprint after import+migration." >&2
+            echo "--- list-secret-keys --with-colons ---" >&2
             gpg --list-secret-keys --with-colons >&2 || true
-            echo "--- gpg --list-secret-keys ---" >&2
-            gpg --list-secret-keys >&2 || true
+            echo "--- list-keys --with-colons ---" >&2
+            gpg --list-keys --with-colons >&2 || true
             exit 1
           fi
           echo "KEY_FP=${KEY_FP}" >> "$GITHUB_ENV"
-          echo "[INFO] Imported key fingerprint: ${KEY_FP}"
+          echo "[INFO] Key fingerprint: ${KEY_FP}"
 
-          # Pre-set ultimate trust so git tag -v passes without interactive prompting
+          # Step D: Pre-set ultimate trust so git tag -v passes without
+          # interactive prompting.
           echo "${KEY_FP}:6:" | gpg --import-ownertrust
 
       # -----------------------------------------------------------------------
