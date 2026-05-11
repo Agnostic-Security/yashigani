@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-10T22:30:00+01:00 (cherry-pick v2.23.2.1 release notes from 2.23.x → v2.23.3) -->
+<!-- last-updated: 2026-05-11T22:00:00+01:00 (v2.23.3 GA — flip [Unreleased] block to [v2.23.3]) -->
 
 # Changelog
 
@@ -12,7 +12,17 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ## [Unreleased]
 
-### Added (v2.23.3)
+(No unreleased changes — v2.23.3 shipped 2026-05-11.)
+
+---
+
+## [v2.23.3] — 2026-05-11
+
+> **Tag:** `v2.23.3` → commit `8cff2f6f` — SSH-signed by maintainer key `~/.ssh/id_ed25519` (no GPG). Signature verifiable with `git tag -v v2.23.3` once the SSH allowed-signers file is configured locally; verifiable on GitHub once the maintainer's SSH pubkey is registered as a Signing Key on the personal account.
+>
+> Full release narrative: [`docs/release-notes/v2.23.3.md`](docs/release-notes/v2.23.3.md)
+
+### Added
 
 - **feat/v233-issue-91-ssrf-pinned-resolver** — DNS-rebinding defence for outbound HTTP
   (`yashigani.net.pinned_resolver`). Resolves the target hostname once at context entry,

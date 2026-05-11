@@ -16,7 +16,7 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.2.1 (`2.23.x` branch, 2026-05-08) — Helm chart digest pin fix (chart-only patch over v2.23.2; code unchanged); see [v2.23.2.1 release notes](docs/release-notes/v2.23.2.1.md)
+**Latest Tagged Release:** v2.23.3 (2026-05-11) — macOS Podman promoted to hard CI gate, per-runtime PKI bootstrap split, manifest pre/post SHA-256 audit-trail logging, OpenSSL 4.0.x aarch64 SVE-probe stopgap, bash 3.2 portability for macOS system bash; see [v2.23.3 release notes](docs/release-notes/v2.23.3.md)
 
 > **Upgrade notice:** v2.23.2 ships a security hardening batch. Existing v2.23.1 deployments should upgrade.
 
