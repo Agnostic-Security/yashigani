@@ -143,9 +143,18 @@ jobs:
             --import \
             3< <(printf '%s' "${GPG_PASSPHRASE}")
 
-          # Step B: Extract fingerprint from the public keyring
-          # (--list-keys always works; --list-secret-keys may silently fail
-          # when gpg-agent is not running on the runner).
+          # Step B: Extract fingerprint + diagnose secret key storage.
+          GNUPGHOME_DIR="${GNUPGHOME:-${HOME}/.gnupg}"
+          echo "[DEBUG] GnuPG home: ${GNUPGHOME_DIR}"
+          echo "[DEBUG] private-keys-v1.d contents:"
+          ls -la "${GNUPGHOME_DIR}/private-keys-v1.d/" 2>/dev/null || echo "(directory not found)"
+          echo "[DEBUG] secring.gpg exists: $(test -f ${GNUPGHOME_DIR}/secring.gpg && echo yes || echo no)"
+          echo "[DEBUG] gpg --list-secret-keys --no-autostart --with-colons:"
+          gpg --batch --no-tty --no-autostart --list-secret-keys --with-colons 2>&1 || true
+          echo "[DEBUG] gpg --list-keys --with-colons:"
+          gpg --batch --no-tty --list-keys --with-colons 2>&1 || true
+
+          # Fingerprint from public keyring (always reliable).
           KEY_FP=$(gpg --batch --no-tty --list-keys --with-colons \
             | awk -F: '/^fpr/ { print $10; exit }')
           if [[ -z "${KEY_FP}" ]]; then
