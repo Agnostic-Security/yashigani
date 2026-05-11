@@ -132,11 +132,10 @@ jobs:
             exit 1
           fi
 
-          # Step A: Initial import.
-          # Passphrase provided via fd3 for fully non-interactive operation.
-          # The key UID is `tr@agnosticsec.com`.
-          # On GnuPG 2.1+, a legacy-format private key goes to secring.gpg,
-          # not private-keys-v1.d/ — fix in Step B.
+          # Step A: Import the armored private key.
+          # --batch --yes --no-tty: fully non-interactive.
+          # --pinentry-mode loopback + --passphrase-fd 3: supply passphrase at
+          # import time. The key UID is `tr@agnosticsec.com`.
           printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg \
             --batch --yes --no-tty \
             --pinentry-mode loopback \
@@ -144,10 +143,10 @@ jobs:
             --import \
             3< <(printf '%s' "${GPG_PASSPHRASE}")
 
-          # Step B: Extract the full fingerprint from the PUBLIC keyring
-          # (pubring.kbx always gets the public key regardless of secret-key
-          # storage format).
-          KEY_FP=$(gpg --list-keys --with-colons \
+          # Step B: Extract fingerprint from the public keyring
+          # (--list-keys always works; --list-secret-keys may silently fail
+          # when gpg-agent is not running on the runner).
+          KEY_FP=$(gpg --batch --no-tty --list-keys --with-colons \
             | awk -F: '/^fpr/ { print $10; exit }')
           if [[ -z "${KEY_FP}" ]]; then
             echo "ERROR: Could not find public key after import." >&2
@@ -155,43 +154,27 @@ jobs:
           fi
           echo "[INFO] Key fingerprint: ${KEY_FP}"
 
-          # Step C: Force legacy secring.gpg → private-keys-v1.d/ migration.
-          # GnuPG 2.1+ migration path: export the secret key from secring.gpg
-          # (using --secret-keyring to point directly at it) then re-import.
-          # This writes the key material into private-keys-v1.d/ and makes
-          # the secret key available to gpg-agent for signing.
-          GNUPGHOME_DIR="${GNUPGHOME:-$HOME/.gnupg}"
-          if [[ -f "${GNUPGHOME_DIR}/secring.gpg" ]]; then
-            echo "[INFO] Migrating legacy secring.gpg to private-keys-v1.d/"
-            gpg \
-              --batch --yes --no-tty \
-              --pinentry-mode loopback \
-              --passphrase-fd 3 \
-              --secret-keyring "${GNUPGHOME_DIR}/secring.gpg" \
-              --export-secret-keys "${KEY_FP}" \
-              3< <(printf '%s' "${GPG_PASSPHRASE}") \
-            | gpg \
-              --batch --yes --no-tty \
-              --pinentry-mode loopback \
-              --passphrase-fd 3 \
-              --import \
-              3< <(printf '%s' "${GPG_PASSPHRASE}")
-          fi
-
-          # Step D: Verify the secret key is now available.
-          SEC_CHECK=$(gpg --list-secret-keys --with-colons "${KEY_FP}" 2>/dev/null \
-            | awk -F: '/^sec/ { print $1; exit }')
-          if [[ -z "${SEC_CHECK}" ]]; then
-            echo "ERROR: Secret key not available after migration. Signing will fail." >&2
-            echo "[DEBUG] --list-secret-keys --with-colons output:" >&2
-            gpg --list-secret-keys --with-colons >&2 || true
-            exit 1
+          # Step C: Pre-load passphrase into gpg-agent using gpg-preset-passphrase.
+          # This is the standard CI approach for passphrase-protected keys.
+          # Ensures that subsequent `git tag -s` calls (which invoke gpg via
+          # the agent) succeed without a pinentry prompt.
+          KEYGRIP=$(gpg --batch --no-tty \
+            --with-keygrip --list-keys --with-colons \
+            | awk -F: '/^grp/ { print $10; exit }')
+          if [[ -n "${KEYGRIP}" ]]; then
+            # Locate gpg-preset-passphrase (path varies by distro/version)
+            GPG_PRESET=$(find /usr/lib/gnupg* /usr/lib/gnupg -name gpg-preset-passphrase 2>/dev/null | head -1)
+            if [[ -n "${GPG_PRESET}" ]]; then
+              printf '%s' "${GPG_PASSPHRASE}" | "${GPG_PRESET}" --preset "${KEYGRIP}"
+              echo "[INFO] Passphrase preset in gpg-agent for keygrip: ${KEYGRIP}"
+            else
+              echo "[WARN] gpg-preset-passphrase not found; falling back to loopback mode" >&2
+            fi
           fi
 
           echo "KEY_FP=${KEY_FP}" >> "$GITHUB_ENV"
-          echo "[INFO] Secret key confirmed available: ${KEY_FP}"
 
-          # Step E: Pre-set ultimate trust so git tag -v passes without
+          # Step D: Pre-set ultimate trust so git tag -v passes without
           # interactive prompting.
           echo "${KEY_FP}:6:" | gpg --import-ownertrust
 
@@ -237,13 +220,21 @@ jobs:
           # Delete the existing (unsigned) local tag
           git tag -d "${TAG}" 2>/dev/null || true
 
-          # Re-create as signed annotated tag
-          echo "${GPG_PASSPHRASE}" | gpg --batch --yes \
-            --pinentry-mode loopback \
-            --passphrase-fd 0 \
-            --armor --output /dev/null --sign /dev/null 2>/dev/null || true
+          # Write a gpg wrapper that supplies --pinentry-mode loopback and
+          # --passphrase-fd so that passphrase-protected keys work in CI
+          # without an interactive pinentry or a running gpg-agent.
+          # GPG_PASSPHRASE is inherited from the env; the wrapper passes it
+          # to gpg via a process-substitution on fd 9.
+          GPG_WRAPPER="${RUNNER_TEMP}/gpg-sign-wrapper"
+          {
+            echo '#!/bin/bash'
+            echo 'exec gpg --batch --yes --no-tty --pinentry-mode loopback --passphrase-fd 9 "$@" 9< <(printf "%s" "${GPG_PASSPHRASE}")'
+          } > "${GPG_WRAPPER}"
+          chmod +x "${GPG_WRAPPER}"
 
-          git -c "gpg.program=gpg" tag -s "${TAG}" "${COMMIT}" \
+          # Re-create tag using wrapper as gpg.program so git supplies all
+          # standard git-tag args, and the wrapper injects the passphrase.
+          git -c "gpg.program=${GPG_WRAPPER}" tag -s "${TAG}" "${COMMIT}" \
             --local-user "${KEY_FP}" \
             -m "${MSG}"
 
