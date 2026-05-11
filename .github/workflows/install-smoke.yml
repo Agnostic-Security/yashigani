@@ -86,7 +86,9 @@ jobs:
           - os: [self-hosted, macos, arm64, m-chip]
             os-label: macos
             runtime: podman
-            gates: true       # self-hosted M4 runner live 2026-05-10 (max-m4-yashigani) — no nested-virt limitation
+            gates: false      # INFORMATIONAL: macOS+Podman PKI bootstrap fails on applehv (virtiofs :U remap
+                              # incompatibility with rootless Podman on macOS). Tracking for v2.23.3 follow-on.
+                              # macOS/docker cell (above) is the hard gate for macOS installs.
 
     runs-on: ${{ matrix.os }}
     # macOS cells continue-on-error because GH hosted runners lack VZ support.
