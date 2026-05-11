@@ -154,21 +154,27 @@ jobs:
           fi
           echo "[INFO] Key fingerprint: ${KEY_FP}"
 
-          # Step C: Pre-load passphrase into gpg-agent using gpg-preset-passphrase.
-          # This is the standard CI approach for passphrase-protected keys.
-          # Ensures that subsequent `git tag -s` calls (which invoke gpg via
-          # the agent) succeed without a pinentry prompt.
+          # Step C: Pre-load passphrase into gpg-agent (best-effort).
+          # Requires allow-preset-passphrase in gpg-agent.conf.
+          # The gpg wrapper in the signing step is the primary passphrase path;
+          # this is belt-and-suspenders for agent-based invocations.
+          GNUPGHOME_DIR="${GNUPGHOME:-${HOME}/.gnupg}"
+          mkdir -p "${GNUPGHOME_DIR}"
+          echo "allow-preset-passphrase" >> "${GNUPGHOME_DIR}/gpg-agent.conf"
+          gpg-connect-agent reloadagent /bye 2>/dev/null || true
+
           KEYGRIP=$(gpg --batch --no-tty \
             --with-keygrip --list-keys --with-colons \
             | awk -F: '/^grp/ { print $10; exit }')
           if [[ -n "${KEYGRIP}" ]]; then
             # Locate gpg-preset-passphrase (path varies by distro/version)
-            GPG_PRESET=$(find /usr/lib/gnupg* /usr/lib/gnupg -name gpg-preset-passphrase 2>/dev/null | head -1)
+            GPG_PRESET=$(find /usr/lib/gnupg2 /usr/lib/gnupg -name gpg-preset-passphrase 2>/dev/null | head -1 || true)
             if [[ -n "${GPG_PRESET}" ]]; then
-              printf '%s' "${GPG_PASSPHRASE}" | "${GPG_PRESET}" --preset "${KEYGRIP}"
-              echo "[INFO] Passphrase preset in gpg-agent for keygrip: ${KEYGRIP}"
+              printf '%s' "${GPG_PASSPHRASE}" | "${GPG_PRESET}" --preset "${KEYGRIP}" \
+                && echo "[INFO] Passphrase preset in gpg-agent for keygrip: ${KEYGRIP}" \
+                || echo "[WARN] gpg-preset-passphrase failed; gpg wrapper will handle passphrase" >&2
             else
-              echo "[WARN] gpg-preset-passphrase not found; falling back to loopback mode" >&2
+              echo "[WARN] gpg-preset-passphrase not found; gpg wrapper handles passphrase" >&2
             fi
           fi
 
