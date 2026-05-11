@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-11T12:00:00+01:00 (refactor(pki): split _pki_run_issuer into per-runtime functions — _pki_run_issuer_docker / _pki_run_issuer_podman_linux / _pki_run_issuer_podman_macos; podman cp pattern for macOS applehv)
+# last-updated: 2026-05-11T00:30:00+01:00 (fix: macOS+Docker Colima virtiofs — skip host-UID chown assertions in check_installer_preflight + compose_up; YSG_OS==macos gated)
 # last-updated: 2026-05-10T21:30:00+01:00 (fix: _pki_chown_client_keys || return 1 at both call sites — fail-closed on chown failure, not silent continue)
 # last-updated: 2026-05-10T13:00:00+01:00 (fix: BUG-AG-001 --pull never for air-gap compose up; BUG-AG-005 bump YASHIGANI_VERSION to 2.23.3)
 # last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — source shared lib/pki_ownership.sh; upgrade no-rotation path stops touching keys; maintainer directive 2026-05-10)
@@ -1230,15 +1232,26 @@ check_installer_preflight() {
       fi
     else
       # Docker / rootful Podman: direct chown to container UID 1001.
-      # shellcheck disable=SC2012
-      local _dir_uid
-      _dir_uid="$(ls -nd "$_bm_dir" 2>/dev/null | awk '{print $3}')"
-      if [[ "$_dir_uid" != "1001" ]]; then
-        if chown 1001:1001 "$_bm_dir" 2>/dev/null; then
-          log_info "chown 1001:1001 applied to $_bm_dir"
-        else
-          log_error "Cannot chown $_bm_dir to 1001:1001 — run: sudo chown 1001:1001 \"$_bm_dir\""
-          _bm_failed=1
+      # macOS+Docker (Colima virtiofs): host-side chown to arbitrary UIDs is
+      # restricted by macOS kernel — only root can chown to non-self UIDs.
+      # Colima's virtiofs UID mapping means containers already see bind-mounted
+      # dirs as root:root inside the VM; after an ephemeral-container chown the
+      # container view reflects UID 1001 even though the macOS host still shows
+      # the installer UID. Do not attempt host chown on macOS — it will always
+      # fail with EPERM, and the failure is spurious (PKI writes succeed).
+      if [[ "${YSG_OS:-}" == "macos" ]]; then
+        log_info "macOS+Docker: skipping host chown for $_bm_dir (virtiofs UID mapping — PKI container will see UID 1001)"
+      else
+        # shellcheck disable=SC2012
+        local _dir_uid
+        _dir_uid="$(ls -nd "$_bm_dir" 2>/dev/null | awk '{print $3}')"
+        if [[ "$_dir_uid" != "1001" ]]; then
+          if chown 1001:1001 "$_bm_dir" 2>/dev/null; then
+            log_info "chown 1001:1001 applied to $_bm_dir"
+          else
+            log_error "Cannot chown $_bm_dir to 1001:1001 — run: sudo chown 1001:1001 \"$_bm_dir\""
+            _bm_failed=1
+          fi
         fi
       fi
     fi
@@ -1249,6 +1262,13 @@ check_installer_preflight() {
     if [[ ! -d "$_bm_dir" ]]; then
       _bm_failed=1
       break
+    fi
+    # macOS+Docker (Colima virtiofs): host UID will never show 1001 because
+    # macOS restricts chown to non-self UIDs. virtiofs handles the mapping at
+    # mount time — containers see UID 1001. Skip the host-UID assertion.
+    if [[ "${YSG_OS:-}" == "macos" ]]; then
+      log_info "macOS+Docker: bind-mount UID assertion skipped for $_bm_dir (virtiofs UID mapping)"
+      continue
     fi
     # shellcheck disable=SC2012
     local _uid
@@ -2998,6 +3018,19 @@ compose_up() {
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     # Deferred to _prepare_secrets_dir_for_pki() — see comment above.
     log_info "secrets_dir chown deferred to PKI bootstrap (Podman rootless)"
+  elif [[ "${YSG_OS:-}" == "macos" ]]; then
+    # macOS + Docker (Colima virtiofs): host-side chown to UID 1001 is not
+    # possible without root. macOS restricts chown to non-self UIDs regardless
+    # of file ownership. This is NOT a problem: Colima's virtiofs maps the
+    # host user (e.g. UID 502) → UID 0 inside the VM, and the ephemeral
+    # Docker chown in _pki_run_issuer() changed the inode's owner to UID 1001
+    # from inside the container. Subsequent containers (PKI issuer, backoffice)
+    # running as UID 1001 can write to the directory because virtiofs maintains
+    # the UID 1001 mapping persistently in the container namespace.
+    # Verified empirically: `docker run --user 1001:1001` can write to a
+    # directory chowned via ephemeral container even though `ls -nd` on the
+    # macOS host still shows the installer UID. (2026-05-11, M4, Colima 0.x)
+    log_info "macOS+Docker: secrets_dir host-UID assertion skipped (Colima virtiofs — container sees UID 1001 from ephemeral chown)"
   else
     # For Docker (non-root caller): _pki_run_issuer() already chowned secrets_dir
     # to UID 1001 via an ephemeral docker container. Attempting chown here again
@@ -3023,6 +3056,7 @@ compose_up() {
     fi
     # Defensive assertion: secrets dir must be owned by UID 1001 before proceeding.
     # (Skipped for Podman rootless — subuid remapping means host UID != 1001.)
+    # (Skipped for macOS — virtiofs UID mapping; see elif branch above.)
     # shellcheck disable=SC2012
     _actual_uid=$(ls -nd "$secrets_dir" 2>/dev/null | awk '{print $3}')
     if [[ "$_actual_uid" != "1001" ]]; then
@@ -3458,9 +3492,13 @@ _podman_verify_healthchecks() {
   local _ok_count=0
   local _skip_count=0
 
-  # List all running containers — capture names into an array
-  local _containers
-  mapfile -t _containers < <(podman ps --format '{{.Names}}' 2>/dev/null || true)
+  # List all running containers — capture names into an array.
+  # Use while+read loop rather than bash 4+ array-builders so install.sh runs on
+  # macOS system bash 3.2 (see scripts/test-installer.sh portability gate).
+  local _containers=()
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] && _containers+=("$_line")
+  done < <(podman ps --format '{{.Names}}' 2>/dev/null || true)
 
   if [[ "${#_containers[@]}" -eq 0 ]]; then
     log_warn "P-9: no running containers found via 'podman ps' — skipping healthcheck wiring check"
@@ -4967,6 +5005,263 @@ _pki_persist_env() {
   done
 }
 
+# =============================================================================
+# _pki_run_issuer — per-runtime split (P-10 / v2.23.3 refactor)
+#
+# Per project_podman_parity_registry.md discipline (Tiago directive 2026-05-10):
+# unified if/else runtime branches inside a single function are the failure mode
+# the registry exists to prevent. Each runtime gets its own function with its own
+# invariants. The dispatcher (_pki_run_issuer) owns shared preamble only.
+#
+# Call graph:
+#   _pki_run_issuer(subcmd, args...)
+#     → _pki_run_issuer_docker(subcmd, image, manifest_in, secrets_in, args...)
+#     → _pki_run_issuer_podman_linux(subcmd, image, manifest_in, secrets_in, args...)
+#     → _pki_run_issuer_podman_macos(subcmd, image, manifest_in, secrets_in, args...)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# _pki_run_issuer_docker — Docker runtime issuer execution
+#
+# Carries 3174a1e macOS+Docker Colima virtiofs behaviour: that path gates on
+# YSG_OS=macos inside compose_up; the chown here runs unconditionally but
+# falls through gracefully when host-UID assertion is not required.
+#
+# Chown strategy: ephemeral `docker run --rm alpine chown` so the daemon's
+# root privilege chowns inside the bind mount regardless of host caller UID.
+# Plain `chown` is last-resort only (works only if installer is root).
+# ---------------------------------------------------------------------------
+_pki_run_issuer_docker() {
+  local subcmd="$1"; local image="$2"; local manifest_in="$3"; local secrets_in="$4"
+  shift 4
+
+  # alpine:3 digest (amd64+arm64 manifest list — 2026-04-29; rotate each release):
+  local _alpine_chown_digest="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+
+  # Docker: no :U support — chown the secrets dir + manifest to UID 1001 so
+  # the issuer (USER yashigani = UID 1001) can write certs/keys into /secrets
+  # and write back bootstrap_token_sha256 to the manifest.
+  #
+  # The previous approach — plain `chown 1001:1001 "$secrets_in" 2>/dev/null || true`
+  # — silently no-ops when the installer runs as a non-root uid (e.g. 1004) that
+  # lacks CAP_CHOWN on the host. The PKI container then starts with secrets_dir
+  # still owned by the installer uid, gets EACCES, and aborts with PermissionError.
+  #
+  # Fix: use an ephemeral Docker container running as root (Docker daemon = root
+  # internally, so it can chown inside the container regardless of host caller uid).
+  # Same pattern as _pki_chown_client_keys() docker_run mode.
+  _docker_chown_dir() {
+    local _dir="$1" _target="$2"
+    docker run --rm --pull=never \
+           --volume "${_dir}:${_target}:rw" \
+           "alpine:3" chown 1001:1001 "${_target}" 2>/dev/null && return 0
+    docker run --rm \
+           --volume "${_dir}:${_target}:rw" \
+           "$_alpine_chown_digest" chown 1001:1001 "${_target}" 2>/dev/null && return 0
+    chown 1001:1001 "$_dir" 2>/dev/null || true
+  }
+  _docker_chown_dir "${secrets_in}" /s
+
+  # Retro #3ah (v2.23.1): the issuer also writes back to
+  # service_identities.yaml (bootstrap_token_sha256 fields) via the
+  # /manifest.yaml bind mount. Without ownership match the write fails
+  # with PermissionError and the whole PKI bootstrap aborts.
+  local _manifest_dir; _manifest_dir="$(dirname "$manifest_in")"
+  local _manifest_base; _manifest_base="$(basename "$manifest_in")"
+  _docker_chown_file() {
+    local _dir="$1" _file="$2"
+    docker run --rm --pull=never \
+           --volume "${_dir}:/m:rw" \
+           "alpine:3" chown 1001:1001 "/m/${_file}" 2>/dev/null && return 0
+    docker run --rm \
+           --volume "${_dir}:/m:rw" \
+           "$_alpine_chown_digest" chown 1001:1001 "/m/${_file}" 2>/dev/null && return 0
+    chown 1001:1001 "${_dir}/${_file}" 2>/dev/null || true
+  }
+  _docker_chown_file "${_manifest_dir}" "${_manifest_base}"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "docker run --rm --network=none -v ${secrets_in}:/secrets:rw,Z -v ${manifest_in}:/manifest.yaml:rw,Z $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
+    return 0
+  fi
+
+  # --network=none: issuer does no network I/O, and cutting the network
+  # prevents any accidental telemetry exfil.
+  docker run --rm --network=none \
+    -v "${secrets_in}:/secrets:rw,Z" \
+    -v "${manifest_in}:/manifest.yaml:rw,Z" \
+    "$image" \
+    python -m yashigani.pki.issuer \
+      --secrets-dir /secrets \
+      --manifest /manifest.yaml \
+      "$subcmd" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# _pki_run_issuer_podman_linux — Linux Podman rootless/rootful issuer execution
+#
+# gate #ROOTLESS-9: ":U" MUST NOT be applied to the manifest file mount.
+# ":U" calls lchown on the mount source. For directories this is recursive;
+# for a single file it is still called. On Podman rootless, the lchown
+# target UID (subuid-mapped 1001 = e.g. 428680) is outside the host
+# user's UID (1005), so the kernel rejects lchown with EPERM even though
+# the user owns the file and is namespace-root inside the container.
+# The secrets dir is pre-chowned to the remapped UID by
+# _prepare_secrets_dir_for_pki(), so it does not need :U; but keeping :U
+# on secrets_dir is harmless and helps rootful Podman. The manifest is
+# pre-chowned via podman unshare (rootless) or plain chown (rootful) so the
+# container can write back bootstrap_token_sha256 fields. ":U" is NOT
+# applied to the manifest mount on any path.
+# ---------------------------------------------------------------------------
+_pki_run_issuer_podman_linux() {
+  local subcmd="$1"; local image="$2"; local manifest_in="$3"; local secrets_in="$4"
+  shift 4
+
+  # Manifest: pre-chown to container UID so the issuer can write back.
+  # Use podman unshare for rootless (non-root caller); direct chown for rootful.
+  if [[ "$(id -u)" != "0" ]]; then
+    # Rootless: map container UID 1001 → host subuid-remapped UID via unshare.
+    podman unshare chown 1001:1001 "$manifest_in" 2>/dev/null \
+      || log_warn "Could not chown manifest via podman unshare — PKI may fail to write bootstrap_token_sha256"
+  else
+    # Rootful Podman: direct chown is safe.
+    chown 1001:1001 "$manifest_in" 2>/dev/null || true
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "podman run --rm --network=none -v ${secrets_in}:/secrets:rw,Z,U -v ${manifest_in}:/manifest.yaml:rw,Z $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
+    return 0
+  fi
+
+  # --network=none: issuer does no network I/O, and cutting the network
+  # prevents any accidental telemetry exfil.
+  podman run --rm --network=none \
+    -v "${secrets_in}:/secrets:rw,Z,U" \
+    -v "${manifest_in}:/manifest.yaml:rw,Z" \
+    "$image" \
+    python -m yashigani.pki.issuer \
+      --secrets-dir /secrets \
+      --manifest /manifest.yaml \
+      "$subcmd" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# _pki_run_issuer_podman_macos — macOS Podman applehv issuer execution (P-10)
+#
+# macOS Podman tunnels to an applehv VM. bind-mount semantics differ from
+# Linux Podman: ":U" calls lchown through the remote socket into the VM, which
+# can silently no-op for the manifest file (EPERM inside the namespace).
+# ":Z" SELinux relabelling is also unsupported on the macOS host side.
+#
+# Strategy: `podman cp` — copy files into/out of a created-but-not-started
+# container so the issuer runs in a known-clean filesystem state without
+# relying on bind-mount permission propagation across the hypervisor boundary.
+#
+# Security mitigations (5/5 reviewer consensus, 2026-05-11):
+#   Laura: realpath -s prefix check on both input paths before podman cp
+#   Laura: container name from openssl rand (CSPRNG, not date-based)
+#   Laura+Lu: atomic rename (cp-out to .new + mv -f) for manifest write-back
+#   Lu: trap on RETURN for podman rm -f — set BEFORE podman create
+#   Su: strict exit-0 gate before any cp-back (never cp back partial state)
+#   Su: podman rm -f pre-create for name collision (silent, not fail-loud)
+#   Su: DRY_RUN gate honouring existing dry_print pattern
+#   Su: podman cp src container:/path (no trailing slash on in-copy)
+#   Su: podman cp container:/path/. dest (trailing dot on out-copy)
+#
+# Discriminator: macOS + no /etc/subuid (per _pki_run_issuer dispatcher logic).
+# Documentation: project_podman_parity_registry.md P-10.
+# ---------------------------------------------------------------------------
+_pki_run_issuer_podman_macos() {
+  local subcmd="$1"; local image="$2"; local manifest_in="$3"; local secrets_in="$4"
+  shift 4
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "podman cp [macOS applehv] | podman run (created) | podman cp back — $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
+    return 0
+  fi
+
+  # --- Laura mitigation: realpath prefix check ---
+  # BSD realpath on macOS does not support -m (allow non-existent components),
+  # but -s (no symlink resolution) is available on macOS 12+. We use -s to get
+  # the lexical canonical path and assert it starts under WORK_DIR.
+  local _canon_manifest _canon_secrets
+  _canon_manifest="$(realpath -s "$manifest_in" 2>/dev/null || printf '%s' "$manifest_in")"
+  _canon_secrets="$(realpath -s "$secrets_in" 2>/dev/null || printf '%s' "$secrets_in")"
+  if [[ "$_canon_manifest" != "${WORK_DIR}"/* ]]; then
+    log_error "_pki_run_issuer_podman_macos: manifest_in '${manifest_in}' resolves outside WORK_DIR '${WORK_DIR}' — aborting"
+    return 1
+  fi
+  if [[ "$_canon_secrets" != "${WORK_DIR}"/* ]]; then
+    log_error "_pki_run_issuer_podman_macos: secrets_in '${secrets_in}' resolves outside WORK_DIR '${WORK_DIR}' — aborting"
+    return 1
+  fi
+
+  # --- Laura mitigation: CSPRNG container name ---
+  local _cname
+  _cname="ysg-pki-issuer-$(openssl rand -hex 8)"
+
+  # --- Lu mitigation: trap on RETURN — set BEFORE podman create ---
+  # Ensures cleanup even if podman create succeeds but a later step exits.
+  # Use ${_created:-false} in the trap body to be safe under set -u: RETURN
+  # traps fire in the calling scope where the local is gone, so the bare
+  # reference would trigger "unbound variable". The :- default avoids that.
+  local _created=false
+  trap 'if [[ "${_created:-false}" == "true" ]]; then podman rm -f "${_cname:-}" >/dev/null 2>&1 || true; fi' RETURN
+
+  # Pre-remove any stale container with the same name (name collision guard).
+  # Silent, not fail-loud: if it doesn't exist, rm -f exits 1 which we ignore.
+  podman rm -f "$_cname" >/dev/null 2>&1 || true
+
+  # Create the container (no start) so we can populate it via podman cp.
+  podman create \
+    --name "$_cname" \
+    --network=none \
+    "$image" \
+    python -m yashigani.pki.issuer \
+      --secrets-dir /secrets \
+      --manifest /manifest.yaml \
+      "$subcmd" "$@" >/dev/null
+  _created=true
+
+  # Copy secrets dir into the container (no trailing slash = copy the dir itself,
+  # placing it at /secrets inside the container).
+  podman cp "${secrets_in}" "${_cname}:/secrets"
+
+  # Copy the manifest file into the container root.
+  podman cp "${manifest_in}" "${_cname}:/manifest.yaml"
+
+  # Run the issuer. Strict exit-0 gate: if non-zero, cp-back is skipped and the
+  # trap cleans up the container — no partial PKI state written to the host.
+  local _rc=0
+  podman start -a "$_cname" || _rc=$?
+
+  if [[ "$_rc" -ne 0 ]]; then
+    log_error "_pki_run_issuer_podman_macos: issuer exited ${_rc} — PKI state NOT written back"
+    return "$_rc"
+  fi
+
+  # --- Laura+Lu mitigation: atomic rename for manifest write-back ---
+  # Copy manifest to a staging file first; then mv -f for atomicity.
+  # Matches _pki_persist_env() precedent at install.sh:5994.
+  podman cp "${_cname}:/manifest.yaml" "${manifest_in}.new"
+  mv -f "${manifest_in}.new" "${manifest_in}"
+
+  # Copy secrets dir back to the host. Trailing dot (/secrets/.) copies the
+  # CONTENTS of /secrets rather than creating a nested /secrets/secrets.
+  podman cp "${_cname}:/secrets/." "${secrets_in}"
+
+  # Trap fires on RETURN and removes the container.
+}
+
+# ---------------------------------------------------------------------------
+# _pki_run_issuer — dispatcher (shared preamble + per-runtime dispatch)
+#
+# Shared preamble: image lookup, path validation, mkdir.
+# Per-runtime dispatch: docker | podman_linux | podman_macos.
+# Discriminator for macOS Podman: uname == Darwin AND no /etc/subuid.
+# (macOS hosts running Podman remote client have no subuid allocation;
+# Linux Podman rootless hosts always have an /etc/subuid entry.)
+# ---------------------------------------------------------------------------
 _pki_run_issuer() {
   # Usage: _pki_run_issuer <subcommand> [extra args...]
   local subcmd="$1"; shift
@@ -5000,109 +5295,25 @@ _pki_run_issuer() {
     return 1
   fi
 
-  # Bind-mount options differ between podman and docker:
-  #   - ":Z" is an SELinux relabel (no-op on non-SELinux hosts like Ubuntu,
-  #     but required on RHEL/Fedora with enforcing policy).
-  #   - ":U" (podman-only) recursively chowns the mount source to the
-  #     container's user/group, so a non-root USER inside the image can
-  #     write. Docker has no equivalent and errors on ":U".
-  # Without ":U" on secrets_dir, rootful podman fails with EACCES when the
-  # image runs as a non-root user (the image sets `USER yashigani`), since
-  # the host dir is owned by root. Retro: v2.23.1 Ubuntu podman clean-slate.
-  #
-  # gate #ROOTLESS-9: ":U" MUST NOT be applied to the manifest file mount.
-  # ":U" calls lchown on the mount source. For directories this is recursive;
-  # for a single file it is still called. On Podman rootless, the lchown
-  # target UID (subuid-mapped 1001 = e.g. 428680) is outside the host
-  # user's UID (1005), so the kernel rejects lchown with EPERM even though
-  # the user owns the file and is namespace-root inside the container.
-  # The secrets dir is pre-chowned to the remapped UID by
-  # _prepare_secrets_dir_for_pki(), so it does not need :U; but keeping :U
-  # on secrets_dir is harmless and helps rootful Podman. The manifest is
-  # pre-chowned via podman unshare (rootless) or plain chown (docker) so the
-  # container can write back bootstrap_token_sha256 fields. ":U" is NOT
-  # applied to the manifest mount on any path.
-  local _secrets_mount_opts="rw,Z"
-  local _manifest_mount_opts="rw,Z"
-  if [[ "$runtime" == "podman" ]]; then
-    _secrets_mount_opts="rw,Z,U"
-    # Manifest: pre-chown to container UID so the issuer can write back.
-    # Use podman unshare for rootless (non-root caller); direct chown for rootful.
-    if [[ "$(id -u)" != "0" ]]; then
-      # Rootless: map container UID 1001 → host subuid-remapped UID via unshare.
-      podman unshare chown 1001:1001 "$manifest_in" 2>/dev/null \
-        || log_warn "Could not chown manifest via podman unshare — PKI may fail to write bootstrap_token_sha256"
-    else
-      # Rootful Podman: direct chown is safe.
-      chown 1001:1001 "$manifest_in" 2>/dev/null || true
-    fi
-  else
-    # Docker: no :U support — chown the secrets dir + manifest to UID 1001 so
-    # the issuer (USER yashigani = UID 1001) can write certs/keys into /secrets
-    # and write back bootstrap_token_sha256 to the manifest.
-    #
-    # The previous approach — plain `chown 1001:1001 "$secrets_in" 2>/dev/null || true`
-    # — silently no-ops when the installer runs as a non-root uid (e.g. 1004) that
-    # lacks CAP_CHOWN on the host. The PKI container then starts with secrets_dir
-    # still owned by the installer uid, gets EACCES, and aborts with PermissionError.
-    #
-    # Fix: use an ephemeral Docker container running as root (Docker daemon = root
-    # internally, so it can chown inside the container regardless of host caller uid).
-    # Same pattern as _pki_chown_client_keys() docker_run mode.
-    # alpine:3 digest (amd64+arm64 manifest list — 2026-04-29; rotate each release):
-    local _alpine_chown_digest="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
-    # Prefer --pull=never with the tag-only ref if alpine:3 is already in the
-    # local Docker store (avoids registry round-trips, including rate-limit hits
-    # on Docker Hub). Fall back to the digest-pinned pull for fresh installs
-    # (supply-chain safe: digest is verified at pull time). Finally fall back to
-    # plain chown as a last resort (only works if installer runs as root).
-    _docker_chown_dir() {
-      local _dir="$1" _target="$2"
-      docker run --rm --pull=never \
-             --volume "${_dir}:${_target}:rw" \
-             "alpine:3" chown 1001:1001 "${_target}" 2>/dev/null && return 0
-      docker run --rm \
-             --volume "${_dir}:${_target}:rw" \
-             "$_alpine_chown_digest" chown 1001:1001 "${_target}" 2>/dev/null && return 0
-      chown 1001:1001 "$_dir" 2>/dev/null || true
-    }
-    _docker_chown_dir "${secrets_in}" /s
-    # Retro #3ah (v2.23.1): the issuer also writes back to
-    # service_identities.yaml (bootstrap_token_sha256 fields) via the
-    # /manifest.yaml bind mount. Without ownership match the write fails
-    # with PermissionError and the whole PKI bootstrap aborts.
-    # Same ephemeral-container pattern for non-root Docker callers.
-    # We bind-mount the parent dir and chown the file inside the container.
-    local _manifest_dir; _manifest_dir="$(dirname "$manifest_in")"
-    local _manifest_base; _manifest_base="$(basename "$manifest_in")"
-    _docker_chown_file() {
-      local _dir="$1" _file="$2"
-      docker run --rm --pull=never \
-             --volume "${_dir}:/m:rw" \
-             "alpine:3" chown 1001:1001 "/m/${_file}" 2>/dev/null && return 0
-      docker run --rm \
-             --volume "${_dir}:/m:rw" \
-             "$_alpine_chown_digest" chown 1001:1001 "/m/${_file}" 2>/dev/null && return 0
-      chown 1001:1001 "${_dir}/${_file}" 2>/dev/null || true
-    }
-    _docker_chown_file "${_manifest_dir}" "${_manifest_base}"
-  fi
-
-  if [[ "$DRY_RUN" == "true" ]]; then
-    dry_print "$runtime run --rm --network=none -v ${secrets_in}:/secrets:${_secrets_mount_opts} -v ${manifest_in}:/manifest.yaml:${_manifest_mount_opts} $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
-    return 0
-  fi
-
-  # --network=none: issuer does no network I/O, and cutting the network
-  # prevents any accidental telemetry exfil.
-  "$runtime" run --rm --network=none \
-    -v "${secrets_in}:/secrets:${_secrets_mount_opts}" \
-    -v "${manifest_in}:/manifest.yaml:${_manifest_mount_opts}" \
-    "$image" \
-    python -m yashigani.pki.issuer \
-      --secrets-dir /secrets \
-      --manifest /manifest.yaml \
-      "$subcmd" "$@"
+  case "$runtime" in
+    docker)
+      _pki_run_issuer_docker "$subcmd" "$image" "$manifest_in" "$secrets_in" "$@"
+      ;;
+    podman)
+      # Discriminator: macOS Podman remote client vs Linux Podman local.
+      # macOS applehv VM callers have no /etc/subuid on the Mac side;
+      # Linux rootless callers always have an /etc/subuid entry.
+      if [[ "$(uname -s)" == "Darwin" ]] && [[ ! -f /etc/subuid ]]; then
+        _pki_run_issuer_podman_macos "$subcmd" "$image" "$manifest_in" "$secrets_in" "$@"
+      else
+        _pki_run_issuer_podman_linux "$subcmd" "$image" "$manifest_in" "$secrets_in" "$@"
+      fi
+      ;;
+    *)
+      log_error "_pki_run_issuer: unknown runtime '${runtime}'"
+      return 1
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -5914,10 +6125,12 @@ main() {
       printf "\n${C_BOLD}  Enable Open WebUI integration? [y/N]: ${C_RESET}"
       local owui_choice
       read -r owui_choice </dev/tty 2>/dev/null || owui_choice="n"
-      if [[ "${owui_choice,,}" == "y" || "${owui_choice,,}" == "yes" ]]; then
-        COMPOSE_PROFILES+=("openwebui")
-        log_success "Open WebUI selected"
-      fi
+      case "$owui_choice" in
+        y|Y|yes|YES|Yes)
+          COMPOSE_PROFILES+=("openwebui")
+          log_success "Open WebUI selected"
+          ;;
+      esac
     fi
 
     # Step 8c: Wazuh SIEM (opt-in)
@@ -5931,10 +6144,12 @@ main() {
       printf "\n${C_BOLD}  Install Wazuh? [y/N]: ${C_RESET}"
       local wazuh_choice
       read -r wazuh_choice </dev/tty 2>/dev/null || wazuh_choice="n"
-      if [[ "${wazuh_choice,,}" == "y" || "${wazuh_choice,,}" == "yes" ]]; then
-        COMPOSE_PROFILES+=("wazuh")
-        log_success "Wazuh SIEM selected"
-      fi
+      case "$wazuh_choice" in
+        y|Y|yes|YES|Yes)
+          COMPOSE_PROFILES+=("wazuh")
+          log_success "Wazuh SIEM selected"
+          ;;
+      esac
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load

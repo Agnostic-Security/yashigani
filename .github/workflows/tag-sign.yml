@@ -1,4 +1,4 @@
-# Last updated: 2026-05-02T10:00:00+01:00
+# Last updated: 2026-05-11T00:00:00+01:00
 name: Tag — GPG Sign & Verify
 
 # Triggered when a version tag is pushed (e.g. v2.23.2).
@@ -46,6 +46,11 @@ jobs:
   sign-tag:
     name: GPG Sign Release Tag
     runs-on: ubuntu-latest
+    # Guard: only run on actual tag refs (refs/tags/…), not on branch pushes
+    # where the branch name happens to match the v*.*.* pattern (e.g. v2.23.3).
+    # GitHub workflow triggers with `push: tags:` do NOT filter out branch-push
+    # events when the branch name matches the tag pattern.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
 
     steps:
       # -----------------------------------------------------------------------
@@ -125,14 +130,83 @@ jobs:
             echo "ERROR: GitHub secret GPG_PRIVATE_KEY is not set." >&2
             exit 1
           fi
-          echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
-          # Retrieve the imported key fingerprint
-          KEY_FP=$(gpg --list-secret-keys --with-colons 'releases@agnosticsec.com' \
-            | awk -F: '/^sec/ { print $5 }' | head -1)
-          echo "KEY_FP=${KEY_FP}" >> "$GITHUB_ENV"
-          echo "[INFO] Imported key fingerprint: ${KEY_FP}"
 
-          # Pre-set ultimate trust so git tag -v passes without interactive prompting
+          # Step A: Import the armored private key.
+          # --batch --yes --no-tty: fully non-interactive.
+          # --pinentry-mode loopback + --passphrase-fd 3: supply passphrase at
+          # import time. The key UID is `tr@agnosticsec.com`.
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg \
+            --batch --yes --no-tty \
+            --pinentry-mode loopback \
+            --passphrase-fd 3 \
+            --import \
+            3< <(printf '%s' "${GPG_PASSPHRASE}")
+
+          # Step B: Verify the private key material is available.
+          # GnuPG 2.1+ stores private keys in private-keys-v1.d/<keygrip>.key.
+          # If the directory is empty after import, the key is either:
+          #   a) A smartcard stub (private material on hardware token — cannot
+          #      sign in CI without the physical device), OR
+          #   b) Exported with --export instead of --export-secret-keys (the
+          #      armored blob contains only the public key despite the header).
+          # In both cases: signing is impossible and Tiago must create a
+          # software key for CI signing.
+          GNUPGHOME_DIR="${GNUPGHOME:-${HOME}/.gnupg}"
+          KEY_COUNT=$(ls "${GNUPGHOME_DIR}/private-keys-v1.d/" 2>/dev/null | wc -l)
+          if [[ "${KEY_COUNT}" -eq 0 ]]; then
+            echo "ERROR: GPG_PRIVATE_KEY imported but no private key material" \
+              "found in private-keys-v1.d/." >&2
+            echo "" >&2
+            echo "Root cause (run 25682146979 diagnostic):" >&2
+            echo "  private-keys-v1.d/ is empty after import." >&2
+            echo "  The 'To migrate secring.gpg, with each smartcard' message" >&2
+            echo "  from GnuPG indicates the key is backed by a hardware token" >&2
+            echo "  (Yubikey/smartcard). Hardware-backed keys cannot sign in CI." >&2
+            echo "" >&2
+            echo "Required action (Tiago):" >&2
+            echo "  1. Generate a SOFTWARE GPG key for CI signing:" >&2
+            echo "       gpg --full-generate-key  (RSA 4096, no expiry, with passphrase)" >&2
+            echo "  2. Export it: gpg --armor --export-secret-keys <fingerprint>" >&2
+            echo "  3. Update GitHub Secret: GPG_PRIVATE_KEY = output of step 2" >&2
+            echo "  4. Update GitHub Secret: GPG_PASSPHRASE = the passphrase" >&2
+            echo "  5. Update docs/release-signing-key.asc with the public key" >&2
+            exit 1
+          fi
+
+          # Step C: Extract fingerprint from public keyring.
+          KEY_FP=$(gpg --batch --no-tty --list-keys --with-colons \
+            | awk -F: '/^fpr/ { print $10; exit }')
+          if [[ -z "${KEY_FP}" ]]; then
+            echo "ERROR: Could not find public key fingerprint after import." >&2
+            exit 1
+          fi
+          echo "[INFO] Key fingerprint: ${KEY_FP}"
+
+          # Step D: Pre-load passphrase into gpg-agent.
+          # Requires allow-preset-passphrase in gpg-agent.conf.
+          # Belt-and-suspenders alongside the gpg wrapper in the signing step.
+          mkdir -p "${GNUPGHOME_DIR}"
+          echo "allow-preset-passphrase" >> "${GNUPGHOME_DIR}/gpg-agent.conf"
+          gpg-connect-agent reloadagent /bye 2>/dev/null || true
+
+          KEYGRIP=$(gpg --batch --no-tty \
+            --with-keygrip --list-keys --with-colons \
+            | awk -F: '/^grp/ { print $10; exit }')
+          if [[ -n "${KEYGRIP}" ]]; then
+            GPG_PRESET=$(find /usr/lib/gnupg2 /usr/lib/gnupg -name gpg-preset-passphrase 2>/dev/null | head -1 || true)
+            if [[ -n "${GPG_PRESET}" ]]; then
+              printf '%s' "${GPG_PASSPHRASE}" | "${GPG_PRESET}" --preset "${KEYGRIP}" \
+                && echo "[INFO] Passphrase preset in gpg-agent for keygrip: ${KEYGRIP}" \
+                || echo "[WARN] gpg-preset-passphrase failed; gpg wrapper handles passphrase" >&2
+            else
+              echo "[WARN] gpg-preset-passphrase not found; gpg wrapper handles passphrase" >&2
+            fi
+          fi
+
+          echo "KEY_FP=${KEY_FP}" >> "$GITHUB_ENV"
+
+          # Step E: Pre-set ultimate trust so git tag -v passes without
+          # interactive prompting.
           echo "${KEY_FP}:6:" | gpg --import-ownertrust
 
       # -----------------------------------------------------------------------
@@ -142,7 +216,7 @@ jobs:
         if: steps.sig_check.outputs.already_signed == 'false'
         run: |
           git config user.name  "Agnostic Security Releases"
-          git config user.email "releases@agnosticsec.com"
+          git config user.email "tr@agnosticsec.com"
           git config user.signingkey "${KEY_FP}"
           git config tag.gpgsign true
 
@@ -177,14 +251,22 @@ jobs:
           # Delete the existing (unsigned) local tag
           git tag -d "${TAG}" 2>/dev/null || true
 
-          # Re-create as signed annotated tag
-          echo "${GPG_PASSPHRASE}" | gpg --batch --yes \
-            --pinentry-mode loopback \
-            --passphrase-fd 0 \
-            --armor --output /dev/null --sign /dev/null 2>/dev/null || true
+          # Write a gpg wrapper that supplies --pinentry-mode loopback and
+          # --passphrase-fd so that passphrase-protected keys work in CI
+          # without an interactive pinentry or a running gpg-agent.
+          # GPG_PASSPHRASE is inherited from the env; the wrapper passes it
+          # to gpg via a process-substitution on fd 9.
+          GPG_WRAPPER="${RUNNER_TEMP}/gpg-sign-wrapper"
+          {
+            echo '#!/bin/bash'
+            echo 'exec gpg --batch --yes --no-tty --pinentry-mode loopback --passphrase-fd 9 "$@" 9< <(printf "%s" "${GPG_PASSPHRASE}")'
+          } > "${GPG_WRAPPER}"
+          chmod +x "${GPG_WRAPPER}"
 
-          git -c "gpg.program=gpg" tag -s "${TAG}" "${COMMIT}" \
-            --local-user "releases@agnosticsec.com" \
+          # Re-create tag using wrapper as gpg.program so git supplies all
+          # standard git-tag args, and the wrapper injects the passphrase.
+          git -c "gpg.program=${GPG_WRAPPER}" tag -s "${TAG}" "${COMMIT}" \
+            --local-user "${KEY_FP}" \
             -m "${MSG}"
 
           echo "[INFO] Signed tag created: ${TAG} -> ${COMMIT}"
@@ -233,7 +315,7 @@ jobs:
             echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
             echo "| Tag | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
             echo "| Commit | \`${COMMIT}\` |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Signer | releases@agnosticsec.com |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Signer | tr@agnosticsec.com |" >> "$GITHUB_STEP_SUMMARY"
             echo "| Method | GPG (git tag -s) |" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "**Verify the signature:**" >> "$GITHUB_STEP_SUMMARY"
