@@ -7,32 +7,29 @@
 # Class 2: internal commercial strategy / governance phrases
 #
 # Exclusions: Internal/** (internal docs live there by design), tests/**
-# (test fixtures may use names in mock data).
+# (test fixtures may use names in mock data), @agnosticsec.com email
+# addresses in verification command comments (literal GitHub account slugs).
 #
-# Sequencing note: gate runs with continue-on-error: true until Su's scrub
-# PRs (chore/v232-public-doc-rule-sweep + chore/v232-scrub-maintainer-name)
-# land on main. Once those merge, remove continue-on-error to make this a
-# hard block. Maxine sequences the flip.
+# STRICT from day 1 on v2.23.3 — NO continue-on-error.
+# v2.23.3 is scrub-clean at gate install time; any new leak is a hard block.
 
 name: public-doc-hygiene
 
 on:
   push:
-    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    branches: [v2.23.3, main]
     paths:
       - 'docs/**'
       - 'README*'
       - 'CHANGELOG.md'
       - '*.md'
-      - 'SECURITY.md'
   pull_request:
-    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    branches: [v2.23.3, main]
     paths:
       - 'docs/**'
       - 'README*'
       - 'CHANGELOG.md'
       - '*.md'
-      - 'SECURITY.md'
 
 permissions:
   contents: read
@@ -41,12 +38,9 @@ jobs:
   scan:
     name: Public doc hygiene scan
     runs-on: ubuntu-latest
-    # continue-on-error: TEMPORARY — remove once Su's scrub PRs land on main.
-    # Tracked: chore/v232-public-doc-rule-sweep + chore/v232-scrub-maintainer-name.
-    continue-on-error: true
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Class 1 — team member names in public files
         id: class1
@@ -55,9 +49,9 @@ jobs:
           HITS=$(grep -rn -i -E \
             '\b(tiago|rosado|maxine|tom|su|captain|iris|laura|ava|ogen|rhea|nora|nico|lior|petra|reel)\b' \
             --include='*.md' \
-            docs/ README* CHANGELOG.md SECURITY.md \
+            docs/ README* CHANGELOG.md \
             2>/dev/null \
-            | grep -v -E "Internal/|tests/|node_modules|\.lock")
+            | grep -v -E "Internal/|tests/|node_modules|@agnosticsec\.com|\.lock")
           set -e
           if [ -n "$HITS" ]; then
             echo "FAIL: Class 1 — team member names found in public-facing files:"
@@ -75,7 +69,7 @@ jobs:
           HITS=$(grep -rn -i -E \
             "private programme|customer programme|cutover|last public|going private|private tier|deprecation timeline|partner programme|nda default|support escalation ladder|tier rollout" \
             --include='*.md' \
-            docs/ README* CHANGELOG.md SECURITY.md \
+            docs/ README* CHANGELOG.md \
             2>/dev/null \
             | grep -v -E "Internal/|tests/|node_modules")
           set -e

@@ -136,7 +136,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: minter
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.global.imageOwner }}/{{ .Values.adminBootstrap.image.repository }}:{{ .Values.adminBootstrap.image.tag }}"
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.adminBootstrap.image.repository "tag" .Values.adminBootstrap.image.tag) }}"
           imagePullPolicy: {{ .Values.adminBootstrap.image.pullPolicy }}
           securityContext:
             runAsUser: 1001

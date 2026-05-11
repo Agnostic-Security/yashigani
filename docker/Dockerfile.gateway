@@ -1,18 +1,19 @@
 # Yashigani Gateway — multi-stage build
-# Python 3.12, non-root UID 1001, minimal attack surface
+# Python 3.14, non-root UID 1001, minimal attack surface
 #
-# v2.2.0: FastText model trained inside Docker at image build time.
-#         No pre-built binary needed in the repo. The model is baked into
-#         the image from training data committed under data/fasttext/.
+# v2.23.3: fasttext-wheel (last upload 2020-09-03, archived 2024-03-22,
+#         Python ≤3.12 ABI pin) replaced with scikit-learn.
+#         Trainer now builds a TF-IDF + LogisticRegression joblib pipeline.
+#         Model artifact: ~28 KB (vs fasttext .bin ~1-2 MB).
 #
 # Build stages:
 #   builder  — compiles the yashigani wheel
-#   trainer  — installs fasttext-wheel, trains the classifier model
+#   trainer  — installs scikit-learn, trains the sensitivity classifier
 #   runtime  — minimal image with wheel + baked model
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
-# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS builder
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS builder
 
 WORKDIR /build
 
@@ -26,62 +27,66 @@ RUN python -m build --wheel --outdir /dist
 
 
 # ── Stage 2: model trainer ───────────────────────────────────────────────────
-# Trains the FastText binary classifier (CLEAN vs INJECTION) from the
-# committed training corpus. Model is baked into the runtime image.
-# fasttext-wheel ships pre-built wheels — no C compiler required.
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS trainer
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+# Trains the sklearn sensitivity classifier (TF-IDF + LogisticRegression) from
+# the committed training corpus. Model is baked into the runtime image.
+# scikit-learn ships pre-built wheels for Python 3.12/3.13/3.14 — no C compiler.
+# Quality bar: macro F1 >= 0.90 (measured 0.9545 on 220-example corpus).
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS trainer
 
 WORKDIR /train
 
 RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
-    pip install --no-cache-dir "numpy<2.0" "fasttext-wheel>=0.9.2"
+    pip install --no-cache-dir "scikit-learn>=1.4" "joblib>=1.3"
 
 # Copy training corpus and training script
 COPY data/fasttext/ ./data/fasttext/
-COPY scripts/train_fasttext.py ./scripts/train_fasttext.py
+COPY scripts/train_sensitivity_classifier.py ./scripts/train_sensitivity_classifier.py
 
-RUN mkdir -p models && \
-    python scripts/train_fasttext.py \
+RUN mkdir -p data && \
+    python scripts/train_sensitivity_classifier.py \
         --data    data/fasttext/training_data.txt \
-        --output  models/fasttext_classifier.bin \
-        --epoch   25 \
-        --lr      0.5 \
-        --word-ngrams 2 \
-        --dim     50
+        --output  data/sensitivity_classifier.joblib \
+        --seed    42 \
+        --C       1.0 \
+        --max-iter 1000 \
+        --compress 6
 
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────────
-# Base image: python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
-FROM python:3.12.13-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3 AS runtime
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS runtime
 
 # Non-root user
 RUN groupadd --gid 1001 yashigani \
  && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false yashigani
 
-# Build-time C deps for asyncpg, fasttext, and cryptography
+# Build-time C deps for asyncpg and cryptography.
+# libgomp1 removed — it was only needed for fasttext's OpenMP threading.
+# age (v1.2.1-1+b5, debian bookworm) for MP.L2-3.8.9 backup encryption — CWE-312
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
-        libgomp1 \
+        age=1.2.1-1+b5 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Install the wheel — pulls all pyproject.toml install_requires automatically.
-# fasttext extra pulled explicitly; vault extra skipped (gateway uses docker KMS).
+# scikit-learn is a direct dependency (not an optional extra).
 # pip is removed after installation: it is not needed at runtime and its presence
 # would expose the image to CVE-2026-3219 (improper archive handling) if pip were
 # ever invoked against attacker-controlled input. It is not — all pip invocations
 # are build-time only — but removing the tool eliminates the attack surface class.
 COPY --from=builder /dist/*.whl /tmp/
 RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
-    pip install --no-cache-dir "/tmp/$(ls /tmp/*.whl | xargs -n1 basename)[fasttext]" && \
+    pip install --no-cache-dir "/tmp/$(ls /tmp/*.whl | xargs -n1 basename)" && \
     rm /tmp/*.whl && \
     pip uninstall -y pip
 
-# FastText classifier model — trained in the trainer stage, baked into image.
+# sklearn sensitivity classifier — trained in the trainer stage, baked into image.
 # No runtime download, no host-side pre-build required.
 RUN mkdir -p /app/models
-COPY --from=trainer /train/models/fasttext_classifier.bin /app/models/fasttext_classifier.bin
+COPY --from=trainer /train/data/sensitivity_classifier.joblib /app/models/sensitivity_classifier.joblib
 
 # Audit log directory (mounted as volume at runtime)
 RUN mkdir -p /data/audit /data/bootstrap /var/log/yashigani && \
@@ -94,7 +99,7 @@ EXPOSE 8080
 # Image-level healthcheck — talks through the mTLS port using the container's
 # own client cert (same material the service presents for inbound mTLS).
 # Pattern A for Python ssl: trust anchor is the public ca_root.crt. Python
-# 3.12/OpenSSL 3.0 strict-chain validation rejects intermediate-only anchors
+# 3.14/OpenSSL 3.0 strict-chain validation rejects intermediate-only anchors
 # (gate #58a evidence, 2026-04-28). Private ca_root.key never enters workload.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import ssl, urllib.request; c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); urllib.request.urlopen('https://localhost:8080/healthz', context=c)"
@@ -106,8 +111,16 @@ ENV PYTHONUNBUFFERED=1 \
     # Without this, a writable $HOME inside the container lets an attacker drop
     # a sitecustomize.py that patches licensing/verifier.py at import time.
     PYTHONNOUSERSITE=1 \
-    FASTTEXT_MODEL_PATH=/app/models/fasttext_classifier.bin \
-    YASHIGANI_SERVICE_NAME=gateway
+    SKLEARN_MODEL_PATH=/app/models/sensitivity_classifier.joblib \
+    YASHIGANI_SERVICE_NAME=gateway \
+    # P-10 (2026-05-11): clear SVE bit (14) in OpenSSL armcap to skip the
+    # unprotected `cntb` probe in OpenSSL 4.0.0 (cryptography ≥47). Affects
+    # virtualised aarch64 hosts that advertise SVE2 in AT_HWCAP2 but do not
+    # enable SVE at EL0 (Podman applehv on macOS, observed on Fedora CoreOS
+    # 41 6.12.13 guest under macOS 15.7.5). 0x8fd preserves NEON/AES/SHA
+    # acceleration. Belt-and-suspenders against the pyproject `cryptography
+    # <47` pin — protects future bumps past 46.x.
+    OPENSSL_armcap=0x8fd
 
 # Internal mTLS (v2.23.1) — uvicorn terminates TLS and requires every client
 # to present a cert signed by our internal CA. Certs land in /run/secrets via

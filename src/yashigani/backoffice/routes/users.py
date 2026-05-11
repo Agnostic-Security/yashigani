@@ -3,8 +3,14 @@ Yashigani Backoffice — User/Operator account management routes.
 Full reset requires admin TOTP re-verification (ASVS V2.8).
 Delete/disable/full-reset require step-up TOTP (ASVS V6.8.4).
 Delete blocked if last user (USER_MINIMUM_VIOLATION).
+
+BOPLA note (issue #90): list_users and create_user use explicit
+response construction via UserAccountPublic / UserCreateResponse to
+guarantee that password_hash, totp_secret, recovery_codes, and lockout
+counters are never leaked in list responses.
 """
-# Last updated: 2026-04-27T00:00:00+01:00
+
+# Last updated: 2026-05-09T00:00:00+01:00
 from __future__ import annotations
 
 from typing import Optional
@@ -14,7 +20,8 @@ from pydantic import BaseModel, Field
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
-from yashigani.auth.totp import verify_totp, generate_provisioning
+from yashigani.auth.totp import generate_provisioning
+from yashigani.backoffice.schemas.bopla import UserAccountPublic, UserCreateResponse
 
 router = APIRouter()
 
@@ -34,19 +41,21 @@ class CreateUserRequest(BaseModel):
 
 @router.get("")
 async def list_users(session: AdminSession):
+    # BOPLA allowlist (#90): UserAccountPublic strips password_hash, totp_secret,
+    # recovery_codes, failed_attempts, locked_until, totp_failed/backoff fields.
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
     accounts = await state.auth_service.list_accounts()
     users = [
-        {
-            "username": r.username,
-            "account_id": r.account_id,
-            "email": r.email,
-            "disabled": r.disabled,
-            "force_password_change": r.force_password_change,
-            "force_totp_provision": r.force_totp_provision,
-            "created_at": r.created_at,
-        }
+        UserAccountPublic(
+            username=r.username,
+            account_id=r.account_id,
+            email=getattr(r, "email", None),
+            disabled=r.disabled,
+            force_password_change=r.force_password_change,
+            force_totp_provision=r.force_totp_provision,
+            created_at=r.created_at,
+        ).model_dump()
         for r in accounts
         if r.account_tier == "user"
     ]
@@ -71,6 +80,7 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
 
     # Enforce license tier end-user limit
     from yashigani.licensing.enforcer import check_end_user_limit, LicenseLimitExceeded
+
     try:
         check_end_user_limit(await state.auth_service.total_user_count())
     except LicenseLimitExceeded as exc:
@@ -86,6 +96,7 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
         )
 
     from yashigani.auth.password import generate_password
+
     temp_password = generate_password(36)
     record = await state.auth_service.create_user(body.username, temp_password)
     if body.email:
@@ -99,30 +110,30 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned, user just needs the URI
 
-    state.audit_writer.write(_config_event(
-        session.account_id, "user_account_created", "", body.username
-    ))
-    return {
-        "status": "ok",
-        "account_id": record.account_id,
-        "username": body.username,
-        "temporary_password": temp_password,
-        "totp_secret": totp.secret_b32,
-        "totp_uri": totp.provisioning_uri,
-    }
+    state.audit_writer.write(_config_event(session.account_id, "user_account_created", "", body.username))
+    # BOPLA allowlist (#90): UserCreateResponse is the ONLY response type
+    # permitted to include totp_secret/temporary_password. This is an explicit
+    # one-time-delivery exception documented in bopla-allowlist.md.
+    return UserCreateResponse(
+        status="ok",
+        account_id=record.account_id,
+        username=body.username,
+        temporary_password=temp_password,
+        totp_secret=totp.secret_b32,
+        totp_uri=totp.provisioning_uri,
+    ).model_dump()
 
 
 @router.delete("/{username}")
 async def delete_user(username: str, session: StepUpAdminSession):
     """Delete a user. Blocked if last user (USER_MINIMUM_VIOLATION)."""
     state = backoffice_state
-    assert state.auth_service is not None   # set unconditionally at startup
+    assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
-    assert state.audit_writer is not None   # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
     record = await state.auth_service.get_account(username)
     if record is None or record.account_tier != "user":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail={"error": "account_not_found"})
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
     if await state.auth_service.total_user_count() <= state.user_min_total:
         raise HTTPException(
@@ -135,9 +146,7 @@ async def delete_user(username: str, session: StepUpAdminSession):
 
     await state.auth_service.delete_account(username)
     state.session_store.invalidate_all_for_account(record.account_id)
-    state.audit_writer.write(_config_event(
-        session.account_id, "user_account_deleted", username, ""
-    ))
+    state.audit_writer.write(_config_event(session.account_id, "user_account_deleted", username, ""))
     return {"status": "ok"}
 
 
@@ -153,16 +162,15 @@ async def full_reset_user(
     Retains: username, UUID, audit history.
     """
     state = backoffice_state
-    assert state.auth_service is not None   # set unconditionally at startup
+    assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
-    assert state.audit_writer is not None   # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
 
     # Resolve admin record for TOTP verification
     admin_record = await state.auth_service.get_account_by_id(session.account_id)
 
     if admin_record is None or not admin_record.totp_secret:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail={"error": "admin_totp_not_configured"})
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"error": "admin_totp_not_configured"})
 
     # full_reset_user handles admin-TOTP verification + target reset atomically
     # inside a single tenant_transaction, using the Postgres-backed replay cache.
@@ -173,9 +181,7 @@ async def full_reset_user(
     )
     if not success:
         if reason == "invalid_admin_totp":
-            state.audit_writer.write(_full_reset_totp_failure(
-                admin_record.username, username
-            ))
+            state.audit_writer.write(_full_reset_totp_failure(admin_record.username, username))
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"error": "invalid_admin_totp"},
@@ -189,9 +195,7 @@ async def full_reset_user(
     if target is not None:
         state.session_store.invalidate_all_for_account(target.account_id)
 
-    state.audit_writer.write(_full_reset_event(
-        admin_record.username, username
-    ))
+    state.audit_writer.write(_full_reset_event(admin_record.username, username))
     return {"status": "ok", "message": "User account fully reset"}
 
 
@@ -203,22 +207,19 @@ async def disable_user(username: str, session: StepUpAdminSession):
     # (API keys / agent tokens) registered under the same account_id.
     # Mirrors disable_admin in accounts.py.
     state = backoffice_state
-    assert state.auth_service is not None   # set unconditionally at startup
+    assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
-    assert state.audit_writer is not None   # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
     record = await state.auth_service.get_account(username)
     if record is None or record.account_tier != "user":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail={"error": "account_not_found"})
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
     if record.disabled:
         return {"status": "ok", "message": "already_disabled"}
     await state.auth_service.disable(username)
     state.session_store.invalidate_all_for_account(record.account_id)
     # LF-DISABLE-PARTIAL: suspend all identity-registry entries for this account.
     _suspend_identity_registry_for_account(record.account_id)
-    state.audit_writer.write(_config_event(
-        session.account_id, "user_account_disabled", username, "disabled"
-    ))
+    state.audit_writer.write(_config_event(session.account_id, "user_account_disabled", username, "disabled"))
     return {"status": "ok"}
 
 
@@ -242,6 +243,7 @@ async def enable_user(username: str, session: AdminSession):
         LicenseLimitExceeded,
         license_limit_exceeded_response,
     )
+
     try:
         check_end_user_limit(count_canonical_end_users())
     except LicenseLimitExceeded as exc:
@@ -251,11 +253,8 @@ async def enable_user(username: str, session: AdminSession):
         )
 
     if not await state.auth_service.enable(username):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail={"error": "account_not_found"})
-    state.audit_writer.write(_config_event(
-        session.account_id, "user_account_enabled", username, "enabled"
-    ))
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+    state.audit_writer.write(_config_event(session.account_id, "user_account_enabled", username, "enabled"))
     return {"status": "ok"}
 
 
@@ -277,36 +276,46 @@ def _suspend_identity_registry_for_account(account_id: str) -> None:
     registry = state.identity_registry
     if registry is None:
         import logging as _log
+
         _log.getLogger(__name__).warning(
-            "LF-DISABLE-PARTIAL: identity_registry not available — "
-            "API keys for account %s NOT suspended", account_id,
+            "LF-DISABLE-PARTIAL: identity_registry not available — API keys for account %s NOT suspended",
+            account_id,
         )
         return
     try:
         suspended = registry.suspend_owned_by(account_id)
         import logging as _log
+
         _log.getLogger(__name__).info(
             "LF-DISABLE-PARTIAL: suspended %d identity-registry entries for account %s",
-            suspended, account_id,
+            suspended,
+            account_id,
         )
     except Exception as exc:
         import logging as _log
+
         _log.getLogger(__name__).error(
-            "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries "
-            "for account %s: %s", account_id, exc,
+            "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries for account %s: %s",
+            account_id,
+            exc,
         )
 
 
 def _config_event(admin_id: str, setting: str, prev: str, new: str):
     from yashigani.audit.schema import ConfigChangedEvent
+
     return ConfigChangedEvent(
-        account_tier="admin", admin_account=admin_id,
-        setting=setting, previous_value=prev, new_value=new,
+        account_tier="admin",
+        admin_account=admin_id,
+        setting=setting,
+        previous_value=prev,
+        new_value=new,
     )
 
 
 def _full_reset_event(admin_username: str, target: str):
     from yashigani.audit.schema import UserFullResetEvent
+
     return UserFullResetEvent(
         account_tier="admin",
         admin_account=admin_username,
@@ -317,6 +326,7 @@ def _full_reset_event(admin_username: str, target: str):
 
 def _full_reset_totp_failure(admin_username: str, target: str):
     from yashigani.audit.schema import FullResetTotpFailureEvent
+
     return FullResetTotpFailureEvent(
         account_tier="admin",
         admin_account=admin_username,

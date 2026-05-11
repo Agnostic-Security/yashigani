@@ -137,10 +137,42 @@ fi
 # ---------------------------------------------------------------------------
 # Step 4: Remove docker/secrets/ directory
 # ---------------------------------------------------------------------------
+# Under Podman rootless, install.sh chowns secrets files into the container
+# user namespace (subuid-mapped UID). Plain `rm -rf` as the host user fails
+# with EPERM because the host sees those files as owned by a high-range UID
+# it does not own.  `podman unshare rm -rf` re-enters the user namespace and
+# can delete them normally.  Docker rootful / podman rootful / K8s: plain
+# `rm -rf` continues to work as today.
+#
+# Detection order:
+#   1. YSG_RUNTIME == "podman" (set by platform-detect.sh or env override)
+#   2. `podman info --format '{{.Host.Security.Rootless}}'` returns "true"
+#   Both must be true to take the unshare path.
+# ---------------------------------------------------------------------------
 SECRETS_DIR="${PROJECT_ROOT}/docker/secrets"
 if [ -d "$SECRETS_DIR" ]; then
   _info "Removing secrets directory: ${SECRETS_DIR}"
-  rm -rf "$SECRETS_DIR"
+
+  _PODMAN_ROOTLESS=0
+  if [ "${YSG_RUNTIME:-}" = "podman" ] && command -v podman >/dev/null 2>&1; then
+    _rl="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo "false")"
+    [ "$_rl" = "true" ] && _PODMAN_ROOTLESS=1
+  fi
+
+  if [ "$_PODMAN_ROOTLESS" -eq 1 ]; then
+    _info "Podman rootless detected — using podman unshare for namespace-owned files"
+    if ! podman unshare rm -rf "$SECRETS_DIR" 2>/dev/null; then
+      # Unshare path itself failed — surface an actionable message and exit non-zero
+      _owner_uid="$(stat -c '%u' "$SECRETS_DIR" 2>/dev/null || echo "unknown")"
+      _error "podman unshare rm -rf failed on ${SECRETS_DIR} (owner UID: ${_owner_uid})"
+      _error "Ensure you are running as the install user and that subuid mapping is intact."
+      _error "Manual fix: podman unshare rm -rf ${SECRETS_DIR}"
+      exit 1
+    fi
+  else
+    rm -rf "$SECRETS_DIR"
+  fi
+
   _ok "Secrets directory removed."
 else
   _info "Secrets directory not found: ${SECRETS_DIR}"

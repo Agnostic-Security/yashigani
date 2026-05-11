@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # scripts/preflight.sh — Yashigani v0.9.2
+# last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode — G20 air-gap gate #58)
 # Pre-install requirement checks. Exits 1 if any REQUIRED check fails.
 
 set -euo pipefail
@@ -376,6 +377,37 @@ _check_secrets() {
   esac
 }
 
+# G19. Backup encryption — age binary + recipient key (MP.L2-3.8.9 / CMMC L2)
+# Warn (not fail) if age is absent: operators may not yet have provisioned keys.
+# Hard-fail if the recipient file exists but is unreadable or malformed.
+_check_backup_encryption() {
+  local recipient_file="${YASHIGANI_BACKUP_RECIPIENT:-/etc/yashigani/backup-recipient.age.pub}"
+
+  # age binary
+  if ! command -v age >/dev/null 2>&1; then
+    _warn_check "Backup encryption (G19)" "age binary not found — install age before enabling backups (MP.L2-3.8.9)"
+  else
+    local _age_ver
+    _age_ver="$(age --version 2>/dev/null || echo "unknown")"
+    _pass "Backup encryption (G19)" "age present (${_age_ver})"
+  fi
+
+  # Recipient public key file — hard-fail if it exists but is wrong
+  if [[ -f "${recipient_file}" ]]; then
+    local _key
+    _key="$(head -1 "${recipient_file}" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "${_key}" ]]; then
+      _fail "Backup recipient key (G19)" "${recipient_file} is empty — backup.sh will refuse to run"
+    elif [[ "${_key}" != age1* ]]; then
+      _fail "Backup recipient key (G19)" "${recipient_file} does not contain a valid age public key (must start with 'age1')"
+    else
+      _pass "Backup recipient key (G19)" "${recipient_file} — ${_key:0:16}..."
+    fi
+  else
+    _warn_check "Backup recipient key (G19)" "${recipient_file} not found — provision before running backup.sh (see docs/operations/backup.md)"
+  fi
+}
+
 # 10. DNS check (conditional on TLS_MODE=acme)
 _check_dns() {
   local tls_mode="${TLS_MODE:-}"
@@ -451,6 +483,91 @@ _check_gpu() {
   esac
 }
 
+# G20. Air-gap mode gate — verify bundle + manifest present + digests parseable
+# Only runs when AIR_GAP=true is set in the environment (set by install.sh).
+# Hard-fails if --air-gap is set but bundle/manifest is missing or corrupt.
+_check_airgap() {
+  local air_gap="${AIR_GAP:-false}"
+  local bundle_path="${AIR_GAP_BUNDLE:-}"
+
+  if [[ "$air_gap" != "true" ]]; then
+    # Not in air-gap mode — skip gate
+    return
+  fi
+
+  # G20a: bundle file must exist
+  if [[ -z "$bundle_path" ]]; then
+    _fail "Air-gap (G20a)" "--air-gap set but AIR_GAP_BUNDLE not specified — pass --bundle <path>"
+  elif [[ ! -f "$bundle_path" ]]; then
+    _fail "Air-gap (G20a)" "Bundle not found: ${bundle_path}"
+  else
+    local bundle_size_mb
+    bundle_size_mb="$(du -sm "${bundle_path}" 2>/dev/null | awk '{print $1}' || echo "?")"
+    _pass "Air-gap (G20a)" "Bundle present: $(basename "${bundle_path}") (${bundle_size_mb} MB)"
+  fi
+
+  # G20b: airgap/manifest.yml must exist beside install.sh or in WORK_DIR
+  local manifest_file=""
+  local _script_dir
+  _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
+  local _repo_root
+  _repo_root="$(cd "${_script_dir}/.." && pwd 2>/dev/null || echo ".")"
+
+  for _d in "${_repo_root}" "$(pwd)" "${WORK_DIR:-}"; do
+    [[ -z "$_d" ]] && continue
+    if [[ -f "${_d}/airgap/manifest.yml" ]]; then
+      manifest_file="${_d}/airgap/manifest.yml"
+      break
+    fi
+  done
+
+  if [[ -z "$manifest_file" ]]; then
+    _fail "Air-gap (G20b)" "airgap/manifest.yml not found — transfer it alongside install.sh"
+  else
+    _pass "Air-gap (G20b)" "Manifest present: ${manifest_file}"
+  fi
+
+  # G20c: manifest must be parseable and contain a version field
+  if [[ -n "$manifest_file" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      _warn_check "Air-gap (G20c)" "python3 not found — manifest parse check skipped"
+    else
+      local manifest_version
+      manifest_version="$(python3 -c "
+import re, sys
+with open('${manifest_file}') as f:
+    for line in f:
+        m = re.match(r'^version: \"?([^\"]+)\"?', line)
+        if m:
+            print(m.group(1)); sys.exit(0)
+sys.exit(1)
+" 2>/dev/null || echo "")"
+      if [[ -z "$manifest_version" ]]; then
+        _fail "Air-gap (G20c)" "Manifest parse failed — version field not found in ${manifest_file}"
+      else
+        _pass "Air-gap (G20c)" "Manifest version: ${manifest_version}"
+      fi
+    fi
+  fi
+
+  # G20d: zstd required to unpack the bundle
+  if ! command -v zstd >/dev/null 2>&1; then
+    _fail "Air-gap (G20d)" "zstd not installed — required to unpack the air-gap bundle (apt install zstd)"
+  else
+    _pass "Air-gap (G20d)" "zstd present ($(zstd --version 2>/dev/null | head -1 || echo 'unknown'))"
+  fi
+
+  # G20e: sidecar manifest sidecar (warn if absent — not hard-fail)
+  local sidecar_path="${bundle_path%.tar.zst}.manifest"
+  if [[ -n "$bundle_path" ]]; then
+    if [[ -f "$sidecar_path" ]]; then
+      _pass "Air-gap (G20e)" "Sidecar manifest present: $(basename "${sidecar_path}")"
+    else
+      _warn_check "Air-gap (G20e)" "Sidecar .manifest not found — SHA256 integrity check will be skipped during load"
+    fi
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Run all checks
 # ---------------------------------------------------------------------------
@@ -463,6 +580,8 @@ _check_disk
 _check_ram
 _check_gpu
 _check_secrets
+_check_backup_encryption
+_check_airgap
 _check_dns
 
 # ---------------------------------------------------------------------------

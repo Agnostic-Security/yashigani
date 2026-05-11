@@ -1,9 +1,16 @@
 """
-Unit tests for _assert_safe_owui_url — YSG-RISK-007.A (CWE-918).
+Unit tests for _assert_safe_upstream_url — YSG-RISK-007.A (CWE-918).
 
-Verifies that the OWUI_API_URL allowlist helper blocks SSRF probes and
-permits only explicitly allowlisted hostnames.
+Verifies that the agent upstream-URL SSRF guard blocks dangerous URLs and
+permits only safe or explicitly allowlisted hostnames.
+
+Updated in fix/v233-base-regressions to reference the current function name
+(_assert_safe_upstream_url, introduced in d76dddb) instead of the removed
+_assert_safe_owui_url helper. The hand-rolled helper was replaced by
+centralised HttpClient._check_policy() for OWUI calls; the agent
+upstream_url path now goes through _assert_safe_upstream_url.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -57,83 +64,92 @@ def _load_agents_module():
 
 
 _agents = _load_agents_module()
-_assert_safe_owui_url = _agents._assert_safe_owui_url
+# d76dddb renamed _assert_safe_owui_url → _assert_safe_upstream_url.
+# All OWUI outbound calls now go through _owui_http_client()._check_policy().
+# Agent upstream_url registration still validates through this function.
+_assert_safe_upstream_url = _agents._assert_safe_upstream_url
 
 
 def _fn(url: str, hostnames_env: str = ""):
-    """Call _assert_safe_owui_url with optional env override."""
+    """Call _assert_safe_upstream_url with optional YASHIGANI_AGENT_UPSTREAM_HOSTNAMES override."""
     if hostnames_env:
-        old = os.environ.get("YASHIGANI_OWUI_HOSTNAMES")
-        os.environ["YASHIGANI_OWUI_HOSTNAMES"] = hostnames_env
+        old = os.environ.get("YASHIGANI_AGENT_UPSTREAM_HOSTNAMES")
+        os.environ["YASHIGANI_AGENT_UPSTREAM_HOSTNAMES"] = hostnames_env
         try:
-            return _assert_safe_owui_url(url)
+            return _assert_safe_upstream_url(url)
         finally:
             if old is None:
-                os.environ.pop("YASHIGANI_OWUI_HOSTNAMES", None)
+                os.environ.pop("YASHIGANI_AGENT_UPSTREAM_HOSTNAMES", None)
             else:
-                os.environ["YASHIGANI_OWUI_HOSTNAMES"] = old
+                os.environ["YASHIGANI_AGENT_UPSTREAM_HOSTNAMES"] = old
     else:
-        # Remove any override so default list is used
-        old = os.environ.pop("YASHIGANI_OWUI_HOSTNAMES", None)
+        # Remove any override so default (empty allowlist) is used
+        old = os.environ.pop("YASHIGANI_AGENT_UPSTREAM_HOSTNAMES", None)
         try:
-            return _assert_safe_owui_url(url)
+            return _assert_safe_upstream_url(url)
         finally:
             if old is not None:
-                os.environ["YASHIGANI_OWUI_HOSTNAMES"] = old
+                os.environ["YASHIGANI_AGENT_UPSTREAM_HOSTNAMES"] = old
 
 
+class TestAssertSafeUpstreamUrl:
+    def test_unresolvable_host_passes(self):
+        """Hostname that doesn't resolve (e.g. internal mesh name) passes scheme check.
 
-class TestAssertSafeOwuiUrl:
-    def test_default_allowlist_open_webui_http(self):
-        """Default hostname open-webui with http:// must pass."""
+        open-webui won't resolve outside a Docker network; DNS failure falls
+        through to the literal-IP check which skips non-IP tokens — URL passes.
+        """
         result = _fn("http://open-webui:8080")
         assert result == "http://open-webui:8080"
 
-    def test_default_allowlist_localhost(self):
-        """localhost is in the default allowlist."""
-        result = _fn("http://localhost:8080")
+    def test_explicit_allowlist_permits_localhost(self):
+        """localhost is permitted when explicitly added to YASHIGANI_AGENT_UPSTREAM_HOSTNAMES."""
+        result = _fn("http://localhost:8080", hostnames_env="localhost")
         assert result == "http://localhost:8080"
 
-    def test_default_allowlist_127(self):
-        """127.0.0.1 is in the default allowlist."""
-        result = _fn("http://127.0.0.1:8080")
+    def test_explicit_allowlist_permits_loopback_ip(self):
+        """127.0.0.1 is permitted when explicitly allowlisted."""
+        result = _fn("http://127.0.0.1:8080", hostnames_env="127.0.0.1")
         assert result == "http://127.0.0.1:8080"
 
     def test_https_allowed(self):
-        """https:// scheme is allowed."""
+        """https:// scheme is allowed for a non-resolving hostname."""
         result = _fn("https://open-webui:8080/api")
         assert result.startswith("https://")
 
     def test_metadata_endpoint_blocked(self):
-        """AWS IMDS metadata endpoint must be blocked."""
-        with pytest.raises(RuntimeError, match="owui_url_blocked"):
+        """AWS IMDS link-local endpoint must be blocked (CWE-918)."""
+        with pytest.raises(ValueError, match="CWE-918"):
             _fn("http://169.254.169.254/latest/meta-data/")
 
     def test_custom_allowlist_permits_custom_host(self):
-        """A custom YASHIGANI_OWUI_HOSTNAMES env value allows the specified host."""
-        result = _fn("http://my-owui.internal:8080", hostnames_env="my-owui.internal")
-        assert result == "http://my-owui.internal:8080"
+        """A custom YASHIGANI_AGENT_UPSTREAM_HOSTNAMES value allows the specified host."""
+        result = _fn("http://my-agent.internal:8080", hostnames_env="my-agent.internal")
+        assert result == "http://my-agent.internal:8080"
 
-    def test_custom_allowlist_blocks_non_listed(self):
-        """A host not in the custom allowlist must be blocked."""
-        with pytest.raises(RuntimeError, match="owui_url_blocked"):
-            _fn("http://evil.example.com:8080", hostnames_env="my-owui.internal")
+    def test_custom_allowlist_does_not_permit_unlisted(self):
+        """A host not in the custom allowlist must be blocked if it resolves to private/loopback."""
+        # evil.example.com won't resolve; falls through to non-IP literal check → passes
+        # Use an IP that is definitely blocked: loopback 127.0.0.2 not in allowlist.
+        with pytest.raises(ValueError, match="CWE-918"):
+            _fn("http://127.0.0.2:8080", hostnames_env="my-agent.internal")
 
     def test_file_scheme_blocked(self):
         """file:// scheme must be blocked."""
-        with pytest.raises(RuntimeError, match="owui_url_blocked"):
+        with pytest.raises(ValueError, match="CWE-918"):
             _fn("file:///etc/passwd")
 
     def test_ftp_scheme_blocked(self):
         """ftp:// scheme must be blocked."""
-        with pytest.raises(RuntimeError, match="owui_url_blocked"):
+        with pytest.raises(ValueError, match="CWE-918"):
             _fn("ftp://open-webui:21/")
 
-    def test_metadata_via_custom_allowlist_still_scheme_checked(self):
-        """Even if an allowlist explicitly lists the metadata IP, it passes scheme check
-        but the IP itself would be blocked only by host-lookup (not the direct allowlist).
-        Test that a valid-scheme, custom-listed host passes."""
-        # 10.0.0.5 is RFC1918 but _assert_safe_owui_url uses hostname allowlist,
-        # not IP range blocking — that's HttpClient's role. Test custom allowlist works.
+    def test_private_ip_via_explicit_allowlist_passes(self):
+        """A private RFC1918 IP explicitly allowlisted is permitted."""
         result = _fn("http://10.0.0.5:8080", hostnames_env="10.0.0.5")
         assert result == "http://10.0.0.5:8080"
+
+    def test_loopback_without_allowlist_blocked(self):
+        """localhost resolves to 127.0.0.1 (loopback) — blocked without allowlist."""
+        with pytest.raises(ValueError, match="CWE-918"):
+            _fn("http://127.0.0.1:8080")

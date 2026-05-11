@@ -1,7 +1,7 @@
 """
 Yashigani internal PKI issuer — generates root, intermediate, and leaf certs.
 
-Last updated: 2026-04-27T21:40:00Z
+Last updated: 2026-05-11T00:00:00Z
 
 Invoked by:
   * install.sh bootstrap_internal_pki()  — first-install cert generation
@@ -46,6 +46,7 @@ import logging
 import secrets
 import stat
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -411,8 +412,16 @@ def _update_manifest_hashes(
     Uses line-based text edit (not full YAML dump) to preserve comments
     and ordering. The manifest is committed IaC; round-tripping through
     pyyaml drops comments.
+
+    Emits a single INFO audit-trail log line (LU-PKI-A01) with:
+      - event_id: per-call UUID4 for correlation
+      - pre_sha256: SHA-256 of the manifest text as read from disk
+      - post_sha256: SHA-256 of the manifest text as written back to disk
     """
+    event_id = str(uuid.uuid4())
     text = manifest_path.read_text()
+    manifest_pre_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     lines = text.splitlines(keepends=True)
     out: list[str] = []
     current_service: Optional[str] = None
@@ -430,7 +439,16 @@ def _update_manifest_hashes(
                 line = f"{prefix}bootstrap_token_sha256: \"{h}\"\n"
         out.append(line)
         i += 1
-    manifest_path.write_text("".join(out))
+    new_text = "".join(out)
+    manifest_path.write_text(new_text)
+    manifest_post_sha256 = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+
+    logger.info(
+        "internal-pki: manifest write-back complete | event_id=%s | pre_sha256=%s | post_sha256=%s",
+        event_id,
+        manifest_pre_sha256,
+        manifest_post_sha256,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

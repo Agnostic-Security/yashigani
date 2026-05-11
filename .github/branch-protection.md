@@ -1,6 +1,6 @@
 # Branch Protection — `main`
 
-<!-- Last updated: 2026-05-01T00:00:00+01:00 -->
+<!-- Last updated: 2026-05-08T00:00:00+01:00 -->
 
 Configure via: Settings > Branches > Add rule > Branch name pattern: `main`
 
@@ -21,6 +21,8 @@ All 7 CI jobs must pass before merge is permitted. Enable "Require status checks
 | `pip-audit Dependency Check` | `security.yml` / `pip-audit` | Runs on PR trigger |
 
 Enable "Require branches to be up to date before merging."
+
+**Note — Install Smoke (`install-smoke.yml`):** The `smoke-gate (Linux + mutation only)` job from `install-smoke.yml` is intentionally NOT in the required status checks above. macOS smoke cells run on a self-hosted Apple-Silicon runner (M-chip) and are gated; GH-hosted macOS runners lack VZ/Colima/Podman-machine support. The Linux smoke cells and mutation test are enforced inside `smoke-gate` itself, which runs against the release branch during M7 pre-flight — not as a PR merge gate on `main`. Do NOT add `smoke-gate (Linux + mutation only)` as a required status check on `main`.
 
 ---
 

@@ -1,0 +1,146 @@
+{{- /*
+Yashigani v2.23.3 — age-encrypted backup CronJob (MP.L2-3.8.9 / CMMC L2)
+
+Runs scripts/backup.sh daily (default: 02:00 UTC) and pipes the archive
+through age encryption before writing to the output PersistentVolume.
+
+Encryption model:
+  - Recipient public key from ConfigMap (.Values.backup.recipientKeyConfigMap).
+  - No private key is needed inside the pod — encryption is asymmetric.
+  - Output: <outputDir>/<timestamp>.tar.gz.age (binary, not armored).
+
+The identity Secret (.Values.backup.identitySecret) is NOT mounted by this
+job — it is only used by the restore path (restore.sh --encrypted).
+
+Finding: MP.L2-3.8.9 — backup encryption at rest
+CWE: CWE-312 (cleartext storage of sensitive information)
+
+Last updated: 2026-05-09T00:00:00+01:00
+*/ -}}
+{{- if .Values.backup.enabled }}
+{{- if not .Values.backup.recipientKeyConfigMap }}
+{{- fail "backup.enabled=true but backup.recipientKeyConfigMap is not set. Provision the ConfigMap first — see docs/operations/backup.md." }}
+{{- end }}
+---
+{{- if and .Values.backup.pvc.create (not .Values.backup.pvcName) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "yashigani.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "yashigani.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    helm.sh/chart: {{ include "yashigani.chart" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: backup
+  annotations:
+    yashigani.io/version: {{ .Chart.AppVersion | quote }}
+spec:
+  accessModes:
+    - {{ .Values.backup.pvc.accessMode | default "ReadWriteOnce" }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.pvc.size | default "10Gi" }}
+  {{- if .Values.backup.pvc.storageClassName }}
+  storageClassName: {{ .Values.backup.pvc.storageClassName | quote }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "yashigani.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "yashigani.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    helm.sh/chart: {{ include "yashigani.chart" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: backup
+  annotations:
+    yashigani.io/version: {{ .Chart.AppVersion | quote }}
+    yashigani.io/finding: "MP.L2-3.8.9"
+    yashigani.io/cwe: "CWE-312"
+spec:
+  schedule: {{ .Values.backup.schedule | default "0 2 * * *" | quote }}
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit | default 3 }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit | default 3 }}
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: {{ include "yashigani.name" . }}
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: backup
+        spec:
+          serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            fsGroup: 1001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              # Reuse the gateway image — it carries age (installed in Dockerfile.gateway)
+              # and the backup.sh script. Override entrypoint to run the backup script.
+              image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.gateway.image.repository "tag" (.Values.gateway.image.tag | default .Chart.AppVersion)) }}"
+              imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default "IfNotPresent" }}
+              command:
+                - bash
+                - /scripts/backup.sh
+              env:
+                - name: YASHIGANI_BACKUP_OUTPUT_DIR
+                  value: {{ .Values.backup.outputDir | default "/var/lib/yashigani/backups" | quote }}
+                - name: YASHIGANI_BACKUP_SOURCE_DIR
+                  value: {{ .Values.backup.sourceDir | default "/var/lib/yashigani" | quote }}
+                # Recipient public key path — populated from the mounted ConfigMap.
+                # backup.sh reads this file at startup (Gate 2 — key shape validation).
+                - name: YASHIGANI_BACKUP_RECIPIENT
+                  value: "/etc/yashigani/backup-recipient.age.pub"
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false  # backup.sh writes to outputDir
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: backup-script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: backup-output
+                  mountPath: {{ .Values.backup.outputDir | default "/var/lib/yashigani/backups" | quote }}
+                - name: backup-recipient-key
+                  mountPath: /etc/yashigani
+                  readOnly: true
+          volumes:
+            - name: backup-script
+              configMap:
+                name: {{ include "yashigani.fullname" . }}-backup-script
+                defaultMode: 0555
+            - name: backup-recipient-key
+              configMap:
+                name: {{ .Values.backup.recipientKeyConfigMap | quote }}
+                items:
+                  - key: recipient.age.pub
+                    path: backup-recipient.age.pub
+                    mode: 0444
+            - name: backup-output
+              {{- if .Values.backup.pvcName }}
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.pvcName | quote }}
+              {{- else if .Values.backup.pvc.create }}
+              persistentVolumeClaim:
+                claimName: {{ include "yashigani.fullname" . }}-backup
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+{{- end }}

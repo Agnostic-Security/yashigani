@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (self-signed certificate mode)
-# Last updated: 2026-05-07T01:00:00+01:00 (retro #83: Grafana mTLS — proxy to grafana:3443)
+# Last updated: 2026-05-09T00:00:00+00:00 (v2.23.3: add /api/v1/admin/* route — SWEEP-16 release blocker)
 #
 # ╔══════════════════════════════════════════════════════════╗
 # ║  WARNING: SELF-SIGNED MODE — LOCAL / DEMO USE ONLY      ║
@@ -255,6 +255,20 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /scim/* {
+        reverse_proxy https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── Admin API — /api/v1/admin/* (PKI, HIBP, secrets, WebAuthn) ────────
+    # Must be explicit before the catch-all (which routes to open-webui).
+    # Regression test: SWEEP-16 in test_v2233_ava_sweep.py
+    # ASVS V9.1, API5 BFLA — fix for v2.23.3 release blocker.
+    # Last updated: 2026-05-09T00:00:00+00:00 (v2.23.3)
+    handle /api/v1/admin/* {
         reverse_proxy https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified

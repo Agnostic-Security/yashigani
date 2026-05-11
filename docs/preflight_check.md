@@ -1,6 +1,6 @@
 # Yashigani Pre-Installation Checklist
 
-**Version:** v2.23.2
+**Version:** v2.23.3
 **Last updated:** 2026-05-08
 **Purpose:** Everything you must gather, configure, or verify *before* running `install.sh` or `docker compose up`. The automated installer handles software installation and secret generation — but it cannot know your infrastructure topology, DNS records, upstream server addresses, or credentials for external services. Collect all items marked **Required** before you start.
 
@@ -94,7 +94,7 @@ Yashigani proxies ALL traffic to one primary upstream. You must know where it is
 
 ### 2.2 DNS TTL
 
-For production: set DNS TTL to 300 seconds (5 minutes) before cutover, and restore to 3600 after. This makes rollback faster if something goes wrong.
+For production: set DNS TTL to 300 seconds (5 minutes) before go-live, and restore to 3600 after. This makes rollback faster if something goes wrong.
 
 ### Checklist — Section 2
 
@@ -709,7 +709,8 @@ These are not installer inputs but must be planned before go-live.
 | TOTP enrollment plan | Required | All admin accounts must enroll TOTP before the bootstrap admin password is distributed. |
 | Admin initial password handling | Required | Printed at first run, one-time display. Store in password manager immediately. |
 | Host-level audit logging | Recommended | `/var/log/auth.log` + SSH logging in addition to Yashigani's own audit |
-| Container image pinning | Recommended | Replace `:latest` tags in docker-compose.yml with specific digest-pinned versions for production. |
+| Container image pinning | **Required for production** | Every image in `docker-compose.yml`, compose overrides, and `helm/yashigani/values.yaml` must be pinned to a specific stable version tag. The release overlay (`docker-compose.release.yml`, `values.release.yaml`) must use `name:tag@sha256:<digest>` form for every external image. Floating-stub tags (`:latest`, `:7-alpine`, `:16-alpine`) are forbidden. |
+| Python / npm / Actions dep currency | **Required for production** | Confirm no dep is >2 minor behind latest stable and zero HIGH/CRITICAL Dependabot alerts are open across all in-scope repos. |
 | Seccomp/AppArmor | Recommended | Verify profiles are loading: `docker inspect --format='{{.HostConfig.SecurityOpt}}' yashigani-gateway-1` |
 | Volume encryption | Recommended | For cloud deployments, use encrypted EBS/Persistent Disk/Azure Managed Disk for the Docker data root |
 | Backup encryption | Recommended | Encrypt all Postgres backups at rest |
@@ -721,7 +722,12 @@ These are not installer inputs but must be planned before go-live.
 [ ] At least 2 admin accounts planned with named owners
 [ ] TOTP enrollment scheduled for all admin accounts at first login
 [ ] Postgres backup strategy decided and scheduled
-[ ] Container image pinning done for production docker-compose.yml
+[ ] Container image pinning: specific-version tags in docker-compose.yml (no floating stubs)
+[ ] Container image pinning: release overlay uses name:tag@sha256:<digest> for all external images
+[ ] G16 dep-bump sweep completed and signed off (release managers)
+[ ] Python packages: zero HIGH/CRITICAL open Dependabot alerts (yashigani + acs repos)
+[ ] npm/JS packages: npm audit --audit-level=high exit 0 (agnosticsec-website repo)
+[ ] GitHub Actions: all workflow-file action refs pinned to SHA at current tagged release
 [ ] OPA deny-by-default confirmed for unlisted paths
 ```
 
@@ -809,95 +815,6 @@ To skip the interactive confirmation:
 [ ] Disk space confirmed ≥ 5 GB free
 [ ] `update.sh` reviewed (in repo root)
 [ ] Rollback plan understood (update.sh handles automatically; manual restore from backup is the fallback)
-```
-
----
-
-## Section 18 — NTP / System Clock Synchronisation (All Deployments)
-
-A host with an unsynchronised or drifted clock silently breaks multiple security-critical subsystems:
-
-| Affected subsystem | Failure mode |
-|---|---|
-| TLS certificate validation | Certificates appear expired or not-yet-valid if clock skew exceeds the cert validity window |
-| JWT / OIDC token validation | Clock skew > 5 minutes invalidates `exp` and `nbf` claims; OIDC ID tokens rejected |
-| TOTP (2FA) | Code windows are ±30 s; skew > 60 s causes consistent TOTP failures for all admin accounts |
-| mTLS handshakes | Client certificate validity checks fail on large skews |
-| Audit log timestamps | Log entries become uncorrelatable across services; forensic timeline is untrustworthy |
-
-**Requirement:** the host clock MUST be synchronised to an NTP source with stratum 1–3 and drift < 100 ms before go-live. Verify using one of the methods below that matches your OS.
-
-### 18.1 Verify NTP Sync — Linux (systemd-timesyncd or chrony)
-
-```bash
-# Option A — systemd-timesyncd (most Ubuntu/Debian/RHEL systems):
-timedatectl status
-# Required output lines:
-#   NTP service: active
-#   System clock synchronized: yes
-
-# Option B — chrony:
-chronyc tracking
-# Required: Reference ID not "7F7F0101" (127.127.1.1 = local clock fallback)
-# Required: Stratum between 1 and 3
-# Required: System time offset < 100 ms (shown as "System time" row)
-```
-
-If `NTP service: inactive`, enable it:
-
-```bash
-sudo timedatectl set-ntp true
-# or for chrony:
-sudo systemctl enable --now chronyd
-```
-
-### 18.2 Verify NTP Sync — macOS (host deployments)
-
-```bash
-sntp -S time.cloudflare.com
-# or:
-systemsetup -getnetworktimeserver   # confirm an NTP server is configured
-```
-
-### 18.3 Recommended NTP Servers
-
-**Tier-0 (preferred for production — well-maintained, geo-distributed, anycast):**
-
-| Server | Operator | Notes |
-|---|---|---|
-| `time.cloudflare.com` | Cloudflare | Anycast; supports NTS (NTP with TLS authentication) |
-| `time.nist.gov` | NIST (US gov) | Authoritative US time source |
-| `time.google.com` | Google | Anycast; wide global coverage |
-
-**Tier-1 (community pool — acceptable for most self-hosted deployments):**
-
-```
-0.pool.ntp.org
-1.pool.ntp.org
-2.pool.ntp.org
-3.pool.ntp.org
-```
-
-Configure at least two servers. A single-server configuration is a single point of failure — if the server is unreachable, the clock can drift without detection.
-
-**Avoid:** vendor-default sources that have had documented outages or do not use pool-based redundancy. Configure explicit servers in `/etc/chrony.conf` or `/etc/systemd/timesyncd.conf` rather than relying on DHCP-pushed NTP.
-
-### 18.4 Auditor Note (CMMC / NIST 800-53)
-
-The operator's NTP configuration is part of the evidence package for:
-
-- **CMMC AU.L2-3.3.7** (system clock synchronisation for audit log integrity)
-- **NIST SP 800-53 AU-8** (time stamps — requires synchronisation to an authoritative time source)
-
-Without verifiable NTP sync, audit log timestamps cannot be treated as reliable forensic evidence. Capture the output of `timedatectl status` or `chronyc tracking` before go-live and retain it in your deployment evidence record.
-
-### Checklist — Section 18
-
-```
-[ ] NTP service active on host (timedatectl: NTP service active, OR chronyc: Stratum 1–3)
-[ ] System clock offset < 100 ms confirmed
-[ ] At least two NTP servers configured (not single-server or DHCP-default only)
-[ ] NTP sync output captured and retained for compliance evidence (CMMC AU.L2-3.3.7 / NIST AU-8)
 ```
 
 ---
@@ -1026,13 +943,12 @@ The current agent lineup is: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 [ ] 2+ admin accounts planned
 [ ] Postgres backup strategy confirmed (restore.sh for backup recovery)
 [ ] Postgres migrations run on startup confirmed
-[ ] Image versions pinned in docker-compose.yml
+[ ] Image versions pinned in docker-compose.yml (specific-version tags; release overlay uses name:tag@sha256:<digest> per §6b G16)
 [ ] Monitoring/alerting receivers configured
 [ ] Budget tiers configured and tested
 [ ] Pre-release OWASP review completed (manual review of ASVS, API Security, Agentic AI controls against current code)
 [ ] Fail2ban auth throttle verified (x5 escalation -> permanent IP block)
 [ ] IP allowlist + blocklist configured (IPv4/IPv6/CIDR)
-[ ] NTP verified: NTP service active, clock offset < 100 ms, ≥ 2 servers configured (Section 18)
 ```
 
 ---

@@ -91,7 +91,7 @@ async def delete_pattern(pattern_id: str, session: StepUpAdminSession):
 @router.get("/status")
 async def pipeline_status(session: AdminSession):
     """Return which layers of the sensitivity pipeline are active."""
-    fasttext_available = False
+    sklearn_available = False
     ollama_available = False
 
     pipeline = backoffice_state.inspection_pipeline
@@ -103,16 +103,18 @@ async def pipeline_status(session: AdminSession):
         else:
             ollama_available = getattr(pipeline, '_classifier', None) is not None
 
-    # FastText availability
+    # sklearn availability (v2.23.3 — replaces fasttext-wheel)
     try:
-        from yashigani.inspection.backends.fasttext_backend import FastTextBackend
-        fasttext_available = True
+        from yashigani.inspection.backends.sklearn_backend import SklearnBackend
+        sklearn_available = True
     except Exception:
         pass
 
     return {
         "regex": True,  # always active
-        "fasttext_available": fasttext_available,
+        "sklearn_available": sklearn_available,
+        # Legacy key retained for dashboard.js backward-compat; remove in v2.24.0.
+        "fasttext_available": sklearn_available,
         "ollama_available": ollama_available,
         "pattern_count": len(_patterns),
     }

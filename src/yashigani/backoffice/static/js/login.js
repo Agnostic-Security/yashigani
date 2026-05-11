@@ -1,4 +1,4 @@
-// Last updated: 2026-05-03
+// Last updated: 2026-05-09
 document.addEventListener('DOMContentLoaded', function() {
     var savedPassword = '';
 
@@ -18,7 +18,14 @@ document.addEventListener('DOMContentLoaded', function() {
      *      throws (malformed input).
      *
      * Returns the sanitised path+search+hash on-origin string, or '/' if
-     * the input fails either check.
+     * the input fails either check (including falsy/empty input).
+     *
+     * Call-site contract (BUG-LOGIN-REDIRECT-01 — v2.23.3): callers that need
+     * a different default when there is NO next param (e.g. '/admin/') must
+     * guard the call themselves:
+     *   window.location.href = (next && safeNext(next)) || '/admin/';
+     * This keeps safeNext's return contract uniform: always '/' on rejection,
+     * always the validated path on acceptance.
      *
      * ASVS V5.1.5, OWASP A01:2021, CWE-601.
      */
@@ -86,7 +93,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 } else {
                     var params = new URLSearchParams(window.location.search);
                     var next = params.get('next');
-                    window.location.href = safeNext(next) || '/admin/';
+                    window.location.href = (next && safeNext(next)) || '/admin/';
                 }
             } else {
                 showMsg('error', parseError(data));
