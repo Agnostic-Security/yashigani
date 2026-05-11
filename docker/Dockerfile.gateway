@@ -112,7 +112,15 @@ ENV PYTHONUNBUFFERED=1 \
     # a sitecustomize.py that patches licensing/verifier.py at import time.
     PYTHONNOUSERSITE=1 \
     SKLEARN_MODEL_PATH=/app/models/sensitivity_classifier.joblib \
-    YASHIGANI_SERVICE_NAME=gateway
+    YASHIGANI_SERVICE_NAME=gateway \
+    # P-10 (2026-05-11): clear SVE bit (14) in OpenSSL armcap to skip the
+    # unprotected `cntb` probe in OpenSSL 4.0.0 (cryptography ≥47). Affects
+    # virtualised aarch64 hosts that advertise SVE2 in AT_HWCAP2 but do not
+    # enable SVE at EL0 (Podman applehv on macOS, observed on Fedora CoreOS
+    # 41 6.12.13 guest under macOS 15.7.5). 0x8fd preserves NEON/AES/SHA
+    # acceleration. Belt-and-suspenders against the pyproject `cryptography
+    # <47` pin — protects future bumps past 46.x.
+    OPENSSL_armcap=0x8fd
 
 # Internal mTLS (v2.23.1) — uvicorn terminates TLS and requires every client
 # to present a cert signed by our internal CA. Certs land in /run/secrets via
