@@ -168,18 +168,29 @@ jobs:
         run: |
           # Ensure podman machine is up first (down -v needs the daemon)
           podman machine start 2>/dev/null || true
+          # IMPORTANT: podman-compose creates a `pod_docker` pod that holds the
+          # container-dependency chain. `podman rm -f` on individual containers
+          # fails with "has dependent containers" until the pod is removed first.
+          podman pod rm -af 2>/dev/null || true
           # Project-scoped tear-down: containers, networks, and ANONYMOUS volumes
           podman compose -f docker/docker-compose.yml down --volumes --remove-orphans 2>/dev/null || true
+          # Force-remove any stray containers still around
+          podman rm -f $(podman ps -aq 2>/dev/null) 2>/dev/null || true
           # Named volumes (docker_postgres_data, docker_audit_data, etc.) — these
-          # hold the stale PKI material; remove explicitly. Filter by name prefix
-          # so we never touch volumes from other compose projects on the runner.
+          # hold stale PKI material; remove explicitly. Filter by name prefix so
+          # other compose projects on the runner are untouched.
           for _v in $(podman volume ls -q --filter name=^docker 2>/dev/null); do
             podman volume rm -f "${_v}" 2>/dev/null || true
           done
+          # Networks too — compose recreates them per run but lingering ones
+          # can cause subnet conflicts.
+          for _n in $(podman network ls -q --filter name=^docker_ 2>/dev/null); do
+            podman network rm -f "${_n}" 2>/dev/null || true
+          done
           # Wipe install.sh-generated artefacts in the workspace too (git-ignored
-          # secrets dir + .env carry the same cert-material correlation)
+          # secrets dir + .env carry the same cert-material correlation).
           rm -rf docker/secrets/* docker/.env 2>/dev/null || true
-          echo "Clean-slate verified: containers=$(podman ps -aq | wc -l), volumes=$(podman volume ls -q --filter name=^docker | wc -l)"
+          echo "Clean-slate verified: containers=$(podman ps -aq | wc -l), volumes=$(podman volume ls -q --filter name=^docker | wc -l), networks=$(podman network ls -q --filter name=^docker_ | wc -l), pods=$(podman pod ls -q | wc -l)"
 
       - name: "[macos/podman] Install Podman + init machine"
         if: matrix.os-label == 'macos' && matrix.runtime == 'podman'
@@ -376,6 +387,25 @@ jobs:
           compose_file="${GITHUB_WORKSPACE}/docker/docker-compose.yml"
           [ -f "$compose_file" ] || compose_file="${HOME}/.yashigani/docker/docker-compose.yml"
           ${compose_cmd} -f "${compose_file}" logs --tail=50 2>/dev/null || true
+
+      - name: "[macos/podman] Post-test cleanup (always)"
+        if: always() && matrix.os-label == 'macos' && matrix.runtime == 'podman'
+        run: |
+          # Self-hosted M4 persists podman state across CI runs. Tear down
+          # everything project-scoped after the test cell completes so the
+          # NEXT cell run (and any non-CI work on this Mac) starts clean.
+          # Matches the BEFORE clean-slate step's pod-first ordering.
+          podman pod rm -af 2>/dev/null || true
+          podman compose -f docker/docker-compose.yml down --volumes --remove-orphans --timeout 5 2>/dev/null || true
+          podman rm -f $(podman ps -aq 2>/dev/null) 2>/dev/null || true
+          for _v in $(podman volume ls -q --filter name=^docker 2>/dev/null); do
+            podman volume rm -f "${_v}" 2>/dev/null || true
+          done
+          for _n in $(podman network ls -q --filter name=^docker_ 2>/dev/null); do
+            podman network rm -f "${_n}" 2>/dev/null || true
+          done
+          rm -rf docker/secrets/* docker/.env 2>/dev/null || true
+          echo "Post-test clean: containers=$(podman ps -aq | wc -l), volumes=$(podman volume ls -q --filter name=^docker | wc -l), networks=$(podman network ls -q --filter name=^docker_ | wc -l), pods=$(podman pod ls -q | wc -l)"
 
       - name: "Upload install log"
         if: always()
