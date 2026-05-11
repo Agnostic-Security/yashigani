@@ -169,12 +169,19 @@ jobs:
           # Init and start the Podman machine (VM-backed on macOS)
           podman machine init --cpus 2 --memory 4096 --disk-size 20 ysg-smoke || true
           podman machine start ysg-smoke
-          # Give the SSH tunnel a moment to settle before issuing `podman info`
-          # (same pattern as Colima's `sleep 5` — the machine reports "started
-          # successfully" before the SSH daemon is accepting connections).
-          sleep 8
-          # Confirm connectivity
-          podman info
+          # Poll until `podman info` succeeds — the machine reports "started
+          # successfully" before the SSH daemon finishes initialising.
+          # Cap at 60 s (tested: typically ready in 15–20 s on M4).
+          _deadline=$(( $(date +%s) + 60 ))
+          until podman info >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "$_deadline" ]; then
+              echo "ERROR: Podman machine not ready after 60 s"
+              podman info   # run once more to surface the actual error
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "Podman machine ready"
           podman-compose version
 
       # -----------------------------------------------------------------------
