@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-12T00:00:00+01:00 (fix(install): write agent-bundle token placeholders before PKI chown — INSTALLER-BUG-AGENT-TOKENS)
 # last-updated: 2026-05-11T12:00:00+01:00 (refactor(pki): split _pki_run_issuer into per-runtime functions — _pki_run_issuer_docker / _pki_run_issuer_podman_linux / _pki_run_issuer_podman_macos; podman cp pattern for macOS applehv)
 # last-updated: 2026-05-11T00:30:00+01:00 (fix: macOS+Docker Colima virtiofs — skip host-UID chown assertions in check_installer_preflight + compose_up; YSG_OS==macos gated)
 # last-updated: 2026-05-10T21:30:00+01:00 (fix: _pki_chown_client_keys || return 1 at both call sites — fail-closed on chown failure, not silent continue)
@@ -3135,13 +3136,21 @@ compose_up() {
   sync 2>/dev/null || true
   sleep 2
 
-  # Ensure agent bundle token files exist if profiles are selected
+  # Ensure agent bundle token files exist if profiles are selected.
+  # Primary write is now in step 8d (main body, before _prepare_secrets_dir_for_pki).
+  # This loop is a safety-net for upgrade paths where token files may be missing.
+  # INSTALLER-BUG-AGENT-TOKENS: writes here are non-fatal — on Podman rootless
+  # the secrets_dir is already chowned to UID 1001 by this point (PKI ran), so
+  # host-user writes may fail with EACCES. The primary write above (step 8d)
+  # already created the file; a failure here is safe to warn-and-continue.
   for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
-    if [[ -n "$_profile" ]]; then
-      local _token_file="${secrets_dir}/${_profile}_token"
-      if [[ ! -s "$_token_file" ]]; then
-        echo "# placeholder — auto-generated at first bootstrap" > "$_token_file"
-        chmod 600 "$_token_file"
+    [[ -z "$_profile" ]] && continue
+    local _token_file="${secrets_dir}/${_profile}_token"
+    if [[ ! -s "$_token_file" ]]; then
+      if ! echo "# placeholder — auto-generated at first bootstrap" > "$_token_file" 2>/dev/null; then
+        log_warn "Could not create token placeholder ${_profile}_token (secrets_dir owned by PKI UID — expected for Podman rootless; step 8d should have written this)"
+      else
+        chmod 600 "$_token_file" 2>/dev/null || true
         log_info "Created token placeholder: ${_profile}_token"
       fi
     fi
@@ -6151,6 +6160,28 @@ main() {
           ;;
       esac
     fi
+
+    # Step 8d: Write agent-bundle token placeholders NOW — while the installer
+    # still owns docker/secrets/ (before _prepare_secrets_dir_for_pki chowns it
+    # to UID 1001 for the PKI issuer container). INSTALLER-BUG-AGENT-TOKENS:
+    # previously these writes lived inside compose_up() which runs AFTER the
+    # chown; on Podman rootless the host user can no longer write to the
+    # subuid-remapped directory and the installer died with EACCES.
+    # Covers every profile that may have been added in steps 8/8b/8c
+    # (langflow, letta, openclaw, openwebui, wazuh, ...).
+    local _tok_secrets_dir="${WORK_DIR}/docker/secrets"
+    for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+      [[ -z "$_profile" ]] && continue
+      local _tok_file="${_tok_secrets_dir}/${_profile}_token"
+      if [[ ! -s "$_tok_file" ]]; then
+        if ! echo "# placeholder — auto-generated at first bootstrap" > "$_tok_file" 2>/dev/null; then
+          log_warn "Could not create token placeholder ${_profile}_token (secrets_dir may be stale-owned — compose_up safety-net will retry)"
+        else
+          chmod 600 "$_tok_file" 2>/dev/null || true
+          log_info "Created token placeholder: ${_profile}_token"
+        fi
+      fi
+    done
 
     # Step 9: docker compose pull — OR air-gap bundle load
     if [[ "$AIR_GAP" == "true" ]]; then
