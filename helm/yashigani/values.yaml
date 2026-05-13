@@ -789,6 +789,100 @@ agentBundles:
     tokenSecretName: "yashigani-openclaw-token"
     tokenSecretKey: "token"
 
+  # Langflow — Visual multi-agent workflow builder (MIT)
+  # https://github.com/langflow-ai/langflow
+  # Single container, embedded SQLite. OpenAI-compatible API on port 7860.
+  # Users build custom agent workflows visually via the Langflow UI.
+  # All LLM calls route through Yashigani gateway (OpenAI-compatible).
+  langflow:
+    enabled: false
+    image:
+      # Pinned to 1.9.2 to match docker-compose.yml.
+      # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
+      repository: docker.io/langflowai/langflow
+      tag: "1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    env:
+      # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
+      OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
+      OPENAI_API_KEY: "yashigani-internal"
+      LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
+      DO_NOT_TRACK: "true"
+      LANGFLOW_AUTO_LOGIN: "true"
+    service:
+      port: 7860
+      type: ClusterIP
+    # YSG-RISK-005 #3av: requests = 50% of limit.
+    # Langflow is heavier than letta (visual UI + workflow engine): 1 GiB limit.
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1024Mi"
+    # Persistent volume for Langflow SQLite DB and flow data.
+    persistence:
+      enabled: true
+      mountPath: /app/langflow
+      size: 5Gi
+      storageClass: ""
+      accessMode: ReadWriteOnce
+    tokenSecretName: "yashigani-langflow-token"
+    tokenSecretKey: "token"
+
+  # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
+  # https://github.com/letta-ai/letta
+  # Agent with long-term memory, tool use, and conversation persistence.
+  # Exposes REST API on port 8283. Uses shared Postgres (separate `letta` DB).
+  # Dependency: Postgres must be available and the `letta` database must exist.
+  # The install.sh installer creates the `letta` database; for K8s deployments
+  # run `CREATE DATABASE letta OWNER yashigani_app;` before enabling this bundle.
+  letta:
+    enabled: false
+    image:
+      # Pinned to 0.16.7 to match docker-compose.yml.
+      # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
+      repository: docker.io/letta/letta
+      tag: "0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    env:
+      # Route LLM calls through Yashigani gateway
+      OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
+      OPENAI_API_KEY: "yashigani-internal"
+      LETTA_LLM_MODEL: "qwen2.5:3b"
+      LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
+    # Letta connects to Postgres. The URI is assembled from the postgres secret.
+    # Secret must contain a `postgres_password` key (same secret as Yashigani core).
+    # Resulting env: LETTA_PG_URI=postgresql://yashigani_app:<pw>@yashigani-pgbouncer:5432/letta
+    dbPasswordSecretName: "yashigani-postgres-secrets"
+    dbPasswordSecretKey: "postgres_password"
+    # K8s service hostname for pgbouncer (used to build LETTA_PG_URI).
+    # Must match the pgbouncer service name rendered by the chart.
+    pgbouncerServiceName: "yashigani-pgbouncer"
+    service:
+      port: 8283
+      type: ClusterIP
+    # YSG-RISK-005 #3av: requests = 50% of limit.
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1024Mi"
+    # Persistent volume for Letta agent memory store.
+    persistence:
+      enabled: true
+      mountPath: /root/.letta
+      size: 5Gi
+      storageClass: ""
+      accessMode: ReadWriteOnce
+    tokenSecretName: "yashigani-letta-token"
+    tokenSecretKey: "token"
+
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
 # Image pulled unmodified from ghcr.io/open-webui/open-webui (upstream).
