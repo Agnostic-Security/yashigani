@@ -4701,7 +4701,7 @@ print_completion_summary() {
   # --- Next steps ---
   printf "  ${C_BOLD}Next steps:${C_RESET}\n"
   printf "    1. Save ALL credentials above in a password manager\n"
-  printf "    2. Scan the TOTP QR URIs into your authenticator app (Google Authenticator, Authy, 1Password)\n"
+  printf "    2. Scan the TOTP QR URIs into a SHA-256-compatible authenticator app (Authy, 1Password, Aegis).\n       Note: Google Authenticator may not work on iOS or older Android — Yashigani uses HMAC-SHA-256\n       per the SHA-256 minimum policy. Apps that ignore the algorithm parameter default to SHA-1\n       and will silently produce wrong codes.\n"
   printf "    3. Log in to the backoffice as '%s' and change the default password\n" "${GEN_ADMIN1_USERNAME}"
   printf "    4. Store '%s' credentials in a safe/vault (break-glass backup)\n" "${GEN_ADMIN2_USERNAME}"
   printf "    5. Register your first AI agent\n"
