@@ -59,7 +59,11 @@ spec:
         app.kubernetes.io/component: agent-bundle
     spec:
       securityContext:
+        {{- if hasKey $bundle "podSecurityContext" }}
+        {{- toYaml $bundle.podSecurityContext | nindent 8 }}
+        {{- else }}
         runAsNonRoot: true
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -67,10 +71,14 @@ spec:
           image: "{{ $bundle.image.repository }}:{{ $bundle.image.tag | default "latest" }}"
           imagePullPolicy: {{ $bundle.image.pullPolicy | default "IfNotPresent" }}
           securityContext:
+            {{- if hasKey $bundle "containerSecurityContext" }}
+            {{- toYaml $bundle.containerSecurityContext | nindent 12 }}
+            {{- else }}
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
             capabilities:
               drop: ["ALL"]
+            {{- end }}
           env:
             {{- range $key, $value := $bundle.env }}
             - name: {{ $key }}

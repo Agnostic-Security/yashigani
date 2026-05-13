@@ -831,6 +831,18 @@ agentBundles:
       accessMode: ReadWriteOnce
     tokenSecretName: "yashigani-langflow-token"
     tokenSecretKey: "token"
+    # Langflow image (1.9.2) runs as uid=1000 with named user "user" (non-numeric).
+    # K8s runAsNonRoot rejects non-numeric USER directives without runAsUser set.
+    # Fix: explicit runAsUser: 1000 so K8s can verify non-root. Risk: LOW (image
+    # is non-root by design; UID matches upstream image USER directive).
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop: ["ALL"]
 
   # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
   # https://github.com/letta-ai/letta
@@ -882,6 +894,20 @@ agentBundles:
       accessMode: ReadWriteOnce
     tokenSecretName: "yashigani-letta-token"
     tokenSecretKey: "token"
+    # Letta image (0.16.7) runs as uid=0 (root). Upstream requires root for
+    # /root/.letta persistence path. runAsNonRoot must be false for this bundle.
+    # Compensating controls: seccomp RuntimeDefault, CAP_ALL dropped,
+    # allowPrivilegeEscalation: false, network policy restricts egress to gateway
+    # + pgbouncer only. Risk: YSG-RISK-005 (agent bundle third-party).
+    # Re-evaluate if letta ships a non-root image variant.
+    podSecurityContext:
+      runAsNonRoot: false
+      runAsUser: 0
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop: ["ALL"]
 
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
