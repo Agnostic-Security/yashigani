@@ -3833,7 +3833,8 @@ _ctx.load_cert_chain(
 user = read_secret("admin1_username")
 pw = read_secret("admin1_password")
 totp_secret = read_secret("admin1_totp_secret")
-if not all([user, pw, totp_secret]):
+caddy_hmac = read_secret("caddy_internal_hmac")
+if not all([user, pw, totp_secret, caddy_hmac]):
     print("ERROR:missing_secrets", file=sys.stderr)
     sys.exit(1)
 
@@ -3841,10 +3842,11 @@ if not all([user, pw, totp_secret]):
 import pyotp, hashlib
 totp_code = pyotp.TOTP(totp_secret, digest=hashlib.sha256).now()
 
-# Login
+# Login — Layer B: X-Caddy-Verified-Secret required on every direct backoffice call
 login_data = json.dumps({"username": user, "password": pw, "totp_code": totp_code}).encode()
 req = urllib.request.Request("https://localhost:8443/auth/login", data=login_data,
-                             headers={"Content-Type": "application/json"})
+                             headers={"Content-Type": "application/json",
+                                      "X-Caddy-Verified-Secret": caddy_hmac})
 try:
     resp = urllib.request.urlopen(req, context=_ctx)
 except Exception as e:
@@ -3863,6 +3865,22 @@ if not session:
     print("ERROR:no_session_cookie", file=sys.stderr)
     sys.exit(1)
 
+# Step-up — POST /admin/agents requires StepUpAdminSession (assert_fresh_stepup).
+# A single stepup covers all agent registrations within the 300 s TTL.
+# Use a fresh TOTP code (same secret; step-up endpoint accepts current window).
+stepup_code = pyotp.TOTP(totp_secret, digest=hashlib.sha256).now()
+stepup_data = json.dumps({"totp_code": stepup_code}).encode()
+req = urllib.request.Request("https://localhost:8443/auth/stepup", data=stepup_data,
+                             headers={"Content-Type": "application/json",
+                                      "X-Caddy-Verified-Secret": caddy_hmac,
+                                      "Cookie": f"__Host-yashigani_admin_session={session}"})
+try:
+    urllib.request.urlopen(req, context=_ctx)
+except Exception as e:
+    print(f"WARNING:stepup_failed:{e}", file=sys.stderr)
+    # warn-and-continue: agent registration will likely fail with step_up_required,
+    # but we do not hard-fail the installer here
+
 # Register agents
 agents = json.loads(os.environ.get("AGENTS_JSON", "[]"))
 results = []
@@ -3870,7 +3888,8 @@ for agent in agents:
     reg_data = json.dumps({"name": agent["name"], "upstream_url": agent["url"], "protocol": agent.get("protocol", "openai")}).encode()
     req = urllib.request.Request("https://localhost:8443/admin/agents", data=reg_data,
                                  headers={"Content-Type": "application/json",
-                                           "Cookie": f"__Host-yashigani_admin_session={session}"})
+                                          "X-Caddy-Verified-Secret": caddy_hmac,
+                                          "Cookie": f"__Host-yashigani_admin_session={session}"})
     try:
         resp = urllib.request.urlopen(req, context=_ctx)
         body = json.loads(resp.read())
