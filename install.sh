@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-13T13:00:00+00:00 (fix(podman): always apply :U-bearing override on macOS Podman — MACOS-PODMAN-OVERRIDE-LOAD-GAP)
 # last-updated: 2026-05-13T00:00:00+00:00 (fix(podman): add :U to all secret bind-mounts and ephemeral chown — MACOS-PODMAN-PKI-VIRTIOFS-U)
 # last-updated: 2026-05-12T00:00:00+01:00 (fix(install): write agent-bundle token placeholders before PKI chown — INSTALLER-BUG-AGENT-TOKENS)
 # last-updated: 2026-05-11T12:00:00+01:00 (refactor(pki): split _pki_run_issuer into per-runtime functions — _pki_run_issuer_docker / _pki_run_issuer_podman_linux / _pki_run_issuer_podman_macos; podman cp pattern for macOS applehv)
@@ -2926,20 +2927,41 @@ compose_up() {
       fi
     fi
 
-    # 4. Use podman-compose if available (sequential, no socket crashes)
-    #    Don't apply podman-override.yml with podman-compose (userns conflicts with pods)
-    if command -v podman-compose >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman-compose")
-      log_info "Using podman-compose (native, sequential)"
-      # No override needed — podman-compose handles rootless natively
+    # 4. Apply the Podman rootless override unconditionally on macOS.
+    #    COMPOSE_CMD was already resolved by resolve_compose_cmd() above.
+    #
+    #    MACOS-PODMAN-OVERRIDE-LOAD-GAP fix (2026-05-13):
+    #    The prior logic gated the override on `command -v podman-compose` being
+    #    absent — i.e. it only loaded the override when using `podman compose`
+    #    (built-in). On Homebrew macOS, `podman-compose` (the Python wrapper) IS
+    #    in PATH, so the condition was TRUE and the override was silently skipped.
+    #    Result: the :U bind-mount flag added by PR #135 was a no-op for any user
+    #    with `brew install podman-compose`, causing `statfs: operation not permitted`
+    #    on every virtiofs secret bind-mount.
+    #
+    #    The :U flag is a Podman-runtime concern (instructs podman to lchown the
+    #    host-side mount source to the container UID's subuid mapping before the
+    #    mount). It is independent of which compose binary is used:
+    #      - podman-compose 1.5.0 (Python): natively parses :U as a propagation
+    #        option and passes it to `podman run -v src:dst:U,...` — verified by
+    #        source inspection (propagation_re includes U, mount_desc_to_volume_args
+    #        emits it). Config output confirmed to preserve the flag.
+    #      - podman compose (built-in): delegates directly to podman run; :U works.
+    #    The override is NEVER loaded on the Docker path (YSG_PODMAN_RUNTIME guard
+    #    above), so applying it here is safe for all supported runtimes.
+    #
+    #    Ava Track B v6 anomaly: v6 succeeded without the override because the
+    #    install directory (yashigani-v6-userflow) had its docker/secrets already
+    #    subuid-chowned by a prior run. The nuke step purges containers + volumes
+    #    but does NOT wipe the bind-mount source directories. A true clean-state
+    #    install (new directory) always needs the override.
+    log_info "Using ${COMPOSE_CMD[*]} with rootless override"
+    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
+    if [[ -f "$podman_override" ]]; then
+      compose_files+=("-f" "$podman_override")
+      log_info "Applying Podman rootless override (:U mounts + security_opt)"
     else
-      # Fall back to podman compose (delegates to docker-compose)
-      # Apply override for security_opt only (no userns_mode)
-      local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
-      if [[ -f "$podman_override" ]]; then
-        compose_files+=("-f" "$podman_override")
-        log_info "Using podman compose with rootless override"
-      fi
+      log_warn "Podman rootless override not found at ${podman_override} — :U mounts will not apply"
     fi
 
     # 5. Build images with podman build (compose build uses Docker buildx)
