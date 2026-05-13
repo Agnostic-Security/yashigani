@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-09T12:00:00+01:00 -->
+<!-- last-updated: 2026-05-13T00:00:00+01:00 — v2.23.4 CSP-INLINE-STYLE-SPA -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,7 +9,7 @@
 </head>
 <body>
     <nav>
-        <div style="display:flex; align-items:center; gap:24px;">
+        <div class="nav-brand">
             <h1>Yashigani</h1>
             <div class="nav-links" id="nav-links">
                 <button class="active" data-action="showPage" data-param="dashboard">Dashboard</button>
@@ -36,15 +36,15 @@
         <!-- Dashboard Page -->
         <div class="page active" id="page-dashboard">
             <!-- First-run onboarding checklist -->
-            <div id="onboarding-checklist" style="display:none;margin-bottom:20px;padding:16px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;">
-                <h3 style="margin:0 0 12px;font-size:1rem;color:#1e40af;">Getting Started</h3>
-                <div style="display:flex;flex-direction:column;gap:6px;font-size:0.85rem;">
-                    <label id="ob-password" style="color:#64748b;"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" style="color:#64748b;"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" style="color:#64748b;"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" style="color:#64748b;"><input type="checkbox" disabled> Set up alert webhooks</label>
+            <div id="onboarding-checklist" class="onboarding">
+                <h3 class="onboarding-title">Getting Started</h3>
+                <div class="onboarding-items">
+                    <label id="ob-password" class="onboarding-lbl"><input type="checkbox" disabled> Change default password</label>
+                    <label id="ob-agent" class="onboarding-lbl"><input type="checkbox" disabled> Register your first agent</label>
+                    <label id="ob-budget" class="onboarding-lbl"><input type="checkbox" disabled> Configure budget allocation</label>
+                    <label id="ob-alerts" class="onboarding-lbl"><input type="checkbox" disabled> Set up alert webhooks</label>
                 </div>
-                <button data-action="dismissOnboarding" style="margin-top:10px;padding:4px 12px;background:transparent;border:1px solid #93c5fd;border-radius:4px;cursor:pointer;font-size:0.8rem;color:#3b82f6;">Dismiss</button>
+                <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
             </div>
 
             <h2>System Health</h2>
@@ -62,23 +62,23 @@
         <div class="page" id="page-agents">
             <h2>Registered Agents</h2>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Agents</span>
-                    <button data-action="toggleForm" data-form-id="register-agent-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Register Agent</button>
+                    <button data-action="toggleForm" data-form-id="register-agent-form" class="btn-xs-add">+ Register Agent</button>
                 </div>
-                <div id="register-agent-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Name</label><br><input id="agent-name" type="text" placeholder="my-agent" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:150px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Upstream URL</label><br><input id="agent-url" type="text" placeholder="http://agent:8000" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:250px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Protocol</label><br><select id="agent-protocol" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="openai">openai</option><option value="letta">letta</option><option value="langflow">langflow</option></select></div>
+                <div id="register-agent-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Name</label><br><input id="agent-name" type="text" placeholder="my-agent" class="fi w-150"></div>
+                        <div><label class="lbl">Upstream URL</label><br><input id="agent-url" type="text" placeholder="http://agent:8000" class="fi w-250"></div>
+                        <div><label class="lbl">Protocol</label><br><select id="agent-protocol" class="fi"><option value="openai">openai</option><option value="letta">letta</option><option value="langflow">langflow</option></select></div>
                     </div>
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:8px;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Groups (comma-separated)</label><br><input id="agent-groups" type="text" placeholder="default,engineering" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:200px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Allowed caller groups</label><br><input id="agent-caller-groups" type="text" placeholder="admins,operators" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:200px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Allowed CIDRs</label><br><input id="agent-cidrs" type="text" placeholder="10.0.0.0/8" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:160px"></div>
-                        <button data-action="registerAgent" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Register</button>
+                    <div class="form-row--mt">
+                        <div><label class="lbl">Groups (comma-separated)</label><br><input id="agent-groups" type="text" placeholder="default,engineering" class="fi w-200"></div>
+                        <div><label class="lbl">Allowed caller groups</label><br><input id="agent-caller-groups" type="text" placeholder="admins,operators" class="fi w-200"></div>
+                        <div><label class="lbl">Allowed CIDRs</label><br><input id="agent-cidrs" type="text" placeholder="10.0.0.0/8" class="fi w-160"></div>
+                        <button data-action="registerAgent" class="btn-sm-save">Register</button>
                     </div>
-                    <div id="register-agent-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="register-agent-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Name</th><th>Agent ID</th><th>Upstream URL</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
@@ -87,13 +87,13 @@
             </div>
 
             <!-- Agent token display (shown once after registration/rotation) -->
-            <div id="agent-token-panel" style="display:none;margin-top:16px;" class="panel">
-                <div class="panel-header" style="background:#fefce8;color:#a16207;">Agent Token (shown once — copy now)</div>
+            <div id="agent-token-panel" class="once-panel panel">
+                <div class="panel-header-warn">Agent Token (shown once — copy now)</div>
                 <div class="panel-body">
-                    <p style="font-size:0.85rem;margin-bottom:8px;"><strong>Agent:</strong> <code id="agent-token-name"></code></p>
-                    <p style="font-size:0.85rem;margin-bottom:8px;"><strong>Token:</strong> <code id="agent-token-value" style="user-select:all;background:#f1f5f9;padding:2px 6px;border-radius:3px;word-break:break-all"></code></p>
-                    <p style="font-size:0.75rem;color:#64748b;margin-top:8px;">This token is never stored and cannot be retrieved. If lost, rotate to generate a new one.</p>
-                    <button data-action="dismissAgentToken" style="margin-top:8px;padding:6px 16px;background:#64748b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Dismiss</button>
+                    <p class="cred-line"><strong>Agent:</strong> <code id="agent-token-name"></code></p>
+                    <p class="cred-line"><strong>Token:</strong> <code id="agent-token-value" class="agent-token-val"></code></p>
+                    <p class="cred-line-sm">This token is never stored and cannot be retrieved. If lost, rotate to generate a new one.</p>
+                    <button data-action="dismissAgentToken" class="btn-dismiss">Dismiss</button>
                 </div>
             </div>
         </div>
@@ -102,16 +102,16 @@
         <div class="page" id="page-accounts">
             <h2>Admin Accounts</h2>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Administrators</span>
-                    <button data-action="toggleForm" data-form-id="create-admin-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add Admin</button>
+                    <button data-action="toggleForm" data-form-id="create-admin-form" class="btn-xs-add">+ Add Admin</button>
                 </div>
-                <div id="create-admin-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Email</label><br><input id="new-admin-email" type="email" placeholder="admin@example.com" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:280px"></div>
-                        <button data-action="createAdmin" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Create</button>
+                <div id="create-admin-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Email</label><br><input id="new-admin-email" type="email" placeholder="admin@example.com" class="fi w-280"></div>
+                        <button data-action="createAdmin" class="btn-sm-save">Create</button>
                     </div>
-                    <div id="create-admin-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="create-admin-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
@@ -119,19 +119,19 @@
                 </table>
             </div>
 
-            <h2 style="margin-top:24px">User Accounts</h2>
+            <h2 class="h2-mt">User Accounts</h2>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Users (non-admin)</span>
-                    <button data-action="toggleForm" data-form-id="create-user-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add User</button>
+                    <button data-action="toggleForm" data-form-id="create-user-form" class="btn-xs-add">+ Add User</button>
                 </div>
-                <div id="create-user-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Username</label><br><input id="new-user-name" type="text" placeholder="username" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:180px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Email</label><br><input id="new-user-email" type="email" placeholder="user@example.com" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:220px"></div>
-                        <button data-action="createUser" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Create</button>
+                <div id="create-user-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Username</label><br><input id="new-user-name" type="text" placeholder="username" class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="new-user-email" type="email" placeholder="user@example.com" class="fi w-220"></div>
+                        <button data-action="createUser" class="btn-sm-save">Create</button>
                     </div>
-                    <div id="create-user-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="create-user-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
@@ -140,15 +140,15 @@
             </div>
 
             <!-- Credentials display (shown once after creation) -->
-            <div id="credentials-panel" style="display:none;margin-top:16px;" class="panel">
-                <div class="panel-header" style="background:#f0fdf4;color:#166534;">New Account Credentials (shown once — copy now)</div>
+            <div id="credentials-panel" class="once-panel panel">
+                <div class="panel-header-success">New Account Credentials (shown once — copy now)</div>
                 <div class="panel-body">
-                    <p style="font-size:0.85rem;margin-bottom:8px;"><strong>Username:</strong> <code id="cred-username"></code></p>
-                    <p style="font-size:0.85rem;margin-bottom:8px;"><strong>Temporary Password:</strong> <code id="cred-password" style="user-select:all;background:#f1f5f9;padding:2px 6px;border-radius:3px"></code></p>
-                    <p style="font-size:0.85rem;margin-bottom:8px;"><strong>TOTP Secret:</strong> <code id="cred-totp" style="user-select:all;background:#f1f5f9;padding:2px 6px;border-radius:3px"></code></p>
-                    <p style="font-size:0.85rem;margin-bottom:8px;"><strong>TOTP URI:</strong> <code id="cred-totp-uri" style="user-select:all;background:#f1f5f9;padding:2px 6px;border-radius:3px;font-size:0.7rem;word-break:break-all"></code></p>
-                    <p style="font-size:0.75rem;color:#64748b;margin-top:12px;">Share these credentials securely with the user. They must change their password at first login.</p>
-                    <button data-action="dismissCredentials" style="margin-top:8px;padding:6px 16px;background:#64748b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Dismiss</button>
+                    <p class="cred-line"><strong>Username:</strong> <code id="cred-username"></code></p>
+                    <p class="cred-line"><strong>Temporary Password:</strong> <code id="cred-password" class="cred-code"></code></p>
+                    <p class="cred-line"><strong>TOTP Secret:</strong> <code id="cred-totp" class="cred-code"></code></p>
+                    <p class="cred-line"><strong>TOTP URI:</strong> <code id="cred-totp-uri" class="cred-code-uri"></code></p>
+                    <p class="cred-line-note">Share these credentials securely with the user. They must change their password at first login.</p>
+                    <button data-action="dismissCredentials" class="btn-dismiss">Dismiss</button>
                 </div>
             </div>
         </div>
@@ -164,45 +164,45 @@
                         <tr><td><span class="badge badge-red">P1</span></td><td>OPA override, sensitivity breach, resources exhausted</td><td>Immediate</td></tr>
                         <tr><td><span class="badge badge-yellow">P2</span></td><td>Classification conflict, 3+ replacements/hr, spending anomaly</td><td>1 hour</td></tr>
                         <tr><td><span class="badge badge-blue">P3</span></td><td>Budget exhausted, identity degraded to local</td><td>Business day</td></tr>
-                        <tr><td><span class="badge" style="background:#f1f5f9;color:#475569;">P4</span></td><td>Routing drift, model degradation</td><td>Week</td></tr>
-                        <tr><td><span class="badge" style="background:#f8fafc;color:#94a3b8;">P5</span></td><td>Container replaced, budget warning, routine rotation</td><td>Informational</td></tr>
+                        <tr><td><span class="badge badge-p4">P4</span></td><td>Routing drift, model degradation</td><td>Week</td></tr>
+                        <tr><td><span class="badge badge-p5">P5</span></td><td>Container replaced, budget warning, routine rotation</td><td>Informational</td></tr>
                     </tbody>
                 </table>
             </div>
-            <div class="panel" style="margin-top:16px;">
+            <div class="panel">
                 <div class="panel-header">Webhook Configuration</div>
                 <div class="panel-body">
-                    <div style="display:flex;flex-direction:column;gap:12px;max-width:600px;">
+                    <div class="form-row--col">
                         <div>
-                            <label style="font-size:0.75rem;color:#64748b;display:block;margin-bottom:4px">Slack Webhook URL</label>
-                            <input id="alert-slack-url" type="url" placeholder="https://hooks.slack.com/services/..." style="padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:100%">
-                        </div>
-                        <div>
-                            <label style="font-size:0.75rem;color:#64748b;display:block;margin-bottom:4px">Microsoft Teams Webhook URL</label>
-                            <input id="alert-teams-url" type="url" placeholder="https://outlook.office.com/webhook/..." style="padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:100%">
+                            <label class="lbl-block">Slack Webhook URL</label>
+                            <input id="alert-slack-url" type="url" placeholder="https://hooks.slack.com/services/..." class="fi-url">
                         </div>
                         <div>
-                            <label style="font-size:0.75rem;color:#64748b;display:block;margin-bottom:4px">PagerDuty Integration Key</label>
-                            <input id="alert-pagerduty-key" type="text" placeholder="32-character integration key" style="padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:100%">
+                            <label class="lbl-block">Microsoft Teams Webhook URL</label>
+                            <input id="alert-teams-url" type="url" placeholder="https://outlook.office.com/webhook/..." class="fi-url">
                         </div>
-                        <div style="display:flex;gap:8px;margin-top:8px;">
-                            <button data-action="saveAlertConfig" style="padding:8px 20px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Save Configuration</button>
-                            <button data-action="testAlertWebhook" data-sink="slack" style="padding:8px 16px;background:#f59e0b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Test Slack</button>
-                            <button data-action="testAlertWebhook" data-sink="teams" style="padding:8px 16px;background:#f59e0b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Test Teams</button>
-                            <button data-action="testAlertWebhook" data-sink="pagerduty" style="padding:8px 16px;background:#f59e0b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Test PagerDuty</button>
+                        <div>
+                            <label class="lbl-block">PagerDuty Integration Key</label>
+                            <input id="alert-pagerduty-key" type="text" placeholder="32-character integration key" class="fi-url">
                         </div>
-                        <div id="alert-config-result" style="font-size:0.8rem;margin-top:4px;"></div>
+                        <div class="form-row--gap12">
+                            <button data-action="saveAlertConfig" class="btn-md-primary">Save Configuration</button>
+                            <button data-action="testAlertWebhook" data-sink="slack" class="btn-sm-amber">Test Slack</button>
+                            <button data-action="testAlertWebhook" data-sink="teams" class="btn-sm-amber">Test Teams</button>
+                            <button data-action="testAlertWebhook" data-sink="pagerduty" class="btn-sm-amber">Test PagerDuty</button>
+                        </div>
+                        <div id="alert-config-result" class="alert-config-result"></div>
                     </div>
                 </div>
             </div>
-            <div class="panel" style="margin-top:16px;">
+            <div class="panel">
                 <div class="panel-header">Alert Triggers</div>
                 <div class="panel-body">
-                    <div style="display:flex;flex-direction:column;gap:8px;">
-                        <label style="font-size:0.85rem"><input type="checkbox" id="alert-trigger-exfil" checked> Alert on credential exfiltration attempt</label>
-                        <label style="font-size:0.85rem"><input type="checkbox" id="alert-trigger-anomaly" checked> Alert on anomaly threshold breach</label>
-                        <label style="font-size:0.85rem"><input type="checkbox" id="alert-trigger-budget"> Alert on budget exhaustion</label>
-                        <label style="font-size:0.85rem"><input type="checkbox" id="alert-trigger-injection" checked> Alert on prompt injection detection</label>
+                    <div class="form-row--col-sm">
+                        <label class="alert-trigger-lbl"><input type="checkbox" id="alert-trigger-exfil" checked> Alert on credential exfiltration attempt</label>
+                        <label class="alert-trigger-lbl"><input type="checkbox" id="alert-trigger-anomaly" checked> Alert on anomaly threshold breach</label>
+                        <label class="alert-trigger-lbl"><input type="checkbox" id="alert-trigger-budget"> Alert on budget exhaustion</label>
+                        <label class="alert-trigger-lbl"><input type="checkbox" id="alert-trigger-injection" checked> Alert on prompt injection detection</label>
                     </div>
                 </div>
             </div>
@@ -226,19 +226,19 @@
                 </div>
             </div>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Organisation Cloud Caps</span>
-                    <button data-action="toggleForm" data-form-id="add-orgcap-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add Cap</button>
+                    <button data-action="toggleForm" data-form-id="add-orgcap-form" class="btn-xs-add">+ Add Cap</button>
                 </div>
-                <div id="add-orgcap-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Org ID</label><br><input id="orgcap-org" type="text" value="default" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:120px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Provider</label><br><select id="orgcap-provider" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option><option value="*">* (all)</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Token Cap</label><br><input id="orgcap-tokens" type="number" min="1" value="1000000" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:140px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Period</label><br><select id="orgcap-period" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
-                        <button data-action="addOrgCap" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Save</button>
+                <div id="add-orgcap-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Org ID</label><br><input id="orgcap-org" type="text" value="default" class="fi w-120"></div>
+                        <div><label class="lbl">Provider</label><br><select id="orgcap-provider" class="fi"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option><option value="*">* (all)</option></select></div>
+                        <div><label class="lbl">Token Cap</label><br><input id="orgcap-tokens" type="number" min="1" value="1000000" class="fi w-140"></div>
+                        <div><label class="lbl">Period</label><br><select id="orgcap-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
+                        <button data-action="addOrgCap" class="btn-sm-save">Save</button>
                     </div>
-                    <div id="orgcap-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="orgcap-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Provider</th><th>Token Cap</th><th>Period</th></tr></thead>
@@ -246,19 +246,19 @@
                 </table>
             </div>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Group Budgets</span>
-                    <button data-action="toggleForm" data-form-id="add-group-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add Group</button>
+                    <button data-action="toggleForm" data-form-id="add-group-form" class="btn-xs-add">+ Add Group</button>
                 </div>
-                <div id="add-group-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Group ID</label><br><input id="group-id" type="text" placeholder="engineering" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:150px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Provider</label><br><select id="group-provider" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Token Budget</label><br><input id="group-tokens" type="number" min="1" value="500000" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:140px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Period</label><br><select id="group-period" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
-                        <button data-action="addGroupBudget" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Save</button>
+                <div id="add-group-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Group ID</label><br><input id="group-id" type="text" placeholder="engineering" class="fi w-150"></div>
+                        <div><label class="lbl">Provider</label><br><select id="group-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
+                        <div><label class="lbl">Token Budget</label><br><input id="group-tokens" type="number" min="1" value="500000" class="fi w-140"></div>
+                        <div><label class="lbl">Period</label><br><select id="group-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
+                        <button data-action="addGroupBudget" class="btn-sm-save">Save</button>
                     </div>
-                    <div id="group-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="group-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Group</th><th>Provider</th><th>Budget</th><th>Period</th></tr></thead>
@@ -266,19 +266,19 @@
                 </table>
             </div>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Individual Budgets</span>
-                    <button data-action="toggleForm" data-form-id="add-ind-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add Individual</button>
+                    <button data-action="toggleForm" data-form-id="add-ind-form" class="btn-xs-add">+ Add Individual</button>
                 </div>
-                <div id="add-ind-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Identity ID</label><br><input id="ind-id" type="text" placeholder="user@example.com" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:200px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Provider</label><br><select id="ind-provider" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Token Budget</label><br><input id="ind-tokens" type="number" min="1" value="100000" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:140px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Period</label><br><select id="ind-period" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
-                        <button data-action="addIndBudget" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Save</button>
+                <div id="add-ind-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Identity ID</label><br><input id="ind-id" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">Provider</label><br><select id="ind-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
+                        <div><label class="lbl">Token Budget</label><br><input id="ind-tokens" type="number" min="1" value="100000" class="fi w-140"></div>
+                        <div><label class="lbl">Period</label><br><select id="ind-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
+                        <button data-action="addIndBudget" class="btn-sm-save">Save</button>
                     </div>
-                    <div id="ind-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="ind-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Identity</th><th>Provider</th><th>Budget</th><th>Period</th></tr></thead>
@@ -298,19 +298,19 @@
                 </table>
             </div>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Model Aliases</span>
-                    <button data-action="toggleForm" data-form-id="add-alias-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add Alias</button>
+                    <button data-action="toggleForm" data-form-id="add-alias-form" class="btn-xs-add">+ Add Alias</button>
                 </div>
-                <div id="add-alias-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Alias</label><br><input id="alias-name" type="text" placeholder="fast" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:120px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Provider</label><br><select id="alias-provider" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Model</label><br><input id="alias-model" type="text" placeholder="qwen2.5:3b" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:200px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Force Local</label><br><select id="alias-local" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="true">Yes</option><option value="false">No</option></select></div>
-                        <button data-action="addAlias" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Save</button>
+                <div id="add-alias-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Alias</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-120"></div>
+                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
+                        <div><label class="lbl">Model</label><br><input id="alias-model" type="text" placeholder="qwen2.5:3b" class="fi w-200"></div>
+                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi"><option value="true">Yes</option><option value="false">No</option></select></div>
+                        <button data-action="addAlias" class="btn-sm-save">Save</button>
                     </div>
-                    <div id="alias-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="alias-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Alias</th><th>Provider</th><th>Model</th><th>Force Local</th><th>Actions</th></tr></thead>
@@ -318,18 +318,18 @@
                 </table>
             </div>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Model Allocations (user/group/org)</span>
-                    <button data-action="toggleForm" data-form-id="add-alloc-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Allocate</button>
+                    <button data-action="toggleForm" data-form-id="add-alloc-form" class="btn-xs-add">+ Allocate</button>
                 </div>
-                <div id="add-alloc-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Model Alias</label><br><input id="alloc-alias" type="text" placeholder="fast" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:120px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Target Type</label><br><select id="alloc-type" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="user">user</option><option value="group">group</option><option value="org">org</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Target ID</label><br><input id="alloc-target" type="text" placeholder="user@example.com" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:200px"></div>
-                        <button data-action="addAllocation" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Allocate</button>
+                <div id="add-alloc-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Model Alias</label><br><input id="alloc-alias" type="text" placeholder="fast" class="fi w-120"></div>
+                        <div><label class="lbl">Target Type</label><br><select id="alloc-type" class="fi"><option value="user">user</option><option value="group">group</option><option value="org">org</option></select></div>
+                        <div><label class="lbl">Target ID</label><br><input id="alloc-target" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <button data-action="addAllocation" class="btn-sm-save">Allocate</button>
                     </div>
-                    <div id="alloc-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="alloc-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Model Alias</th><th>Target Type</th><th>Target ID</th><th>Actions</th></tr></thead>
@@ -356,19 +356,19 @@
                 </div>
             </div>
             <div class="panel">
-                <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="panel-header panel-header-flex">
                     <span>Detection Patterns</span>
-                    <button data-action="toggleForm" data-form-id="add-pattern-form" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">+ Add Pattern</button>
+                    <button data-action="toggleForm" data-form-id="add-pattern-form" class="btn-xs-add">+ Add Pattern</button>
                 </div>
-                <div id="add-pattern-form" style="display:none;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Classification</label><br><select id="pat-class" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="RESTRICTED">RESTRICTED</option><option value="CONFIDENTIAL">CONFIDENTIAL</option><option value="INTERNAL">INTERNAL</option><option value="PUBLIC">PUBLIC</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Type</label><br><select id="pat-type" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="regex">regex</option><option value="keyword">keyword</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Pattern</label><br><input id="pat-pattern" type="text" placeholder="\bpattern\b" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:250px"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Description</label><br><input id="pat-desc" type="text" placeholder="What it detects" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:180px"></div>
-                        <button data-action="addPattern" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Save</button>
+                <div id="add-pattern-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Classification</label><br><select id="pat-class" class="fi"><option value="RESTRICTED">RESTRICTED</option><option value="CONFIDENTIAL">CONFIDENTIAL</option><option value="INTERNAL">INTERNAL</option><option value="PUBLIC">PUBLIC</option></select></div>
+                        <div><label class="lbl">Type</label><br><select id="pat-type" class="fi"><option value="regex">regex</option><option value="keyword">keyword</option></select></div>
+                        <div><label class="lbl">Pattern</label><br><input id="pat-pattern" type="text" placeholder="\bpattern\b" class="fi w-250"></div>
+                        <div><label class="lbl">Description</label><br><input id="pat-desc" type="text" placeholder="What it detects" class="fi w-180"></div>
+                        <button data-action="addPattern" class="btn-sm-save">Save</button>
                     </div>
-                    <div id="pattern-result" style="margin-top:6px;font-size:0.8rem"></div>
+                    <div id="pattern-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Classification</th><th>Type</th><th>Pattern</th><th>Description</th><th>Actions</th></tr></thead>
@@ -378,9 +378,9 @@
             <div class="panel">
                 <div class="panel-header">Test Classifier</div>
                 <div class="panel-body">
-                    <textarea id="test-text" rows="3" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;font-size:0.85rem;resize:vertical" placeholder="Paste text to classify..."></textarea>
-                    <button data-action="testClassify" style="margin-top:8px;padding:8px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem">Classify</button>
-                    <div id="classify-result" style="margin-top:8px;font-size:0.85rem"></div>
+                    <textarea id="test-text" rows="3" class="classify-textarea" placeholder="Paste text to classify..."></textarea>
+                    <button data-action="testClassify" class="classify-btn">Classify</button>
+                    <div id="classify-result" class="classify-result"></div>
                 </div>
             </div>
         </div>
@@ -391,44 +391,44 @@
             <div class="panel">
                 <div class="panel-header">Search</div>
                 <div class="panel-body">
-                    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-                        <div><label style="font-size:0.75rem;color:#64748b">Event type</label><br><select id="audit-event-type" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"><option value="">All</option><option value="login">Login</option><option value="agent_registered">Agent registered</option><option value="credential_exfil">Credential exfil</option><option value="policy_denied">Policy denied</option><option value="config_change">Config change</option></select></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">From</label><br><input id="audit-from" type="date" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">To</label><br><input id="audit-to" type="date" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem"></div>
-                        <div><label style="font-size:0.75rem;color:#64748b">Free text</label><br><input id="audit-text" type="text" placeholder="search..." style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:180px"></div>
-                        <button data-action="searchAudit" style="padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Search</button>
-                        <button data-action="exportAudit" style="padding:6px 16px;background:#64748b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Export CSV</button>
+                    <div class="form-row">
+                        <div><label class="lbl">Event type</label><br><select id="audit-event-type" class="fi"><option value="">All</option><option value="login">Login</option><option value="agent_registered">Agent registered</option><option value="credential_exfil">Credential exfil</option><option value="policy_denied">Policy denied</option><option value="config_change">Config change</option></select></div>
+                        <div><label class="lbl">From</label><br><input id="audit-from" type="date" class="fi"></div>
+                        <div><label class="lbl">To</label><br><input id="audit-to" type="date" class="fi"></div>
+                        <div><label class="lbl">Free text</label><br><input id="audit-text" type="text" placeholder="search..." class="fi w-180"></div>
+                        <button data-action="searchAudit" class="btn-sm-primary">Search</button>
+                        <button data-action="exportAudit" class="btn-sm-secondary">Export CSV</button>
                     </div>
                 </div>
             </div>
-            <div class="panel" style="margin-top:12px;">
+            <div class="panel">
                 <div class="panel-header" id="audit-count">Events</div>
                 <table>
                     <thead><tr><th>Timestamp</th><th>Event</th><th>User/Agent</th><th>Verdict</th><th>Detail</th></tr></thead>
                     <tbody id="audit-tbody"><tr><td colspan="5" class="empty">Use the search form above to query audit events.</td></tr></tbody>
                 </table>
-                <div id="audit-pagination" style="padding:8px 16px;font-size:0.8rem;"></div>
+                <div id="audit-pagination" class="audit-pagination"></div>
             </div>
         </div>
 
         <!-- Monitoring Page -->
         <div class="page" id="page-monitoring">
             <h2>Monitoring</h2>
-            <div class="cards" style="margin-bottom:24px;">
-                <div class="card" style="cursor:pointer" data-action="openExternal" data-url="/admin/grafana/">
+            <div class="cards">
+                <div class="card card-clickable" data-action="openExternal" data-url="/admin/grafana/">
                     <div class="card-label">Grafana Dashboards</div>
-                    <div class="card-value" style="font-size:1.2rem">12 dashboards</div>
-                    <p style="font-size:0.75rem;color:#64748b;margin-top:4px">System health, budget usage, agent activity, security overview, tracing, and more. Click to open.</p>
+                    <div class="card-value card-value-lg">12 dashboards</div>
+                    <p class="card-desc">System health, budget usage, agent activity, security overview, tracing, and more. Click to open.</p>
                 </div>
-                <div class="card" style="cursor:pointer" data-action="openExternal" data-url="/admin/prometheus/">
+                <div class="card card-clickable" data-action="openExternal" data-url="/admin/prometheus/">
                     <div class="card-label">Prometheus Metrics</div>
-                    <div class="card-value" style="font-size:1.2rem">Query Engine</div>
-                    <p style="font-size:0.75rem;color:#64748b;margin-top:4px">Direct access to Prometheus PromQL queries, alert rules, and target status. Click to open.</p>
+                    <div class="card-value card-value-lg">Query Engine</div>
+                    <p class="card-desc">Direct access to Prometheus PromQL queries, alert rules, and target status. Click to open.</p>
                 </div>
-                <div class="card" style="cursor:pointer" data-action="openExternal" data-url="/admin/wazuh/">
+                <div class="card card-clickable" data-action="openExternal" data-url="/admin/wazuh/">
                     <div class="card-label">Wazuh SIEM</div>
-                    <div class="card-value" style="font-size:1.2rem">Security Monitoring</div>
-                    <p style="font-size:0.75rem;color:#64748b;margin-top:4px">Open-source SIEM: threat detection, compliance, vulnerability assessment. Available when installed with --wazuh flag.</p>
+                    <div class="card-value card-value-lg">Security Monitoring</div>
+                    <p class="card-desc">Open-source SIEM: threat detection, compliance, vulnerability assessment. Available when installed with --wazuh flag.</p>
                 </div>
             </div>
             <h2>Quick Links</h2>
@@ -458,15 +458,15 @@
         <!-- Backup Page -->
         <div class="page" id="page-backup">
             <h2>Backup Status</h2>
-            <div class="panel" style="margin-bottom:16px;">
+            <div class="panel">
                 <div class="panel-header">Backups</div>
                 <div class="panel-body">
-                    <p style="font-size:0.8rem;color:#64748b;margin-bottom:8px;">Backups created by the installer and update scripts. Verify integrity by re-hashing against the recorded checksum manifest.</p>
+                    <p class="txt-note">Backups created by the installer and update scripts. Verify integrity by re-hashing against the recorded checksum manifest.</p>
                     <div id="backup-status-container"><span class="loading">Loading...</span></div>
-                    <div id="backup-actions" style="margin-top:12px;">
-                        <button id="btn-verify-latest" data-action="verifyBackup" style="padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem" disabled>Verify latest</button>
+                    <div id="backup-actions" class="backup-actions">
+                        <button id="btn-verify-latest" data-action="verifyBackup" class="btn-verify" disabled>Verify latest</button>
                     </div>
-                    <div id="backup-verify-result" style="margin-top:10px;font-size:0.85rem;display:none;"></div>
+                    <div id="backup-verify-result" class="backup-verify-result"></div>
                 </div>
             </div>
         </div>
@@ -476,10 +476,10 @@
             <h2>PKI Certificate Management</h2>
 
             <!-- Status Overview -->
-            <div class="panel" style="margin-bottom:16px;">
+            <div class="panel">
                 <div class="panel-header">Certificate Status</div>
                 <div class="panel-body">
-                    <p style="font-size:0.8rem;color:#64748b;margin-bottom:8px;">
+                    <p class="pki-status-note">
                         Leaf certificate status for all internal services.
                         Certificates flagged <strong>Needs Renewal</strong> should be rotated before expiry.
                         Rotation requires a TOTP step-up.
@@ -489,18 +489,17 @@
             </div>
 
             <!-- Rotate result -->
-            <div id="pki-rotate-result" style="font-size:0.85rem;min-height:1.2em;margin-bottom:8px;display:none;"></div>
+            <div id="pki-rotate-result" class="pki-rotate-result"></div>
 
             <!-- Chain Detail (hidden until a service is selected) -->
-            <div id="pki-chain-detail" style="display:none;">
-                <div class="panel" style="margin-bottom:16px;">
+            <div id="pki-chain-detail" class="pki-chain-detail">
+                <div class="panel">
                     <div class="panel-header">Certificate Chain Detail — <span id="pki-chain-service-name"></span></div>
                     <div class="panel-body">
-                        <table style="font-size:0.82rem;width:100%;border-collapse:collapse;">
+                        <table class="pki-chain-table">
                             <tbody id="pki-chain-table-body"></tbody>
                         </table>
-                        <button onclick="hidePkiChain()"
-                                style="margin-top:12px;padding:6px 16px;background:#f1f5f9;color:#334155;border:none;border-radius:4px;cursor:pointer;font-size:0.82rem;">
+                        <button onclick="hidePkiChain()" class="btn-pki-close">
                             Close
                         </button>
                     </div>
@@ -508,14 +507,14 @@
             </div>
 
             <!-- BYO-CA documentation panel -->
-            <div class="panel" style="margin-bottom:16px;">
+            <div class="panel">
                 <div class="panel-header">CA Mode</div>
-                <div class="panel-body" style="font-size:0.82rem;color:#334155;">
+                <div class="panel-body panel-body-prose">
                     <p>
                         <strong>Internal CA (default):</strong> certificates are issued by the built-in two-tier PKI
                         (root → intermediate → per-service leaf). No external dependency.
                     </p>
-                    <p style="margin-top:8px;">
+                    <p>
                         <strong>BYO-CA mode:</strong> set <code>YASHIGANI_PKI_CA_MODE=byo</code> to use an external
                         signing endpoint (step-ca, Vault PKI, etc.). Requires
                         <code>YASHIGANI_BYO_SIGNING_ENDPOINT</code> and <code>YASHIGANI_BYO_CA_CERT_PATH</code>.
@@ -530,32 +529,32 @@
             <h2>Settings</h2>
 
             <!-- Optional Services -->
-            <div class="panel" style="margin-bottom:16px;">
+            <div class="panel">
                 <div class="panel-header">Optional Services</div>
                 <div class="panel-body">
-                    <p style="font-size:0.8rem;color:#64748b;margin-bottom:8px;">Enable or disable optional components. Changes take effect immediately.</p>
+                    <p class="txt-note">Enable or disable optional components. Changes take effect immediately.</p>
                     <table>
                         <thead><tr><th>Service</th><th>Description</th><th>Status</th><th>Action</th></tr></thead>
                         <tbody id="services-list"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
                     </table>
-                    <div id="services-result" style="margin-top:6px;font-size:0.8rem;"></div>
+                    <div id="services-result" class="settings-services-result"></div>
                 </div>
             </div>
 
             <!-- IP Access Control (fail2ban-style) -->
-            <div class="panel" style="margin-bottom:16px;">
+            <div class="panel">
                 <div class="panel-header">IP Access Control</div>
                 <div class="panel-body">
-                    <h3 style="font-size:0.9rem;font-weight:600;margin-bottom:8px;">Blocked IPs (permanent bans)</h3>
-                    <div id="blocked-ips-list" style="font-size:0.85rem;color:#64748b;margin-bottom:8px;">Loading...</div>
-                    <h3 style="font-size:0.9rem;font-weight:600;margin-bottom:8px;margin-top:16px;">Login Allowlist (empty = allow all)</h3>
-                    <p style="font-size:0.75rem;color:#94a3b8;margin-bottom:8px;">When entries exist, ONLY these IPs/CIDRs can access the login page. Supports IPv4 and IPv6.</p>
-                    <div id="allowed-ips-list" style="font-size:0.85rem;color:#64748b;margin-bottom:8px;">Loading...</div>
-                    <div style="display:flex;gap:8px;align-items:end;margin-top:8px;">
-                        <div><label style="font-size:0.75rem;color:#64748b">IP or CIDR</label><br><input id="new-allowed-ip" type="text" placeholder="10.0.0.0/8 or 2001:db8::1" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:250px"></div>
-                        <button data-action="addAllowedIp" style="padding:6px 16px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">Add to Allowlist</button>
+                    <h3 class="settings-h3">Blocked IPs (permanent bans)</h3>
+                    <div id="blocked-ips-list" class="ip-list-display">Loading...</div>
+                    <h3 class="settings-h3-mt">Login Allowlist (empty = allow all)</h3>
+                    <p class="txt-note-sm">When entries exist, ONLY these IPs/CIDRs can access the login page. Supports IPv4 and IPv6.</p>
+                    <div id="allowed-ips-list" class="ip-list-display">Loading...</div>
+                    <div class="ip-allowlist-row">
+                        <div><label class="lbl">IP or CIDR</label><br><input id="new-allowed-ip" type="text" placeholder="10.0.0.0/8 or 2001:db8::1" class="fi w-250"></div>
+                        <button data-action="addAllowedIp" class="btn-allowlist-add">Add to Allowlist</button>
                     </div>
-                    <div id="ip-access-result" style="margin-top:6px;font-size:0.8rem;"></div>
+                    <div id="ip-access-result" class="ip-access-result"></div>
                 </div>
             </div>
 
@@ -566,8 +565,8 @@
             <div class="panel">
                 <div class="panel-header">Identity Providers</div>
                 <div class="panel-body">
-                    <p style="font-size:0.85rem;color:#334155;margin-bottom:12px;">Configure external identity providers for user authentication. Users authenticate via IdP and are automatically provisioned in Yashigani.</p>
-                    <div class="cards" style="margin-bottom:12px;">
+                    <p class="txt-body">Configure external identity providers for user authentication. Users authenticate via IdP and are automatically provisioned in Yashigani.</p>
+                    <div class="cards idp-cards-mb">
                         <div class="card">
                             <div class="card-label">OIDC Provider</div>
                             <span class="badge badge-yellow" id="oidc-status">Not configured</span>
@@ -577,88 +576,84 @@
                             <span class="badge badge-yellow" id="saml-status">Not configured</span>
                         </div>
                     </div>
-                    <div style="font-size:0.8rem;color:#64748b;background:#f8fafc;padding:12px;border-radius:6px;">
+                    <div class="idp-config-box">
                         <p><strong>OIDC Configuration</strong></p>
-                        <div style="display:grid;grid-template-columns:140px 1fr;gap:6px;margin-top:8px;">
-                            <label style="font-size:0.75rem;color:#64748b">Issuer URL</label>
-                            <input id="oidc-issuer" type="text" placeholder="https://idp.example.com/realms/yashigani" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.8rem">
-                            <label style="font-size:0.75rem;color:#64748b">Client ID</label>
-                            <input id="oidc-client-id" type="text" placeholder="yashigani" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.8rem">
-                            <label style="font-size:0.75rem;color:#64748b">Client Secret</label>
-                            <input id="oidc-client-secret" type="password" placeholder="" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.8rem">
+                        <div class="idp-grid">
+                            <label class="lbl">Issuer URL</label>
+                            <input id="oidc-issuer" type="text" placeholder="https://idp.example.com/realms/yashigani" class="fi-sm">
+                            <label class="lbl">Client ID</label>
+                            <input id="oidc-client-id" type="text" placeholder="yashigani" class="fi-sm">
+                            <label class="lbl">Client Secret</label>
+                            <input id="oidc-client-secret" type="password" placeholder="" class="fi-sm">
                         </div>
-                        <button data-action="saveIdpConfig" data-idp-type="oidc" style="margin-top:8px;padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Save OIDC Config</button>
-                        <span id="oidc-save-result" style="margin-left:8px;font-size:0.8rem"></span>
-                        <p style="margin-top:16px;"><strong>SAML v2 Configuration</strong></p>
-                        <div style="display:grid;grid-template-columns:140px 1fr;gap:6px;margin-top:8px;">
-                            <label style="font-size:0.75rem;color:#64748b">Metadata URL</label>
-                            <input id="saml-metadata" type="text" placeholder="https://idp.example.com/saml/metadata" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.8rem">
-                            <label style="font-size:0.75rem;color:#64748b">Entity ID</label>
-                            <input id="saml-entity" type="text" placeholder="https://yashigani.example.com" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.8rem">
+                        <button data-action="saveIdpConfig" data-idp-type="oidc" class="btn-xs-primary txt-mt8">Save OIDC Config</button>
+                        <span id="oidc-save-result" class="idp-result"></span>
+                        <p class="idp-section-mt"><strong>SAML v2 Configuration</strong></p>
+                        <div class="idp-grid">
+                            <label class="lbl">Metadata URL</label>
+                            <input id="saml-metadata" type="text" placeholder="https://idp.example.com/saml/metadata" class="fi-sm">
+                            <label class="lbl">Entity ID</label>
+                            <input id="saml-entity" type="text" placeholder="https://yashigani.example.com" class="fi-sm">
                         </div>
-                        <button data-action="saveIdpConfig" data-idp-type="saml" style="margin-top:8px;padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Save SAML Config</button>
-                        <span id="saml-save-result" style="margin-left:8px;font-size:0.8rem"></span>
+                        <button data-action="saveIdpConfig" data-idp-type="saml" class="btn-xs-primary txt-mt8">Save SAML Config</button>
+                        <span id="saml-save-result" class="idp-result"></span>
                     </div>
                 </div>
             </div>
             <div class="panel">
                 <div class="panel-header">System Info</div>
                 <div class="panel-body">
-                    <p style="font-size:0.85rem;color:#64748b;">Version: 2.1 | Runtime: Podman/Docker | TLS: Self-signed</p>
+                    <p class="txt-version">Version: 2.1 | Runtime: Podman/Docker | TLS: Self-signed</p>
                 </div>
             </div>
             <div class="panel">
                 <div class="panel-header">Cryptography</div>
                 <div class="panel-body">
-                    <p style="font-size:0.85rem;color:#334155;margin-bottom:12px;">Cryptographic algorithm inventory (OWASP ASVS v5 V11). Lists all algorithms in use, deprecated ciphers, and post-quantum readiness.</p>
+                    <p class="txt-body">Cryptographic algorithm inventory (OWASP ASVS v5 V11). Lists all algorithms in use, deprecated ciphers, and post-quantum readiness.</p>
                     <div id="crypto-inventory"><span class="loading">Loading...</span></div>
-                    <button data-action="exportCryptoJson" style="margin-top:12px;padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Export JSON</button>
+                    <button data-action="exportCryptoJson" class="btn-export">Export JSON</button>
                 </div>
             </div>
 
-            <!-- Authentication &gt; HIBP — v2.23.3 (#59) -->
-            <div class="panel" style="margin-top:16px;">
+            <!-- Authentication > HIBP — v2.23.3 (#59) -->
+            <div class="panel">
                 <div class="panel-header">Authentication &gt; HIBP API Key</div>
                 <div class="panel-body">
-                    <p style="font-size:0.8rem;color:#64748b;margin-bottom:12px;">
+                    <p class="hibp-description">
                         The HIBP k-Anonymity breach check works anonymously (no key required) for most deployments.
                         Set an API key here if you want the commercial-tier rate-limit lift or if you run a
                         self-hosted HIBP mirror that requires authentication.
                         <br>
                         <strong>Resolution priority:</strong> admin-panel key &rarr; env var
-                        <code style="font-size:0.75rem;background:#f1f5f9;padding:1px 4px;border-radius:3px;">YASHIGANI_HIBP_API_KEY</code>
+                        <code class="code-hibp-key">YASHIGANI_HIBP_API_KEY</code>
                         &rarr; anonymous.
                     </p>
 
                     <!-- Current status -->
-                    <div id="hibp-status-container" style="margin-bottom:14px;"><span class="loading">Loading…</span></div>
+                    <div id="hibp-status-container" class="hibp-status-container"><span class="loading">Loading…</span></div>
 
                     <!-- Set key form -->
-                    <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:8px;">
+                    <div class="hibp-input-row">
                         <div>
-                            <label style="font-size:0.75rem;color:#64748b;display:block;margin-bottom:3px;">API Key (never echoed back)</label>
+                            <label class="lbl-block-sm">API Key (never echoed back)</label>
                             <input id="hibp-key-input" type="password"
                                    autocomplete="new-password"
                                    placeholder="Enter HIBP API key (8–128 chars, alphanumeric + hyphens)"
-                                   style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:340px;max-width:100%;">
+                                   class="fi-hibp">
                         </div>
-                        <button id="hibp-btn-save"
-                                style="padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">
+                        <button id="hibp-btn-save" class="btn-hibp-save">
                             Save Key
                         </button>
-                        <button id="hibp-btn-clear"
-                                style="padding:6px 16px;background:#dc2626;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem"
-                                disabled>
+                        <button id="hibp-btn-clear" class="btn-hibp-clear" disabled>
                             Clear Key
                         </button>
-                        <button id="hibp-btn-test"
-                                style="padding:6px 16px;background:#64748b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem">
+                        <button id="hibp-btn-test" class="btn-hibp-test">
                             Test
                         </button>
                     </div>
-                    <div id="hibp-key-result" style="font-size:0.8rem;min-height:1.2em;margin-bottom:4px;"></div>
-                    <div id="hibp-probe-result" style="font-size:0.8rem;min-height:1.2em;color:#334155;"></div>
-                    <p style="font-size:0.75rem;color:#94a3b8;margin-top:8px;margin-bottom:0;">
+                    <div id="hibp-key-result" class="hibp-key-result"></div>
+                    <div id="hibp-probe-result" class="hibp-probe-result"></div>
+                    <p class="hibp-totp-note">
                         Save and Clear require step-up TOTP re-verification (ASVS V6.8.4).
                         The key is encrypted at rest with the deployment AES key and is never returned by the API.
                     </p>
@@ -668,26 +663,24 @@
     </main>
 
     <!-- V6.8.4 Step-up TOTP modal — shown when a high-value action requires fresh TOTP -->
-    <div id="stepup-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:9999;align-items:center;justify-content:center;">
-        <div style="background:#fff;border-radius:8px;padding:32px;width:320px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.2);">
-            <h3 style="margin:0 0 8px;font-size:1.1rem;color:#1e293b;">Additional verification required</h3>
-            <p style="font-size:0.85rem;color:#475569;margin:0 0 20px;">
+    <div id="stepup-modal" class="stepup-overlay">
+        <div class="stepup-dialog">
+            <h3 class="stepup-title">Additional verification required</h3>
+            <p class="stepup-desc">
                 This action requires re-verification.
                 Enter your current 6-digit TOTP code.
             </p>
-            <label style="font-size:0.8rem;font-weight:600;color:#334155;display:block;margin-bottom:6px;">TOTP Code</label>
+            <label class="stepup-lbl">TOTP Code</label>
             <input id="stepup-code" type="text" inputmode="numeric" autocomplete="one-time-code"
                    maxlength="6" pattern="[0-9]{6}"
                    placeholder="000000"
-                   style="width:100%;box-sizing:border-box;padding:10px 12px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:1.1rem;letter-spacing:0.15em;text-align:center;outline:none;margin-bottom:8px;">
-            <p id="stepup-error" style="color:#dc2626;font-size:0.8rem;min-height:1.2em;margin:0 0 16px;"></p>
-            <div style="display:flex;gap:10px;">
-                <button id="stepup-submit" onclick="submitStepUp()"
-                        style="flex:1;padding:10px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.9rem;font-weight:600;">
+                   class="stepup-input">
+            <p id="stepup-error" class="stepup-error"></p>
+            <div class="stepup-buttons">
+                <button id="stepup-submit" onclick="submitStepUp()" class="btn-stepup-submit">
                     Verify
                 </button>
-                <button onclick="cancelStepUp()"
-                        style="flex:1;padding:10px;background:#f1f5f9;color:#334155;border:none;border-radius:6px;cursor:pointer;font-size:0.9rem;">
+                <button onclick="cancelStepUp()" class="btn-stepup-cancel">
                     Cancel
                 </button>
             </div>
