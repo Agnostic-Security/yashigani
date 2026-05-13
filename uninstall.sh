@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-13T00:00:00+01:00 (fix: UNINSTALL-LEAVES-VOLUMES #8 — explicit volume rm loop)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,6 +9,56 @@ COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
 REMOVE_VOLUMES="false"
 RUNTIME="${RUNTIME:-}"
 YES="false"
+
+# ---------------------------------------------------------------------------
+# Canonical named volumes declared in docker/docker-compose.yml top-level
+# volumes: section.  These are the names as declared (without the project
+# prefix).  The project prefix is derived from the compose file's parent
+# directory name (docker/) → prefix "docker".
+#
+# UNINSTALL-LEAVES-VOLUMES (#8): podman-compose ≤1.3.x does NOT honour the
+# --volumes flag for named volumes — it only removes anonymous volumes.
+# docker compose ≥2.x does honour it, but we cannot rely on that being
+# available.  The explicit per-volume rm loop below is the reliable fallback
+# that works on both runtimes.
+#
+# When adding/removing named volumes in docker-compose.yml, keep this list
+# in sync.
+# ---------------------------------------------------------------------------
+_CANONICAL_VOLUMES=(
+    audit_data
+    bootstrap_data
+    redis_data
+    ollama_data
+    prometheus_data
+    grafana_data
+    caddy_data
+    caddy_config
+    postgres_data
+    alertmanager_data
+    loki_data
+    keycloak_data
+    openclaw_data
+    langflow_data
+    letta_data
+    openwebui_data
+    budget_redis_data
+    step_ca_data
+    wazuh_api_configuration
+    wazuh_etc
+    wazuh_logs
+    wazuh_queue
+    wazuh_var_multigroups
+    wazuh_integrations
+    wazuh_active_response
+    wazuh_agentless
+    wazuh_wodles
+    filebeat_etc
+    filebeat_var
+    wazuh_indexer_data
+    wazuh_dashboard_config
+    wazuh_dashboard_custom
+)
 
 for arg in "$@"; do
     case "$arg" in
@@ -78,6 +129,39 @@ fi
 
 # shellcheck disable=SC2086
 $COMPOSE -f "$COMPOSE_FILE" down $DOWN_ARGS
+
+# ---------------------------------------------------------------------------
+# Explicit per-volume cleanup — UNINSTALL-LEAVES-VOLUMES (#8)
+#
+# podman-compose ≤1.3.x ignores --volumes for named volumes.
+# docker compose ≥2.x honours it, but the explicit loop is idempotent and
+# safe on both runtimes: `volume rm` exits 0 when the volume doesn't exist
+# (--force / ignore-not-found).  We log each removal so it is auditable.
+#
+# The project prefix is the compose file's parent directory name: "docker".
+# ---------------------------------------------------------------------------
+if [ "$REMOVE_VOLUMES" = "true" ]; then
+    _PROJECT_PREFIX="docker"
+    echo "Removing named volumes (UNINSTALL-LEAVES-VOLUMES #8 explicit loop):"
+    _removed=0
+    _skipped=0
+    for _vol in "${_CANONICAL_VOLUMES[@]}"; do
+        _full="${_PROJECT_PREFIX}_${_vol}"
+        if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
+            if "$RUNTIME" volume rm "$_full" >/dev/null 2>&1; then
+                echo "  [removed] $_full"
+                _removed=$(( _removed + 1 ))
+            else
+                echo "  [WARN] failed to remove $_full (in use?)" >&2
+            fi
+        else
+            echo "  [skip]    $_full (not present)"
+            _skipped=$(( _skipped + 1 ))
+        fi
+    done
+    echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present."
+fi
+
 echo ""
 echo "Yashigani stopped."
 [ "$REMOVE_VOLUMES" = "true" ] && echo "All volumes deleted." || echo "Data volumes preserved."
