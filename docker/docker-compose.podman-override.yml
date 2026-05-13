@@ -1,6 +1,6 @@
 # Podman rootless overrides — applied automatically by install.sh when RUNTIME=podman
 # Usage: podman compose -f docker/docker-compose.yml -f docker/docker-compose.podman-override.yml up -d
-# Last updated: 2026-05-07T00:00:00+01:00 (fix: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES parity with docker-compose.yml)
+# Last updated: 2026-05-13T00:00:00+00:00 (fix: add :U to all secrets bind-mounts — MACOS-PODMAN-PKI-VIRTIOFS-U)
 #
 # P-9 healthcheck strategy (podman-healthcheck-silent-drop):
 #   Podman silently drops image-baked OCI HEALTHCHECK directives when compose
@@ -38,9 +38,25 @@ services:
   # but these images run as UID 1001 (yashigani user). Without keep-id,
   # Podman rootless maps host UID 1000 to container root, and the
   # container's internal USER directive switches to UID 1001 normally.
+  #
+  # --- Secrets bind-mount UID remapping (MACOS-PODMAN-PKI-VIRTIOFS-U) ---
+  # :U causes Podman to lchown the host-side source dir to the subuid-mapped
+  # UID of the container user before mounting. Required on macOS because:
+  #   1. podman unshare is unavailable on the macOS remote client, so
+  #      _prepare_secrets_dir_for_pki() cannot pre-chown docker/secrets/.
+  #   2. The PKI issuer runs with :U on its secrets mount, which lchowns
+  #      docker/secrets/ on the host to the subuid-mapped UID for UID 1001.
+  #   3. Without :U on service mounts, subsequent containers see subuid-owned
+  #      files and fail to read mTLS client certs/keys — producing
+  #      "tlsv1 alert unknown ca" from postgres and auth failures gateway-wide.
+  # On Linux rootless: :U is a no-op when secrets/ is already pre-chowned via
+  # podman unshare. On rootful Podman: :U is ignored (container runs as root).
+  # Docker: this override file is never applied on the Docker path.
   gateway:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   backoffice:
     security_opt:
@@ -51,15 +67,24 @@ services:
     # Docker's embedded DNS). Value must match docker-compose.yml exactly.
     environment:
       YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
+    # backoffice mounts secrets rw (compose line 386) to write bootstrap tokens.
+    # :U on rw mounts is safe — Podman lchowns before mounting, then backoffice
+    # writes bootstrap credentials into the remapped namespace correctly.
+    volumes:
+      - ./secrets:/run/secrets:rw,U
 
   # --- Root-running services — NO keep-id ---
   policy:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   redis:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   ollama:
     security_opt:
@@ -77,30 +102,44 @@ services:
   prometheus:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   grafana:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   caddy:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   postgres:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   pgbouncer:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   alertmanager:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   loki:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   promtail:
     security_opt:
@@ -116,19 +155,29 @@ services:
   otel-collector:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   jaeger:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   vault:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   open-webui:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U
 
   budget-redis:
     security_opt:
       - label=disable
+    volumes:
+      - ./secrets:/run/secrets:ro,U

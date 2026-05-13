@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-13T00:00:00+00:00 (fix(podman): add :U to all secret bind-mounts and ephemeral chown — MACOS-PODMAN-PKI-VIRTIOFS-U)
 # last-updated: 2026-05-12T00:00:00+01:00 (fix(install): write agent-bundle token placeholders before PKI chown — INSTALLER-BUG-AGENT-TOKENS)
 # last-updated: 2026-05-11T12:00:00+01:00 (refactor(pki): split _pki_run_issuer into per-runtime functions — _pki_run_issuer_docker / _pki_run_issuer_podman_linux / _pki_run_issuer_podman_macos; podman cp pattern for macOS applehv)
 # last-updated: 2026-05-11T00:30:00+01:00 (fix: macOS+Docker Colima virtiofs — skip host-UID chown assertions in check_installer_preflight + compose_up; YSG_OS==macos gated)
@@ -5592,7 +5593,8 @@ _pki_chown_client_keys() {
           _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
         fi
         if ! podman run --rm \
-               --volume "${_secrets_dir}:/s:rw" \
+               --network=none \
+               --volume "${_secrets_dir}:/s:rw,U" \
                "$_alpine_image" \
                sh -c "$_container_cmd" 2>/dev/null; then
           log_warn "podman run chown/chmod failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
@@ -5848,7 +5850,7 @@ _prepare_secrets_dir_for_pki() {
       if podman unshare chown 1001:1001 "$secrets_dir" 2>/dev/null; then
         log_info "secrets_dir chown 1001:1001 applied via podman unshare (rootless)"
       else
-        log_warn "Could not chown ${secrets_dir} via podman unshare — PKI issuer will use :U remapping"
+        log_warn "Could not chown ${secrets_dir} via podman unshare — PKI issuer and all service containers use :U remapping (podman-override.yml); ownership is consistent across the stack"
       fi
     fi
   fi
