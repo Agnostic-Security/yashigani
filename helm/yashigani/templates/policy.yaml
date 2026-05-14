@@ -1,4 +1,31 @@
 {{- if .Values.policy.enabled }}
+{{- /*
+  Last updated: 2026-05-14T00:00:00+00:00 — BUG-K8S-OPA-UNREACHABLE fix
+
+  Root cause: OPA pod was started without TLS flags, so it served plain HTTP
+  on port 8181. The gateway and backoffice both call OPA via
+  internal_httpx_client (yashigani.pki.client), which builds a mutual-TLS
+  SSLContext using the internal CA. A TLS ClientHello against a plain-HTTP
+  listener fails with a connection error → gateway catches the exception and
+  returns {"allow": false, "reason": "opa_unreachable"} → HTTP 403.
+
+  Fix: when mtls.enabled, mount the PKI leaves Secret (same Secret used by
+  every other workload) at /run/secrets and pass OPA the three TLS flags
+  matching the docker-compose path (EX-231-01 closure, v2.23.2):
+    --tls-cert-file        /run/secrets/policy_client.crt
+    --tls-private-key-file /run/secrets/policy_client.key
+    --tls-ca-cert-file     /run/secrets/ca_root.crt   (Pattern A: Python ssl)
+
+  When mtls.enabled=false, OPA runs as before (plain HTTP), matching the
+  docker-compose non-TLS path.
+
+  Hypothesis verified: (b) partial (OPA was up but not serving TLS, so the
+  mTLS client's TCP connection was rejected at the TLS handshake layer, not
+  at a probe level); correctly framed as a missing mTLS wiring gap, not a
+  NetworkPolicy or DNS issue.
+
+  Note: automountServiceAccountToken disabled — OPA has no K8s API calls.
+*/ -}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -20,8 +47,16 @@ spec:
       labels:
         app.kubernetes.io/name: yashigani-policy
         app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- if .Values.mtls.enabled }}
+      annotations:
+        # Roll the pod when the PKI cert Secret changes (cert rotation).
+        checksum/pki-certs: {{ lookup "v1" "Secret" .Release.Namespace .Values.mtls.secretName | default dict | dig "metadata" "resourceVersion" "" | quote }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      # OPA does not call the K8s API — disable SA token automount so the
+      # token file is not available inside the pod.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -41,9 +76,20 @@ spec:
             - "--addr=0.0.0.0:8181"
             - "--diagnostic-addr=0.0.0.0:8282"
             - "--log-level=error"
+            {{- if .Values.mtls.enabled }}
+            # mTLS: OPA serves TLS on :8181 with its own leaf cert so that
+            # internal_httpx_client callers (gateway, backoffice) can complete
+            # the mutual-TLS handshake. Mirrors docker-compose path (v2.23.2
+            # EX-231-01 closure). ca_root.crt = Pattern A for Go/OPA as well
+            # (Go x509 builds the chain from the presented cert leaf, so the
+            # root anchor is sufficient here too).
+            - "--tls-cert-file=/run/secrets/policy_client.crt"
+            - "--tls-private-key-file=/run/secrets/policy_client.key"
+            - "--tls-ca-cert-file=/run/secrets/ca_root.crt"
+            {{- end }}
             - "/policies"
           ports:
-            - name: http
+            - name: {{ if .Values.mtls.enabled }}https{{ else }}http{{ end }}
               containerPort: 8181
               protocol: TCP
             - name: diagnostic
@@ -84,10 +130,20 @@ spec:
               mountPath: /policies/agents.rego
               subPath: agents.rego
               readOnly: true
+            {{- if .Values.mtls.enabled }}
+            - name: pki-certs
+              mountPath: /run/secrets
+              readOnly: true
+            {{- end }}
       volumes:
         - name: policies
           configMap:
             name: yashigani-policy-bundle
+        {{- if .Values.mtls.enabled }}
+        - name: pki-certs
+          secret:
+            secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -104,7 +160,7 @@ spec:
     app.kubernetes.io/name: yashigani-policy
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
-    - name: http
+    - name: {{ if .Values.mtls.enabled }}https{{ else }}http{{ end }}
       port: {{ .Values.policy.service.port }}
       targetPort: 8181
       protocol: TCP
