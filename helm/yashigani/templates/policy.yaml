@@ -1,17 +1,17 @@
 {{- if .Values.policy.enabled }}
 {{- /*
-  Last updated: 2026-05-14T00:00:00+00:00 — BUG-K8S-OPA-UNREACHABLE fix
+  Last updated: 2026-05-15T00:00:00+00:00 — BUG-K8S-OPA-UNREACHABLE probe fix (A3 follow-up)
 
-  Root cause: OPA pod was started without TLS flags, so it served plain HTTP
-  on port 8181. The gateway and backoffice both call OPA via
+  Root cause (21372bb, v2.23.4): OPA pod was started without TLS flags, so it
+  served plain HTTP on port 8181. The gateway and backoffice both call OPA via
   internal_httpx_client (yashigani.pki.client), which builds a mutual-TLS
   SSLContext using the internal CA. A TLS ClientHello against a plain-HTTP
   listener fails with a connection error → gateway catches the exception and
   returns {"allow": false, "reason": "opa_unreachable"} → HTTP 403.
 
-  Fix: when mtls.enabled, mount the PKI leaves Secret (same Secret used by
-  every other workload) at /run/secrets and pass OPA the three TLS flags
-  matching the docker-compose path (EX-231-01 closure, v2.23.2):
+  Fix (21372bb): when mtls.enabled, mount the PKI leaves Secret (same Secret
+  used by every other workload) at /run/secrets and pass OPA the three TLS
+  flags matching the docker-compose path (EX-231-01 closure, v2.23.2):
     --tls-cert-file        /run/secrets/policy_client.crt
     --tls-private-key-file /run/secrets/policy_client.key
     --tls-ca-cert-file     /run/secrets/ca_root.crt   (Pattern A: Python ssl)
@@ -19,10 +19,22 @@
   When mtls.enabled=false, OPA runs as before (plain HTTP), matching the
   docker-compose non-TLS path.
 
-  Hypothesis verified: (b) partial (OPA was up but not serving TLS, so the
-  mTLS client's TCP connection was rejected at the TLS handshake layer, not
-  at a probe level); correctly framed as a missing mTLS wiring gap, not a
-  NetworkPolicy or DNS issue.
+  Secondary defect (A3 re-validate, 2026-05-15): OPA 1.16.1 applies TLS to
+  BOTH the main listener (:8181) AND the diagnostic-addr (:8282) whenever
+  --tls-cert-file is set. The readiness/liveness probes were using plain
+  httpGet on :8282 → OPA responded with a TLS record → K8s received HTTP 400
+  → liveness probe killed the pod after 5 failures (50 s) → CrashLoopBackOff.
+  Confirmed by: (a) kubectl events showing "HTTP probe failed with statuscode: 400";
+  (b) OPA logs showing "http: TLS handshake error from 10.244.0.1:PORT";
+  (c) docker test (openpolicyagent/opa:1.16.1 + openssl) confirming :8282 serves
+  TLS when --tls-cert-file is present.
+
+  Fix (this commit): add scheme: HTTPS to readinessProbe and livenessProbe httpGet
+  blocks when mtls.enabled=true. K8s kubelets do NOT verify the server certificate
+  on httpGet scheme: HTTPS probes (no CA bundle is passed; the handshake completes
+  and HTTP status is checked). This is intentional K8s behaviour and acceptable for
+  liveness/readiness; real mTLS verification happens between gateway/backoffice and
+  OPA at runtime via internal_httpx_client.
 
   Note: automountServiceAccountToken disabled — OPA has no K8s API calls.
 */ -}}
@@ -99,6 +111,9 @@ spec:
             httpGet:
               path: /health
               port: 8282
+              {{- if .Values.mtls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
@@ -107,6 +122,9 @@ spec:
             httpGet:
               path: /health
               port: 8282
+              {{- if .Values.mtls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 3
