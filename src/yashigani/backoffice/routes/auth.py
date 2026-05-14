@@ -7,13 +7,14 @@ POST /auth/password/change  — forced change on first login
 POST /auth/totp/provision   — TOTP + recovery codes provisioning
 POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value flows
 
-Last updated: 2026-05-09T00:00:00+01:00
+Last updated: 2026-05-14T00:00:00+01:00
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -373,6 +374,12 @@ async def login(body: LoginRequest, request: Request, response: Response):
         if age_days > max_age_days:
             record.force_password_change = True
             _log.info("Password expired: user=%s age=%d days, max=%d", record.username, int(age_days), max_age_days)
+
+    # Gap 3 / v2.23.4 arch-completion: register HUMAN identity before session
+    # creation so a seat-limit rejection prevents session issuance (fail-closed).
+    # Skips silently when identity_registry is None (community-tier).
+    # Raises HTTPException(403) when the licence seat limit is exhausted.
+    _register_human_identity_on_login(record, state)
 
     session = state.session_store.create(
         account_id=record.account_id,
@@ -1169,4 +1176,137 @@ def _make_sessions_invalidated_event(
         acting_admin=acting_admin,
         reason=reason,
         sessions_count=sessions_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gap 3 / v2.23.4 arch-completion: HUMAN identity registration on local-auth login
+#
+# SSO callbacks create a HUMAN identity in identity_registry (sso.py:271).
+# Local-auth login (username + password + TOTP) did not — leaving users without
+# a Bearer-issuable identity for /v1/*.  This helper closes that gap.
+#
+# Security invariants:
+#   - Only account_tier == "user" triggers registration. admins MUST NOT be
+#     registered as HUMAN identities (Gap 2 indirect separation).
+#   - Idempotent: get_by_slug() check prevents duplicate entries on re-login.
+#   - Seat-limit hard error: LicenseLimitExceeded → 403, login rejected.
+#   - Community-tier graceful-skip: identity_registry is None → skip, allow login.
+#   - Legacy account with no email: falls back to {username}@yashigani.local
+#     (mirrors existing pattern at auth.py:533 / /auth/verify).  This
+#     preserves backward compatibility with pre-email-as-username accounts while
+#     still giving them a stable, deterministic slug.  The fallback email is
+#     logged at WARNING so operators can backfill real emails during a Gap 1
+#     migration.
+# ---------------------------------------------------------------------------
+
+_AUTH_SLUG_RE = re.compile(r"[^a-z0-9\-]")
+
+
+def _auth_email_to_slug(email: str) -> str:
+    """
+    Derive a stable registry slug from an email address.
+    Mirrors sso.py::_email_to_slug — kept separate to avoid coupling auth.py
+    to the SSO module, which has its own heavy import chain.
+
+    e.g. alice@example.com → alice-example-com
+    """
+    local, _, domain = email.partition("@")
+    raw = f"{local}-{domain}".lower()
+    slug = _AUTH_SLUG_RE.sub("-", raw).strip("-")
+    return slug[:64]
+
+
+def _register_human_identity_on_login(record, state) -> None:
+    """
+    Register a HUMAN identity in the identity_registry for a successfully
+    authenticated local-auth user (account_tier == "user").
+
+    Called BEFORE session creation in the login handler so that a seat-limit
+    rejection prevents the session from being issued (fail-closed).
+
+    Raises HTTPException(403) if the licence seat limit is exhausted.
+    Silently skips if identity_registry is None (community-tier deployment).
+    """
+    # Only user-tier accounts get HUMAN identities.
+    # Admin and totp_provisioning tiers must NOT be registered here.
+    if record.account_tier != "user":
+        return
+
+    registry = getattr(state, "identity_registry", None)
+    if registry is None:
+        # Community-tier or pre-init: identity stack not available.
+        # Preserve today's behaviour — login succeeds without Bearer identity.
+        _log.warning(
+            "identity_registry unavailable on login for %s — "
+            "HUMAN identity not created (community-tier or pre-init); "
+            "user will have no Bearer identity for /v1/*",
+            record.username,
+        )
+        return
+
+    from yashigani.identity.registry import IdentityKind
+    from yashigani.licensing.enforcer import LicenseLimitExceeded
+
+    # Resolve the email for the slug.  Use the record email if set; otherwise
+    # fall back to the @yashigani.local synthetic email (Gap 1 legacy accounts).
+    email = record.email
+    if not email:
+        email = f"{record.username}@yashigani.local"
+        _log.warning(
+            "User %s has no email set — using synthetic slug email %s for "
+            "identity_registry. Backfill real email to resolve (Gap 1).",
+            record.username,
+            email,
+        )
+
+    slug = _auth_email_to_slug(email)
+
+    # Idempotency guard: if already registered, nothing to do.
+    existing = registry.get_by_slug(slug)
+    if existing is not None:
+        _log.debug(
+            "HUMAN identity already exists for %s (slug=%s, identity_id=%s) — skip re-register",
+            record.username,
+            slug,
+            existing.get("identity_id"),
+        )
+        return
+
+    # New user — register with HUMAN kind.
+    # description carries the account_id for cross-system linkage (Gap 3 / v2.23.4).
+    try:
+        identity_id, _plaintext_key = registry.register(
+            kind=IdentityKind.HUMAN,
+            name=record.username,
+            slug=slug,
+            description=f"local-auth user; account_id={record.account_id}",
+        )
+    except LicenseLimitExceeded as exc:
+        _log.warning(
+            "Seat limit reached: cannot register HUMAN identity for %s "
+            "(%d/%d used). Login rejected.",
+            record.username,
+            exc.current,
+            exc.max_val,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "seat_limit_exceeded",
+                "message": (
+                    "The maximum number of user seats for this licence has been reached. "
+                    "Contact your administrator to increase the seat limit."
+                ),
+                "current": exc.current,
+                "max": exc.max_val,
+            },
+        ) from exc
+
+    _log.info(
+        "HUMAN identity registered on local-auth login: "
+        "identity_id=%s slug=%s account_id=%s",
+        identity_id,
+        slug,
+        record.account_id,
     )
