@@ -73,6 +73,10 @@ class EventType(str, Enum):
     SELFSERVICE_POLICY_DENY = "SELFSERVICE_POLICY_DENY"
     # User management
     USER_FULL_RESET = "USER_FULL_RESET"
+    # Gap 4 / v2.23.4 — self-service Bearer issuance + revocation
+    USER_API_KEY_ISSUED = "USER_API_KEY_ISSUED"
+    USER_API_KEY_REVOKED = "USER_API_KEY_REVOKED"
+    ADMIN_USER_API_KEY_ISSUED = "ADMIN_USER_API_KEY_ISSUED"
     # Gateway
     GATEWAY_REQUEST = "GATEWAY_REQUEST"
     RATE_LIMIT_VIOLATION = "RATE_LIMIT_VIOLATION"
@@ -1231,3 +1235,68 @@ class PasswordReuseRejectedEvent(AuditEvent):
     # The exact match position is intentionally not recorded (no ordering
     # information that could assist an attacker in narrowing the history).
     history_depth_checked: int = 0  # == PASSWORD_HISTORY_DEPTH at call time
+
+
+# ---------------------------------------------------------------------------
+# Gap 4 / v2.23.4 — User self-service Bearer issuance + admin override
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class UserApiKeyIssuedEvent(AuditEvent):
+    """Written when a user self-issues or rotates their HUMAN-identity Bearer.
+
+    Security invariants (immutable floors):
+      - The plaintext token is NEVER stored here. Only last4 is logged.
+      - masking_applied is always True.
+      - actor is the account_id of the user performing the action.
+
+    ASVS V7.1.1 — all auth decisions logged with forensic context.
+    Gap 4 / v2.23.4 arch-completion.
+    """
+
+    event_type: str = EventType.USER_API_KEY_ISSUED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True  # immutable floor — plaintext never logged
+    actor: str = ""      # account_id of the user (not username — avoids PII in lower sinks)
+    identity_id: str = ""
+    key_last4: str = ""  # last 4 chars of plaintext token — sufficient for forensics
+    rotation: bool = False  # True if a prior token existed and was immediately invalidated
+
+
+@dataclass
+class UserApiKeyRevokedEvent(AuditEvent):
+    """Written when a user or admin revokes a HUMAN-identity Bearer key.
+
+    Security invariants: same as UserApiKeyIssuedEvent.
+    """
+
+    event_type: str = EventType.USER_API_KEY_REVOKED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    actor: str = ""          # account_id of the principal performing the revocation
+    identity_id: str = ""
+    key_id: str = ""         # key_id being revoked (Redis field or identity_id)
+    revoked_by_admin: bool = False
+
+
+@dataclass
+class AdminUserApiKeyIssuedEvent(AuditEvent):
+    """Written when an admin issues/rotates a user's API key via the admin override route.
+
+    Security invariants:
+      - plaintext token never logged.
+      - admin_account_id is the acting admin (account_id, not username).
+      - target_username is included for forensic correlation.
+
+    ASVS V7.1.1 / Lu audit-trail requirement (Gap 4 arch ticket).
+    """
+
+    event_type: str = EventType.ADMIN_USER_API_KEY_ISSUED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account_id: str = ""   # acting admin account_id
+    target_username: str = ""    # target user
+    target_identity_id: str = ""
+    key_last4: str = ""
+    grace_seconds: int = 30      # grace window applied to prior token

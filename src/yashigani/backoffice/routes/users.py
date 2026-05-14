@@ -258,6 +258,96 @@ async def enable_user(username: str, session: AdminSession):
     return {"status": "ok"}
 
 
+@router.post("/{username}/api-key")
+async def admin_issue_user_api_key(username: str, session: StepUpAdminSession):
+    """
+    Admin override — issue or rotate a target user's API key.
+
+    Requirements:
+      - Caller: admin tier + fresh StepUp (StepUpAdminSession).
+      - Target: must exist, must be account_tier == "user".
+      - 30-second grace window on the prior token (client transition window).
+
+    Returns plaintext_token ONCE — admin must deliver securely to the user.
+    Audit-logged with acting admin identity.
+
+    Gap 4 / v2.23.4 arch-completion — mirrors admin override for agents
+    (agents/token_rotation.py pattern).
+    """
+    state = backoffice_state
+    assert state.auth_service is not None
+    assert state.audit_writer is not None
+
+    # Resolve target user record
+    record = await state.auth_service.get_account(username)
+    if record is None or record.account_tier != "user":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    # Registry availability
+    registry = getattr(state, "identity_registry", None)
+    if registry is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "user_identity_registry_unavailable",
+                "message": "Identity registry not available on this deployment tier.",
+            },
+        )
+
+    # Resolve target HUMAN identity by slug
+    from yashigani.backoffice.routes.auth import _auth_email_to_slug
+    email = record.email or f"{record.username}@yashigani.local"
+    slug = _auth_email_to_slug(email)
+    identity = registry.get_by_slug(slug)
+    if identity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "identity_not_found",
+                "message": (
+                    f"No HUMAN identity found for user '{username}'. "
+                    "Ensure the user has logged in at least once to register their identity."
+                ),
+            },
+        )
+
+    identity_id = identity["identity_id"]
+
+    # Admin rotation: 30-second grace window for client transition
+    # (mirrors agents/token_rotation.py grace_period_hours pattern scaled to seconds)
+    _ADMIN_GRACE_SECONDS = 30
+    plaintext_token = registry.rotate_key(identity_id, grace_seconds=_ADMIN_GRACE_SECONDS)
+    key_last4 = plaintext_token[-4:]
+
+    # Audit — acting admin identity logged for forensic trail
+    from yashigani.audit.schema import AdminUserApiKeyIssuedEvent
+    state.audit_writer.write(AdminUserApiKeyIssuedEvent(
+        admin_account_id=session.account_id,
+        target_username=username,
+        target_identity_id=identity_id,
+        key_last4=key_last4,
+        grace_seconds=_ADMIN_GRACE_SECONDS,
+    ))
+
+    import logging as _log
+    _log.getLogger(__name__).info(
+        "Admin API key issued for user: admin=%s target=%s identity_id=%s grace=%ds",
+        session.account_id, username, identity_id, _ADMIN_GRACE_SECONDS,
+    )
+
+    # Read back expires_at for response
+    reg_data = registry.get(identity_id) or {}
+    expires_at = reg_data.get("api_key_expires_at", "")
+
+    return {
+        "plaintext_token": plaintext_token,
+        "shown_once": True,
+        "expires_at": expires_at,
+        "grace_seconds": _ADMIN_GRACE_SECONDS,
+        "message": "Deliver this token securely to the user. It will not be shown again.",
+    }
+
+
 def _suspend_identity_registry_for_account(account_id: str) -> None:
     """Suspend all identity-registry entries owned by account_id.
 

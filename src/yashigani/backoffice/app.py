@@ -90,6 +90,8 @@ from yashigani.backoffice.routes import (
     webauthn_v1_router,
     # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
     pki_v1_router,
+    # v2.23.4 — Gap 4: user self-service Bearer issuance (/me/api-key*)
+    me_router,
 )
 
 
@@ -735,6 +737,10 @@ def create_backoffice_app() -> FastAPI:
     # v2.23.3 — PKI admin UI + BYO-CA driver (#51 + #53)
     # Routes carry /api/v1/admin/pki/ prefix defined in the router itself.
     app.include_router(pki_v1_router, tags=["pki"])
+
+    # v2.23.4 — Gap 4: user self-service Bearer issuance (/me/api-key*)
+    # Routes carry /me/ prefix defined in the router itself (no extra prefix needed).
+    app.include_router(me_router, tags=["me"])
 
     # v0.9.0 — Phase 6: WebAuthn/Passkeys
     # webauthn_router carries its own full path segments (no prefix stripping needed)
