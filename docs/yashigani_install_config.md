@@ -1074,6 +1074,38 @@ curl -sk https://<your-domain>/auth/sso/select
 
 SAML v2 requires Professional tier or higher. The SAML ACS endpoint (`/auth/sso/saml/<idp-id>/acs`) validates assertions using python3-saml (OneLogin) with RSA-SHA256 signatures.
 
+#### SAML SP key — RSA REQUIRED
+
+The SAML Service Provider (SP) private key **must** be RSA. Yashigani enforces
+this at runtime and refuses to enable SAML if the SP key is EC, DSA, or any
+other algorithm.
+
+**Rationale (ACS-RISK-044 / CVE-2026-41989):** libgcrypt contains a
+heap-buffer-overflow in `gcry_pk_decrypt` on the ECDH decryption path (CVSS 7.5).
+This path is only exercised when the SP key is EC-type and the IdP sends an
+EncryptedAssertion with ECDH-ES key transport. RSA SP keys route through a
+different code path entirely and do not reach the vulnerable function. Using RSA
+makes the vulnerability dead code in a standard Yashigani deployment.
+
+`install.sh` generates a 4096-bit RSA key and a self-signed SP certificate in
+`docker/secrets/` during install. This is the recommended default.
+
+**If you bring your own SP key (BYOK)**, generate it with:
+
+```bash
+openssl genrsa -out sp.key 4096
+openssl req -new -x509 -key sp.key -out sp.crt -days 3650 \
+  -subj "/CN=<your-domain>/O=<your-org>/OU=SAML-SP"
+```
+
+**DO NOT** use `openssl ecparam`, `openssl genpkey -algorithm EC`, or any
+EC-key-generation tool. Yashigani will refuse to start the SAML feature if
+a non-RSA key is supplied.
+
+**Future:** When post-quantum (PQR) key algorithms (ML-KEM / Kyber) are
+supported across the SAML 2.0 + xmlsec + IdP ecosystem, this requirement will
+be revisited (ACS-RISK-044 forward-tracking note).
+
 **Step 1.** Configure your IdP with the following ACS URL:
 
 ```
@@ -1090,7 +1122,16 @@ YASHIGANI_IDP_2_DISCOVERY_URL=https://login.microsoftonline.com/<tenant>/federat
 YASHIGANI_IDP_2_EMAIL_DOMAINS=example.com
 ```
 
-**Step 3.** Configure SAML SP certificates via KMS or Docker secrets. The SP certificate and private key must be available for assertion signing.
+**Step 3.** Activate the SAML SP key by uncommenting in `docker/.env`:
+
+```bash
+YASHIGANI_SAML_SP_PRIVATE_KEY_FILE=/run/secrets/saml_sp.key
+YASHIGANI_SAML_SP_CERT_FILE=/run/secrets/saml_sp.crt
+```
+
+These paths point to the key and certificate that `install.sh` generated in
+`docker/secrets/`. If you are using a custom key, place the PEM files in
+`docker/secrets/` (private key at `0400` permissions) and update the paths.
 
 **Step 4.** Test by navigating to your IdP's SSO URL — the SAML assertion will POST to the ACS endpoint.
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-14T22:00:00+00:00 (docs(saml): document + sanity-check RSA SP key requirement — ACS-RISK-044)
 # last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
 # last-updated: 2026-05-13T15:00:00+00:00 (fix(podman): scope :U-override-load to macOS Podman only — LINUX-SHARED-MOUNT-UID-CLOBBER)
 # last-updated: 2026-05-13T13:00:00+00:00 (fix(podman): always apply :U-bearing override on macOS Podman — MACOS-PODMAN-OVERRIDE-LOAD-GAP)
@@ -1528,6 +1529,98 @@ _validate_aes_key() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# SAML SP key generation — ACS-RISK-044 mitigation
+# ---------------------------------------------------------------------------
+# SECURITY-MODEL REQUIREMENT: The SAML Service Provider key MUST be RSA.
+#
+# CVE-2026-41989 (libgcrypt20 ECDH heap-buffer-overflow, HIGH CVSS 7.5):
+#   An attacker who can POST a crafted EncryptedAssertion with ECDH-ES key
+#   transport to the SAML ACS endpoint can trigger a heap overflow in
+#   gcry_pk_decrypt() inside libgcrypt.  The ECDH path is ONLY exercised
+#   when the SP private key is an EC key.  RSA SP keys route to the RSA
+#   decryption path in xmlsec1 and never invoke gcry_pk_decrypt at all.
+#   The libgcrypt ECDH code path is therefore dead on a standard Yashigani
+#   deployment — ACS-RISK-044 is NOT-EXPLOITABLE when the SP key is RSA.
+#
+# Runtime enforcement: SAMLProvider.__init__ calls _assert_rsa_sp_key()
+#   in src/yashigani/sso/saml.py, which loads the key with
+#   cryptography.hazmat.primitives.serialization.load_pem_private_key and
+#   asserts isinstance(key, RSAPrivateKey).  Any non-RSA key type disables
+#   SAML at startup — fail-closed.
+#
+# This function generates the default SP key+cert during install so
+# operators have a ready-to-use RSA key without any manual steps.
+# BYOK is documented in docs/yashigani_install_config.md §8.2.
+#
+# PQR forward note: when ML-KEM/Kyber key-transport is standardised in the
+# SAML 2.0 / XML Encryption / xmlsec1 / IdP ecosystem, this requirement can
+# be revisited (see ACS-RISK-044 forward-tracking note in risk register).
+_generate_saml_sp_key() {
+  local secrets_dir="${WORK_DIR}/docker/secrets"
+  local sp_key_file="${secrets_dir}/saml_sp.key"
+  local sp_cert_file="${secrets_dir}/saml_sp.crt"
+
+  # Idempotent: skip if already present (preserve across re-runs)
+  if [[ -f "${sp_key_file}" && -f "${sp_cert_file}" ]]; then
+    log_info "SAML SP key already present — skipping generation"
+    return 0
+  fi
+
+  if ! command -v openssl >/dev/null 2>&1; then
+    log_warn "openssl not found — skipping SAML SP key generation"
+    log_warn "Generate manually before enabling SAML: openssl genrsa -out docker/secrets/saml_sp.key 4096"
+    return 0
+  fi
+
+  local domain_label="${YASHIGANI_TLS_DOMAIN:-yashigani}"
+  log_info "Generating SAML SP RSA-4096 key + self-signed certificate..."
+
+  # SECURITY-MODEL REQUIREMENT: SAML SP key MUST be RSA.
+  # EC keys would expose us to ACS-RISK-044 (CVE-2026-41989, libgcrypt ECDH
+  # heap overflow) via the SAML decryption path.  Runtime enforcement at
+  # SAMLProvider init refuses EC keys — see src/yashigani/sso/saml.py.
+  # When PQR algorithms ship in SAML+xmlsec+IdP ecosystem, this requirement
+  # can be revisited (see ACS-RISK-044 forward note in risk register).
+  umask 077
+  if ! openssl genrsa -out "${sp_key_file}" 4096 2>/dev/null; then
+    log_error "Failed to generate SAML SP RSA key (ACS-RISK-044)"
+    exit 1
+  fi
+
+  # Post-generation RSA invariant: confirm the key we just wrote is actually RSA.
+  # Catches the (theoretical) case where openssl behaves unexpectedly OR someone
+  # edits the line above to switch to a non-RSA algorithm without reading this
+  # comment.  Fail-closed: if the check fails, abort install.
+  if ! openssl pkey -in "${sp_key_file}" -text -noout 2>/dev/null | head -1 | grep -q 'Private-Key:.*RSA'; then
+    log_error "FATAL: generated SAML SP key is not RSA. ACS-RISK-044 mitigation requires RSA." >&2
+    log_error "Remove ${sp_key_file} and re-run install.sh to regenerate." >&2
+    exit 1
+  fi
+
+  # Self-signed SP certificate — valid 10 years (IdPs only verify SP cert for
+  # assertion encryption; use your own CA-signed cert for production if required)
+  if ! openssl req -new -x509 \
+      -key "${sp_key_file}" \
+      -out "${sp_cert_file}" \
+      -days 3650 \
+      -subj "/CN=${domain_label}/O=Yashigani/OU=SAML-SP" \
+      2>/dev/null; then
+    log_error "Failed to generate SAML SP self-signed certificate (ACS-RISK-044)"
+    exit 1
+  fi
+
+  # Harden permissions: private key owner-read-only (CWE-732 / v2.23.1 S1)
+  chmod 0400 "${sp_key_file}"
+  chmod 0644 "${sp_cert_file}"
+
+  log_success "SAML SP key + certificate generated (RSA-4096, self-signed)"
+  log_info "  Key:  docker/secrets/saml_sp.key (0400)"
+  log_info "  Cert: docker/secrets/saml_sp.crt (0644)"
+  log_info "  Configure SAML IdPs via YASHIGANI_IDP_<N>_SP_PRIVATE_KEY_FILE and"
+  log_info "  YASHIGANI_IDP_<N>_SP_CERT_FILE in docker/.env (see §8.2 in install guide)"
+}
+
 # Write all required environment variables to docker/.env
 _write_aes_key_to_env() {
   local env_file="${WORK_DIR}/docker/.env"
@@ -1738,9 +1831,32 @@ sys.exit(1)
 # YASHIGANI_IDP_1_EMAIL_DOMAINS=example.com,example.org
 # YASHIGANI_IDP_1_REDIRECT_URI=https://<domain>/auth/sso/oidc/my-entra-id/callback
 #
+# SAML v2 IdP example (Professional tier and above):
+# YASHIGANI_IDP_2_ID=entra-saml
+# YASHIGANI_IDP_2_NAME=Entra ID (SAML)
+# YASHIGANI_IDP_2_PROTOCOL=saml
+# YASHIGANI_IDP_2_DISCOVERY_URL=https://login.microsoftonline.com/<tenant>/federationmetadata/2007-06/federationmetadata.xml
+# YASHIGANI_IDP_2_EMAIL_DOMAINS=example.com
+#
+# SAML SP key + certificate (ACS-RISK-044 — RSA REQUIRED; see §8.2 in install guide).
+# install.sh generates docker/secrets/saml_sp.key (RSA-4096) + docker/secrets/saml_sp.crt
+# at install time.  Uncomment and set these paths to activate SAML SP cryptography.
+# DO NOT replace saml_sp.key with an EC key — runtime enforcement will refuse it.
+# YASHIGANI_SAML_SP_PRIVATE_KEY_FILE=/run/secrets/saml_sp.key
+# YASHIGANI_SAML_SP_CERT_FILE=/run/secrets/saml_sp.crt
+#
 # Require Yashigani TOTP after SSO (defense against session hijack/replay):
 # YASHIGANI_SSO_2FA_REQUIRED=false
 SSO_EOF
+  fi
+
+  # --- SAML SP key generation (ACS-RISK-044) ---
+  # Generates docker/secrets/saml_sp.key (RSA-4096) + saml_sp.crt on first install.
+  # Idempotent: skipped if the files already exist.
+  if [[ "$DRY_RUN" != "true" ]]; then
+    _generate_saml_sp_key
+  else
+    dry_print "Generate SAML SP RSA-4096 key + certificate (ACS-RISK-044)"
   fi
 
   log_info "Environment written to ${env_file}"
