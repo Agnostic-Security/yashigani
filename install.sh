@@ -1619,6 +1619,9 @@ _generate_saml_sp_key() {
   # SAMLProvider init refuses EC keys — see src/yashigani/sso/saml.py.
   # When PQR algorithms ship in SAML+xmlsec+IdP ecosystem, this requirement
   # can be revisited (see ACS-RISK-044 forward note in risk register).
+  # Bug fix (7cdbcf9 follow-up): secrets_dir may not yet exist at step 5;
+  # mkdir -p is idempotent so safe on both fresh install and re-run.
+  mkdir -p "${secrets_dir}"
   umask 077
   if ! openssl genrsa -out "${sp_key_file}" 4096 2>/dev/null; then
     log_error "Failed to generate SAML SP RSA key (ACS-RISK-044)"
@@ -1629,7 +1632,13 @@ _generate_saml_sp_key() {
   # Catches the (theoretical) case where openssl behaves unexpectedly OR someone
   # edits the line above to switch to a non-RSA algorithm without reading this
   # comment.  Fail-closed: if the check fails, abort install.
-  if ! openssl pkey -in "${sp_key_file}" -text -noout 2>/dev/null | head -1 | grep -q 'Private-Key:.*RSA'; then
+  #
+  # Bug fix (7cdbcf9 follow-up): `openssl pkey -text | head -1 | grep 'RSA'`
+  # is broken on OpenSSL 3.x (Ubuntu 24.04 / OpenSSL 3.0.13): the first line
+  # is "Private-Key: (4096 bit, 2 primes)" — "RSA" does not appear until a
+  # later line.  Use `openssl rsa -check` instead: exits 0 only for valid RSA
+  # private keys; works identically on OpenSSL 1.x and 3.x.
+  if ! openssl rsa -check -in "${sp_key_file}" >/dev/null 2>&1; then
     log_error "FATAL: generated SAML SP key is not RSA. ACS-RISK-044 mitigation requires RSA." >&2
     log_error "Remove ${sp_key_file} and re-run install.sh to regenerate." >&2
     exit 1
