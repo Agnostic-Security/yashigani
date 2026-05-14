@@ -113,12 +113,25 @@ case "$_runtime_class" in
       _fail "systemctl is-enabled yashigani.service → ${_enabled} (expected: enabled)"
     fi
 
-    # Verify After= and Requires= for podman.socket.service dependency
-    if grep -q "Requires=podman.socket.service" "$_unit" 2>/dev/null; then
-      _pass "Unit declares Requires=podman.socket.service"
+    # Verify Requires= names the correct unit (podman.socket, NOT podman.socket.service)
+    if grep -q "Requires=podman.socket$" "$_unit" 2>/dev/null; then
+      _pass "Unit declares Requires=podman.socket"
     else
-      _fail "Unit missing Requires=podman.socket.service — reboot ordering may be broken"
+      _fail "Unit missing Requires=podman.socket (or uses wrong name e.g. podman.socket.service) — reboot ordering may be broken"
     fi
+
+    # Verify every Requires= target resolves on this host (catches wrong unit names)
+    _req_units="$(awk -F= '/^Requires=/ {print $2}' "$_unit" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')"
+    while IFS= read -r _req_unit; do
+      [[ -z "$_req_unit" ]] && continue
+      # Accept the unit if list-unit-files knows it OR systemctl status can query it
+      if systemctl list-unit-files "$_req_unit" 2>/dev/null | grep -q "^${_req_unit}" || \
+         systemctl status "$_req_unit" >/dev/null 2>&1; then
+        _pass "Requires=${_req_unit} resolves on this host"
+      else
+        _fail "Requires=${_req_unit} does NOT resolve — unit not found; systemctl start yashigani.service will fail"
+      fi
+    done <<< "$_req_units"
     ;;
 
   podman_rootless)

@@ -3658,9 +3658,9 @@ _setup_auto_start_podman_rootful() {
 [Unit]
 Description=Yashigani MCP Security Gateway
 Documentation=https://yashigani.io
-After=network-online.target podman.socket.service
+After=network-online.target podman.socket
 Wants=network-online.target
-Requires=podman.socket.service
+Requires=podman.socket
 
 [Service]
 Type=oneshot
