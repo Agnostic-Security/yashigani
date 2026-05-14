@@ -17,9 +17,14 @@ Three regression groups:
     (c) POST /admin/accounts/{user_username}/force-reset → 404
 
   Group 3 — Gateway indirect admin separation via identity_registry
-    (a) Admin record has no HUMAN identity_registry entry by default
+    (a) Admin record has no HUMAN identity_registry entry after
+        _register_human_identity_on_login — verified against REAL fakeredis
+        registry (post-lupa; B2 hardening 2026-05-15)
     (b) _resolve_identity() returns None for an admin slug not in registry
     (c) _resolve_identity() returns None when no auth header present
+    (d) REGRESSION: create_admin never registers a HUMAN identity — load-bearing
+        test for Laura threat-model F2 (admin-tier separation via identity_registry).
+        Uses real registry; catches any future accidental registration at the source.
 
 Source-code regression targets (lines current at v2.23.4):
   src/yashigani/backoffice/routes/users.py:60   — list filter account_tier == "user"
@@ -30,19 +35,22 @@ Source-code regression targets (lines current at v2.23.4):
   src/yashigani/backoffice/routes/accounts.py:160 — disable action check
   src/yashigani/backoffice/routes/accounts.py:223 — force-reset action check
   src/yashigani/gateway/openai_router.py:1151   — _resolve_identity(), no account_tier check
+  src/yashigani/backoffice/routes/auth.py:1233  — _register_human_identity_on_login tier guard
 
 ASVS v5 controls: V4.1.1 (access control enforcement), V4.1.2 (deny-by-default),
   V4.2.1 (IDOR / BOLA prevention).
 OWASP API Top 10 2023: API1 (BOLA), API5 (Broken Function-Level Auth).
 
-Last updated: 2026-05-14T00:00:00+00:00
+Last updated: 2026-05-15T00:00:00+00:00
 """
 from __future__ import annotations
 
 import time
+import types
 from dataclasses import dataclass, field
 from typing import Optional
 
+import fakeredis
 import pytest
 
 
@@ -549,58 +557,54 @@ class TestAccountsRouteRejectsUserRecords:
 # Group 3 — Gateway indirect admin separation
 # ---------------------------------------------------------------------------
 
+def _make_real_registry():
+    """
+    Real IdentityRegistry backed by an in-process fakeredis instance.
+
+    Requires fakeredis with Lua eval support (lupa>=2.1 — added in
+    Captain's 6af2187).  This replaces the earlier MagicMock approach
+    (b31b268) so that tests bind production code rather than a stub.
+    """
+    from yashigani.identity import IdentityRegistry
+    return IdentityRegistry(fakeredis.FakeRedis())
+
+
+def _make_real_registry_with_user_only():
+    """
+    Real fakeredis-backed IdentityRegistry with alice registered as HUMAN.
+    Admin slug is intentionally absent — no call to registry.register() for
+    any admin email.  Used by test_group3a and test_group3b.
+    """
+    from yashigani.identity import IdentityKind
+    registry = _make_real_registry()
+    registry.register(
+        kind=IdentityKind.HUMAN,
+        name="Alice",
+        slug="alice-example-com",
+        description="test user",
+    )
+    return registry
+
+
 class TestGatewayAdminIndirectSeparation:
     """
-    Regression: admin records have NO identity_registry HUMAN entry by default.
-    _resolve_identity() at openai_router.py:1151 does NOT check account_tier —
-    instead, admins are excluded indirectly because they have no slug registered
-    in the identity_registry.
+    Regression: admin records have NO identity_registry HUMAN entry.
 
-    If an admin slug were ever registered as a HUMAN identity (e.g. by a
-    future bootstrap bug), _resolve_identity() would resolve it and the admin
-    could reach /v1/* endpoints. These tests lock in the 'no-entry-means-none'
-    contract.
+    _resolve_identity() at openai_router.py:1151 does NOT check account_tier —
+    admins are excluded indirectly because they have no slug registered in
+    the identity_registry.
+
+    Group 3a–3c: unchanged contract tests with real fakeredis registry
+    (post-lupa hardening; replaces MagicMock approach from b31b268).
+
+    Group 3d: load-bearing regression for Laura threat-model F2.
+    Directly calls _register_human_identity_on_login() with an admin-tier
+    record against a real registry.  If auth.py:1233 tier guard is ever
+    removed or bypassed, this test catches the regression immediately.
 
     Source-code target: openai_router.py:1151 _resolve_identity()
+                        auth.py:1233 _register_human_identity_on_login tier guard
     """
-
-    def _make_registry_with_user_only(self):
-        """
-        Mock IdentityRegistry with only 'alice' registered as a HUMAN identity.
-        Admin slug is absent — get_by_slug("admin@example.com") returns None.
-
-        We use MagicMock rather than the real IdentityRegistry because the real
-        registry uses a Redis Lua EVAL script for HUMAN registration, which
-        requires the `lupa` package (not installed in this test environment).
-        The MagicMock approach matches the pattern established in
-        test_v2231_asvs_fixes.py and is sufficient — we are testing the
-        _resolve_identity() contract, not the IdentityRegistry implementation.
-        """
-        from unittest.mock import MagicMock
-
-        registry = MagicMock()
-        # Only 'alice' is registered as a HUMAN identity
-        _alice_identity = {
-            "identity_id": "idnt_alice001",
-            "kind": "human",
-            "name": "Alice",
-            "slug": "alice",
-            "status": "active",
-            "groups": [],
-            "allowed_models": [],
-            "sensitivity_ceiling": "PUBLIC",
-            "bound_spiffe_uri": "",
-        }
-
-        def _get_by_slug(slug: str):
-            if slug == "alice":
-                return _alice_identity
-            return None  # admin slug and any other slug → None
-
-        registry.get_by_slug = MagicMock(side_effect=_get_by_slug)
-        # get_by_api_key is not used in these tests but must not raise
-        registry.get_by_api_key = MagicMock(return_value=None)
-        return registry
 
     def _make_starlette_request(self, headers: dict) -> object:
         """Build a minimal Starlette Request from a headers dict."""
@@ -616,39 +620,44 @@ class TestGatewayAdminIndirectSeparation:
 
     def test_group3a_admin_record_has_no_human_identity_entry(self):
         """
-        Admin record has no HUMAN identity_registry entry by default.
+        Admin slug is absent from a real fakeredis IdentityRegistry after a
+        user-only registration — get_by_slug("admin-example-com") returns None.
 
-        Asserts that after registering only a user-tier HUMAN identity,
-        a lookup by admin slug returns None — i.e. the admin has no identity
-        entry and therefore cannot be resolved by _resolve_identity().
+        B2 hardening (2026-05-15): replaces MagicMock with real registry so
+        the test exercises production IdentityRegistry code rather than a stub.
 
         Regression target: the invariant that admin accounts are NEVER
         registered as HUMAN identities in the identity_registry. If a future
         bootstrap or admin-creation path registers admin emails as HUMAN
-        identities, get_by_slug("admin@example.com") would return a result
-        and this test would fail.
-        """
-        registry = self._make_registry_with_user_only()
+        identities, get_by_slug("admin-example-com") would return a non-None
+        result and this test would fail.
 
-        # Admin slug lookup must return None — no HUMAN entry registered
-        result = registry.get_by_slug("admin@example.com")
+        Source-code target: auth.py:1233 tier guard in
+            _register_human_identity_on_login().
+        """
+        registry = _make_real_registry_with_user_only()
+
+        # Admin slug lookup must return None — no HUMAN entry was registered
+        admin_slug = "admin-example-com"
+        result = registry.get_by_slug(admin_slug)
         assert result is None, (
-            "REGRESSION (openai_router.py:1151): admin slug 'admin@example.com' "
-            "found in identity_registry — admin has unexpected HUMAN identity entry. "
+            f"REGRESSION (auth.py:1233): admin slug '{admin_slug}' "
+            "found in real identity_registry — admin has unexpected HUMAN identity entry. "
             "This would allow admin to reach /v1/* endpoints via SSO header. "
             f"Result: {result}"
         )
 
-        # User slug lookup must succeed — confirms the registry is working
-        user_result = registry.get_by_slug("alice")
+        # User slug lookup must succeed — confirms the real registry is functional
+        user_result = registry.get_by_slug("alice-example-com")
         assert user_result is not None, (
-            "Fixture problem: 'alice' not found in identity_registry after registration."
+            "Fixture problem: 'alice-example-com' not found in real identity_registry "
+            "after registration."
         )
 
     def test_group3b_resolve_identity_returns_none_for_unregistered_admin_slug(self):
         """
-        _resolve_identity() called with X-Forwarded-User: admin@example.com
-        header returns None — admin slug not in identity_registry.
+        _resolve_identity() called with X-Forwarded-User: admin-example-com
+        returns None — admin slug not in real identity_registry.
 
         Regression target: openai_router.py:1165
           `identity = _state.identity_registry.get_by_slug(forwarded_user)`
@@ -659,15 +668,15 @@ class TestGatewayAdminIndirectSeparation:
         """
         from yashigani.gateway.openai_router import _resolve_identity, configure
 
-        registry = self._make_registry_with_user_only()
+        registry = _make_real_registry_with_user_only()
         configure(identity_registry=registry)
 
-        req = self._make_starlette_request({"X-Forwarded-User": "admin@example.com"})
+        req = self._make_starlette_request({"X-Forwarded-User": "admin-example-com"})
         result = _resolve_identity(req)
         assert result is None, (
             "REGRESSION (openai_router.py:1151): _resolve_identity() resolved "
-            "identity for admin slug 'admin@example.com' despite no HUMAN entry "
-            f"in identity_registry. Result: {result}"
+            "identity for admin slug 'admin-example-com' despite no HUMAN entry "
+            f"in real identity_registry. Result: {result}"
         )
 
     def test_group3c_resolve_identity_returns_none_when_no_auth_header(self):
@@ -686,7 +695,7 @@ class TestGatewayAdminIndirectSeparation:
         """
         from yashigani.gateway.openai_router import _resolve_identity, configure
 
-        registry = self._make_registry_with_user_only()
+        registry = _make_real_registry_with_user_only()
         configure(identity_registry=registry)
 
         # No X-Forwarded-User, no Authorization header
@@ -696,4 +705,113 @@ class TestGatewayAdminIndirectSeparation:
             "REGRESSION (openai_router.py:1151): _resolve_identity() returned a "
             "non-None identity with no auth headers present. "
             f"Result: {result}"
+        )
+
+    def test_group3d_create_admin_does_not_register_human_identity(self):
+        """
+        LOAD-BEARING REGRESSION — Laura threat-model F2 / ASVS V4.1.1.
+
+        Directly exercises the production path:
+          LocalAuthService.create_admin() → _register_human_identity_on_login()
+          → auth.py:1233 tier guard (account_tier != "user" → return early)
+
+        Setup:
+          1. Real fakeredis IdentityRegistry (empty — pre-state assert confirms
+             no admin slug entry exists).
+          2. Call LocalAuthService.create_admin("admin@example.com") to obtain
+             a real AccountRecord with account_tier="admin".
+          3. Call _register_human_identity_on_login(record, state) directly —
+             the same function called on every local-auth login.
+          4. Post-state: assert registry STILL has no entry for the admin slug.
+
+        Why this is load-bearing:
+          The old b31b268 Group 3a test used a MagicMock that returned None
+          unconditionally.  A bug where _register_human_identity_on_login()
+          skipped the tier guard and called registry.register(kind=HUMAN, ...)
+          for an admin account would still pass that test (mock is not affected
+          by production code).  THIS test would fail immediately because it
+          asserts against the real registry state after executing the real code.
+
+        Failure message on regression:
+          "REGRESSION (auth.py:1233): _register_human_identity_on_login() "
+          "registered a HUMAN identity for admin-tier account 'admin@example.com' "
+          "— tier guard at auth.py:1233 is missing or bypassed."
+
+        ASVS v5: V4.1.1 (enforce access control at every layer).
+        OWASP API Top 10 2023: API1 (BOLA), API5 (Broken Function-Level Auth).
+        Laura threat-model: F2 (admin reachability via identity_registry).
+        """
+        from yashigani.auth.local_auth import LocalAuthService
+        from yashigani.backoffice.routes.auth import _register_human_identity_on_login
+
+        # Real fakeredis-backed registry — clean state, nothing registered yet.
+        registry = _make_real_registry()
+
+        # Derive the slug the production code would use for this admin email.
+        # _auth_email_to_slug("admin@example.com") → "admin-example-com"
+        admin_email = "admin@example.com"
+        admin_slug = "admin-example-com"
+
+        # Pre-state assertion: registry is empty, no admin slug entry.
+        pre_result = registry.get_by_slug(admin_slug)
+        assert pre_result is None, (
+            f"Fixture problem: registry already contains an entry for '{admin_slug}' "
+            "before test setup. This should never happen on a fresh fakeredis instance."
+        )
+
+        # Create a real admin AccountRecord via LocalAuthService.
+        # This is the same code path the bootstrap / /admin/accounts POST uses.
+        auth_svc = LocalAuthService()
+        admin_record, _temp_password = auth_svc.create_admin(
+            username=admin_email,
+            auto_generate=True,
+        )
+        assert admin_record.account_tier == "admin", (
+            f"Fixture problem: create_admin produced a record with tier "
+            f"'{admin_record.account_tier}' — expected 'admin'."
+        )
+
+        # Build a minimal state namespace that _register_human_identity_on_login
+        # reads: it accesses state.identity_registry via getattr().
+        state = types.SimpleNamespace(identity_registry=registry)
+
+        # Execute the production function — this is what runs on every login.
+        # For an admin-tier record, auth.py:1233 must return early WITHOUT
+        # calling registry.register().
+        _register_human_identity_on_login(admin_record, state)
+
+        # Post-state assertion: registry MUST still have no entry for admin slug.
+        post_result = registry.get_by_slug(admin_slug)
+        assert post_result is None, (
+            f"REGRESSION (auth.py:1233): _register_human_identity_on_login() "
+            f"registered a HUMAN identity for admin-tier account '{admin_email}' "
+            f"(slug='{admin_slug}'). The tier guard at auth.py:1233 is missing or "
+            f"bypassed. This would allow the admin to reach /v1/* endpoints via "
+            f"SSO header. Registry entry found: {post_result}"
+        )
+
+        # Verify alice (user tier) DOES get registered — confirms the function
+        # works for legitimate user-tier accounts (control case).
+        from yashigani.identity import IdentityKind
+        alice_email = "alice@example.com"
+        alice_slug = "alice-example-com"
+        user_record = auth_svc.create_user(
+            username=alice_email,
+            plaintext_password="CorrectHorseBatteryStaple-Fixture-Test1!",
+        )
+        # Patch email so the slug resolves to alice-example-com (not the
+        # @yashigani.local fallback — create_user doesn't set email).
+        user_record.email = alice_email
+
+        _register_human_identity_on_login(user_record, state)
+
+        alice_result = registry.get_by_slug(alice_slug)
+        assert alice_result is not None, (
+            f"Control case FAIL: _register_human_identity_on_login() did NOT "
+            f"register a HUMAN identity for user-tier account '{alice_email}' "
+            f"(slug='{alice_slug}'). The function is not working for legitimate users."
+        )
+        assert alice_result.get("kind") == "human", (
+            f"Control case FAIL: alice's identity has kind={alice_result.get('kind')!r}, "
+            f"expected 'human'."
         )
