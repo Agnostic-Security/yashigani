@@ -7,7 +7,7 @@ POST /auth/password/change  — forced change on first login
 POST /auth/totp/provision   — TOTP + recovery codes provisioning
 POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value flows
 
-Last updated: 2026-05-14T00:00:00+01:00
+Last updated: 2026-05-14T12:00:00+01:00
 """
 
 from __future__ import annotations
@@ -1262,15 +1262,36 @@ def _register_human_identity_on_login(record, state) -> None:
 
     slug = _auth_email_to_slug(email)
 
-    # Idempotency guard: if already registered, nothing to do.
+    # Idempotency guard: if already registered, check status.
+    # F9 (Laura Gap 3 threat-model): if the identity was suspended by admin
+    # (disable→re-enable cycle), the local-auth login must reactivate it —
+    # not skip it — otherwise the re-enabled user has a suspended HUMAN
+    # identity and cannot reach /v1/*.
     existing = registry.get_by_slug(slug)
     if existing is not None:
-        _log.debug(
-            "HUMAN identity already exists for %s (slug=%s, identity_id=%s) — skip re-register",
-            record.username,
-            slug,
-            existing.get("identity_id"),
-        )
+        identity_id = existing.get("identity_id", "")
+        existing_status = existing.get("status", "active")
+        if existing_status in ("suspended", "inactive"):
+            # Identity exists but was suspended (admin disabled user, then re-enabled
+            # the local-auth account but did not unsuspend the identity manually).
+            # Re-activate the identity so the user can reach /v1/*.
+            registry.reactivate(identity_id)
+            _log.info(
+                "HUMAN identity reactivated on login for %s "
+                "(slug=%s, identity_id=%s, was_status=%s) — "
+                "disable→re-enable cycle detected (F9 ACS-RISK-044 mitigation)",
+                record.username,
+                slug,
+                identity_id,
+                existing_status,
+            )
+        else:
+            _log.debug(
+                "HUMAN identity already active for %s (slug=%s, identity_id=%s) — skip re-register",
+                record.username,
+                slug,
+                identity_id,
+            )
         return
 
     # New user — register with HUMAN kind.

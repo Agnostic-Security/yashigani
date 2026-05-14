@@ -10,13 +10,15 @@ guarantee that password_hash, totp_secret, recovery_codes, and lockout
 counters are never leaked in list responses.
 """
 
-# Last updated: 2026-05-09T00:00:00+01:00
+# Last updated: 2026-05-14T00:00:00+01:00
 from __future__ import annotations
 
 from typing import Optional
 
+import re as _re
+
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
@@ -31,12 +33,48 @@ class FullResetRequest(BaseModel):
 
 
 class CreateUserRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=64)
-    email: Optional[str] = Field(
-        default=None,
-        max_length=254,
-        pattern=r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$",
+    """
+    Gap 1 / v2.23.4 arch-completion: email-as-username for user-tier accounts.
+
+    `email` is now REQUIRED for user-tier account creation (Tiago design intent:
+    "email as the username for normal users"). The canonical identity for a user
+    is their email address — `username` is a deprecated convenience alias.
+
+    If `username` is not supplied, it is derived from the local part of `email`
+    (e.g. alice@example.com → username="alice"). If supplied explicitly it is
+    accepted as-is (max 64 chars) for backward compatibility with older callers.
+
+    Admin records are unchanged — admin usernames are already emails (set at
+    create_admin() time in local_auth.py:161 / pg_auth.py:99).
+    """
+    email: EmailStr = Field(
+        description="Email address for the new user (required). Used as the canonical identity.",
     )
+    username: Optional[str] = Field(
+        default=None,
+        min_length=3,
+        max_length=64,
+        description=(
+            "Optional username override. Deprecated for user-tier accounts — "
+            "email is the canonical identity. If omitted, derived from the "
+            "local part of email."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _derive_username_if_absent(self) -> "CreateUserRequest":
+        """
+        If username is not supplied, derive it from the email local part.
+
+        Uses model_validator (post-field-validation) so self.email is guaranteed
+        to be a valid EmailStr value at this point.
+        """
+        if self.username is None:
+            local = str(self.email).partition("@")[0]
+            # Sanitise: keep alphanumeric + underscore + hyphen, max 64 chars.
+            derived = _re.sub(r"[^a-zA-Z0-9_\-]", "_", local)[:64]
+            self.username = derived if len(derived) >= 3 else f"u_{derived}"
+        return self
 
 
 @router.get("")
@@ -73,10 +111,22 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     and a TOTP secret. Both are returned once — admin shares them
     out-of-band with the user. User must change password and provision
     TOTP at first login.
+
+    Gap 1 / v2.23.4: email is now the canonical identity for user-tier
+    accounts. The `email` field is REQUIRED. `username` is derived from
+    the email local part if not supplied.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
     assert state.audit_writer is not None  # set unconditionally at startup
+
+    # Gap 1: email is required and is the canonical identity.
+    # body.email is validated as EmailStr by Pydantic — guaranteed non-None here.
+    effective_email = str(body.email)
+    # Resolve the effective username (may have been derived from email in validator).
+    # _derive_username_if_absent model_validator guarantees non-None; assert for mypy.
+    assert body.username is not None, "username must be non-None after model validation"
+    effective_username: str = body.username
 
     # Enforce license tier end-user limit
     from yashigani.licensing.enforcer import check_end_user_limit, LicenseLimitExceeded
@@ -89,7 +139,8 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
             detail={"error": "end_user_limit_exceeded", "limit": exc.max_val, "current": exc.current},
         )
 
-    if await state.auth_service.get_account(body.username) is not None:
+    # Check username uniqueness (email-as-username also checked via set_email below).
+    if await state.auth_service.get_account(effective_username) is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": "username_taken"},
@@ -98,26 +149,26 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     from yashigani.auth.password import generate_password
 
     temp_password = generate_password(36)
-    record = await state.auth_service.create_user(body.username, temp_password)
-    if body.email:
-        await state.auth_service.set_email(body.username, body.email)
-        record.email = body.email
+    record = await state.auth_service.create_user(effective_username, temp_password)
+    # Always set email — it is required for user-tier accounts (Gap 1).
+    await state.auth_service.set_email(effective_username, effective_email)
+    record.email = effective_email
 
     # Generate TOTP secret for provisioning — installer-privileged path
     # because the admin is performing an out-of-band TOTP delivery.
-    totp = generate_provisioning(account_name=body.username, issuer="Yashigani")
-    await state.auth_service.set_totp_secret_direct(body.username, totp.secret_b32)
+    totp = generate_provisioning(account_name=effective_username, issuer="Yashigani")
+    await state.auth_service.set_totp_secret_direct(effective_username, totp.secret_b32)
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned, user just needs the URI
 
-    state.audit_writer.write(_config_event(session.account_id, "user_account_created", "", body.username))
+    state.audit_writer.write(_config_event(session.account_id, "user_account_created", "", effective_username))
     # BOPLA allowlist (#90): UserCreateResponse is the ONLY response type
     # permitted to include totp_secret/temporary_password. This is an explicit
     # one-time-delivery exception documented in bopla-allowlist.md.
     return UserCreateResponse(
         status="ok",
         account_id=record.account_id,
-        username=body.username,
+        username=effective_username,
         temporary_password=temp_password,
         totp_secret=totp.secret_b32,
         totp_uri=totp.provisioning_uri,
