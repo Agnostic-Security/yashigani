@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
-# Last updated: 2026-05-14T21:00:00+00:00 (feat: remove auto-start artifacts on uninstall — BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
+# Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,8 +67,10 @@ _CANONICAL_VOLUMES=(
 # Called BEFORE compose down so that a reboot mid-uninstall does not
 # re-start the stack.
 #
-# Tiago directive 2026-05-14: loginctl disable-linger is UNCONDITIONAL on
-# any uninstall (not gated on --remove-volumes).
+# Tiago directive 2026-05-14 (Q3): loginctl disable-linger is gated on
+# --remove-volumes. Plain uninstall preserves linger so a re-install picks
+# up the user systemd instance cleanly. --remove-volumes is the full-clean
+# exit path that removes data + linger together.
 # BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
 # ---------------------------------------------------------------------------
 _remove_auto_start() {
@@ -119,22 +121,26 @@ _remove_auto_start() {
     echo "  [skip]    User unit not found: ${_user_unit}"
   fi
 
-  # Linger: unconditional on any uninstall (Tiago directive 2026-05-14).
-  # loginctl disable-linger stops the user's systemd instance from persisting
-  # across logouts and from starting at boot.
-  local _current_user
-  _current_user="$(id -un)"
-  local _linger_state
-  _linger_state="$(loginctl show-user "$_current_user" --property=Linger --value 2>/dev/null || echo 'unknown')"
-  if [[ "$_linger_state" == "yes" ]]; then
-    if loginctl disable-linger "$_current_user" 2>/dev/null \
-       || sudo -n loginctl disable-linger "$_current_user" 2>/dev/null; then
-      echo "  [removed] Linger disabled for ${_current_user}"
+  # Linger: gated on --remove-volumes (Tiago directive 2026-05-14 Q3).
+  # Plain uninstall preserves linger so a re-install picks up the user
+  # systemd instance cleanly. --remove-volumes is the full-clean exit path.
+  if [[ "${REMOVE_VOLUMES:-false}" == "true" ]]; then
+    local _current_user
+    _current_user="$(id -un)"
+    local _linger_state
+    _linger_state="$(loginctl show-user "$_current_user" --property=Linger --value 2>/dev/null || echo 'unknown')"
+    if [[ "$_linger_state" == "yes" ]]; then
+      if loginctl disable-linger "$_current_user" 2>/dev/null \
+         || sudo -n loginctl disable-linger "$_current_user" 2>/dev/null; then
+        echo "  [removed] Linger disabled for ${_current_user}"
+      else
+        echo "  [warn]    Could not disable linger for ${_current_user} — run: loginctl disable-linger ${_current_user}" >&2
+      fi
     else
-      echo "  [warn]    Could not disable linger for ${_current_user} — run: loginctl disable-linger ${_current_user}" >&2
+      echo "  [skip]    Linger not active for ${_current_user} (state: ${_linger_state})"
     fi
   else
-    echo "  [skip]    Linger not active for ${_current_user} (state: ${_linger_state})"
+    echo "  [skip]    Linger left enabled — pass --remove-volumes to disable"
   fi
 }
 
