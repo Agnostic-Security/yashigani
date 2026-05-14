@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
 # last-updated: 2026-05-13T15:00:00+00:00 (fix(podman): scope :U-override-load to macOS Podman only — LINUX-SHARED-MOUNT-UID-CLOBBER)
 # last-updated: 2026-05-13T13:00:00+00:00 (fix(podman): always apply :U-bearing override on macOS Podman — MACOS-PODMAN-OVERRIDE-LOAD-GAP)
 # last-updated: 2026-05-13T00:00:00+00:00 (fix(podman): add :U to all secret bind-mounts and ephemeral chown — MACOS-PODMAN-PKI-VIRTIOFS-U)
@@ -3586,6 +3587,313 @@ _podman_verify_healthchecks() {
 }
 
 # =============================================================================
+# STEP 10b: Container auto-start on host reboot
+# =============================================================================
+# Installs OS-level auto-start artifacts so Yashigani containers survive a
+# host reboot without operator intervention.
+#
+# Runtime class dispatch:
+#   k8s         → no-op (pod restart is controller-native)
+#   macOS       → LaunchAgent plist (login-only; dev-workstation target v2.23.4)
+#   Linux Docker → verify/enable docker.service; rely on restart: unless-stopped
+#   Linux Podman rootful  → /etc/systemd/system/yashigani.service
+#   Linux Podman rootless → loginctl enable-linger + ~/.config/systemd/user/yashigani.service
+#
+# All sub-functions are idempotent: re-running overwrites existing units safely.
+# BUG: BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+# =============================================================================
+
+# Dispatcher — determines runtime class and calls the appropriate sub-function.
+_setup_auto_start() {
+  # K8s: not our concern. Controllers handle pod restart natively.
+  if [[ "${YSG_RUNTIME:-}" == "k8s" || "${MODE:-}" == "k8s" ]]; then
+    log_info "Auto-start: K8s runtime — skipping (pod restart managed by controller)"
+    return 0
+  fi
+
+  # macOS: LaunchAgent path regardless of Podman/Docker
+  if [[ "${YSG_OS:-}" == "macos" ]]; then
+    _setup_auto_start_macos
+    return
+  fi
+
+  # Linux Docker
+  if [[ "${YSG_RUNTIME:-}" == "docker" ]]; then
+    _setup_auto_start_docker_linux
+    return
+  fi
+
+  # Linux Podman rootful (EUID=0)
+  if [[ "${YSG_RUNTIME:-}" == "podman" && "$(id -u)" == "0" ]]; then
+    _setup_auto_start_podman_rootful
+    return
+  fi
+
+  # Linux Podman rootless (EUID != 0)
+  if [[ "${YSG_RUNTIME:-}" == "podman" && "$(id -u)" != "0" ]]; then
+    _setup_auto_start_podman_rootless
+    return
+  fi
+
+  log_warn "Auto-start: could not determine runtime class — skipping. Containers will NOT auto-start on reboot."
+}
+
+# Linux rootful Podman: writes /etc/systemd/system/yashigani.service
+# Rootful installs run as root so no sudo is needed for unit writes.
+_setup_auto_start_podman_rootful() {
+  log_info "Auto-start: configuring systemd service for rootful Podman (Linux)..."
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log_warn "Auto-start: systemctl not found — skipping (non-systemd host)."
+    log_warn "  Containers will NOT auto-start on reboot. Start manually:"
+    log_warn "    cd ${WORK_DIR} && ${COMPOSE_CMD[*]} -f docker/docker-compose.yml up -d"
+    return 0
+  fi
+
+  local unit_file="/etc/systemd/system/yashigani.service"
+  local compose_cmd_str="${COMPOSE_CMD[*]}"
+
+  # Write unit file (rootful install runs as root — no sudo needed)
+  cat > "$unit_file" <<EOF
+[Unit]
+Description=Yashigani MCP Security Gateway
+Documentation=https://yashigani.io
+After=network-online.target podman.socket.service
+Wants=network-online.target
+Requires=podman.socket.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${WORK_DIR}
+ExecStart=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml up -d
+ExecStop=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml stop
+TimeoutStartSec=300
+TimeoutStopSec=120
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  chmod 644 "$unit_file"
+
+  # Reload daemon so systemd picks up the new unit
+  systemctl daemon-reload
+
+  # Enable (creates symlink in wants; survives reboots)
+  if systemctl enable yashigani.service; then
+    log_success "Auto-start: yashigani.service enabled — containers will start on next boot"
+  else
+    log_warn "Auto-start: systemctl enable failed — containers may NOT auto-start on reboot"
+    log_warn "  Run manually: systemctl enable yashigani.service"
+  fi
+
+  # Verify and surface state so operator can see it in the same terminal session
+  local _enabled
+  _enabled="$(systemctl is-enabled yashigani.service 2>/dev/null || echo 'unknown')"
+  if [[ "$_enabled" != "enabled" ]]; then
+    log_warn "Auto-start: unit is '${_enabled}' (expected 'enabled') — check: journalctl -xe"
+  else
+    log_info "Auto-start: systemctl is-enabled yashigani.service → ${_enabled}"
+  fi
+}
+
+# Linux rootless Podman: loginctl enable-linger + ~/.config/systemd/user/yashigani.service
+_setup_auto_start_podman_rootless() {
+  log_info "Auto-start: configuring user systemd service for rootless Podman (Linux)..."
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log_warn "Auto-start: systemctl not found — skipping (non-systemd host)."
+    log_warn "  Containers will NOT auto-start on reboot. Start manually:"
+    log_warn "    cd ${WORK_DIR} && ${COMPOSE_CMD[*]} -f docker/docker-compose.yml up -d"
+    return 0
+  fi
+
+  local _runtime_user
+  _runtime_user="$(id -un)"
+
+  # Step 1: Enable linger (MUST precede unit enable)
+  # loginctl enable-linger requires the user's systemd instance to persist after
+  # logout and start before login — without it, containers die on logout and
+  # cannot auto-start on boot.
+  # Try direct first (works when the running user has the capability); fall
+  # back to sudo -n (non-interactive, so CI and scripted installs don't hang).
+  if loginctl enable-linger "$_runtime_user" 2>/dev/null; then
+    log_success "Auto-start: linger enabled for ${_runtime_user}"
+  elif sudo -n loginctl enable-linger "$_runtime_user" 2>/dev/null; then
+    log_success "Auto-start: linger enabled for ${_runtime_user} (via sudo)"
+  else
+    log_warn "Auto-start: could not enable linger for ${_runtime_user}."
+    log_warn "  Run manually: loginctl enable-linger ${_runtime_user}"
+    log_warn "  Without linger, containers will die on logout and will NOT auto-start on boot."
+    # Continue — unit install is still useful if linger is added later manually
+  fi
+
+  # Step 2: Create user systemd unit directory if absent
+  local unit_dir="${HOME}/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  chmod 700 "$unit_dir"
+
+  local unit_file="${unit_dir}/yashigani.service"
+  local compose_cmd_str="${COMPOSE_CMD[*]}"
+
+  cat > "$unit_file" <<EOF
+[Unit]
+Description=Yashigani MCP Security Gateway
+Documentation=https://yashigani.io
+After=default.target podman.socket
+Wants=default.target
+Requires=podman.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${WORK_DIR}
+ExecStart=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml up -d
+ExecStop=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml stop
+TimeoutStartSec=300
+TimeoutStopSec=120
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+
+  chmod 600 "$unit_file"
+
+  # Reload and enable in the user systemd instance
+  systemctl --user daemon-reload
+
+  if systemctl --user enable yashigani.service; then
+    log_success "Auto-start: user yashigani.service enabled"
+  else
+    log_warn "Auto-start: systemctl --user enable failed — check: systemctl --user status yashigani.service"
+  fi
+
+  # Surface linger state so the operator can verify in the same terminal session
+  local _linger
+  _linger="$(loginctl show-user "$_runtime_user" --property=Linger --value 2>/dev/null || echo 'unknown')"
+  if [[ "$_linger" != "yes" ]]; then
+    log_warn "Auto-start: Linger=${_linger} for ${_runtime_user}. Without linger, service will not start on boot."
+  else
+    log_info "Auto-start: Linger=${_linger} for ${_runtime_user}"
+  fi
+}
+
+# Linux Docker: verify docker.service is enabled; rely on restart: unless-stopped
+# No unit file is written — Docker manages its own daemon lifecycle.
+_setup_auto_start_docker_linux() {
+  log_info "Auto-start: verifying Docker daemon auto-start (Linux)..."
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log_warn "Auto-start: systemctl not found. Verify docker.service starts on boot manually."
+    return 0
+  fi
+
+  local _docker_enabled
+  _docker_enabled="$(systemctl is-enabled docker 2>/dev/null || echo 'unknown')"
+
+  if [[ "$_docker_enabled" == "enabled" || "$_docker_enabled" == "static" ]]; then
+    log_info "Auto-start: docker.service is ${_docker_enabled} — restart: unless-stopped covers container restart"
+    return 0
+  fi
+
+  # Not enabled — attempt to enable (Docker installs typically auto-enable; this
+  # is a safety net for stripped-down or minimal Docker installations)
+  log_warn "Auto-start: docker.service is '${_docker_enabled}' (not enabled). Enabling now..."
+  if systemctl enable docker 2>/dev/null; then
+    log_success "Auto-start: docker.service enabled — containers will restart on next boot via restart: unless-stopped"
+  else
+    log_warn "Auto-start: could not enable docker.service. Run: systemctl enable docker"
+    log_warn "  Without this, containers will NOT auto-start on host reboot."
+  fi
+}
+
+# macOS Podman: installs ~/Library/LaunchAgents/io.yashigani.autostart.plist
+#
+# IMPORTANT — v2.23.4 LIMITATION:
+#   This LaunchAgent fires at USER LOGIN, not at system boot. Yashigani on
+#   macOS will auto-start when the admin user logs in, but NOT on an unattended
+#   reboot before login. This is the correct target for the macOS-Podman
+#   dev-workstation persona in v2.23.4. A LaunchDaemon (boot-time, root-owned)
+#   is deferred — see BUG-REBOOT-NO-AUTO-START out-of-scope items.
+#
+# Docker Desktop on macOS manages its own "Start at login" setting via its
+# system-tray UI; we do not install a competing LaunchAgent for that path.
+_setup_auto_start_macos() {
+  log_info "Auto-start: configuring LaunchAgent for macOS Podman..."
+
+  if [[ "${YSG_RUNTIME:-}" != "podman" ]]; then
+    log_info "Auto-start: macOS Docker path — Docker Desktop manages its own login-item. Skipping."
+    return 0
+  fi
+
+  local launch_agents_dir="${HOME}/Library/LaunchAgents"
+  mkdir -p "$launch_agents_dir"
+  local plist="${launch_agents_dir}/io.yashigani.autostart.plist"
+  local compose_cmd_str="${COMPOSE_CMD[*]}"
+
+  # Resolve full path to compose binary — LaunchAgent env may lack PATH entries
+  # present in the user's interactive shell (e.g. Homebrew prefix not in PATH)
+  local _compose_bin
+  _compose_bin="$(command -v podman-compose 2>/dev/null || command -v podman 2>/dev/null || echo 'podman-compose')"
+
+  # Ensure log dir exists before launchctl registers it as a log target
+  mkdir -p "${HOME}/.yashigani/logs"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.yashigani.autostart</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>podman machine start 2&gt;/dev/null; ${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml up -d</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${WORK_DIR}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${HOME}/.yashigani/logs/autostart.log</string>
+  <key>StandardErrorPath</key>
+  <string>${HOME}/.yashigani/logs/autostart-error.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>${HOME}</string>
+  </dict>
+</dict>
+</plist>
+EOF
+
+  chmod 644 "$plist"
+
+  # Load immediately so it is registered for this login session
+  launchctl load "$plist" 2>/dev/null || true
+
+  log_success "Auto-start: LaunchAgent installed at ${plist}"
+  log_info "  Services will auto-start on next login."
+  log_info "  Logs: ${HOME}/.yashigani/logs/autostart.log"
+  log_warn "  NOTE (v2.23.4): LaunchAgent fires at USER LOGIN, not at boot."
+  log_warn "  On an unattended macOS server, a LaunchDaemon is required (root-owned, deferred to v2.23.5+)."
+}
+
+# =============================================================================
 # STEP 10c (compose/vm, upgrade only): Postgres SSL upgrade injection
 # =============================================================================
 # When upgrading FROM a version that lacked internal mTLS (v2.22.x and earlier),
@@ -6257,6 +6565,12 @@ main() {
 
     # Step 10: docker compose up -d
     compose_up
+
+    # Step 10b: Install auto-start units so containers survive a host reboot.
+    # Runs after compose_up so WORK_DIR + COMPOSE_CMD are fully resolved.
+    # Runs before health-check so unit state is visible in the same terminal session.
+    # BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+    _setup_auto_start
 
     # Step 10c: Inject postgres SSL when upgrading from a version without mTLS.
     # This runs AFTER compose_up (postgres must be running) but BEFORE

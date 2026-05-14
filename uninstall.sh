@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
-# Last updated: 2026-05-13T00:00:00+01:00 (fix: UNINSTALL-LEAVES-VOLUMES #8 — explicit volume rm loop)
+# Last updated: 2026-05-14T21:00:00+00:00 (feat: remove auto-start artifacts on uninstall — BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,6 +59,84 @@ _CANONICAL_VOLUMES=(
     wazuh_dashboard_config
     wazuh_dashboard_custom
 )
+
+# ---------------------------------------------------------------------------
+# _remove_auto_start — disables and removes OS-level auto-start artifacts
+# installed by install.sh _setup_auto_start.
+#
+# Called BEFORE compose down so that a reboot mid-uninstall does not
+# re-start the stack.
+#
+# Tiago directive 2026-05-14: loginctl disable-linger is UNCONDITIONAL on
+# any uninstall (not gated on --remove-volumes).
+# BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+# ---------------------------------------------------------------------------
+_remove_auto_start() {
+  echo "=== Removing auto-start configuration ==="
+  local _os
+  _os="$(uname -s)"
+
+  # macOS LaunchAgent
+  if [[ "$_os" == "Darwin" ]]; then
+    local _plist="${HOME}/Library/LaunchAgents/io.yashigani.autostart.plist"
+    if [[ -f "$_plist" ]]; then
+      launchctl unload "$_plist" 2>/dev/null || true
+      rm -f "$_plist"
+      echo "  [removed] LaunchAgent: ${_plist}"
+    else
+      echo "  [skip]    LaunchAgent not found: ${_plist}"
+    fi
+    return 0
+  fi
+
+  # Linux — systemd present?
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "  [skip] systemctl not found — no auto-start units to remove"
+    return 0
+  fi
+
+  # Rootful unit: /etc/systemd/system/yashigani.service
+  local _sys_unit="/etc/systemd/system/yashigani.service"
+  if [[ -f "$_sys_unit" ]]; then
+    systemctl disable yashigani.service 2>/dev/null || true
+    systemctl stop yashigani.service 2>/dev/null || true
+    rm -f "$_sys_unit"
+    systemctl daemon-reload 2>/dev/null || true
+    echo "  [removed] System unit: ${_sys_unit}"
+  else
+    echo "  [skip]    System unit not found: ${_sys_unit}"
+  fi
+
+  # Rootless unit: ~/.config/systemd/user/yashigani.service
+  local _user_unit="${HOME}/.config/systemd/user/yashigani.service"
+  if [[ -f "$_user_unit" ]]; then
+    systemctl --user disable yashigani.service 2>/dev/null || true
+    systemctl --user stop yashigani.service 2>/dev/null || true
+    rm -f "$_user_unit"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "  [removed] User unit: ${_user_unit}"
+  else
+    echo "  [skip]    User unit not found: ${_user_unit}"
+  fi
+
+  # Linger: unconditional on any uninstall (Tiago directive 2026-05-14).
+  # loginctl disable-linger stops the user's systemd instance from persisting
+  # across logouts and from starting at boot.
+  local _current_user
+  _current_user="$(id -un)"
+  local _linger_state
+  _linger_state="$(loginctl show-user "$_current_user" --property=Linger --value 2>/dev/null || echo 'unknown')"
+  if [[ "$_linger_state" == "yes" ]]; then
+    if loginctl disable-linger "$_current_user" 2>/dev/null \
+       || sudo -n loginctl disable-linger "$_current_user" 2>/dev/null; then
+      echo "  [removed] Linger disabled for ${_current_user}"
+    else
+      echo "  [warn]    Could not disable linger for ${_current_user} — run: loginctl disable-linger ${_current_user}" >&2
+    fi
+  else
+    echo "  [skip]    Linger not active for ${_current_user} (state: ${_linger_state})"
+  fi
+}
 
 for arg in "$@"; do
     case "$arg" in
@@ -127,6 +205,12 @@ else
     DOWN_ARGS="--remove-orphans"
 fi
 
+# Step 1: Remove auto-start units BEFORE stopping containers.
+# Disabling first prevents a reboot mid-uninstall from re-starting the stack.
+# BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+_remove_auto_start
+
+# Step 2: Stop the compose stack
 # shellcheck disable=SC2086
 $COMPOSE -f "$COMPOSE_FILE" down $DOWN_ARGS
 
