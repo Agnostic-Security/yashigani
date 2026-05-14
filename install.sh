@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-15T00:00:00+00:00 (fix(install): move linger-enable to pre-flight, drop privileged-linger shortcut from install body — Q2 / lint-sudo-pattern fix)
 # last-updated: 2026-05-14T22:00:00+00:00 (docs(saml): document + sanity-check RSA SP key requirement — ACS-RISK-044)
 # last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
 # last-updated: 2026-05-13T15:00:00+00:00 (fix(podman): scope :U-override-load to macOS Podman only — LINUX-SHARED-MOUNT-UID-CLOBBER)
@@ -1173,6 +1174,42 @@ check_installer_preflight() {
           printf "       A 'no space left on device' mid-build can leave the stack in a broken state.\n\n"
         fi
       fi
+    fi
+  fi
+
+  # --- Check 1c: rootless Podman linger pre-flight ---------------------------
+  # loginctl linger must be enabled for the install user BEFORE install runs;
+  # without it the user's systemd instance is killed on logout and the
+  # yashigani.service unit cannot start containers at boot.
+  # The installer body never runs sudo (feedback_audience_sysadmins), so this
+  # is a pure warning — the operator must enable linger manually as a
+  # pre-flight step. We pause briefly so the operator can Ctrl-C and act.
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" || "${YSG_RUNTIME:-}" == "podman" ]] \
+     && [[ "$(id -u)" != "0" ]]; then
+    local _linger_val
+    _linger_val="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo "no")"
+    if [[ "$_linger_val" != "yes" ]]; then
+      printf "\n"
+      printf "============================================================\n"
+      printf "PRE-FLIGHT WARNING\n"
+      printf "============================================================\n"
+      printf "Rootless Podman install detected.\n"
+      printf "Linger is NOT enabled for user: %s\n" "$USER"
+      printf "\n"
+      printf "Without linger, containers will not auto-start on boot.\n"
+      printf "\n"
+      printf "To enable linger BEFORE this install (recommended):\n"
+      printf "\n"
+      printf "    sudo loginctl enable-linger %s\n" "$USER"
+      printf "\n"
+      printf "Then re-run install.sh.\n"
+      printf "\n"
+      printf "Continuing without linger — containers will install but will\n"
+      printf "require manual \`loginctl enable-linger\` and restart to gain\n"
+      printf "auto-start capability.\n"
+      printf "============================================================\n"
+      printf "\n"
+      sleep 3
     fi
   fi
 
@@ -3835,17 +3872,23 @@ _setup_auto_start_podman_rootless() {
   # loginctl enable-linger requires the user's systemd instance to persist after
   # logout and start before login — without it, containers die on logout and
   # cannot auto-start on boot.
-  # Try direct first (works when the running user has the capability); fall
-  # back to sudo -n (non-interactive, so CI and scripted installs don't hang).
+  # The install body never runs sudo (feedback_audience_sysadmins). Linger
+  # enablement is a documented pre-flight step (sudo loginctl enable-linger).
+  # If the current user already has the capability (e.g. rootful), direct
+  # loginctl works; otherwise we warn with a copy-pasteable remediation.
   if loginctl enable-linger "$_runtime_user" 2>/dev/null; then
     log_success "Auto-start: linger enabled for ${_runtime_user}"
-  elif sudo -n loginctl enable-linger "$_runtime_user" 2>/dev/null; then
-    log_success "Auto-start: linger enabled for ${_runtime_user} (via sudo)"
   else
-    log_warn "Auto-start: could not enable linger for ${_runtime_user}."
-    log_warn "  Run manually: loginctl enable-linger ${_runtime_user}"
-    log_warn "  Without linger, containers will die on logout and will NOT auto-start on boot."
-    # Continue — unit install is still useful if linger is added later manually
+    log_warn "Auto-start: linger NOT enabled for ${_runtime_user}."
+    log_warn ""
+    log_warn "Without linger, containers will die on logout and will NOT auto-start on boot."
+    log_warn ""
+    log_warn "To enable linger, run BEFORE the next install/restart:"
+    log_warn ""
+    log_warn "    sudo loginctl enable-linger ${_runtime_user}"
+    log_warn ""
+    log_warn "Then re-run install.sh to set up the auto-start service unit."
+    # Continue — unit install is still useful if linger is added later
   fi
 
   # Step 2: Create user systemd unit directory if absent

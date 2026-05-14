@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-15T00:00:00+00:00 (fix(uninstall): drop privileged-linger shortcut from disable-linger, copy-pasteable remediation — Q2 / lint-sudo-pattern fix)
 # Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
 
 set -euo pipefail
@@ -130,11 +131,12 @@ _remove_auto_start() {
     local _linger_state
     _linger_state="$(loginctl show-user "$_current_user" --property=Linger --value 2>/dev/null || echo 'unknown')"
     if [[ "$_linger_state" == "yes" ]]; then
-      if loginctl disable-linger "$_current_user" 2>/dev/null \
-         || sudo -n loginctl disable-linger "$_current_user" 2>/dev/null; then
+      if loginctl disable-linger "$_current_user" 2>/dev/null; then
         echo "  [removed] Linger disabled for ${_current_user}"
       else
-        echo "  [warn]    Could not disable linger for ${_current_user} — run: loginctl disable-linger ${_current_user}" >&2
+        echo "  [warn]    Linger could NOT be disabled for ${_current_user}." >&2
+        echo "  [warn]    To remove, run as root:" >&2
+        echo "  [warn]        sudo loginctl disable-linger ${_current_user}" >&2
       fi
     else
       echo "  [skip]    Linger not active for ${_current_user} (state: ${_linger_state})"

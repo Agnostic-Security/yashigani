@@ -1,7 +1,7 @@
 # Yashigani — Installation and Configuration Guide
 
-**Version:** 2.23.2
-**Last updated:** 2026-05-07T01:00:00+01:00
+**Version:** 2.23.4
+**Last updated:** 2026-05-15T00:00:00+00:00
 **Applies to:** Docker Compose and Kubernetes (Helm) deployments
 
 ---
@@ -128,6 +128,32 @@ Yashigani is designed for sysadmin operators. The privilege model is layered to 
 - All workloads enforce non-root via Kubernetes admission policies (Kyverno) — any pod that drifts is rejected at the admission webhook.
 - The Ollama persistent volume is sized for both model weights AND per-user inference data (default 100 GiB; increase via `ollama.persistence.size` for heavy multi-user document workloads).
 - For a fully root-free runtime, replace `edoburu/pgbouncer` with a managed connection pooler that ships non-root upstream — Yashigani's gateway and backoffice support direct PostgreSQL connections when PgBouncer is removed from the topology.
+
+#### Pre-flight: enable linger (rootless Podman only)
+
+If installing Yashigani as rootless Podman (`--runtime=podman` as a non-root user),
+you MUST enable systemd linger for the install user before running `install.sh`.
+Without linger, containers will not auto-start on host boot.
+
+Run this once, as root:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+This is a one-time setup. Subsequent re-installs do not require re-running it.
+
+To verify linger is enabled:
+
+```bash
+loginctl show-user $USER --property=Linger --value
+# expected output: yes
+```
+
+If you do not enable linger, `install.sh` will emit a pre-flight warning with a
+copy-pasteable command and pause for 3 seconds; the install will continue but the
+auto-start service unit will not function until linger is enabled and the system is
+restarted.
 
 ---
 
