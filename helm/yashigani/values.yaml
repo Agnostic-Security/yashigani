@@ -1,6 +1,6 @@
 # Yashigani v2.23.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-10 (fix: G16 image-pin — langgraph floating-tag stub replaced with not-yet-available hold-back)
+# Last updated: 2026-05-15 (fix: admissionPolicies default false — Kyverno not bundled; feat: CRD pre-install guard)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -88,11 +88,15 @@ networkPolicies:
 #   - capabilities.drop: [ALL] (every container)
 #   - No runAsUser: 0 (except documented exceptions)
 #
-# PREREQUISITE: Kyverno must be installed cluster-wide BEFORE applying the
-# release. See helm/yashigani/policies/admission/README.md for install steps.
+# Set to true only AFTER installing Kyverno cluster-wide
+# (`helm install kyverno kyverno/kyverno -n kyverno --create-namespace`).
+# The chart does not bundle Kyverno.
 #
-# Set to false if the cluster does not have Kyverno (e.g. during initial
-# bootstrap before Kyverno is installed). Document in risk register.
+# In CNI environments or clusters without Kyverno the ClusterPolicy CRD will
+# not be present and helm install/upgrade will fail with an opaque API-server
+# error. Leaving this false means application-layer mTLS + SPIFFE gate remain
+# active; document any disablement in the risk register with maintainer
+# sign-off, referencing ACS-RISK-008.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # LIC-002 SECURITY NOTICE — YASHIGANI_LICENSE_TIER is NOT an operator-settable
@@ -109,7 +113,7 @@ networkPolicies:
 # as a HIGH-severity finding and remove it before deploying.
 # ---------------------------------------------------------------------------
 admissionPolicies:
-  enabled: true
+  enabled: false
   # Kyverno policy action: Enforce (hard reject) or Audit (log only).
   # Must be Enforce in production. Audit only during rollout evaluation.
   validationFailureAction: Enforce
