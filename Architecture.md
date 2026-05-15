@@ -1,3 +1,4 @@
+<!-- last-updated: 2026-05-15T12:00:00+01:00 (docs: also clean v0.6.0 version-table cell — Linux/macOS/cloud/VM → Linux/macOS — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal/no-container install claims — v2.23.4) -->
 # Yashigani Architecture and Feature History
 
@@ -156,7 +157,7 @@ The current release narrative (v2.23.0 + v2.23.1 + v2.23.2) is in the [README](R
 | v0.7.0 | Operational hardening + OPA Policy Assistant | ECDSA P-256 key active, DB partition automation + monitoring, OPA Policy Assistant (NL → RBAC JSON), MCP quick-start snippets, direct webhook alerting (Slack/Teams/PagerDuty), CIDR IP allowlisting per agent, path matching parity fix, runtime-configurable rate limit thresholds |
 | v0.6.2 | Starter tier + three-dimensional limits | 5-tier model adds Starter (OIDC-only), max_end_users + max_admin_seats split, v3 license payload schema |
 | v0.6.1 | Tier restructuring + open-source licensing | 4-tier model (Community/Professional/Professional Plus/Enterprise), Apache 2.0 community license, CLA framework |
-| v0.6.0 | Universal installer + licensing | Linux/macOS/cloud/VM installer, 3-tier licensing (Community/Professional/Enterprise), ECDSA P-256 license verification, feature gates |
+| v0.6.0 | Universal installer + licensing | Linux/macOS installer (Docker/Podman runtime required), 3-tier licensing (Community/Professional/Enterprise), ECDSA P-256 license verification, feature gates |
 | v0.5.0 | Data plane hardening + observability | PostgreSQL 16 RLS + AES-256-GCM, pg_partman, PgBouncer, JWT introspection (JWKS waterfall), multi-sink audit, OTEL/Jaeger, FastText ML, Vault KMS, Loki, Alertmanager, per-endpoint rate limiting, response caching, Wazuh, anomaly detection, inference logging, container hardening, structured JSON logging |
 | v0.4.0 | Cloud-native operations | Kubernetes Helm charts, GitHub Actions CI/CD, KEDA autoscaling, pod disruption budgets, network policies, Trivy scanning, CODEOWNERS |
 | v0.3.0 | Enterprise identity + inspection | RBAC via OPA, agent routing, multi-backend inspection (5 providers), OIDC + SAML v2 SSO, SCIM, fail-closed sentinel, response masking, payload masking |
