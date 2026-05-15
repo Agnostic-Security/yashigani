@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-15T12:00:00+00:00 (fix(uninstall): force-remove dependent containers before volume rm — BUG-UNINSTALL-DEPGRAPH-LEAK)
 # Last updated: 2026-05-15T10:00:00+00:00 (fix(uninstall): stub docker/.env for compose-down in DR scenario — BUG-UNINSTALL-NO-ENV)
 # Last updated: 2026-05-15T00:00:00+00:00 (fix(uninstall): drop privileged-linger shortcut from disable-linger, copy-pasteable remediation — Q2 / lint-sudo-pattern fix)
 # Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
@@ -280,6 +281,81 @@ trap _cleanup_stub EXIT
 # ---------------------------------------------------------------------------
 # shellcheck disable=SC2086
 $COMPOSE -f "$COMPOSE_FILE" down $DOWN_ARGS
+
+# ---------------------------------------------------------------------------
+# BUG-UNINSTALL-DEPGRAPH-LEAK: belt-and-braces container force-removal.
+#
+# podman-compose ≤1.3.x has known parity issues with depends_on ordering on
+# teardown: containers that were in Exited state (not running) may not be
+# removed by `compose down` when they originated from a different checkout or
+# were stopped externally. Any Exited container that still references a named
+# volume keeps that volume locked — `volume rm` then fails with "still in use".
+#
+# Fix: after compose down, enumerate ALL project containers (running OR exited)
+# and force-remove any that remain. The enumeration uses two complementary
+# strategies so it works on both Docker Engine and Podman:
+#
+#   1. Label filter: `--filter label=io.podman.compose.project=docker` (Podman)
+#      or `--filter label=com.docker.compose.project=docker` (Docker Engine).
+#      The project name is derived from the compose file's parent dir: "docker".
+#
+#   2. Name-prefix fallback: containers whose name starts with "docker_" or
+#      "docker-" (podman-compose vs docker compose naming conventions).
+#
+# The loop is idempotent: if compose-down already removed all containers,
+# `$RUNTIME ps -a -q ...` returns nothing and no rm is attempted.
+#
+# Both rootful (sudo $RUNTIME) and rootless ($RUNTIME without sudo) paths are
+# covered by using the same $RUNTIME variable resolved above.
+# ---------------------------------------------------------------------------
+_PROJECT_PREFIX="docker"
+echo "=== Belt-and-braces: removing any remaining project containers (BUG-UNINSTALL-DEPGRAPH-LEAK) ==="
+_remaining_ids=""
+
+# Strategy 1: label filter — try both compose-label variants
+# podman-compose sets io.podman.compose.project; docker compose sets com.docker.compose.project
+for _label_key in "io.podman.compose.project" "com.docker.compose.project"; do
+    _ids="$("$RUNTIME" ps -a -q --filter "label=${_label_key}=${_PROJECT_PREFIX}" 2>/dev/null || true)"
+    if [ -n "$_ids" ]; then
+        _remaining_ids="${_remaining_ids}${_ids}
+"
+    fi
+done
+
+# Strategy 2: name-prefix filter — catches containers named docker_* or docker-*
+# podman-compose names: docker_<service>_<n>; docker compose: docker-<service>-<n>
+_ids_by_name="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null || true)"
+if [ -n "$_ids_by_name" ]; then
+    _remaining_ids="${_remaining_ids}${_ids_by_name}
+"
+fi
+
+# Deduplicate and remove blank lines
+_remaining_ids="$(printf '%s' "$_remaining_ids" | sort -u | grep -v '^$' || true)"
+
+if [ -n "$_remaining_ids" ]; then
+    _container_count="$(printf '%s\n' "$_remaining_ids" | grep -c '.'  || echo 0)"
+    echo "  Found ${_container_count} remaining container(s) — force-removing..."
+    _rm_ok=0
+    _rm_fail=0
+    while IFS= read -r _cid; do
+        [ -z "$_cid" ] && continue
+        _cname="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
+        if "$RUNTIME" rm -f "$_cid" >/dev/null 2>&1; then
+            echo "  [removed] container: ${_cname} (${_cid})"
+            _rm_ok=$(( _rm_ok + 1 ))
+        else
+            echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
+            _rm_fail=$(( _rm_fail + 1 ))
+        fi
+    done <<< "$_remaining_ids"
+    echo "Container cleanup: ${_rm_ok} removed, ${_rm_fail} failed."
+    if [ "$_rm_fail" -gt 0 ]; then
+        echo "  [WARN] ${_rm_fail} container(s) could not be removed. Volume rm may still fail." >&2
+    fi
+else
+    echo "  [ok]    No remaining project containers found."
+fi
 
 # ---------------------------------------------------------------------------
 # Explicit per-volume cleanup — UNINSTALL-LEAVES-VOLUMES (#8)
