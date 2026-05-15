@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-15T12:00:00+00:00 (fix(install): detect contaminated volumes + verify healthz on convergence — BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
 # last-updated: 2026-05-15T00:00:00+00:00 (fix(install): move linger-enable to pre-flight, drop privileged-linger shortcut from install body — Q2 / lint-sudo-pattern fix)
 # last-updated: 2026-05-14T22:00:00+00:00 (docs(saml): document + sanity-check RSA SP key requirement — ACS-RISK-044)
 # last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
@@ -139,6 +140,7 @@ INSTALL_WAZUH=false       # opt-in: --wazuh flag
 INSTALL_OPENWEBUI=false   # opt-in: --with-openwebui flag
 INSTALL_INTERNAL_CA=false # opt-in: --with-internal-ca flag
 COMPOSE_PROFILES=()       # populated by select_agent_bundles()
+REUSE_VOLUMES=false        # --reuse-volumes: skip contaminated-volume pre-check (BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
 
 # Internal mTLS PKI — two-tier (root → intermediate → leaf).
 # Lifetimes are clamped to the bounds in docker/service_identities.yaml
@@ -201,6 +203,11 @@ OPTIONS
   --skip-preflight                        Skip preflight checks
   --skip-pull                             Skip docker compose pull (use local images)
   --upgrade                               Upgrade an existing installation
+  --reuse-volumes                         Skip pre-install contaminated-volume detection.
+                                          Use only when deliberately reusing volumes from a
+                                          previous install (data-in-place upgrade path).
+                                          WARNING: mismatched PKI CA in postgres_data will
+                                          cause DB-init failures. Prefer --upgrade instead.
   --dry-run                               Print steps without executing
   --help                                  Show this help and exit
 
@@ -294,6 +301,7 @@ parse_args() {
       --skip-preflight)  SKIP_PREFLIGHT=true;   shift ;;
       --skip-pull)       SKIP_PULL=true;         shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
+      --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
       --agent-bundles)
         AGENT_BUNDLES="${2:?'--agent-bundles requires a value, e.g. langflow,letta'}"
@@ -2208,6 +2216,124 @@ check_existing_installation() {
 }
 
 # =============================================================================
+# _check_contaminated_volumes — BUG-INSTALL-ON-CONTAMINATED-VOLUMES (2a)
+# =============================================================================
+# Before compose up, enumerate the canonical named volumes for the project.
+# If ANY pre-existing volume is found AND the operator did NOT pass
+# --reuse-volumes, fail LOUD with a clear remediation message.
+#
+# Rationale: a leftover postgres_data volume from a prior install may hold an
+# old PKI CA bundle. The new install generates a fresh CA; the postgres init
+# scripts (05-enable-ssl.sh) write NEW certs into PGDATA on first boot — but
+# postgres only runs those scripts when PGDATA is EMPTY. A pre-populated volume
+# skips init → new CA but old PGDATA certs → mTLS cert mismatch → every
+# backoffice DB connection fails → gateway /healthz returns 200 (gateway is up)
+# but all authenticated requests fail. Install appears to succeed. Classic
+# fake-green path.
+#
+# The canonical volume list mirrors _CANONICAL_VOLUMES in uninstall.sh.
+# When adding/removing named volumes in docker-compose.yml, keep both in sync.
+#
+# Called from the compose/vm install path AFTER check_existing_installation()
+# (which confirmed no containers are running) and BEFORE generate_secrets()
+# (no point generating secrets for a doomed install).
+#
+# Skip when:
+#   * UPGRADE=true — operator explicitly chose upgrade-in-place
+#   * REUSE_VOLUMES=true — operator explicitly acknowledged contamination risk
+#   * DRY_RUN=true — no side-effects
+# ---------------------------------------------------------------------------
+_INSTALL_CANONICAL_VOLUMES=(
+    audit_data
+    bootstrap_data
+    redis_data
+    ollama_data
+    prometheus_data
+    grafana_data
+    caddy_data
+    caddy_config
+    postgres_data
+    alertmanager_data
+    loki_data
+    keycloak_data
+    openclaw_data
+    langflow_data
+    letta_data
+    openwebui_data
+    budget_redis_data
+    step_ca_data
+    wazuh_api_configuration
+    wazuh_etc
+    wazuh_logs
+    wazuh_queue
+    wazuh_var_multigroups
+    wazuh_integrations
+    wazuh_active_response
+    wazuh_agentless
+    wazuh_wodles
+    filebeat_etc
+    filebeat_var
+    wazuh_indexer_data
+    wazuh_dashboard_config
+    wazuh_dashboard_custom
+)
+
+_check_contaminated_volumes() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "_check_contaminated_volumes (skipped in dry-run)"
+    return 0
+  fi
+  if [[ "${UPGRADE:-false}" == "true" ]]; then
+    log_info "Upgrade mode — skipping contaminated-volume check (--upgrade implies reuse)"
+    return 0
+  fi
+  if [[ "${REUSE_VOLUMES:-false}" == "true" ]]; then
+    log_warn "Contaminated-volume check SKIPPED (--reuse-volumes passed). PKI cert mismatch risk acknowledged."
+    return 0
+  fi
+
+  local _runtime="${RUNTIME:-docker}"
+  local _project_prefix="docker"
+  local _found_volumes=()
+
+  for _vol in "${_INSTALL_CANONICAL_VOLUMES[@]}"; do
+    local _full_vol="${_project_prefix}_${_vol}"
+    if "$_runtime" volume inspect "$_full_vol" >/dev/null 2>&1; then
+      _found_volumes+=("$_full_vol")
+    fi
+  done
+
+  if [[ "${#_found_volumes[@]}" -eq 0 ]]; then
+    log_success "Contaminated-volume check: no leftover project volumes found — clean slate confirmed"
+    return 0
+  fi
+
+  # Found leftover volumes — fail LOUD
+  log_error "BUG-INSTALL-ON-CONTAMINATED-VOLUMES: volumes from a prior install detected:"
+  for _v in "${_found_volumes[@]}"; do
+    log_error "  - ${_v}"
+  done
+  log_error ""
+  log_error "A leftover postgres_data volume holds the OLD PKI CA bundle. The new install"
+  log_error "generates a fresh CA; postgres DB-init scripts run only on an EMPTY volume."
+  log_error "Proceeding would cause a cert mismatch → DB connections fail → fake-green install."
+  log_error ""
+  log_error "Remediation — choose ONE:"
+  log_error "  (a) Full clean slate (RECOMMENDED):"
+  log_error "        cd ~/.yashigani && sudo ./uninstall.sh --remove-volumes --yes"
+  log_error "      then re-run this installer."
+  log_error ""
+  log_error "  (b) Keep existing data (upgrade-in-place):"
+  log_error "        ./install.sh --upgrade [other options]"
+  log_error "      WARNING: only safe if the existing PKI CA matches the new install."
+  log_error ""
+  log_error "  (c) Acknowledge contamination risk (advanced — NOT recommended):"
+  log_error "        ./install.sh --reuse-volumes [other options]"
+  log_error "      This skips the check. Use only if you are certain the CA matches."
+  exit 1
+}
+
+# =============================================================================
 # STEP 7 (compose/vm): Handle license key
 # =============================================================================
 handle_license() {
@@ -3667,6 +3793,114 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     _podman_verify_healthchecks
   fi
+
+  # ---------------------------------------------------------------------------
+  # BUG-INSTALL-ON-CONTAMINATED-VOLUMES (2b): post-compose-up convergence check.
+  #
+  # install.sh was observed to exit 0 even when the gateway DB-init failed (old
+  # PKI CA in postgres_data → mTLS cert mismatch → backoffice DB connects fail).
+  # The gateway container itself starts and /healthz returns 200, but any request
+  # that touches the DB fails. The step-12 health-check only polls /healthz, not
+  # a DB-backed endpoint — so a gateway with a healthy process but broken DB
+  # passes the health check.
+  #
+  # This check adds a BLOCKING gateway convergence probe that also verifies the
+  # backoffice /healthz responds via the gateway (Caddy → backoffice routing).
+  # If the backoffice is down (DB-init failed), /login returns 502/504, not 200.
+  # Failure here exits 1 with a diagnostic dump: last 50 lines of gateway +
+  # postgres logs.
+  #
+  # Called at the END of compose_up() so it runs before bootstrap_postgres.
+  # Timeout: 60 seconds (polling every 2s).
+  # ---------------------------------------------------------------------------
+  _verify_gateway_healthz
+}
+
+# =============================================================================
+# _verify_gateway_healthz — BUG-INSTALL-ON-CONTAMINATED-VOLUMES (2b)
+# =============================================================================
+# Post-compose-up convergence gate. Polls:
+#   1. Gateway /healthz → must return HTTP 200 (gateway process alive)
+#   2. Backoffice /login → must return HTTP 200 via Caddy (proves Caddy→backoffice
+#      routing; /login is unauth-200 per health-check.sh retro #3n comment)
+#
+# If either check times out (60s), dumps gateway + postgres logs and exits 1.
+# Exit 0 from compose_up is therefore conditional on both checks passing.
+#
+# Timeout and poll interval are tunable via env vars for CI:
+#   YSG_HEALTHZ_TIMEOUT_S   (default: 60)
+#   YSG_HEALTHZ_POLL_S      (default: 2)
+_verify_gateway_healthz() {
+  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-60}"
+  local _poll_s="${YSG_HEALTHZ_POLL_S:-2}"
+  local _https_port="${YASHIGANI_HTTPS_PORT:-443}"
+  local _domain="${DOMAIN:-localhost}"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "_verify_gateway_healthz (skipped in dry-run)"
+    return 0
+  fi
+
+  log_info "Convergence gate: polling gateway /healthz (timeout ${_timeout_s}s) — BUG-INSTALL-ON-CONTAMINATED-VOLUMES"
+
+  local _deadline=$(( $(date +%s) + _timeout_s ))
+  local _gateway_ok=0
+
+  while [[ "$(date +%s)" -lt "$_deadline" ]]; do
+    if curl -sk --max-time 5 \
+         --resolve "${_domain}:${_https_port}:127.0.0.1" \
+         "https://${_domain}:${_https_port}/healthz" \
+         -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
+      _gateway_ok=1
+      break
+    fi
+    sleep "$_poll_s"
+  done
+
+  if [[ "$_gateway_ok" -eq 0 ]]; then
+    log_error "Convergence gate FAILED: gateway /healthz did not return 200 within ${_timeout_s}s"
+    log_error "This typically means:"
+    log_error "  - Gateway container crashed (check gateway logs below)"
+    log_error "  - PKI cert mismatch (contaminated postgres_data volume — re-run uninstall.sh --remove-volumes)"
+    log_error "  - Caddy TLS certificate not yet provisioned"
+    log_error ""
+    log_error "=== Last 50 lines: gateway logs ==="
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 gateway 2>/dev/null || true
+    log_error "=== Last 50 lines: postgres logs ==="
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
+    exit 1
+  fi
+
+  log_success "Convergence gate: gateway /healthz 200 OK"
+
+  # Now verify backoffice is reachable via Caddy (proves DB layer alive enough
+  # for backoffice to start). /login returns 200 when unauth — retro #3n.
+  log_info "Convergence gate: polling backoffice /login via Caddy (timeout ${_timeout_s}s)"
+  local _deadline2=$(( $(date +%s) + _timeout_s ))
+  local _backoffice_ok=0
+
+  while [[ "$(date +%s)" -lt "$_deadline2" ]]; do
+    if curl -sk --max-time 5 \
+         --resolve "${_domain}:${_https_port}:127.0.0.1" \
+         "https://${_domain}:${_https_port}/login" \
+         -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
+      _backoffice_ok=1
+      break
+    fi
+    sleep "$_poll_s"
+  done
+
+  if [[ "$_backoffice_ok" -eq 0 ]]; then
+    log_error "Convergence gate FAILED: backoffice /login did not return 200 within ${_timeout_s}s"
+    log_error "Backoffice may have failed to connect to the database."
+    log_error "=== Last 50 lines: backoffice logs ==="
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 backoffice 2>/dev/null || true
+    log_error "=== Last 50 lines: postgres logs ==="
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
+    exit 1
+  fi
+
+  log_success "Convergence gate: backoffice /login 200 OK — Caddy→backoffice routing verified"
 }
 
 # =============================================================================
@@ -6620,6 +6854,19 @@ main() {
 
     # Idempotency: check for running installation before making changes
     check_existing_installation
+
+    # Pre-install contaminated-volume check (BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
+    # Must run AFTER check_existing_installation (containers stopped) and BEFORE
+    # generate_secrets (no point generating secrets for a doomed install).
+    # Resolve RUNTIME for the volume check now if not yet set.
+    if [[ -z "${RUNTIME:-}" ]]; then
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        RUNTIME="docker"
+      elif command -v podman >/dev/null 2>&1; then
+        RUNTIME="podman"
+      fi
+    fi
+    _check_contaminated_volumes
 
     # Write AES key to .env
     _write_aes_key_to_env
