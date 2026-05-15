@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-15T14:00:00+00:00 (fix(uninstall): wipe docker/secrets/ on --remove-volumes + final straggler pass — BUG-3-MULTI-USER-INSTALL-PKI + BUG-1-REDIS-STRAGGLER)
 # Last updated: 2026-05-15T12:00:00+00:00 (fix(uninstall): force-remove dependent containers before volume rm — BUG-UNINSTALL-DEPGRAPH-LEAK)
 # Last updated: 2026-05-15T10:00:00+00:00 (fix(uninstall): stub docker/.env for compose-down in DR scenario — BUG-UNINSTALL-NO-ENV)
 # Last updated: 2026-05-15T00:00:00+00:00 (fix(uninstall): drop privileged-linger shortcut from disable-linger, copy-pasteable remediation — Q2 / lint-sudo-pattern fix)
@@ -404,6 +405,96 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
         fi
     done
     echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present."
+fi
+
+# ---------------------------------------------------------------------------
+# BUG-3-MULTI-USER-INSTALL-PKI: wipe docker/secrets/ on --remove-volumes.
+#
+# Symptom: uninstall.sh --remove-volumes leaves docker/secrets/ populated with
+# PKI files owned by the install user. A subsequent install from a different
+# user (e.g. root vs tom) fails because the new installer cannot overwrite
+# files it does not own. `sudo rm -rf` is required because cross-user ownership
+# is precisely why the bug exists.
+#
+# Safety guards:
+#   1. Only runs when --remove-volumes is set.
+#   2. Path-validates: _secrets_dir must equal SCRIPT_DIR/docker/secrets.
+#      Prevents accidental rm if SCRIPT_DIR is mis-resolved.
+#   3. Preserves the directory itself (only contents are removed).
+#   4. If docker/secrets/ does not exist, skips silently.
+# ---------------------------------------------------------------------------
+if [ "$REMOVE_VOLUMES" = "true" ]; then
+    _secrets_dir="${SCRIPT_DIR}/docker/secrets"
+    # Path-validation guard: only proceed if the resolved path is exactly canonical.
+    if [ "${_secrets_dir}" != "${SCRIPT_DIR}/docker/secrets" ]; then
+        echo "  [WARN] docker/secrets path resolved unexpectedly (${_secrets_dir}) — skipping PKI wipe for safety" >&2
+    elif [ ! -d "${_secrets_dir}" ]; then
+        echo "  [skip] docker/secrets/ does not exist — nothing to wipe"
+    else
+        echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
+        if sudo rm -rf "${_secrets_dir:?}"/*; then
+            echo "  [removed] docker/secrets/* — directory preserved, contents wiped"
+        else
+            echo "  [WARN] sudo rm -rf docker/secrets/* failed — manual cleanup may be required" >&2
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Redis-straggler final pass — BUG-1 incomplete edge case.
+#
+# Podman can recreate a container during network teardown if `restart: always`
+# is set and the container exits non-zero. The compose `down` + belt-and-braces
+# loop above remove containers that exist at that point; but a container that
+# exits AFTER the loop runs (race window: network teardown respawn) will survive.
+#
+# Fix: run one additional ps+rm pass AFTER volume cleanup. This is intentionally
+# a best-effort second sweep rather than an infinite loop — if a container still
+# survives two sweeps, it is not a compose-managed straggler and must be
+# investigated separately (see docs/yashigani_install_config.md §troubleshooting).
+#
+# `restart: always` on redis and budget-redis (see docker-compose.yml) is the
+# known trigger. The post-volume pass runs after volume rm, so any volume-locked
+# containers are already unlocked, and the respawn cannot re-attach to the now-
+# deleted volume — it will exit(1) immediately and stay in Exited state, where
+# the rm -f below can reach it.
+# ---------------------------------------------------------------------------
+echo "=== Final straggler pass (redis-straggler edge case — BUG-1 incomplete) ==="
+_final_remaining=""
+
+for _label_key in "io.podman.compose.project" "com.docker.compose.project"; do
+    _ids="$("$RUNTIME" ps -a -q --filter "label=${_label_key}=${_PROJECT_PREFIX}" 2>/dev/null || true)"
+    if [ -n "$_ids" ]; then
+        _final_remaining="${_final_remaining}${_ids}
+"
+    fi
+done
+_ids_by_name="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null || true)"
+if [ -n "$_ids_by_name" ]; then
+    _final_remaining="${_final_remaining}${_ids_by_name}
+"
+fi
+_final_remaining="$(printf '%s' "$_final_remaining" | sort -u | grep -v '^$' || true)"
+
+if [ -n "$_final_remaining" ]; then
+    _straggler_count="$(printf '%s\n' "$_final_remaining" | grep -c '.' || echo 0)"
+    echo "  Found ${_straggler_count} straggler container(s) after volume rm — force-removing..."
+    _final_ok=0
+    _final_fail=0
+    while IFS= read -r _cid; do
+        [ -z "$_cid" ] && continue
+        _cname="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
+        if "$RUNTIME" rm -f --time 0 "$_cid" >/dev/null 2>&1; then
+            echo "  [removed] straggler: ${_cname} (${_cid})"
+            _final_ok=$(( _final_ok + 1 ))
+        else
+            echo "  [WARN] could not remove straggler: ${_cname} (${_cid})" >&2
+            _final_fail=$(( _final_fail + 1 ))
+        fi
+    done <<< "$_final_remaining"
+    echo "Straggler cleanup: ${_final_ok} removed, ${_final_fail} failed."
+else
+    echo "  [ok]    No straggler containers after volume rm."
 fi
 
 echo ""
