@@ -104,6 +104,33 @@ Before starting, confirm the following network conditions are met:
 
 > **Warning:** Do not expose Redis (6379), budget-redis (6380), Postgres (5432), or Prometheus (9090) ports to the host in production. These services are intentionally not bound to host interfaces in the default `docker-compose.yml`.
 
+#### Iptables FORWARD policy for rootful Podman installs
+
+On Linux hosts running rootful Podman, traffic to the install's external HTTP/HTTPS ports is delivered via iptables DNAT to the container. If the host's iptables `FORWARD` chain has policy `DROP` and no matching `ACCEPT` rule for the DNATed traffic, external clients will see TCP timeouts to the install's ports.
+
+Check: `sudo iptables -L FORWARD -n | head -5` — if `policy DROP` and dropped-packet counters increase when you `curl` from outside, this is your symptom.
+
+Remediation (operator's choice, depending on local policy):
+
+- Add an explicit ACCEPT rule for the container subnet (preferred — minimum permissive):
+
+  ```
+  sudo iptables -I FORWARD -i <container-bridge> -j ACCEPT
+  sudo iptables -I FORWARD -o <container-bridge> -j ACCEPT
+  ```
+
+  Replace `<container-bridge>` with the bridge interface Podman created for the stack (typically visible via `ip link show` after `podman network ls`).
+
+- Or set the chain policy (broader, simpler):
+
+  ```
+  sudo iptables -P FORWARD ACCEPT
+  ```
+
+If your network config prevents binding ports 80/443, `install.sh` now accepts `--http-port` and `--https-port` flags to bind on higher ports (e.g. `--http-port 8080 --https-port 8443`) — the same ports the installer defaults to on macOS and rootless Podman.
+
+This is an environmental operator precondition outside `install.sh`'s scope: the installer cannot safely modify host iptables policy without the operator's awareness.
+
 ---
 
 ### 1.4 Privileges and Security Posture
@@ -3084,4 +3111,4 @@ Recovery steps:
 
 ---
 
-*Yashigani v2.23.3 — Installation and Configuration Guide — 2026-05-08T00:00:00+01:00*
+*Yashigani v2.23.4 — Installation and Configuration Guide — 2026-05-15T14:00:00+00:00*
