@@ -179,6 +179,16 @@ services:
       YASHIGANI_AGENT_TOKEN_MIN_LENGTH: "64"
       # Postgres via PgBouncer — TLS verify-ca + client cert.
       YASHIGANI_DB_DSN: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@pgbouncer:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key
+      # BUG-GATEWAY-DSN-DIRECT-MISSING fix: gateway run_migrations() acquires a
+      # session-scoped pg_advisory_lock.  When it uses the pgbouncer DSN the lock
+      # lands on backend pid N; pgbouncer then recycles that backend to the asyncpg
+      # pool — the lock survives on pid N.  Backoffice lifespan then tries
+      # pg_advisory_lock on its own direct connection (pid M) and blocks
+      # permanently because pid N still holds the lock (pgbouncer transaction-pool
+      # DISCARD ALL does NOT release advisory locks).  Fix: route the lock
+      # connection direct to postgres:5432, bypassing pgbouncer, identical to
+      # backoffice line ~306 and Helm gateway.yaml:141.
+      YASHIGANI_DB_DSN_DIRECT: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key
       YASHIGANI_DEPLOYMENT_STREAM: ${YASHIGANI_DEPLOYMENT_STREAM:-opensource}
       # M-01 fix: switched from http:// (plaintext) to grpcs:// (mTLS).
       # Pattern A for Python ssl: opentelemetry-exporter-otlp uses Python ssl,
