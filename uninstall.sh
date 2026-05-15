@@ -493,6 +493,26 @@ if [ -n "$_final_remaining" ]; then
         fi
     done <<< "$_final_remaining"
     echo "Straggler cleanup: ${_final_ok} removed, ${_final_fail} failed."
+
+    # After removing straggler containers, retry any volumes that failed the first
+    # pass due to "Resource is still in use". Now that the holding containers are
+    # gone, the volume rm should succeed. Only retry when --remove-volumes is set.
+    if [ "$REMOVE_VOLUMES" = "true" ] && [ "$_final_ok" -gt 0 ]; then
+        echo "  Retrying volumes that were in-use during first pass..."
+        _retry_removed=0
+        for _vol in "${_CANONICAL_VOLUMES[@]}"; do
+            _full="${_PROJECT_PREFIX}_${_vol}"
+            if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
+                if "$RUNTIME" volume rm "$_full" >/dev/null 2>&1; then
+                    echo "  [removed] (retry) ${_full}"
+                    _retry_removed=$(( _retry_removed + 1 ))
+                else
+                    echo "  [WARN] (retry) failed to remove ${_full}" >&2
+                fi
+            fi
+        done
+        echo "  Volume retry: ${_retry_removed} additional volume(s) removed."
+    fi
 else
     echo "  [ok]    No straggler containers after volume rm."
 fi
