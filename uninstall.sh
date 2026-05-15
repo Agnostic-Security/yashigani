@@ -335,9 +335,19 @@ _remaining_ids="$(printf '%s' "$_remaining_ids" | sort -u | grep -v '^$' || true
 
 if [ -n "$_remaining_ids" ]; then
     _container_count="$(printf '%s\n' "$_remaining_ids" | grep -c '.'  || echo 0)"
-    echo "  Found ${_container_count} remaining container(s) — force-removing..."
+    echo "  Found ${_container_count} remaining container(s) — stopping then force-removing..."
     _rm_ok=0
     _rm_fail=0
+    # Pass 1: stop all containers in parallel (graceful shutdown signal).
+    # --time 0 sends SIGKILL immediately — avoids waiting 10s per container
+    # on containers that ignore SIGTERM (e.g. postgres in crash-loop).
+    while IFS= read -r _cid; do
+        [ -z "$_cid" ] && continue
+        "$RUNTIME" stop --time 0 "$_cid" >/dev/null 2>&1 || true
+    done <<< "$_remaining_ids"
+    # Pass 2: force-remove (rm -f on an already-stopped container is idempotent).
+    # podman rm -f removes even containers that ignore stop; --depend also removes
+    # any dependent containers (available in Podman >=4.x; no-op on Docker/older).
     while IFS= read -r _cid; do
         [ -z "$_cid" ] && continue
         _cname="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
@@ -345,8 +355,15 @@ if [ -n "$_remaining_ids" ]; then
             echo "  [removed] container: ${_cname} (${_cid})"
             _rm_ok=$(( _rm_ok + 1 ))
         else
-            echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
-            _rm_fail=$(( _rm_fail + 1 ))
+            # Last resort: try with --depend flag (Podman >=4.x tears down
+            # dependent containers before removing this one)
+            if "$RUNTIME" rm -f --depend "$_cid" >/dev/null 2>&1; then
+                echo "  [removed+dep] container: ${_cname} (${_cid})"
+                _rm_ok=$(( _rm_ok + 1 ))
+            else
+                echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
+                _rm_fail=$(( _rm_fail + 1 ))
+            fi
         fi
     done <<< "$_remaining_ids"
     echo "Container cleanup: ${_rm_ok} removed, ${_rm_fail} failed."
