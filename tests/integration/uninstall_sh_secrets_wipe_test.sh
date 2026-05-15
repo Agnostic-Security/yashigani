@@ -18,7 +18,7 @@
 #   1 — one or more checks FAIL
 #
 # BUG-3-MULTI-USER-INSTALL-PKI
-# last-updated: 2026-05-15T14:00:00+00:00
+# last-updated: 2026-05-15T20:50:00+00:00 (fix: replace /tmp/ with REPO_ROOT-relative paths — V232-NEG04)
 
 set -uo pipefail
 IFS=$'\n\t'
@@ -128,8 +128,9 @@ if [[ "$_LIVE_ELIGIBLE" != "true" ]]; then
         _skip "(c) Live test skipped: not running as root (sudo rm requires root)"
     fi
 else
-    # Create a temporary test clone directory to run uninstall.sh against
-    _TEST_DIR="$(mktemp -d /tmp/ysg_secrets_wipe_test_XXXXXX)"
+    # Create a temporary test clone directory to run uninstall.sh against.
+    # Use REPO_ROOT-relative path per no-/tmp policy (V232-NEG04).
+    _TEST_DIR="$(mktemp -d "${REPO_ROOT}/tests/integration/.tmp_secrets_wipe_c_XXXXXX")"
     _cleanup_c() { rm -rf "$_TEST_DIR"; }
     trap '_cleanup_c' EXIT
 
@@ -195,7 +196,8 @@ if [[ "$_LIVE_ELIGIBLE" != "true" ]]; then
         _fail "(d.1) Cannot confirm wipe is gated on REMOVE_VOLUMES"
     fi
 else
-    _TEST_DIR2="$(mktemp -d /tmp/ysg_secrets_wipe_test_XXXXXX)"
+    # Use REPO_ROOT-relative path per no-/tmp policy (V232-NEG04).
+    _TEST_DIR2="$(mktemp -d "${REPO_ROOT}/tests/integration/.tmp_secrets_wipe_d_XXXXXX")"
     _cleanup_d() { rm -rf "$_TEST_DIR2"; }
     trap '_cleanup_d' EXIT
 
