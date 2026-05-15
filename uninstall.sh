@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-15T10:00:00+00:00 (fix(uninstall): stub docker/.env for compose-down in DR scenario — BUG-UNINSTALL-NO-ENV)
 # Last updated: 2026-05-15T00:00:00+00:00 (fix(uninstall): drop privileged-linger shortcut from disable-linger, copy-pasteable remediation — Q2 / lint-sudo-pattern fix)
 # Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
 
@@ -219,6 +220,64 @@ fi
 _remove_auto_start
 
 # Step 2: Stop the compose stack
+#
+# BUG-UNINSTALL-NO-ENV: docker-compose.yml uses ${VAR:?} fail-closed declarations
+# for 6 required variables. Without a populated docker/.env, compose refuses to
+# parse the file and exits non-zero before sending any down/stop signals to
+# containers. This breaks the canonical DR "clean Step 0" path (fresh clone,
+# no prior install.sh run in this checkout).
+#
+# Fix: if docker/.env is absent, write a stub file with placeholder values for
+# all required vars before calling compose down. The stub is removed immediately
+# after compose returns (success or failure). A sentinel flag (_STUB_ENV_CREATED)
+# ensures we NEVER delete a real .env that was already present.
+#
+# The :? declarations in docker-compose.yml are kept intact — they are the
+# correct fail-closed posture for install-time. This fix is local to uninstall.sh.
+#
+# Regression guard: the test in tests/integration/uninstall_sh_missing_env_test.sh
+# runs `compose config` against the stub to catch any new :? var added to
+# docker-compose.yml without a matching stub entry here.
+# ---------------------------------------------------------------------------
+
+_ENV_FILE="${SCRIPT_DIR}/docker/.env"
+_STUB_ENV_CREATED="false"
+
+if [ ! -f "$_ENV_FILE" ]; then
+    echo "  [info] docker/.env not found — writing uninstall stub to allow compose parse (BUG-UNINSTALL-NO-ENV)"
+    # ---------------------------------------------------------------------------
+    # Stub values for ALL ${VAR:?} required variables in docker/docker-compose.yml.
+    # These are placeholder-only — no real secrets, no install-time validation.
+    # grep 'docker/docker-compose.yml' for '\$\{[A-Z_]+:\?' to enumerate if new
+    # vars are added.  Keep this list in sync with that grep.
+    # ---------------------------------------------------------------------------
+    cat > "$_ENV_FILE" <<'UNINSTALL_STUB_EOF'
+# !! UNINSTALL STUB — DO NOT USE FOR INSTALL !!
+# Written by uninstall.sh when docker/.env was absent (BUG-UNINSTALL-NO-ENV).
+# Removed automatically after compose down completes.
+# All values are non-functional placeholders to satisfy compose parse-time
+# ${VAR:?} declarations in docker/docker-compose.yml.
+YASHIGANI_TLS_DOMAIN=uninstall-stub.local
+PROMETHEUS_BASICAUTH_HASH=uninstall-stub-hash
+CADDY_INTERNAL_HMAC=uninstall-stub-hmac
+UPSTREAM_MCP_URL=http://uninstall-stub-upstream:9999
+OWUI_SECRET_KEY=uninstall-stub-owui-key
+YASHIGANI_DB_AES_KEY=uninstall-stub-aes-key
+UNINSTALL_STUB_EOF
+    _STUB_ENV_CREATED="true"
+fi
+
+# Ensure stub is removed on exit (success, failure, or signal).
+# We only remove if WE created it — never touch a real .env.
+_cleanup_stub() {
+    if [ "$_STUB_ENV_CREATED" = "true" ] && [ -f "$_ENV_FILE" ]; then
+        rm -f "$_ENV_FILE"
+        echo "  [info] uninstall stub docker/.env removed (BUG-UNINSTALL-NO-ENV)"
+    fi
+}
+trap _cleanup_stub EXIT
+
+# ---------------------------------------------------------------------------
 # shellcheck disable=SC2086
 $COMPOSE -f "$COMPOSE_FILE" down $DOWN_ARGS
 
