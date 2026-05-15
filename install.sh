@@ -2292,7 +2292,10 @@ _check_contaminated_volumes() {
     return 0
   fi
 
-  local _runtime="${RUNTIME:-docker}"
+  # Use the install's own runtime — not auto-detect. On dual-runtime hosts
+  # (Docker + Podman both installed), auto-detect can pick the wrong store.
+  # RUNTIME is set in the call site from COMPOSE_CMD[0] / YSG_RUNTIME.
+  local _runtime="${RUNTIME:-${YSG_RUNTIME:-docker}}"
   local _project_prefix="docker"
   local _found_volumes=()
 
@@ -6858,13 +6861,27 @@ main() {
     # Pre-install contaminated-volume check (BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
     # Must run AFTER check_existing_installation (containers stopped) and BEFORE
     # generate_secrets (no point generating secrets for a doomed install).
-    # Resolve RUNTIME for the volume check now if not yet set.
+    #
+    # IMPORTANT: use YSG_RUNTIME (the operator-selected runtime) NOT a fresh
+    # auto-detect. On hosts where both Docker Engine and Podman are installed,
+    # auto-detect can pick the wrong runtime and check volumes in the wrong
+    # store. If the stack was installed under Docker, those volumes live in the
+    # Docker store; if under Podman, in the Podman store. We must check the
+    # same store the new install will use.
+    #
+    # COMPOSE_CMD was set by resolve_compose_cmd() called from
+    # check_existing_installation(). The first element tells us the runtime.
+    if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+      resolve_compose_cmd 2>/dev/null || true
+    fi
+    # Derive RUNTIME from resolved COMPOSE_CMD: "podman-compose" or "podman compose"
+    # → podman; "docker compose" or "docker-compose" → docker.
     if [[ -z "${RUNTIME:-}" ]]; then
-      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        RUNTIME="docker"
-      elif command -v podman >/dev/null 2>&1; then
-        RUNTIME="podman"
-      fi
+      case "${COMPOSE_CMD[0]:-}" in
+        podman*) RUNTIME="podman" ;;
+        docker*) RUNTIME="docker" ;;
+        *)       RUNTIME="${YSG_RUNTIME:-docker}" ;;
+      esac
     fi
     _check_contaminated_volumes
 
