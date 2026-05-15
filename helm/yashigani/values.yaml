@@ -1103,16 +1103,18 @@ ddosProtection:
 responseInspection:
   enabled: false
 
-# SSO / Identity Provider configuration (v2.1).
+# SSO / Identity Provider configuration (v2.1 — OIDC; v2.23.4 — SAMLv2).
 # Mirrors the YASHIGANI_IDP_<N>_* env vars used by docker-compose.
-# Up to 10 IdPs may be configured. Secrets (clientSecret) must be stored in
-# a Kubernetes Secret and referenced via existingSecretName.
+# Up to 10 IdPs may be configured. Secrets (clientSecret, samlSpPrivateKey)
+# must be stored in a Kubernetes Secret and referenced via existingSecretName.
 sso:
   twoFactorRequired: false
   # existingSecretName: yashigani-sso-secrets
-  # The secret must contain keys idp_<n>_client_secret for each IdP index.
+  # The secret must contain keys idp_<n>_client_secret for OIDC IdPs,
+  # and idp_<n>_saml_sp_private_key for SAML IdPs (RSA keys only —
+  # non-RSA keys reject startup per ACS-RISK-044 mitigation).
   idps: []
-  # Example:
+  # OIDC example:
   # - id: "keycloak-dev"
   #   name: "Keycloak Dev"
   #   protocol: "oidc"
@@ -1121,6 +1123,20 @@ sso:
   #   clientSecretKey: "idp_1_client_secret"   # key inside existingSecretName
   #   emailDomains: "example.com"
   #   redirectUri: "https://yashigani.example.com/admin/sso/callback"
+  #
+  # SAMLv2 example (requires Professional tier or above):
+  # - id: "entra-saml"
+  #   name: "Entra ID (SAML)"
+  #   protocol: "saml"
+  #   entityId: "https://yashigani.example.com/saml"   # SP entity ID
+  #   samlIdpSsoUrl: "https://login.microsoftonline.com/<tenant>/saml2"
+  #   samlIdpSlsUrl: "https://login.microsoftonline.com/<tenant>/saml2"
+  #   samlIdpX509Cert: "<base64-cert-body-no-headers>"
+  #   samlSpSlsUrl: "https://yashigani.example.com/auth/sso/saml/entra-saml/sls"
+  #   samlSpPrivateKeySecretKey: "idp_2_saml_sp_private_key"  # RSA key in existingSecretName
+  #   samlSpCertSecretKey: "idp_2_saml_sp_cert"
+  #   redirectUri: "https://yashigani.example.com/auth/sso/saml/entra-saml/acs"
+  #   emailDomains: "example.com"
 
 # Model Aliases — Redis-backed alias-to-model routing (v2.3 backoffice feature).
 # Aliases are managed at runtime via the backoffice UI/API.

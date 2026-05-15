@@ -382,28 +382,52 @@ def _bootstrap():
         tier_name = license_state.tier.value if license_state else "community"
         identity_broker = IdentityBroker(tier=tier_name)
 
-        # Read IdP configurations from environment
-        # Format: YASHIGANI_IDP_<N>_ID, _NAME, _PROTOCOL, _DISCOVERY_URL, _CLIENT_ID, _CLIENT_SECRET, _EMAIL_DOMAINS
+        # Read IdP configurations from environment.
+        # OIDC format: YASHIGANI_IDP_<N>_ID, _NAME, _PROTOCOL, _DISCOVERY_URL,
+        #              _CLIENT_ID, _CLIENT_SECRET, _EMAIL_DOMAINS, _REDIRECT_URI
+        # SAML format: above + _SAML_IDP_SSO_URL, _SAML_IDP_SLS_URL,
+        #              _SAML_IDP_X509_CERT, _SAML_SP_SLS_URL,
+        #              _SAML_SP_PRIVATE_KEY, _SAML_SP_CERT,
+        #              _ENTITY_ID (SP entity ID), _CLIENT_ID (legacy alias)
+        #
+        # For SAML IdPs, _REDIRECT_URI is the SP ACS URL.
+        # _SAML_SP_PRIVATE_KEY must be an RSA key — non-RSA rejects startup
+        # via _assert_rsa_sp_key() in SAMLProvider.__init__ (ACS-RISK-044).
         idp_index = 1
         while True:
             prefix = f"YASHIGANI_IDP_{idp_index}_"
             idp_id = os.getenv(f"{prefix}ID", "")
             if not idp_id:
                 break
+            protocol = os.getenv(f"{prefix}PROTOCOL", "oidc")
+            tls_domain = os.getenv("YASHIGANI_TLS_DOMAIN", "localhost")
+            if protocol == "saml":
+                default_redirect = (
+                    f"https://{tls_domain}/auth/sso/saml/{idp_id}/acs"
+                )
+            else:
+                default_redirect = (
+                    f"https://{tls_domain}/auth/sso/oidc/{idp_id}/callback"
+                )
+            redirect_uri = os.getenv(f"{prefix}REDIRECT_URI", default_redirect)
             idp_config = IdPConfig(
                 id=idp_id,
                 name=os.getenv(f"{prefix}NAME", idp_id),
-                protocol=os.getenv(f"{prefix}PROTOCOL", "oidc"),
+                protocol=protocol,
                 metadata_url=os.getenv(f"{prefix}DISCOVERY_URL", ""),
                 client_id=os.getenv(f"{prefix}CLIENT_ID", ""),
                 client_secret=os.getenv(f"{prefix}CLIENT_SECRET", ""),
+                entity_id=os.getenv(f"{prefix}ENTITY_ID", ""),
                 email_domains=[
                     d.strip() for d in os.getenv(f"{prefix}EMAIL_DOMAINS", "").split(",") if d.strip()
                 ],
-            )
-            redirect_uri = os.getenv(
-                f"{prefix}REDIRECT_URI",
-                f"https://{os.getenv('YASHIGANI_TLS_DOMAIN', 'localhost')}/auth/sso/oidc/{idp_id}/callback",
+                # SAML-specific fields — empty string for OIDC IdPs.
+                saml_idp_sso_url=os.getenv(f"{prefix}SAML_IDP_SSO_URL", ""),
+                saml_idp_sls_url=os.getenv(f"{prefix}SAML_IDP_SLS_URL", ""),
+                saml_idp_x509_cert=os.getenv(f"{prefix}SAML_IDP_X509_CERT", ""),
+                saml_sp_sls_url=os.getenv(f"{prefix}SAML_SP_SLS_URL", ""),
+                saml_sp_private_key=os.getenv(f"{prefix}SAML_SP_PRIVATE_KEY", ""),
+                saml_sp_certificate=os.getenv(f"{prefix}SAML_SP_CERT", ""),
             )
             try:
                 identity_broker.add_idp(idp_config, redirect_uri=redirect_uri)
