@@ -1,3 +1,4 @@
+<!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
 <!-- last-updated: 2026-05-11T22:00:00+01:00 (v2.23.3 GA — flip [Unreleased] block to [v2.23.3]) -->
 
@@ -21,8 +22,6 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 > **Tag:** `v2.23.3` → commit `8cff2f6f` — SSH-signed by maintainer key `~/.ssh/id_ed25519` (no GPG). Signature verifiable with `git tag -v v2.23.3` once the SSH allowed-signers file is configured locally; verifiable on GitHub once the maintainer's SSH pubkey is registered as a Signing Key on the personal account.
 >
-> Full release narrative: [`docs/release-notes/v2.23.3.md`](docs/release-notes/v2.23.3.md)
-
 ### Added
 
 - **feat/v233-issue-91-ssrf-pinned-resolver** — DNS-rebinding defence for outbound HTTP
@@ -81,15 +80,11 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
   **Upgrade path:** Helm users on v2.23.2 should upgrade to v2.23.2.1 immediately (`helm upgrade --version 2.23.2.1`). No image rebuild or config change needed. Docker / Podman Compose deployments are unaffected (image pins in `docker-compose.release.yml` were already correct).
 
-Full release narrative: [`docs/release-notes/v2.23.2.1.md`](docs/release-notes/v2.23.2.1.md)
-
 ---
 
 ## [v2.23.2] — 2026-05-06
 
 Theme: **Security Hardening + Supply-Chain Controls + ASVS L3 92% + Agentic AI Overreliance Controls**.
-
-Full release narrative: [`docs/release-notes/v2.23.2.md`](docs/release-notes/v2.23.2.md)
 
 ### Today's batch (2026-05-06)
 

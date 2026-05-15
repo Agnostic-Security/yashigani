@@ -16,7 +16,7 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.3 (2026-05-11) — macOS Podman promoted to hard CI gate, per-runtime PKI bootstrap split, manifest pre/post SHA-256 audit-trail logging, OpenSSL 4.0.x aarch64 SVE-probe stopgap, bash 3.2 portability for macOS system bash; see [v2.23.3 release notes](docs/release-notes/v2.23.3.md)
+**Latest Tagged Release:** v2.23.3 (2026-05-11) — macOS Podman promoted to hard CI gate, per-runtime PKI bootstrap split, manifest pre/post SHA-256 audit-trail logging, OpenSSL 4.0.x aarch64 SVE-probe stopgap, bash 3.2 portability for macOS system bash; see `CHANGELOG.md` for the release entry.
 
 > **Upgrade notice:** v2.23.2 ships a security hardening batch. Existing v2.23.1 deployments should upgrade.
 
