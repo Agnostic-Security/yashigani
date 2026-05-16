@@ -331,7 +331,7 @@ data:
     (internal-mtls-gateway) {
       transport http {
         tls
-        tls_trusted_ca_certs /run/secrets/ca_bundle.crt
+        tls_trust_pool file /run/secrets/ca_bundle.crt
         tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
         tls_server_name gateway
       }
@@ -339,7 +339,7 @@ data:
     (internal-mtls-backoffice) {
       transport http {
         tls
-        tls_trusted_ca_certs /run/secrets/ca_bundle.crt
+        tls_trust_pool file /run/secrets/ca_bundle.crt
         tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
         tls_server_name backoffice
       }
@@ -563,7 +563,7 @@ data:
         reverse_proxy https://yashigani-gateway:8080 {
           transport http {
             tls
-            tls_trusted_ca_certs /run/secrets/ca_bundle.crt
+            tls_trust_pool file /run/secrets/ca_bundle.crt
             tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
             tls_server_name gateway
           }
@@ -595,7 +595,7 @@ data:
         reverse_proxy https://yashigani-backoffice:8443 {
           transport http {
             tls
-            tls_trusted_ca_certs /run/secrets/ca_bundle.crt
+            tls_trust_pool file /run/secrets/ca_bundle.crt
             tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
             tls_server_name backoffice
           }
