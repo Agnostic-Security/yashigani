@@ -718,8 +718,13 @@ services:
     tmpfs:
       # ACS-RISK-008 (v2.23.4): ollama_data:/data is a named volume (writable).
       # HOME=/data + OLLAMA_MODELS=/data/models — model data goes to volume.
-      # /tmp needed for model decompression staging during pulls.
+      # /tmp needed for model decompression staging during pulls (1777 standard for /tmp).
+      # /root/.ollama: ollama generates a node identity (id_ed25519) on first start;
+      # binary hard-codes /root/.ollama regardless of HOME. ollama runs as root
+      # (uid 0 — see `user: "0:0"` above), so tmpfs mounted root-owned with mode=0700
+      # = owner-only access for the in-container root process. Correct hardening.
       - /tmp:size=512m,mode=1777
+      - /root/.ollama:size=8m,mode=0700
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -962,12 +967,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    read_only: true
+    # ACS-RISK-008 (v2.23.4): read_only:true NOT applied on compose path for postgres.
+    # postgres needs writable /var/run/postgresql (unix-domain socket + PID lock file)
+    # owned by uid 999 (postgres-in-container) with restrictive perms (e.g. 0755 or 0700).
+    # podman-compose tmpfs short-form syntax does not accept `uid=`/`gid=` options,
+    # and mode=1777 on a system socket directory is unacceptable per security review.
+    # Compensating controls: cap_drop:[ALL] + no-new-privileges + user:999:999 +
+    # seccomp profile on the application services that connect to postgres.
+    # K8s path retains full readOnlyRootFilesystem via securityContext (uid mapping
+    # works correctly there). See ACS-RISK-008 risk register entry for rationale.
     tmpfs:
-      # ACS-RISK-008 (v2.23.4): postgres_data:/var/lib/postgresql/data is a named volume.
-      # /var/run/postgresql is REQUIRED by postgres (PID file + unix domain socket).
-      # /tmp needed for sort spills and WAL staging during queries.
-      - /var/run/postgresql:size=16m,mode=0755
       - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
@@ -1022,12 +1031,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    read_only: true
+    # ACS-RISK-008 (v2.23.4): read_only:true NOT applied on compose path for pgbouncer.
+    # pgbouncer entrypoint generates /etc/pgbouncer/userlist.txt at startup from
+    # DB_USER/DB_PASSWORD env (sed-based write). It also needs /var/run/pgbouncer
+    # writable for its PID file. Both need to be owned by uid 70 (pgbouncer user)
+    # with restrictive perms. podman-compose tmpfs short-form syntax does not accept
+    # `uid=`/`gid=` options, and mode=1777 on these dirs is unacceptable per security
+    # review. Compensating controls: cap_drop:[ALL] + no-new-privileges + user:70:70.
+    # K8s path retains full readOnlyRootFilesystem via securityContext.
     tmpfs:
-      # ACS-RISK-008 (v2.23.4): pgbouncer config + certs are read-only mounts.
-      # /var/run/pgbouncer needed for PID file (pgbouncer.pid).
-      # /tmp needed for standard temp file operations.
-      - /var/run/pgbouncer:size=8m,mode=0755
       - /tmp:size=32m,mode=1777
     security_opt:
       - no-new-privileges:true
