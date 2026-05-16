@@ -167,9 +167,7 @@ def test_list_identities_kind_filter_rejects_invalid_kind():
     with patch("yashigani.backoffice.routes.agents.backoffice_state") as mock_state:
         mock_state.identity_registry = mock_registry
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.get_event_loop().run_until_complete(
-                list_identities(session=mock_session, kind="garbage")
-            )
+            asyncio.run(list_identities(session=mock_session, kind="garbage"))
         assert exc_info.value.status_code == 422
 
 
@@ -187,9 +185,7 @@ def test_list_identities_returns_empty_list_when_no_identities():
 
     with patch("yashigani.backoffice.routes.agents.backoffice_state") as mock_state:
         mock_state.identity_registry = mock_registry
-        result = asyncio.get_event_loop().run_until_complete(
-            list_identities(session=mock_session, kind=None)
-        )
+        result = asyncio.run(list_identities(session=mock_session, kind=None))
         assert result == []
         mock_registry.list_all.assert_called_once_with(kind=None)
 
@@ -219,9 +215,7 @@ def test_list_identities_maps_human_entry():
 
     with patch("yashigani.backoffice.routes.agents.backoffice_state") as mock_state:
         mock_state.identity_registry = mock_registry
-        result = asyncio.get_event_loop().run_until_complete(
-            list_identities(session=mock_session, kind="human")
-        )
+        result = asyncio.run(list_identities(session=mock_session, kind="human"))
 
     assert len(result) == 1
     resp = result[0]
