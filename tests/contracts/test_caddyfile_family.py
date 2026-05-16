@@ -1,4 +1,4 @@
-# Last updated: 2026-05-16T00:00:00+00:00 (v2.23.4: YSG-RISK-026 — add per-listener cross-variant parity test)
+# Last updated: 2026-05-17T00:00:00+00:00 (v2.23.4: F6 CSP parity tests + Helm CSP align)
 """
 Caddyfile family contract tests — anti-rot gate.
 
@@ -520,6 +520,148 @@ def test_mutation_listener_parity_is_caught() -> None:
     assert len(unique_protocols) != 1 or "tls1.3" not in next(iter(unique_protocols)), (
         "MUTATION TEST FAILED: removing 'protocols tls1.3' from Caddyfile.selfsigned "
         "was NOT detected by the per-listener parity check. The contract is broken."
+    )
+
+
+# ---------------------------------------------------------------------------
+# F6 / v2.23.4 — CSP header parity: compose variants vs Helm Caddyfile
+# ---------------------------------------------------------------------------
+
+# The canonical CSP directive set shared by all Caddyfile variants.
+# Must stay in sync with:
+#   docker/Caddyfile.acme        (line ~126)
+#   docker/Caddyfile.ca          (line ~110)
+#   docker/Caddyfile.selfsigned  (line ~157)
+#   helm/yashigani/templates/configmaps.yaml  (header block)
+_CSP_REQUIRED_DIRECTIVES: frozenset[str] = frozenset({
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+})
+
+_HELM_CONFIGMAP = (
+    Path(__file__).parent.parent.parent
+    / "helm" / "yashigani" / "templates" / "configmaps.yaml"
+)
+
+
+def _extract_csp_value(text: str) -> str:
+    """
+    Extract the Content-Security-Policy header value from a Caddyfile or
+    Helm configmap snippet.  Returns the raw directive string (everything
+    after the CSP header name, unquoted).
+    """
+    for line in text.splitlines():
+        # Matches: Content-Security-Policy   "..."
+        m = re.search(r'Content-Security-Policy\s+"([^"]+)"', line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _csp_directives(csp_value: str) -> frozenset[str]:
+    """
+    Parse a CSP directive string into a frozenset of directive tokens.
+    Splits on ';' and strips whitespace.
+    """
+    return frozenset(d.strip() for d in csp_value.split(";") if d.strip())
+
+
+@pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+def test_csp_directives_present_in_compose_caddyfiles(name: str, path: Path) -> None:
+    """
+    Every compose Caddyfile must have a Content-Security-Policy header
+    containing all required directives defined in _CSP_REQUIRED_DIRECTIVES.
+
+    Regression: if a directive is removed, the browser will fall back to
+    default-src which is less specific and may allow unintended sources.
+    """
+    text = _load(path)
+    csp_value = _extract_csp_value(text)
+    assert csp_value, f"Caddyfile.{name}: no Content-Security-Policy header found"
+
+    directives = _csp_directives(csp_value)
+    missing = _CSP_REQUIRED_DIRECTIVES - directives
+    assert not missing, (
+        f"\nCaddyfile.{name} — CSP missing required directives:\n"
+        + "\n".join(f"  - {d}" for d in sorted(missing))
+        + f"\n\nFound CSP value: {csp_value!r}"
+    )
+
+
+def test_csp_helm_matches_compose() -> None:
+    """
+    YSG-RISK-026 F6 parity: the Helm Caddyfile (configmaps.yaml) must have
+    the same Content-Security-Policy directives as the compose Caddyfiles.
+
+    Historical drift: Helm had only ``default-src 'self'; object-src 'none';
+    base-uri 'none'`` — missing script-src, style-src, img-src, font-src,
+    connect-src, frame-ancestors, form-action.  Browser console: "style-src
+    was not explicitly set, so default-src is used as a fallback."
+
+    Root cause: F6 (Ava A5 E2E v2.23.4 Track C — 2026-05-16).
+    """
+    assert _HELM_CONFIGMAP.exists(), f"Helm configmaps.yaml not found: {_HELM_CONFIGMAP}"
+    helm_text = _HELM_CONFIGMAP.read_text(encoding="utf-8")
+    helm_csp = _extract_csp_value(helm_text)
+    assert helm_csp, f"Helm configmaps.yaml: no Content-Security-Policy header found"
+
+    helm_directives = _csp_directives(helm_csp)
+    missing_from_helm = _CSP_REQUIRED_DIRECTIVES - helm_directives
+    assert not missing_from_helm, (
+        "\nHelm configmaps.yaml CSP missing required directives "
+        "(diverged from compose Caddyfiles — F6 regression class):\n"
+        + "\n".join(f"  - {d}" for d in sorted(missing_from_helm))
+        + f"\n\nHelm CSP value: {helm_csp!r}\n\n"
+        "Fix: align helm/yashigani/templates/configmaps.yaml header block "
+        "to match docker/Caddyfile.{selfsigned,acme,ca}."
+    )
+
+    # Also verify compose CSP matches Helm (bidirectional parity)
+    for name, path in CADDYFILES.items():
+        compose_csp = _extract_csp_value(_load(path))
+        compose_directives = _csp_directives(compose_csp)
+        in_compose_not_helm = compose_directives - helm_directives
+        # Allow compose to have report-uri/report-to (Helm may omit these)
+        non_report = frozenset(
+            d for d in in_compose_not_helm
+            if not d.startswith("report-uri") and not d.startswith("report-to")
+        )
+        assert not non_report, (
+            f"\nCaddyfile.{name} has CSP directives absent from Helm configmaps.yaml "
+            f"(excluding report-uri/report-to):\n"
+            + "\n".join(f"  - {d}" for d in sorted(non_report))
+            + f"\n\nCompose CSP: {compose_csp!r}\nHelm CSP: {helm_csp!r}"
+        )
+
+
+def test_mutation_csp_drift_is_caught() -> None:
+    """
+    Mutation guard for CSP parity tests.
+    Remove 'style-src' from a compose Caddyfile in-memory and verify the
+    CSP directives check fires.
+    """
+    name = "selfsigned"
+    path = CADDYFILES[name]
+    original = _load(path)
+    # Mutate: remove style-src 'self' from the CSP value
+    mutated = original.replace("style-src 'self'; ", "")
+    assert mutated != original, "Mutation failed — style-src not found in CSP"
+
+    csp_value = _extract_csp_value(mutated)
+    directives = _csp_directives(csp_value)
+    missing = _CSP_REQUIRED_DIRECTIVES - directives
+
+    assert "style-src 'self'" in missing, (
+        "MUTATION TEST FAILED: removing 'style-src' from CSP was NOT detected "
+        "by the CSP directives check. The contract is broken."
     )
 
 
