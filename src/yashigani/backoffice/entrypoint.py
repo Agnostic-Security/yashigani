@@ -180,25 +180,49 @@ def _bootstrap():
         logger.warning("Rate limiter Redis unavailable (%s) — rate limiting disabled", exc)
 
     # ── RBAC store + Agent registry (Redis db/3) ─────────────────────────────
+    # F3 / v2.23.4: retry-with-backoff on RBAC+Agent Redis init.
+    # K8s DNS for headless Services (ClusterIP: None) may not resolve at
+    # container startup — the backing Endpoints object is populated by kube-dns
+    # only after the Pod IP is registered, which can take a few seconds after
+    # the first pod is scheduled.  A single-attempt init silently sets
+    # agent_registry=None for the entire pod lifetime → every /admin/agents
+    # call returns 503.  Five attempts with 1/2/4/8/16 s backoff covers the
+    # typical kube-dns propagation window without blocking readiness probes.
     rbac_store = None
     agent_registry = None
-    try:
-        import redis as _redis
-        redis_rbac_url = _backoffice_redis_url(3)
-        redis_rbac_client = _redis.from_url(redis_rbac_url, decode_responses=False)
-        rbac_store = RBACStore(redis_client=redis_rbac_client)
-        logger.info(
-            "RBAC store initialised: %d group(s) loaded from Redis",
-            len(rbac_store.list_groups()),
-        )
-        # Agent registry shares the same Redis db/3 instance (different key namespace)
-        agent_registry = AgentRegistry(redis_client=redis_rbac_client)
-        logger.info(
-            "Agent registry initialised: %d agent(s) in index",
-            agent_registry.count("all"),
-        )
-    except Exception as exc:
-        logger.warning("RBAC/Agent Redis unavailable (%s) — RBAC and agent registry disabled", exc)
+    _RBAC_MAX_ATTEMPTS = 5
+    _rbac_backoff = 1.0
+    for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
+        try:
+            import redis as _redis
+            redis_rbac_url = _backoffice_redis_url(3)
+            redis_rbac_client = _redis.from_url(redis_rbac_url, decode_responses=False)
+            rbac_store = RBACStore(redis_client=redis_rbac_client)
+            logger.info(
+                "RBAC store initialised: %d group(s) loaded from Redis",
+                len(rbac_store.list_groups()),
+            )
+            # Agent registry shares the same Redis db/3 instance (different key namespace)
+            agent_registry = AgentRegistry(redis_client=redis_rbac_client)
+            logger.info(
+                "Agent registry initialised: %d agent(s) in index",
+                agent_registry.count("all"),
+            )
+            break  # success
+        except Exception as exc:
+            if _rbac_attempt < _RBAC_MAX_ATTEMPTS:
+                logger.warning(
+                    "RBAC/Agent Redis unavailable (attempt %d/%d): %s — retrying in %.0f s",
+                    _rbac_attempt, _RBAC_MAX_ATTEMPTS, exc, _rbac_backoff,
+                )
+                time.sleep(_rbac_backoff)
+                _rbac_backoff *= 2
+            else:
+                logger.warning(
+                    "RBAC/Agent Redis unavailable after %d attempts (%s) — "
+                    "RBAC and agent registry disabled",
+                    _RBAC_MAX_ATTEMPTS, exc,
+                )
 
     # ── Backend registry + config store (Redis db/1, separate key namespace) ─
     backend_registry = None
