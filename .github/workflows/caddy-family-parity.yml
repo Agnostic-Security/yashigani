@@ -172,15 +172,15 @@ jobs:
           # Strategy: awk from the `Caddyfile: |` line, strip 4-space indent,
           # stop at next `  [a-zA-Z]` key or `{{- end }}` at top.
           awk '
-            /^  Caddyfile: \|/ { capturing=1; next }
+            /^  Caddyfile: [|]/ { capturing=1; next }
             capturing && /^  [a-zA-Z]/ { exit }
-            capturing && /^{{- end }}/ { exit }
+            capturing && /^\{\{- end \}\}/ { exit }
             capturing { sub(/^    /, ""); print }
           ' helm/yashigani/templates/configmaps.yaml > /tmp/helm-Caddyfile.raw
 
           # The extracted text contains Helm control blocks. Strip them
           # (replace conditional lines with empty, leaving the enabled body).
-          grep -v '{{-\|{{' /tmp/helm-Caddyfile.raw > /tmp/helm-Caddyfile.stripped || true
+          grep -v '{{' /tmp/helm-Caddyfile.raw > /tmp/helm-Caddyfile.stripped || true
 
           # Substitute env placeholders that caddy adapt needs
           sed \
