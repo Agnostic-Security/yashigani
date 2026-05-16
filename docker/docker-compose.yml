@@ -967,7 +967,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    # ACS-RISK-008 (v2.23.4): read_only:true NOT applied on compose path for postgres.
+    # ACS-RISK-008 (v2.23.4): read_only skipped on compose path for postgres.
     # postgres needs writable /var/run/postgresql (unix-domain socket + PID lock file)
     # owned by uid 999 (postgres-in-container) with restrictive perms (e.g. 0755 or 0700).
     # podman-compose tmpfs short-form syntax does not accept `uid=`/`gid=` options,
@@ -1031,7 +1031,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    # ACS-RISK-008 (v2.23.4): read_only:true NOT applied on compose path for pgbouncer.
+    # ACS-RISK-008 (v2.23.4): read_only skipped on compose path for pgbouncer.
     # pgbouncer entrypoint generates /etc/pgbouncer/userlist.txt at startup from
     # DB_USER/DB_PASSWORD env (sed-based write). It also needs /var/run/pgbouncer
     # writable for its PID file. Both need to be owned by uid 70 (pgbouncer user)
