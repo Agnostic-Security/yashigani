@@ -128,6 +128,9 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (caddy.yaml:49-51).
     # NET_BIND_SERVICE required: Caddy binds privileged ports 80 and 443.
     cap_drop: [ALL]
@@ -590,6 +593,9 @@ services:
       # and fails-closed per request if OPA is unreachable (deny by default).
       # Healthcheck is re-enabled in K8s only.
       disable: true
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (policy.yaml:36).
     # No cap_add: OPA binds ports 8181/8282 (non-privileged).
     cap_drop: [ALL]
@@ -640,6 +646,9 @@ services:
       start_period: 10s
     # No depends_on — redis_password is written by the installer to docker/secrets/
     # before compose starts. Removed backoffice dependency to break cycle.
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (redis.yaml:51).
     # No cap_add: redis binds port 6380 (non-privileged).
     cap_drop: [ALL]
@@ -676,6 +685,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (ollama.yaml:42).
     # No cap_add: ollama binds port 11434 (non-privileged).
     cap_drop: [ALL]
@@ -725,6 +737,9 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (init job).
     # No cap_add: no privileged-port binding.
     cap_drop: [ALL]
@@ -787,6 +802,9 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (prometheus.yaml:116).
     # No cap_add: prometheus binds port 9090 (non-privileged).
     cap_drop: [ALL]
@@ -843,6 +861,9 @@ services:
         condition: service_healthy
       backoffice:
         condition: service_healthy
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (grafana.yaml:41).
     # No cap_add: grafana binds port 3000 (non-privileged).
     cap_drop: [ALL]
@@ -972,6 +993,9 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (alertmanager.yaml:38).
     # No cap_add: alertmanager binds port 9093 (non-privileged).
     cap_drop: [ALL]
@@ -1011,6 +1035,9 @@ services:
       # K8s Helm: tcpSocket probe works because kubelet performs the TCP check
       # natively (no in-container binary needed) — see loki.yaml.
       disable: true
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (loki.yaml:39).
     # No cap_add: loki binds port 3100 (non-privileged).
     cap_drop: [ALL]
@@ -1052,6 +1079,9 @@ services:
         # accepting connections; promtail retries at the application level on any
         # connection failure. — RETRO-V233-001 (extended)
         condition: service_started
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart for promtail.
     # No cap_add: promtail binds port 9080 (non-privileged). Docker socket access
     # is via bind mount (read-only), not a capability.
@@ -1087,6 +1117,9 @@ services:
       retries: 3
     depends_on:
       - jaeger
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (otel-collector.yaml:56).
     # No cap_add: otel-collector binds ports 4317/4318 (non-privileged).
     cap_drop: [ALL]
@@ -1129,6 +1162,9 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (jaeger.yaml:48).
     # No cap_add: jaeger binds ports 13133/16686/4317 (non-privileged).
     cap_drop: [ALL]
@@ -1191,6 +1227,9 @@ services:
     restart: unless-stopped
     mem_limit: ${YASHIGANI_VAULT_MEM_LIMIT:-512m}
     cpus: ${YASHIGANI_VAULT_CPU_LIMIT:-0.5}
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (vault profile).
     # IPC_LOCK required: Vault uses mlock(2) to prevent secrets swapping to disk.
     cap_drop: [ALL]
@@ -1405,6 +1444,12 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    # read_only skipped: wazuh-manager has numerous internal write paths under
+    # /var/ossec not fully captured by the named volumes — asymmetry documented
+    # in risk register ACS-RISK-008.
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (wazuh profile).
     # No cap_add: wazuh-manager uses standard ports (55000/1514/1515).
     cap_drop: [ALL]
@@ -1433,6 +1478,11 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    # read_only skipped: OpenSearch/JVM writes to /usr/share/wazuh-indexer paths
+    # not covered by volumes — asymmetry documented in risk register ACS-RISK-008.
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (wazuh profile).
     # No cap_add: wazuh-indexer binds port 9200 (non-privileged).
     cap_drop: [ALL]
@@ -1470,6 +1520,12 @@ services:
       timeout: 10s
       retries: 5
       start_period: 90s
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    # read_only skipped: wazuh-dashboard writes plugin assets to paths under
+    # /usr/share/wazuh-dashboard not captured by volumes — asymmetry documented
+    # in risk register ACS-RISK-008.
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (wazuh profile).
     # No cap_add: wazuh-dashboard binds port 5601 (non-privileged).
     cap_drop: [ALL]
@@ -1504,6 +1560,9 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
+    security_opt:
+      - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (internal-ca profile).
     # No cap_add: step-ca binds port 9000 (non-privileged).
     cap_drop: [ALL]
