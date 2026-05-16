@@ -1,11 +1,11 @@
 # Last updated: 2026-05-16T00:00:00+01:00
 """
-Helm Caddyfile directive contract tests — ACS-RISK-025 regression gate.
+Helm Caddyfile directive contract tests — YSG-RISK-025 regression gate.
 
 Ensures the Helm-rendered Caddyfile (embedded in caddy-config ConfigMap) never
 regresses to the deprecated ``tls_trusted_ca_certs`` directive (removed in
 Caddy 2.12). The compose-side migration was applied in v2.23.2; the helm-side
-was tracked as ACS-RISK-025 and closed in v2.23.4.
+was tracked as YSG-RISK-025 and closed in v2.23.4.
 
 Contract
 --------
@@ -84,11 +84,11 @@ class TestHelmCaddyTrustPool:
         return _helm_render()
 
     def test_no_deprecated_tls_trusted_ca_certs(self, rendered: str) -> None:
-        """ACS-RISK-025 regression gate: deprecated directive must not appear."""
+        """YSG-RISK-025 regression gate: deprecated directive must not appear."""
         assert "tls_trusted_ca_certs" not in rendered, (
             "helm-rendered configmap still contains deprecated 'tls_trusted_ca_certs'. "
             "Caddy 2.12+ removed this directive — use 'tls_trust_pool file <path>' "
-            "inside transport http blocks. ACS-RISK-025 regression."
+            "inside transport http blocks. YSG-RISK-025 regression."
         )
 
     def test_tls_trust_pool_present(self, rendered: str) -> None:

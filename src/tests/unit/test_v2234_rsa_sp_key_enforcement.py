@@ -1,5 +1,5 @@
 """
-Unit tests for ACS-RISK-044 mitigation — RSA SP key enforcement at SAMLProvider init.
+Unit tests for YSG-RISK-044 mitigation — RSA SP key enforcement at SAMLProvider init.
 
 CVE-2026-41989: libgcrypt ECDH heap-buffer-overflow.  The vulnerable code path
 (gcry_pk_decrypt on ECDH-ES key transport) is only reachable when the SP private
@@ -13,7 +13,7 @@ Test matrix:
   T1 — RSA key (PKCS#8 PEM body) is accepted; SAMLProvider initialises without error.
   T2 — EC key (P-256, PKCS#8 PEM body) raises ValueError with clear message.
   T3 — DSA key (PKCS#8 PEM body) raises ValueError with clear message.
-  T4 — Exception message from EC rejection contains "ACS-RISK-044".
+  T4 — Exception message from EC rejection contains "YSG-RISK-044".
   T5 — Exception message from EC rejection contains the openssl genrsa remediation command.
   T6 — Full PEM (with headers) is also accepted for RSA keys.
   T7 — Full PEM (with headers) is rejected for EC keys.
@@ -146,14 +146,14 @@ def test_dsa_key_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T4 — Error message cites ACS-RISK-044
+# T4 — Error message cites YSG-RISK-044
 # ---------------------------------------------------------------------------
 
 def test_error_message_cites_acs_risk_044() -> None:
     """
-    T4: The ValueError raised for an EC key must mention ACS-RISK-044.
+    T4: The ValueError raised for an EC key must mention YSG-RISK-044.
     """
-    with pytest.raises(ValueError, match="ACS-RISK-044"):
+    with pytest.raises(ValueError, match="YSG-RISK-044"):
         _assert_rsa_sp_key(_ec_pem_body())
 
 
@@ -189,7 +189,7 @@ def test_ec_full_pem_rejected() -> None:
     """
     T7: A full PKCS#8 EC PEM (with headers) is still rejected with clear message.
     """
-    with pytest.raises(ValueError, match="ACS-RISK-044"):
+    with pytest.raises(ValueError, match="YSG-RISK-044"):
         _assert_rsa_sp_key(_ec_full_pem())
 
 
@@ -213,7 +213,7 @@ def test_saml_provider_init_ec_raises() -> None:
     before any SAML library interaction occurs.
     """
     cfg = _minimal_saml_config(_ec_pem_body())
-    with pytest.raises(ValueError, match="ACS-RISK-044"):
+    with pytest.raises(ValueError, match="YSG-RISK-044"):
         SAMLProvider(cfg)
 
 
@@ -222,5 +222,5 @@ def test_saml_provider_init_dsa_raises() -> None:
     SAMLProvider.__init__ must raise ValueError for a DSA SP key.
     """
     cfg = _minimal_saml_config(_dsa_pem_body())
-    with pytest.raises(ValueError, match="ACS-RISK-044"):
+    with pytest.raises(ValueError, match="YSG-RISK-044"):
         SAMLProvider(cfg)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # last-updated: 2026-05-15T12:00:00+00:00 (fix(install): detect contaminated volumes + verify healthz on convergence — BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
 # last-updated: 2026-05-15T00:00:00+00:00 (fix(install): move linger-enable to pre-flight, drop privileged-linger shortcut from install body — Q2 / lint-sudo-pattern fix)
-# last-updated: 2026-05-14T22:00:00+00:00 (docs(saml): document + sanity-check RSA SP key requirement — ACS-RISK-044)
-# last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / ACS-RISK-046)
+# last-updated: 2026-05-14T22:00:00+00:00 (docs(saml): document + sanity-check RSA SP key requirement — YSG-RISK-044)
+# last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / YSG-RISK-046)
 # last-updated: 2026-05-13T15:00:00+00:00 (fix(podman): scope :U-override-load to macOS Podman only — LINUX-SHARED-MOUNT-UID-CLOBBER)
 # last-updated: 2026-05-13T13:00:00+00:00 (fix(podman): always apply :U-bearing override on macOS Podman — MACOS-PODMAN-OVERRIDE-LOAD-GAP)
 # last-updated: 2026-05-13T00:00:00+00:00 (fix(podman): add :U to all secret bind-mounts and ephemeral chown — MACOS-PODMAN-PKI-VIRTIOFS-U)
@@ -1608,7 +1608,7 @@ _validate_aes_key() {
 }
 
 # ---------------------------------------------------------------------------
-# SAML SP key generation — ACS-RISK-044 mitigation
+# SAML SP key generation — YSG-RISK-044 mitigation
 # ---------------------------------------------------------------------------
 # SECURITY-MODEL REQUIREMENT: The SAML Service Provider key MUST be RSA.
 #
@@ -1619,7 +1619,7 @@ _validate_aes_key() {
 #   when the SP private key is an EC key.  RSA SP keys route to the RSA
 #   decryption path in xmlsec1 and never invoke gcry_pk_decrypt at all.
 #   The libgcrypt ECDH code path is therefore dead on a standard Yashigani
-#   deployment — ACS-RISK-044 is NOT-EXPLOITABLE when the SP key is RSA.
+#   deployment — YSG-RISK-044 is NOT-EXPLOITABLE when the SP key is RSA.
 #
 # Runtime enforcement: SAMLProvider.__init__ calls _assert_rsa_sp_key()
 #   in src/yashigani/sso/saml.py, which loads the key with
@@ -1633,7 +1633,7 @@ _validate_aes_key() {
 #
 # PQR forward note: when ML-KEM/Kyber key-transport is standardised in the
 # SAML 2.0 / XML Encryption / xmlsec1 / IdP ecosystem, this requirement can
-# be revisited (see ACS-RISK-044 forward-tracking note in risk register).
+# be revisited (see YSG-RISK-044 forward-tracking note in risk register).
 _generate_saml_sp_key() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
   local sp_key_file="${secrets_dir}/saml_sp.key"
@@ -1655,17 +1655,17 @@ _generate_saml_sp_key() {
   log_info "Generating SAML SP RSA-4096 key + self-signed certificate..."
 
   # SECURITY-MODEL REQUIREMENT: SAML SP key MUST be RSA.
-  # EC keys would expose us to ACS-RISK-044 (CVE-2026-41989, libgcrypt ECDH
+  # EC keys would expose us to YSG-RISK-044 (CVE-2026-41989, libgcrypt ECDH
   # heap overflow) via the SAML decryption path.  Runtime enforcement at
   # SAMLProvider init refuses EC keys — see src/yashigani/sso/saml.py.
   # When PQR algorithms ship in SAML+xmlsec+IdP ecosystem, this requirement
-  # can be revisited (see ACS-RISK-044 forward note in risk register).
+  # can be revisited (see YSG-RISK-044 forward note in risk register).
   # Bug fix (7cdbcf9 follow-up): secrets_dir may not yet exist at step 5;
   # mkdir -p is idempotent so safe on both fresh install and re-run.
   mkdir -p "${secrets_dir}"
   umask 077
   if ! openssl genrsa -out "${sp_key_file}" 4096 2>/dev/null; then
-    log_error "Failed to generate SAML SP RSA key (ACS-RISK-044)"
+    log_error "Failed to generate SAML SP RSA key (YSG-RISK-044)"
     exit 1
   fi
 
@@ -1680,7 +1680,7 @@ _generate_saml_sp_key() {
   # later line.  Use `openssl rsa -check` instead: exits 0 only for valid RSA
   # private keys; works identically on OpenSSL 1.x and 3.x.
   if ! openssl rsa -check -in "${sp_key_file}" >/dev/null 2>&1; then
-    log_error "FATAL: generated SAML SP key is not RSA. ACS-RISK-044 mitigation requires RSA." >&2
+    log_error "FATAL: generated SAML SP key is not RSA. YSG-RISK-044 mitigation requires RSA." >&2
     log_error "Remove ${sp_key_file} and re-run install.sh to regenerate." >&2
     exit 1
   fi
@@ -1693,7 +1693,7 @@ _generate_saml_sp_key() {
       -days 3650 \
       -subj "/CN=${domain_label}/O=Yashigani/OU=SAML-SP" \
       2>/dev/null; then
-    log_error "Failed to generate SAML SP self-signed certificate (ACS-RISK-044)"
+    log_error "Failed to generate SAML SP self-signed certificate (YSG-RISK-044)"
     exit 1
   fi
 
@@ -1925,7 +1925,7 @@ sys.exit(1)
 # YASHIGANI_IDP_2_DISCOVERY_URL=https://login.microsoftonline.com/<tenant>/federationmetadata/2007-06/federationmetadata.xml
 # YASHIGANI_IDP_2_EMAIL_DOMAINS=example.com
 #
-# SAML SP key + certificate (ACS-RISK-044 — RSA REQUIRED; see §8.2 in install guide).
+# SAML SP key + certificate (YSG-RISK-044 — RSA REQUIRED; see §8.2 in install guide).
 # install.sh generates docker/secrets/saml_sp.key (RSA-4096) + docker/secrets/saml_sp.crt
 # at install time.  Uncomment and set these paths to activate SAML SP cryptography.
 # DO NOT replace saml_sp.key with an EC key — runtime enforcement will refuse it.
@@ -1937,13 +1937,13 @@ sys.exit(1)
 SSO_EOF
   fi
 
-  # --- SAML SP key generation (ACS-RISK-044) ---
+  # --- SAML SP key generation (YSG-RISK-044) ---
   # Generates docker/secrets/saml_sp.key (RSA-4096) + saml_sp.crt on first install.
   # Idempotent: skipped if the files already exist.
   if [[ "$DRY_RUN" != "true" ]]; then
     _generate_saml_sp_key
   else
-    dry_print "Generate SAML SP RSA-4096 key + certificate (ACS-RISK-044)"
+    dry_print "Generate SAML SP RSA-4096 key + certificate (YSG-RISK-044)"
   fi
 
   log_info "Environment written to ${env_file}"
@@ -4063,7 +4063,7 @@ _podman_verify_healthchecks() {
 #   Linux Podman rootless → loginctl enable-linger + ~/.config/systemd/user/yashigani.service
 #
 # All sub-functions are idempotent: re-running overwrites existing units safely.
-# BUG: BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+# BUG: BUG-REBOOT-NO-AUTO-START / YSG-RISK-046
 # =============================================================================
 
 # Dispatcher — determines runtime class and calls the appropriate sub-function.
@@ -7065,7 +7065,7 @@ main() {
     # Step 10b: Install auto-start units so containers survive a host reboot.
     # Runs after compose_up so WORK_DIR + COMPOSE_CMD are fully resolved.
     # Runs before health-check so unit state is visible in the same terminal session.
-    # BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+    # BUG-REBOOT-NO-AUTO-START / YSG-RISK-046
     _setup_auto_start
 
     # Step 10c: Inject postgres SSL when upgrading from a version without mTLS.

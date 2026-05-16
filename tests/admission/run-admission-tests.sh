@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ACS-RISK-008 Admission Control Test Runner
+# YSG-RISK-008 Admission Control Test Runner
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # Applies compliant + non-compliant pod fixtures against the live cluster and
@@ -20,7 +20,7 @@ NS="yashigani"
 _pass() { echo "  PASS: $1"; ((PASS++)); }
 _fail() { echo "  FAIL: $1"; ((FAIL++)); }
 
-echo "=== ACS-RISK-008 Admission Control Tests ==="
+echo "=== YSG-RISK-008 Admission Control Tests ==="
 echo "Namespace: ${NS}"
 echo "Cluster: $(kubectl config current-context 2>/dev/null || echo '<unknown>')"
 echo ""
@@ -45,7 +45,7 @@ fi
 echo ""
 echo "--- Test 2: Non-compliant root user (must be rejected) ---"
 output=$(kubectl apply -f "${SCRIPT_DIR}/fixture-noncompliant-root.yaml" 2>&1 || true)
-if echo "${output}" | grep -qiE "denied|violation|ACS-RISK-008|restrict-root-user|run-as-non-root"; then
+if echo "${output}" | grep -qiE "denied|violation|YSG-RISK-008|restrict-root-user|run-as-non-root"; then
   _pass "Root pod rejected by admission policy"
   kubectl delete pod yashigani-test-noncompliant-root -n "${NS}" --ignore-not-found 2>/dev/null || true
 else
@@ -56,7 +56,7 @@ fi
 echo ""
 echo "--- Test 3: Non-compliant privilege escalation (must be rejected) ---"
 output=$(kubectl apply -f "${SCRIPT_DIR}/fixture-noncompliant-privesc.yaml" 2>&1 || true)
-if echo "${output}" | grep -qiE "denied|violation|ACS-RISK-008|privilege-escalation"; then
+if echo "${output}" | grep -qiE "denied|violation|YSG-RISK-008|privilege-escalation"; then
   _pass "PrivEsc pod rejected by admission policy"
   kubectl delete pod yashigani-test-noncompliant-privesc -n "${NS}" --ignore-not-found 2>/dev/null || true
 else
@@ -67,7 +67,7 @@ fi
 echo ""
 echo "--- Test 4: Non-compliant missing seccomp (must be rejected) ---"
 output=$(kubectl apply -f "${SCRIPT_DIR}/fixture-noncompliant-no-seccomp.yaml" 2>&1 || true)
-if echo "${output}" | grep -qiE "denied|violation|ACS-RISK-008|seccomp"; then
+if echo "${output}" | grep -qiE "denied|violation|YSG-RISK-008|seccomp"; then
   _pass "No-seccomp pod rejected by admission policy"
   kubectl delete pod yashigani-test-noncompliant-no-seccomp -n "${NS}" --ignore-not-found 2>/dev/null || true
 else

@@ -1,3 +1,4 @@
+<!-- last-updated: 2026-05-16T18:30:00+01:00 (v2.23.4: draft [Unreleased] entry covering 62 commits since v2.23.3) -->
 <!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
 <!-- last-updated: 2026-05-11T22:00:00+01:00 (v2.23.3 GA — flip [Unreleased] block to [v2.23.3]) -->
@@ -12,9 +13,128 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [Unreleased]
+## [Unreleased] — v2.23.4 (pre-tag)
 
-(No unreleased changes — v2.23.3 shipped 2026-05-11.)
+> The v2.23.4 release closes the v2.23.3 follow-up backlog, ships the SAML BYOK
+> config-load surface, multi-platform install robustness improvements, and a
+> new CI gate that prevents Caddyfile / service-identity drift between compose
+> and Helm. Tag pending pre-flight gate completion.
+
+### Added
+
+- **SAML BYOK config-load surface** — `broker.add_idp()` now accepts SAML
+  identity-provider configurations via the `YASHIGANI_IDP_<N>_SAML_*`
+  environment variables (idp metadata URL/XML, SP entity ID, ACS URL, SP
+  private key, SP certificate). `_assert_rsa_sp_key()` runs at config-load
+  time, rejecting non-RSA SP keys at container startup rather than at first
+  signature attempt. Mitigates the libgcrypt ECDH heap-overflow class
+  (CVE-2026-41989) at config-load.
+- **HUMAN identity registration on local-auth login** — local password+TOTP
+  users now get an identity-registry entry created automatically on first
+  login, with tier-aware metadata. Closes the design gap where local-auth
+  users had no identity-registry presence.
+- **`/me/api-key` self-service Bearer issuance** — users can mint, list, and
+  revoke their own API keys from the user UI. Step-up TOTP required for
+  issuance (ASVS V6.8.4). API-key strings are hash-stored; `last4` shown in
+  UI for identification.
+- **Container auto-start on host reboot** — compose installs now provision a
+  user-scoped `systemd --user` unit under `loginctl enable-linger` so the
+  gateway and backoffice come back up after a host reboot without operator
+  intervention. Helm path already handled by Kubernetes.
+- **`--http-port` / `--https-port` CLI flags** — `install.sh` exposes port
+  remapping for hosts where 80/443 are taken. Defaults unchanged.
+- **Langflow + Letta in `agentBundles`** — Helm chart wires Langflow and Letta
+  as opt-in agent-bundle services with per-bundle tokens, `securityContext`,
+  and matching K8s Secrets. Disabled by default.
+- **Email-as-username + suspended-identity reactivation flow** — local-auth
+  accounts identify by email rather than free-form username; admin
+  reactivation action covers the suspended-identity case.
+
+### Fixed
+
+- **Gateway pgbouncer-DSN advisory-lock deadlock** — `run_migrations()` in the
+  gateway service used the pgbouncer DSN for the migration advisory lock.
+  Under pgbouncer session-recycling the lock survived `lock_conn.close()`,
+  leaving it held on a recycled backend pid; the backoffice's lifespan
+  acquisition then deadlocked. Surfaced on Mac Podman (Linux VM was
+  timing-lucky). Fix: gateway service now has `YASHIGANI_DB_DSN_DIRECT`
+  pointing at postgres directly, matching the long-standing backoffice
+  pattern.
+- **Install — contaminated-volume detection** — `install.sh` now refuses to
+  proceed when a leftover `docker_postgres_data` volume holds an old PKI CA
+  bundle, because postgres DB-init scripts run only on an empty volume.
+  Operator is directed to `uninstall.sh --remove-volumes` or
+  `install.sh --upgrade`.
+- **Uninstall — partial `.env` handling** — `uninstall.sh` now stubs missing
+  required `:?` environment variables before `compose down`, covering the
+  operator path where a prior install failed partway and left an incomplete
+  `docker/.env`. Previously gated only on `.env` being entirely absent.
+- **Uninstall — dependency-graph leak on `--remove-volumes`** — compose-down
+  now force-removes containers in leaf-first dependency order before volume
+  removal, then runs a final cleanup pass to catch redis straggler containers
+  that respawn during Podman network teardown.
+- **Uninstall — multi-user PKI cleanup** — `docker/secrets/` is now wiped on
+  `--remove-volumes` so a subsequent install by a different Unix user does
+  not fail on PKI key ownership.
+- **macOS Podman — virtiofs `:U` ownership remap** — all bind-mounts of
+  secret material apply `:U` (and ephemeral chown where needed) on macOS
+  Podman. Linux Podman unaffected. Scoped to macOS Podman after a regression
+  on rootful Linux.
+- **Helm — OPA mTLS wired correctly on K8s install**, and OPA probes use the
+  HTTPS scheme when `mtls.enabled=true`.
+- **Helm — `tls_trusted_ca_certs` → `tls_trust_pool`** chart-side Caddyfile
+  migration to caddy 2.11's replacement directive.
+- **Helm — `admissionPolicies.enabled` default is now `false`** because the
+  chart's Kyverno ClusterPolicy resources require Kyverno to be installed
+  in the cluster. Default-on caused stock `helm install` to fail on clusters
+  without Kyverno. Opt in with `--set admissionPolicies.enabled=true`; the
+  chart now fails fast with a friendly error if Kyverno CRDs are missing.
+- **SPA — inline styles removed; CSP tightened** with no `unsafe-inline` for
+  `style-src`.
+- **Auto-agent-registration — 401 on Layer B header path fixed** during
+  installer-driven agent bundle registration.
+
+### Security
+
+- **SAML SP-key RSA enforcement at config-load** — non-RSA SP private keys
+  rejected at `SAMLProvider.__init__`, preventing the EC-key path from
+  reaching python3-saml. Mitigates the libgcrypt ECDH heap-overflow CVE
+  class regardless of upstream patch availability.
+- **python3-saml manual-re-audit gates** — `xmlparser.py` entity and
+  DTD-resolution paths flagged for manual re-audit at every upstream bump.
+- **Admin/user tier separation regression test** — covered with a real
+  fakeredis-backed integration test exercising the production registration
+  path (not a mock).
+
+### Changed
+
+- **Version bumped 2.23.3 → 2.23.4** across `pyproject.toml`, `install.sh`,
+  `docker-compose.yml` defaults, helm `values.yaml`, `airgap/manifest.yml`,
+  and `AI_ASSETS.md`. The v2.23.4 branch was cut from v2.23.3 tip without
+  the initial version bump; this closes the drift so `install.sh` against
+  v2.23.4 source builds and deploys v2.23.4-tagged containers (rather than
+  silently building `:2.23.3`-tagged ones from v2.23.4 code).
+
+### CI / Tooling
+
+- **Caddyfile family parity gate** — new workflow runs `caddy adapt` against
+  each compose Caddyfile variant (`acme`, `ca`, `selfsigned`) plus the
+  helm-rendered Caddyfile fragment, asserts exit 0, and verifies per-listener
+  directive parity across the compose variants. Adds a `service_identities.yaml`
+  dedup check (single source of truth via symlink) and a Helm env-var parity
+  check that catches the gateway-DSN-DIRECT class of regression.
+
+### Documentation
+
+- **Architecture cleanup** — removed unimplemented bare-metal install claims
+  from `Architecture.md`. Bare-metal install was design intent that never
+  shipped code.
+- **`iptables FORWARD` precondition** for rootful Podman installs on test
+  VMs documented (production hosts with sane FORWARD policy unaffected).
+- **SHA-256-compatible authenticator app guidance** in post-install message
+  — Yashigani uses HMAC-SHA-256 per the SHA-256 minimum policy; apps that
+  ignore the `algorithm` parameter (e.g. older Google Authenticator) silently
+  default to SHA-1 and produce wrong codes.
 
 ---
 

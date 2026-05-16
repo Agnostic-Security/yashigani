@@ -235,7 +235,7 @@ def test_register_agent_route_returns_402_at_limit(tier_name: str):
         import unittest.mock as _mock
         from yashigani.auth import spiffe as _spiffe_mod
 
-        # ACS-RISK-012b: POST /admin/agents now has require_spiffe_id gate.
+        # YSG-RISK-012b: POST /admin/agents now has require_spiffe_id gate.
         # Stub _load_acls to bypass the SPIFFE gate in this tier-limit test —
         # the gate is separately tested in test_acs_risk_012b_spiffe_admin_agents.py;
         # this test's contract is "tier limit → HTTP 402", not SPIFFE identity.
@@ -323,7 +323,7 @@ def test_register_agent_route_returns_201_below_limit():
         import unittest.mock as _mock
         from yashigani.auth import spiffe as _spiffe_mod
 
-        # ACS-RISK-012b: POST /admin/agents now has require_spiffe_id gate.
+        # YSG-RISK-012b: POST /admin/agents now has require_spiffe_id gate.
         # Stub _load_acls to bypass the SPIFFE gate here — gate behaviour is
         # separately tested in test_acs_risk_012b_spiffe_admin_agents.py.
         _ADMIN_AGENTS_ACL = {"/admin/agents": frozenset({

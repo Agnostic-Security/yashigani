@@ -1,4 +1,4 @@
-# Last updated: 2026-05-16T00:00:00+00:00 (v2.23.4: ACS-RISK-026 — add per-listener cross-variant parity test)
+# Last updated: 2026-05-16T00:00:00+00:00 (v2.23.4: YSG-RISK-026 — add per-listener cross-variant parity test)
 """
 Caddyfile family contract tests — anti-rot gate.
 
@@ -7,7 +7,7 @@ blocks audited, all missing inject-caddy-verified imports detected and fixed).
 
 Contract assertions (all three Caddyfiles: selfsigned / acme / ca)
 -------------------------------------------------------------------
-0. Per-listener security directive parity (ACS-RISK-026 Step 3):
+0. Per-listener security directive parity (YSG-RISK-026 Step 3):
    The main public HTTPS site block must have identical TLS protocol set,
    cipher list, and client_auth verifier mode across all three Caddyfile
    variants.  cert source (tls internal / tls acme / tls cert+key) differs
@@ -307,7 +307,7 @@ def test_inject_count_consistent_across_family(name: str, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-listener security directive parity (ACS-RISK-026 Step 3)
+# Per-listener security directive parity (YSG-RISK-026 Step 3)
 # ---------------------------------------------------------------------------
 
 
@@ -413,7 +413,7 @@ def _site_client_auth_mode(block: str) -> str | None:
 
 def test_main_site_listener_parity_across_family() -> None:
     """
-    ACS-RISK-026 Step 3 — Per-listener security directive parity.
+    YSG-RISK-026 Step 3 — Per-listener security directive parity.
 
     The three Caddyfile variants differ legitimately in cert source:
     - selfsigned: ``tls internal { ... }``
@@ -476,7 +476,7 @@ def test_main_site_listener_parity_across_family() -> None:
             )
 
     assert not failures, (
-        "\nPer-listener security directive parity FAILED — ACS-RISK-026 Step 3.\n\n"
+        "\nPer-listener security directive parity FAILED — YSG-RISK-026 Step 3.\n\n"
         + "\n".join(failures)
         + "\n\nThe three Caddyfile variants must have identical security posture on "
         "the main HTTPS listener (protocols, ciphers, client_auth mode).\n"

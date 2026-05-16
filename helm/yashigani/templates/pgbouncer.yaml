@@ -43,7 +43,7 @@ spec:
           imagePullPolicy: {{ .Values.pgbouncer.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
-            # ACS-RISK-008: readOnlyRootFilesystem NOT set — edoburu/pgbouncer
+            # YSG-RISK-008: readOnlyRootFilesystem NOT set — edoburu/pgbouncer
             # writes userlist.txt to /etc/pgbouncer/ at startup. An emptyDir
             # overlay is incompatible with the subPath config mount already in
             # place. Documented exception; deferred to v2.23.3.

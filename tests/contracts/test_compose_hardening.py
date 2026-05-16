@@ -1,12 +1,12 @@
 """
-ACS-RISK-008 Compose Hardening Parity Gate (v2.23.4)
+YSG-RISK-008 Compose Hardening Parity Gate (v2.23.4)
 
 Asserts that every service in docker/docker-compose.yml has:
   1. cap_drop: [ALL]             — universal (was already true pre-v2.23.4)
   2. security_opt with no-new-privileges:true
   3. read_only: true             — OR is in the documented exemption list
 
-Exemption list (documented asymmetry, see risk register ACS-RISK-008):
+Exemption list (documented asymmetry, see risk register YSG-RISK-008):
   wazuh-manager, wazuh-indexer, wazuh-dashboard
     Reason: Wazuh suite (profile-gated, opt-in) has complex internal write paths
     under /var/ossec and /usr/share/wazuh-* not covered by declared volumes.
@@ -40,7 +40,7 @@ import yaml
 COMPOSE_FILE = pathlib.Path(__file__).parent.parent.parent / "docker" / "docker-compose.yml"
 
 # Services exempt from read_only: true requirement.
-# Each entry MUST have a documented reason in docker/docker-compose.yml (see ACS-RISK-008 comments).
+# Each entry MUST have a documented reason in docker/docker-compose.yml (see YSG-RISK-008 comments).
 READ_ONLY_EXEMPTIONS = frozenset(
     {
         "wazuh-manager",   # OpenSearch/JVM + agent internal write paths not covered by volumes
@@ -109,7 +109,7 @@ class TestCapDropAll:
                 failures.append(name)
         assert not failures, (
             f"Services missing cap_drop: [ALL]: {failures}\n"
-            "ACS-RISK-008: cap_drop is the baseline defence. Every service MUST have it."
+            "YSG-RISK-008: cap_drop is the baseline defence. Every service MUST have it."
         )
 
 
@@ -127,7 +127,7 @@ class TestNoNewPrivileges:
                 failures.append(name)
         assert not failures, (
             f"Services missing no-new-privileges:true: {failures}\n"
-            "ACS-RISK-008: no-new-privileges prevents privilege escalation via setuid/setgid "
+            "YSG-RISK-008: no-new-privileges prevents privilege escalation via setuid/setgid "
             "binaries inside the container. All services must have this set.\n"
             "Fix: add `security_opt: [no-new-privileges:true]` to each failing service."
         )
@@ -141,7 +141,7 @@ class TestReadOnly:
     def test_all_services_have_read_only_or_are_exempt(self, services, service_names):
         """
         Every service must have read_only: true, OR must be in READ_ONLY_EXEMPTIONS.
-        Exemptions require a documented reason in docker-compose.yml and risk register ACS-RISK-008.
+        Exemptions require a documented reason in docker-compose.yml and risk register YSG-RISK-008.
         """
         failures = []
         for name in service_names:
@@ -152,13 +152,13 @@ class TestReadOnly:
                 failures.append(name)
         assert not failures, (
             f"Services missing read_only: true (and not in exemption list): {failures}\n"
-            "ACS-RISK-008: read_only: true prevents container filesystem writes outside "
+            "YSG-RISK-008: read_only: true prevents container filesystem writes outside "
             "declared volumes and tmpfs mounts.\n"
             "Fix: add `read_only: true` to each failing service, plus `tmpfs:` entries "
             "for any paths the service needs to write to at runtime.\n"
             f"Documented exemptions: {sorted(READ_ONLY_EXEMPTIONS)}\n"
             "To add a new exemption: add to READ_ONLY_EXEMPTIONS above, add inline comment "
-            "in docker-compose.yml, and update risk register ACS-RISK-008."
+            "in docker-compose.yml, and update risk register YSG-RISK-008."
         )
 
     def test_exemptions_have_inline_comment(self, services):

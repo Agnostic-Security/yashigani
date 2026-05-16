@@ -1,7 +1,7 @@
-# Last updated: 2026-05-16T00:00:00+00:00 (v2.23.4: ACS-RISK-026 close)
+# Last updated: 2026-05-16T00:00:00+00:00 (v2.23.4: YSG-RISK-026 close)
 name: Caddyfile Family Parity
 
-# ACS-RISK-026: Caddyfile family drift CI gate.
+# YSG-RISK-026: Caddyfile family drift CI gate.
 #
 # Historical incidents this gate would have caught:
 #   e0d3869 — LAURA-V231-007: inject-caddy-verified missing from Caddyfile.ca
@@ -301,7 +301,7 @@ jobs:
         run: pip install "pytest>=8"
 
       - name: Caddyfile family contract tests (inject-caddy-verified + TLS1.3 + GCM ciphers + client_auth placement)
-        # ACS-RISK-026 Step 3: per-listener directive parity across all 3 compose variants.
+        # YSG-RISK-026 Step 3: per-listener directive parity across all 3 compose variants.
         # Catches: e0d3869 (inject-caddy-verified missing in .ca), 63c5351 (client_auth inside handle),
         # bc9cd0d (TLS 1.3 missing on one variant), cfa72f3 (inject-caddy-verified on residual blocks).
         # The caddy-adapt job (Step 1) does not run here — it's in the caddy-adapt job above.
@@ -326,7 +326,7 @@ jobs:
         run: pip install "pytest>=8"
 
       - name: service_identities.yaml SHA parity (pytest)
-        # ACS-RISK-026 Step 4: canonical docker/ copy and helm/files/ copy must
+        # YSG-RISK-026 Step 4: canonical docker/ copy and helm/files/ copy must
         # be byte-identical. The helm/files/ entry is a symlink to docker/; the
         # sha256 test validates the symlink resolves to the correct content.
         run: python3 -m pytest tests/contracts/test_service_identities_sha.py -v
@@ -378,7 +378,7 @@ jobs:
         run: pip install "pytest>=8"
 
       - name: Helm env-block parity (YASHIGANI_DB_DSN_DIRECT + all shared env vars)
-        # ACS-RISK-026 Step 5 (Lu add-on): verifies YASHIGANI_DB_DSN_DIRECT,
+        # YSG-RISK-026 Step 5 (Lu add-on): verifies YASHIGANI_DB_DSN_DIRECT,
         # YASHIGANI_DB_DSN, CADDY_INTERNAL_HMAC, OTEL_EXPORTER_OTLP_CERTIFICATE,
         # and YASHIGANI_SECRETS_DIR are present with correct values in BOTH
         # gateway.yaml and backoffice.yaml.

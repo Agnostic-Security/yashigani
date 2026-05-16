@@ -1,7 +1,7 @@
-# Last updated: 2026-05-16T21:00:00+01:00 (v2.23.4: ACS-RISK-008 close — compose hardening parity gate)
+# Last updated: 2026-05-16T21:00:00+01:00 (v2.23.4: YSG-RISK-008 close — compose hardening parity gate)
 name: Compose Hardening Parity Gate
 
-# ACS-RISK-008 (v2.23.4): CI gate to prevent compose hardening regression.
+# YSG-RISK-008 (v2.23.4): CI gate to prevent compose hardening regression.
 #
 # Checks enforced:
 #   1. Every service in docker/docker-compose.yml must have cap_drop: [ALL]
@@ -20,7 +20,7 @@ name: Compose Hardening Parity Gate
 #   contract test patterns in tests/contracts/.
 #
 # Historical incidents this gate would have caught:
-#   ACS-RISK-008 (pre-fix): 24/27 services had no read_only, 17/27 missing
+#   YSG-RISK-008 (pre-fix): 24/27 services had no read_only, 17/27 missing
 #   no-new-privileges. Any new service added without these would drift silently.
 
 on:
@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   compose-hardening-parity:
-    name: Compose hardening parity (ACS-RISK-008)
+    name: Compose hardening parity (YSG-RISK-008)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

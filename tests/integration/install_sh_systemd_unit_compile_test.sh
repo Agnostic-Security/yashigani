@@ -32,7 +32,7 @@
 #   0 — all checks PASS
 #   1 — one or more checks FAIL
 #
-# BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+# BUG-REBOOT-NO-AUTO-START / YSG-RISK-046
 # last-updated: 2026-05-14T00:00:00+00:00
 
 set -euo pipefail

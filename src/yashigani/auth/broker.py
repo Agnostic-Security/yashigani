@@ -61,7 +61,7 @@ class IdPConfig:
     # SAML SP / IdP credentials (ignored for protocol="oidc").
     # sp_private_key: RSA private key PEM body (no headers) or full PEM.
     #   Enforcement: _assert_rsa_sp_key() fires at add_idp() time — non-RSA keys
-    #   reject startup (ACS-RISK-044 / CVE-2026-41989 mitigation).
+    #   reject startup (YSG-RISK-044 / CVE-2026-41989 mitigation).
     # idp_sso_url / idp_sls_url: SAML SSO and SLS endpoints from IdP metadata.
     # idp_x509_cert / sp_certificate: X.509 PEM bodies (no headers).
     # sp_sls_url: SP Single Logout Service URL.
@@ -163,7 +163,7 @@ class IdentityBroker:
             # Build SAMLConfig from the IdPConfig SAML fields and register the
             # provider.  SAMLProvider.__init__ calls _assert_rsa_sp_key() —
             # non-RSA SP keys raise ValueError here, fail-closing at config-load
-            # (ACS-RISK-044 / CVE-2026-41989 mitigation).
+            # (YSG-RISK-044 / CVE-2026-41989 mitigation).
             #
             # entity_id on IdPConfig serves as the SAML SP entity ID (the SP's
             # own public identifier).  sp_acs_url defaults to metadata_url when

@@ -78,10 +78,10 @@ networkPolicies:
   enabled: true
 
 # ---------------------------------------------------------------------------
-# Admission Control (ACS-RISK-008 — v2.23.2 P1)
+# Admission Control (YSG-RISK-008 — v2.23.2 P1)
 # ---------------------------------------------------------------------------
 # When enabled, the chart renders Kyverno ClusterPolicy resources that REJECT
-# pods missing the ACS-RISK-008 container hardening baseline:
+# pods missing the YSG-RISK-008 container hardening baseline:
 #   - runAsNonRoot: true (pod or container level)
 #   - allowPrivilegeEscalation: false (every container)
 #   - seccompProfile.type: RuntimeDefault (pod level)
@@ -96,7 +96,7 @@ networkPolicies:
 # not be present and helm install/upgrade will fail with an opaque API-server
 # error. Leaving this false means application-layer mTLS + SPIFFE gate remain
 # active; document any disablement in the risk register with maintainer
-# sign-off, referencing ACS-RISK-008.
+# sign-off, referencing YSG-RISK-008.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # LIC-002 SECURITY NOTICE — YASHIGANI_LICENSE_TIER is NOT an operator-settable
@@ -1112,7 +1112,7 @@ sso:
   # existingSecretName: yashigani-sso-secrets
   # The secret must contain keys idp_<n>_client_secret for OIDC IdPs,
   # and idp_<n>_saml_sp_private_key for SAML IdPs (RSA keys only —
-  # non-RSA keys reject startup per ACS-RISK-044 mitigation).
+  # non-RSA keys reject startup per YSG-RISK-044 mitigation).
   idps: []
   # OIDC example:
   # - id: "keycloak-dev"

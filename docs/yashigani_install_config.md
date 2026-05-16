@@ -1133,7 +1133,7 @@ The SAML Service Provider (SP) private key **must** be RSA. Yashigani enforces
 this at runtime and refuses to enable SAML if the SP key is EC, DSA, or any
 other algorithm.
 
-**Rationale (ACS-RISK-044 / CVE-2026-41989):** libgcrypt contains a
+**Rationale (YSG-RISK-044 / CVE-2026-41989):** libgcrypt contains a
 heap-buffer-overflow in `gcry_pk_decrypt` on the ECDH decryption path (CVSS 7.5).
 This path is only exercised when the SP key is EC-type and the IdP sends an
 EncryptedAssertion with ECDH-ES key transport. RSA SP keys route through a
@@ -1157,7 +1157,7 @@ a non-RSA key is supplied.
 
 **Future:** When post-quantum (PQR) key algorithms (ML-KEM / Kyber) are
 supported across the SAML 2.0 + xmlsec + IdP ecosystem, this requirement will
-be revisited (ACS-RISK-044 forward-tracking note).
+be revisited (YSG-RISK-044 forward-tracking note).
 
 **Step 1.** Configure your IdP with the following ACS URL:
 

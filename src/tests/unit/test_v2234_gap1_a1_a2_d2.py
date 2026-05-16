@@ -341,7 +341,7 @@ class TestBYOKSpKeyValidation:
 
     Scenario: admin replaces saml_sp.key with an EC key (BYOK — Bring Your Own Key),
     then restarts the container. SAMLProvider.__init__ must fail loudly with
-    ValueError referencing ACS-RISK-044.
+    ValueError referencing YSG-RISK-044.
 
     Tom's commit 105be23 added _assert_rsa_sp_key() called at SAMLProvider.__init__.
     The existing tests (test_v2234_rsa_sp_key_enforcement.py) cover T1-T7 for the
@@ -408,7 +408,7 @@ class TestBYOKSpKeyValidation:
     def test_d2_byok_ec_key_full_pem_rejected(self):
         """
         D2(b): Admin supplies BYOK EC key (full PEM with headers).
-        SAMLProvider.__init__ must raise ValueError citing ACS-RISK-044.
+        SAMLProvider.__init__ must raise ValueError citing YSG-RISK-044.
 
         If this test fails, an admin can degrade SAML to an EC SP key without
         any startup error, silently enabling the CVE-2026-41989 attack path.
@@ -416,7 +416,7 @@ class TestBYOKSpKeyValidation:
         from yashigani.sso.saml import SAMLProvider
         ec_pem = self._make_ec_pem_str()
         cfg = self._saml_config(ec_pem)
-        with pytest.raises(ValueError, match="ACS-RISK-044"):
+        with pytest.raises(ValueError, match="YSG-RISK-044"):
             SAMLProvider(cfg)
 
     def test_d2_byok_ec_key_no_headers_rejected(self):
@@ -427,7 +427,7 @@ class TestBYOKSpKeyValidation:
         from yashigani.sso.saml import SAMLProvider
         ec_body = self._make_ec_pem_body()
         cfg = self._saml_config(ec_body)
-        with pytest.raises(ValueError, match="ACS-RISK-044"):
+        with pytest.raises(ValueError, match="YSG-RISK-044"):
             SAMLProvider(cfg)
 
     def test_d2_byok_rsa_key_accepted(self):
@@ -474,7 +474,7 @@ class TestBYOKSpKeyValidation:
         """
         from yashigani.sso.saml import _assert_rsa_sp_key
         ec_pem = self._make_ec_pem_str()
-        with pytest.raises(ValueError, match="ACS-RISK-044"):
+        with pytest.raises(ValueError, match="YSG-RISK-044"):
             _assert_rsa_sp_key(ec_pem)
 
     def test_d2_byok_assert_rsa_sp_key_standalone_rsa_accepted(self):

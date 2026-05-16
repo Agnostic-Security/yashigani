@@ -1,4 +1,4 @@
-# ACS-RISK-008 — Container hardening: require runAsNonRoot
+# YSG-RISK-008 — Container hardening: require runAsNonRoot
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # Rejects pods where neither the pod-level nor any individual container sets
@@ -22,7 +22,7 @@ metadata:
     policies.kyverno.io/description: >-
       Pods in the yashigani namespace must set runAsNonRoot: true at the pod
       or container level, or provide a non-zero runAsUser. Implements
-      ACS-RISK-008 container hardening requirement.
+      YSG-RISK-008 container hardening requirement.
 spec:
   # validationFailureAction: Enforce — hard reject on admission.
   # Change to Audit to observe without blocking (during rollout only).
@@ -38,7 +38,7 @@ spec:
               namespaces:
                 - yashigani
       # Exclude ollama: upstream image requires UID 0.
-      # Risk-register ref: ACS-RISK-008-EX-OLLAMA-2026-05-02
+      # Risk-register ref: YSG-RISK-008-EX-OLLAMA-2026-05-02
       exclude:
         any:
           - resources:
@@ -51,7 +51,7 @@ spec:
                   app.kubernetes.io/name: ollama
       validate:
         message: >-
-          ACS-RISK-008: All containers must either set runAsNonRoot: true
+          YSG-RISK-008: All containers must either set runAsNonRoot: true
           or a non-zero runAsUser. Pod '{{ request.object.metadata.name }}'
           has a container that runs as root or has no user configured.
         foreach:

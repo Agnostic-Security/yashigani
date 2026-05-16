@@ -18,7 +18,7 @@ Covered components:
   src/yashigani/auth/broker.py — IdentityBroker.add_idp(), remove_idp()
   src/yashigani/backoffice/entrypoint.py — IdP env-var loop (SAML fields)
 
-ACS-RISK-044 rationale update:
+YSG-RISK-044 rationale update:
   Before this commit: NOT-REACHABLE (SAMLProvider never constructed — _saml_providers empty).
   After this commit: NOT-EXPLOITABLE — RSA-only enforcement at config-load in
   SAMLProvider.__init__ (src/yashigani/sso/saml.py:134) rejects non-RSA keys
@@ -159,7 +159,7 @@ class TestAddIdpSamlBranchRsa:
 # ---------------------------------------------------------------------------
 
 class TestAddIdpSamlBranchEcRejected:
-    """B02: add_idp() with an EC SP key must raise ValueError (ACS-RISK-044)."""
+    """B02: add_idp() with an EC SP key must raise ValueError (YSG-RISK-044)."""
 
     def test_ec_key_raises_value_error(self):
         """
@@ -167,7 +167,7 @@ class TestAddIdpSamlBranchEcRejected:
         """
         broker = _professional_broker()
         cfg = _saml_idp_config(sp_private_key=_ec_pem_body())
-        with pytest.raises(ValueError, match="ACS-RISK-044"):
+        with pytest.raises(ValueError, match="YSG-RISK-044"):
             broker.add_idp(cfg, redirect_uri="https://sp.example.com/acs")
 
     def test_ec_key_does_not_populate_saml_providers(self):
@@ -206,7 +206,7 @@ class TestAddIdpSamlBranchEcRejected:
 # ---------------------------------------------------------------------------
 
 class TestAddIdpSamlBranchDsaRejected:
-    """B03: add_idp() with a DSA SP key must raise ValueError (ACS-RISK-044)."""
+    """B03: add_idp() with a DSA SP key must raise ValueError (YSG-RISK-044)."""
 
     def test_dsa_key_raises_value_error(self):
         """
@@ -214,7 +214,7 @@ class TestAddIdpSamlBranchDsaRejected:
         """
         broker = _professional_broker()
         cfg = _saml_idp_config(sp_private_key=_dsa_pem_body())
-        with pytest.raises(ValueError, match="ACS-RISK-044"):
+        with pytest.raises(ValueError, match="YSG-RISK-044"):
             broker.add_idp(cfg, redirect_uri="https://sp.example.com/acs")
 
 
@@ -228,14 +228,14 @@ class TestAddIdpSamlAssertRsaFiresAtInit:
     def test_rsa_enforcement_is_at_construction_time(self):
         """
         B04: Passing an EC key to add_idp() raises immediately — before any
-        SAML request is processed.  This is the critical ACS-RISK-044 invariant:
+        SAML request is processed.  This is the critical YSG-RISK-044 invariant:
         the vulnerable path is never reachable for non-RSA keys.
         """
         broker = _professional_broker()
         cfg = _saml_idp_config(sp_private_key=_ec_pem_body())
 
         # Raises at add_idp(), not deferred to handle_saml_response().
-        with pytest.raises(ValueError, match="ACS-RISK-044"):
+        with pytest.raises(ValueError, match="YSG-RISK-044"):
             broker.add_idp(cfg, redirect_uri="https://sp.example.com/acs")
 
         # handle_saml_response must not be reached — it returns early because

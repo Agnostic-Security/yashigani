@@ -23,7 +23,7 @@ def _assert_rsa_sp_key(sp_private_key: str) -> None:
     """
     Enforce that the SAML SP private key is RSA.
 
-    ACS-RISK-044 (CVE-2026-41989): libgcrypt ECDH heap-buffer-overflow is
+    YSG-RISK-044 (CVE-2026-41989): libgcrypt ECDH heap-buffer-overflow is
     only reachable when the SP key is EC-type (ECDH-ES key-transport path).
     RSA SP keys route to a different decryption path and do not reach the
     vulnerable C code in gcry_pk_decrypt.
@@ -64,19 +64,19 @@ def _assert_rsa_sp_key(sp_private_key: str) -> None:
         except Exception as exc:
             raise ValueError(
                 f"SAML SP key could not be parsed as a PEM private key "
-                f"(ACS-RISK-044). "
+                f"(YSG-RISK-044). "
                 f"Regenerate with: openssl genrsa -out sp_key.pem 4096"
             ) from exc
     except Exception as exc:
         raise ValueError(
             f"SAML SP key could not be loaded: {exc!r} "
-            f"(ACS-RISK-044). "
+            f"(YSG-RISK-044). "
             f"Regenerate with: openssl genrsa -out sp_key.pem 4096"
         ) from exc
 
     if not isinstance(key, RSAPrivateKey):
         raise ValueError(
-            f"SAML SP key must be RSA (mitigates ACS-RISK-044 / CVE-2026-41989). "
+            f"SAML SP key must be RSA (mitigates YSG-RISK-044 / CVE-2026-41989). "
             f"Got: {type(key).__name__}. "
             f"EC/EdDSA/DSA SP keys are not permitted — PQR support is deferred. "
             f"Regenerate with: openssl genrsa -out sp_key.pem 4096"
@@ -129,7 +129,7 @@ class SAMLProvider:
     """
 
     def __init__(self, config: SAMLConfig) -> None:
-        # ACS-RISK-044 (CVE-2026-41989): enforce RSA SP key at init time.
+        # YSG-RISK-044 (CVE-2026-41989): enforce RSA SP key at init time.
         # Raises ValueError immediately if the key is non-RSA.
         _assert_rsa_sp_key(config.sp_private_key)
         self._config = config

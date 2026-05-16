@@ -1,4 +1,4 @@
-# ACS-RISK-008 admission test — NON-COMPLIANT pod fixture (no seccomp)
+# YSG-RISK-008 admission test — NON-COMPLIANT pod fixture (no seccomp)
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # This pod deliberately omits seccompProfile. It MUST be REJECTED by
@@ -6,7 +6,7 @@
 #
 # Expected result:
 #   Error from server: admission webhook "validate.kyverno.svc" denied the request:
-#   [...] ACS-RISK-008: Pod 'yashigani-test-noncompliant-no-seccomp' must set
+#   [...] YSG-RISK-008: Pod 'yashigani-test-noncompliant-no-seccomp' must set
 #   seccompProfile.type to RuntimeDefault or Localhost
 #
 # Usage:

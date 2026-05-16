@@ -76,7 +76,7 @@ _CANONICAL_VOLUMES=(
 # --remove-volumes. Plain uninstall preserves linger so a re-install picks
 # up the user systemd instance cleanly. --remove-volumes is the full-clean
 # exit path that removes data + linger together.
-# BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+# BUG-REBOOT-NO-AUTO-START / YSG-RISK-046
 # ---------------------------------------------------------------------------
 _remove_auto_start() {
   echo "=== Removing auto-start configuration ==="
@@ -219,7 +219,7 @@ fi
 
 # Step 1: Remove auto-start units BEFORE stopping containers.
 # Disabling first prevents a reboot mid-uninstall from re-starting the stack.
-# BUG-REBOOT-NO-AUTO-START / ACS-RISK-046
+# BUG-REBOOT-NO-AUTO-START / YSG-RISK-046
 _remove_auto_start
 
 # Step 2: Stop the compose stack

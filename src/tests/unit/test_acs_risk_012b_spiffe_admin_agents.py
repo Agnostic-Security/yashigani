@@ -1,8 +1,8 @@
-"""Unit tests for ACS-RISK-012b — SPIFFE binding on /admin/agents write routes.
+"""Unit tests for YSG-RISK-012b — SPIFFE binding on /admin/agents write routes.
 
 Last updated: 2026-05-16T00:00:00+01:00
 
-Closes: ACS-RISK-012b (ASVS V10.3.5 sender-constrained tokens).
+Closes: YSG-RISK-012b (ASVS V10.3.5 sender-constrained tokens).
 
 Coverage:
   1. No SPIFFE header on POST /admin/agents → 401 no_spiffe_id
@@ -227,7 +227,7 @@ def test_service_identities_yaml_has_admin_agents_acl():
 
     assert "/admin/agents" in acls, (
         "service_identities.yaml endpoint_acls must contain '/admin/agents' "
-        "key (ACS-RISK-012b close requirement)"
+        "key (YSG-RISK-012b close requirement)"
     )
 
     entry = acls["/admin/agents"]

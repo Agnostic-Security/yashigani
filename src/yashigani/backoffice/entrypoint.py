@@ -392,7 +392,7 @@ def _bootstrap():
         #
         # For SAML IdPs, _REDIRECT_URI is the SP ACS URL.
         # _SAML_SP_PRIVATE_KEY must be an RSA key — non-RSA rejects startup
-        # via _assert_rsa_sp_key() in SAMLProvider.__init__ (ACS-RISK-044).
+        # via _assert_rsa_sp_key() in SAMLProvider.__init__ (YSG-RISK-044).
         idp_index = 1
         while True:
             prefix = f"YASHIGANI_IDP_{idp_index}_"

@@ -1,4 +1,4 @@
-# ACS-RISK-008 admission test — NON-COMPLIANT pod fixture (privilege escalation)
+# YSG-RISK-008 admission test — NON-COMPLIANT pod fixture (privilege escalation)
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # This pod deliberately omits allowPrivilegeEscalation: false (default is true).
@@ -6,7 +6,7 @@
 #
 # Expected result:
 #   Error from server: admission webhook "validate.kyverno.svc" denied the request:
-#   [...] ACS-RISK-008: Container 'test' [...] must set allowPrivilegeEscalation: false
+#   [...] YSG-RISK-008: Container 'test' [...] must set allowPrivilegeEscalation: false
 #
 # Usage:
 #   kubectl apply -f tests/admission/fixture-noncompliant-privesc.yaml

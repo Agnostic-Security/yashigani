@@ -15,22 +15,22 @@ updates:
       - "n0n0iz"
     target-branch: "main"
     # --- Manual-re-audit dependencies (security-critical, Lu/Laura sign-off required) ---
-    # python3-saml — pinned at 1.16.x for ACS-RISK-044 + ACS-RISK-045 mitigation.
+    # python3-saml — pinned at 1.16.x for YSG-RISK-044 + YSG-RISK-045 mitigation.
     #   Trigger: any python3-saml minor (1.17+) or major (2.x) bump emits a Dependabot
     #   PR with the standard `security` + `dependencies` labels (applied above).
     #   Manual gate before merge:
     #     1. Confirm `OneLogin_Saml2_XML_Parser` / `xmlparser.py` still configures the
     #        hardened lxml `GlobalParserTLS` with `resolve_entities=False` + DTD-forbid +
-    #        EntitiesForbidden — the binding mitigation for ACS-RISK-045 (CVE-2026-6732).
+    #        EntitiesForbidden — the binding mitigation for YSG-RISK-045 (CVE-2026-6732).
     #     2. Confirm `OneLogin_Saml2_Response.process_response()` still routes EC SP keys
     #        through `gcry_pk_decrypt` via libxmlsec1 ONLY when EncryptedAssertion uses
     #        `kw-ecdh-es`; confirm install.sh-generated RSA SP keys remain unaffected —
-    #        the binding mitigation for ACS-RISK-044 (CVE-2026-41989).
+    #        the binding mitigation for YSG-RISK-044 (CVE-2026-41989).
     #     3. Re-run Laura's static-analysis verdict at
     #        `/Internal/Compliance/yashigani/v2.23.4/laura_saml_probe_evidence_20260514/verdict.txt`
     #        against the new version; record outcome in the risk register before merging.
-    #   Without all three confirmations, the PR is BLOCKED on ACS-RISK-044 + ACS-RISK-045.
-    #   Lu sign-off owner: see Internal/Risk-Register/yashigani-risks.md ACS-RISK-044 + ACS-RISK-045.
+    #   Without all three confirmations, the PR is BLOCKED on YSG-RISK-044 + YSG-RISK-045.
+    #   Lu sign-off owner: see Internal/Risk-Register/yashigani-risks.md YSG-RISK-044 + YSG-RISK-045.
     # --- end manual-re-audit list ---
 
   # GitHub Actions — SHA-pinned with version comments (OWASP CI/CD C-7 / LAURA-2026-04-29-004)
