@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.23.4 — Docker Compose stack
+# Last updated: 2026-05-16T21:00:00+01:00 (fix: ACS-RISK-008 compose hardening — read_only+tmpfs 24/27 + no-new-privileges 27/27)
 # Last updated: 2026-05-16T18:00:00+01:00 (v2.23.4: bump version 2.23.3 → 2.23.4 across install/build/helm/airgap)
 # Last updated: 2026-05-10T00:00:00+01:00 (fix: G16 image-pin + to_thread run_migrations; start_period 30s→60s)
 # Last updated: 2026-05-09T00:00:00+01:00 (fix/v233-base-regressions: add YASHIGANI_DB_AES_KEY to backoffice env — smoke fix)
@@ -128,6 +129,11 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): caddy_data + caddy_config are named volumes
+      # (writable). /tmp needed for ACME challenge staging + TLS cert staging.
+      - /tmp:size=64m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -489,6 +495,13 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): /app/backend/data is a named volume (writable).
+      # /tmp needed for Python/FastAPI runtime temp files.
+      # /var/cache needed by Python package runtime.
+      - /tmp:size=128m,mode=1777
+      - /var/cache:size=32m,mode=0755
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (open-webui.yaml:90,110).
@@ -547,6 +560,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): budget_redis_data:/data is a named volume.
+      # /tmp needed for redis internal temp files. /run for PID file.
+      - /tmp:size=32m,mode=1777
+      - /run:size=8m,mode=0755
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (budget-redis.yaml:49).
@@ -593,6 +612,10 @@ services:
       # and fails-closed per request if OPA is unreachable (deny by default).
       # Healthcheck is re-enabled in K8s only.
       disable: true
+    read_only: true
+    # ACS-RISK-008 (v2.23.4): OPA is scratch-based — all state is in-memory.
+    # Policy files are read-only mounts. No tmpfs required: OPA writes nothing
+    # to filesystem during normal operation.
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -646,6 +669,12 @@ services:
       start_period: 10s
     # No depends_on — redis_password is written by the installer to docker/secrets/
     # before compose starts. Removed backoffice dependency to break cycle.
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): redis_data:/data is a named volume (writable).
+      # /tmp needed for redis internal temp files. /run for PID file.
+      - /tmp:size=32m,mode=1777
+      - /run:size=8m,mode=0755
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -685,6 +714,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): ollama_data:/data is a named volume (writable).
+      # HOME=/data + OLLAMA_MODELS=/data/models — model data goes to volume.
+      # /tmp needed for model decompression staging during pulls.
+      - /tmp:size=512m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -737,6 +772,11 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): ollama-init is a one-shot pull job.
+      # /tmp needed for download staging before writing to ollama:/data via HTTP.
+      - /tmp:size=512m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -802,6 +842,11 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): prometheus_data:/prometheus is a named volume.
+      # /tmp needed for TSDB write-ahead staging and BusyBox shell temp files.
+      - /tmp:size=64m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -843,6 +888,9 @@ services:
       GF_SERVER_HTTP_PORT: "3443"
       GF_SERVER_CERT_FILE: "/run/secrets/grafana_client.crt"
       GF_SERVER_CERT_KEY: "/run/secrets/grafana_client.key"
+      # ACS-RISK-008: force console-only logging so /var/log/grafana is not needed
+      # (avoids a second tmpfs mount; structured logs remain visible in docker logs).
+      GF_LOG_MODE: "console"
     volumes:
       - grafana_data:/var/lib/grafana
       - ../config/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -861,6 +909,13 @@ services:
         condition: service_healthy
       backoffice:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): grafana_data:/var/lib/grafana is a named volume.
+      # /tmp for Go/Grafana runtime temp files.
+      # /var/log/grafana needed if GF_LOG_MODE includes file (default includes console).
+      # Set GF_LOG_MODE=console to avoid needing /var/log/grafana tmpfs.
+      - /tmp:size=64m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -907,6 +962,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): postgres_data:/var/lib/postgresql/data is a named volume.
+      # /var/run/postgresql is REQUIRED by postgres (PID file + unix domain socket).
+      # /tmp needed for sort spills and WAL staging during queries.
+      - /var/run/postgresql:size=16m,mode=0755
+      - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (postgres.yaml:67).
@@ -960,6 +1022,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): pgbouncer config + certs are read-only mounts.
+      # /var/run/pgbouncer needed for PID file (pgbouncer.pid).
+      # /tmp needed for standard temp file operations.
+      - /var/run/pgbouncer:size=8m,mode=0755
+      - /tmp:size=32m,mode=1777
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (pgbouncer.yaml:50).
@@ -993,6 +1062,11 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): alertmanager_data:/alertmanager is a named volume.
+      # /tmp needed for Go runtime temp files.
+      - /tmp:size=32m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -1035,6 +1109,11 @@ services:
       # K8s Helm: tcpSocket probe works because kubelet performs the TCP check
       # natively (no in-container binary needed) — see loki.yaml.
       disable: true
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): loki_data:/loki is a named volume.
+      # /tmp needed for Loki WAL compaction staging (distroless but Go binary uses /tmp).
+      - /tmp:size=256m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -1079,6 +1158,11 @@ services:
         # accepting connections; promtail retries at the application level on any
         # connection failure. — RETRO-V233-001 (extended)
         condition: service_started
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): promtail has no data volume. Config + certs are
+      # read-only mounts. Docker socket is read-only bind mount. /tmp for Go runtime.
+      - /tmp:size=32m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -1117,6 +1201,12 @@ services:
       retries: 3
     depends_on:
       - jaeger
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): otel-collector has no data volume.
+      # Config + certs are read-only mounts. In-memory receiver.
+      # /tmp needed for Go runtime temp files.
+      - /tmp:size=64m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -1162,6 +1252,11 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): jaeger v2 is distroless with in-memory storage.
+      # /tmp needed for Go runtime. jaeger.yml config + secrets are read-only.
+      - /tmp:size=64m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
@@ -1205,6 +1300,11 @@ services:
       timeout: 5s
       retries: 6
       start_period: 60s
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): keycloak_data:/opt/keycloak/data is a named volume.
+      # JVM requires writable /tmp for temp file operations (large for JVM GC).
+      - /tmp:size=256m,mode=1777
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (test-idp profile).
@@ -1239,6 +1339,13 @@ services:
       VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
     volumes:
       - ./secrets:/run/secrets:ro
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): vault dev-mode stores data in-memory only.
+      # /tmp needed for Go runtime temp files.
+      # /home/vault needed by vault binary for credential caching.
+      - /tmp:size=64m,mode=1777
+      - /home/vault:size=16m,mode=0700
     healthcheck:
       test: ["CMD", "vault", "status"]
       interval: 10s
@@ -1294,6 +1401,11 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): langflow_data:/app/langflow is a named volume.
+      # /tmp needed for Python runtime temp files and pip install caching.
+      - /tmp:size=128m,mode=1777
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
@@ -1337,6 +1449,11 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): letta_data:/root/.letta is a named volume.
+      # /tmp needed for Python runtime temp files.
+      - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
@@ -1393,6 +1510,11 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): openclaw_data:/home/node/.openclaw is a named volume.
+      # /tmp needed for Node.js runtime temp files.
+      - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (openclaw profile).
@@ -1560,6 +1682,11 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    read_only: true
+    tmpfs:
+      # ACS-RISK-008 (v2.23.4): step_ca_data:/home/step is a named volume (CA state).
+      # /tmp needed for Go runtime temp files.
+      - /tmp:size=32m,mode=1777
     # ACS-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
