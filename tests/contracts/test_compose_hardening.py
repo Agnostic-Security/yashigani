@@ -8,9 +8,23 @@ Asserts that every service in docker/docker-compose.yml has:
 
 Exemption list (documented asymmetry, see risk register ACS-RISK-008):
   wazuh-manager, wazuh-indexer, wazuh-dashboard
-  Reason: Wazuh suite (profile-gated, opt-in) has complex internal write paths
-  under /var/ossec and /usr/share/wazuh-* not covered by declared volumes.
-  All three have no-new-privileges + cap_drop. read_only deferred.
+    Reason: Wazuh suite (profile-gated, opt-in) has complex internal write paths
+    under /var/ossec and /usr/share/wazuh-* not covered by declared volumes.
+    All three have no-new-privileges + cap_drop. read_only deferred.
+
+  postgres
+    Reason: needs writable /var/run/postgresql for the unix-domain socket + PID
+    lock file, owned by uid 999 (postgres-in-container) with restrictive perms.
+    podman-compose tmpfs short-form syntax does NOT accept uid=/gid= options
+    (Docker does); mode=1777 on a system socket directory is unacceptable per
+    security review. K8s path retains full readOnlyRootFilesystem.
+
+  pgbouncer
+    Reason: entrypoint generates /etc/pgbouncer/userlist.txt at startup; needs
+    writable /var/run/pgbouncer (PID file) AND /etc/pgbouncer. Same podman
+    tmpfs limitation as postgres. K8s path retains full readOnlyRootFilesystem.
+
+  All exempt services retain no-new-privileges + cap_drop:[ALL] + user:<uid>.
 
 If a new service is added to docker-compose.yml WITHOUT these controls, this
 test fails — that is the compose equivalent of Kyverno admission enforcement.
@@ -32,6 +46,8 @@ READ_ONLY_EXEMPTIONS = frozenset(
         "wazuh-manager",   # OpenSearch/JVM + agent internal write paths not covered by volumes
         "wazuh-indexer",   # OpenSearch /usr/share/wazuh-indexer implicit writes
         "wazuh-dashboard", # Plugin assets under /usr/share/wazuh-dashboard implicit writes
+        "postgres",        # podman tmpfs no uid/gid → can't uid-restrict /var/run/postgresql
+        "pgbouncer",       # podman tmpfs no uid/gid → can't uid-restrict /var/run/pgbouncer + /etc/pgbouncer/userlist.txt
     }
 )
 
