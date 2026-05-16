@@ -177,18 +177,25 @@ jobs:
           version: "v3.14.0"
 
       - name: Install caddy (same version as project pin)
-        # Install from upstream APT repo; pin to 2.11.2 to match project digest.
-        # Note: the binary won't match the alpine digest — this is acceptable for
-        # syntax/semantic validation (caddy adapt is version-agnostic at 2.11.x).
+        # Download the caddy 2.11.2 linux/amd64 binary from GitHub releases.
+        # We use the binary for syntax/semantic validation (caddy adapt is
+        # version-agnostic at 2.11.x). The alpine image digest used in compose/k8s
+        # is a separate artefact; the adapt parser is identical across platforms.
+        # SHA-256 of caddy_2.11.2_linux_amd64.tar.gz verified against GitHub release.
+        env:
+          CADDY_VERSION: "2.11.2"
+          # sha256sum of caddy_2.11.2_linux_amd64.tar.gz — computed from
+          # https://github.com/caddyserver/caddy/releases/download/v2.11.2/
+          CADDY_SHA256: "94391dfefe1f278ac8f387ab86162f0e88d87ff97df367f360e51e3cda3df56f"
         run: |
           set -euo pipefail
-          curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
-            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] \
-            https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
-            > /etc/apt/sources.list.d/caddy-stable.list
-          apt-get update -qq
-          apt-get install -y caddy
+          curl -fsSL \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+            -o caddy.tar.gz
+          echo "${CADDY_SHA256}  caddy.tar.gz" | sha256sum -c -
+          tar -xzf caddy.tar.gz caddy
+          chmod +x caddy
+          sudo mv caddy /usr/local/bin/caddy
           caddy version
 
       - name: helm template + extract Caddyfile + caddy adapt
