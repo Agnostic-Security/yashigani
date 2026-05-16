@@ -17,7 +17,7 @@ Routes:
   DELETE /admin/agents/{agent_id}               — deactivate (soft delete)
   POST   /admin/agents/{agent_id}/token/rotate  — rotate PSK, return new token once
 
-Last updated: 2026-05-09T00:00:00+01:00
+Last updated: 2026-05-16T00:00:00+01:00
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import re
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 # ---------------------------------------------------------------------------
 _HTML_TAG_RE = re.compile(r"(?i)(?:javascript:|data:|vbscript:|<[a-zA-Z/!])")
 
+from yashigani.auth.spiffe import require_spiffe_id
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 
@@ -556,7 +557,12 @@ async def list_agents(session: AdminSession):
     return [_to_response(a) for a in registry.list_all()]
 
 
-@router.post("/admin/agents", response_model=AgentRegisterResponse, status_code=201)
+@router.post(
+    "/admin/agents",
+    response_model=AgentRegisterResponse,
+    status_code=201,
+    dependencies=[Depends(require_spiffe_id("/admin/agents"))],
+)
 async def register_agent(
     body: AgentRegisterRequest,
     session: StepUpAdminSession,
@@ -644,7 +650,11 @@ async def get_agent(
     return _to_response(agent)
 
 
-@router.put("/admin/agents/{agent_id}", response_model=AgentResponse)
+@router.put(
+    "/admin/agents/{agent_id}",
+    response_model=AgentResponse,
+    dependencies=[Depends(require_spiffe_id("/admin/agents"))],
+)
 async def update_agent(
     agent_id: str,
     body: AgentUpdateRequest,
@@ -705,7 +715,11 @@ async def update_agent(
     return _to_response(updated)
 
 
-@router.delete("/admin/agents/{agent_id}", status_code=204)
+@router.delete(
+    "/admin/agents/{agent_id}",
+    status_code=204,
+    dependencies=[Depends(require_spiffe_id("/admin/agents"))],
+)
 async def deactivate_agent(
     agent_id: str,
     session: StepUpAdminSession,
@@ -741,7 +755,11 @@ async def deactivate_agent(
     _push_opa()
 
 
-@router.post("/admin/agents/{agent_id}/token/rotate", response_model=AgentRotateResponse)
+@router.post(
+    "/admin/agents/{agent_id}/token/rotate",
+    response_model=AgentRotateResponse,
+    dependencies=[Depends(require_spiffe_id("/admin/agents"))],
+)
 async def rotate_agent_token(
     agent_id: str,
     session: StepUpAdminSession,
