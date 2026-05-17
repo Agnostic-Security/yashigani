@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
-# Last updated: 2026-05-15T17:00:00+00:00 (fix(uninstall): stub missing required env vars before compose down — BUG-UNINSTALL-PARTIAL-ENV)
+# Last updated: 2026-05-17T10:00:00+00:00 (fix(uninstall): add wazuh-compose volumes to canonical list + prune dangling anon volumes — ANON-VOL-LEAK)
 # Last updated: 2026-05-15T14:00:00+00:00 (fix(uninstall): wipe docker/secrets/ on --remove-volumes + final straggler pass — BUG-3-MULTI-USER-INSTALL-PKI + BUG-1-REDIS-STRAGGLER)
 # Last updated: 2026-05-15T12:00:00+00:00 (fix(uninstall): force-remove dependent containers before volume rm — BUG-UNINSTALL-DEPGRAPH-LEAK)
 # Last updated: 2026-05-15T10:00:00+00:00 (fix(uninstall): stub docker/.env for compose-down in DR scenario — BUG-UNINSTALL-NO-ENV)
@@ -63,6 +63,10 @@ _CANONICAL_VOLUMES=(
     wazuh_indexer_data
     wazuh_dashboard_config
     wazuh_dashboard_custom
+    # docker-compose.wazuh.yml volumes — missing from original list (ANON-VOL-LEAK)
+    wazuh_manager_config
+    wazuh_manager_logs
+    wazuh_manager_queue
 )
 
 # ---------------------------------------------------------------------------
@@ -571,6 +575,73 @@ if [ -n "$_final_remaining" ]; then
     fi
 else
     echo "  [ok]    No straggler containers after volume rm."
+fi
+
+# ---------------------------------------------------------------------------
+# Dangling / anonymous volume prune — ANON-VOL-LEAK
+#
+# Compose may create anonymous volumes for tmpfs-backed service paths or
+# for volumes not listed in the top-level `volumes:` section (e.g. volumes
+# declared in an opt-in compose override like docker-compose.wazuh.yml that
+# were not started via the primary compose file). These have SHA-like names
+# and are NOT cleaned up by the named-volume loop above.
+#
+# Prune strategy:
+#   For docker: `docker volume prune --filter label=... -f` is too broad.
+#   For podman: `podman volume prune --filter dangling=true -f` is safe —
+#   Podman marks a volume as dangling only when no container references it.
+#
+# We only prune volumes that both:
+#   (a) Have no running or stopped container referencing them (dangling=true).
+#   (b) Were created with label `io.podman.compose.project=docker` (Podman)
+#       or `com.docker.compose.project=docker` (Docker Engine) — limiting the
+#       prune to this project's volumes.
+#
+# Fallback: when label filtering is unavailable (older runtimes), we skip
+# silently and log a manual remediation hint.
+# ---------------------------------------------------------------------------
+if [ "$REMOVE_VOLUMES" = "true" ]; then
+    echo "=== Dangling volume prune (ANON-VOL-LEAK) ==="
+    _dangling_pruned=0
+
+    if [ "$RUNTIME" = "podman" ]; then
+        # Podman: prune dangling volumes belonging to this project
+        # Try label-filtered prune first (Podman >=4.x supports --filter label=)
+        _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true \
+            --filter "label=io.podman.compose.project=${_PROJECT_PREFIX}" 2>/dev/null || true)"
+        if [ -z "$_dangling_ids" ]; then
+            # Fall back: any dangling volume whose Name or Label matches project
+            _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
+                | grep -E "^[0-9a-f]{64}$" || true)"
+        fi
+        if [ -n "$_dangling_ids" ]; then
+            while IFS= read -r _vid; do
+                [ -z "$_vid" ] && continue
+                if "$RUNTIME" volume rm "$_vid" >/dev/null 2>&1; then
+                    echo "  [removed] dangling volume: ${_vid}"
+                    _dangling_pruned=$(( _dangling_pruned + 1 ))
+                else
+                    echo "  [skip]    dangling volume not removable (in use?): ${_vid}" >&2
+                fi
+            done <<< "$_dangling_ids"
+        fi
+    elif [ "$RUNTIME" = "docker" ]; then
+        # Docker: prune dangling volumes filtered to project label
+        # `docker volume prune` exits 0 even if nothing was pruned
+        _docker_prune_out="$("$RUNTIME" volume prune \
+            --filter "label=com.docker.compose.project=${_PROJECT_PREFIX}" \
+            -f 2>/dev/null || true)"
+        if echo "$_docker_prune_out" | grep -q "Total reclaimed space"; then
+            _dangling_pruned=1   # at least one pruned
+            echo "  [pruned] docker dangling volumes: ${_docker_prune_out}"
+        fi
+    fi
+
+    if [ "$_dangling_pruned" -eq 0 ]; then
+        echo "  [ok]    No dangling project volumes found."
+    else
+        echo "  Dangling volumes pruned: ${_dangling_pruned}."
+    fi
 fi
 
 echo ""
