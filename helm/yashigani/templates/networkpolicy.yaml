@@ -374,7 +374,7 @@ spec:
           port: {{ if .Values.mtls.enabled }}6380{{ else }}6379{{ end }}
 
 ---
-# Ollama — accept ingress from gateway only (inference is data-plane only)
+# Ollama — accept ingress from gateway, backoffice, and ollama-init Job pod
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -396,6 +396,13 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: yashigani-backoffice
+      ports:
+        - protocol: TCP
+          port: 11434
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-ollama-init
       ports:
         - protocol: TCP
           port: 11434

@@ -1,4 +1,4 @@
-# last-updated: 2026-05-17T14:00:00+01:00 (feat: ollama-init Job — auto-pull default model when openWebui.enabled=true)
+# last-updated: 2026-05-17T15:30:00+01:00 (fix: ollama-init Job — busybox initContainer + NetworkPolicy ingress for Job pod)
 {{- if .Values.ollama.enabled }}
 ---
 apiVersion: apps/v1
@@ -146,11 +146,12 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: wait-for-ollama
-          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
-          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          # busybox ships wget; the ollama image does not. Pinned by digest per image-pinning SOP.
+          image: "busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+          imagePullPolicy: IfNotPresent
           securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
+            runAsNonRoot: true
+            runAsUser: 65534
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -159,19 +160,16 @@ spec:
           args:
             - |
               until wget -q -O- http://yashigani-ollama:11434/api/tags >/dev/null 2>&1; do
-                echo "waiting for yashigani-ollama:11434..."; sleep 3
+                echo "waiting for yashigani-ollama:11434..."; sleep 5
               done
               echo "ollama is reachable"
           resources:
             requests:
               cpu: "50m"
-              memory: "64Mi"
+              memory: "32Mi"
             limits:
               cpu: "100m"
-              memory: "128Mi"
-          volumeMounts:
-            - name: tmp
-              mountPath: /tmp
+              memory: "64Mi"
       containers:
         - name: ollama-init
           image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
