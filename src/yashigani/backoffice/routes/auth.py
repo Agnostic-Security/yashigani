@@ -1138,8 +1138,13 @@ def _make_stepup_event(username: str, outcome: str, account_tier: str = "admin")
     )
 
 
-def _make_login_attempt_event(username: str, client_ip: str):
-    """ACS gap #95: emit AUTH_LOGIN_ATTEMPT before auth result."""
+def _make_login_attempt_event(username: str, client_ip: str, account_tier: str = "admin"):
+    """ACS gap #95: emit AUTH_LOGIN_ATTEMPT before auth result.
+
+    account_tier defaults to "admin" for the pre-auth call site in login() where
+    the account record has not yet been fetched.  Pass record.account_tier
+    explicitly wherever the record is already in scope.
+    """
     from yashigani.audit.schema import AuthLoginAttemptEvent
 
     # Mask the last octet of the IP for lower-assurance sinks.
@@ -1147,7 +1152,7 @@ def _make_login_attempt_event(username: str, client_ip: str):
     parts = client_ip.rsplit(".", 1)
     ip_prefix = f"{parts[0]}.0" if len(parts) == 2 else client_ip
     return AuthLoginAttemptEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         client_ip_prefix=ip_prefix,
         outcome="attempt",

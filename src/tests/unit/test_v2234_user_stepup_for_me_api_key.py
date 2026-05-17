@@ -8,7 +8,7 @@ Fix: Changed session dependency from AdminSession → AnySession in auth.py.
 ASVS V6.8.4 — Re-authentication before critical operations.
 ASVS V7.3.4 — Audit log accuracy: account_tier in stepup event reflects actual tier.
 
-Last updated: 2026-05-17T23:30:00+01:00
+Last updated: 2026-05-17T23:55:00+01:00
 
 Test matrix:
   T1  — Anonymous session (no cookie) → 401 authentication_required
@@ -21,6 +21,7 @@ Test matrix:
   T8  — After successful user-stepup, assert_fresh_stepup passes (me/api-key gate opens)
   T9  — User-tier step-up audit event has account_tier="user" (Iris FINDING-001)
   T10 — Admin-tier step-up audit event has account_tier="admin" (Iris FINDING-001)
+  T14 — _make_login_attempt_event passes account_tier through (Iris class-of-bug follow-on)
 """
 from __future__ import annotations
 
@@ -695,3 +696,42 @@ class TestT13SessionsInvalidatedEventTier:
             reason="self_reset",
         )
         assert event.account_tier == "admin"
+
+
+class TestT14LoginAttemptEventTier:
+    """T14: _make_login_attempt_event passes account_tier through (Iris class-of-bug follow-on).
+
+    The function fires at the top of login() BEFORE authenticate() returns a
+    record, so the default="admin" is preserved for backward-compat with that
+    pre-auth call site.  Any future call site that has a record in scope (e.g.
+    a self-service flow that pre-fetches the account) MUST pass
+    record.account_tier explicitly — this test asserts that path works.
+    """
+
+    def test_user_tier_login_attempt_event_has_user_tier(self):
+        """
+        When account_tier='user' is passed explicitly, the emitted event must
+        carry account_tier='user' — not the old hardcoded 'admin'.
+        """
+        from yashigani.backoffice.routes.auth import _make_login_attempt_event
+
+        event = _make_login_attempt_event("alice@example.com", "10.0.0.1", account_tier="user")
+        assert event.account_tier == "user", (
+            f"Iris class-of-bug follow-on: expected account_tier='user', got {event.account_tier!r}"
+        )
+
+    def test_admin_tier_login_attempt_event_has_admin_tier(self):
+        """Regression guard: admin-tier login-attempt event still carries 'admin'."""
+        from yashigani.backoffice.routes.auth import _make_login_attempt_event
+
+        event = _make_login_attempt_event("admin@example.com", "10.0.0.2", account_tier="admin")
+        assert event.account_tier == "admin"
+
+    def test_login_attempt_default_is_admin_for_pre_auth_call_site(self):
+        """Default (no account_tier arg) must still produce 'admin' for the pre-auth login() call."""
+        from yashigani.backoffice.routes.auth import _make_login_attempt_event
+
+        event = _make_login_attempt_event("whoever@example.com", "192.168.1.1")
+        assert event.account_tier == "admin", (
+            "Pre-auth login() call site must default to 'admin' when record not yet available"
+        )
