@@ -155,6 +155,11 @@ class EventType(str, Enum):
     # IDENTITY_REACTIVATED: emitted when an admin explicitly reactivates a
     # suspended identity via POST /admin/users/{username}/reactivate.
     IDENTITY_REACTIVATED = "IDENTITY_REACTIVATED"
+    # v2.23.4 — OPA fail-closed (ASVS V8.* + V14.5.*)
+    # OPA_RESPONSE_CHECK_FAILED: emitted when the OPA response-check path is
+    # unreachable, errors, or not configured.  Request is DENIED (fail-closed).
+    # Alert on sustained rate — an OPA outage causes response-delivery denials.
+    OPA_RESPONSE_CHECK_FAILED = "OPA_RESPONSE_CHECK_FAILED"
 
 
 # ---------------------------------------------------------------------------
