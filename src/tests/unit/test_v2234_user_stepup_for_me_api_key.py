@@ -6,8 +6,9 @@ previously required AdminSession (403 insufficient_tier for non-admins).
 Fix: Changed session dependency from AdminSession → AnySession in auth.py.
 
 ASVS V6.8.4 — Re-authentication before critical operations.
+ASVS V7.3.4 — Audit log accuracy: account_tier in stepup event reflects actual tier.
 
-Last updated: 2026-05-17T23:00:00+01:00
+Last updated: 2026-05-17T23:30:00+01:00
 
 Test matrix:
   T1  — Anonymous session (no cookie) → 401 authentication_required
@@ -18,6 +19,8 @@ Test matrix:
   T6  — Wrong-tenant user (account_id not in DB) → 403 totp_not_configured
   T7  — User session, 4 failures → 5th attempt → 429 stepup_attempts_exceeded
   T8  — After successful user-stepup, assert_fresh_stepup passes (me/api-key gate opens)
+  T9  — User-tier step-up audit event has account_tier="user" (Iris FINDING-001)
+  T10 — Admin-tier step-up audit event has account_tier="admin" (Iris FINDING-001)
 """
 from __future__ import annotations
 
@@ -121,6 +124,16 @@ async def _call_stepup(session, account_record, totp_ok=True, totp_code="123456"
     Call stepup_verify() directly with mocked dependencies.
     Returns (result_dict, mock_store) or raises HTTPException.
     """
+    result, mock_store, _audit = await _call_stepup_full(session, account_record, totp_ok=totp_ok, totp_code=totp_code)
+    return result, mock_store
+
+
+async def _call_stepup_full(session, account_record, totp_ok=True, totp_code="123456"):
+    """
+    Call stepup_verify() directly with mocked dependencies.
+    Returns (result_dict, mock_store, mock_audit) or raises HTTPException.
+    Exposes mock_audit so callers can inspect write() call args.
+    """
     from yashigani.backoffice.routes.auth import StepUpRequest, _totp_failures
     from yashigani.backoffice import state as _state_mod
 
@@ -151,7 +164,7 @@ async def _call_stepup(session, account_record, totp_ok=True, totp_code="123456"
         with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()):
             from yashigani.backoffice.routes.auth import stepup_verify
             result = await stepup_verify(body=body, session=session, store=mock_store)
-            return result, mock_store
+            return result, mock_store, mock_audit
     finally:
         _state_mod.backoffice_state.auth_service = orig_auth
         _state_mod.backoffice_state.audit_writer = orig_audit
@@ -467,6 +480,68 @@ class TestT8AssertFreshStepupPassesAfterUserStepup:
         # Now the /me/api-key gate (assert_fresh_stepup) must pass.
         # StepUpRequired must NOT be raised.
         assert_fresh_stepup(session)  # raises StepUpRequired on failure
+
+
+# ---------------------------------------------------------------------------
+# T9 — User-tier step-up audit event has account_tier="user" (Iris FINDING-001)
+# ---------------------------------------------------------------------------
+
+class TestT9UserTierAuditEvent:
+    """T9: Iris FINDING-001 / ASVS V7.3.4 — user-tier stepup writes account_tier='user'."""
+
+    def test_user_stepup_audit_event_has_user_tier(self):
+        """
+        After a successful user-tier step-up, the audit event written to the
+        audit_writer must carry account_tier='user', not 'admin'.
+        """
+        session = _make_session(account_tier="user", account_id="acc-user-009", token="g" * 64)
+        record = _make_account_record(
+            account_id="acc-user-009",
+            username="frank",
+            account_tier="user",
+        )
+
+        async def _run():
+            result, store, audit = await _call_stepup_full(session, record, totp_ok=True)
+            return audit
+
+        mock_audit = asyncio.get_event_loop().run_until_complete(_run())
+        mock_audit.write.assert_called_once()
+        event = mock_audit.write.call_args[0][0]
+        assert event.account_tier == "user", (
+            f"FINDING-001: expected account_tier='user' on user stepup event, got {event.account_tier!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T10 — Admin-tier step-up audit event has account_tier="admin" (Iris FINDING-001)
+# ---------------------------------------------------------------------------
+
+class TestT10AdminTierAuditEvent:
+    """T10: Iris FINDING-001 / ASVS V7.3.4 — admin-tier stepup writes account_tier='admin'."""
+
+    def test_admin_stepup_audit_event_has_admin_tier(self):
+        """
+        After a successful admin-tier step-up, the audit event written to the
+        audit_writer must carry account_tier='admin' (regression guard).
+        """
+        session = _make_admin_session(token="h" * 64, account_id="acc-admin-010")
+        record = _make_account_record(
+            account_id="acc-admin-010",
+            username="superadmin",
+            account_tier="admin",
+        )
+
+        async def _run():
+            result, store, audit = await _call_stepup_full(session, record, totp_ok=True)
+            return audit
+
+        mock_audit = asyncio.get_event_loop().run_until_complete(_run())
+        mock_audit.write.assert_called_once()
+        event = mock_audit.write.call_args[0][0]
+        assert event.account_tier == "admin", (
+            f"FINDING-001 regression: expected account_tier='admin' on admin stepup event, got {event.account_tier!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -894,7 +894,7 @@ async def stepup_verify(
 
     if not ok:
         _totp_failures[session_prefix] = failure_count + 1
-        state.audit_writer.write(_make_stepup_event(admin_record.username, "failure"))
+        state.audit_writer.write(_make_stepup_event(admin_record.username, "failure", admin_record.account_tier))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -906,7 +906,7 @@ async def stepup_verify(
     # Success — record step-up timestamp in Redis session, clear failure counter.
     _totp_failures.pop(session_prefix, None)
     store.record_totp_stepup(session.token)
-    state.audit_writer.write(_make_stepup_event(admin_record.username, "success"))
+    state.audit_writer.write(_make_stepup_event(admin_record.username, "success", admin_record.account_tier))
 
     from yashigani.auth.stepup import STEPUP_TTL_SECONDS
 
@@ -1123,11 +1123,11 @@ def _make_provision_event(username: str):
     )
 
 
-def _make_stepup_event(username: str, outcome: str):
+def _make_stepup_event(username: str, outcome: str, account_tier: str = "admin"):
     from yashigani.audit.schema import AdminLoginEvent
 
     return AdminLoginEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         outcome=f"stepup_{outcome}",
         failure_reason=None if outcome == "success" else "invalid_totp",
