@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-17T00:00:00+00:00 (feat(install): use-case wizard — [Y/n] Open WebUI question in interactive mode; --with-openwebui unchanged for non-interactive)
 # last-updated: 2026-05-15T12:00:00+00:00 (fix(install): detect contaminated volumes + verify healthz on convergence — BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
 # last-updated: 2026-05-15T00:00:00+00:00 (fix(install): move linger-enable to pre-flight, drop privileged-linger shortcut from install body — Q2 / lint-sudo-pattern fix)
 # last-updated: 2026-05-14T22:00:00+00:00 (docs(saml): document + sanity-check RSA SP key requirement — YSG-RISK-044)
@@ -178,9 +179,11 @@ OPTIONS
   --db-aes-key     KEY                    Database AES-256 encryption key (64-char hex)
   --namespace      NAMESPACE              Kubernetes namespace (default: yashigani)
   --agent-bundles  BUNDLES               Comma-separated opt-in agents: langflow,letta,openclaw (or "all")
-  --with-openwebui                        Enable optional integration with the open-source Open WebUI project
-                                          (image pulled unmodified from ghcr.io/open-webui/open-webui;
-                                           Open WebUI is governed by its own licence terms)
+  --with-openwebui                        Install Open WebUI chat surface (non-interactive explicit opt-in).
+                                          In interactive mode a wizard question is presented instead
+                                          ("Will Yashigani be used by humans with a web UI? [Y/n]").
+                                          Pulls image unmodified from ghcr.io/open-webui/open-webui;
+                                          Open WebUI is governed by its own licence terms.
   --with-internal-ca                      Include Smallstep CA for internal service-to-service TLS
   --wazuh                                 Install Wazuh SIEM (manager + indexer + dashboard)
   --offline                               Legacy offline flag (no ACME, no image pulls). Use
@@ -6980,26 +6983,31 @@ main() {
     # Step 8: Optional agent bundle selection
     select_agent_bundles
 
-    # Step 8b: Open WebUI (opt-in)
-    if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
-      COMPOSE_PROFILES+=("openwebui")
-      log_success "Open WebUI enabled (--with-openwebui flag)"
-    elif [[ "$NON_INTERACTIVE" != "true" ]]; then
-      printf "\n${C_BOLD}Enable integration with the open-source Open WebUI project?${C_RESET}\n"
-      printf "    Pulls the upstream image (ghcr.io/open-webui/open-webui) and deploys it\n"
-      printf "    unmodified to provide a browser-based chat UI for your end users. Open\n"
-      printf "    WebUI is governed by its own licence terms; review them before enabling.\n"
-      printf "    Without this, Yashigani runs as API-only (gateway + admin panel).\n"
-      printf "    ${C_YELLOW}Can be enabled later from the admin panel.${C_RESET}\n"
-      printf "\n${C_BOLD}  Enable Open WebUI integration? [y/N]: ${C_RESET}"
-      local owui_choice
-      read -r owui_choice </dev/tty 2>/dev/null || owui_choice="n"
-      case "$owui_choice" in
-        y|Y|yes|YES|Yes)
-          COMPOSE_PROFILES+=("openwebui")
-          log_success "Open WebUI selected"
-          ;;
-      esac
+    # Step 8b: Open WebUI — interactive wizard or honour --with-openwebui flag.
+    # Non-interactive: INSTALL_OPENWEBUI is false (default) or true (--with-openwebui).
+    #   No prompt. Honour the flag as-is.
+    # Interactive: ask [Y/n] (default Y). Wizard sets INSTALL_OPENWEBUI=true when Y.
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
+        COMPOSE_PROFILES+=("openwebui")
+        log_success "Open WebUI enabled (--with-openwebui flag)"
+      else
+        log_info "Open WebUI skipped (default non-interactive; pass --with-openwebui to enable)"
+      fi
+    else
+      printf "\n${C_BOLD}Will Yashigani be used by humans with a web UI?${C_RESET}\n"
+      printf "  Y (default) — Installs Open WebUI as chat surface for human users.\n"
+      printf "                Recommended if any human will log in and chat with MCP-backed LLMs.\n"
+      printf "  N           — API/agent-only deployment. Smaller footprint, no chat UI exposed.\n"
+      printf "                You can add Open WebUI later by re-running install.sh with --with-openwebui.\n"
+      printf "\n"
+      if prompt_yn "Install Open WebUI (human chat UI)?" "y"; then
+        INSTALL_OPENWEBUI=true
+        COMPOSE_PROFILES+=("openwebui")
+        log_success "Open WebUI selected"
+      else
+        log_info "Open WebUI skipped — API/agent-only deployment"
+      fi
     fi
 
     # Step 8c: Wazuh SIEM (opt-in)
