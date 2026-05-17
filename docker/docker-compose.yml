@@ -709,11 +709,15 @@ services:
     mem_limit: ${YASHIGANI_OLLAMA_MEM_LIMIT:-4096m}
     cpus: ${YASHIGANI_OLLAMA_CPU_LIMIT:-2.0}
     volumes:
-      - ollama_data:/data
+      # ollama_data mounted at /root/.ollama — the standard ollama-in-container path.
+      # Ollama writes models, node identity, and partials all under ~/.ollama (= /root/.ollama
+      # because user:0:0). Earlier override redirected via OLLAMA_MODELS env to /data/models
+      # without moving the volume, which left model partials trying to write to a tmpfs at
+      # /root/.ollama (8MB) → "no space left on device" on pull. Aligning volume + default
+      # path makes models persist across container restarts and removes the env-redirect.
+      - ollama_data:/root/.ollama
     environment:
       OLLAMA_HOST: "0.0.0.0"
-      HOME: "/data"
-      OLLAMA_MODELS: "/data/models"
     healthcheck:
       # ollama image has no curl/wget — use bash /dev/tcp to check port
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/11434' 2>/dev/null"]
@@ -723,15 +727,9 @@ services:
       start_period: 60s
     read_only: true
     tmpfs:
-      # YSG-RISK-008 (v2.23.4): ollama_data:/data is a named volume (writable).
-      # HOME=/data + OLLAMA_MODELS=/data/models — model data goes to volume.
       # /tmp needed for model decompression staging during pulls (1777 standard for /tmp).
-      # /root/.ollama: ollama generates a node identity (id_ed25519) on first start;
-      # binary hard-codes /root/.ollama regardless of HOME. ollama runs as root
-      # (uid 0 — see `user: "0:0"` above), so tmpfs mounted root-owned with mode=0700
-      # = owner-only access for the in-container root process. Correct hardening.
+      # No /root/.ollama tmpfs — it's now the named-volume mount above (persistent models).
       - /tmp:size=512m,mode=1777
-      - /root/.ollama:size=8m,mode=0700
     # YSG-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true

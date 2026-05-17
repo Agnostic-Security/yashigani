@@ -68,11 +68,11 @@ services:
   ollama:
     security_opt:
       - label=disable
-    environment:
-      # Ollama writes to /root/.ollama by default. In Podman rootless,
-      # the home dir is / not /root. Override to use the volume mount.
-      OLLAMA_MODELS: /root/.ollama/models
-      HOME: /root
+    # OLLAMA_MODELS + HOME env overrides removed: the main compose now mounts
+    # ollama_data at /root/.ollama directly (the standard ollama-in-container
+    # path), so defaults work without env redirection. Earlier override here
+    # set env without moving the volume mount, which caused model partials to
+    # try to write to a tmpfs at /root/.ollama (8MB) → no-space-left.
 
   ollama-init:
     security_opt:
