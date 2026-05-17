@@ -1,4 +1,5 @@
-# Last updated: 2026-05-06 (V232-CI-TRIVY-SPLIT: trivy-scan split into independent
+# Last updated: 2026-05-17 (G16 dep-bump: codeql-action v4 68bde55 → codeql-bundle-v2.25.4 bc0b696b)
+# Previous: 2026-05-06 (V232-CI-TRIVY-SPLIT: trivy-scan split into independent
 #   trivy-gateway + trivy-backoffice jobs so a gateway CVE no longer cascade-skips
 #   the backoffice build+scan; SARIF uploads + metric pushes guarded by hashFiles)
 # Previous: 2026-05-06 (pip-audit: bump pip to 26.1 — fixes GHSA-jp4c-xjxw-mgf9/CVE-2026-6357)
@@ -85,7 +86,7 @@ jobs:
       # V232-CI-TRIVY-SPLIT: hashFiles guard — only upload if Trivy actually wrote
       # the SARIF (i.e. the scan ran). Build failure before scan = no SARIF = skip.
       - name: Upload SARIF gateway
-        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
         if: always() && hashFiles('trivy-gateway.sarif') != ''
         with:
           sarif_file: trivy-gateway.sarif
@@ -152,7 +153,7 @@ jobs:
       # V232-CI-TRIVY-SPLIT: hashFiles guard — only upload if Trivy actually wrote
       # the SARIF (i.e. the scan ran). Build failure before scan = no SARIF = skip.
       - name: Upload SARIF backoffice
-        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
         if: always() && hashFiles('trivy-backoffice.sarif') != ''
         with:
           sarif_file: trivy-backoffice.sarif
@@ -265,7 +266,7 @@ jobs:
             --config p/supply-chain \
             --sarif-output opengrep.sarif \
             src/yashigani/
-      - uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+      - uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
         if: always()
         with:
           sarif_file: opengrep.sarif
@@ -372,7 +373,7 @@ jobs:
             opengrep-summary.txt
           retention-days: 90
 
-      - uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+      - uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
         if: always()
         with:
           sarif_file: opengrep-push.sarif
