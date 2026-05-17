@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-10T00:00:00+01:00 — fix(helm): jaeger healthcheckv2 use_v2:false (B-K8S-5 follow-up) */ -}}
+{{- /* Last updated: 2026-05-17T00:00:00+01:00 — fix(helm): align K8s OPA policy bundle with compose — real policies replace stubs */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -12,22 +12,385 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
 data:
   yashigani.rego: |
+    # Yashigani — OPA policy bundle.
+    # All policy decisions are local. No cloud delegation. (ASVS V4.2)
+    #
+    # Inputs provided by the gateway proxy:
+    #   input.method        — HTTP method
+    #   input.path          — request path
+    #   input.session_id    — caller session token (hashed)
+    #   input.agent_id      — X-Yashigani-Agent-Id header value
+    #   input.user_id       — X-Yashigani-User-Id header value
+    #   input.headers       — sanitized request headers (no Authorization/Cookie)
+    #
+    # The gateway's fail-closed behaviour: any OPA error → deny.
+
     package yashigani
-    import rego.v1
-    default allow := true
+
+    import future.keywords.if
+    import future.keywords.in
+
+    # ---------------------------------------------------------------------------
+    # Default: deny unless explicitly allowed
+    # ---------------------------------------------------------------------------
+
+    default allow := false
+
+    # ---------------------------------------------------------------------------
+    # Allow authenticated sessions
+    # ---------------------------------------------------------------------------
+
+    allow if {
+        # Session ID must be present (non-empty, non-anonymous)
+        input.session_id != ""
+        input.session_id != "anonymous"
+
+        # Agent ID must be declared
+        input.agent_id != ""
+        input.agent_id != "unknown"
+
+        # Method must be in the allowed set
+        input.method in allowed_methods
+
+        # Path must not match any blocked pattern
+        not path_blocked
+    }
+
+    # ---------------------------------------------------------------------------
+    # Allowed HTTP methods for MCP traffic
+    # ---------------------------------------------------------------------------
+
+    allowed_methods := {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+
+    # ---------------------------------------------------------------------------
+    # Blocked path patterns
+    # ---------------------------------------------------------------------------
+
+    path_blocked if {
+        # Block direct access to internal metadata/admin paths
+        startswith(input.path, "/admin")
+    }
+
+    path_blocked if {
+        startswith(input.path, "/.well-known/internal")
+    }
+
+    path_blocked if {
+        input.path == "/metrics"
+    }
+
+    path_blocked if {
+        input.path == "/healthz"
+    }
+
+    # ---------------------------------------------------------------------------
+    # RBAC enforcement — deny if RBAC data is loaded and user is not permitted
+    # ---------------------------------------------------------------------------
+    # When data.yashigani.rbac.groups is non-empty, every request that passed
+    # the session/method/path checks above must additionally satisfy allow_rbac
+    # (defined in rbac.rego).  If RBAC data is absent or empty the gate is
+    # open — this preserves backwards compatibility during roll-out.
+
+    deny_rbac if {
+        count(data.yashigani.rbac.groups) > 0
+        not allow_rbac
+    }
+
+    # Override the default allow: deny when RBAC says no
+    allow := false if { deny_rbac }
+
+    # ---------------------------------------------------------------------------
+    # Agent-to-agent enforcement
+    # agent_call_allowed is defined in agents.rego (same package yashigani).
+    # ---------------------------------------------------------------------------
+
+    # Deny agent calls that are not explicitly allowed
+    deny_agent_call if {
+        input.principal.type == "agent"
+        not agent_call_allowed
+    }
+
+    allow := false if { deny_agent_call }
   v1_routing.rego: |
-    package yashigani.v1_routing
+    # Yashigani v1.0 — OPA Routing Safety Net
+    #
+    # Second-pass validation of Optimization Engine routing decisions.
+    # Defence-in-depth: even if the OE has a bug, OPA catches policy violations.
+    #
+    # Input schema:
+    #   input.identity          — identity record (kind, groups, allowed_models, sensitivity_ceiling)
+    #   input.routing_decision  — OE decision (provider, model, route, sensitivity, rule)
+    #   input.request           — request metadata (path, method)
+
+    package yashigani.v1
+
     import rego.v1
-    default allow := true
-    default response_allow := true
+
+    # ── Identity authorisation ────────────────────────────────────────────────
+
+    # Allow /v1/* requests from authenticated identities
+    default allow_v1 := false
+
+    allow_v1 if {
+        input.identity.status == "active"
+    }
+
+    # ── Model access control ─────────────────────────────────────────────────
+
+    # Identity can use the selected model
+    default model_allowed := true
+
+    model_allowed if {
+        count(input.identity.allowed_models) == 0  # No restriction = all models allowed
+    }
+
+    model_allowed if {
+        input.routing_decision.model in input.identity.allowed_models
+    }
+
+    model_allowed if {
+        "*" in input.identity.allowed_models
+    }
+
+    # ── Routing safety net ────────────────────────────────────────────────────
+
+    # CRITICAL: CONFIDENTIAL/RESTRICTED data must NEVER route to cloud
+    # unless the provider is in the trusted_cloud_providers list
+    default routing_safe := true
+
+    routing_safe := false if {
+        input.routing_decision.sensitivity in {"CONFIDENTIAL", "RESTRICTED"}
+        input.routing_decision.route == "cloud"
+        not trusted_cloud_provider
+    }
+
+    trusted_cloud_provider if {
+        input.routing_decision.provider in input.trusted_cloud_providers
+    }
+
+    # Identity cannot receive data above their sensitivity ceiling
+    default sensitivity_allowed := true
+
+    sensitivity_allowed := false if {
+        sensitivity_rank(input.routing_decision.sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
+    }
+
+    sensitivity_rank(level) := 0 if level == "PUBLIC"
+    sensitivity_rank(level) := 1 if level == "INTERNAL"
+    sensitivity_rank(level) := 2 if level == "CONFIDENTIAL"
+    sensitivity_rank(level) := 3 if level == "RESTRICTED"
+
+    # ── Response-path enforcement ─────────────────────────────────────────────
+    #
+    # Evaluates whether a response can be delivered to the caller.
+    # Input schema (response path):
+    #   input.identity              — caller's identity record
+    #   input.response_sensitivity  — detected sensitivity of the response content
+    #   input.response_verdict      — inspection verdict (clean/suspicious/blocked)
+    #   input.pii_detected          — boolean, PII found in response
+
+    default response_allowed := true
+
+    # Block response if its sensitivity exceeds the caller's ceiling
+    response_allowed := false if {
+        sensitivity_rank(input.response_sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
+    }
+
+    # Block response if inspection verdict is BLOCKED and identity is not admin
+    response_allowed := false if {
+        input.response_verdict == "blocked"
+        input.identity.kind != "admin"
+    }
+
+    response_decision := {
+        "allow": response_allowed,
+        "reason": response_reason,
+    }
+
+    response_reason := "ok" if response_allowed
+
+    response_reason := "response_sensitivity_exceeds_ceiling" if {
+        not response_allowed
+        sensitivity_rank(input.response_sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
+    }
+
+    response_reason := "response_blocked_by_inspection" if {
+        not response_allowed
+        input.response_verdict == "blocked"
+    }
+
+    # ── Combined decision ─────────────────────────────────────────────────────
+
+    decision := {
+        "allow": allow_v1,
+        "model_allowed": model_allowed,
+        "routing_safe": routing_safe,
+        "sensitivity_allowed": sensitivity_allowed,
+        "reason": reason,
+    }
+
+    reason := "ok" if {
+        allow_v1
+        model_allowed
+        routing_safe
+        sensitivity_allowed
+    }
+
+    reason := "identity_not_active" if not allow_v1
+
+    reason := "model_not_allowed" if {
+        allow_v1
+        not model_allowed
+    }
+
+    reason := "routing_unsafe_sensitive_to_cloud" if {
+        allow_v1
+        model_allowed
+        not routing_safe
+    }
+
+    reason := "sensitivity_ceiling_exceeded" if {
+        allow_v1
+        model_allowed
+        routing_safe
+        not sensitivity_allowed
+    }
   rbac.rego: |
-    package yashigani.rbac
-    import rego.v1
-    default allow := true
+    # Yashigani RBAC — OPA enforcement module.
+    #
+    # Deny-by-default: if data.yashigani.rbac is empty or the user has no
+    # groups, allow_rbac evaluates to false.
+    #
+    # data.yashigani.rbac is populated by rbac/opa_push.py after every mutation
+    # via a PUT to /v1/data/yashigani/rbac.
+    #
+    # Input fields consumed:
+    #   input.session.email    — user email resolved from the gateway session
+    #   input.request.method   — HTTP method
+    #   input.request.path     — request path
+
+    package yashigani
+
+    import future.keywords.if
+    import future.keywords.in
+
+    # ---------------------------------------------------------------------------
+    # allow_rbac — true if the user is in a group that permits the request
+    # ---------------------------------------------------------------------------
+
+    allow_rbac if {
+        # Require RBAC data to be present and non-empty
+        count(data.yashigani.rbac.groups) > 0
+
+        email := input.session.email
+        email != ""
+
+        # Walk user → group → pattern
+        group_id := data.yashigani.rbac.user_groups[email][_]
+        group    := data.yashigani.rbac.groups[group_id]
+        pattern  := group.allowed_resources[_]
+
+        _method_matches(pattern.method, input.request.method)
+        _path_matches(pattern.path_glob, input.request.path)
+    }
+
+    # ---------------------------------------------------------------------------
+    # Method helper — "*" matches anything; otherwise exact match
+    # ---------------------------------------------------------------------------
+
+    _method_matches(pattern, method) if { pattern == "*" }
+    _method_matches(pattern, method) if { pattern == method }
+
+    # ---------------------------------------------------------------------------
+    # Path helper — mirrors store.py _path_matches exactly
+    #
+    #   "**"           — any path
+    #   "/prefix/**"   — /prefix/ and anything underneath
+    #   exact string   — only that path
+    # ---------------------------------------------------------------------------
+
+    _path_matches(glob, path) if { glob == "**" }
+    _path_matches(glob, path) if { glob == path }
+    _path_matches(glob, path) if {
+        endswith(glob, "/**")
+        prefix := trim_suffix(glob, "/**")
+        startswith(path, concat("", [prefix, "/"]))
+    }
   agents.rego: |
-    package yashigani.agents
-    import rego.v1
-    default allow := true
+    package yashigani
+
+    import future.keywords.if
+    import future.keywords.in
+
+    # ---------------------------------------------------------------------------
+    # agent_call_allowed — true when a calling agent is permitted to reach
+    # the target agent's path.
+    #
+    # Input fields (set by the gateway for /agents/* requests):
+    #   input.principal.type                  "agent"
+    #   input.principal.agent_id              calling agent's ID
+    #   input.principal.groups                list of RBAC group IDs the caller belongs to
+    #   input.target_agent.agent_id           target agent ID
+    #   input.target_agent.allowed_caller_groups  groups allowed to call this agent
+    #   input.target_agent.allowed_paths      path prefixes or exact paths the agent accepts
+    #   input.request.remainder_path          path after /agents/{target_agent_id}
+    # ---------------------------------------------------------------------------
+
+    agent_call_allowed if {
+        input.principal.type == "agent"
+        input.principal.agent_id != ""
+
+        # Caller must be in at least one of the target's allowed_caller_groups
+        group := input.principal.groups[_]
+        group in input.target_agent.allowed_caller_groups
+
+        # The remainder path must match at least one allowed path pattern
+        _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
+    }
+
+    # Path matching helper — exact or prefix
+    _path_allowed(path, allowed_paths) if {
+        p := allowed_paths[_]
+        _agent_path_matches(p, path)
+    }
+
+    _agent_path_matches(pattern, path) if { pattern == "**" }
+    _agent_path_matches(pattern, path) if { pattern == path }
+    _agent_path_matches(pattern, path) if {
+        endswith(pattern, "/**")
+        prefix := trim_suffix(pattern, "/**")
+        startswith(path, concat("", [prefix, "/"]))
+    }
+    _agent_path_matches(pattern, path) if {
+        not endswith(pattern, "/**")
+        not contains(pattern, "*")
+        startswith(path, concat("", [pattern, "/"]))
+    }
+
+    # ---------------------------------------------------------------------------
+    # agent_call_deny_reason — human-readable explanation used in audit events
+    # ---------------------------------------------------------------------------
+
+    agent_call_deny_reason := "caller_group_not_in_allowed_caller_groups" if {
+        input.principal.type == "agent"
+        not _caller_group_allowed
+    }
+
+    agent_call_deny_reason := "path_not_in_allowed_paths" if {
+        input.principal.type == "agent"
+        _caller_group_allowed
+        not _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
+    }
+
+    agent_call_deny_reason := "target_agent_not_in_data" if {
+        input.principal.type == "agent"
+        not input.target_agent.agent_id
+    }
+
+    _caller_group_allowed if {
+        group := input.principal.groups[_]
+        group in input.target_agent.allowed_caller_groups
+    }
 {{- end }}
 
 {{- if .Values.otelCollector.enabled }}
