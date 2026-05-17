@@ -12,8 +12,11 @@ Tests:
   4. Open WebUI Deployment has OPENAI_API_KEY wired via secretKeyRef.
   5. Agent bundles (langflow/letta) have OPENAI_API_KEY wired via secretKeyRef.
   6. validate-security.yaml rejects a production install with empty internalBearer.value.
+  7. OPA-URL-001: production with valid opaUrl renders cleanly.
+  8. OPA-URL-001: production with empty opaUrl renders fail directive.
+  9. OPA-URL-001: development with empty opaUrl renders cleanly (dev ergonomics).
 
-Last updated: 2026-05-17 (feat: Captain Bucket-C bearer-token wiring tests)
+Last updated: 2026-05-17 (fix: OPA-URL-001 fail-closed guard for production — close Laura OBS-01)
 """
 
 import subprocess
@@ -299,4 +302,65 @@ class TestFailClosedOnEmptyBearer:
             f"stderr: {stderr}\n"
             "Check helm/yashigani/templates/validate-security.yaml for the "
             "INTERNAL-BEARER-001 guard."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests 7-9: OPA-URL-001 — fail-closed guard for YASHIGANI_OPA_URL
+# Laura OBS-01: production/staging must not allow empty opaUrl.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOpaUrlGuard:
+    def test_production_with_valid_opa_url_renders_cleanly(self):
+        """
+        Test 7: helm template with global.environment=production and a valid
+        gateway.env.opaUrl renders without the OPA-URL-001 fail directive.
+        """
+        # Should not raise — helm_template raises on non-zero returncode
+        render = helm_template([
+            "--set", "global.environment=production",
+            "--set", f"internalBearer.value={TEST_BEARER}",
+            "--set", "mtls.enabled=true",
+            "--set", "gateway.env.opaUrl=https://opa:8181/v1/data/yashigani/v1/decision",
+        ])
+        assert "OPA-URL-001" not in render, (
+            "OPA-URL-001 fail directive appeared in render even though opaUrl is set.\n"
+            "Check helm/yashigani/templates/validate-security.yaml."
+        )
+
+    def test_production_with_empty_opa_url_fails_with_opa_url_001(self):
+        """
+        Test 8: helm template with global.environment=production and
+        gateway.env.opaUrl="" must fail with the OPA-URL-001 error.
+        An empty opaUrl causes YASHIGANI_OPA_URL="" at runtime, which makes
+        openai_router.py return allow:True for every request (policy bypass).
+        """
+        stderr = helm_template_expect_fail([
+            "--set", "global.environment=production",
+            "--set", f"internalBearer.value={TEST_BEARER}",
+            "--set", "mtls.enabled=true",
+            "--set", "gateway.env.opaUrl=",
+        ])
+        assert "OPA-URL-001" in stderr, (
+            f"Expected OPA-URL-001 error in helm stderr but not found.\n"
+            f"stderr: {stderr}\n"
+            "Check helm/yashigani/templates/validate-security.yaml for the "
+            "OPA-URL-001 guard."
+        )
+
+    def test_development_with_empty_opa_url_renders_cleanly(self):
+        """
+        Test 9: helm template with global.environment=development and
+        gateway.env.opaUrl="" must render cleanly — development environments
+        permit OPA bypass for local ergonomics (no bundled OPA required).
+        """
+        render = helm_template([
+            "--set", "global.environment=development",
+            "--set", f"internalBearer.value={TEST_BEARER}",
+            "--set", "gateway.env.opaUrl=",
+        ])
+        assert "OPA-URL-001" not in render, (
+            "OPA-URL-001 fail directive appeared in development render with empty opaUrl.\n"
+            "The OPA-URL-001 guard must only fire for production/staging environments.\n"
+            "Check helm/yashigani/templates/validate-security.yaml."
         )

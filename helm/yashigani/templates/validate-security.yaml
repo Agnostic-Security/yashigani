@@ -67,3 +67,28 @@
     {{- fail "INTERNAL-BEARER-001 SECURITY VIOLATION: internalBearer.value is empty and internalBearer.existingSecretName is not set in production. Agent bundles (open-webui, langflow, letta) require a stable per-install bearer token for gateway authentication. Supply --set internalBearer.value=\"$(openssl rand -hex 32)\" or set internalBearer.existingSecretName to a pre-created K8s Secret with key yashigani_internal_bearer. On upgrade: re-supply the current token value or the existing Secret will be regenerated, breaking running agent bundles." -}}
   {{- end -}}
 {{- end -}}
+
+{{- /*
+  OPA-URL-001 — Laura OBS-01: fail production/staging installs where
+  gateway.env.opaUrl is empty (resolves to YASHIGANI_OPA_URL="").
+
+  When YASHIGANI_OPA_URL is unset at runtime, openai_router.py returns
+  {"allow": True, "reason": "opa_not_configured"} unconditionally — every
+  request bypasses the OPA policy check. This is an authorisation control
+  failure for any production deployment.
+
+  The default value in values.yaml ("https://yashigani-policy:8181") is
+  valid for in-cluster deployments where the bundled OPA sidecar is used.
+  This guard only fires if the operator has explicitly overridden the value
+  to an empty string (e.g. --set gateway.env.opaUrl=""), which would silently
+  disable policy enforcement.
+
+  To resolve: supply a non-empty OPA URL via:
+    --set gateway.env.opaUrl="https://opa:8181/v1/data/yashigani/v1/decision"
+  Or use the bundled OPA deployment (the default chart configuration).
+*/ -}}
+{{- if or (eq .Values.global.environment "production") (eq .Values.global.environment "staging") -}}
+  {{- if not .Values.gateway.env.opaUrl -}}
+    {{- fail "OPA-URL-001 SECURITY VIOLATION: gateway.env.opaUrl is empty in production/staging. When YASHIGANI_OPA_URL is unset, the gateway OPA policy check returns allow:True for every request — all policy enforcement is bypassed. Set gateway.env.opaUrl to the OPA decision endpoint, e.g. --set gateway.env.opaUrl=\"https://yashigani-policy:8181\" or use the bundled OPA deployment (default chart configuration). Do not override to an empty value in production or staging environments." -}}
+  {{- end -}}
+{{- end -}}
