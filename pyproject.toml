@@ -94,7 +94,17 @@ dev     = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"yashigani.backoffice" = ["templates/*.html", "static/css/*.css", "static/js/*.js"]
+"yashigani.backoffice" = [
+    "templates/*.html",
+    "static/css/*.css",
+    "static/js/*.js",
+    "static/swagger-ui/*.js",
+    "static/swagger-ui/*.css",
+]
+"yashigani.gateway" = [
+    "static/swagger-ui/*.js",
+    "static/swagger-ui/*.css",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]
