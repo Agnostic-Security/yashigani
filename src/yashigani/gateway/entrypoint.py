@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Callable, Literal, cast
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
@@ -61,7 +62,7 @@ def _build_app(mesh_mode: bool = False):
     chs = CredentialHandleService(
         kms_provider=kms_provider,
         resource_monitor=resource_monitor,
-        on_audit=audit_writer,
+        on_audit=cast(Callable[..., object], audit_writer),  # AuditLogWriter is callable at runtime
     )
 
     # Inspection pipeline
@@ -119,7 +120,7 @@ def _build_app(mesh_mode: bool = False):
         )
 
     # Rate limiter — Redis DB 2
-    _rl_fail_mode = resolve_rate_limit_fail_mode()
+    _rl_fail_mode = cast(Literal["open", "closed"], resolve_rate_limit_fail_mode())
     logger.info("Rate limiter fail mode: %s", _rl_fail_mode)
     rate_limiter = None
     try:
