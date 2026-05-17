@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-17T09:00:00+01:00 (fix(pki): host-side bootstrap_token_sha256 update in _pki_run_issuer_podman_macos — compose-path SHA mismatch fix)
 # last-updated: 2026-05-17T14:00:00+00:00 (feat(install): write OLLAMA_MODEL to .env when --with-openwebui; ollama-init gated on openwebui profile)
 # last-updated: 2026-05-17T00:00:00+00:00 (feat(install): use-case wizard — [Y/n] Open WebUI question in interactive mode; --with-openwebui unchanged for non-interactive)
 # last-updated: 2026-05-15T12:00:00+00:00 (fix(install): detect contaminated volumes + verify healthz on convergence — BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
@@ -6094,6 +6095,64 @@ _pki_run_issuer_podman_macos() {
   # Copy secrets dir back to the host. Trailing dot (/secrets/.) copies the
   # CONTENTS of /secrets rather than creating a nested /secrets/secrets.
   podman cp "${_cname}:/secrets/." "${secrets_in}"
+
+  # --- Host-side manifest hash update (macOS Podman applehv write-back guard) ---
+  #
+  # On macOS Podman (remote client to applehv VM) the container's write-back to
+  # /manifest.yaml is confirmed by the issuer log but the podman cp above copies
+  # the container's manifest to .new; in practice the .new file may carry the
+  # original (pre-bootstrap) content if the VM's copy-on-write layer for the
+  # manually-managed container fs is not fully flushed before podman cp reads it.
+  #
+  # Regardless of whether the cp-back carried the updated manifest, we now have
+  # all *_bootstrap_token files on the HOST (copied above via podman cp /secrets/.).
+  # Re-derive the SHA-256 of each token from the host copies and patch
+  # service_identities.yaml directly — this is authoritative and doesn't depend
+  # on the container's manifest write-back landing correctly.
+  #
+  # Logic mirrors _update_manifest_hashes() in src/yashigani/pki/issuer.py:
+  #   - Walk each "- name: <svc>" block in service_identities.yaml.
+  #   - If <svc>_bootstrap_token exists in secrets_in, compute its SHA-256.
+  #   - Replace the bootstrap_token_sha256 line for that service.
+  #
+  # Uses a Python one-liner (Python 3 is guaranteed on macOS 12+) so we don't
+  # need to replicate the YAML-aware line-walk in bash.
+  _pki_macos_update_manifest_hashes() {
+    local _mf="$1" _sec="$2"
+    python3 - "$_mf" "$_sec" <<'PYEOF'
+import sys, hashlib, pathlib, os
+
+manifest_path = pathlib.Path(sys.argv[1])
+secrets_dir   = pathlib.Path(sys.argv[2])
+
+text  = manifest_path.read_text()
+lines = text.splitlines(keepends=True)
+out   = []
+current_service = None
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("- name:"):
+        current_service = stripped.split(":", 1)[1].strip().strip("'\"")
+    if stripped.startswith("bootstrap_token_sha256:") and current_service:
+        tok = secrets_dir / f"{current_service}_bootstrap_token"
+        if tok.exists():
+            h = hashlib.sha256(tok.read_bytes().strip()).hexdigest()
+            prefix = line[: len(line) - len(line.lstrip())]
+            line = f'{prefix}bootstrap_token_sha256: "{h}"\n'
+    out.append(line)
+
+new_text = "".join(out)
+# Atomic write (same pattern as _pki_persist_env)
+tmp = manifest_path.with_suffix(".yaml.new_hashes")
+tmp.write_text(new_text)
+tmp.replace(manifest_path)
+print(f"pki-macos-hash-update: manifest patched for {secrets_dir}", file=sys.stderr)
+PYEOF
+  }
+
+  if ! _pki_macos_update_manifest_hashes "${manifest_in}" "${secrets_in}"; then
+    log_warn "_pki_run_issuer_podman_macos: host-side hash update failed — bootstrap_token_sha256 in manifest may be stale"
+  fi
 
   # Trap fires on RETURN and removes the container.
 }

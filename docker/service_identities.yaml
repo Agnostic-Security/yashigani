@@ -50,7 +50,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/caddy
     purpose: "TLS edge + internal CA root"
     mtls_capable: true
-    bootstrap_token_sha256: "0f8c9f985dcbbf62fae4f3201e5542406a2a5fa5eef8064389b00a73b4cf5f89"
+    bootstrap_token_sha256: "8233da468b42eb1b31763a936b1ecd1c799d04bc7df5bed866ea758a0c21cf6c"
     revoked: false
 
   - name: gateway
@@ -58,7 +58,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/gateway
     purpose: "MCP reverse proxy (data plane)"
     mtls_capable: true
-    bootstrap_token_sha256: "906127d78fb05db3b458d3d0628aa899fdc8f8bbc46aa954f3579601253db1de"
+    bootstrap_token_sha256: "753ef663891fe4d8fdf46c592d22ec6d2fb8146d45bb6739d4a48a7f0d5cb377"
     revoked: false
 
   - name: backoffice
@@ -66,7 +66,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/backoffice
     purpose: "Admin control plane (SSO, RBAC, audit, billing)"
     mtls_capable: true
-    bootstrap_token_sha256: "3dc933322ea091c06c62cfd6b728730dd370e2515c2cb8120bebb3e03aad8e79"
+    bootstrap_token_sha256: "e5470833a685c29ac40f9035fcc5a8127221be56d7de8e9c288fb5073d057ba9"
     revoked: false
 
   - name: policy
@@ -79,7 +79,7 @@ services:
     # updated to use internal_httpx_client / internal_httpx_sync_client
     # (EX-231-01 closure, task #54).
     mtls_capable: true
-    bootstrap_token_sha256: "a0aa2aefcfbf3b01e961a496199e978bf936ca29a63f712e31be87e4408d787c"
+    bootstrap_token_sha256: "9396417ef97ed27a3bcefd613c7d53f928d887ebf294c6348ea3fef9f3ff3b6b"
     revoked: false
 
   # ── Data stores ───────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/postgres
     purpose: "PostgreSQL 16 (tenants, audit, RBAC, inference)"
     mtls_capable: true
-    bootstrap_token_sha256: "562c1bc952c78fc5f7fea9b8a7fa08dbd256b50e4b43e5acc59665f9ee643c8a"
+    bootstrap_token_sha256: "d9ad48e5474a4ccc04c4349ef93de1b90a54d6229bd43b54ac1816ad3dc2de6c"
     revoked: false
 
   - name: pgbouncer
@@ -96,7 +96,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/pgbouncer
     purpose: "Transaction-mode PostgreSQL pooler"
     mtls_capable: true
-    bootstrap_token_sha256: "9b0bd17af51b3e3bb05c9d09d5770828314b1603e0ea07d92d5298a5dc60bdec"
+    bootstrap_token_sha256: "357daecd7ec4ee80bfa05f9c076f0a0e79861ab1d5b72e9355f0be633f61d82a"
     revoked: false
 
   - name: redis
@@ -104,7 +104,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/redis
     purpose: "Session store, TOTP provisioning, rate-limit counters"
     mtls_capable: true
-    bootstrap_token_sha256: "d0842bede9ff86648ffdb6ce50959461692107885fc39423aaa8430311bfab62"
+    bootstrap_token_sha256: "122bc5c5f0a48c66743d21d104d8ba3f4afc4dd52e7291955192a9d40d2b867e"
     revoked: false
 
   - name: budget-redis
@@ -112,7 +112,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/budget-redis
     purpose: "Budget counter store (noeviction)"
     mtls_capable: true
-    bootstrap_token_sha256: "4ec3599b0c31024d39b58e8534e427df9e1082be931e1df22ba1b46ccfbd257a"
+    bootstrap_token_sha256: "7c439ac8504fc762d4d850d2150d8a9433011620e0777587af96cc35b0a3b583"
     revoked: false
 
   # ── Observability ─────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/prometheus
     purpose: "Metrics collection + federation"
     mtls_capable: true
-    bootstrap_token_sha256: "6be481ad4d8b04887ddedcc7d6037fea63e939ed6ebebc44efa2f3014b3d93b9"
+    bootstrap_token_sha256: "446629e8391bf7644d6b1ffbb3a9753e04306f18a5773066ea74652daeac2719"
     revoked: false
 
   - name: grafana
@@ -129,7 +129,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/grafana
     purpose: "Dashboards + alerting"
     mtls_capable: true
-    bootstrap_token_sha256: "9c2049aa0a80909736652e089f0c91825ee7acc510a345426b6920571bf09b48"
+    bootstrap_token_sha256: "0bd9a8715b813b07e4d52301cd6537883a15cc222913ae22ae33cb895b938575"
     revoked: false
 
   - name: alertmanager
@@ -137,7 +137,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/alertmanager
     purpose: "Alert routing"
     mtls_capable: true
-    bootstrap_token_sha256: "fb5387822bfbfd2665980475c68c9b7dbffde0e3e3b748929d47db37248ca012"
+    bootstrap_token_sha256: "03f34755e531116e919b91ef79ab3bf73f67142db32cda0e27c4d008a130148c"
     revoked: false
 
   - name: loki
@@ -145,7 +145,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/loki
     purpose: "Log aggregation backend"
     mtls_capable: true
-    bootstrap_token_sha256: "4f0276bed5a514a38678128d7f7bafca636dd3c50d458e39a5e6e8eb41f040f1"
+    bootstrap_token_sha256: "5e5a4a402415807c8c82ca2c6559540d705b4fe3f238456e552708bbca0accb8"
     revoked: false
 
   - name: promtail
@@ -157,7 +157,7 @@ services:
     # remains plain HTTP for the local healthcheck). mtls_capable:true here means
     # only that the issuer must produce a client cert for this service.
     mtls_capable: true
-    bootstrap_token_sha256: "9cb6929cf4e9596dedbac3147dced86292916746cc020cb308fed102cb1843ff"
+    bootstrap_token_sha256: "17fd50515fd428196a59bde20eca2563441e1504ea147a231932e236ecbac9f4"
     revoked: false
 
   - name: otel-collector
@@ -165,7 +165,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/otel-collector
     purpose: "OTLP receiver (mTLS); Jaeger exporter (mTLS, EX-231-09 closed v2.23.2)"
     mtls_capable: true
-    bootstrap_token_sha256: "b9b04d5abe2343ca27fa381efd3f832e0d5c8bc5349476b4382af14cbee77c29"
+    bootstrap_token_sha256: "c4663f5b4e19b83e88d3577a24a0458bc1fbb512bba22dbaa7763fcbffb945da"
     revoked: false
 
   - name: jaeger
@@ -173,7 +173,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/jaeger
     purpose: "Distributed trace UI + OTLP gRPC collector (mTLS, EX-231-09 closed v2.23.2)"
     mtls_capable: true
-    bootstrap_token_sha256: "574de27a1b7f5597f872a3ba56d40341cdc0ed8668a1a9a5616b4b30e9e5a639"
+    bootstrap_token_sha256: "e83ecaeb794ef1e518971fc395ab671b2cb0d9f858e0301ae01dcd0c25ca2d20"
     revoked: false
 
   # ── AI / inference ────────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ services:
     # Ollama does not support server TLS. Protection = internal bridge-only +
     # bearer token. This is an honest gap, not a pretend control.
     mtls_capable: false
-    bootstrap_token_sha256: "b4d906f0663a1dc35629515e8505684b6928d358a5e3d8d15d755c79299b7d65"
+    bootstrap_token_sha256: "41a20f61dd3b633da3e9e3e92d43501ff35b121e7417a21e50037532316980fa"
     revoked: false
 
   # ── Optional / profile-gated services ─────────────────────────────────────
@@ -193,7 +193,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/open-webui
     purpose: "User-facing chat UI (profile: openwebui)"
     mtls_capable: true
-    bootstrap_token_sha256: "9e536b3c2c57c5d227051baebc216ba81796b9fec8b36c24960cf6afc2466037"
+    bootstrap_token_sha256: "3b6d02180904655375ccad83b868396f42c960d76422484d4b29265f38749ead"
     revoked: false
 
   - name: langflow
@@ -201,7 +201,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/langflow
     purpose: "Visual agent workflow builder (profile: langflow)"
     mtls_capable: false       # upstream image, no TLS. Uses CA as client.
-    bootstrap_token_sha256: "bcb5799245b74345de78b36c1bb287542a38a3f90456f77db46bc3ea07095b41"
+    bootstrap_token_sha256: "f33a4a92d0f29a04a29b1aa87a9328d711b1862c811c5c7c0e2ced16c09bd93d"
     revoked: false
 
   - name: letta
@@ -209,7 +209,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/letta
     purpose: "Stateful agent with persistent memory (profile: letta)"
     mtls_capable: false       # upstream image, no TLS. Uses CA as client.
-    bootstrap_token_sha256: "dd6f5057773a64c454653e5b23e43920d7e7dced05d180fa94a4d33b11209aa8"
+    bootstrap_token_sha256: "6286076bbe4c6ff3d145f927c673b7923dc44fca380efc8811489c71160950c4"
     revoked: false
 
   - name: openclaw
@@ -217,7 +217,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/openclaw
     purpose: "Personal AI w/ messaging channel integrations (profile: openclaw)"
     mtls_capable: false       # upstream image. Uses CA as client.
-    bootstrap_token_sha256: "892b2c27875c0d9ae2ec639dc5bb905c788d1f0cfdce866e1f01bbbb72ae727d"
+    bootstrap_token_sha256: "4aee4c24ca983690ee4069132a78e46c2f0a13fc91de28838ca68496d11d4b1a"
     revoked: false
 
   - name: keycloak
@@ -225,7 +225,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/keycloak
     purpose: "Upstream test IdP for OIDC/SAML federation (profile: test-idp)"
     mtls_capable: true
-    bootstrap_token_sha256: "91c9b9dab2b5fb5b79c0848618523fe2424711a3f63f489207da7a8a3902f8a8"
+    bootstrap_token_sha256: "24e73780b67282df6ff2842b17de79d475930b07feef3f7409f06168d3c6b6b4"
     revoked: false
 
   - name: vault
@@ -233,7 +233,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/vault
     purpose: "HashiCorp Vault dev-mode KMS (profile: vault)"
     mtls_capable: true
-    bootstrap_token_sha256: "e4e746938b77b0b24a70d68b8b080843cb5230f5eb9f37e636148055b0e136f5"
+    bootstrap_token_sha256: "4eb96cbc1dc23bd6b4bebf71111c1da08701923fec46d74c97e6e934bde0acdf"
     revoked: false
 
   - name: step-ca
@@ -241,7 +241,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/step-ca
     purpose: "Smallstep CA — legacy, kept for --with-internal-ca profile only"
     mtls_capable: true
-    bootstrap_token_sha256: "9166ae76e03d90f77d0c4c29638c265e246f271ae5889d1ffd42b85c57f0a001"
+    bootstrap_token_sha256: "da671daac8b57f030b54cce03178ea488234c20f94a6db31b83e34484a3a8faa"
     revoked: false
 
   - name: wazuh-manager
@@ -249,7 +249,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/wazuh-manager
     purpose: "Wazuh SIEM event ingest (profile: wazuh)"
     mtls_capable: true
-    bootstrap_token_sha256: "dff1a0c12a2ac578c1a46b1fcbb93278c8a2b738a80f27a1414f5dcd37fad7a8"
+    bootstrap_token_sha256: "f2f9ab637a95fb52bfefc9ffcb883bfd4460bf9459f794312ddfc5978d1695f3"
     revoked: false
 
   - name: wazuh-indexer
@@ -257,7 +257,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/wazuh-indexer
     purpose: "Wazuh SIEM OpenSearch backend (profile: wazuh)"
     mtls_capable: true
-    bootstrap_token_sha256: "ddfc23ed19fa087b385f1b18e7c34026a9752f38ea69453f2b20dc145c0812c8"
+    bootstrap_token_sha256: "368520e9b0a332a75278b78f909ec522cbef02f76b13e5b7199799d75cfa7d77"
     revoked: false
 
   - name: wazuh-dashboard
@@ -265,7 +265,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/wazuh-dashboard
     purpose: "Wazuh SIEM UI (profile: wazuh)"
     mtls_capable: true
-    bootstrap_token_sha256: "3baeaa2e81297a538825ad604b25504bd6dbfb119118c5ee97c59d778dd29e9c"
+    bootstrap_token_sha256: "41e264bc6ccc94ff16108a32fffb1e51bbe48f827bd9da0fef4673cfdb0b6115"
     revoked: false
 
 # ─────────────────────────────────────────────────────────────────────────────

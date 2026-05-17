@@ -1,7 +1,7 @@
 """
 Yashigani internal PKI issuer — generates root, intermediate, and leaf certs.
 
-Last updated: 2026-05-11T00:00:00Z
+Last updated: 2026-05-17T09:00:00+01:00
 
 Invoked by:
   * install.sh bootstrap_internal_pki()  — first-install cert generation
@@ -517,6 +517,7 @@ def rotate_leaves(
     int_cert = _load_cert(paths.intermediate_cert)
     int_key = _load_key(paths.intermediate_key)
     rotated: list[str] = []
+    hashes_by_service: dict[str, str] = {}
     for service in manifest.live_services():
         if only_service and service.name != only_service:
             continue
@@ -524,20 +525,29 @@ def rotate_leaves(
             service, int_cert, int_key, manifest.cert_policy, leaf_lifetime_days
         )
         _write_leaf(paths, service, leaf_cert, leaf_key, int_cert)
-        # Ensure bootstrap token exists for this service (idempotent).
-        # K8s upgrade path: on a fresh cluster install the bootstrap job runs
-        # bootstrap() which writes the tokens. On upgrade it runs rotate_leaves()
-        # which previously skipped token generation. The K8s PKI applier now
-        # includes *_bootstrap_token files in the leaves Secret; _ensure_bootstrap_token
-        # creates the file on first rotate if it was absent (migrating pre-token
-        # installs) and is a no-op on subsequent rotates.
-        _ensure_bootstrap_token(paths, service.name)
+        # Ensure bootstrap token exists for this service (idempotent) and capture
+        # the hash so we can update the manifest.
+        # Compose upgrade path: rotate_leaves() previously discarded the hash and
+        # never called _update_manifest_hashes(), leaving stale committed
+        # bootstrap_token_sha256 values in the manifest that no longer matched
+        # the on-disk token → TamperError at gateway startup.  Fix: collect hashes
+        # here and write them back at the end, matching the bootstrap() flow.
+        # K8s: _update_manifest_hashes still runs (harmlessly writing into the
+        # container's copy of /manifest.yaml) but K8s verification is skipped via
+        # _IN_KUBERNETES in ssl_context.py, so the manifset write-back is not load-
+        # bearing on that path.
+        hashes_by_service[service.name] = _ensure_bootstrap_token(paths, service.name)
         rotated.append(service.name)
         logger.info(
             "internal-pki: rotated leaf for %s, valid until %s",
             service.name,
             leaf_cert.not_valid_after_utc,
         )
+    # Write bootstrap_token_sha256 back to the manifest for ALL rotated services.
+    # When only_service is set, hashes_by_service contains exactly one entry and
+    # only that service's line is touched; other entries are left as-is.
+    if hashes_by_service:
+        _update_manifest_hashes(paths.manifest_path, hashes_by_service)
     return rotated
 
 
