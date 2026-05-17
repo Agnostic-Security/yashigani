@@ -7,7 +7,7 @@ POST /auth/password/change  — forced change on first login
 POST /auth/totp/provision   — TOTP + recovery codes provisioning
 POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value flows
 
-Last updated: 2026-05-14T12:00:00+01:00
+Last updated: 2026-05-17T23:00:00+01:00
 """
 
 from __future__ import annotations
@@ -834,13 +834,18 @@ class StepUpRequest(BaseModel):
 @router.post("/stepup")
 async def stepup_verify(
     body: StepUpRequest,
-    session: AdminSession,
+    session: AnySession,
     store=Depends(get_session_store),
 ):
     """
-    Step-up TOTP verification for high-value admin flows (ASVS V6.8.4).
+    Step-up TOTP verification for high-value flows (ASVS V6.8.4).
 
-    The admin submits their current TOTP code.  On success, the session's
+    Accepts any authenticated session (admin OR regular user) so that
+    user-tier accounts can satisfy the assert_fresh_stepup prerequisite
+    required by POST /me/api-key.  Anonymous and expired sessions are
+    rejected by the AnySession dependency before this handler runs.
+
+    The caller submits their current TOTP code.  On success, the session's
     last_totp_verified_at is updated.  The caller may then retry the
     high-value endpoint that returned step_up_required.  The verification
     window is YASHIGANI_STEPUP_TTL_SECONDS (default 300 s / 5 min).
@@ -852,6 +857,11 @@ async def stepup_verify(
       incremented on the session prefix.
     - No credential enumeration: same HTTP 401 body for wrong code or
       no session.
+    - Cross-tenant isolation: account is resolved by session.account_id
+      against the platform DB; a session with a fabricated/wrong-tenant
+      account_id will find no record → 403 totp_not_configured.
+    - Tier scope: widened from admin-only to any-session. Admin step-up
+      semantics (audit events, replay cache, failure counter) are identical.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
