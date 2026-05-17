@@ -1,5 +1,5 @@
 {{- /*
-  Last updated: 2026-05-17T00:00:00+00:00
+  Last updated: 2026-05-17T12:00:00+00:00
   v2.23.1 task #94 — startupProbe + tightened liveness/readiness so
   helm install --wait does not stall on slow first-boot of upstream image.
   v2.23.1 GA fix — initContainer chowns upstream image static/ dir so the
@@ -129,8 +129,13 @@ spec:
                   key: {{ .Values.openWebui.env.webuiSecretKeySecretKey }}
             - name: OPENAI_API_BASE_URL
               value: {{ .Values.openWebui.env.openaiApiBaseUrl | quote }}
+            # Captain Bucket-C: per-install bearer token read from K8s Secret.
+            # Replaces the former hardcoded "yashigani-internal" literal.
             - name: OPENAI_API_KEY
-              value: {{ .Values.openWebui.env.openaiApiKey | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internalBearer.existingSecretName | default "yashigani-agent-bearer" }}
+                  key: yashigani_internal_bearer
             - name: OLLAMA_BASE_URL
               value: {{ .Values.openWebui.env.ollamaBaseUrl | quote }}
             - name: ENABLE_OLLAMA_API

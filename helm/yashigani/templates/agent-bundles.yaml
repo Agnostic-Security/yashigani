@@ -25,7 +25,7 @@
   DISCLAIMER: These integrations are provided AS IS by Agnostic Security.
   Image digests are pinned per release. All support goes to upstream maintainers.
 */}}
-{{- /* Last updated: 2026-05-13T00:00:00+01:00 — feat: add langflow + letta bundle support (persistence + dbPasswordSecretRef) — HELM-MISSING-LANGFLOW-LETTA (#7) */ -}}
+{{- /* Last updated: 2026-05-17T12:00:00+01:00 — feat: internalBearer secretKeyRef for OPENAI_API_KEY — Captain Bucket-C */ -}}
 
 {{- $root := . -}}
 
@@ -84,6 +84,13 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            # Captain Bucket-C: inject OPENAI_API_KEY from per-install internalBearer Secret.
+            # Replaces the former hardcoded "yashigani-internal" literal in values.yaml.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.internalBearer.existingSecretName | default "yashigani-agent-bearer" }}
+                  key: yashigani_internal_bearer
             {{- if and $bundle.tokenSecretName $bundle.tokenSecretKey }}
             - name: YASHIGANI_AGENT_TOKEN
               valueFrom:

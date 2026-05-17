@@ -1,5 +1,6 @@
 """
 YSG-RISK-008 Compose Hardening Parity Gate (v2.23.4)
+Captain Bucket-C: no-hardcoded-bearer gate added 2026-05-17.
 
 Asserts that every service in docker/docker-compose.yml has:
   1. cap_drop: [ALL]             — universal (was already true pre-v2.23.4)
@@ -38,6 +39,12 @@ import yaml
 
 
 COMPOSE_FILE = pathlib.Path(__file__).parent.parent.parent / "docker" / "docker-compose.yml"
+
+# The hardcoded bearer token that must no longer appear in docker-compose.yml
+# after Captain Bucket-C fix (v2.23.4). It may still appear in git history
+# (covered by the gitleaks-baseline.json FP entries which were cleaned up),
+# but MUST NOT appear in the live production file.
+BANNED_BEARER_LITERAL = "yashigani-internal"
 
 # Services exempt from read_only: true requirement.
 # Each entry MUST have a documented reason in docker/docker-compose.yml (see YSG-RISK-008 comments).
@@ -201,4 +208,41 @@ class TestReadOnly:
         assert not stale, (
             f"READ_ONLY_EXEMPTIONS contains services not in docker-compose.yml: {stale}\n"
             "Remove stale exemptions from READ_ONLY_EXEMPTIONS in this test file."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate 4: no hardcoded bearer token literal (Captain Bucket-C — v2.23.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNoHardcodedBearer:
+    def test_literal_yashigani_internal_absent_from_compose(self):
+        """
+        The literal string 'yashigani-internal' must NOT appear as a plain env
+        value in docker/docker-compose.yml. Agent bundles (open-webui, langflow,
+        letta) must read OPENAI_API_KEY from /run/secrets/yashigani_internal_bearer
+        via the entrypoint shim — not from a hardcoded string.
+
+        Captain Bucket-C finding: hardcoded bearer token in compose file allows
+        any operator with access to docker-compose.yml to present as an internal
+        agent to the gateway without needing the per-install secret.
+        """
+        compose_text = COMPOSE_FILE.read_text()
+        lines_with_banned = [
+            (i + 1, line.strip())
+            for i, line in enumerate(compose_text.splitlines())
+            if BANNED_BEARER_LITERAL in line
+            # Allow comment lines that explain the removal
+            and not line.strip().startswith("#")
+            # Allow the entrypoint shim lines which read from the secret file
+            # (the shim command itself must not hardcode the value)
+            and "cat /run/secrets/yashigani_internal_bearer" not in line
+        ]
+        assert not lines_with_banned, (
+            f"Found literal '{BANNED_BEARER_LITERAL}' as a non-comment value in "
+            f"docker/docker-compose.yml on {len(lines_with_banned)} line(s):\n"
+            + "\n".join(f"  Line {ln}: {txt}" for ln, txt in lines_with_banned)
+            + "\n\nCaptain Bucket-C: replace hardcoded bearer with the entrypoint shim "
+            "pattern: mount ./secrets:/run/secrets:ro and read the token from "
+            "/run/secrets/yashigani_internal_bearer at container startup."
         )

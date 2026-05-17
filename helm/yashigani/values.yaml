@@ -1,6 +1,6 @@
-# Yashigani v2.23.2 — Umbrella Chart Top-Level Values
+# Yashigani v2.23.4 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-15 (fix: admissionPolicies default false — Kyverno not bundled; feat: CRD pre-install guard)
+# Last updated: 2026-05-17 (feat: internalBearer per-install secret — Captain Bucket-C; remove hardcoded yashigani-internal)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -225,6 +225,28 @@ adminBootstrap:
     limits:
       cpu: "200m"
       memory: "128Mi"
+
+# ---------------------------------------------------------------------------
+# Internal Bearer Token (Captain Bucket-C — per-install, rotatable secret)
+# ---------------------------------------------------------------------------
+# YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (open-webui,
+# langflow, letta) present as the OpenAI `Authorization: Bearer <token>` when
+# calling gateway:8081/v1. The gateway's AgentAuthMiddleware validates it at
+# the app layer. Previously hardcoded to "yashigani-internal"; now per-install.
+#
+# Fail-closed: if internalBearer.value is empty AND no existingSecretName is
+# set, helm template/install/upgrade will fail (see validate-security.yaml).
+# Generate with: openssl rand -hex 32
+#
+# Upgrade-safe: the auto-generated Secret uses helm lookup so the value is
+# preserved on `helm upgrade` and only generated fresh on first install.
+internalBearer:
+  # Set a non-empty value here, or leave empty to auto-generate on first install.
+  # In production: pass via --set internalBearer.value="$(openssl rand -hex 32)"
+  # or supply an existingSecretName with key `yashigani_internal_bearer`.
+  value: ""
+  # Optionally point to a pre-created K8s Secret (key: yashigani_internal_bearer).
+  existingSecretName: ""
 
 # ---------------------------------------------------------------------------
 # Gateway — MCP reverse proxy (data plane)
@@ -831,7 +853,8 @@ agentBundles:
     env:
       # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
       OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
-      OPENAI_API_KEY: "yashigani-internal"
+      # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
+      # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
       DO_NOT_TRACK: "true"
       LANGFLOW_AUTO_LOGIN: "true"
@@ -888,7 +911,8 @@ agentBundles:
     env:
       # Route LLM calls through Yashigani gateway
       OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
-      OPENAI_API_KEY: "yashigani-internal"
+      # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
+      # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LETTA_LLM_MODEL: "qwen2.5:3b"
       LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
     # Letta connects to Postgres. The URI is assembled from the postgres secret.
@@ -987,7 +1011,8 @@ openWebui:
     # (8081, plain HTTP). Network isolation (K8s NetworkPolicy) is the transport
     # guard; AgentAuthMiddleware enforces token auth at the app layer.
     openaiApiBaseUrl: "http://yashigani-gateway:8081/v1"
-    openaiApiKey: "yashigani-internal"
+    # openaiApiKey is now wired via secretKeyRef (internalBearer Secret) in
+    # open-webui.yaml — Captain Bucket-C fix. This field is intentionally absent.
     ollamaBaseUrl: ""
     enableOllamaApi: "false"
     defaultModels: "qwen2.5:3b"

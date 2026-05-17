@@ -42,3 +42,28 @@
     {{- fail "F-V232-002 SECURITY VIOLATION: postgres.enabled=false (external PostgreSQL) but postgres.tls.ca is unset. Setting postgres.tls.ca is required so the DSN can use sslmode=verify-ca or sslmode=verify-full for server-certificate validation. sslmode=require (CERT_NONE) is not accepted — see V14.4.1. Provide the CA PEM value in postgres.tls.ca, or document the risk-acceptance in your risk register." -}}
   {{- end -}}
 {{- end -}}
+
+{{- /*
+  Captain Bucket-C (INTERNAL-BEARER-001): fail production installs where
+  internalBearer.value is empty AND no existingSecretName is provided.
+  An empty bearer token in production means the chart cannot generate a
+  stable per-install token — agents (open-webui, langflow, letta) would
+  receive a freshly-randomised token on every upgrade, breaking their auth
+  to the gateway on every helm upgrade.
+
+  Operators MUST supply one of:
+    --set internalBearer.value="$(openssl rand -hex 32)"          (operator-generated)
+    --set internalBearer.existingSecretName=my-bearer-secret      (external secret)
+
+  On helm upgrade of a running install: helm lookup in secrets.yaml preserves
+  the existing Secret value automatically — so passing --set internalBearer.value=""
+  on an UPGRADE is the dangerous case: it would regenerate a new random token and
+  break all running agent bundles. This guard blocks that scenario.
+
+  Non-production environments allow empty value for local development (auto-generate).
+*/ -}}
+{{- if eq .Values.global.environment "production" -}}
+  {{- if and (not .Values.internalBearer.existingSecretName) (not .Values.internalBearer.value) -}}
+    {{- fail "INTERNAL-BEARER-001 SECURITY VIOLATION: internalBearer.value is empty and internalBearer.existingSecretName is not set in production. Agent bundles (open-webui, langflow, letta) require a stable per-install bearer token for gateway authentication. Supply --set internalBearer.value=\"$(openssl rand -hex 32)\" or set internalBearer.existingSecretName to a pre-created K8s Secret with key yashigani_internal_bearer. On upgrade: re-supply the current token value or the existing Secret will be regenerated, breaking running agent bundles." -}}
+  {{- end -}}
+{{- end -}}

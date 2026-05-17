@@ -467,6 +467,17 @@ services:
     restart: unless-stopped
     mem_limit: ${YASHIGANI_OPENWEBUI_MEM_LIMIT:-2048m}
     cpus: ${YASHIGANI_OPENWEBUI_CPU_LIMIT:-1.0}
+    # Captain Bucket-C: entrypoint shim reads YASHIGANI_INTERNAL_BEARER from
+    # /run/secrets/yashigani_internal_bearer and exports it as OPENAI_API_KEY
+    # before exec-ing the upstream image CMD (bash start.sh — verified via
+    # `docker inspect ghcr.io/open-webui/open-webui:v0.9.2`).
+    # open-webui does not support *_FILE env convention; shim is required.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec "$@"'
+      - '--'
+    command: ["bash", "start.sh"]
     environment:
       # Disable Open WebUI's own auth — Caddy/Yashigani handles identity
       WEBUI_AUTH: "false"
@@ -482,7 +493,8 @@ services:
       # data-network-only). Network isolation on `data` bridge is the transport
       # guard; AgentAuthMiddleware enforces token auth at the app layer.
       OPENAI_API_BASE_URL: http://gateway:8081/v1
-      OPENAI_API_KEY: "yashigani-internal"
+      # OPENAI_API_KEY is injected by the entrypoint shim from
+      # /run/secrets/yashigani_internal_bearer — do NOT set it here.
       # Disable direct Ollama access — everything through gateway
       OLLAMA_BASE_URL: ""
       ENABLE_OLLAMA_API: "false"
@@ -508,6 +520,9 @@ services:
       SENTENCE_TRANSFORMERS_HOME: "/app/backend/data/cache/embedding/models"
     volumes:
       - openwebui_data:/app/backend/data
+      # Captain Bucket-C: mount secrets dir so entrypoint shim can read
+      # yashigani_internal_bearer at startup.
+      - ./secrets:/run/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/health 2>/dev/null || exit 1"]
       interval: 15s
@@ -1450,10 +1465,21 @@ services:
     restart: unless-stopped
     mem_limit: ${YASHIGANI_LANGFLOW_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_LANGFLOW_CPU_LIMIT:-1.0}
+    # Captain Bucket-C: entrypoint shim reads YASHIGANI_INTERNAL_BEARER from
+    # /run/secrets/yashigani_internal_bearer and exports it as OPENAI_API_KEY.
+    # Langflow 1.9.2 CMD: python -m langflow run --host 0.0.0.0 --port 7860
+    # (verified from upstream Dockerfile at tag 1.9.2).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec "$@"'
+      - '--'
+    command: ["python", "-m", "langflow", "run", "--host", "0.0.0.0", "--port", "7860"]
     environment:
       # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
       OPENAI_API_BASE: http://gateway:8080/v1
-      OPENAI_API_KEY: "yashigani-internal"
+      # OPENAI_API_KEY is injected by the entrypoint shim from
+      # /run/secrets/yashigani_internal_bearer — do NOT set it here.
       # Default model for new flows
       LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
       # Disable telemetry
@@ -1461,6 +1487,9 @@ services:
       LANGFLOW_AUTO_LOGIN: "true"
     volumes:
       - langflow_data:/app/langflow
+      # Captain Bucket-C: mount secrets dir so entrypoint shim can read
+      # yashigani_internal_bearer at startup.
+      - ./secrets:/run/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:7860/health', timeout=5)\""]
       interval: 15s
@@ -1497,16 +1526,30 @@ services:
     restart: unless-stopped
     mem_limit: ${YASHIGANI_LETTA_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_LETTA_CPU_LIMIT:-1.0}
+    # Captain Bucket-C: entrypoint shim reads YASHIGANI_INTERNAL_BEARER from
+    # /run/secrets/yashigani_internal_bearer and exports it as OPENAI_API_KEY.
+    # Letta 0.16.7 CMD: letta server --host 0.0.0.0
+    # (verified from upstream Dockerfile at tag 0.16.7).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec "$@"'
+      - '--'
+    command: ["letta", "server", "--host", "0.0.0.0"]
     environment:
       # Route LLM calls through Yashigani gateway
       OPENAI_API_BASE: http://gateway:8080/v1
-      OPENAI_API_KEY: "yashigani-internal"
+      # OPENAI_API_KEY is injected by the entrypoint shim from
+      # /run/secrets/yashigani_internal_bearer — do NOT set it here.
       LETTA_LLM_MODEL: "qwen2.5:3b"
       LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
       # Use shared Postgres for persistence (separate DB)
       LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/letta
     volumes:
       - letta_data:/root/.letta
+      # Captain Bucket-C: mount secrets dir so entrypoint shim can read
+      # yashigani_internal_bearer at startup.
+      - ./secrets:/run/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8283/v1/health\", timeout=5)'"]
       interval: 15s
@@ -1558,6 +1601,10 @@ services:
       # Gateway-to-OpenClaw traffic stays on the internal Docker bridge (no ports:
       # entry needed for that path). CWE-668 — design decision: option A.
       - "127.0.0.1:18789:18789"
+    # Captain Bucket-C NOTE: openclaw.json contains __YASHIGANI_INTERNAL_BEARER__
+    # as a placeholder. Su's install.sh must substitute it with the real per-install
+    # token from docker/secrets/yashigani_internal_bearer before starting this service.
+    # See: https://github.com/agnosticsec-com/yashigani/issues/openclaw-bearer-sub
     environment:
       OPENCLAW_CONFIG_PATH: /etc/openclaw/openclaw.json
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
