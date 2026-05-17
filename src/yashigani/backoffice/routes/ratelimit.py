@@ -108,6 +108,7 @@ async def update_ratelimit_config(body: RateLimitConfigRequest, session: AdminSe
             "rate_limit_config",
             f"global_rps={prev.global_rps}",
             f"global_rps={new_cfg.global_rps}",
+            account_tier=session.account_tier,
         ))
     return {"status": "ok"}
 
@@ -172,15 +173,17 @@ async def reset_bucket(bucket_key: str, session: AdminSession):
 
     assert state.audit_writer is not None  # set unconditionally at startup
     state.audit_writer.write(_config_event(
-        session.account_id, "rate_limit_bucket_reset", bucket_key, "deleted"
+        session.account_id, "rate_limit_bucket_reset", bucket_key, "deleted",
+        account_tier=session.account_tier,
     ))
     return {"status": "ok", "bucket_key": bucket_key}
 
 
-def _config_event(admin_id: str, setting: str, prev: str, new: str):
+def _config_event(admin_id: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    # account_tier derived from session at call site — defence-in-depth: RBAC bypass visible in audit.
     from yashigani.audit.schema import ConfigChangedEvent
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_id,
         setting=setting,
         previous_value=prev,

@@ -326,7 +326,7 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
     ip_addr = _client_ip(request)
     session_obj = store.create(
         account_id=admin_id,
-        account_tier="admin",
+        account_tier="admin",  # Class C: WebAuthn is admin-only by design; tier is structural.
         client_ip=ip_addr,
     )
     token = session_obj.token

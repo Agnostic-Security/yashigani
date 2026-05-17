@@ -110,6 +110,7 @@ async def update_schedule(body: ScheduleUpdateRequest, session: StepUpAdminSessi
         "kms_rotation_schedule",
         scheduler._cron_expr,
         body.cron_expr,
+        account_tier=session.account_tier,
     ))
 
     return {"status": "ok", "cron_expr": body.cron_expr}
@@ -143,6 +144,7 @@ async def rotate_now(session: StepUpAdminSession):
         "kms_manual_rotation",
         "",
         "triggered",
+        account_tier=session.account_tier,
     ))
 
     return {"status": "ok", "message": "Manual rotation triggered"}
@@ -184,10 +186,11 @@ def _redact_key(key: str) -> str:
     return key[:4] + "****" + key[-4:]
 
 
-def _config_event(admin_id: str, setting: str, prev: str, new: str):
+def _config_event(admin_id: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    # account_tier derived from session at call site — defence-in-depth: RBAC bypass visible in audit.
     from yashigani.audit.schema import ConfigChangedEvent
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_id,
         setting=setting,
         previous_value=prev,

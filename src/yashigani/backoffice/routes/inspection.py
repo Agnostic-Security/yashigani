@@ -108,7 +108,8 @@ async def set_model(body: ModelSelectRequest, session: AdminSession):
 
     assert state.audit_writer is not None  # set unconditionally at startup
     state.audit_writer.write(_config_event(
-        session.account_id, "inspection.model", prev_model, body.model
+        session.account_id, "inspection.model", prev_model, body.model,
+        account_tier=session.account_tier,
     ))
     return {"status": "ok", "model": body.model}
 
@@ -158,6 +159,7 @@ async def set_threshold(body: ThresholdRequest, session: AdminSession):
         "inspection.threshold",
         str(prev),
         str(body.threshold),
+        account_tier=session.account_tier,
     ))
     return {"status": "ok", "threshold": body.threshold}
 
@@ -198,7 +200,8 @@ async def set_mode(body: ModeRequest, session: AdminSession):
 
     assert state.audit_writer is not None  # set unconditionally at startup
     state.audit_writer.write(_config_event(
-        session.account_id, "inspection.mode", prev, body.mode
+        session.account_id, "inspection.mode", prev, body.mode,
+        account_tier=session.account_tier,
     ))
     return {"status": "ok", "mode": body.mode}
 
@@ -207,10 +210,11 @@ async def set_mode(body: ModeRequest, session: AdminSession):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _config_event(admin_id: str, setting: str, prev: str, new: str):
+def _config_event(admin_id: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    # account_tier derived from session at call site — defence-in-depth: RBAC bypass visible in audit.
     from yashigani.audit.schema import ConfigChangedEvent
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_id,
         setting=setting,
         previous_value=prev,
