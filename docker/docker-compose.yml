@@ -476,7 +476,11 @@ services:
       # Fail-closed: MUST be set in docker/.env (install.sh generates it).
       WEBUI_SECRET_KEY: ${OWUI_SECRET_KEY:?OWUI_SECRET_KEY must be set in docker/.env — run install.sh to generate}
       # Point ALL inference at Yashigani gateway — OpenAI-compatible
-      OPENAI_API_BASE_URL: http://gateway:8080/v1
+      # BUG-2 (v2.23.4): gateway:8080 is mTLS-only (ssl.CERT_REQUIRED).
+      # Route Open WebUI through gateway's internal mesh port (8081, plain HTTP,
+      # data-network-only). Network isolation on `data` bridge is the transport
+      # guard; AgentAuthMiddleware enforces token auth at the app layer.
+      OPENAI_API_BASE_URL: http://gateway:8081/v1
       OPENAI_API_KEY: "yashigani-internal"
       # Disable direct Ollama access — everything through gateway
       OLLAMA_BASE_URL: ""
@@ -507,13 +511,15 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (open-webui.yaml:90,110).
     # No cap_add: open-webui binds port 8080 (non-privileged).
     cap_drop: [ALL]
-    # EX-231-10: open-webui calls gateway via http://gateway:8080/v1 — this is
-    # the one approved direct-to-gateway path (user-facing LLM calls, not admin
-    # control plane). open-webui is itself behind Caddy (:443/open-webui/*) so
-    # it represents a trusted position. Joins `data` for DNS visibility to
-    # gateway. Does NOT join caddy_internal (open-webui does not proxy to
-    # backoffice) or obs.
+    # EX-231-10 (v2.23.4 BUG-1 fix): open-webui joins BOTH caddy_internal AND data.
+    # caddy_internal — Caddy reverse-proxies TO open-webui:8080. Without this
+    #   network, the DNS name "open-webui" is unresolvable from Caddy's namespace
+    #   (502 on https://localhost:8443/ — Ava Track B finding 2026-05-17).
+    # data — open-webui calls gateway:8081/v1 (internal mesh port, plain HTTP).
+    #   gateway is on `data`; gateway:8081 is the mesh-only listener with no mTLS.
+    # open-webui does NOT join obs (no metrics scraping needed).
     networks:
+      - caddy_internal
       - data
     profiles:
       - openwebui

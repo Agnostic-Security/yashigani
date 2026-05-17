@@ -96,6 +96,9 @@ RUN mkdir -p /data/audit /data/bootstrap /var/log/yashigani && \
 USER yashigani
 
 EXPOSE 8080
+# Internal mesh port — plain HTTP, data-network-only, Open WebUI ingress.
+# Never host-mapped; never reachable from caddy_internal or edge networks.
+EXPOSE 8081
 
 # Image-level healthcheck — talks through the mTLS port using the container's
 # own client cert (same material the service presents for inbound mTLS).
@@ -123,18 +126,21 @@ ENV PYTHONUNBUFFERED=1 \
     # <47` pin — protects future bumps past 46.x.
     OPENSSL_armcap=0x8fd
 
-# Internal mTLS (v2.23.1) — uvicorn terminates TLS and requires every client
-# to present a cert signed by our internal CA. Certs land in /run/secrets via
-# a bind-mount configured by docker-compose.
-#   --ssl-cert-reqs=2  → ssl.CERT_REQUIRED (stdlib constant, mutual TLS)
-#   --ssl-ca-certs     → Pattern A for Python ssl: anchor on the PUBLIC ca_root.crt.
-#                         uvicorn is Python ssl, so partial-chain rejection on
-#                         intermediate-only anchors applies (gate #58a evidence).
-CMD ["uvicorn", "yashigani.gateway.entrypoint:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8080", \
-     "--ssl-keyfile", "/run/secrets/gateway_client.key", \
-     "--ssl-certfile", "/run/secrets/gateway_client.crt", \
-     "--ssl-ca-certs", "/run/secrets/ca_root.crt", \
-     "--ssl-cert-reqs", "2", \
-     "--no-access-log"]
+# Dual-port startup wrapper (v2.23.4):
+#   Port 8080 — mTLS (ssl.CERT_REQUIRED), caddy_internal network only.
+#               CaddyVerifiedMiddleware + SpiffePeerCertMiddleware active.
+#   Port 8081 — plain HTTP, data network only (Open WebUI ingress).
+#               No mTLS; network isolation is the sole transport-layer guard.
+#               CaddyVerifiedMiddleware + SpiffePeerCertMiddleware NOT added.
+#               AgentAuthMiddleware + LicenseEnforcementMiddleware active.
+#
+# Pattern A for Python ssl: trust anchor is the public ca_root.crt.
+# Python 3.14/OpenSSL 3.0 strict-chain rejects intermediate-only anchors
+# (gate #58a evidence). --ssl-cert-reqs=2 → ssl.CERT_REQUIRED (mutual TLS).
+COPY --chown=root:root docker/gateway-start.sh /usr/local/bin/gateway-start.sh
+# Switch to root briefly to set execute bit, then back to yashigani.
+# The script is owned root, executed by yashigani (read+execute = 755).
+USER root
+RUN chmod 0755 /usr/local/bin/gateway-start.sh
+USER yashigani
+CMD ["/bin/sh", "/usr/local/bin/gateway-start.sh"]

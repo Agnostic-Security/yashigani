@@ -68,8 +68,11 @@ spec:
           port: 53
 
 ---
-# Gateway — accept ingress from Caddy ONLY (EX-231-10: Caddy is sole ingress).
-# open-webui is removed — in K8s it must route through Caddy's :443 listener.
+# Gateway — ingress rules (EX-231-10 + BUG-2 v2.23.4):
+#   Port 8080 (mTLS): Caddy ONLY — Caddy is the sole external ingress.
+#   Port 8081 (mesh): open-webui ONLY — internal mesh port, plain HTTP.
+#     open-webui cannot reach port 8080 (mTLS+CaddyVerified blocks it).
+#     Port 8081 never serves Caddy-proxied traffic; it has no CaddyVerified gate.
 # nginx-ingress retained for installations using tlsMode=nginx (Caddy bypassed).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -85,6 +88,7 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # mTLS port — Caddy and nginx-ingress only
     - from:
         - podSelector:
             matchLabels:
@@ -97,6 +101,14 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    # Internal mesh port — open-webui only (BUG-2 fix, v2.23.4)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: open-webui
+      ports:
+        - protocol: TCP
+          port: 8081
 
 ---
 # Gateway egress — allow outbound to policy, redis, budget-redis, ollama, postgres (via pgbouncer), OTEL
@@ -560,9 +572,15 @@ spec:
           port: 8080
 
 ---
-# Open WebUI egress — EX-231-10: LLM calls route through Caddy, not gateway
-# directly. open-webui connects to Caddy:443, which proxies to gateway:8080.
-# This enforces the Caddy-centric model for all ingress to gateway.
+# Open WebUI egress — BUG-2 (v2.23.4): LLM calls route directly to gateway's
+# internal mesh port (8081, plain HTTP). The prior design (Caddy:443 routing)
+# was aspirational — the Caddy /v1/* block injects X-Caddy-Verified-Secret,
+# which open-webui does not send; and the gateway's /v1 endpoint requires it.
+# The mesh port (8081) has no CaddyVerified gate; network isolation is the
+# transport guard (this NetworkPolicy enforces the port boundary).
+# open-webui still reaches Caddy:443 for the /open-webui/* catch-all proxy
+# (browser → Caddy → open-webui:8080). That direction is Caddy→open-webui, not
+# open-webui→Caddy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -577,13 +595,14 @@ spec:
   policyTypes:
     - Egress
   egress:
+    # LLM inference — gateway internal mesh port (plain HTTP, in-cluster only)
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: yashigani-caddy
+              app.kubernetes.io/name: yashigani-gateway
       ports:
         - protocol: TCP
-          port: 443
+          port: 8081
 
 ---
 # Prometheus — accept ingress from grafana and from caddy / nginx-ingress

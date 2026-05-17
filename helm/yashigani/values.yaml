@@ -962,7 +962,10 @@ openWebui:
     enableSignup: "true"
     webuiSecretKeySecretName: "yashigani-open-webui-secrets"
     webuiSecretKeySecretKey: "secret_key"
-    openaiApiBaseUrl: "http://yashigani-gateway:8080/v1"
+    # BUG-2 (v2.23.4): gateway:8080 is mTLS-only. Use the internal mesh port
+    # (8081, plain HTTP). Network isolation (K8s NetworkPolicy) is the transport
+    # guard; AgentAuthMiddleware enforces token auth at the app layer.
+    openaiApiBaseUrl: "http://yashigani-gateway:8081/v1"
     openaiApiKey: "yashigani-internal"
     ollamaBaseUrl: ""
     enableOllamaApi: "false"
