@@ -1,10 +1,18 @@
 {{- /*
   LIC-006 — Security validation: enforce mtls.enabled=true in production.
 
+  F-V232-002 — V14.4.1: enforce that external PostgreSQL connections always
+  use TLS with certificate validation (verify-ca or verify-full). When
+  postgres.enabled=false the operator is expected to supply a DSN via
+  existingSecretName. We cannot read runtime secrets at Helm template time,
+  but we CAN enforce that the operator has declared a CA certificate value
+  (postgres.tls.ca) so the chart-generated DSN template uses verify-ca, not
+  the insecure require mode.
+
   Helm template-time validation (fail function) rejects helm install/upgrade
-  before any resources are created. This is the correct layer for configuration
-  guard-rails: a Job hook would run after resources are rendered, which is too
-  late if the operator needs to correct values.
+  before any resources are created. This is the correct layer for
+  configuration guard-rails: a Job hook would run after resources are
+  rendered, which is too late if the operator needs to correct values.
 
   Additional guard: warn on global.environment unknown values to surface
   typos that could lead to unexpected behaviour in the kms/factory.py startup
@@ -19,4 +27,18 @@
 {{- /* LIC-006: warn on staging without mTLS to catch promotion mistakes */ -}}
 {{- if and (eq .Values.global.environment "staging") (not .Values.mtls.enabled) -}}
   {{- fail "LIC-006 WARNING: mtls.enabled is false in staging. This is permitted but not recommended — staging should mirror production posture. If intentional, document in your risk register." -}}
+{{- end -}}
+
+{{- /*
+  F-V232-002 (V14.4.1): when postgres.enabled=false (external PostgreSQL),
+  require postgres.tls.ca to be set so the connecting DSN can perform
+  server-certificate validation (verify-ca or verify-full).
+  An unset CA means the only available fallback is sslmode=require (CERT_NONE),
+  which disables server-cert validation and violates V14.4.1.
+  This guard fires for production and staging environments.
+*/ -}}
+{{- if and (not .Values.postgres.enabled) (or (eq .Values.global.environment "production") (eq .Values.global.environment "staging")) -}}
+  {{- if not ((.Values.postgres).tls).ca -}}
+    {{- fail "F-V232-002 SECURITY VIOLATION: postgres.enabled=false (external PostgreSQL) but postgres.tls.ca is unset. Setting postgres.tls.ca is required so the DSN can use sslmode=verify-ca or sslmode=verify-full for server-certificate validation. sslmode=require (CERT_NONE) is not accepted — see V14.4.1. Provide the CA PEM value in postgres.tls.ca, or document the risk-acceptance in your risk register." -}}
+  {{- end -}}
 {{- end -}}

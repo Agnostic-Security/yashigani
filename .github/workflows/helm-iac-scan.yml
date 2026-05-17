@@ -1,0 +1,103 @@
+# Last updated: 2026-05-17T00:00:00+01:00 (F-V232-004 / ASVS V12.5.1)
+#
+# Checkov IaC scan on Helm template output — closes F-V232-004 (ASVS V12.5.1).
+#
+# Motivation: F-V232-004 from v2.23.3 Lu audit — no IaC security scanner on
+# Helm manifests. Kyverno admission policies (YSG-RISK-008, cde404a) provide a
+# runtime gate; this CI gate adds pre-admission static lint.
+#
+# Design:
+#   1. Render the chart with `helm template` across the supported value matrix:
+#      - Default CI render (mtls.enabled=true, global.environment=ci)
+#      - External-postgres path (postgres.enabled=false, with tls.ca)
+#   2. Run Checkov against the rendered YAML output.
+#   3. Skip: known false positives are documented in .checkov.yml at repo root,
+#      each entry citing the YSG-RISK ID or architectural reason.
+#   4. Severity threshold: HIGH + CRITICAL only (achieved via the skip-check
+#      list in .checkov.yml — LOW/MEDIUM noise is excluded).
+#
+# Action pin: bridgecrewio/checkov-action (master 2026-05-17)
+# SHA: 4048c972aae68d0b983a48bb3479aab2d877b898
+# Verified: gh api repos/bridgecrewio/checkov-action/commits/master --jq .sha
+#
+# Permissions: read-only (contents: read) — no writes to repo or registry.
+
+name: Helm IaC Scan (Checkov)
+
+on:
+  push:
+    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    paths:
+      - "helm/**"
+      - ".checkov.yml"
+      - ".github/workflows/helm-iac-scan.yml"
+  pull_request:
+    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    paths:
+      - "helm/**"
+      - ".checkov.yml"
+      - ".github/workflows/helm-iac-scan.yml"
+
+concurrency:
+  group: helm-iac-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checkov-helm:
+    name: Checkov / Helm template
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Helm v3.14.0
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: v3.14.0
+
+      - name: Render Helm chart (default CI values)
+        run: |
+          helm template yashigani helm/yashigani \
+            --set global.environment=ci \
+            --set mtls.enabled=true \
+            --set admissionPolicies.enabled=false \
+            > /tmp/helm-render-default.yaml
+          echo "Rendered $(wc -l < /tmp/helm-render-default.yaml) lines"
+
+      - name: Render Helm chart (external-postgres path)
+        run: |
+          helm template yashigani helm/yashigani \
+            --set global.environment=ci \
+            --set mtls.enabled=true \
+            --set admissionPolicies.enabled=false \
+            --set postgres.enabled=false \
+            --set postgres.tls.ca=dGVzdC1jYS1wZW0= \
+            --set postgres.existingSecretName=ext-pg-secret \
+            > /tmp/helm-render-extpg.yaml
+          echo "Rendered $(wc -l < /tmp/helm-render-extpg.yaml) lines"
+
+      - name: Checkov scan — default CI render
+        # bridgecrewio/checkov-action master @ 2026-05-17
+        uses: bridgecrewio/checkov-action@4048c972aae68d0b983a48bb3479aab2d877b898
+        with:
+          file: /tmp/helm-render-default.yaml
+          config_file: .checkov.yml
+          # framework kubernetes handles K8s manifest YAML
+          framework: kubernetes
+          # quiet: only show failures (not pass list)
+          quiet: true
+          # soft_fail: false — fail the job on any non-skipped finding
+          soft_fail: false
+
+      - name: Checkov scan — external-postgres render
+        uses: bridgecrewio/checkov-action@4048c972aae68d0b983a48bb3479aab2d877b898
+        with:
+          file: /tmp/helm-render-extpg.yaml
+          config_file: .checkov.yml
+          framework: kubernetes
+          quiet: true
+          soft_fail: false

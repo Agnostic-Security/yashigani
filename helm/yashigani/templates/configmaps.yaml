@@ -1064,6 +1064,12 @@ data:
         asyncpg does not parse sslrootcert/sslcert/sslkey from the DSN query
         string — it expects an ssl.SSLContext object or the string 'require'.
         This helper pulls the params out and returns a clean DSN + context.
+
+        F-V232-002 (V14.4.1): sslmode=require (no server-cert validation)
+        is intentionally unsupported.  Only verify-ca and verify-full are
+        accepted.  Any other sslmode causes a hard failure so that
+        misconfigured DSNs are caught at startup rather than silently
+        bypassing TLS certificate validation.
         """
         parsed = urlparse(dsn)
         params = parse_qs(parsed.query, keep_blank_values=True)
@@ -1079,13 +1085,23 @@ data:
         if sslmode is None or sslmode == "disable":
             return clean_dsn, None
 
+        if sslmode not in ("verify-ca", "verify-full"):
+            raise ValueError(
+                f"F-V232-002: sslmode='{sslmode}' is not permitted. "
+                "Only verify-ca and verify-full are accepted — sslmode=require "
+                "disables server certificate validation and is a security "
+                "violation per V14.4.1. Update the DSN to use sslmode=verify-ca."
+            )
+
         ctx = ssl.create_default_context(cafile=sslrootcert)
         if sslcert and sslkey:
             ctx.load_cert_chain(certfile=sslcert, keyfile=sslkey)
-        if sslmode in ("require", "verify-ca"):
+        # verify-ca: validate cert against CA but skip hostname check
+        # (hostname is validated at the mTLS/SPIFFE layer).
+        # verify-full: validate cert AND hostname (used for external postgres).
+        if sslmode == "verify-ca":
             ctx.check_hostname = False
-            if sslmode == "require":
-                ctx.verify_mode = ssl.CERT_NONE
+        # verify-full leaves check_hostname=True (default) — nothing to patch.
         return clean_dsn, ctx
 
 
