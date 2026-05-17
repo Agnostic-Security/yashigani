@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-17T00:00:00+01:00 — fix(helm): align K8s OPA policy bundle with compose — real policies replace stubs */ -}}
+{{- /* Last updated: 2026-05-17T00:00:00+01:00 — fix(caddy): add handle /me/* block — close v2.23.4 finding Gap A — me-api-key edge routing */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -828,6 +828,14 @@ data:
         }
       }
       handle /auth/* {
+        reverse_proxy https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      handle /me/* {
         reverse_proxy https://yashigani-backoffice:8443 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-backoffice

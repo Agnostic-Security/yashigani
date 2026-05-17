@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (CA-signed certificate mode)
-# Last updated: 2026-05-09T00:00:00+00:00 (v2.23.3: add /api/v1/admin/* route — BUG-LOGIN-REDIRECT-01 / SWEEP-16)
+# Last updated: 2026-05-17T00:00:00+00:00 (v2.23.4: add handle /me/* block — close v2.23.4 finding Gap A — me-api-key edge routing)
 # Use this for enterprise / on-prem deployments with an internal CA.
 #
 # Before starting:
@@ -189,6 +189,15 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /auth/* {
+        reverse_proxy https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /me/* {
         reverse_proxy https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
