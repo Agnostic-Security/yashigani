@@ -323,3 +323,31 @@ jobs:
         # lines and security-critical functions (CWE-89 / YSG-RISK-001 controls).
         # Internal re-audit YCS-20260502-v2.23.1-CWE89-reaudit-001 follow-up #3.
         run: python3 tools/check_partition_helm_parity.py
+
+  api-docs-drift:
+    # v2.23.4: fail if committed docs/api/ markdown has drifted from the live
+    # OpenAPI schema.  Regenerates the three markdown files and checks git diff.
+    # Run on Python 3.12 only — same version as mypy gate, stable stubs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Regenerate API docs
+        run: python3 scripts/gen_api_docs.py
+
+      - name: Check for schema drift
+        run: |
+          if ! git diff --exit-code docs/api/; then
+            echo "ERROR: docs/api/ has drifted from the live OpenAPI schema."
+            echo "Run 'python3 scripts/gen_api_docs.py' locally and commit the updated files."
+            exit 1
+          fi
+          echo "OK: docs/api/ is consistent with the live schema."

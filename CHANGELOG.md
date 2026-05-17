@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-16T18:30:00+01:00 (v2.23.4: draft [Unreleased] entry covering 62 commits since v2.23.3) -->
+<!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
 <!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
 <!-- last-updated: 2026-05-11T22:00:00+01:00 (v2.23.3 GA — flip [Unreleased] block to [v2.23.3]) -->
@@ -49,6 +49,13 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 - **Email-as-username + suspended-identity reactivation flow** — local-auth
   accounts identify by email rather than free-form username; admin
   reactivation action covers the suspended-identity case.
+- **Auth-gated OpenAPI / Swagger UI** — the Backoffice now exposes
+  `GET /admin/openapi.json`, `GET /admin/api-docs` (Swagger UI), and
+  `GET /admin/api-redoc` behind `require_admin_session`. The Gateway exposes
+  `GET /openapi.json` and `GET /docs` behind identity resolution (same
+  Bearer/SSO check as `/v1/*`). Anonymous access returns 401. Swagger UI
+  assets are self-hosted from `static/swagger-ui/` (swagger-ui-dist 5.32.6)
+  to satisfy `script-src 'self'` CSP.
 
 ### Fixed
 
@@ -123,9 +130,18 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   directive parity across the compose variants. Adds a `service_identities.yaml`
   dedup check (single source of truth via symlink) and a Helm env-var parity
   check that catches the gateway-DSN-DIRECT class of regression.
+- **OpenAPI schema drift gate** (`api-docs-drift` CI job) — regenerates
+  `docs/api/*.md` from the live FastAPI schema and fails the build if the
+  committed markdown has drifted. Catches schema changes that aren't reflected
+  in the published API reference.
 
 ### Documentation
 
+- **API reference docs** (`docs/api/`) — three markdown files generated from
+  the live OpenAPI schema: `gateway-api.md` (operator/agent-facing),
+  `admin-api.md` (backoffice management plane), `auth-api.md` (shared auth
+  endpoints). `docs/api/README.md` index links all three. Files are regenerated
+  by `scripts/gen_api_docs.py` and drift-checked in CI.
 - **Architecture cleanup** — removed unimplemented bare-metal install claims
   from `Architecture.md`. Bare-metal install was design intent that never
   shipped code.

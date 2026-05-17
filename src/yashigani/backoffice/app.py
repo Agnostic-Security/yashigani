@@ -3,7 +3,7 @@ Yashigani Backoffice — FastAPI admin portal.
 Isolated on port 8443. Local auth only (username + password + TOTP).
 No data-plane access. TLS required.
 
-Last updated: 2026-05-10T00:00:00+01:00
+Last updated: 2026-05-17T00:00:00+01:00
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -414,9 +415,11 @@ def create_backoffice_app() -> FastAPI:
     app = FastAPI(
         title="Yashigani Backoffice",
         version="2.1.0",
-        docs_url=None,  # disable Swagger in production
+        # Disabled at root — schema and docs are mounted at /admin/ paths below,
+        # behind admin session auth (v2.23.4: re-enable OpenAPI behind auth).
+        docs_url=None,
         redoc_url=None,
-        openapi_url=None,  # never expose schema externally
+        openapi_url=None,
         lifespan=lifespan,
     )
 
@@ -616,6 +619,58 @@ def create_backoffice_app() -> FastAPI:
     _static_dir = pathlib.Path(__file__).parent / "static"
     if _static_dir.exists():
         app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
+    # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
+    #
+    # OpenAPI schema and Swagger/ReDoc UIs are NOT served at the root
+    # (openapi_url=None above).  Instead they live under /admin/ so they
+    # sit behind the existing admin-area authentication posture:
+    #
+    #   GET /admin/openapi.json  — raw OpenAPI 3.x JSON (admin session required)
+    #   GET /admin/api-docs      — Swagger UI (admin session required)
+    #   GET /admin/api-redoc     — ReDoc UI   (admin session required)
+    #
+    # Swagger UI JS+CSS are self-hosted from /static/swagger-ui/ (downloaded
+    # from swagger-ui-dist@5.32.6) to satisfy strict-CSP (script-src 'self').
+    # No cdn.jsdelivr.net or any third-party CDN is loaded.
+    #
+    # Auth dependency: yashigani.backoffice.middleware.require_admin_session —
+    # same session-store-validated dependency used on all /admin/* API routes.
+    # Unauthenticated requests → 401 (or 403 if wrong tier).
+    # The uniform_admin_404_as_401 middleware also masks routing 404 as 401.
+    from yashigani.backoffice.middleware import require_admin_session
+
+    @app.get(
+        "/admin/openapi.json",
+        include_in_schema=False,
+        dependencies=[Depends(require_admin_session)],
+    )
+    async def admin_openapi_schema():
+        """Serve the OpenAPI schema behind admin session auth."""
+        return JSONResponse(app.openapi())
+
+    @app.get("/admin/api-docs", include_in_schema=False)
+    async def admin_swagger_ui(
+        session=Depends(require_admin_session),  # noqa: ARG001
+    ) -> HTMLResponse:
+        """Swagger UI — served from self-hosted assets (no CDN)."""
+        return get_swagger_ui_html(
+            openapi_url="/admin/openapi.json",
+            title="Yashigani Backoffice — API Reference",
+            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+            swagger_css_url="/static/swagger-ui/swagger-ui.css",
+            swagger_favicon_url="/static/swagger-ui/favicon.png",
+        )
+
+    @app.get("/admin/api-redoc", include_in_schema=False)
+    async def admin_redoc_ui(
+        session=Depends(require_admin_session),  # noqa: ARG001
+    ) -> HTMLResponse:
+        """ReDoc UI — served from self-hosted assets (no CDN)."""
+        return get_redoc_html(
+            openapi_url="/admin/openapi.json",
+            title="Yashigani Backoffice — API Reference (ReDoc)",
+        )
 
     # Admin UI — HTML pages
     _templates_dir = pathlib.Path(__file__).parent / "templates"
