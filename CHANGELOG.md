@@ -171,6 +171,25 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   containers create anonymous volumes that survive `compose down -v`. The
   canonical uninstall volume list now includes them, plus a final
   `podman volume prune --filter dangling=true` pass.
+- **Auth — `/auth/stepup` widened to accept user sessions** — previously
+  only admin sessions could complete step-up TOTP verification. The
+  `/me/api-key` self-service customer flow at `src/yashigani/backoffice/routes/me.py:215`
+  requires `assert_fresh_stepup(session)`, but `/auth/stepup` at
+  `auth.py:837` was gated to admin sessions only — making the customer
+  feature unreachable for the user persona it was documented for.
+  `AdminSession` → `AnySession` widens the dependency to accept any
+  authenticated session while preserving every existing guard
+  (anonymous-rejection, replay-cache, per-session failure counter at 5
+  attempts, cross-tenant guard, audit-event emission). Closes a v2.23.4
+  pre-tag finding (Gap B in `finding-me-api-key-unreachable.md`).
+- **Caddy — `handle /me/*` block added to all 4 Caddyfiles** — compose
+  selfsigned/acme/ca + the helm-rendered Caddyfile fragment now route
+  `/me/*` to backoffice. Without this, `POST /me/api-key` returned HTTP
+  405 from Caddy's default response (route was implemented in backoffice
+  code but unreachable at the edge). Closes the other half of the
+  pre-tag finding (Gap A in `finding-me-api-key-unreachable.md`). Each
+  block matches its file-local `/auth/*` template — same mTLS,
+  `inject-caddy-verified` HMAC, transport snippet.
 
 ### Security
 
@@ -180,6 +199,38 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   class regardless of upstream patch availability.
 - **python3-saml manual-re-audit gates** — `xmlparser.py` entity and
   DTD-resolution paths flagged for manual re-audit at every upstream bump.
+- **Helm — `sslmode=require` fallback removed; fail-closed on misconfig**
+  — `_build_ssl_context` in the partition-maintenance ConfigMap previously
+  accepted `sslmode=require` (no server-cert validation). It now raises
+  `ValueError` on any mode other than `verify-ca` / `verify-full` so a
+  misconfigured DSN fails at startup rather than silently bypassing TLS
+  certificate validation. New `validate-security.yaml` guard fails fast
+  if `postgres.enabled=false` and `postgres.tls.ca` is unset in production
+  or staging. 9-test regression suite at
+  `tests/contracts/test_helm_sslmode.py`. Closes F-V232-002 (ASVS V14.4.1).
+- **CI — gitleaks secret-scan workflow added** — `.github/workflows/secret-scan.yml`
+  runs `gitleaks/gitleaks-action@ff98106` (v2.3.9) against PR diffs and the
+  full history on push to release branches. `.gitleaks.toml` config covers
+  AWS / Stripe / private-key / generic-API-key / Yashigani-specific
+  patterns. Historical false-positives captured in
+  `gitleaks-baseline.json` so CI only fails on **new** leaks. Closes
+  F-V232-003 (ASVS V10.3.4).
+- **CI — Checkov IaC scan on Helm template output** —
+  `.github/workflows/helm-iac-scan.yml` runs
+  `bridgecrewio/checkov-action@4048c97` against `helm template` output
+  across the default + external-postgres value matrices. Allowlist in
+  `.checkov.yml` (101 entries; each cites a YSG-RISK ID or ARCH/CLUSTER
+  classification — no uncited suppressions). Closes F-V232-004 (ASVS V12.5.1).
+- **Trivy base-CVE hygiene — `apt-get -y upgrade` in both Dockerfiles**
+  — `docker/Dockerfile.gateway` and `docker/Dockerfile.backoffice` now
+  run `apt-get -y upgrade` between `apt-get update` and `apt-get install`,
+  so image builds pull Debian trixie security-updated base packages
+  rather than only the snapshot baked into the `python:3.14.0-slim` base.
+  Closes CVE-2026-29111 (systemd) and CVE-2026-4878 (libcap2) on both
+  images. Remaining 3 CVEs (CVE-2025-69720 ncurses, CVE-2026-41989
+  libgcrypt, CVE-2026-6732 libxml2) are all NOT-EXPLOITABLE-CVA per
+  pre-existing verdicts independent of package version. Trivy rescan
+  verdict: `testing_runs/yashigani_trivy_rescan_20260517/verdict.md`.
 - **Admin/user tier separation regression test** — covered with a real
   fakeredis-backed integration test exercising the production registration
   path (not a mock).
