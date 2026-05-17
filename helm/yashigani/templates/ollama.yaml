@@ -1,3 +1,4 @@
+# last-updated: 2026-05-17T14:00:00+01:00 (feat: ollama-init Job — auto-pull default model when openWebui.enabled=true)
 {{- if .Values.ollama.enabled }}
 ---
 apiVersion: apps/v1
@@ -105,4 +106,129 @@ spec:
       port: {{ .Values.ollama.service.port }}
       targetPort: 11434
       protocol: TCP
+{{- end }}
+{{- if and .Values.ollama.enabled .Values.openWebui.enabled }}
+---
+# ollama-init Job — pulls the default LLM model so Open WebUI has a backend
+# on first deploy. Runs once per helm install/upgrade when openWebui.enabled=true.
+# Gated on openWebui.enabled — no model needed for API-only deployments.
+# Helm chart equivalent of the compose ollama-init service (profiles: openwebui).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: yashigani-ollama-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-ollama-init
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/chart-version: {{ .Chart.Version | quote }}
+    yashigani/ollama-model: {{ .Values.ollama.initJob.defaultModel | quote }}
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: yashigani-ollama-init
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-ollama
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              until </dev/tcp/yashigani-ollama/11434 2>/dev/null; do
+                echo "waiting for yashigani-ollama:11434..."; sleep 3
+              done
+              echo "ollama is reachable"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: ollama-init
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: OLLAMA_MODEL
+              value: {{ .Values.ollama.initJob.defaultModel | quote }}
+            - name: OLLAMA_MODEL_DIGEST
+              value: {{ .Values.ollama.initJob.modelDigest | quote }}
+            - name: OLLAMA_MIN_DISK_GIB
+              value: {{ .Values.ollama.initJob.minDiskGiB | quote }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "Checking disk space on ollama volume..."
+              AVAIL_KB=$(df -k /data 2>/dev/null | awk 'NR==2{print $4}')
+              REQUIRED_KB=$(( ${OLLAMA_MIN_DISK_GIB:-3} * 1024 * 1024 ))
+              if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt "$REQUIRED_KB" ]; then
+                AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+                echo "WARNING: Ollama volume has only ~${AVAIL_GB} GB free (need >=${OLLAMA_MIN_DISK_GIB:-3} GB)."
+                echo "Skipping model pull. Free space on the PVC and re-deploy."
+                exit 0
+              fi
+              echo "Disk OK. Pulling ${OLLAMA_MODEL}..."
+              OLLAMA_HOST=http://yashigani-ollama:11434 ollama pull "${OLLAMA_MODEL}"
+              EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-skip}"
+              ACTUAL_DIGEST=$(OLLAMA_HOST=http://yashigani-ollama:11434 ollama list | grep "${OLLAMA_MODEL}" | awk '{print $2}')
+              if [ -n "$EXPECTED_DIGEST" ] && [ "$EXPECTED_DIGEST" != "skip" ]; then
+                if echo "$ACTUAL_DIGEST" | grep -q "$EXPECTED_DIGEST"; then
+                  echo "Digest verified: $ACTUAL_DIGEST"
+                else
+                  echo "WARNING: Digest mismatch! Expected=$EXPECTED_DIGEST Actual=$ACTUAL_DIGEST"
+                  echo "Set ollama.initJob.modelDigest=skip to bypass (after upstream model update)."
+                  exit 1
+                fi
+              fi
+              echo "Model pull complete: ${OLLAMA_MODEL}"
+          resources:
+            {{- toYaml .Values.ollama.initJob.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: data-yashigani-ollama-0
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
 {{- end }}

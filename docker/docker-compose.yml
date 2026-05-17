@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.23.4 — Docker Compose stack
+# Last updated: 2026-05-17T12:00:00+01:00 (feat: ollama-init profiles gate + disk-space check + env var — auto-pull model only when --with-openwebui)
 # Last updated: 2026-05-16T21:00:00+01:00 (fix: YSG-RISK-008 compose hardening — read_only+tmpfs 24/27 + no-new-privileges 27/27)
 # Last updated: 2026-05-16T18:00:00+01:00 (v2.23.4: bump version 2.23.3 → 2.23.4 across install/build/helm/airgap)
 # Last updated: 2026-05-10T00:00:00+01:00 (fix: G16 image-pin + to_thread run_migrations; start_period 30s→60s)
@@ -751,23 +752,50 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
-  # Model bootstrap — pull classifier model on first start
+  # Model bootstrap — pull default LLM model when Open WebUI is enabled.
+  # Gated on `profiles: [openwebui]` — only starts when --with-openwebui is set
+  # (install.sh adds the "openwebui" profile only in that path).
+  # Model: qwen2.5:3b (1.9 GB, Qwen 2.5 3B-parameter instruct, available on
+  # registry.ollama.ai). Override via OLLAMA_MODEL env var in docker/.env.
+  # Digest check guards against supply-chain substitution (SOL-SC-03).
   ollama-init:
     dns_search: ["."]
     image: docker.io/ollama/ollama:0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
     # gate V232-SMOKE-018 — same rationale as `ollama` service above.
     user: "0:0"
     restart: on-failure:3
+    # mem_limit: 256m is sufficient — the init container is a thin CLI client;
+    # it sends an HTTP pull request to ollama:11434 and streams the model there.
+    # The 1.9 GB model data is written to the ollama volume, not into this container.
     mem_limit: ${YASHIGANI_OLLAMA_INIT_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_OLLAMA_INIT_CPU_LIMIT:-0.25}
+    environment:
+      # OLLAMA_MODEL: set by install.sh to qwen2.5:3b when --with-openwebui is
+      # selected. Operators may override in docker/.env.
+      # OLLAMA_MODEL_DIGEST: short SHA for supply-chain digest verification.
+      # Set to "skip" to bypass (e.g. after an upstream model update).
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      OLLAMA_MODEL_DIGEST: ${OLLAMA_MODEL_DIGEST:-357c53fb659c}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         until </dev/tcp/ollama/11434 2>/dev/null; do
           echo "waiting for ollama..."; sleep 3
         done
-        echo "ollama is ready, pulling model..."
-        OLLAMA_HOST=http://ollama:11434 ollama pull ${OLLAMA_MODEL:-qwen2.5:3b}
+        echo "ollama is ready, checking disk space..."
+        # Disk-space pre-check: require ≥3 GB free on the ollama data volume.
+        # The model (qwen2.5:3b) is 1.9 GB; 3 GB leaves headroom for staging.
+        # Uses df on /data (the ollama volume mount) in 1K blocks.
+        AVAIL_KB=$(df -k /data 2>/dev/null | awk 'NR==2{print $4}')
+        REQUIRED_KB=3145728  # 3 GB in KB
+        if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt "$REQUIRED_KB" ]; then
+          AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+          echo "WARNING: Ollama volume has only ~${AVAIL_GB} GB free (need ≥3 GB for model pull)."
+          echo "Skipping model pull to avoid failed install. Free space on the docker volume and re-run install.sh --with-openwebui."
+          exit 0
+        fi
+        echo "Disk space OK (${AVAIL_KB} KB free). Pulling model..."
+        OLLAMA_HOST=http://ollama:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
         # Verify model digest — detect tampered/poisoned models (SOL-SC-03)
         EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-357c53fb659c}"
         ACTUAL_DIGEST=$(OLLAMA_HOST=http://ollama:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $2}')
@@ -780,6 +808,7 @@ services:
             exit 1
           fi
         fi
+        echo "Model pull complete: ${OLLAMA_MODEL:-qwen2.5:3b}"
     depends_on:
       ollama:
         condition: service_healthy
@@ -791,13 +820,20 @@ services:
     # YSG-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true
-    # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (init job).
+    # V232-CSCAN-01k-RES-01: defence-in-depth — Helm counterpart is the
+    # ollama-init Job in helm/yashigani/templates/ollama.yaml (gated on
+    # openWebui.enabled).
     # No cap_add: no privileged-port binding.
     cap_drop: [ALL]
     # EX-231-10: ollama-init needs data (ollama DNS) + edge (model pull).
     networks:
       - data
       - edge    # Required for model registry DNS resolution
+    # Only start when Open WebUI profile is active (--with-openwebui).
+    # Without a model loaded, Open WebUI has no backends to list and the
+    # chat surface shows "no models available".
+    profiles:
+      - openwebui
 
   # ---------------------------------------------------------------------------
   # Prometheus — metrics collection

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-17T14:00:00+00:00 (feat(install): write OLLAMA_MODEL to .env when --with-openwebui; ollama-init gated on openwebui profile)
 # last-updated: 2026-05-17T00:00:00+00:00 (feat(install): use-case wizard — [Y/n] Open WebUI question in interactive mode; --with-openwebui unchanged for non-interactive)
 # last-updated: 2026-05-15T12:00:00+00:00 (fix(install): detect contaminated volumes + verify healthz on convergence — BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
 # last-updated: 2026-05-15T00:00:00+00:00 (fix(install): move linger-enable to pre-flight, drop privileged-linger shortcut from install body — Q2 / lint-sudo-pattern fix)
@@ -7007,6 +7008,25 @@ main() {
         log_success "Open WebUI selected"
       else
         log_info "Open WebUI skipped — API/agent-only deployment"
+      fi
+    fi
+
+    # Step 8b-ii: Write OLLAMA_MODEL to .env when Open WebUI is enabled.
+    # ollama-init (compose) and the ollama-init Job (helm) both read OLLAMA_MODEL
+    # to decide which model to pull. install.sh sets it here so operators get
+    # a working default (qwen2.5:3b, 1.9 GB) without manual .env editing.
+    # Value is written only when INSTALL_OPENWEBUI=true; on API-only installs the
+    # ollama-init service is gated by profiles: [openwebui] and never starts,
+    # so the var is irrelevant there.
+    if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
+      local _env_file="${WORK_DIR}/docker/.env"
+      local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-qwen2.5:3b}"
+      # Preserve any operator-supplied OLLAMA_MODEL — only write if absent.
+      if ! grep -q "^OLLAMA_MODEL=" "$_env_file" 2>/dev/null; then
+        echo "OLLAMA_MODEL=${_ollama_model}" >> "$_env_file"
+        log_info "Ollama default model set: ${_ollama_model} (1.9 GB — will pull on first start)"
+      else
+        log_info "Ollama model already set in .env — preserving operator value"
       fi
     fi
 

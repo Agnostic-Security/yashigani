@@ -507,6 +507,27 @@ ollama:
     # Verified 2026-05-03 — no root required.
     home: "/data"
     ollamaModels: "/data/models"
+  # initJob — one-shot Kubernetes Job to pull the default model on first deploy.
+  # Activated only when openWebui.enabled=true (no model needed for API-only).
+  # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
+  #   chat surface shows it as an available backend.
+  # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
+  #   Set to "skip" after an upstream model update that changes the digest.
+  # minDiskGiB: minimum free gigabytes required on the ollama volume before pull.
+  #   If free space < minDiskGiB the Job logs a warning and exits 0 (warn-only).
+  initJob:
+    # defaultModel: qwen2.5:3b — 1.9 GB, Qwen 2.5 3B-parameter instruct model.
+    # Good balance of size and capability for a single-node deployment.
+    defaultModel: "qwen2.5:3b"
+    modelDigest: "357c53fb659c"
+    minDiskGiB: 3
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
 
 # ---------------------------------------------------------------------------
 # Prometheus — metrics collection
