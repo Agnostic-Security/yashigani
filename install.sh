@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-17T17:00:00+00:00 (feat(install): per-install YASHIGANI_INTERNAL_BEARER token generation — close Captain Bucket-C finding)
 # last-updated: 2026-05-17T09:00:00+01:00 (fix(pki): host-side bootstrap_token_sha256 update in _pki_run_issuer_podman_macos — compose-path SHA mismatch fix)
 # last-updated: 2026-05-17T14:00:00+00:00 (feat(install): write OLLAMA_MODEL to .env when --with-openwebui; ollama-init gated on openwebui profile)
 # last-updated: 2026-05-17T00:00:00+00:00 (feat(install): use-case wizard — [Y/n] Open WebUI question in interactive mode; --with-openwebui unchanged for non-interactive)
@@ -1256,6 +1257,24 @@ check_installer_preflight() {
       printf "============================================================\n"
       printf "\n"
       sleep 3
+    fi
+  fi
+
+  # --- Check 1d: stale YASHIGANI_INTERNAL_BEARER env-var -------------------
+  # If the env-var is set in the calling shell but the secret file is absent or
+  # empty, the operator is running in a stale environment from a prior install.
+  # The containers will NOT pick up the generated secret and internal routing
+  # will break silently. Exit early with a clear remediation message.
+  if [[ -n "${YASHIGANI_INTERNAL_BEARER:-}" ]]; then
+    local _bearer_file="${WORK_DIR}/docker/secrets/yashigani_internal_bearer"
+    if [[ ! -s "$_bearer_file" ]]; then
+      printf "\nPre-flight failed: stale YASHIGANI_INTERNAL_BEARER env-var detected.\n\n"
+      printf "  The env-var is set in your shell but docker/secrets/yashigani_internal_bearer\n"
+      printf "  is absent or empty. This indicates a stale environment from a prior install.\n\n"
+      printf "  Remediation: rerun in a fresh shell or:\n"
+      printf "      unset YASHIGANI_INTERNAL_BEARER\n\n"
+      printf "  Then re-run this installer.\n\n"
+      exit 1
     fi
   fi
 
@@ -5083,6 +5102,29 @@ generate_secrets() {
       echo "CADDY_INTERNAL_HMAC=${_hmac_val}" >> "$env_file"
     fi
 
+    # Bucket-C finding (Captain gitleaks baseline 2026-05-17): per-install
+    # YASHIGANI_INTERNAL_BEARER — generate if absent on upgrade path.
+    local _bearer_file_up="${secrets_dir}/yashigani_internal_bearer"
+    if [[ ! -s "$_bearer_file_up" ]]; then
+      local _bearer_up
+      _bearer_up="$(_gen_password)"
+      printf "%s" "$_bearer_up" > "$_bearer_file_up"
+      chmod 0600 "$_bearer_file_up"
+      log_info "Generated yashigani_internal_bearer → ${_bearer_file_up} (mode 0600, upgrade path)"
+    else
+      log_info "yashigani_internal_bearer already present — preserving (upgrade path)"
+    fi
+    # Always sync into .env so Compose can interpolate YASHIGANI_INTERNAL_BEARER.
+    local _bearer_val_up
+    _bearer_val_up="$(cat "$_bearer_file_up")"
+    if grep -q "^YASHIGANI_INTERNAL_BEARER=" "$env_file" 2>/dev/null; then
+      local tmp_env; tmp_env="$(mktemp)"
+      sed "s|^YASHIGANI_INTERNAL_BEARER=.*|YASHIGANI_INTERNAL_BEARER=${_bearer_val_up}|" "$env_file" > "$tmp_env"
+      mv "$tmp_env" "$env_file"
+    else
+      echo "YASHIGANI_INTERNAL_BEARER=${_bearer_val_up}" >> "$env_file"
+    fi
+
     # #2-fix: sync installer version into .env on upgrade path (same as fresh install).
     if grep -q "^YASHIGANI_VERSION=" "$env_file" 2>/dev/null; then
       local tmp_env; tmp_env="$(mktemp)"
@@ -5270,6 +5312,35 @@ generate_secrets() {
     mv "$tmp_env" "$env_file"
   else
     echo "CADDY_INTERNAL_HMAC=${_hmac_val}" >> "$env_file"
+  fi
+
+  # --- Bucket-C: per-install YASHIGANI_INTERNAL_BEARER ---------------------
+  # Replaces the hardcoded "yashigani-internal" literal that was baked into
+  # public source (Captain gitleaks baseline finding 2026-05-17).
+  # Token uses _gen_password() — 36 chars, A-Za-z0-9!*,-._~ with category
+  # guarantees — per feedback_password_charset.md.
+  # Mode 0600: only the install user can read it; Captain wires it into
+  # docker-compose.yml as a Docker/Podman secret (Captain's scope).
+  # Idempotent: file already exists with non-empty content → preserve.
+  local _bearer_file="${secrets_dir}/yashigani_internal_bearer"
+  if [[ ! -s "$_bearer_file" ]]; then
+    local _bearer_token
+    _bearer_token="$(_gen_password)"
+    printf "%s" "$_bearer_token" > "$_bearer_file"
+    chmod 0600 "$_bearer_file"
+    log_info "Generated yashigani_internal_bearer → ${_bearer_file} (mode 0600)"
+  else
+    log_info "yashigani_internal_bearer already present — preserving (use --remove-volumes to rotate)"
+    local _bearer_token
+    _bearer_token="$(cat "$_bearer_file")"
+  fi
+  # Sync YASHIGANI_INTERNAL_BEARER into .env for Compose interpolation.
+  if grep -q "^YASHIGANI_INTERNAL_BEARER=" "$env_file" 2>/dev/null; then
+    local tmp_env; tmp_env="$(mktemp)"
+    sed "s|^YASHIGANI_INTERNAL_BEARER=.*|YASHIGANI_INTERNAL_BEARER=${_bearer_token}|" "$env_file" > "$tmp_env"
+    mv "$tmp_env" "$env_file"
+  else
+    echo "YASHIGANI_INTERNAL_BEARER=${_bearer_token}" >> "$env_file"
   fi
 
   # --- HIBP breach check on generated passwords (defense-in-depth) ---
@@ -5491,6 +5562,18 @@ print_completion_summary() {
     printf "  ${C_YELLOW}║${C_RESET}    Indexer:      admin / %-34s ${C_YELLOW}║${C_RESET}\n" "${GEN_WAZUH_INDEXER_PASSWORD}"
     printf "  ${C_YELLOW}║${C_RESET}    API:          wazuh-wui / %-30s ${C_YELLOW}║${C_RESET}\n" "${GEN_WAZUH_API_PASSWORD}"
     printf "  ${C_YELLOW}║${C_RESET}    Dashboard:    kibanaserver / %-28s ${C_YELLOW}║${C_RESET}\n" "${GEN_WAZUH_DASHBOARD_PASSWORD}"
+    printf "  ${C_YELLOW}║${C_RESET}                                                                ${C_YELLOW}║${C_RESET}\n"
+  fi
+  # --- YASHIGANI_INTERNAL_BEARER audit line (masked — operator sanity check) ---
+  local _ibearer_file="${WORK_DIR}/docker/secrets/yashigani_internal_bearer"
+  if [[ -s "$_ibearer_file" ]]; then
+    local _ibearer_full
+    _ibearer_full="$(cat "$_ibearer_file")"
+    local _ibearer_len="${#_ibearer_full}"
+    local _ibearer_preview="${_ibearer_full:0:4}...${_ibearer_full: -4} (${_ibearer_len} chars)"
+    printf "  ${C_YELLOW}║${C_RESET}  ${C_BOLD}Internal Bearer token:${C_RESET}                                        ${C_YELLOW}║${C_RESET}\n"
+    printf "  ${C_YELLOW}║${C_RESET}    %-60s ${C_YELLOW}║${C_RESET}\n" "${_ibearer_preview}"
+    printf "  ${C_YELLOW}║${C_RESET}    (first 4 + last 4 chars shown — full token in docker/secrets/)   ${C_YELLOW}║${C_RESET}\n"
     printf "  ${C_YELLOW}║${C_RESET}                                                                ${C_YELLOW}║${C_RESET}\n"
   fi
   printf "  ${C_YELLOW}╚══════════════════════════════════════════════════════════════════╝${C_RESET}\n"

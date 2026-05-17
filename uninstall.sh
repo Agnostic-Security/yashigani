@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-17T17:00:00+00:00 (fix(uninstall): document yashigani_internal_bearer in secrets-wipe comment — Bucket-C)
 # Last updated: 2026-05-17T10:00:00+00:00 (fix(uninstall): add wazuh-compose volumes to canonical list + prune dangling anon volumes — ANON-VOL-LEAK)
 # Last updated: 2026-05-15T14:00:00+00:00 (fix(uninstall): wipe docker/secrets/ on --remove-volumes + final straggler pass — BUG-3-MULTI-USER-INSTALL-PKI + BUG-1-REDIS-STRAGGLER)
 # Last updated: 2026-05-15T12:00:00+00:00 (fix(uninstall): force-remove dependent containers before volume rm — BUG-UNINSTALL-DEPGRAPH-LEAK)
@@ -475,6 +476,15 @@ fi
 # user (e.g. root vs tom) fails because the new installer cannot overwrite
 # files it does not own. `sudo rm -rf` is required because cross-user ownership
 # is precisely why the bug exists.
+#
+# Wiped files include (non-exhaustive):
+#   - PKI keys + certs (ca_root.key, ca_intermediate.key, *_client.key, etc.)
+#   - admin1_password, admin2_password, admin_initial_password
+#   - postgres_password, redis_password, grafana_admin_password
+#   - caddy_internal_hmac
+#   - yashigani_internal_bearer  (Bucket-C: per-install internal Bearer token;
+#       rotated on fresh install after --remove-volumes — Captain gitleaks 2026-05-17)
+#   - bootstrap tokens + all other docker/secrets/* files
 #
 # Safety guards:
 #   1. Only runs when --remove-volumes is set.
