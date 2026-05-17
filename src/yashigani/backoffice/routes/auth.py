@@ -331,7 +331,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
             account_tier="totp_provisioning",
             client_ip=client_ip,
         )
-        state.audit_writer.write(_make_login_event(body.username, "totp_provision_restricted", None))
+        state.audit_writer.write(_make_login_event(body.username, "totp_provision_restricted", None, account_tier=record.account_tier))
         _log.info(
             "TOTP provisioning session issued for %s (force_totp_provision=True). "
             "Full admin access blocked until TOTP is provisioned.",
@@ -387,7 +387,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         client_ip=client_ip,
     )
 
-    state.audit_writer.write(_make_login_event(body.username, "success", None))
+    state.audit_writer.write(_make_login_event(body.username, "success", None, account_tier=record.account_tier))
 
     _set_session_cookie(response, session.token, record.account_tier)
     return {
@@ -411,7 +411,7 @@ async def logout(
     # self_reset) are audited; logout was the only gap (yashigani-retro#95).
     state = backoffice_state
     if state.audit_writer is not None:
-        state.audit_writer.write(_make_login_event(session.account_id, "logout", None))
+        state.audit_writer.write(_make_login_event(session.account_id, "logout", None, account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -489,7 +489,7 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
     # Invalidate all sessions
     state.session_store.invalidate_all_for_account(record.account_id)
 
-    state.audit_writer.write(_make_login_event(body.username, "self_reset", None))
+    state.audit_writer.write(_make_login_event(body.username, "self_reset", None, account_tier=record.account_tier))
     # ACS gap #95 (auth_log): SESSIONS_INVALIDATED event for session lifecycle audit.
     state.audit_writer.write(
         _make_sessions_invalidated_event(
@@ -1094,22 +1094,36 @@ async def _get_record_by_id(account_id: str):
     return await state.auth_service.get_account_by_id(account_id)
 
 
-def _make_login_event(username: str, outcome: str, reason):
+def _make_login_event(username: str, outcome: str, reason, account_tier: str = "admin"):
+    """ASVS V7.3.4: account_tier reflects the actual session/record tier.
+
+    Safe default "admin" is intentional for the pre-auth failure call site at
+    login() line ~299 where authenticate() returned (False, None, reason) and
+    no record is available.  All post-auth call sites MUST pass
+    record.account_tier or session.account_tier explicitly.
+    """
     from yashigani.audit.schema import AdminLoginEvent
 
     return AdminLoginEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         outcome=outcome,
         failure_reason=reason,
     )
 
 
-def _make_config_event(username: str, setting: str, prev: str, new: str):
+def _make_config_event(username: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    """ASVS V7.3.4: account_tier reflects the actual session tier, not a hardcoded value.
+
+    This helper is currently unused (callers construct ConfigChangedEvent directly),
+    but the parameter is wired for defence-in-depth: if RBAC gates break, an audit
+    record constructed via this helper will still record the actual tier.
+    Safe default "admin" matches the admin-only routes that would use this helper.
+    """
     from yashigani.audit.schema import ConfigChangedEvent
 
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         setting=setting,
         previous_value=prev,
