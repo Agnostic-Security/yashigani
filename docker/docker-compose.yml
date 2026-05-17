@@ -489,6 +489,23 @@ services:
       # UI settings
       DEFAULT_MODELS: "qwen2.5:3b"
       WEBUI_NAME: "Yashigani AI — Powered by Open WebUI"
+      # BUG-3 (v2.23.4): Route RAG embeddings through Ollama to eliminate the
+      # HuggingFace SentenceTransformer dependency.  HF_HUB_OFFLINE=1 makes
+      # SentenceTransformer fail fast (LocalEntryNotFoundError) rather than
+      # timing out against huggingface.co, but the error still fires on every
+      # retrieval call.  Routing through Ollama (already available on the data
+      # network) removes the dependency entirely.
+      RAG_EMBEDDING_ENGINE: "ollama"
+      RAG_OLLAMA_BASE_URL: "http://ollama:11434"
+      # HuggingFace/external model offline flags — prevent startup download
+      # attempts that time out against NetworkPolicy-blocked hosts.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "1"
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      SENTENCE_TRANSFORMERS_HOME: "/app/backend/data/cache/embedding/models"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

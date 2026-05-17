@@ -1,5 +1,5 @@
 {{- /*
-  Last updated: 2026-05-01T23:34:00+01:00
+  Last updated: 2026-05-17T00:00:00+00:00
   v2.23.1 task #94 — startupProbe + tightened liveness/readiness so
   helm install --wait does not stall on slow first-boot of upstream image.
   v2.23.1 GA fix — initContainer chowns upstream image static/ dir so the
@@ -167,6 +167,16 @@ spec:
               value: "false"
             - name: SENTENCE_TRANSFORMERS_HOME
               value: "/app/backend/data/cache/embedding/models"
+            # BUG-3 (v2.23.4): Route RAG embeddings through Ollama instead of
+            # SentenceTransformers/HuggingFace.  With HF_HUB_OFFLINE=1 and no
+            # cached model, every retrieval call logs LocalEntryNotFoundError.
+            # Setting RAG_EMBEDDING_ENGINE=ollama delegates embedding calls to
+            # the local Ollama instance (already reachable via the data network)
+            # and eliminates the HuggingFace dependency entirely.
+            - name: RAG_EMBEDDING_ENGINE
+              value: "ollama"
+            - name: RAG_OLLAMA_BASE_URL
+              value: {{ .Values.gateway.env.ollamaUrl | quote }}
           # Retro #3ag (v2.23.1 task #94) — startupProbe gates liveness/readiness
           # so cold-boot of the upstream open-webui image (SvelteKit + Python +
           # LangChain stack, regularly 90-180s on Docker Desktop) does not get
