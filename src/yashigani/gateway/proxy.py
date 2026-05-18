@@ -40,6 +40,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from yashigani.auth.spiffe import require_spiffe_id
 from yashigani.pki.client import internal_httpx_client
+from yashigani.audit.schema import PIIDetectedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -615,16 +616,15 @@ async def _proxy_request_body(
                 )
                 if audit_writer is not None:
                     try:
-                        audit_writer(
-                            "PII_DETECTED",
-                            {
-                                "request_id": request_id,
-                                "direction": "request",
-                                "pii_types": pii_types,
-                                "action_taken": _req_pii_result.action_taken,
-                                "destination": "upstream",
-                                "finding_count": len(_req_pii_result.findings),
-                            },
+                        audit_writer.write(
+                            PIIDetectedEvent(
+                                request_id=request_id,
+                                direction="request",
+                                pii_types=pii_types,
+                                action_taken=_req_pii_result.action_taken,
+                                destination="upstream",
+                                finding_count=len(_req_pii_result.findings),
+                            )
                         )
                     except Exception as _exc:
                         logger.warning("PII audit write failed (request_id=%s): %s", request_id, _exc)
@@ -750,16 +750,15 @@ async def _proxy_request_body(
                 )
                 if audit_writer is not None:
                     try:
-                        audit_writer(
-                            "PII_DETECTED",
-                            {
-                                "request_id": request_id,
-                                "direction": "response",
-                                "pii_types": pii_resp_types,
-                                "action_taken": _resp_pii_result.action_taken,
-                                "destination": "upstream",
-                                "finding_count": len(_resp_pii_result.findings),
-                            },
+                        audit_writer.write(
+                            PIIDetectedEvent(
+                                request_id=request_id,
+                                direction="response",
+                                pii_types=pii_resp_types,
+                                action_taken=_resp_pii_result.action_taken,
+                                destination="upstream",
+                                finding_count=len(_resp_pii_result.findings),
+                            )
                         )
                     except Exception as _exc:
                         logger.warning("PII audit write failed (request_id=%s): %s", request_id, _exc)

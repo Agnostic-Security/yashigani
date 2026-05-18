@@ -129,8 +129,13 @@ class TestOpaResponseCheckExceptionFailClosed:
 
     @pytest.mark.asyncio
     async def test_p1_timeout_calls_audit_writer_once(self):
-        """T4: OPA timeout → audit_writer called exactly once with exception event."""
+        """T4: OPA timeout → audit_writer.write() called once with OpaResponseCheckFailedEvent.
+
+        Updated for Iris FINDING-004: AuditLogWriter has no __call__; callers must
+        use .write(AuditEvent).  Assert .write() is called, not audit_writer().
+        """
         import httpx
+        from yashigani.audit.schema import OpaResponseCheckFailedEvent
         from yashigani.gateway import openai_router as _mod
         _reset_router_state()
         _mod._state.opa_url = "https://policy:8181"
@@ -149,18 +154,21 @@ class TestOpaResponseCheckExceptionFailClosed:
                 pii_detected=False,
             )
 
-        mock_audit.assert_called_once()
-        call_args = mock_audit.call_args
-        assert call_args[0][0] == "OPA_RESPONSE_CHECK_FAILED"
-        payload = call_args[0][1]
-        assert payload["outcome"] == "exception"
-        assert payload["action"] == "denied_fail_closed"
+        mock_audit.write.assert_called_once()
+        written_event = mock_audit.write.call_args[0][0]
+        assert isinstance(written_event, OpaResponseCheckFailedEvent)
+        assert written_event.outcome == "exception"
+        assert written_event.action == "denied_fail_closed"
         _mod._state.audit_writer = None
 
     @pytest.mark.asyncio
     async def test_p1_connection_refused_calls_audit_writer_once(self):
-        """T5: OPA connection refused → audit_writer called exactly once."""
+        """T5: OPA connection refused → audit_writer.write() called once.
+
+        Updated for Iris FINDING-004: assert .write() not audit_writer().
+        """
         import httpx
+        from yashigani.audit.schema import OpaResponseCheckFailedEvent
         from yashigani.gateway import openai_router as _mod
         _reset_router_state()
         _mod._state.opa_url = "https://policy:8181"
@@ -179,7 +187,9 @@ class TestOpaResponseCheckExceptionFailClosed:
                 pii_detected=False,
             )
 
-        mock_audit.assert_called_once()
+        mock_audit.write.assert_called_once()
+        written_event = mock_audit.write.call_args[0][0]
+        assert isinstance(written_event, OpaResponseCheckFailedEvent)
         _mod._state.audit_writer = None
 
     @pytest.mark.asyncio

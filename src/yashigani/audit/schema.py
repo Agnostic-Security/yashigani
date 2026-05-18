@@ -160,6 +160,15 @@ class EventType(str, Enum):
     # unreachable, errors, or not configured.  Request is DENIED (fail-closed).
     # Alert on sustained rate — an OPA outage causes response-delivery denials.
     OPA_RESPONSE_CHECK_FAILED = "OPA_RESPONSE_CHECK_FAILED"
+    # v2.23.4 — PII detection events (ASVS V7.3.4 / Iris FINDING-004)
+    # PII_DETECTED: emitted when the PII detector finds sensitive data in a
+    # request or response body.  Raw PII values are NEVER logged — only
+    # pii_type labels and a count.
+    PII_DETECTED = "PII_DETECTED"
+    # v2.23.4 — Streaming stream-termination event (Iris FINDING-004)
+    # STREAM_TERMINATED: emitted when a streaming response is terminated
+    # early by the StreamingInspector due to sensitive content detection.
+    STREAM_TERMINATED = "STREAM_TERMINATED"
 
 
 # ---------------------------------------------------------------------------
@@ -1361,3 +1370,96 @@ class IdentityReactivatedEvent(AuditEvent):
     target_username: str = ""           # user being reactivated
     target_identity_id: str = ""        # identity_id being reactivated
     reason: str = ""                    # optional reason supplied in request body
+
+
+# ---------------------------------------------------------------------------
+# v2.23.4 — OPA response-check fail-closed event (Iris FINDING-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OpaResponseCheckFailedEvent(AuditEvent):
+    """Written when the OPA response-check is unreachable, errors, or
+    not configured and the gateway denies the response (fail-closed).
+
+    Alert on sustained rate — OPA outage = sustained response-delivery
+    denials.  ASVS V8.* + V14.5.* / v2.23.4 Iris FINDING-004.
+
+    Security invariants:
+      - No response body or user content is stored here.
+      - exc_str is truncated to 256 chars to prevent log bloat.
+      - masking_applied is always True.
+    """
+
+    event_type: str = EventType.OPA_RESPONSE_CHECK_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""          # "opa_not_configured" | "opa_exception"
+    outcome: str = ""         # "not_configured" | "exception"
+    exc_class: str = ""       # exception class name (empty for not_configured)
+    exc_str: str = ""         # str(exc)[:256] (empty for not_configured)
+    identity_id: str = ""
+    response_sensitivity: str = ""
+    action: str = "denied_fail_closed"
+
+
+# ---------------------------------------------------------------------------
+# v2.23.4 — PII detection event (Iris FINDING-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PIIDetectedEvent(AuditEvent):
+    """Written when the PII detector identifies sensitive data in a
+    gateway request or response body.
+
+    Security invariants (immutable floors):
+      - Raw PII values are NEVER stored — only pii_type labels and counts.
+      - masking_applied is always True.
+      - direction is "request" or "response".
+      - destination is "local" (Ollama) or "cloud" (remote LLM API).
+
+    ASVS V7.3.4 / v2.23.4 Iris FINDING-004.
+    """
+
+    event_type: str = EventType.PII_DETECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True   # immutable floor — PII labels are still sensitive
+    request_id: str = ""
+    direction: str = ""            # "request" | "response"
+    pii_types: list = None         # type: ignore[assignment]
+    action_taken: str = ""         # "logged" | "redacted" | "blocked"
+    destination: str = ""          # "local" | "cloud" | "upstream"
+    finding_count: int = 0
+
+    def __post_init__(self):
+        if self.pii_types is None:
+            self.pii_types = []
+
+
+# ---------------------------------------------------------------------------
+# v2.23.4 — Stream termination event (Iris FINDING-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StreamTerminatedEvent(AuditEvent):
+    """Written when a streaming response is terminated early by the
+    StreamingInspector due to sensitive content detection.
+
+    Security invariants:
+      - accumulated_chars is a character count only — no content is stored.
+      - masking_applied is always True.
+      - trigger format: "<layer>:<level>" e.g. "regex:CONFIDENTIAL".
+
+    ASVS V7.3.4 / v2.23.4 Iris FINDING-004.
+    """
+
+    event_type: str = EventType.STREAM_TERMINATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    trigger: str = ""          # e.g. "regex:CONFIDENTIAL" | "fasttext:RESTRICTED"
+    request_id: str = ""
+    session_id: str = ""
+    agent_id: str = ""
+    accumulated_chars: int = 0

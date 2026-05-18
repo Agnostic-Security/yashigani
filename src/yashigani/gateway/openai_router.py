@@ -68,6 +68,12 @@ from pydantic import BaseModel, Field
 
 from yashigani.pki.client import internal_httpx_client
 from yashigani.metrics.registry import _C as _metric_counter
+from yashigani.audit.schema import (
+    OpaResponseCheckFailedEvent,
+    PIIDetectedEvent,
+    ResponseInjectionDetectedEvent,
+    StreamTerminatedEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +342,40 @@ def configure(
     )
 
 
+# ── Audit adapters ──────────────────────────────────────────────────────
+
+
+def _make_streaming_audit_adapter(audit_writer):
+    """Return a Callable[[str, dict], None] that bridges the
+    StreamingInspector ``on_audit(name, data)`` convention to
+    ``AuditLogWriter.write(AuditEvent)``.
+
+    Returns None when audit_writer is None (StreamingInspector treats None
+    as a no-op).
+
+    Iris FINDING-004: AuditLogWriter has no __call__; callers must use .write().
+    """
+    if audit_writer is None:
+        return None
+
+    def _adapter(name: str, data: dict) -> None:
+        if name == "STREAM_TERMINATED":
+            audit_writer.write(
+                StreamTerminatedEvent(
+                    trigger=data.get("trigger", ""),
+                    request_id=data.get("request_id", ""),
+                    session_id=data.get("session_id", ""),
+                    agent_id=data.get("agent_id", ""),
+                    accumulated_chars=int(data.get("accumulated_chars", 0)),
+                )
+            )
+        # Unknown event names are silently dropped — the adapter is
+        # intentionally narrow.  New streaming event types should get their
+        # own EventType + dataclass and a branch here.
+
+    return _adapter
+
+
 # ── PII helpers ─────────────────────────────────────────────────────────
 
 
@@ -345,16 +385,15 @@ def _pii_audit(request_id: str, direction: str, pii_result, action: str, destina
         return
     try:
         pii_types = [f.pii_type.value for f in pii_result.findings]
-        _state.audit_writer(
-            "PII_DETECTED",
-            {
-                "request_id": request_id,
-                "direction": direction,       # "request" | "response"
-                "pii_types": pii_types,
-                "action_taken": action,
-                "destination": destination,   # "local" | "cloud"
-                "finding_count": len(pii_result.findings),
-            },
+        _state.audit_writer.write(
+            PIIDetectedEvent(
+                request_id=request_id,
+                direction=direction,
+                pii_types=pii_types,
+                action_taken=action,
+                destination=destination,
+                finding_count=len(pii_result.findings),
+            )
         )
     except Exception as exc:
         logger.warning("PII audit write failed (request_id=%s): %s", request_id, exc)
@@ -707,7 +746,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 request_id=request_id,
                 session_id=stream_session_id,
                 agent_id=stream_agent_id,
-                on_audit=_state.audit_writer if _state.audit_writer else None,
+                on_audit=_make_streaming_audit_adapter(_state.audit_writer),
             )
 
             # Token accounting — called once after stream end
@@ -1018,9 +1057,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 # Write audit event for the block
                 if _state.audit_writer:
                     try:
-                        _state.audit_writer(
-                            "RESPONSE_INJECTION_DETECTED",
-                            resp_result.audit_fields,
+                        _af = resp_result.audit_fields
+                        _state.audit_writer.write(
+                            ResponseInjectionDetectedEvent(
+                                verdict=_af.get("verdict", ""),
+                                request_id=_af.get("request_id", ""),
+                                session_id=_af.get("session_id", ""),
+                                agent_id=_af.get("agent_id", ""),
+                                confidence_score=float(_af.get("confidence_score", 0.0)),
+                                action_taken=_af.get("action_taken", ""),
+                                content_type=_af.get("content_type", ""),
+                                response_content_hash=_af.get("response_content_hash", ""),
+                                fasttext_only_mode=bool(_af.get("fasttext_only_mode", False)),
+                            )
                         )
                     except Exception as _exc:
                         logger.warning("Audit write failed for response block: %s", _exc)
@@ -1507,15 +1556,14 @@ async def _opa_response_check(
         ).inc()
         if _state.audit_writer:
             try:
-                _state.audit_writer(
-                    "OPA_RESPONSE_CHECK_FAILED",
-                    {
-                        "reason": "opa_not_configured",
-                        "outcome": "not_configured",
-                        "identity_id": identity.get("identity_id", "unknown") if identity else "anonymous",
-                        "response_sensitivity": response_sensitivity,
-                        "action": "denied_fail_closed",
-                    },
+                _state.audit_writer.write(
+                    OpaResponseCheckFailedEvent(
+                        reason="opa_not_configured",
+                        outcome="not_configured",
+                        identity_id=identity.get("identity_id", "unknown") if identity else "anonymous",
+                        response_sensitivity=str(response_sensitivity),
+                        action="denied_fail_closed",
+                    )
                 )
             except Exception as _aw_exc:
                 logger.warning("Audit write failed for OPA not-configured event: %s", _aw_exc)
@@ -1564,17 +1612,16 @@ async def _opa_response_check(
         ).inc()
         if _state.audit_writer:
             try:
-                _state.audit_writer(
-                    "OPA_RESPONSE_CHECK_FAILED",
-                    {
-                        "reason": "opa_exception",
-                        "outcome": "exception",
-                        "exc_class": exc_class,
-                        "exc_str": str(exc)[:256],
-                        "identity_id": identity.get("identity_id", "unknown") if identity else "anonymous",
-                        "response_sensitivity": response_sensitivity,
-                        "action": "denied_fail_closed",
-                    },
+                _state.audit_writer.write(
+                    OpaResponseCheckFailedEvent(
+                        reason="opa_exception",
+                        outcome="exception",
+                        exc_class=exc_class,
+                        exc_str=str(exc)[:256],
+                        identity_id=identity.get("identity_id", "unknown") if identity else "anonymous",
+                        response_sensitivity=str(response_sensitivity),
+                        action="denied_fail_closed",
+                    )
                 )
             except Exception as _aw_exc:
                 logger.warning("Audit write failed for OPA exception event: %s", _aw_exc)
