@@ -6887,6 +6887,15 @@ bootstrap_internal_pki() {
       # No new keys generated. Existing keys are already correctly owned from the
       # previous install/rotate step. Do NOT re-apply chown (upgrade no-touch rule).
       # maintainer directive 2026-05-10 / GATE5-BUG-01.
+      #
+      # Exception — Podman rootless: re-apply unshare chown unconditionally (idempotent).
+      # Keys may be host:host owned if docker/secrets/ survived a wipe without
+      # namespace remapping (partial-state retry, backup restore, upgrade-over-upgrade).
+      # For Docker/rootful host UID == container UID so the no-touch rule is safe there;
+      # for Podman rootless it is not. See YSG-INSTALL-PKI-001.
+      if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" && "$(id -u)" != "0" ]]; then
+        _pki_chown_client_keys || return 1
+      fi
       log_info "Existing key ownership preserved (no rotation — upgrade no-touch rule)"
     fi
     return 0
