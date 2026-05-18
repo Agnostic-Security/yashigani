@@ -6641,6 +6641,16 @@ _pki_chown_client_keys() {
     admin2_totp_secret
     grafana_admin_password
     caddy_internal_hmac
+    # YSG-INSTALL-PKI-002: yashigani_internal_bearer is read by gateway + backoffice
+    # (UID 1001) to authenticate internal service-to-service calls. On the
+    # "preserving (upgrade path)" branch in generate_secrets() the file is NOT
+    # regenerated and NOT chowned. Podman rootless: file stays host:host owned
+    # (UID 1000); container UID 1001 (host mapping 101001) cannot read it →
+    # gateway + backoffice crash-loop with "YASHIGANI_INTERNAL_BEARER is not set".
+    # Adding it here closes the class: _pki_chown_client_keys runs on fresh install,
+    # rotation, and the no-rotation Podman-rootless branch (YSG-INSTALL-PKI-001)
+    # so all three code paths now correctly chown this file.
+    yashigani_internal_bearer
     openclaw_gateway_token
     # wazuh passwords are read by the wazuh containers (run as root inside docker),
     # not by the UID 1001 services. Chowning them to 1001 is harmless: root (UID 0)
