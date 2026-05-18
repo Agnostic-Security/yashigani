@@ -155,6 +155,14 @@ YASHIGANI_INTERMEDIATE_LIFETIME_DAYS="${YASHIGANI_INTERMEDIATE_LIFETIME_DAYS:-18
 YASHIGANI_CERT_LIFETIME_DAYS="${YASHIGANI_CERT_LIFETIME_DAYS:-90}"
 PKI_ACTION=""             # --pki-action=bootstrap|rotate-leaves|rotate-intermediate|rotate-root|status
 
+# Public-access SAN for demo / system-use deployments (YSG-CERT-SAN-001).
+# Tiago directive 2026-05-18: VM-IP / hostname access is a supported customer
+# path for demo and system-use; CA / Let's Encrypt is the proper-deployment path.
+# These are injected into the Caddy server cert SAN at PKI bootstrap / rotation.
+# Empty string = auto-detect at install time (see _detect_public_access_params).
+YSG_PUBLIC_HOSTNAME="${YSG_PUBLIC_HOSTNAME:-}"
+YSG_PUBLIC_IP="${YSG_PUBLIC_IP:-}"
+
 # If stdin is not a TTY (piped from curl), force non-interactive
 if [ ! -t 0 ]; then
   NON_INTERACTIVE=true
@@ -213,6 +221,15 @@ OPTIONS
   --https-port <N>                        Host port to bind for HTTPS (default: 443; or 8443
                                           on macOS / rootless Podman). Same network note as
                                           --http-port. Range: 1-65535.
+  --public-hostname HOSTNAME              Hostname (or IP) to include in the Caddy
+                                          server cert SAN for demo / system-use access.
+                                          Auto-detected via hostname -f if omitted.
+                                          Use this when your demo host is reachable by a
+                                          known FQDN (e.g. yashigani.local, myhost.lan).
+                                          Proper deployments: use --tls-mode acme or ca.
+  --public-ip      IP                     Host IP to include in the Caddy cert SAN.
+                                          Auto-detected via hostname -I if omitted.
+                                          Useful when demos are accessed directly by IP.
   --skip-preflight                        Skip preflight checks
   --skip-pull                             Skip docker compose pull (use local images)
   --upgrade                               Upgrade an existing installation
@@ -335,6 +352,16 @@ parse_args() {
           log_info "--https-port flag (${_raw_https_port}) overrides env YASHIGANI_HTTPS_PORT (${YASHIGANI_HTTPS_PORT})"
         fi
         export YASHIGANI_HTTPS_PORT="$_raw_https_port"
+        shift 2
+        ;;
+      --public-hostname)
+        YSG_PUBLIC_HOSTNAME="${2:?'--public-hostname requires a value'}"
+        export YSG_PUBLIC_HOSTNAME
+        shift 2
+        ;;
+      --public-ip)
+        YSG_PUBLIC_IP="${2:?'--public-ip requires a value'}"
+        export YSG_PUBLIC_IP
         shift 2
         ;;
       --skip-preflight)  SKIP_PREFLIGHT=true;   shift ;;
@@ -5818,6 +5845,89 @@ k8s_print_access() {
 }
 
 # =============================================================================
+# Public-access SAN auto-detection (YSG-CERT-SAN-001)
+# =============================================================================
+# Detect the host's public-facing hostname and primary IP for inclusion in the
+# Caddy server cert SAN. Called once before PKI bootstrap + rotation.
+#
+# Resolution order (per _detect_public_access_params):
+#   1. Operator flag: --public-hostname / --public-ip (already in YSG_PUBLIC_HOSTNAME / YSG_PUBLIC_IP)
+#   2. Auto-detect: hostname -f (FQDN) + hostname -I (first non-loopback IP)
+#   3. Fall through with empty values — cert has internal SANs only (old behaviour).
+#
+# Results are exported; _pki_run_issuer passes them to the issuer via
+# --caddy-extra-dns and --caddy-extra-ip flags on bootstrap / rotate-leaves.
+# =============================================================================
+
+_detect_public_access_params() {
+  # Step 1 — if both already set by flags, nothing to do.
+  if [[ -n "${YSG_PUBLIC_HOSTNAME:-}" && -n "${YSG_PUBLIC_IP:-}" ]]; then
+    log_info "Public access SAN: hostname=${YSG_PUBLIC_HOSTNAME} ip=${YSG_PUBLIC_IP} (from flags)"
+    export YSG_PUBLIC_HOSTNAME YSG_PUBLIC_IP
+    return 0
+  fi
+
+  # Step 2 — auto-detect hostname if not set.
+  if [[ -z "${YSG_PUBLIC_HOSTNAME:-}" ]]; then
+    local _detected_hostname=""
+    # hostname -f (FQDN) preferred — falls back to short hostname if FQDN unavailable.
+    # macOS: hostname -f is not supported; use hostname alone.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      _detected_hostname="$(hostname 2>/dev/null || true)"
+    else
+      _detected_hostname="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+    fi
+    # Strip trailing dot (some distros emit "myhost.lan." from hostname -f).
+    _detected_hostname="${_detected_hostname%.}"
+    # Reject empty, localhost, or .localdomain — these add no demo value.
+    if [[ -n "$_detected_hostname" \
+          && "$_detected_hostname" != "localhost" \
+          && "$_detected_hostname" != "localhost.localdomain" ]]; then
+      YSG_PUBLIC_HOSTNAME="$_detected_hostname"
+      log_info "Public access SAN: hostname=${YSG_PUBLIC_HOSTNAME} (auto-detected via hostname -f)"
+    else
+      log_info "Public access SAN: hostname auto-detect returned '${_detected_hostname}' — skipping DNS SAN"
+    fi
+    export YSG_PUBLIC_HOSTNAME
+  fi
+
+  # Step 3 — auto-detect primary external IP if not set.
+  if [[ -z "${YSG_PUBLIC_IP:-}" ]]; then
+    local _detected_ip=""
+    # hostname -I returns space-separated IPs; take the first non-loopback one.
+    # macOS: hostname -I is not supported; use ipconfig getifaddr en0 as fallback.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      _detected_ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
+      if [[ -z "$_detected_ip" ]]; then
+        # en1 fallback (Wi-Fi on some Macs)
+        _detected_ip="$(ipconfig getifaddr en1 2>/dev/null || true)"
+      fi
+    else
+      # hostname -I: space-separated; pick first entry, strip leading/trailing space.
+      _detected_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    # Reject empty or loopback addresses.
+    if [[ -n "$_detected_ip" \
+          && "$_detected_ip" != "127.0.0.1" \
+          && "$_detected_ip" != "::1" ]]; then
+      YSG_PUBLIC_IP="$_detected_ip"
+      log_info "Public access SAN: ip=${YSG_PUBLIC_IP} (auto-detected)"
+    else
+      log_info "Public access SAN: IP auto-detect returned '${_detected_ip}' — skipping IP SAN"
+    fi
+    export YSG_PUBLIC_IP
+  fi
+
+  if [[ -n "${YSG_PUBLIC_HOSTNAME:-}" || -n "${YSG_PUBLIC_IP:-}" ]]; then
+    log_info "Caddy cert will cover: ${YSG_PUBLIC_HOSTNAME:-<none>} / ${YSG_PUBLIC_IP:-<none>}"
+    log_info "  Proper deployments: use --tls-mode acme or --tls-mode ca for browser-trusted certs"
+  else
+    log_warn "Public access SAN: no hostname or IP resolved — Caddy cert covers internal names only"
+    log_warn "  Access via VM IP will fail TLS. Use --public-hostname / --public-ip to override."
+  fi
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 # =============================================================================
@@ -6870,6 +6980,8 @@ bootstrap_internal_pki() {
   set_step "9b" "internal mTLS PKI"
   log_step "9b/${TOTAL_STEPS}" "Bootstrapping internal mTLS PKI..."
   _pki_validate_lifetimes
+  # YSG-CERT-SAN-001: resolve public hostname + IP for Caddy cert SAN.
+  _detect_public_access_params
 
   local ca_root="${WORK_DIR}/docker/secrets/ca_root.crt"
   if [[ -f "$ca_root" ]]; then
@@ -6901,8 +7013,13 @@ bootstrap_internal_pki() {
     fi
 
     if [[ "$needs_rotation" == "true" ]]; then
+      # Build extra-SAN args for Caddy cert on rotation (YSG-CERT-SAN-001).
+      local _rotate_san_args=()
+      [[ -n "${YSG_PUBLIC_HOSTNAME:-}" ]] && _rotate_san_args+=(--caddy-extra-dns "${YSG_PUBLIC_HOSTNAME}")
+      [[ -n "${YSG_PUBLIC_IP:-}" ]]       && _rotate_san_args+=(--caddy-extra-ip  "${YSG_PUBLIC_IP}")
       if ! _pki_run_issuer rotate-leaves \
-             --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"; then
+             --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS" \
+             "${_rotate_san_args[@]}"; then
         log_error "Leaf rotation failed — mTLS mesh will not converge"
         return 1
       fi
@@ -6938,10 +7055,16 @@ bootstrap_internal_pki() {
   log_info "  Intermediate: ${YASHIGANI_INTERMEDIATE_LIFETIME_DAYS} days"
   log_info "  Leaves:       ${YASHIGANI_CERT_LIFETIME_DAYS} days"
 
+  # Build extra-SAN args for Caddy cert (YSG-CERT-SAN-001).
+  local _san_args=()
+  [[ -n "${YSG_PUBLIC_HOSTNAME:-}" ]] && _san_args+=(--caddy-extra-dns "${YSG_PUBLIC_HOSTNAME}")
+  [[ -n "${YSG_PUBLIC_IP:-}" ]]       && _san_args+=(--caddy-extra-ip  "${YSG_PUBLIC_IP}")
+
   if ! _pki_run_issuer bootstrap \
        --root-lifetime-years "$YASHIGANI_ROOT_CA_LIFETIME_YEARS" \
        --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
-       --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"; then
+       --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS" \
+       "${_san_args[@]}"; then
     log_error "PKI bootstrap failed — internal mTLS certs not generated"
     return 1
   fi
@@ -6964,8 +7087,15 @@ handle_pki_subcommand() {
       ;;
     rotate-leaves)
       log_step "-" "Rotating leaf certs"
+      # YSG-CERT-SAN-001: respect public SAN env vars if set (e.g. after re-running
+      # with --public-hostname / --public-ip on a previously-installed stack).
+      _detect_public_access_params
+      local _rl_san_args=()
+      [[ -n "${YSG_PUBLIC_HOSTNAME:-}" ]] && _rl_san_args+=(--caddy-extra-dns "${YSG_PUBLIC_HOSTNAME}")
+      [[ -n "${YSG_PUBLIC_IP:-}" ]]       && _rl_san_args+=(--caddy-extra-ip  "${YSG_PUBLIC_IP}")
       _pki_run_issuer rotate-leaves \
-        --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
+        --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS" \
+        "${_rl_san_args[@]}"
       log_success "Leaf certs rotated — restart services to pick up new certs"
       log_info "  docker compose restart gateway backoffice postgres pgbouncer redis budget-redis policy"
       ;;
