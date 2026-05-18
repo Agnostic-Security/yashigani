@@ -171,6 +171,14 @@ spec:
                   name: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
                   key: caddy_internal_hmac
             {{- end }}
+            # YSG-COMPOSE-ENV-001 Helm parity: gateway reads YASHIGANI_INTERNAL_BEARER
+            # from env (os.environ.get) — must be injected via secretKeyRef, not only
+            # present in yashigani-agent-bearer for agent-bundle shims.
+            - name: YASHIGANI_INTERNAL_BEARER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internalBearer.existingSecretName | default "yashigani-agent-bearer" }}
+                  key: yashigani_internal_bearer
           envFrom:
             - secretRef:
                 name: {{ .Values.gateway.existingSecretName | default "yashigani-gateway-secrets" }}
