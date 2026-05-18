@@ -274,6 +274,96 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   ignore the `algorithm` parameter (e.g. older Google Authenticator) silently
   default to SHA-1 and produce wrong codes.
 
+### Breaking Changes — review before upgrade from v2.23.3
+
+- **OPA fail-closed posture** (`318a3db` + `f720857`) — the OPA response-check
+  in `src/yashigani/gateway/openai_router.py` now returns
+  `allow: False` on EVERY exception path (timeout, 5xx response, connection
+  refused, `opa_not_configured`) instead of the prior `allow: True`. Helm
+  enforces it at deploy-time via the `OPA-URL-001` violation when
+  `global.environment=production` and `gateway.env.YASHIGANI_OPA_URL` is
+  empty. **Operational impact:** an OPA outage now causes inference requests
+  to be denied until OPA recovers, instead of silently allowing all traffic
+  through. This is the correct zero-trust posture per the project's
+  zero-trust default, but it IS a behavioural break for operators upgrading
+  from v2.23.3 with intermittently-reachable OPA. Alert on
+  `yashigani_opa_response_check_failures_total` rate (new Prometheus counter
+  registered in `metrics/registry.py`) to spot OPA reachability issues early.
+  Dev opt-in: set `YASHIGANI_OPA_OPTIONAL=true` AND keep `YASHIGANI_ENV` out
+  of production / staging to preserve the prior fail-open behaviour during
+  local development.
+
+### Security (post-FINDING-002 addendum 2026-05-18)
+
+These entries were added after the Iris third-pass audit caught CHANGELOG
+drift on the rebased branch. They cover the post-FINDING-001 work:
+
+- **`yashigani-internal` Bearer rotated to per-install secret** (`514316d`
+  gateway env-var read + `27d46ab` `install.sh` token generation +
+  compose+helm secret wiring on the pre-rebase `fcc551a`). The literal
+  string `yashigani-internal` is gone from production source. `install.sh`
+  generates a 36-char charset-compliant token at install time, written to
+  `docker/secrets/yashigani_internal_bearer` at mode 0600; Helm equivalent
+  via the `yashigani-agent-bearer` Secret with upgrade-safe `lookup`.
+  Compose entrypoint shims export the secret to `OPENAI_API_KEY` for Open
+  WebUI + Langflow + Letta service consumers. Gateway compare uses
+  `hmac.compare_digest`. Closes the Captain gitleaks-baseline Bucket-C
+  finding from 2026-05-17.
+- **`OPA_RESPONSE_CHECK_FAILED` audit-event type added** (`src/yashigani/audit/schema.py`,
+  shipped in `318a3db`). New Prometheus counter
+  `yashigani_opa_response_check_failures_total{outcome, reason}` registered
+  at module load.
+- **`account_tier` audit-accuracy comprehensive sweep** — across the
+  v2.23.4 close-out the audit-event constructors in `src/yashigani/backoffice/routes/auth.py`
+  and additional `_config_event` / `_full_reset_event` / similar helpers in
+  `users.py`, `accounts.py`, `audit.py`, `ratelimit.py`, `inspection.py`,
+  `kms.py`, `pg_auth.py`, `webauthn_v1.py` were widened to derive
+  `account_tier` from the session/account record instead of hardcoding
+  `"admin"`. With `/auth/stepup` now widened to accept user sessions, the
+  hardcode would otherwise have written user-tier step-ups to audit log as
+  admin-tier events (ASVS V7.3.4). Commits: `9007e11`, `9a50285`,
+  `8682695`, `b55c8f1`, `c04627f`, `2379d19`.
+- **Anonymous-caller upstream rejection** (`318a3db` step 1b). On
+  `/v1/chat/completions` and adjacent inference endpoints, an unauthenticated
+  caller is now rejected with HTTP 401 BEFORE the OPA response-check is
+  reached. Previously, an `identity is None` caller would short-circuit the
+  OPA check entirely via the `if _state.opa_url and identity` guard at
+  line 1010; that guard is now `if _state.opa_url` because identity is
+  guaranteed non-None by the new upstream gate. The `yashigani-internal`
+  Bearer presents `kind=service` identity and passes the upstream gate
+  unaffected.
+
+### CI / Tooling — post-FINDING-002 addendum
+
+- **`acs-v3-hardcoded-bearer-auth-bypass`** rule shipped on the ACS side
+  (CWE-798, ASVS V6.3.2, OWASP A07:2021, OWASP API API2, NIST IA-5, CMMC
+  IA.L2-3.5.2). Detects `if token == "<literal>"` / `if key in ("<literal>",)`
+  / `hmac.compare_digest(<var>, "<literal>")` / lowercase-normalised
+  comparisons / direct config-template literal assignments in
+  auth-handling paths. Wired into 19 of 20 framework files (ACS rc2). New
+  detection-lane that would have caught the `yashigani-internal` literal
+  before it shipped.
+- **Laura red-team brief template** now includes a STANDING credential-audit
+  lane (Lane A — 10 hardcoded-credential pattern classes; Lane B — 5
+  JWT/session probes). Non-optional on every pre-release dispatch
+  henceforth. Template at
+  `Internal/Compliance/yashigani/templates/laura-pre-release-brief-template.md`.
+
+### Documentation — post-FINDING-002 addendum
+
+- **OPA fail-closed operator runbook** — `_opa_response_check` docstring
+  in `openai_router.py` now describes the new fail-closed behaviour, the
+  audit-event emission, the Prometheus counter, and the operator response
+  when an OPA outage causes denials. Replaces the prior misleading
+  docstring that claimed audit coverage that did not actually fire (Iris
+  FINDING-001, closed in `9007e11`).
+- **CHANGELOG addendum trail** — Iris third-pass FINDING-005 caught that
+  the post-FINDING-002 addendum at `fa506e2` did not cover 10 subsequent
+  commits. This block closes that gap. Lesson saved to
+  `feedback_detection_lane_parity_audit.md` (one audit lane catches a
+  class — every other lane must demonstrate it would catch the same class
+  or document the gap).
+
 ---
 
 ## [v2.23.3] — 2026-05-11
