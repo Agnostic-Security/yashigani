@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (Let's Encrypt / ACME mode)
-# Last updated: 2026-05-17T00:00:00+00:00 (v2.23.4: add handle /me/* block — close v2.23.4 finding Gap A — me-api-key edge routing)
+# Last updated: 2026-05-18T00:00:00+00:00 (v2.23.4: add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing)
 # Set YASHIGANI_TLS_DOMAIN in your .env before starting.
 # Caddy will auto-obtain and renew the certificate via ACME HTTP-01 or TLS-ALPN-01.
 #
@@ -201,6 +201,29 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /mcp/* {
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── Gateway OpenAPI surface — /openapi.json + /docs ───────────────
+    # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
+    # GET /docs (Swagger UI) via gateway identity-resolution middleware.
+    # Without explicit handles these requests fell through to the Open WebUI
+    # catch-all and were functionally unreachable.
+    handle /openapi.json {
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /docs {
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified

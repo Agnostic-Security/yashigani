@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-17T00:00:00+01:00 — fix(caddy): add handle /me/* block — close v2.23.4 finding Gap A — me-api-key edge routing */ -}}
+{{- /* Last updated: 2026-05-18T00:00:00+01:00 — fix(caddy): add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -812,6 +812,25 @@ data:
         }
       }
       handle /mcp/* {
+        reverse_proxy https://yashigani-gateway:8080 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-gateway
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
+      # GET /docs (Swagger UI). Without explicit handles these fell through
+      # to the Open WebUI catch-all and were functionally unreachable.
+      handle /openapi.json {
+        reverse_proxy https://yashigani-gateway:8080 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-gateway
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      handle /docs {
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
