@@ -278,12 +278,74 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# TEST (13): ISSUE-023 regression — parse-probe on the python3 -c block
+# Wraps the block in a shell function and runs bash -n on the fragment.
+# Rationale: bash -n on the whole file gives a false PASS when apostrophes
+# inside a python3 -c '...' block accidentally re-balance later in the file
+# (ISSUE-023: server's / window's closed the single-quote string at runtime
+# but bash -n reported PASS because the file-level delimiter count balanced).
+# This test catches the regression in the specific block we own.
+# ---------------------------------------------------------------------------
+_section "TEST (13): ISSUE-023 regression — bash -n parse-probe on python3 -c block"
+
+_probe_file=""
+# shellcheck disable=SC2329  # _probe_cleanup invoked via trap, not inline
+_probe_cleanup() { [[ -n "$_probe_file" ]] && rm -f "$_probe_file"; }
+trap _probe_cleanup EXIT
+
+# Locate the python3 -c block in install.sh by its anchor lines.
+# The opening line ends with: python3 -c '   (bare single-quote, nothing after)
+_py_open_lineno="$(grep -nE "[[:space:]]python3[[:space:]]+-c[[:space:]]+'[[:space:]]*$" "${INSTALL_SH}" | cut -d: -f1 | head -1)"
+# The closing line starts with: ' 2>&1 (the closing delimiter of the shell single-quoted string)
+_py_close_lineno=""
+if [[ -n "$_py_open_lineno" ]]; then
+    _py_close_lineno="$(awk -v start="${_py_open_lineno}" 'NR > start && /^'"'"' 2>&1/ { print NR; exit }' "${INSTALL_SH}")"
+fi
+
+if [[ -z "$_py_open_lineno" || -z "$_py_close_lineno" ]]; then
+    _fail "(13.1) Could not locate python3 -c block boundaries — grep anchors need updating"
+else
+    _info "(13.1) python3 -c block located at L${_py_open_lineno}-L${_py_close_lineno}"
+
+    _probe_file="$(mktemp "${REPO_ROOT}/tests/install/parse_probe_issue023_XXXXXX.sh")"
+    _ctx_start=$(( _py_open_lineno > 2 ? _py_open_lineno - 2 : 1 ))
+    _ctx_end=$(( _py_close_lineno + 2 ))
+
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '_parse_probe_fn() {\n'
+        sed -n "${_ctx_start},${_ctx_end}p" "${INSTALL_SH}"
+        printf '\n}\n'
+    } > "$_probe_file"
+
+    _parse_out="$(bash -n "$_probe_file" 2>&1)"
+    _parse_rc=$?
+    if [[ $_parse_rc -eq 0 ]]; then
+        _pass "(13.1) bash -n parse-probe on register_agent_bundles python3 -c block PASS (ISSUE-023 not regressed)"
+    else
+        _fail "(13.1) bash -n parse-probe FAIL on python3 -c block — ISSUE-023 apostrophe regression detected: ${_parse_out}"
+    fi
+
+    # Also verify the block body contains no apostrophes (belt-and-suspenders;
+    # complements TEST 1 in test_install_sh_lint.sh which covers all blocks).
+    _apos_hits="$(sed -n "$(( _py_open_lineno + 1 )),$(( _py_close_lineno - 1 ))p" "${INSTALL_SH}" | grep -n "'")"
+    if [[ -n "$_apos_hits" ]]; then
+        _fail "(13.2) Apostrophe(s) found in python3 -c block body — ISSUE-023 regression:"
+        while IFS= read -r hit; do
+            printf "    %s\n" "$hit" >&2
+        done <<< "$_apos_hits"
+    else
+        _pass "(13.2) No apostrophes in python3 -c block body — ISSUE-023 not regressed"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf "\n=== RESULTS: PASS=%d FAIL=%d SKIP=%d ===\n" "$PASS" "$FAIL" "$SKIP"
 if [[ "$FAIL" -gt 0 ]]; then
-    printf "\nRESULT: FAIL — %d check(s) failed. (ISSUE-020)\n" "$FAIL"
+    printf "\nRESULT: FAIL — %d check(s) failed. (ISSUE-020 / ISSUE-023)\n" "$FAIL"
     exit 1
 fi
-printf "\nRESULT: PASS — %d checks passed, %d skipped. (ISSUE-020)\n" "$PASS" "$SKIP"
+printf "\nRESULT: PASS — %d checks passed, %d skipped. (ISSUE-020 / ISSUE-023)\n" "$PASS" "$SKIP"
 exit 0

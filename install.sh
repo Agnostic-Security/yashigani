@@ -4738,8 +4738,8 @@ if not session:
 # A single stepup covers all agent registrations within the 300 s TTL.
 #
 # ISSUE-020 (2026-05-19): login and stepup both call pyotp.TOTP(...).now().  If
-# both calls land in the same 30 s TOTP window the server's Postgres-backed
-# replay cache already holds that window's code (inserted by login) and rejects
+# both calls land in the same 30 s TOTP window the Postgres-backed replay
+# cache already holds that window code (inserted by login) and rejects
 # the stepup with invalid_totp_code → session last_totp_verified_at never set
 # → POST /admin/agents returns 401 step_up_required on every attempt.
 #
