@@ -258,12 +258,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# TEST (8): ISSUE-024 — agent _name= values in the agents_json build loop
+#           case statement are lowercase.
+# The AgentRegisterRequest model enforces ^[a-z][a-z0-9_-]{0,63}$ on the
+# name field.  Capitalised values (Langflow, Letta, OpenClaw) pass the shell
+# case statement but cause a 422 from the API, silently leaving /admin/agents
+# empty.  This test asserts the case statement sends lowercase to the API.
+#
+# Strategy: grep install.sh directly for lines matching the known pattern
+#   `  <profile>)  local _name="<value>"  _url=...`
+# This is more robust than awk-based function extraction because install.sh
+# has multiple `case "$_profile"` blocks and awk can match the wrong one.
+# ---------------------------------------------------------------------------
+_section "TEST (8): ISSUE-024 — agent name= values in case statement are lowercase"
+
+# Extract lines that contain both a profile case arm AND _name= assignment
+# These look like: `  langflow)  local _name="langflow"  _url=...`
+_name_lines="$(grep -E '^\s+(langflow|letta|openclaw)\)\s+local _name=' "$INSTALL_SH" || true)"
+
+if [[ -z "$_name_lines" ]]; then
+    _fail "(8.extract) Could not find profile _name= case lines in install.sh — pattern may have changed"
+else
+    _pass "(8.extract) Found profile _name= case arm lines in install.sh"
+fi
+
+# All three profile names must map to a lowercase _name= value.
+for _expected_lc in "langflow" "letta" "openclaw"; do
+    # Find the line for this profile and extract the _name= value.
+    _profile_line="$(echo "$_name_lines" | grep -E "^\s+${_expected_lc}\)" | head -1)"
+    if [[ -z "$_profile_line" ]]; then
+        _fail "(8.${_expected_lc}) Could not find case arm for profile '${_expected_lc}'"
+        continue
+    fi
+    _name_val="$(echo "$_profile_line" | grep -oE '_name="[^"]+"' | sed 's/_name=//;s/"//g')"
+    if [[ -z "$_name_val" ]]; then
+        _fail "(8.${_expected_lc}) Could not extract _name= value for profile '${_expected_lc}'"
+    elif [[ "$_name_val" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
+        _pass "(8.${_expected_lc}) Profile '${_expected_lc}' maps to lowercase _name=\"${_name_val}\" — matches API regex ^[a-z][a-z0-9_-]{0,63}$"
+    else
+        _fail "(8.${_expected_lc}) Profile '${_expected_lc}' maps to _name=\"${_name_val}\" — FAILS API regex ^[a-z][a-z0-9_-]{0,63}$ (ISSUE-024)"
+    fi
+done
+
+# Also assert no Capitalised name appears in any profile _name= case arm.
+# Belt-and-suspenders: catches future regressions where a display name is
+# accidentally re-introduced as the API slug.
+_upper_in_case="$(echo "$_name_lines" | grep -oE '_name="[A-Z][^"]+"' || true)"
+if [[ -n "$_upper_in_case" ]]; then
+    _fail "(8.upper) Capitalised _name= value(s) found in profile case arms: ${_upper_in_case}"
+else
+    _pass "(8.upper) No capitalised _name= values in profile case arms"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf "\n=== RESULTS: PASS=%d FAIL=%d SKIP=%d ===\n" "$PASS" "$FAIL" "$SKIP"
 if [[ "$FAIL" -gt 0 ]]; then
-    printf "\nRESULT: FAIL — %d check(s) failed. (YSG-AGENT-REG-001)\n" "$FAIL"
+    printf "\nRESULT: FAIL — %d check(s) failed. (YSG-AGENT-REG-001 + ISSUE-024)\n" "$FAIL"
     exit 1
 fi
-printf "\nRESULT: PASS — %d checks passed, %d skipped. (YSG-AGENT-REG-001)\n" "$PASS" "$SKIP"
+printf "\nRESULT: PASS — %d checks passed, %d skipped. (YSG-AGENT-REG-001 + ISSUE-024)\n" "$PASS" "$SKIP"
 exit 0

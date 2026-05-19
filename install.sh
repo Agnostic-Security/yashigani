@@ -4287,8 +4287,23 @@ EOF
 
   chmod 600 "$unit_file"
 
-  # Reload and enable in the user systemd instance
-  systemctl --user daemon-reload
+  # Reload and enable in the user systemd instance.
+  # Non-fatal: if install is run via `sudo -u <user> bash install.sh` (automated
+  # provisioning, CI, multi-user setup) there may be no D-Bus session for that
+  # user → "Failed to connect to bus: No medium found".  Mirror the loginctl
+  # enable-linger pattern above: warn with remediation, continue.
+  if systemctl --user daemon-reload 2>/dev/null; then
+    log_success "Auto-start: user systemd daemon reloaded"
+  else
+    log_warn "Auto-start: systemctl --user daemon-reload failed (no D-Bus session?)."
+    log_warn ""
+    log_warn "This is expected when install runs without a user login session."
+    log_warn "To reload manually after logging in as ${_runtime_user}:"
+    log_warn ""
+    log_warn "    systemctl --user daemon-reload"
+    log_warn ""
+    # Continue — the unit file is written; enabling/starting it later still works
+  fi
 
   if systemctl --user enable yashigani.service; then
     log_success "Auto-start: user yashigani.service enabled"
@@ -4658,9 +4673,9 @@ register_agent_bundles() {
   for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
     [[ -z "$_profile" ]] && continue
     case "$_profile" in
-      langflow)  local _name="Langflow"  _url="http://langflow:7860"   _proto="langflow" ;;
-      letta)     local _name="Letta"     _url="http://letta:8283"     _proto="letta" ;;
-      openclaw)  local _name="OpenClaw"  _url="http://openclaw:18789" _proto="openai" ;;
+      langflow)  local _name="langflow"  _url="http://langflow:7860"   _proto="langflow" ;;
+      letta)     local _name="letta"     _url="http://letta:8283"     _proto="letta" ;;
+      openclaw)  local _name="openclaw"  _url="http://openclaw:18789" _proto="openai" ;;
       *) continue ;;
     esac
     $first || agents_json+=','
