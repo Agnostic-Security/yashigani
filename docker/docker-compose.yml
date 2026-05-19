@@ -1,7 +1,7 @@
 ---
 # Yashigani v2.23.4 — Docker Compose stack
+# Last updated: 2026-05-20T00:06:00+01:00 (fix(postgres,compose): LETTA-001 — pg_hba letta-specific TLS rule + sslmode=require URI)
 # Last updated: 2026-05-19T00:00:00+00:00 (fix(compose): ollama-init profiles — add langflow/letta/openclaw so SF-011 closed; umask 0077 in gateway-start.sh)
-# Last updated: 2026-05-18T00:00:00+00:00 (fix(compose): wire YASHIGANI_INTERNAL_BEARER into x-common-env — close YSG-COMPOSE-ENV-001)
 # Last updated: 2026-05-17T12:00:00+01:00 (feat: ollama-init profiles gate + disk-space check + env var — auto-pull model only when --with-openwebui)
 # Last updated: 2026-05-16T21:00:00+01:00 (fix: YSG-RISK-008 compose hardening — read_only+tmpfs 24/27 + no-new-privileges 27/27)
 # Last updated: 2026-05-16T18:00:00+01:00 (v2.23.4: bump version 2.23.3 → 2.23.4 across install/build/helm/airgap)
