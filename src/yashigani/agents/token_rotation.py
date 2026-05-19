@@ -93,7 +93,8 @@ def rotate_agent_token(
     if current_hash_raw:
         grace_key = f"agent:token:grace:{agent_id}"
         grace_ttl = int(grace_period_hours * 3600)
-        r.set(grace_key, current_hash_raw, ex=grace_ttl)
+        if grace_ttl > 0:
+            r.set(grace_key, current_hash_raw, ex=grace_ttl)
         logger.info(
             "token_rotation: old token for %s stored in grace key (TTL=%dh)",
             agent_id, grace_period_hours,

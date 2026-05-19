@@ -503,9 +503,10 @@ return 1
 
         pipe = self._r.pipeline()
 
-        # Move current key to grace
+        # Move current key to grace — skip when grace_seconds=0 (immediate rotation;
+        # EX 0 is rejected by Redis: "invalid expire time in 'set' command").
         current = self._r.get(f"identity:key:{identity_id}")
-        if current:
+        if current and grace_seconds > 0:
             pipe.set(f"identity:key:grace:{identity_id}", current, ex=grace_seconds)
 
         # Set new key
