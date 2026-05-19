@@ -4848,8 +4848,12 @@ for agent in agents:
                     f.write(token)
                 try:
                     os.chmod(token_path, 0o600)
-                except OSError:
-                    pass  # best-effort; host-side chmod applied below
+                except OSError as _chmod_err:
+                    # best-effort; host-side chmod applied below.
+                    # Log so the issue is visible in install.log (e.g. owner mismatch
+                    # on Podman rootless where file owner is UID 101000 inside the
+                    # container but a different UID on the host).
+                    print(f"WARNING:chmod_600_failed:{token_path}:{_chmod_err}", file=sys.stderr)
             except PermissionError:
                 pass  # token printed below for host-side capture
             results.append("OK:" + aname + ":" + profile + ":" + token)
