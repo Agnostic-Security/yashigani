@@ -209,4 +209,32 @@ class CaddyVerifiedMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-__all__ = ["load_caddy_secret", "CaddyVerifiedMiddleware"]
+def validate_caddy_secret(header_value: str) -> bool:
+    """Return True if *header_value* matches the loaded per-install secret.
+
+    Used by SpiffePeerCertMiddleware (Option C, Laura ACCEPT-WITH-RESIDUAL) to
+    AND-couple the HMAC gate with ``x-spiffe-id`` preservation.  Only requests
+    that carry a valid ``X-Caddy-Verified-Secret`` are allowed to pass an
+    ``x-spiffe-id`` header through to route handlers.  Requests without a
+    matching secret (direct-mesh forge attempt) have their ``x-spiffe-id``
+    stripped.
+
+    Returns False if:
+    - ``_caddy_secret`` is None (lifespan not yet run — fail-closed).
+    - ``header_value`` is empty.
+    - ``header_value`` does not match (constant-time compare_digest).
+    - ``header_value`` contains non-ASCII (treated as mismatch).
+    """
+    secret = _caddy_secret
+    if secret is None or not header_value:
+        return False
+    try:
+        return hmac.compare_digest(
+            header_value.encode("ascii"),
+            secret.encode("ascii"),
+        )
+    except (UnicodeEncodeError, ValueError):
+        return False
+
+
+__all__ = ["load_caddy_secret", "CaddyVerifiedMiddleware", "validate_caddy_secret"]
