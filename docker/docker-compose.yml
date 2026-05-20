@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.23.4 — Docker Compose stack
+# Last updated: 2026-05-20T11:10:00+01:00 (fix(compose): AGENT-RUNTIME-003d disable read_only for letta — openapi+alembic write to CWD /app)
 # Last updated: 2026-05-20T10:50:00+01:00 (fix(compose): AGENT-RUNTIME-003c drop sslmode=require from LETTA_PG_URI — pg8000 alembic path)
 # Last updated: 2026-05-20T10:30:00+01:00 (fix(compose): AGENT-RUNTIME-003b drop cd /tmp from letta shim + langflow ALEMBIC_LOG_TO_STDOUT)
 # Last updated: 2026-05-20T00:06:00+01:00 (fix(postgres,compose): LETTA-001 — pg_hba letta-specific TLS rule + sslmode=require URI)
@@ -1617,9 +1618,16 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    read_only: true
+    # read_only skipped: letta writes openapi_letta.json to the current working
+    # directory at module import time (app.py:162 — generate_openapi_schema).
+    # CWD is /app (WORKDIR in upstream image) which is inside the rootfs.
+    # startup.sh also calls alembic from /app, requiring /app to be writable
+    # for the alembic.ini lookup. Helm equivalent: readOnlyRootFilesystem: false.
+    # YSG-RISK-048 addendum: letta rootfs is writable. Mitigated by no-new-privileges
+    # + cap_drop:ALL + named volume isolation + network policy.
+    # Forward-close v2.24.0: file-system hardening when letta allows configuring
+    # openapi output dir + alembic ini path via env vars.
     tmpfs:
-      # YSG-RISK-008 (v2.23.4): letta_data:/root/.letta is a named volume.
       # /tmp needed for Python runtime temp files.
       - /tmp:size=64m,mode=1777
     security_opt:
