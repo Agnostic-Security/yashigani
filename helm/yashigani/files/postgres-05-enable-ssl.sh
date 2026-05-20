@@ -76,10 +76,11 @@ PGCONF
 # local + 127.0.0.1 remain for the postgres entrypoint bootstrap flows.
 #
 # YSG-RISK-048 CLOSED 2026-05-20: the former letta-specific plain-TCP carveout
-# (host letta yashigani_app ... scram-sha-256) is removed. Letta now connects
-# via letta-pg-stunnel sidecar which terminates plain TCP from letta and presents
-# letta_stunnel_client.crt to postgres over mTLS. Full clientcert=verify-ca
-# catch-all applies to all services including letta's sidecar.
+# (host letta yashigani_app ... scram-sha-256) was removed when the stunnel sidecar
+# was implemented (commit e694127). It remains removed under the pgbouncer design:
+# letta now connects via letta-pgbouncer sidecar (edoburu/pgbouncer:v1.25.1-p0,
+# UID 70) which presents letta-pgbouncer_client.crt to postgres over full mTLS
+# (verify-full). Full clientcert=verify-ca catch-all applies to all services.
 cat > "${PGDATA}/pg_hba.conf" <<'HBA'
 # TYPE  DATABASE  USER           ADDRESS        METHOD
 # Local socket — used by the postgres docker-entrypoint itself for init.
@@ -89,8 +90,8 @@ host    all       all            127.0.0.1/32   trust
 host    all       all            ::1/128        trust
 # All network connections must use TLS with a client cert signed by our
 # internal CA, AND present a valid scram-sha-256 password. Three factors.
-# Letta reaches postgres via the letta-pg-stunnel sidecar which presents
-# letta_stunnel_client.crt — no carveout required (YSG-RISK-048 closed).
+# Letta reaches postgres via the letta-pgbouncer sidecar which presents
+# letta-pgbouncer_client.crt — no carveout required (YSG-RISK-048 closed).
 hostssl all       all            0.0.0.0/0      scram-sha-256  clientcert=verify-ca
 hostssl all       all            ::/0           scram-sha-256  clientcert=verify-ca
 # Defence in depth — explicitly reject any plaintext attempt.

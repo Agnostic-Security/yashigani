@@ -1557,57 +1557,45 @@ services:
     profiles:
       - langflow
 
-  # letta-pg-stunnel — TLS-terminating stunnel sidecar for letta→postgres mTLS
-  # YSG-RISK-048 CLOSED 2026-05-20: letta (asyncpg) cannot present client certs
-  # via URI params. This sidecar accepts plain TCP from letta on port 5432,
-  # dials postgres:5432 over mTLS presenting letta_stunnel_client.crt/key,
-  # and validates the server cert against ca_root.crt (verify=2).
+  # letta-pgbouncer — session-mode pgbouncer sidecar for letta→postgres mTLS
+  # Implements Iris design recommendation (Option 1 — 33/35):
+  #   iris-letta-postgres-mtls-design-review.md
+  # Security fixes: laura-pgbouncer-letta-threat-model.md (F1 Helm netpol,
+  #   F2 admin console disable, F3 client_tls constraint comment, F4 YSG-RISK-049)
   #
-  # Image: built locally from docker/letta-pg-stunnel/Dockerfile (alpine:3.20 +
-  # apk stunnel). dweomer/stunnel:latest was pinned previously but is amd64-only
-  # (single-arch manifest, no arm64 variant on Docker Hub). The local build runs
-  # natively on any arch Docker supports (amd64, arm64, etc.) because Docker
-  # builds for the host's native platform by default. No buildx / cross-compilation
-  # required — install.sh calls `compose build letta-pg-stunnel` before compose up.
-  # Helm path: see helm/yashigani/values.yaml extraContainers note for arm64 K8s.
-  letta-pg-stunnel:
+  # Replaces the dead-end letta-pg-stunnel design (commit e694127):
+  #   stunnel UID contradiction (pki_ownership.sh records UID 0:0600 for a cert
+  #   stunnel reads as UID 101 — clean install would fail at key-read), five 0777
+  #   tmpfs mounts (feedback_security_company_no_shortcuts violation), hand-rolled
+  #   protocol handler (Iris C2 violation), amd64-only image (Iris C5 violation).
+  #
+  # pgbouncer accepts plain TCP from letta (letta pg8000 cannot present client certs
+  # via URI params — constraint C1 in Iris's register), then dials postgres:5432
+  # over full mTLS presenting letta-pgbouncer_client.crt (issued by install.sh,
+  # chowned UID 70:0600). session mode required for alembic DDL advisory locks.
+  # YSG-RISK-048 CLOSED 2026-05-20 via pgbouncer session-mode sidecar.
+  letta-pgbouncer:
     dns_search: ["."]
-    build:
-      context: ./letta-pg-stunnel
-    image: yashigani-letta-pg-stunnel:v2.23.4
+    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
+    user: "70:70"
     restart: unless-stopped
-    mem_limit: 32m
-    cpus: 0.1
+    mem_limit: 64m
+    cpus: 0.2
     environment:
-      # entrypoint.sh (docker/letta-pg-stunnel/entrypoint.sh) reads these env vars
-      # and generates stunnel.conf at container start. Convention mirrors dweomer/stunnel
-      # so compose/Helm config remains identical after the image swap.
-      STUNNEL_SERVICE: "letta-pg"
-      # Accept plain TCP on all interfaces port 5432. Letta connects to
-      # letta-pg-stunnel:5432 (plain TCP, no sslmode in URI).
-      STUNNEL_ACCEPT: "5432"
-      # Dial postgres:5432 over mTLS.
-      STUNNEL_CONNECT: "postgres:5432"
-      # client = yes: stunnel acts as TLS client (not server) toward postgres.
-      STUNNEL_CLIENT: "yes"
-      # Present letta-stunnel_client.crt/key to postgres (mTLS client identity).
-      # File name matches service_identities.yaml name: letta-stunnel →
-      # install.sh issues letta-stunnel_client.crt/key (hyphen, not underscore).
-      STUNNEL_CRT: "/run/secrets/letta-stunnel_client.crt"
-      STUNNEL_KEY: "/run/secrets/letta-stunnel_client.key"
-      # Validate postgres server cert against our CA bundle (verify=2 = verify peer).
-      STUNNEL_CAFILE: "/run/secrets/ca_root.crt"
-      STUNNEL_VERIFY: "2"
-      # sslVersionMin = TLSv1.2 is hardcoded in entrypoint.sh — not configurable
-      # via env var. STUNNEL_DEBUG controls the log verbosity (0-7).
-      STUNNEL_DEBUG: "5"
+      # edoburu image uses DATABASE_URL to generate userlist.txt at startup.
+      # Points at the `letta` database (separate DB from yashigani — clean isolation).
+      DATABASE_URL: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/letta
+      AUTH_TYPE: plain
+      POOL_MODE: session
+      MAX_CLIENT_CONN: "50"
+      DEFAULT_POOL_SIZE: "20"
     volumes:
       - ./secrets:/run/secrets:ro
+      - ./pgbouncer/pgbouncer-letta.ini:/etc/pgbouncer/pgbouncer.ini:ro
     healthcheck:
-      # nc (netcat) is available in Alpine. A successful TCP connect to the
-      # plain-TCP listener on 5432 proves stunnel is accepting connections.
-      # The TLS tunnel to postgres is validated by the pg_stat_ssl query at deploy time.
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 5432"]
+      # edoburu/pgbouncer image is busybox-based — same nc healthcheck as the
+      # existing pgbouncer instance. 127.0.0.1 avoids IPv6-first resolution.
+      test: ["CMD-SHELL", "nc -w 2 127.0.0.1 5432 </dev/null >/dev/null 2>&1"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -1615,25 +1603,20 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    read_only: true
+    # YSG-RISK-008 (v2.23.4): read_only skipped on compose path for pgbouncer.
+    # pgbouncer entrypoint generates /etc/pgbouncer/userlist.txt at startup from
+    # DB_USER/DB_PASSWORD env (sed-based write). It also needs /var/run/pgbouncer
+    # writable for its PID file. Both need to be owned by uid 70 (pgbouncer user)
+    # with restrictive perms. podman-compose tmpfs short-form syntax does not accept
+    # `uid=`/`gid=` options, and mode=1777 on these dirs is unacceptable per security
+    # review. Compensating controls: cap_drop:[ALL] + no-new-privileges + user:70:70.
+    # K8s path retains full readOnlyRootFilesystem via securityContext in sidecar spec.
     tmpfs:
-      # stunnel writes pid + log to /var/run/stunnel/ and /var/log/stunnel/
-      # (paths set in stunnel.conf.template). emptyDir via tmpfs — no persistence needed.
-      - /var/run/stunnel:size=4m,mode=0755
-      - /var/log/stunnel:size=8m,mode=0755
-      # stunnel.sh writes the generated stunnel.conf to /etc/stunnel/stunnel.conf
-      # (STUNNEL_CONF env var default). That path is in the read-only rootfs
-      # — needs a writable tmpfs overlay.
-      - /etc/stunnel:size=4m,mode=0755
-      # update-ca-certificates writes to /usr/local/share/ca-certificates and
-      # /etc/ssl/certs in the entrypoint. Those paths are under the read-only rootfs,
-      # so stunnel.sh will fail without a writable overlay. Two tmpfs mounts cover them.
-      - /usr/local/share/ca-certificates:size=4m,mode=0755
-      - /etc/ssl/certs:size=4m,mode=0755
+      - /tmp:size=32m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
-    # EX-231-10: letta-pg-stunnel is a data-plane dep; sits on `data` network
+    # EX-231-10: letta-pgbouncer is a data-plane dep; sits on `data` network
     # alongside postgres and letta.
     networks:
       - data
@@ -1677,12 +1660,13 @@ services:
       LETTA_LLM_MODEL: "qwen2.5:3b"
       LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
       # Use shared Postgres for persistence (separate DB).
-      # Letta connects to letta-pg-stunnel:5432 (plain TCP — no sslmode param).
-      # letta-pg-stunnel terminates the plain TCP connection from letta and dials
-      # postgres:5432 over mTLS, presenting letta_stunnel_client.crt. From letta's
-      # perspective this is a plain TCP connection to a local postgres-like endpoint.
-      # YSG-RISK-048 CLOSED 2026-05-20 — stunnel sidecar provides full mTLS.
-      LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@letta-pg-stunnel:5432/letta
+      # Letta connects to letta-pgbouncer:5432 as plain TCP (no sslmode —
+      # letta pg8000 cannot present client certs via URI params, C1 in Iris's register).
+      # pgbouncer sidecar accepts plain TCP from letta and dials postgres:5432
+      # over full mTLS presenting letta-pgbouncer_client.crt. End-to-end transport
+      # is mTLS; letta is unaware. YSG-RISK-048 CLOSED 2026-05-20 via pgbouncer
+      # session-mode sidecar (Iris design doc Option 1 — replaces stunnel).
+      LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@letta-pgbouncer:5432/letta
     volumes:
       - letta_data:/root/.letta
       # Captain Bucket-C: mount secrets dir so entrypoint shim can read
@@ -1707,7 +1691,7 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      letta-pg-stunnel:
+      letta-pgbouncer:
         condition: service_healthy
     read_only: true
     tmpfs:

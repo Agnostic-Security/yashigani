@@ -23,7 +23,7 @@
     resources             — requests/limits block (required by policy)
     extraContainers       — list of additional container specs injected verbatim into
                             the pod's containers[] array (used for TLS-terminating
-                            sidecars, e.g. letta-pg-stunnel). Each entry is a full
+                            sidecars, e.g. letta-pgbouncer). Each entry is a full
                             Kubernetes container spec. Values.yaml controls image,
                             env, securityContext, resources, and volumeMounts.
                             Additional volumes for the sidecar MUST be declared via
@@ -113,16 +113,16 @@ spec:
                   key: {{ $bundle.tokenSecretKey }}
             {{- end }}
             {{- if and $bundle.dbPasswordSecretName $bundle.dbPasswordSecretKey }}
-            {{- $pgHost := $bundle.pgbouncerServiceName | default "yashigani-pgbouncer" }}
             - name: LETTA_PG_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ $bundle.dbPasswordSecretName }}
                   key: {{ $bundle.dbPasswordSecretKey }}
-            # letta connects to 127.0.0.1:5432 (pod-local loopback) — the letta-pg-stunnel
-            # sidecar listens there and tunnels the connection to postgres over mTLS.
-            # YSG-RISK-048 CLOSED 2026-05-20: stunnel sidecar provides full mTLS;
-            # no plain-TCP carveout in pg_hba required.
+            # letta connects to 127.0.0.1:5432 (pod-local loopback) — the letta-pgbouncer
+            # sidecar listens there and dials yashigani-postgres:5432 over full mTLS,
+            # presenting letta-pgbouncer_client.crt (UID 70:0400). No plain-TCP carveout
+            # in pg_hba required. YSG-RISK-048 CLOSED 2026-05-20 via pgbouncer session-mode
+            # sidecar (Iris design doc Option 1; replaces stunnel+socat).
             - name: LETTA_PG_URI
               value: {{ printf "postgresql://yashigani_app:$(LETTA_PG_PASSWORD)@127.0.0.1:5432/letta" | quote }}
             {{- end }}

@@ -2759,18 +2759,9 @@ except Exception:
     log_success "Local images built"
   fi
 
-  # Build letta-pg-stunnel if letta profile is active.
-  # dweomer/stunnel:latest is amd64-only; we build locally from docker/letta-pg-stunnel/
-  # (alpine:3.20 + apk stunnel) so the image runs natively on any arch (amd64, arm64).
-  # build adds ~30-60s on first run; subsequent runs use Docker layer cache.
-  if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^letta$"; then
-    log_info "Building letta-pg-stunnel image (multi-arch stunnel sidecar)..."
-    "${COMPOSE_CMD[@]}" -f "$compose_file" build letta-pg-stunnel || {
-      log_error "Failed to build letta-pg-stunnel image. Check docker/letta-pg-stunnel/Dockerfile."
-      exit 1
-    }
-    log_success "letta-pg-stunnel image built: yashigani-letta-pg-stunnel:v2.23.4"
-  fi
+  # letta-pgbouncer uses edoburu/pgbouncer:v1.25.1-p0 (same multi-arch image as the
+  # existing pgbouncer service — arm64 + amd64, pinned sha256). No local build required.
+  # The image is pulled as part of the standard remote image pull step below.
 
   # Pull all remote images
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then

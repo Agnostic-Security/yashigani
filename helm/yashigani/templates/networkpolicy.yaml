@@ -522,10 +522,30 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+    # Laura F1 (laura-pgbouncer-letta-threat-model.md): letta pod added here.
+    # In Helm sidecar design, the letta-pgbouncer sidecar runs in the letta pod's
+    # network namespace. The sidecar must reach postgres:5432 directly (not via
+    # the cluster pgbouncer). K8s NetworkPolicy governs the pod's egress — including
+    # all sidecars in the same pod. This ingress rule permits the sidecar's upstream
+    # connection. The letta application container never initiates a connection to
+    # postgres directly; it connects only to the sidecar on 127.0.0.1:5432 (loopback,
+    # which is not governed by NetworkPolicy in standard K8s).
+    - from:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: letta
+      ports:
+        - protocol: TCP
+          port: 5432
     {{- end }}
 
 ---
-# PgBouncer — accept ingress from gateway, backoffice, langgraph, and letta agents
+# PgBouncer — accept ingress from gateway, backoffice, langgraph (transaction-mode clients).
+# Laura F1 (laura-pgbouncer-letta-threat-model.md): letta REMOVED from this policy.
+# Letta now uses the letta-pgbouncer sidecar (pod loopback 127.0.0.1:5432) and must
+# NOT reach the cluster-level pgbouncer — that path allows letta to access the `yashigani`
+# database via the shared pgbouncer, creating a cross-database BOLA (API1:2023) vector.
+# ASVS-V9.1.2: network segmentation enforcing least-privilege access.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -550,10 +570,6 @@ spec:
         - podSelector:
             matchLabels:
               yashigani.io/bundle: langgraph
-        # letta uses shared Postgres (separate `letta` DB via pgbouncer)
-        - podSelector:
-            matchLabels:
-              yashigani.io/bundle: letta
         - podSelector:
             matchLabels:
               app.kubernetes.io/component: db-maintenance
@@ -867,10 +883,19 @@ spec:
       ports:
         - protocol: TCP
           port: {{ if .Values.mtls.enabled }}6380{{ else }}6379{{ end }}
+    # Laura F1 (laura-pgbouncer-letta-threat-model.md): agent-bundle egress to
+    # yashigani-pgbouncer REPLACED with egress to yashigani-postgres.
+    # Rationale: letta uses a pod-sidecar pgbouncer (127.0.0.1:5432 loopback).
+    # The sidecar shares the pod's network namespace and its egress to postgres
+    # is governed by this policy. Permitting egress to yashigani-pgbouncer for the
+    # letta pod would allow the letta application container (running as UID 0) to
+    # bypass the sidecar and access the `yashigani` database — cross-database BOLA.
+    # ASVS-V9.1.2. Other agent bundles (langflow, openclaw) do not use pgbouncer;
+    # they have no DB egress requirement.
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: yashigani-pgbouncer
+              app.kubernetes.io/name: yashigani-postgres
       ports:
         - protocol: TCP
           port: 5432
