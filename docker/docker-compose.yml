@@ -1562,19 +1562,26 @@ services:
   # via URI params. This sidecar accepts plain TCP from letta on port 5432,
   # dials postgres:5432 over mTLS presenting letta_stunnel_client.crt/key,
   # and validates the server cert against ca_root.crt (verify=2).
-  # Image: dweomer/stunnel:latest — Alpine-based, minimal footprint (~4 MB),
-  # well-maintained, widely used for stunnel sidecars in Docker deployments.
-  # Pinned to digest sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
-  # (verified 2026-05-20 via `docker manifest inspect --verbose`).
+  #
+  # Image: built locally from docker/letta-pg-stunnel/Dockerfile (alpine:3.20 +
+  # apk stunnel). dweomer/stunnel:latest was pinned previously but is amd64-only
+  # (single-arch manifest, no arm64 variant on Docker Hub). The local build runs
+  # natively on any arch Docker supports (amd64, arm64, etc.) because Docker
+  # builds for the host's native platform by default. No buildx / cross-compilation
+  # required — install.sh calls `compose build letta-pg-stunnel` before compose up.
+  # Helm path: see helm/yashigani/values.yaml extraContainers note for arm64 K8s.
   letta-pg-stunnel:
     dns_search: ["."]
-    image: docker.io/dweomer/stunnel:latest@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
+    build:
+      context: ./letta-pg-stunnel
+    image: yashigani-letta-pg-stunnel:v2.23.4
     restart: unless-stopped
     mem_limit: 32m
     cpus: 0.1
     environment:
-      # dweomer/stunnel entrypoint reads these env vars and generates stunnel.conf
-      # from /srv/stunnel/stunnel.conf.template via envsubst. No custom conf file needed.
+      # entrypoint.sh (docker/letta-pg-stunnel/entrypoint.sh) reads these env vars
+      # and generates stunnel.conf at container start. Convention mirrors dweomer/stunnel
+      # so compose/Helm config remains identical after the image swap.
       STUNNEL_SERVICE: "letta-pg"
       # Accept plain TCP on all interfaces port 5432. Letta connects to
       # letta-pg-stunnel:5432 (plain TCP, no sslmode in URI).
@@ -1591,8 +1598,8 @@ services:
       # Validate postgres server cert against our CA bundle (verify=2 = verify peer).
       STUNNEL_CAFILE: "/run/secrets/ca_root.crt"
       STUNNEL_VERIFY: "2"
-      # Enforce TLS 1.2 minimum (sslVersionMin is set in the template already).
-      # dweomer/stunnel template already sets sslVersionMin = TLSv1.2.
+      # sslVersionMin = TLSv1.2 is hardcoded in entrypoint.sh — not configurable
+      # via env var. STUNNEL_DEBUG controls the log verbosity (0-7).
       STUNNEL_DEBUG: "5"
     volumes:
       - ./secrets:/run/secrets:ro

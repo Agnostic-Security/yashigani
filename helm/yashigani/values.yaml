@@ -1036,10 +1036,26 @@ agentBundles:
     # YSG-RISK-048 CLOSED 2026-05-20.
     # Letta connects to 127.0.0.1:5432 (loopback); stunnel presents
     # letta_stunnel_client.crt to postgres over mTLS (verify=2, CA-validated).
-    # dweomer/stunnel image: Alpine-based (~4 MB), pinned to digest.
-    # Image runs as root initially; stunnel.conf setuid/setgid drops to the
-    # `stunnel` system user (Alpine adduser -S, UID 100) after binding port.
-    # Cap_drop ALL + readOnlyRootFilesystem enforced; emptyDirs for write paths.
+    #
+    # IMAGE NOTE — ARCH CONSTRAINT (Helm path):
+    # Compose path builds yashigani-letta-pg-stunnel:v2.23.4 locally from
+    # docker/letta-pg-stunnel/ (alpine:3.20 + apk stunnel), which runs natively
+    # on any host arch. Helm does NOT build at deploy time, so the image below
+    # must be available in the cluster's registry.
+    #
+    # dweomer/stunnel:latest@sha256:c46e11e6... is amd64-only — DO NOT use on
+    # arm64 K8s clusters. Options for arm64 Helm deployments:
+    #   (a) Build and push the local image to your registry before helm install:
+    #       docker buildx build --platform linux/amd64,linux/arm64 \
+    #         -t <your-registry>/yashigani-letta-pg-stunnel:v2.23.4 \
+    #         --push docker/letta-pg-stunnel/
+    #       Then override: helm install ... --set agentBundles.letta.extraContainers[0].image=<your-registry>/...
+    #   (b) A GHCR multi-arch release image is planned as a v2.23.5 release artefact.
+    #       Track: BACKLOG-V240-002.
+    #
+    # For amd64 K8s (default): dweomer/stunnel is retained below for backwards
+    # compatibility. Runs as root initially + stunnel drops to setuid user after
+    # bind. Cap_drop ALL + readOnlyRootFilesystem enforced; emptyDirs for write paths.
     extraContainers:
       - name: letta-pg-stunnel
         image: "docker.io/dweomer/stunnel:latest@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef"
