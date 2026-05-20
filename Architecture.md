@@ -49,7 +49,7 @@ AI Agent / Human (via Open WebUI or API)
         v
 [ Sensitivity Pipeline ]    <-- Three layers (all ON by default):
         |                       1. Regex pattern matching
-        |                       2. FastText ML classifier (<5ms, v2.20: baked into image)
+        |                       2. scikit-learn ML classifier (<5ms, v2.23.3: TF-IDF + LogisticRegression replaces FastText; baked into image)
         |                       3. Ollama LLM classification
         |                       + CHS credential detection
         |                       + Payload masking before AI send
@@ -96,8 +96,8 @@ AI Agent / Human (response)
 | **Identity Broker** | Multi-IdP identity broker: OIDC + SAML v2; Caddy delegates auth (since v2.0) |
 | **Pool Manager** | Per-identity container lifecycle: create, route, health, replace, scale, postmortem forensics (since v2.0) |
 | **OPA Policy Engine** | Declarative, version-controlled authorization for every tool call; routing safety net with LLM policy review (since v2.0) |
-| **Sensitivity Pipeline** | Three-layer classification: regex + FastText ML + Ollama; all ON by default (since v2.0) |
-| **Inspection Pipeline** | FastText ML + multi-backend LLM inspection with fail-closed sentinel |
+| **Sensitivity Pipeline** | Three-layer classification: regex + scikit-learn ML + Ollama; all ON by default (since v2.0; ML backend swapped FastText → scikit-learn TF-IDF + LogisticRegression in v2.23.3) |
+| **Inspection Pipeline** | scikit-learn ML + multi-backend LLM inspection with fail-closed sentinel |
 | **Audit Pipeline** | Multi-sink writer: file, PostgreSQL, Splunk, Elasticsearch, Wazuh; P1-P5 alert severity with SIEM integration (since v2.0) |
 | **PgBouncer** | PostgreSQL connection pooler, prevents connection exhaustion (password from .env since v1.09.5) |
 | **Redis** | Rate limiting, response caching, anomaly detection sliding windows |
@@ -289,7 +289,7 @@ v2.0 is Yashigani's first production-grade release, adding five major subsystems
 
 **Multi-IdP Identity Broker** -- Yashigani is the identity broker. It supports multiple identity providers natively via OIDC and SAML v2. Caddy delegates all authentication decisions to the backoffice. SCIM provisions users and groups. Group policies govern model and agent access. IdP limits are tier-gated: Community supports local auth only, Non-profit & Education supports 1 OIDC + 1 SAML (matching Professional, free with verification), Starter supports 1 OIDC provider, Professional supports 1 OIDC + 1 SAML, Professional Plus supports 5 IdPs, Enterprise is unlimited.
 
-**Sensitivity Classification Pipeline** -- Every prompt passes through a three-layer sensitivity classification pipeline, all layers ON by default. Layer 1 (regex) matches patterns for PII, PCI, intellectual property, and PHI. Layer 2 (FastText ML) provides sub-5ms offline classification. Layer 3 (Ollama qwen2.5) performs deep semantic analysis. Administrators can customize patterns per tenant and opt out of the Ollama layer, but cannot disable regex. Classification results feed directly into the Optimization Engine's routing decisions.
+**Sensitivity Classification Pipeline** -- Every prompt passes through a three-layer sensitivity classification pipeline, all layers ON by default. Layer 1 (regex) matches patterns for PII, PCI, intellectual property, and PHI. Layer 2 (scikit-learn ML, TF-IDF + LogisticRegression since v2.23.3 — previously FastText) provides sub-5ms offline classification. Layer 3 (Ollama qwen2.5) performs deep semantic analysis. Administrators can customize patterns per tenant and opt out of the Ollama layer, but cannot disable regex. Classification results feed directly into the Optimization Engine's routing decisions.
 
 **P1-P5 Alert Severity with SIEM Integration** -- Routing decisions are audit events written through the existing audit pipeline to all SIEM sinks. A P1-P5 severity scale triggers on specific conditions: sensitivity breach (P1), OPA override (P1), classification conflict (P2), spending anomaly (P2), budget auto-switch (P3), and others.
 
@@ -439,7 +439,7 @@ The initial release established the core security envelope. Yashigani began as a
 
 ### 5.3 Content Inspection and AI Safety
 
-- FastText ML first-pass classifier (offline, under 5ms latency)
+- scikit-learn ML first-pass classifier (TF-IDF + LogisticRegression, joblib serialised, offline, under 5ms latency; replaced FastText in v2.23.3)
 - Multi-backend LLM inspection chain:
   - Ollama (local)
   - Anthropic Claude
@@ -453,7 +453,7 @@ The initial release established the core security envelope. Yashigani began as a
 - Response masking and sanitization
 - Anomaly detection: repeated-small-call pattern detection (Redis ZSET sliding window)
 - Inference payload logging (AES-256-GCM encrypted, stored in Postgres)
-- **Sensitivity classification pipeline (since v2.0)** — three layers, all ON by default: regex pattern matching (PII, PCI, IP, PHI), FastText ML classifier, Ollama LLM classification; admin can opt out of Ollama but cannot disable regex; results feed into Optimization Engine routing
+- **Sensitivity classification pipeline (since v2.0)** — three layers, all ON by default: regex pattern matching (PII, PCI, IP, PHI), scikit-learn ML classifier (TF-IDF + LogisticRegression since v2.23.3; FastText pre-v2.23.3), Ollama LLM classification; admin can opt out of Ollama but cannot disable regex; results feed into Optimization Engine routing
 - **Optimization Engine (since v2.0)** — four-dimensional routing (sensitivity + complexity + budget + cost); P1-P9 priority matrix; CONFIDENTIAL/RESTRICTED always local; budget exhaustion degrades to local, never rejects
 - **Model alias table (since v2.0)** — DB-driven via admin API, Postgres + Redis cache, CRUD at `/admin/models/aliases`
 - **Agent personas (since v2.22)** — Lala (Langflow), Julietta (Letta), Scout (OpenClaw) with descriptions and example prompts
