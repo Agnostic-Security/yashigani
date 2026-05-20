@@ -858,6 +858,13 @@ agentBundles:
       LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
       DO_NOT_TRACK: "true"
       LANGFLOW_AUTO_LOGIN: "true"
+      # FAIL-002 parity (v2.23.4): langflow 1.9.2 writes alembic migration log to
+      # /app/.venv/lib/python3.12/site-packages/langflow/alembic/alembic.log — inside
+      # the image rootfs. readOnlyRootFilesystem:false already prevents EROFS in K8s,
+      # but this env var is defence-in-depth: redirects alembic output to stdout
+      # (langflow.services.database.service._run_migrations uses nullcontext(sys.stdout)
+      # when alembic_log_to_stdout=True, bypassing the file open entirely).
+      LANGFLOW_ALEMBIC_LOG_TO_STDOUT: "true"
     service:
       port: 7860
       type: ClusterIP
