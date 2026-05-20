@@ -25,7 +25,7 @@
   DISCLAIMER: These integrations are provided AS IS by Agnostic Security.
   Image digests are pinned per release. All support goes to upstream maintainers.
 */}}
-{{- /* Last updated: 2026-05-17T12:00:00+01:00 — feat: internalBearer secretKeyRef for OPENAI_API_KEY — Captain Bucket-C */ -}}
+{{- /* Last updated: 2026-05-20T12:00:00+01:00 — fix: readOnlyRootFilesystem:true default + extraVolumes/extraVolumeMounts for per-bundle writable paths (letta openapi_letta.json + nltk_data) */ -}}
 
 {{- $root := . -}}
 
@@ -75,7 +75,13 @@ spec:
             {{- toYaml $bundle.containerSecurityContext | nindent 12 }}
             {{- else }}
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false
+            # readOnlyRootFilesystem: true is the secure default.
+            # Per-bundle writable paths are handled via extraVolumeMounts (emptyDir/tmpfs)
+            # rather than degrading the whole rootfs to writable.
+            # Detection-lane parity finding (2026-05-20): this was incorrectly set to
+            # false since agent-bundles.yaml was introduced — Lu/Iris/Laura all missed it
+            # across multiple releases. Fixed as part of letta read_only:true closure.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
             {{- end }}
@@ -113,16 +119,26 @@ spec:
             {{- end }}
           resources:
             {{- toYaml $bundle.resources | nindent 12 }}
-          {{- if and $bundle.persistence $bundle.persistence.enabled }}
+          {{- if or (and $bundle.persistence $bundle.persistence.enabled) $bundle.extraVolumeMounts }}
           volumeMounts:
+            {{- if and $bundle.persistence $bundle.persistence.enabled }}
             - name: {{ printf "%s-data" $bundleID }}
               mountPath: {{ $bundle.persistence.mountPath }}
+            {{- end }}
+            {{- if $bundle.extraVolumeMounts }}
+            {{- toYaml $bundle.extraVolumeMounts | nindent 12 }}
+            {{- end }}
           {{- end }}
-      {{- if and $bundle.persistence $bundle.persistence.enabled }}
+      {{- if or (and $bundle.persistence $bundle.persistence.enabled) $bundle.extraVolumes }}
       volumes:
+        {{- if and $bundle.persistence $bundle.persistence.enabled }}
         - name: {{ printf "%s-data" $bundleID }}
           persistentVolumeClaim:
             claimName: {{ printf "yashigani-%s-data" $bundleID }}
+        {{- end }}
+        {{- if $bundle.extraVolumes }}
+        {{- toYaml $bundle.extraVolumes | nindent 8 }}
+        {{- end }}
       {{- end }}
 {{- if $bundle.service }}
 ---

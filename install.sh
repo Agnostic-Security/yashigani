@@ -10,6 +10,7 @@
 # last-updated: 2026-05-14T21:00:00+00:00 (feat: container auto-start on host reboot — _setup_auto_start + sub-functions; BUG-REBOOT-NO-AUTO-START / YSG-RISK-046)
 # last-updated: 2026-05-13T15:00:00+00:00 (fix(podman): scope :U-override-load to macOS Podman only — LINUX-SHARED-MOUNT-UID-CLOBBER)
 # last-updated: 2026-05-13T13:00:00+00:00 (fix(podman): always apply :U-bearing override on macOS Podman — MACOS-PODMAN-OVERRIDE-LOAD-GAP)
+# last-updated: 2026-05-20T12:00:00+01:00 (fix(install): Step 8e — pre-create docker/letta-runtime/openapi_letta.json before compose up for read_only:true letta container)
 # last-updated: 2026-05-13T00:00:00+00:00 (fix(podman): add :U to all secret bind-mounts and ephemeral chown — MACOS-PODMAN-PKI-VIRTIOFS-U)
 # last-updated: 2026-05-12T00:00:00+01:00 (fix(install): write agent-bundle token placeholders before PKI chown — INSTALLER-BUG-AGENT-TOKENS)
 # last-updated: 2026-05-11T12:00:00+01:00 (refactor(pki): split _pki_run_issuer into per-runtime functions — _pki_run_issuer_docker / _pki_run_issuer_podman_linux / _pki_run_issuer_podman_macos; podman cp pattern for macOS applehv)
@@ -7641,6 +7642,25 @@ main() {
         fi
       fi
     done
+
+    # Step 8e: Pre-create letta-runtime bind-mount host files.
+    # docker-compose.yml mounts ./letta-runtime/openapi_letta.json:/app/openapi_letta.json:rw
+    # as a single-file bind mount so letta can write openapi_letta.json (app.py:162)
+    # while the rootfs remains read_only:true. Docker requires the host-side path to exist
+    # as a FILE before bind-mounting (if it doesn't exist, Docker creates a directory at
+    # that path, causing letta startup to fail with IsADirectoryError).
+    # This only creates the file when the letta profile is active.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^letta$"; then
+      local _letta_rt_dir="${WORK_DIR}/docker/letta-runtime"
+      local _letta_openapi="${_letta_rt_dir}/openapi_letta.json"
+      if [[ ! -d "$_letta_rt_dir" ]]; then
+        mkdir -p "$_letta_rt_dir" || log_warn "Could not create letta-runtime dir — letta openapi bind-mount may fail"
+      fi
+      if [[ ! -f "$_letta_openapi" ]]; then
+        touch "$_letta_openapi" || log_warn "Could not create letta-runtime/openapi_letta.json placeholder — letta openapi bind-mount may fail"
+        log_info "Created letta-runtime/openapi_letta.json bind-mount placeholder"
+      fi
+    fi
 
     # Step 9: docker compose pull — OR air-gap bundle load
     if [[ "$AIR_GAP" == "true" ]]; then

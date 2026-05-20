@@ -961,9 +961,41 @@ agentBundles:
       runAsUser: 0
     containerSecurityContext:
       allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: false
+      # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).
+      # letta 0.16.7 write paths handled via extraVolumeMounts below:
+      #   /app/openapi_letta.json  — emptyDir (app.py:162 writes openapi schema at startup)
+      #   /root/nltk_data          — emptyDir (lifespan NLTK punkt_tab fallback download)
+      # All other writes go to /root/.letta (PVC) or /tmp (tmpfs via emptyDir medium:Memory).
+      # Detection-lane parity finding 2026-05-20: readOnlyRootFilesystem:false was never
+      # correct — set since agent-bundles.yaml introduction, missed by Lu/Iris/Laura across
+      # multiple releases. Closed as part of letta read_only:true security debt closure.
+      readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
+    # Extra volumes for letta write paths that cannot go to the persistent /root/.letta PVC.
+    extraVolumeMounts:
+      # letta app.py:162 writes openapi_letta.json relative to CWD (/app) at module import.
+      # emptyDir provides a writable inode at /app/openapi_letta.json without opening the
+      # rest of /app. subPath mounts the single file path only.
+      - name: letta-runtime
+        mountPath: /app/openapi_letta.json
+        subPath: openapi_letta.json
+      # NLTK punkt_tab download in lifespan (fallback — not pre-baked in Docker image).
+      # Silently fails without a writable path; emptyDir here avoids the silent failure.
+      - name: letta-nltk
+        mountPath: /root/nltk_data
+      # /tmp for Python runtime temp files.
+      - name: letta-tmp
+        mountPath: /tmp
+    extraVolumes:
+      - name: letta-runtime
+        emptyDir: {}
+      - name: letta-nltk
+        emptyDir: {}
+      - name: letta-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Mi
 
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)

@@ -1,6 +1,6 @@
 ---
 # Yashigani v2.23.4 — Docker Compose stack
-# Last updated: 2026-05-20T11:10:00+01:00 (fix(compose): AGENT-RUNTIME-003d disable read_only for letta — openapi+alembic write to CWD /app)
+# Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
 # Last updated: 2026-05-20T10:50:00+01:00 (fix(compose): AGENT-RUNTIME-003c drop sslmode=require from LETTA_PG_URI — pg8000 alembic path)
 # Last updated: 2026-05-20T10:30:00+01:00 (fix(compose): AGENT-RUNTIME-003b drop cd /tmp from letta shim + langflow ALEMBIC_LOG_TO_STDOUT)
 # Last updated: 2026-05-20T00:06:00+01:00 (fix(postgres,compose): LETTA-001 — pg_hba letta-specific TLS rule + sslmode=require URI)
@@ -1607,6 +1607,14 @@ services:
       # Captain Bucket-C: mount secrets dir so entrypoint shim can read
       # yashigani_internal_bearer at startup.
       - ./secrets:/run/secrets:ro
+      # letta 0.16.7 write-path fix — keep read_only:true on the rootfs:
+      # app.py:162 writes openapi_letta.json via Path("openapi_letta.json").write_text()
+      # relative to CWD (/app). Single-file bind mount creates a writable inode at exactly
+      # /app/openapi_letta.json without making the rest of /app writable. Pre-create the
+      # file on the host so Docker can bind it (bind-mount of a non-existent path creates
+      # a directory, not a file). The file is regenerated on every startup — host copy
+      # is just a placeholder. Installer (Su) creates this file in install.sh.
+      - ./letta-runtime/openapi_letta.json:/app/openapi_letta.json:rw
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8283/v1/health\", timeout=5)'"]
       interval: 15s
@@ -1618,18 +1626,14 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    # read_only skipped: letta writes openapi_letta.json to the current working
-    # directory at module import time (app.py:162 — generate_openapi_schema).
-    # CWD is /app (WORKDIR in upstream image) which is inside the rootfs.
-    # startup.sh also calls alembic from /app, requiring /app to be writable
-    # for the alembic.ini lookup. Helm equivalent: readOnlyRootFilesystem: false.
-    # YSG-RISK-048 addendum: letta rootfs is writable. Mitigated by no-new-privileges
-    # + cap_drop:ALL + named volume isolation + network policy.
-    # Forward-close v2.24.0: file-system hardening when letta allows configuring
-    # openapi output dir + alembic ini path via env vars.
+    read_only: true
     tmpfs:
-      # /tmp needed for Python runtime temp files.
+      # /tmp: Python runtime temp files.
       - /tmp:size=64m,mode=1777
+      # /root/nltk_data: NLTK punkt_tab download in lifespan (fallback, not pre-baked in image).
+      # NLTK download is wrapped in try/except; would fail silently without this tmpfs,
+      # but providing a writable path means punkt_tab is available for on-demand tokenisation.
+      - /root/nltk_data:size=32m,mode=0700
     security_opt:
       - no-new-privileges:true
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
