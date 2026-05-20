@@ -525,7 +525,7 @@ spec:
     {{- end }}
 
 ---
-# PgBouncer — accept ingress from gateway, backoffice, langgraph, and letta agents
+# PgBouncer — accept ingress from gateway, backoffice, and langgraph agents
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -550,10 +550,6 @@ spec:
         - podSelector:
             matchLabels:
               yashigani.io/bundle: langgraph
-        # letta uses shared Postgres (separate `letta` DB via pgbouncer)
-        - podSelector:
-            matchLabels:
-              yashigani.io/bundle: letta
         - podSelector:
             matchLabels:
               app.kubernetes.io/component: db-maintenance
@@ -830,8 +826,6 @@ spec:
           port: 8000    # langgraph
         - protocol: TCP
           port: 7860    # langflow
-        - protocol: TCP
-          port: 8283    # letta
         - protocol: TCP
           port: 18789   # openclaw
 

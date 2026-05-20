@@ -33,7 +33,7 @@
 #   redis_password      — gateway:1001, backoffice:1001, redis:999, budget-redis:999
 #   yashigani_internal_bearer
 #                       — gateway:1001+backoffice:1001 (via env); plus
-#                         langflow:1000, letta:0 (rootless→host-user), open-webui:0
+#                         langflow:1000, open-webui:0
 #                         via entrypoint shim `cat /run/secrets/yashigani_internal_bearer`
 #                         (YSG-SECRETS-DIST-001 — close class cycle from 86872a7→5a341cb)
 #
@@ -58,7 +58,6 @@
 #   grafana:472       Grafana (USER 472 upstream Dockerfile)
 #   prometheus:1001   Prometheus nobody (65534) + group_add 1001 → 0640 group-read
 #   langflow:1000     Bucket-C — langflowai/langflow:1.9.2 USER langflow (UID 1000)
-#   letta:0           Bucket-C — letta/letta:0.16.7 root (data at /root/.letta)
 #   open-webui:0      Bucket-C — open-webui:v0.9.2 root (runs bash start.sh as root)
 #   openclaw:1000     Bucket-C — openclaw Node image USER node (UID 1000); reads
 #                     openclaw_gateway_token via env only (not file at runtime)

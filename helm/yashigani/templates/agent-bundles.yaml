@@ -12,8 +12,7 @@
       tokenSecretKey      — injects YASHIGANI_AGENT_TOKEN from a K8s secret
     dbPasswordSecretName /
       dbPasswordSecretKey / pgbouncerServiceName
-                          — assembles LETTA_PG_URI (letta only; generic enough to
-                            extend to other bundles needing postgres)
+                          — assembles a PG_URI env var for bundles needing postgres
     service.port /
       service.type        — renders a ClusterIP Service for the bundle
     persistence.enabled /
@@ -25,7 +24,7 @@
   DISCLAIMER: These integrations are provided AS IS by Agnostic Security.
   Image digests are pinned per release. All support goes to upstream maintainers.
 */}}
-{{- /* Last updated: 2026-05-20T12:00:00+01:00 — fix: readOnlyRootFilesystem:true default + extraVolumes/extraVolumeMounts for per-bundle writable paths (letta openapi_letta.json + nltk_data) */ -}}
+{{- /* Last updated: 2026-05-20 — chore: remove letta bundle; letta repositioned to BYO-agent */ -}}
 
 {{- $root := . -}}
 
@@ -79,8 +78,7 @@ spec:
             # Per-bundle writable paths are handled via extraVolumeMounts (emptyDir/tmpfs)
             # rather than degrading the whole rootfs to writable.
             # Detection-lane parity finding (2026-05-20): this was incorrectly set to
-            # false since agent-bundles.yaml was introduced — Lu/Iris/Laura all missed it
-            # across multiple releases. Fixed as part of letta read_only:true closure.
+            # false since agent-bundles.yaml was introduced. Fixed in v2.23.4.
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
@@ -106,16 +104,13 @@ spec:
             {{- end }}
             {{- if and $bundle.dbPasswordSecretName $bundle.dbPasswordSecretKey }}
             {{- $pgHost := $bundle.pgbouncerServiceName | default "yashigani-pgbouncer" }}
-            - name: LETTA_PG_PASSWORD
+            - name: BUNDLE_PG_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ $bundle.dbPasswordSecretName }}
                   key: {{ $bundle.dbPasswordSecretKey }}
-            # asyncpg cannot present client certs via URI params. postgres pg_hba has a letta-specific
-            # TLS-only rule (no clientcert). Cluster-internal traffic; postgres TLS managed by K8s service.
-            # YSG-RISK-048: accepted MEDIUM → residual LOW. Forward close v2.24.0 if letta→psycopg3.
-            - name: LETTA_PG_URI
-              value: {{ printf "postgresql://yashigani_app:$(LETTA_PG_PASSWORD)@%s:5432/letta?sslmode=require" $pgHost | quote }}
+            - name: BUNDLE_PG_URI
+              value: {{ printf "postgresql://yashigani_app:$(BUNDLE_PG_PASSWORD)@%s:5432/app?sslmode=require" $pgHost | quote }}
             {{- end }}
           resources:
             {{- toYaml $bundle.resources | nindent 12 }}

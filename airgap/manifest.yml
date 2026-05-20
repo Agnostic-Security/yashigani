@@ -163,12 +163,6 @@ profiles:
         ref: "docker.io/langflowai/langflow:1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
         note: "LangFlow agent orchestration"
 
-      - name: "docker.io/letta/letta"
-        tag: "0.16.7"
-        digest: "sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
-        ref: "docker.io/letta/letta:0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
-        note: "Letta agent runtime"
-
       - name: "ghcr.io/openclaw/openclaw"
         tag: "2026.5.6"
         digest: "sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"

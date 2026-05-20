@@ -44,7 +44,6 @@
 #   smallstep/step-ca:0.30.2                    sha256:a2b17872915c193259b75a5474c398326f41bd199f0842093e52cf4182bc8270
 #   ghcr.io/open-webui/open-webui:v0.9.2        sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49
 #   langflowai/langflow:1.9.2                   sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14
-#   letta/letta:0.16.7                          sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c
 #   ghcr.io/openclaw/openclaw:2026.5.6          sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc
 #   wazuh/wazuh-manager:4.14.5                  sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109
 #   wazuh/wazuh-indexer:4.14.5                  sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
@@ -115,9 +114,6 @@ services:
 
   langflow:
     image: docker.io/langflowai/langflow:1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14
-
-  letta:
-    image: docker.io/letta/letta:0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c
 
   openclaw:
     image: ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc

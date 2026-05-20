@@ -230,7 +230,7 @@ adminBootstrap:
 # Internal Bearer Token (Captain Bucket-C — per-install, rotatable secret)
 # ---------------------------------------------------------------------------
 # YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (open-webui,
-# langflow, letta) present as the OpenAI `Authorization: Bearer <token>` when
+# langflow, openclaw) present as the OpenAI `Authorization: Bearer <token>` when
 # calling gateway:8081/v1. The gateway's AgentAuthMiddleware validates it at
 # the app layer. Previously hardcoded to "yashigani-internal"; now per-install.
 #
@@ -317,7 +317,6 @@ backoffice:
   # endpoint. Agent registration is still admin-gated (TOTP step-up + audit trail).
   agentUpstreamHostnames:
     - langflow
-    - letta
     - openclaw
   image:
     # Built locally by install.sh from the v2.23.4 tagged source.
@@ -869,7 +868,7 @@ agentBundles:
       port: 7860
       type: ClusterIP
     # YSG-RISK-005 #3av: requests = 50% of limit.
-    # Langflow is heavier than letta (visual UI + workflow engine): 1 GiB limit.
+    # Langflow (visual UI + workflow engine): 1 GiB limit.
     resources:
       requests:
         cpu: "500m"
@@ -899,103 +898,9 @@ agentBundles:
       capabilities:
         drop: ["ALL"]
 
-  # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
-  # https://github.com/letta-ai/letta
-  # Agent with long-term memory, tool use, and conversation persistence.
-  # Exposes REST API on port 8283. Uses shared Postgres (separate `letta` DB).
-  # Dependency: Postgres must be available and the `letta` database must exist.
-  # The install.sh installer creates the `letta` database; for K8s deployments
-  # run `CREATE DATABASE letta OWNER yashigani_app;` before enabling this bundle.
-  letta:
-    enabled: false
-    image:
-      # Pinned to 0.16.7 to match docker-compose.yml.
-      # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
-      repository: docker.io/letta/letta
-      tag: "0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
-      pullPolicy: IfNotPresent
-    replicaCount: 1
-    env:
-      # Route LLM calls through Yashigani gateway
-      OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
-      # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
-      # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
-      LETTA_LLM_MODEL: "qwen2.5:3b"
-      LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
-    # Letta connects to Postgres. The URI is assembled from the postgres secret.
-    # Secret must contain a `postgres_password` key (same secret as Yashigani core).
-    # Resulting env: LETTA_PG_URI=postgresql://yashigani_app:<pw>@yashigani-pgbouncer:5432/letta
-    dbPasswordSecretName: "yashigani-postgres-secrets"
-    dbPasswordSecretKey: "postgres_password"
-    # K8s service hostname for pgbouncer (used to build LETTA_PG_URI).
-    # Must match the pgbouncer service name rendered by the chart.
-    pgbouncerServiceName: "yashigani-pgbouncer"
-    service:
-      port: 8283
-      type: ClusterIP
-    # YSG-RISK-005 #3av: requests = 50% of limit.
-    resources:
-      requests:
-        cpu: "500m"
-        memory: "512Mi"
-      limits:
-        cpu: "1000m"
-        memory: "1024Mi"
-    # Persistent volume for Letta agent memory store.
-    persistence:
-      enabled: true
-      mountPath: /root/.letta
-      size: 5Gi
-      storageClass: ""
-      accessMode: ReadWriteOnce
-    tokenSecretName: "yashigani-letta-token"
-    tokenSecretKey: "token"
-    # Letta image (0.16.7) runs as uid=0 (root). Upstream requires root for
-    # /root/.letta persistence path. runAsNonRoot must be false for this bundle.
-    # Compensating controls: seccomp RuntimeDefault, CAP_ALL dropped,
-    # allowPrivilegeEscalation: false, network policy restricts egress to gateway
-    # + pgbouncer only. Risk: YSG-RISK-005 (agent bundle third-party).
-    # Re-evaluate if letta ships a non-root image variant.
-    podSecurityContext:
-      runAsNonRoot: false
-      runAsUser: 0
-    containerSecurityContext:
-      allowPrivilegeEscalation: false
-      # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).
-      # letta 0.16.7 write paths handled via extraVolumeMounts below:
-      #   /app/openapi_letta.json  — emptyDir (app.py:162 writes openapi schema at startup)
-      #   /root/nltk_data          — emptyDir (lifespan NLTK punkt_tab fallback download)
-      # All other writes go to /root/.letta (PVC) or /tmp (tmpfs via emptyDir medium:Memory).
-      # Detection-lane parity finding 2026-05-20: readOnlyRootFilesystem:false was never
-      # correct — set since agent-bundles.yaml introduction, missed by Lu/Iris/Laura across
-      # multiple releases. Closed as part of letta read_only:true security debt closure.
-      readOnlyRootFilesystem: true
-      capabilities:
-        drop: ["ALL"]
-    # Extra volumes for letta write paths that cannot go to the persistent /root/.letta PVC.
-    extraVolumeMounts:
-      # letta app.py:162 writes openapi_letta.json relative to CWD (/app) at module import.
-      # emptyDir provides a writable inode at /app/openapi_letta.json without opening the
-      # rest of /app. subPath mounts the single file path only.
-      - name: letta-runtime
-        mountPath: /app/openapi_letta.json
-        subPath: openapi_letta.json
-      # NLTK punkt_tab download in lifespan (fallback — not pre-baked in Docker image).
-      # Silently fails without a writable path; emptyDir here avoids the silent failure.
-      - name: letta-nltk
-        mountPath: /root/nltk_data
-      # /tmp for Python runtime temp files.
-      - name: letta-tmp
-        mountPath: /tmp
-    extraVolumes:
-      - name: letta-runtime
-        emptyDir: {}
-      - name: letta-nltk
-        emptyDir: {}
-      - name: letta-tmp
-        emptyDir:
-          medium: Memory
-          sizeLimit: 64Mi
+  # Letta — removed from bundled runtime (v2.23.4).
+  # Register letta as a BYO-agent via POST /admin/agents.
+  # See docs/byo-agent-letta.md for setup instructions.
 
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)

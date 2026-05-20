@@ -86,7 +86,7 @@ x-common-env: &common-env
   # the value reaches every Python service (gateway + backoffice) that reads
   # os.environ.get("YASHIGANI_INTERNAL_BEARER"). Fail-fast syntax: missing value
   # surfaces at compose-up, not deep inside the container at lifespan startup.
-  # Bucket-C shims (open-webui, langflow, letta) read from /run/secrets/yashigani_internal_bearer
+  # Bucket-C shims (open-webui, langflow, openclaw) read from /run/secrets/yashigani_internal_bearer
   # file directly — they also benefit from the env var for consistency.
   YASHIGANI_INTERNAL_BEARER: ${YASHIGANI_INTERNAL_BEARER:?run install.sh to generate yashigani_internal_bearer}
 
@@ -409,12 +409,12 @@ services:
       # service — the SSRF guard still blocks all other private IPs and all non-HTTP(S)
       # schemes. Agent registration remains admin-gated (TOTP step-up + audit log).
       # TM trade-off: TA-3 (insider admin SSRF) / TA-2 (admin compromise) — attacker
-      # who can both compromise an admin account AND point the `langflow`, `letta`, or
+      # who can both compromise an admin account AND point the `langflow` or
       # `openclaw` hostname to a private IP bypasses the IP-class check. Compensating
       # controls: TOTP step-up on every registration, OPA-gated invocation, audit trail.
       # Operators extending with custom agents: append comma-separated names to this value.
-      # Example: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,letta,openclaw,custom-agent
-      YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
+      # Example: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,openclaw,custom-agent
+      YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,openclaw"
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -797,7 +797,7 @@ services:
     #           capabilities: [gpu]
 
   # Model bootstrap — pull default LLM model when any AI workload is enabled.
-  # Gated on profiles: [openwebui, langflow, letta, openclaw] — runs when any
+  # Gated on profiles: [openwebui, langflow, openclaw] — runs when any
   # of these profiles is active (SF-011 fix 2026-05-19: was openwebui-only,
   # which left agent-bundle installs with 0 models and HTTP 404 on chat).
   # Model: qwen2.5:3b (1.9 GB, Qwen 2.5 3B-parameter instruct, available on
@@ -876,19 +876,18 @@ services:
       - data
       - edge    # Required for model registry DNS resolution
     # SF-011 fix (2026-05-19): ollama-init must also run when agent bundles
-    # (langflow, letta, openclaw) are active without --with-openwebui.
+    # (langflow, openclaw) are active without --with-openwebui.
     # The gateway DEFAULT_MODELS env defaults to qwen2.5:3b for ALL inference;
     # without the model pulled, /v1/chat/completions returns HTTP 404
     # "model not found" for all agent-bundle workloads regardless of auth.
     # Root cause: ollama-init was gated on `openwebui` only, so
-    # `--agent-bundles langflow,letta` with no `--with-openwebui` never ran
+    # `--agent-bundles langflow` with no `--with-openwebui` never ran
     # it → 0 models in ollama → 404 on every chat call.
     # Fix: add all agent-bundle profiles so ollama-init runs whenever any
     # AI workload that needs the model is active.
     profiles:
       - openwebui
       - langflow
-      - letta
       - openclaw
 
   # ---------------------------------------------------------------------------
@@ -1474,7 +1473,6 @@ services:
   # Yashigani release. All support goes to the upstream maintainers.
   # Enable at install time or via:
   #   docker compose --profile langflow up -d
-  #   docker compose --profile letta up -d
   #   docker compose --profile openclaw up -d
   #
   # DISCLAIMER: These integrations carry no support obligation from
@@ -1557,93 +1555,10 @@ services:
     profiles:
       - langflow
 
-  # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
-  # https://github.com/letta-ai/letta
-  # Agent with long-term memory, tool use, and conversation persistence.
-  # Exposes REST API on port 8283 with OpenAI-compatible chat endpoint.
-  letta:
-    dns_search: ["."]
-    image: docker.io/letta/letta:0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c
-    restart: unless-stopped
-    mem_limit: ${YASHIGANI_LETTA_MEM_LIMIT:-1024m}
-    cpus: ${YASHIGANI_LETTA_CPU_LIMIT:-1.0}
-    # Captain Bucket-C: entrypoint shim reads YASHIGANI_INTERNAL_BEARER from
-    # /run/secrets/yashigani_internal_bearer and exports it as OPENAI_API_KEY.
-    # Letta 0.16.7 upstream: ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-    #                        CMD ["./letta/server/startup.sh"]
-    # startup.sh: runs `alembic upgrade head` then starts letta server.
-    # AGENT-RUNTIME-003: original shim used `exec "$@"` which resolved to
-    # `exec letta server --host 0.0.0.0` — bypassing startup.sh and alembic
-    # migrations, causing "relation 'organizations' does not exist" crash.
-    # Fix: exec /app/letta/server/startup.sh (runs alembic upgrade head first).
-    # AGENT-RUNTIME-003b (2026-05-20): prior fix added `cd /tmp` before exec,
-    # believing letta writes openapi_letta.json to CWD at runtime. Investigation
-    # confirms this is false — openapi_letta.json is in .gitignore, not written
-    # by the server at runtime. `cd /tmp` caused alembic to fail ("No
-    # 'script_location' key found") because alembic.ini is at /app/alembic.ini
-    # and alembic resolves script_location relative to CWD. Fix: drop cd /tmp.
-    entrypoint:
-      - /bin/sh
-      - -c
-      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec /app/letta/server/startup.sh'
-    environment:
-      # Route LLM calls through Yashigani gateway
-      OPENAI_API_BASE: http://gateway:8080/v1
-      # OPENAI_API_KEY is injected by the entrypoint shim from
-      # /run/secrets/yashigani_internal_bearer — do NOT set it here.
-      LETTA_LLM_MODEL: "qwen2.5:3b"
-      LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
-      # Use shared Postgres for persistence (separate DB).
-      # asyncpg (letta's SQLAlchemy async driver) and pg8000 (alembic sync driver) both
-      # cannot negotiate TLS via URI params — asyncpg ignores libpq cert params; pg8000
-      # uses ssl_context not sslmode kwarg. Plain TCP + scram-sha-256 is the working config.
-      # pg_hba rule is `host letta yashigani_app scram-sha-256` (plain TCP, before the
-      # hostssl clientcert catch-all).
-      # YSG-RISK-048: plain TCP + password-only auth for letta; forward-close v2.24.0
-      # when letta migrates to psycopg3 or asyncpg adds URI cert support.
-      LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/letta
-    volumes:
-      - letta_data:/root/.letta
-      # Captain Bucket-C: mount secrets dir so entrypoint shim can read
-      # yashigani_internal_bearer at startup.
-      - ./secrets:/run/secrets:ro
-      # letta 0.16.7 write-path fix — keep read_only:true on the rootfs:
-      # app.py:162 writes openapi_letta.json via Path("openapi_letta.json").write_text()
-      # relative to CWD (/app). Single-file bind mount creates a writable inode at exactly
-      # /app/openapi_letta.json without making the rest of /app writable. Pre-create the
-      # file on the host so Docker can bind it (bind-mount of a non-existent path creates
-      # a directory, not a file). The file is regenerated on every startup — host copy
-      # is just a placeholder. Installer (Su) creates this file in install.sh.
-      - ./letta-runtime/openapi_letta.json:/app/openapi_letta.json:rw
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8283/v1/health\", timeout=5)'"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    depends_on:
-      gateway:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    read_only: true
-    tmpfs:
-      # /tmp: Python runtime temp files.
-      - /tmp:size=64m,mode=1777
-      # /root/nltk_data: NLTK punkt_tab download in lifespan (fallback, not pre-baked in image).
-      # NLTK download is wrapped in try/except; would fail silently without this tmpfs,
-      # but providing a writable path means punkt_tab is available for on-demand tokenisation.
-      - /root/nltk_data:size=32m,mode=0700
-    security_opt:
-      - no-new-privileges:true
-    # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
-    # No cap_add: letta binds port 8283 (non-privileged).
-    cap_drop: [ALL]
-    # EX-231-10: letta calls gateway + postgres, both on `data`.
-    networks:
-      - data
-    profiles:
-      - letta
+  # Letta — REMOVED from bundled runtime (v2.23.4).
+  # Letta is repositioned to Tier-3 client-imported memory layer per
+  # [[project_yashigani_agent_framework_integration_backlog]].
+  # Register letta as a BYO-agent via POST /admin/agents (see BYO-agent docs).
 
   # Goose — REMOVED (ACP protocol too slow on CPU, ~300s per request)
 
@@ -1923,8 +1838,6 @@ volumes:
   openclaw_data:
     driver: local
   langflow_data:
-    driver: local
-  letta_data:
     driver: local
   openwebui_data:
     driver: local
