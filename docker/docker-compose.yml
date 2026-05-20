@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.23.4 — Docker Compose stack
+# Last updated: 2026-05-20T10:30:00+01:00 (fix(compose): AGENT-RUNTIME-003b drop cd /tmp from letta shim + langflow ALEMBIC_LOG_TO_STDOUT)
 # Last updated: 2026-05-20T00:06:00+01:00 (fix(postgres,compose): LETTA-001 — pg_hba letta-specific TLS rule + sslmode=require URI)
 # Last updated: 2026-05-19T00:00:00+00:00 (fix(compose): ollama-init profiles — add langflow/letta/openclaw so SF-011 closed; umask 0077 in gateway-start.sh)
 # Last updated: 2026-05-17T12:00:00+01:00 (feat: ollama-init profiles gate + disk-space check + env var — auto-pull model only when --with-openwebui)
@@ -1514,6 +1515,10 @@ services:
       # Named volume langflow_data:/app/langflow is writable.
       LANGFLOW_DATABASE_URL: "sqlite:////app/langflow/langflow.db"
       LANGFLOW_CONFIG_DIR: "/app/langflow/config"
+      # YSG-RISK-008 (read_only:true): alembic migration log cannot write to
+      # /app/.venv/.../langflow/alembic/alembic.log (read-only rootfs).
+      # redirect to stdout — identical output, no file needed.
+      LANGFLOW_ALEMBIC_LOG_TO_STDOUT: "true"
     volumes:
       - langflow_data:/app/langflow
       # Captain Bucket-C: mount secrets dir so entrypoint shim can read
@@ -1568,17 +1573,17 @@ services:
     # AGENT-RUNTIME-003: original shim used `exec "$@"` which resolved to
     # `exec letta server --host 0.0.0.0` — bypassing startup.sh and alembic
     # migrations, causing "relation 'organizations' does not exist" crash.
-    # Fix: exec /app/letta/server/startup.sh (absolute path — safe from CWD=/tmp).
+    # Fix: exec /app/letta/server/startup.sh (runs alembic upgrade head first).
+    # AGENT-RUNTIME-003b (2026-05-20): prior fix added `cd /tmp` before exec,
+    # believing letta writes openapi_letta.json to CWD at runtime. Investigation
+    # confirms this is false — openapi_letta.json is in .gitignore, not written
+    # by the server at runtime. `cd /tmp` caused alembic to fail ("No
+    # 'script_location' key found") because alembic.ini is at /app/alembic.ini
+    # and alembic resolves script_location relative to CWD. Fix: drop cd /tmp.
     entrypoint:
       - /bin/sh
       - -c
-      # CWD change: letta writes openapi_letta.json to Path("openapi_letta.json")
-      # (relative to CWD) in app.py:162. Upstream WORKDIR is /app (read-only under
-      # read_only:true). cd /tmp before exec so the write lands in /tmp (writable
-      # via existing tmpfs). File is a dev/SDK-generator artifact — never read back
-      # at runtime. FastAPI in-memory openapi_schema is unaffected by CWD.
-      # startup.sh uses only absolute paths — CWD=/tmp is safe for migration phase.
-      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && cd /tmp && exec /app/letta/server/startup.sh'
+      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec /app/letta/server/startup.sh'
     environment:
       # Route LLM calls through Yashigani gateway
       OPENAI_API_BASE: http://gateway:8080/v1
