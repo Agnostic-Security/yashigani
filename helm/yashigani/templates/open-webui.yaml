@@ -51,6 +51,11 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — open-webui receives
+        # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups is
+        # not functionally required here. Added for Compose↔Helm parity.
+        # Laura GID-001: openclaw excluded (bearer via env var injection, no file read).
+        supplementalGroups: [2002]
         seccompProfile:
           type: RuntimeDefault
       # Retro #3ak follow-up (v2.23.1 GA fix) — the upstream open-webui image bakes

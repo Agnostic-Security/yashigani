@@ -558,6 +558,12 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (open-webui.yaml:90,110).
     # No cap_add: open-webui binds port 8080 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DESIGN-002 / LAURA-TM-GID-001: open-webui Bucket-C shim reads
+    # yashigani_internal_bearer via `cat /run/secrets/yashigani_internal_bearer`
+    # at startup. GID 2002 (ysg-secrets) grants group-read on the 0640 file.
+    # Laura GID-001: openclaw excluded (bearer via OPENCLAW_GATEWAY_TOKEN env var).
+    group_add:
+      - "2002"
     # EX-231-10 (v2.23.4 BUG-1 fix): open-webui joins BOTH caddy_internal AND data.
     # caddy_internal — Caddy reverse-proxies TO open-webui:8080. Without this
     #   network, the DNS name "open-webui" is unresolvable from Caddy's namespace
@@ -624,6 +630,11 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (budget-redis.yaml:49).
     # No cap_add: redis binds port 6380 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DESIGN-002 / LAURA-TM-GID-001: budget-redis reads redis_password via
+    # `cat /run/secrets/redis_password` in the startup command (UID 999,
+    # cap_drop ALL, no DAC_OVERRIDE). GID 2002 (ysg-secrets) grants group-read.
+    group_add:
+      - "2002"
     # EX-231-10: budget-redis is a data-plane dep of gateway/backoffice only.
     networks:
       - data
@@ -734,6 +745,11 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (redis.yaml:51).
     # No cap_add: redis binds port 6380 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DESIGN-002 / LAURA-TM-GID-001: redis reads redis_password via
+    # `cat /run/secrets/redis_password` in the startup command (UID 999,
+    # cap_drop ALL, no DAC_OVERRIDE). GID 2002 (ysg-secrets) grants group-read.
+    group_add:
+      - "2002"
     # EX-231-10: redis is a data-plane dep only.
     networks:
       - data
@@ -1081,6 +1097,12 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (postgres.yaml:67).
     # No cap_add: postgres binds port 5432 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DESIGN-002 / LAURA-TM-GID-001: postgres reads postgres_password via
+    # POSTGRES_PASSWORD_FILE at startup (UID 999, cap_drop ALL, no DAC_OVERRIDE).
+    # GID 2002 (ysg-secrets) grants group-read on the 0640 file.
+    # Laura GID-001: openclaw excluded (bearer via env var, no file read).
+    group_add:
+      - "2002"
     # EX-231-10: postgres is data-plane only.
     networks:
       - data
@@ -1550,6 +1572,12 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
     # No cap_add: langflow binds port 7860 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DESIGN-002 / LAURA-TM-GID-001: langflow Bucket-C shim reads
+    # yashigani_internal_bearer via `cat /run/secrets/yashigani_internal_bearer`
+    # at startup. GID 2002 (ysg-secrets) grants group-read on the 0640 file.
+    # Laura GID-001: openclaw excluded (bearer via OPENCLAW_GATEWAY_TOKEN env var).
+    group_add:
+      - "2002"
     # EX-231-10: langflow calls gateway via http://gateway:8080/v1 (same as
     # open-webui). Joins `data` for gateway DNS. Does NOT join caddy_internal.
     networks:
@@ -1706,6 +1734,12 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
     # No cap_add: letta binds port 8283 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DESIGN-002 / LAURA-TM-GID-001: letta Bucket-C shim reads
+    # yashigani_internal_bearer via `cat /run/secrets/yashigani_internal_bearer`
+    # at startup. GID 2002 (ysg-secrets) grants group-read on the 0640 file.
+    # Laura GID-001: openclaw excluded (bearer via OPENCLAW_GATEWAY_TOKEN env var).
+    group_add:
+      - "2002"
     # EX-231-10: letta calls gateway + postgres, both on `data`.
     networks:
       - data

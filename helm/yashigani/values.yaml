@@ -893,6 +893,11 @@ agentBundles:
     podSecurityContext:
       runAsNonRoot: true
       runAsUser: 1000
+      # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — langflow receives
+      # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups
+      # is not functionally required here. Added for Compose↔Helm parity.
+      # Laura GID-001: openclaw excluded (bearer via env var, no file read).
+      supplementalGroups: [2002]
     containerSecurityContext:
       allowPrivilegeEscalation: false
       readOnlyRootFilesystem: false
@@ -959,6 +964,11 @@ agentBundles:
     podSecurityContext:
       runAsNonRoot: false
       runAsUser: 0
+      # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — letta receives
+      # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups
+      # is not functionally required here. Added for Compose↔Helm parity.
+      # Laura GID-001: openclaw excluded (bearer via env var, no file read).
+      supplementalGroups: [2002]
     containerSecurityContext:
       allowPrivilegeEscalation: false
       # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).
