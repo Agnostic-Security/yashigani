@@ -1557,6 +1557,82 @@ services:
     profiles:
       - langflow
 
+  # letta-pg-stunnel — TLS-terminating stunnel sidecar for letta→postgres mTLS
+  # YSG-RISK-048 CLOSED 2026-05-20: letta (asyncpg) cannot present client certs
+  # via URI params. This sidecar accepts plain TCP from letta on port 5432,
+  # dials postgres:5432 over mTLS presenting letta_stunnel_client.crt/key,
+  # and validates the server cert against ca_root.crt (verify=2).
+  # Image: dweomer/stunnel:latest — Alpine-based, minimal footprint (~4 MB),
+  # well-maintained, widely used for stunnel sidecars in Docker deployments.
+  # Pinned to digest sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
+  # (verified 2026-05-20 via `docker manifest inspect --verbose`).
+  letta-pg-stunnel:
+    dns_search: ["."]
+    image: docker.io/dweomer/stunnel:latest@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
+    restart: unless-stopped
+    mem_limit: 32m
+    cpus: 0.1
+    environment:
+      # dweomer/stunnel entrypoint reads these env vars and generates stunnel.conf
+      # from /srv/stunnel/stunnel.conf.template via envsubst. No custom conf file needed.
+      STUNNEL_SERVICE: "letta-pg"
+      # Accept plain TCP on all interfaces port 5432. Letta connects to
+      # letta-pg-stunnel:5432 (plain TCP, no sslmode in URI).
+      STUNNEL_ACCEPT: "5432"
+      # Dial postgres:5432 over mTLS.
+      STUNNEL_CONNECT: "postgres:5432"
+      # client = yes: stunnel acts as TLS client (not server) toward postgres.
+      STUNNEL_CLIENT: "yes"
+      # Present letta-stunnel_client.crt/key to postgres (mTLS client identity).
+      # File name matches service_identities.yaml name: letta-stunnel →
+      # install.sh issues letta-stunnel_client.crt/key (hyphen, not underscore).
+      STUNNEL_CRT: "/run/secrets/letta-stunnel_client.crt"
+      STUNNEL_KEY: "/run/secrets/letta-stunnel_client.key"
+      # Validate postgres server cert against our CA bundle (verify=2 = verify peer).
+      STUNNEL_CAFILE: "/run/secrets/ca_root.crt"
+      STUNNEL_VERIFY: "2"
+      # Enforce TLS 1.2 minimum (sslVersionMin is set in the template already).
+      # dweomer/stunnel template already sets sslVersionMin = TLSv1.2.
+      STUNNEL_DEBUG: "5"
+    volumes:
+      - ./secrets:/run/secrets:ro
+    healthcheck:
+      # nc (netcat) is available in Alpine. A successful TCP connect to the
+      # plain-TCP listener on 5432 proves stunnel is accepting connections.
+      # The TLS tunnel to postgres is validated by the pg_stat_ssl query at deploy time.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5432"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      # stunnel writes pid + log to /var/run/stunnel/ and /var/log/stunnel/
+      # (paths set in stunnel.conf.template). emptyDir via tmpfs — no persistence needed.
+      - /var/run/stunnel:size=4m,mode=0755
+      - /var/log/stunnel:size=8m,mode=0755
+      # stunnel.sh writes the generated stunnel.conf to /etc/stunnel/stunnel.conf
+      # (STUNNEL_CONF env var default). That path is in the read-only rootfs
+      # — needs a writable tmpfs overlay.
+      - /etc/stunnel:size=4m,mode=0755
+      # update-ca-certificates writes to /usr/local/share/ca-certificates and
+      # /etc/ssl/certs in the entrypoint. Those paths are under the read-only rootfs,
+      # so stunnel.sh will fail without a writable overlay. Two tmpfs mounts cover them.
+      - /usr/local/share/ca-certificates:size=4m,mode=0755
+      - /etc/ssl/certs:size=4m,mode=0755
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # EX-231-10: letta-pg-stunnel is a data-plane dep; sits on `data` network
+    # alongside postgres and letta.
+    networks:
+      - data
+    profiles:
+      - letta
+
   # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
   # https://github.com/letta-ai/letta
   # Agent with long-term memory, tool use, and conversation persistence.
@@ -1594,14 +1670,12 @@ services:
       LETTA_LLM_MODEL: "qwen2.5:3b"
       LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
       # Use shared Postgres for persistence (separate DB).
-      # asyncpg (letta's SQLAlchemy async driver) and pg8000 (alembic sync driver) both
-      # cannot negotiate TLS via URI params — asyncpg ignores libpq cert params; pg8000
-      # uses ssl_context not sslmode kwarg. Plain TCP + scram-sha-256 is the working config.
-      # pg_hba rule is `host letta yashigani_app scram-sha-256` (plain TCP, before the
-      # hostssl clientcert catch-all).
-      # YSG-RISK-048: plain TCP + password-only auth for letta; forward-close v2.24.0
-      # when letta migrates to psycopg3 or asyncpg adds URI cert support.
-      LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/letta
+      # Letta connects to letta-pg-stunnel:5432 (plain TCP — no sslmode param).
+      # letta-pg-stunnel terminates the plain TCP connection from letta and dials
+      # postgres:5432 over mTLS, presenting letta_stunnel_client.crt. From letta's
+      # perspective this is a plain TCP connection to a local postgres-like endpoint.
+      # YSG-RISK-048 CLOSED 2026-05-20 — stunnel sidecar provides full mTLS.
+      LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@letta-pg-stunnel:5432/letta
     volumes:
       - letta_data:/root/.letta
       # Captain Bucket-C: mount secrets dir so entrypoint shim can read
@@ -1625,6 +1699,8 @@ services:
       gateway:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      letta-pg-stunnel:
         condition: service_healthy
     read_only: true
     tmpfs:

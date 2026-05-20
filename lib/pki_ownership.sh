@@ -91,6 +91,12 @@ _YSG_PKI_SERVICE_MAP=(
   # Postgres: official image UID 999. 05-enable-ssl.sh reads key via `install`
   # as the postgres user after chown. Retro #3ad — v2.23.1.
   "postgres:999:0600"
+  # letta-pg-stunnel: dweomer/stunnel — no USER directive; runs as root initially.
+  # stunnel.conf setuid=stunnel drops to UID 100 after bind, but the key file is
+  # read at startup (before setuid), so chown to UID 0 (root-owned) is correct.
+  # Mode 0600: only root reads the key; stunnel process is root when it reads it.
+  # YSG-RISK-048 CLOSED 2026-05-20.
+  "letta-stunnel:0:0600"
   # OPA: openpolicyagent/opa USER=1000:1000. V232-SMOKE-002.
   "policy:1000:0600"
   # OpenTelemetry Collector + Jaeger: ARG USER_UID=10001. V232-SMOKE-002.

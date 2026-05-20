@@ -212,6 +212,21 @@ services:
     bootstrap_token_sha256: "6286076bbe4c6ff3d145f927c673b7923dc44fca380efc8811489c71160950c4"
     revoked: false
 
+  - name: letta-stunnel
+    # letta-stunnel: TLS-terminating stunnel sidecar for letta→postgres mTLS.
+    # YSG-RISK-048 CLOSED 2026-05-20.
+    # This cert is presented by the letta-pg-stunnel container (dweomer/stunnel)
+    # when establishing mTLS connections to postgres. Postgres verifies the cert
+    # against ca_intermediate.crt (pg_hba clientcert=verify-ca).
+    # dns_sans include both the compose service name and the K8s sidecar hostname
+    # (127.0.0.1 loopback — no DNS SAN needed for client certs; kept for parity).
+    dns_sans: [letta-stunnel, letta-stunnel.internal, yashigani-letta-stunnel]
+    spiffe_id: spiffe://yashigani.internal/letta-stunnel
+    purpose: "TLS-terminating stunnel sidecar — proxies letta→postgres over mTLS (profile: letta)"
+    mtls_capable: true        # stunnel is the mTLS client toward postgres.
+    bootstrap_token_sha256: ""  # populated by install.sh on first deploy
+    revoked: false
+
   - name: openclaw
     dns_sans: [openclaw, openclaw.internal, yashigani-openclaw]
     spiffe_id: spiffe://yashigani.internal/openclaw

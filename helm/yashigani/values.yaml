@@ -996,6 +996,119 @@ agentBundles:
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
+      # Volumes for letta-pg-stunnel sidecar write paths (read_only rootfs).
+      # stunnel.sh write paths (all under read-only rootfs without these):
+      #   /etc/stunnel/stunnel.conf  — generated stunnel.conf (envsubst from template)
+      #   /var/run/stunnel/          — PID file
+      #   /var/log/stunnel/          — stunnel log
+      #   /usr/local/share/ca-certificates — CA bundle staging (update-ca-certificates)
+      #   /etc/ssl/certs             — system CA store (update-ca-certificates output)
+      - name: stunnel-conf
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Mi
+      - name: stunnel-run
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Mi
+      - name: stunnel-log
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Mi
+      - name: stunnel-ca-certs
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Mi
+      - name: stunnel-ssl-certs
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Mi
+      # PKI secrets volume — provides ca_root.crt + letta_stunnel_client.crt/key
+      # to the letta-pg-stunnel sidecar. References the same Secret as all other
+      # mTLS workloads (yashigani-pki-certs, populated by the mtls-bootstrap-job).
+      # defaultMode 0440: group-readable so the stunnel user (UID 100) can read
+      # the key after stunnel drops from root to the `stunnel` system user.
+      - name: letta-stunnel-pki
+        secret:
+          secretName: "yashigani-pki-certs"
+          defaultMode: 0440
+    # letta-pg-stunnel sidecar — TLS-terminating proxy for letta→postgres mTLS.
+    # YSG-RISK-048 CLOSED 2026-05-20.
+    # Letta connects to 127.0.0.1:5432 (loopback); stunnel presents
+    # letta_stunnel_client.crt to postgres over mTLS (verify=2, CA-validated).
+    # dweomer/stunnel image: Alpine-based (~4 MB), pinned to digest.
+    # Image runs as root initially; stunnel.conf setuid/setgid drops to the
+    # `stunnel` system user (Alpine adduser -S, UID 100) after binding port.
+    # Cap_drop ALL + readOnlyRootFilesystem enforced; emptyDirs for write paths.
+    extraContainers:
+      - name: letta-pg-stunnel
+        image: "docker.io/dweomer/stunnel:latest@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef"
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          # stunnel image has no USER directive; runs as root initially and drops
+          # to `stunnel` user (UID 100) via stunnel.conf setuid. runAsNonRoot:false
+          # is required for the initial bind/setup phase. Compensating: cap_drop ALL,
+          # readOnlyRootFilesystem, allowPrivilegeEscalation:false.
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+          # dweomer/stunnel entrypoint reads STUNNEL_* vars and generates stunnel.conf
+          # via envsubst from /srv/stunnel/stunnel.conf.template.
+          - name: STUNNEL_SERVICE
+            value: "letta-pg"
+          # Accept plain TCP on loopback port 5432. Letta connects to 127.0.0.1:5432.
+          - name: STUNNEL_ACCEPT
+            value: "127.0.0.1:5432"
+          # Dial postgres ClusterIP service over mTLS (K8s service name).
+          - name: STUNNEL_CONNECT
+            value: "yashigani-postgres:5432"
+          # client=yes: stunnel acts as TLS client (not server) toward postgres.
+          - name: STUNNEL_CLIENT
+            value: "yes"
+          # Present letta-stunnel_client.crt/key to postgres (mTLS identity).
+          # File name matches service_identities.yaml name: letta-stunnel →
+          # mtls-bootstrap-job issues letta-stunnel_client.crt/key (hyphen).
+          - name: STUNNEL_CRT
+            value: "/run/secrets/letta-stunnel_client.crt"
+          - name: STUNNEL_KEY
+            value: "/run/secrets/letta-stunnel_client.key"
+          # Validate postgres server cert against Yashigani CA (verify=2 = verify peer).
+          - name: STUNNEL_CAFILE
+            value: "/run/secrets/ca_root.crt"
+          - name: STUNNEL_VERIFY
+            value: "2"
+          # verifyChain=yes: full chain validation from CA root.
+          - name: STUNNEL_VERIFY_CHAIN
+            value: "yes"
+          # Debug level 5: informational + warnings (sufficient for production).
+          - name: STUNNEL_DEBUG
+            value: "5"
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "16Mi"
+          limits:
+            cpu: "100m"
+            memory: "32Mi"
+        volumeMounts:
+          # PKI secrets volume provides ca_root.crt + letta_stunnel_client.crt/key.
+          - name: letta-stunnel-pki
+            mountPath: /run/secrets
+            readOnly: true
+          # stunnel write paths — emptyDir (memory-backed).
+          - name: stunnel-conf
+            mountPath: /etc/stunnel
+          - name: stunnel-run
+            mountPath: /var/run/stunnel
+          - name: stunnel-log
+            mountPath: /var/log/stunnel
+          - name: stunnel-ca-certs
+            mountPath: /usr/local/share/ca-certificates
+          - name: stunnel-ssl-certs
+            mountPath: /etc/ssl/certs
 
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
