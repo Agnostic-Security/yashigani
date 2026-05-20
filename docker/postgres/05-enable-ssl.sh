@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
 # Yashigani v2.23.4 — enable TLS + client-cert verification on Postgres.
-# Last updated: 2026-05-20 (chore: remove letta pg_hba carveout — letta repositioned to BYO-agent)
+# Last updated: 2026-05-20 (AGENT-RUNTIME-003c: downgrade letta pg_hba rule hostssl→host — pg8000 alembic TLS limitation)
 #
 # This init script runs ONCE on first initdb of the postgres container (the
 # stock postgres entrypoint executes /docker-entrypoint-initdb.d/*.sh in
@@ -80,6 +80,7 @@ PGCONF
 
 # Rewrite pg_hba.conf so plaintext connections from the network are rejected.
 # local + 127.0.0.1 remain for the postgres entrypoint bootstrap flows.
+# Letta-specific rule added before the clientcert catch-all (asyncpg limitation).
 cat > "${PGDATA}/pg_hba.conf" <<'HBA'
 # TYPE  DATABASE  USER           ADDRESS        METHOD
 # Local socket — used by the postgres docker-entrypoint itself for init.
@@ -87,6 +88,13 @@ local   all       all                           trust
 # Loopback — postgres image runs its own bootstrap on 127.0.0.1.
 host    all       all            127.0.0.1/32   trust
 host    all       all            ::1/128        trust
+# Letta: asyncpg (runtime) and pg8000 (alembic) cannot negotiate TLS via URI params.
+# YSG-RISK-048: plain TCP + scram-sha-256 for letta; mTLS forward-close target v2.24.0.
+# MUST appear BEFORE the hostssl clientcert=verify-ca catch-all.
+# AGENT-RUNTIME-003c: pg8000 alembic path fails with `sslmode` kwarg error on hostssl
+# rule — pg8000 uses ssl_context not sslmode. Downgrade to host (plain TCP).
+host letta     yashigani_app  0.0.0.0/0      scram-sha-256
+host letta     yashigani_app  ::/0           scram-sha-256
 # Everything else must come in over TLS with a client cert signed by our
 # internal CA, AND present a valid scram-sha-256 password. Three factors.
 hostssl all       all            0.0.0.0/0      scram-sha-256  clientcert=verify-ca

@@ -204,6 +204,14 @@ services:
     bootstrap_token_sha256: "f33a4a92d0f29a04a29b1aa87a9328d711b1862c811c5c7c0e2ced16c09bd93d"
     revoked: false
 
+  - name: letta
+    dns_sans: [letta, letta.internal, yashigani-letta]
+    spiffe_id: spiffe://yashigani.internal/letta
+    purpose: "Stateful agent with persistent memory (profile: letta)"
+    mtls_capable: false       # upstream image, no TLS. Uses CA as client.
+    bootstrap_token_sha256: "6286076bbe4c6ff3d145f927c673b7923dc44fca380efc8811489c71160950c4"
+    revoked: false
+
   - name: openclaw
     dns_sans: [openclaw, openclaw.internal, yashigani-openclaw]
     spiffe_id: spiffe://yashigani.internal/openclaw
