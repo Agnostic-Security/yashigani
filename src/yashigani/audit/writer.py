@@ -27,10 +27,13 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import httpx
+
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.masking import CredentialMasker
 from yashigani.audit.schema import AuditEvent, SiemDeliveryFailedEvent
 from yashigani.audit.scope import MaskingScopeConfig
+from yashigani.net.pinned_resolver import _resolve_first_safe_ip
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,129 @@ def validate_siem_url(url: str) -> str:
         )
 
     return url
+
+
+# ---------------------------------------------------------------------------
+# SIEM delivery — DNS-pinned synchronous helper (A4, CWE-918)
+# ---------------------------------------------------------------------------
+# Replaces urllib.request.urlopen (TOCTOU DNS-rebinding gap) with an httpx
+# sync client whose transport is pinned to the pre-resolved IP.
+# follow_redirects=False closes the HTTP-redirect bypass vector (Iris §3.1).
+#
+# The function is module-level (not a method) so it can be patched in tests
+# without instantiating AuditLogWriter.
+
+_SIEM_REQUEST_TIMEOUT = 10.0  # seconds
+
+
+class _SyncPinnedTransport(httpx.HTTPTransport):
+    """Sync httpx transport that monkey-patches socket.getaddrinfo to return
+    the pre-resolved pinned IP, preventing DNS rebinding during the TCP connect.
+
+    Mirrors the async _PinnedTransport in yashigani.net.pinned_resolver but
+    uses httpx.HTTPTransport (sync) instead of AsyncHTTPTransport.
+    """
+
+    def __init__(self, pinned_ip: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._pinned_ip = pinned_ip
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        original_getaddrinfo = socket.getaddrinfo
+        pinned_ip = self._pinned_ip
+
+        def _pinned_getaddrinfo(host, port, *args, **kwargs):  # type: ignore[override]
+            request_host = request.url.host
+            if host in (request_host, request_host.lower()):
+                try:
+                    addr = ipaddress.ip_address(pinned_ip)
+                    family = socket.AF_INET6 if isinstance(addr, ipaddress.IPv6Address) else socket.AF_INET
+                except ValueError:
+                    family = socket.AF_INET
+                return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (pinned_ip, port))]
+            return original_getaddrinfo(host, port, *args, **kwargs)
+
+        socket.getaddrinfo = _pinned_getaddrinfo  # type: ignore[assignment]
+        try:
+            return super().handle_request(request)
+        finally:
+            socket.getaddrinfo = original_getaddrinfo  # type: ignore[assignment]
+
+
+def _send_to_target_pinned(url: str, raw_json: str, target: "SiemTarget") -> None:
+    """Deliver a SIEM event using a DNS-pinned synchronous HTTP connection.
+
+    Steps:
+    1. Resolve the hostname once via _resolve_first_safe_ip (SSRF policy check).
+    2. Pin the resolved IP in a custom httpx transport.
+    3. POST with follow_redirects=False (redirect bypass prevention).
+
+    Raises RuntimeError on non-2xx responses.
+    Raises BlockedByPolicy if the hostname resolves to a disallowed address.
+
+    A4 — ACS scan 2026-05-21, CWE-918.
+    """
+    import httpx as _httpx  # already imported at module level but be explicit
+
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    # Resolve + verify SSRF policy in one synchronous call.
+    # _resolve_first_safe_ip raises BlockedByPolicy if all addresses are blocked.
+    pinned_ip = _resolve_first_safe_ip(hostname, port, allowlist=None, blocklist=None)
+
+    logger.debug(
+        "SIEM_PINNED_DELIVERY host=%s pinned_ip=%s port=%d target=%s",
+        hostname,
+        pinned_ip,
+        port,
+        target.name,
+    )
+
+    body, content_type = _format_for_target_static(raw_json, target)
+    transport = _SyncPinnedTransport(pinned_ip=pinned_ip, verify=True)
+
+    with _httpx.Client(
+        transport=transport,
+        timeout=_SIEM_REQUEST_TIMEOUT,
+        follow_redirects=False,  # CWE-918: never follow redirects to avoid host-hop bypass
+    ) as client:
+        resp = client.post(
+            url,
+            content=body.encode("utf-8"),
+            headers={
+                "Content-Type": content_type,
+                target.auth_header: target.auth_value,
+            },
+        )
+
+    if resp.status_code >= 300:
+        raise RuntimeError(f"SIEM delivery HTTP {resp.status_code} from {target.name!r}")
+
+
+def _format_for_target_static(raw_json: str, target: "SiemTarget") -> tuple[str, str]:
+    """Static version of AuditLogWriter._format_for_target for use by the module-level helper."""
+    if target.target_type == "webhook":
+        return raw_json, "application/json"
+
+    event_dict = json.loads(raw_json)
+
+    if target.target_type == "splunk_hec":
+        import time as _time
+        payload = json.dumps({
+            "time": _time.time(),
+            "event": event_dict,
+            "sourcetype": "yashigani",
+        })
+        return payload, "application/json"
+
+    if target.target_type == "elastic_opensearch":
+        index_line = json.dumps({"index": {"_index": "yashigani-audit"}})
+        ndjson = index_line + "\n" + raw_json + "\n"
+        return ndjson, "application/x-ndjson"
+
+    raise ValueError(f"Unknown SIEM target type: {target.target_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -337,50 +463,20 @@ class AuditLogWriter:
             )
 
     def _send_to_target(self, raw_json: str, target: SiemTarget) -> None:
-        import urllib.request
-        import urllib.error
-
         # Re-assert SSRF safety at send time — the URL may have been stored
         # before the validator was in place (YSG-RISK-007.C #3ax, CWE-918).
         validate_siem_url(target.url)
 
-        body, content_type = self._format_for_target(raw_json, target)
-        req = urllib.request.Request(
-            url=target.url,
-            data=body.encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": content_type,
-                target.auth_header: target.auth_value,
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status >= 300:
-                    raise RuntimeError(f"HTTP {resp.status}")
-        except urllib.error.HTTPError as exc:
-            exc.status_code = exc.code  # type: ignore[attr-defined]
-            raise
+        # DNS-rebinding defence (A4 — ACS scan 2026-05-21, CWE-918).
+        # Replace urllib.request.urlopen + socket.gethostbyname (TOCTOU gap) with
+        # a synchronous pinned-IP delivery.  The hostname is resolved ONCE, verified
+        # against SSRF policy, then the TCP connection is made directly to the
+        # resolved IP.  Any DNS change between validation and connection is
+        # therefore irrelevant — the IP is pinned for the lifetime of this call.
+        # follow_redirects=False closes the HTTP-redirect bypass vector (Iris §3.1).
+        _send_to_target_pinned(target.url, raw_json, target)
 
     @staticmethod
     def _format_for_target(raw_json: str, target: SiemTarget) -> tuple[str, str]:
-        if target.target_type == "webhook":
-            return raw_json, "application/json"
-
-        event_dict = json.loads(raw_json)
-
-        if target.target_type == "splunk_hec":
-            import time as _time
-            payload = json.dumps({
-                "time": _time.time(),
-                "event": event_dict,
-                "sourcetype": "yashigani",
-            })
-            return payload, "application/json"
-
-        if target.target_type == "elastic_opensearch":
-            index_line = json.dumps({"index": {"_index": "yashigani-audit"}})
-            ndjson = index_line + "\n" + raw_json + "\n"
-            return ndjson, "application/x-ndjson"
-
-        raise ValueError(f"Unknown SIEM target type: {target.target_type!r}")
+        """Delegate to module-level _format_for_target_static (shared with pinned delivery)."""
+        return _format_for_target_static(raw_json, target)
