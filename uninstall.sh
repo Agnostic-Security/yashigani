@@ -182,6 +182,19 @@ EOF
     esac
 done
 
+# State-file runtime detection (Iris IRIS-ARCH-001 / Laura LAURA-TM-CLEANUP-001).
+# install.sh writes docker/.yashigani-install-state at successful install completion.
+# Reading it here avoids heuristic auto-detect on dual-runtime hosts (V240-004).
+# Falls through to auto-detect when state file is absent (pre-v2.23.4 installs).
+_STATE_FILE="${SCRIPT_DIR}/docker/.yashigani-install-state"
+if [ -z "$RUNTIME" ] && [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
+    _state_runtime="$(grep -E '^RUNTIME=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
+    if [ "$_state_runtime" = "docker" ] || [ "$_state_runtime" = "podman" ]; then
+        RUNTIME="$_state_runtime"
+        log_info "Using runtime from install state file: $RUNTIME"
+    fi
+fi
+
 # Detect runtime — prefer Podman (mirrors install.sh auto-detect order).
 # Rationale: on dual-runtime hosts where the install was done via Podman, Docker
 # may also answer `docker info`, causing volume rm to target the wrong store.
@@ -523,14 +536,16 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
     else
         echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
         # Tier 1: direct rm (same-user caller — no overhead for common case).
-        if rm -rf "${_secrets_dir:?}/"* 2>/dev/null; then
+        # Glob covers regular files (*), dotfiles (.[!.]*), and edge-case dotdot
+        # files (..?*) — e.g. .pki-status written by _pki_run_issuer (Laura LAURA-TM-CLEANUP-001).
+        if rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
             echo "  [removed] docker/secrets/* — direct rm succeeded"
         else
             # Cross-UID ownership (Iris BACKLOG-V240-006 / Laura 2D GO 2026-05-21).
             _secrets_wiped=false
             # Tier 2: Podman unshare (lighter; no container overhead on Podman paths).
             if [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
-                if podman unshare rm -rf "${_secrets_dir:?}/"* 2>/dev/null; then
+                if podman unshare rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
                     echo "  [removed] docker/secrets/* — podman unshare rm succeeded"
                     _secrets_wiped=true
                 fi
@@ -544,11 +559,11 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
                 if "$RUNTIME" run --rm --pull=never \
                         --volume "${_secrets_dir}:/t:rw" \
                         "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
-                        sh -c 'rm -rf /t/*' 2>/dev/null \
+                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null \
                    || "$RUNTIME" run --rm \
                         --volume "${_secrets_dir}:/t:rw" \
                         "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
-                        sh -c 'rm -rf /t/*' 2>/dev/null; then
+                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null; then
                     echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
                     _secrets_wiped=true
                 fi
@@ -561,6 +576,11 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
                 printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
             fi
         fi
+        # Remove the now-empty secrets/ directory so install.sh can recreate it
+        # with the correct owner on fresh install (Iris IRIS-ARCH-001 §3.4).
+        # rmdir is safe: succeeds on an empty dir regardless of caller UID;
+        # fails silently (|| true) if contents remain (Tier 4 error path above).
+        rmdir "${_secrets_dir}" 2>/dev/null || true
     fi
 fi
 

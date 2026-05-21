@@ -8075,6 +8075,22 @@ main() {
     # Step 12: Health check
     run_health_check
 
+    # Step 12b: Write install state file (Iris IRIS-ARCH-001 / Laura LAURA-TM-CLEANUP-001).
+    # Records the effective runtime + installer identity so uninstall.sh can read the
+    # correct runtime without heuristic auto-detect (V240-004 + dual-runtime mismatch).
+    # Mode 0644: intentional — uninstall.sh may run as a different OS user (cross-UID
+    # clean-slate scenario). Contents are not sensitive (see Laura TM-1 verdict).
+    # git-ignored via docker/.yashigani-install-state entry in .gitignore.
+    {
+      printf 'RUNTIME=%s\n'            "${RUNTIME:-${YSG_RUNTIME:-docker}}"
+      printf 'INSTALL_UID=%s\n'        "$(id -u)"
+      printf 'INSTALL_USER=%s\n'       "$(id -un)"
+      printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
+    } > "${WORK_DIR}/docker/.yashigani-install-state"
+    chmod 0644 "${WORK_DIR}/docker/.yashigani-install-state"
+    log_info "Install state written: ${WORK_DIR}/docker/.yashigani-install-state"
+
     # Step 13: Completion summary
     print_completion_summary
   fi

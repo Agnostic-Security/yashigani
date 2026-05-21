@@ -18,6 +18,7 @@ htmlcov/
 
 # Yashigani runtime data
 docker/secrets/
+docker/.yashigani-install-state
 data/*
 !data/fasttext
 docker/data/
