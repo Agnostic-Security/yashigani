@@ -16,7 +16,7 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.3 (2026-05-11) — macOS Podman promoted to hard CI gate, per-runtime PKI bootstrap split, manifest pre/post SHA-256 audit-trail logging, OpenSSL 4.0.x aarch64 SVE-probe stopgap, bash 3.2 portability for macOS system bash; see [v2.23.3 release notes](docs/release-notes/v2.23.3.md)
+**Latest Tagged Release:** v2.23.3 (2026-05-11) — macOS Podman promoted to hard CI gate, per-runtime PKI bootstrap split, manifest pre/post SHA-256 audit-trail logging, OpenSSL 4.0.x aarch64 SVE-probe stopgap, bash 3.2 portability for macOS system bash; see `CHANGELOG.md` for the release entry.
 
 > **Upgrade notice:** v2.23.2 ships a security hardening batch. Existing v2.23.1 deployments should upgrade.
 
@@ -70,7 +70,7 @@ Agentic AI systems are not just chat interfaces. They call real tools, read real
 
 AI agents and human users call LLMs — cloud and local — without inspection, audit, or policy enforcement. Prompts flow to models unchecked. Responses flow back unexamined. No one knows what was asked, what was answered, or whether any of it violated policy. Security teams have no visibility; compliance teams have no evidence.
 
-**Yashigani's response:** Every prompt and every response passes through Yashigani's bidirectional inspection pipeline before reaching its destination. Inbound payloads are classified by a two-stage pipeline — a FastText ML classifier for low-latency first-pass detection (under 5ms, fully offline), followed by a configurable LLM-based deep inspection backend (Ollama, Anthropic Claude, Google Gemini, Azure OpenAI, or LM Studio). Responses are inspected on the return path with the same rigor. The pipeline is fail-closed: if all inspection backends are unavailable, the request is blocked by a sentinel policy, not passed through. Credential Harvesting Suppression (CHS) detects credential-shaped patterns in both directions. Every transaction produces a structured audit event written simultaneously to multiple sinks — local file, PostgreSQL (with row-level security and AES-256-GCM column encryption), and SIEM platforms (Splunk, Elasticsearch, Wazuh). Nothing passes uninspected. Nothing passes unrecorded.
+**Yashigani's response:** Every prompt and every response passes through Yashigani's bidirectional inspection pipeline before reaching its destination. Inbound payloads are classified by a two-stage pipeline — a scikit-learn ML classifier (TF-IDF + LogisticRegression, joblib serialised, sub-5ms latency, fully offline) for low-latency first-pass detection, followed by a configurable LLM-based deep inspection backend (Ollama, Anthropic Claude, Google Gemini, Azure OpenAI, or LM Studio). Responses are inspected on the return path with the same rigor. The pipeline is fail-closed: if all inspection backends are unavailable, the request is blocked by a sentinel policy, not passed through. Credential Harvesting Suppression (CHS) detects credential-shaped patterns in both directions. Every transaction produces a structured audit event written simultaneously to multiple sinks — local file, PostgreSQL (with row-level security and AES-256-GCM column encryption), and SIEM platforms (Splunk, Elasticsearch, Wazuh). Nothing passes uninspected. Nothing passes unrecorded.
 
 ### 2.2 Identity Sprawl
 
@@ -88,7 +88,7 @@ Cloud LLM costs spiral without visibility or limits. A single team can burn thro
 
 Sensitive data — PII, PCI cardholder data, intellectual property, PHI — is sent to cloud LLM APIs without detection or classification. Once transmitted, data may be retained, logged, or used for training. Traditional DLP solutions were not designed for LLM payloads: they do not understand prompt structure, they cannot classify at inference speed, and they cannot enforce routing decisions based on sensitivity.
 
-**Yashigani's response:** The three-layer sensitivity pipeline classifies every prompt before routing. Layer 1: regex pattern matching catches structured sensitive data (credit card numbers, SSNs, API keys). Layer 2: FastText ML classifier detects semantic sensitivity at under 5ms, fully offline. Layer 3: Ollama LLM classification provides deep contextual analysis for ambiguous cases. Data classified as CONFIDENTIAL or RESTRICTED is routed to local models only — this is an immutable rule enforced by the Optimization Engine. No override exists. No admin can bypass it. No configuration can disable it. CHS additionally strips credential-shaped patterns from payloads before any AI inspection backend sees them. The dedicated PII detection module (since v2.20) adds 10 entity types (SSN, credit card with Luhn validation, email, phone, IBAN, passport, NHS number, driver's licence, IP address, date of birth) with three enforcement modes: LOG (detect and audit), REDACT (replace with `[REDACTED:TYPE]` before forwarding to cloud), and BLOCK (reject requests containing PII destined for cloud models). PII filtering runs on both request and response paths — bidirectional, on all traffic, by default. Cloud bypass requires explicit admin opt-in.
+**Yashigani's response:** The three-layer sensitivity pipeline classifies every prompt before routing. Layer 1: regex pattern matching catches structured sensitive data (credit card numbers, SSNs, API keys). Layer 2: scikit-learn ML classifier (TF-IDF + LogisticRegression, joblib serialised) detects semantic sensitivity at under 5ms, fully offline. Layer 3: Ollama LLM classification provides deep contextual analysis for ambiguous cases. Data classified as CONFIDENTIAL or RESTRICTED is routed to local models only — this is an immutable rule enforced by the Optimization Engine. No override exists. No admin can bypass it. No configuration can disable it. CHS additionally strips credential-shaped patterns from payloads before any AI inspection backend sees them. The dedicated PII detection module (since v2.20) adds 10 entity types (SSN, credit card with Luhn validation, email, phone, IBAN, passport, NHS number, driver's licence, IP address, date of birth) with three enforcement modes: LOG (detect and audit), REDACT (replace with `[REDACTED:TYPE]` before forwarding to cloud), and BLOCK (reject requests containing PII destined for cloud models). PII filtering runs on both request and response paths — bidirectional, on all traffic, by default. Cloud bypass requires explicit admin opt-in.
 
 ### 2.5 Routing Opacity
 
@@ -118,7 +118,7 @@ Containers crash. Models fail to load. Ollama instances run out of memory. Servi
 
 ## 3. Pre-flight Checklist
 
-Before any install on a new host, run the pre-flight checklist. It confirms host and runtime readiness — container runtime detection (Docker / Podman / Kubernetes), available disk and RAM, GPU detection (Apple Silicon M-series, NVIDIA, AMD, with `lspci` fallback) with model size recommendations based on VRAM, and inspection-pipeline prerequisites (regex, FastText, Ollama). The installer's preflight phase runs the same checks automatically; the standalone document is what an operator reads before kicking the installer off.
+Before any install on a new host, run the pre-flight checklist. It confirms host and runtime readiness — container runtime detection (Docker / Podman / Kubernetes), available disk and RAM, GPU detection (Apple Silicon M-series, NVIDIA, AMD, with `lspci` fallback) with model size recommendations based on VRAM, and inspection-pipeline prerequisites (regex, scikit-learn ML, Ollama). The installer's preflight phase runs the same checks automatically; the standalone document is what an operator reads before kicking the installer off.
 
 For a more detailed explanation, see the [Pre-flight Checklist](docs/preflight_check.md).
 
@@ -175,7 +175,53 @@ For a more detailed explanation, see the [Compliance Reports](docs/compliance/RE
 
 ## 7. Current Release Highlights
 
-The v2.23 line currently ships three releases. v2.23.0 is the single-branch / API-first / strict-CSP foundation; v2.23.1 adds core-plane mTLS and the two-tier PKI; v2.23.2 delivers the security hardening batch, supply-chain controls, and N-1 upgrade validation. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+The v2.23 line currently ships five releases. v2.23.0 is the single-branch / API-first / strict-CSP foundation; v2.23.1 adds core-plane mTLS and the two-tier PKI; v2.23.2 delivers the security hardening batch, supply-chain controls, and N-1 upgrade validation; v2.23.3 adds DNS-rebinding defence, PKI admin UI + BYO-CA driver, air-gap deployment, API3 BOPLA, backup encryption, and password-history reuse rejection; v2.23.4 closes the cleanup-system architectural class, ships the pgbouncer mTLS sidecar (`letta-pgbouncer`), documents the KMS-architectural posture for credentials, adds Open WebUI in-mesh routing, `/me/api-key` self-service issuance, HUMAN identity registration on local-auth login, and OPA fail-closed posture. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+
+### v2.23.4 — Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, and KMS Posture Reframe
+
+v2.23.4 closes the v2.23.3 follow-up backlog and lands an architectural close of the install/uninstall cleanup-system class (state file + container-fallback rm + cross-UID handlers across the entire lifecycle). It ships the `letta-pgbouncer` mTLS sidecar (closing YSG-RISK-048), the Open WebUI in-mesh path through the gateway, `/me/api-key` self-service Bearer issuance, HUMAN identity registration on local-auth login, and the OPA fail-closed posture. Ava 13/13 E2E PASS at tag (Phase 1 + Phase 2 + crucible test of the `.env` cross-UID handler). Tag SSH-signed.
+
+**Cleanup-System Architectural Close** -- Install and uninstall now share a persisted state file (`docker/.yashigani-install-state`, mode 0644, key=value with `RUNTIME` / `INSTALL_UID` / `INSTALL_USER`), eliminating runtime-detection and ownership-assumption heuristics. uninstall.sh's container-fallback `rm` (Alpine-image based, sudo-free) handles cross-UID chown'd dirs (`docker/{data,certs,logs}`) and secrets (`docker/secrets/*`) without requiring `sudo` on non-PTY SSH sessions. Dotfile-aware wipe glob (`.[!.]* + ..?*`) prevents `.pki-status` from surviving the wipe. `.env` cross-UID handler skips-with-WARN when host-side read fails; `docker compose down` proceeds via Docker socket. `_do_chgrp` hoisted to script scope. Closes BACKLOG-V240-003 / -004 / -006 and the architectural root cause of five cascading uninstall blockers.
+
+**`letta-pgbouncer` mTLS Sidecar** -- Letta's postgres connection now routes through a dedicated session-mode pgbouncer sidecar (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, `read_only:true`, `cap_drop:[ALL]`, `no-new-privileges`). The sidecar presents `letta-pgbouncer_client.crt` to postgres over mTLS; postgres `pg_hba.conf` catch-all (`hostssl all all 0.0.0.0/0 scram-sha-256 clientcert=verify-ca`) applies uniformly with no letta carveout. Closes the asyncpg+pg8000 client-cert-URI-param limitation at the sidecar boundary. Closes YSG-RISK-048.
+
+**KMS-Architectural Posture for Credentials** -- The cleartext `userlist.txt` is documented at `docs/yashigani_install_config.md` §6.1 as the non-KMS dev/standalone posture (YSG-RISK-049 ACCEPTED-LOW). Production deployments configure a KMS provider via `YSG_KMS_PROVIDER=vault|azure|aws|gcp|keeper`; the providers in `src/yashigani/kms/` fetch credentials at runtime, bypassing the cleartext-on-disk path entirely. The yashigani-internal Bearer is per-install (32-char charset-compliant token at `docker/secrets/yashigani_internal_bearer`, mode 0600) — the literal string `yashigani-internal` is gone from production source.
+
+**Open WebUI → Gateway In-Mesh Path** -- The gateway exposes a dual-port surface: `:8080` for mTLS edge traffic and `:8081` for plain-HTTP in-mesh traffic carrying an `Authorization: Bearer yashigani-internal` token. Open WebUI joins the `caddy_internal` network and routes chat completions via the gateway rather than direct to Ollama, so OPA policy + identity-binding apply to UI traffic the same way they apply to API traffic. The Ollama default model `qwen2.5:3b` auto-pulls on first install with `--with-openwebui` so the chat UI works out of the box.
+
+**`/me/api-key` Self-Service Bearer Issuance** -- Users can mint, list, and revoke their own API keys from the user UI. Step-up TOTP required for issuance (ASVS V6.8.4); `/auth/stepup` widened from admin-only to accept user sessions while preserving every existing guard (anonymous-rejection, replay-cache, per-session failure counter, cross-tenant guard, audit-event emission). API-key strings are hash-stored; `last4` shown in UI for identification.
+
+**HUMAN Identity Registration on Local-Auth Login** -- Local password+TOTP users now get an identity-registry entry created automatically on first login, with tier-aware metadata. Closes the design gap where local-auth users had no identity-registry presence (previously only SSO-registered users were tracked).
+
+**OPA Fail-Closed Posture** -- The OPA response-check in `gateway/openai_router.py` now returns `allow: False` on every exception path (timeout, 5xx, connection refused, `opa_not_configured`) instead of the prior `allow: True`. Helm enforces it at deploy-time via the `OPA-URL-001` violation when `global.environment=production` and `gateway.env.YASHIGANI_OPA_URL` is empty. New Prometheus counter `yashigani_opa_response_check_failures_total{outcome, reason}` registered. Behavioural break for upgrades from v2.23.3 with intermittently-reachable OPA (see CHANGELOG `Breaking Changes` for the dev opt-in via `YASHIGANI_OPA_OPTIONAL=true`).
+
+**SAML BYOK Config-Load Surface** -- `broker.add_idp()` accepts SAML identity-provider configurations via `YASHIGANI_IDP_<N>_SAML_*` environment variables. `_assert_rsa_sp_key()` runs at config-load time, rejecting non-RSA SP keys at container startup rather than at first signature attempt. Mitigates the libgcrypt ECDH heap-overflow class (CVE-2026-41989) at the config-load boundary.
+
+**Container Auto-Start on Host Reboot** -- Compose installs provision a user-scoped `systemd --user` unit under `loginctl enable-linger` so the gateway and backoffice come back up after a host reboot without operator intervention. Helm path already handled by Kubernetes.
+
+**OPA + Helm Policy Bundle Alignment** -- The K8s helm chart previously shipped a stub OPA ConfigMap with package `yashigani.v1_routing` and no `decision` / `allow_v1` rules — the gateway read `result.get("allow", False)` against the empty result, returning 403 on every K8s chat request. Replaced with the verbatim compose `policy/{yashigani,v1_routing,rbac,agents}.rego` bundle so K8s and compose make the same policy decisions.
+
+**Iris+Laura Design-Review-First Sequencing** -- Every cross-component / security-touching / architectural change in the v2.23.4 close-out arc went through an Iris design review and a Laura threat-model before any implementer dispatch. 10+ review cycles persisted as design docs at `internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`. The pattern produced zero "ship-then-rework" cycles after adoption; cascading regressions in the pre-pattern era (5 layers of stunnel workarounds before the pgbouncer reframe) became the failure mode that the rule was designed to prevent.
+
+### v2.23.3 — DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, and Password-History Reuse Rejection
+
+v2.23.3 is a security and supply-chain hardening release on top of v2.23.2. It adds DNS-rebinding defence for outbound HTTP, a PKI admin UI with a BYO-CA driver for operator-controlled cert chains, full air-gap deployment support, OWASP API3 BOPLA per-property allowlists, age-encrypted backups, password-reuse history (CMMC L2 IA.L2-3.5.8), and a swap of the abandoned `fasttext-wheel` dependency in the prompt-injection classifier to scikit-learn. Tag SSH-signed.
+
+**DNS-Rebinding Defence for Outbound HTTP** -- `yashigani.net.pinned_resolver` resolves the target hostname once at context entry, verifies the IP against the SSRF allowlist/blocklist, and patches `socket.getaddrinfo` for the transport so subsequent DNS changes cannot redirect the connection. OWUI agent push wired through pinned-resolver to defend against the admin-account-compromise pivot. New audit event type `SSRF_PINNED_RESOLVER_USED`. New security doc `docs/security/ssrf.md`. 18 + 8 new tests. Closes OWASP API7 SSRF DNS-rebinding gap (issue #91).
+
+**PKI Admin UI + BYO-CA Driver** -- `/api/v1/admin/pki/*` endpoints expose chain inspection, leaf rotation (step-up TOTP), bundle download (PEM, private key never included), and all-services status. The BYO-CA driver (`YASHIGANI_PKI_CA_MODE=byo`) issues EC P-256 CSRs against an external signing endpoint (step-ca / Vault PKI), validates the returned chain, and atomically installs the new key. Auth modes: `token`, `mtls`, `none`. Fail-closed on any driver error — no silent fallback to the internal issuer. Closes issues #51 + #53.
+
+**Air-Gap Deployment Support** -- Operators build an offline bundle from a pinned `airgap/manifest.yml` on a connected host via `scripts/prepare-airgap-bundle.sh`, transfer it, and install with `install.sh --air-gap --bundle <path>`. Per-image digest verification fail-closed at pull and load; `zstd`-compressed tar; SHA256 sidecar manifest for out-of-band integrity check. `--air-gap` implies `--offline` + `--tls-mode selfsigned`. Pre-flight G20 gate enforces bundle existence, manifest parse, zstd availability. Docs: `docs/operations/air-gap-install.md`. Closes issue #58.
+
+**API3 BOPLA Per-Property Allowlist** -- New explicit deny-by-default public-view Pydantic schemas (`AdminAccountPublic`, `UserAccountPublic`, `SiemTargetPublic`, `IdPPublic`, `JWTConfigPublic`, `JWTTestResultPublic`) backed by `model_config extra='forbid'`. Sensitive fields (`password_hash`, `totp_secret`, `recovery_codes`, `failed_attempts`, `client_secret`, `auth_value`, `private_key`, PII claims) are never serialised on list endpoints. 54 regression tests. OWASP API3:2023, ASVS V4.2.1, CWE-213.
+
+**Encrypted Backups** -- `scripts/backup.sh` produces age-encrypted `<timestamp>.tar.gz.age` backups via AES-256-GCM (age X25519). `restore.sh` extended with `--encrypted <identity.age> <archive>` path; legacy unencrypted archives accepted with deprecation warning. `age=1.2.1-1+b5` added to both Dockerfiles. Helm `backup-cronjob.yaml` + `backup-script` ConfigMap. Closes CMMC L2 product gap MP.L2-3.8.9 / CWE-312.
+
+**Password Reuse History (CMMC L2 IA.L2-3.5.8)** -- Self-service password changes check the new password against the last `PASSWORD_HISTORY_DEPTH` (default 12, range 1–24) Argon2id hashes in the new `password_history` table (migration 0010). Reuse rejected HTTP 422 `password_reuse`. Audit event `PASSWORD_REUSE_REJECTED` emits `user_id` and `history_depth_checked` only — no password or hash ever logged.
+
+**`fasttext-wheel` → scikit-learn Swap** -- The prompt-injection sensitivity classifier migrated from the abandoned `fasttext-wheel==0.9.2` (last upstream release Sep 2020) to `scikit-learn>=1.4` + `joblib>=1.3`. The trained model is now stored and loaded via joblib; equivalent classification quality with active upstream maintenance. Closes YSG-RISK-040.
+
+**N-1 Upgrade Validation (v2.23.2 → v2.23.3)** -- The install-and-upgrade smoke matrix (introduced in v2.23.2) now validates the v2.23.2 → v2.23.3 upgrade path on the same four platform combinations (macOS Podman / macOS Docker / Linux Podman / Linux Docker). Backup, upgrade, restore, and both-admin reachability verified at every CI run.
 
 ### v2.23.2 — Security Hardening, Supply-Chain Controls, and ASVS L3 92%
 
@@ -308,7 +354,7 @@ The table below lists only rows that **differ across tiers**. Rows that are iden
 | **Licensing** | | | | | | | |
 | Free, no license key | Yes | — | — | — | — | — | — |
 | Signed licence key required | — | Yes (verified) | Yes | Yes | Yes | Yes | Yes |
-| Pricing | Free | Free (always) | £1,750/yr | £3,000/yr | £12,000/yr | £80,000/yr | From £200,000/yr |
+| Pricing | Free | Free (always) | £1,750/yr | £3,000/yr | £12,000/yr | £80,000/yr | From £200,000/yr *(coming soon)* |
 | Max agents / MCP servers | 20 | Unlimited | 200 | 400 | 2,000 | 16,000 | Unlimited |
 | Max end users | 5 | Unlimited | 50 | 100 | 500 | 4,000 | Unlimited |
 | Max admin seats | 2 | Unlimited | 5 | 10 | 25 | 100 | Unlimited |
@@ -334,9 +380,9 @@ Paid tiers support optional 50- or 250-user bundles to grow within a tier before
 |---|---|---|---|---|---|---|
 | Starter | 50 users | £1,627.50 | +50 | +200 | 5 | 350 users / £11,137.50 |
 | Professional | 50 users | £1,350 | +50 | +200 | 50 | 3,000 users / £79,500 |
-| Professional Plus | 250 users | £6,000 | +250 | +1,000 | 20 | 9,000 users / £200,000 |
+| Professional Plus | 250 users | £6,000 | +250 | +1,000 | Unlimited *(during Enterprise pre-launch)* | No cap *(during Enterprise pre-launch)* |
 
-Each tier's maximum bundle spend is set just below the next tier's base price — at that point, upgrading delivers more capacity, features, and better value per user. Igniter has no bundles; upgrade to Starter at 51+ users.
+Each tier's maximum bundle spend is normally set just below the next tier's base price — at that point, upgrading delivers more capacity, features, and better value per user. **While Enterprise is in pre-launch, Professional Plus has no upper bundle cap** — keep adding 250-user bundles as you grow. When Enterprise becomes generally available, customers who've expanded beyond the typical Pro Plus envelope will be invited to migrate at GA. Igniter has no bundles; upgrade to Starter at 51+ users.
 
 ### 8.1 Common features
 
@@ -361,7 +407,7 @@ The following features are included in **all seven tiers** at parity. They are d
 - OPA routing safety net + LLM policy review (since v2.0)
 
 **Content inspection and AI safety**
-- FastText ML classifier (offline, <5ms)
+- scikit-learn ML classifier — TF-IDF + LogisticRegression, joblib serialised (offline, <5ms; replaced FastText in v2.23.3)
 - Response-path inspection (since v0.9.0)
 - All 5 inspection backends — Ollama, Anthropic Claude, Google Gemini, Azure OpenAI, LM Studio
 - Fail-closed sentinel

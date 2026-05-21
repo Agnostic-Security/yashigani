@@ -7,13 +7,14 @@ POST /auth/password/change  — forced change on first login
 POST /auth/totp/provision   — TOTP + recovery codes provisioning
 POST /auth/stepup           — V6.8.4 step-up TOTP verification for high-value flows
 
-Last updated: 2026-05-09T00:00:00+01:00
+Last updated: 2026-05-17T23:00:00+01:00
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -330,7 +331,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
             account_tier="totp_provisioning",
             client_ip=client_ip,
         )
-        state.audit_writer.write(_make_login_event(body.username, "totp_provision_restricted", None))
+        state.audit_writer.write(_make_login_event(body.username, "totp_provision_restricted", None, account_tier=record.account_tier))
         _log.info(
             "TOTP provisioning session issued for %s (force_totp_provision=True). "
             "Full admin access blocked until TOTP is provisioned.",
@@ -374,13 +375,19 @@ async def login(body: LoginRequest, request: Request, response: Response):
             record.force_password_change = True
             _log.info("Password expired: user=%s age=%d days, max=%d", record.username, int(age_days), max_age_days)
 
+    # Gap 3 / v2.23.4 arch-completion: register HUMAN identity before session
+    # creation so a seat-limit rejection prevents session issuance (fail-closed).
+    # Skips silently when identity_registry is None (community-tier).
+    # Raises HTTPException(403) when the licence seat limit is exhausted.
+    _register_human_identity_on_login(record, state)
+
     session = state.session_store.create(
         account_id=record.account_id,
         account_tier=record.account_tier,
         client_ip=client_ip,
     )
 
-    state.audit_writer.write(_make_login_event(body.username, "success", None))
+    state.audit_writer.write(_make_login_event(body.username, "success", None, account_tier=record.account_tier))
 
     _set_session_cookie(response, session.token, record.account_tier)
     return {
@@ -404,7 +411,7 @@ async def logout(
     # self_reset) are audited; logout was the only gap (yashigani-retro#95).
     state = backoffice_state
     if state.audit_writer is not None:
-        state.audit_writer.write(_make_login_event(session.account_id, "logout", None))
+        state.audit_writer.write(_make_login_event(session.account_id, "logout", None, account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -482,13 +489,14 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
     # Invalidate all sessions
     state.session_store.invalidate_all_for_account(record.account_id)
 
-    state.audit_writer.write(_make_login_event(body.username, "self_reset", None))
+    state.audit_writer.write(_make_login_event(body.username, "self_reset", None, account_tier=record.account_tier))
     # ACS gap #95 (auth_log): SESSIONS_INVALIDATED event for session lifecycle audit.
     state.audit_writer.write(
         _make_sessions_invalidated_event(
             admin_account=body.username,
             acting_admin="",  # self-service reset
             reason="self_reset",
+            account_tier=record.account_tier,
         )
     )
 
@@ -673,6 +681,7 @@ async def change_password(
             change_type="forced" if record.force_password_change else "self_service",
             old_hash_tail=old_hash_tail,
             new_hash_tail=new_hash_tail,
+            account_tier=record.account_tier,
         )
     )
     # ACS gap #95 (auth_log): SESSIONS_INVALIDATED event for session lifecycle audit.
@@ -681,6 +690,7 @@ async def change_password(
             admin_account=record.username,
             acting_admin="",  # self-service password change
             reason="password_change",
+            account_tier=record.account_tier,
         )
     )
     return {"status": "ok", "sessions_invalidated": True, "re_authentication_required": True}
@@ -761,7 +771,7 @@ async def provision_totp_confirm(
             },
         )
 
-    state.audit_writer.write(_make_provision_event(record.username))
+    state.audit_writer.write(_make_provision_event(record.username, account_tier=record.account_tier))
 
     return {"status": "ok", "message": "TOTP enrolment complete."}
 
@@ -803,7 +813,7 @@ async def provision_totp(
             detail={"error": "invalid_totp_code", "message": "TOTP code did not match. Re-scan the QR code."},
         )
 
-    state.audit_writer.write(_make_provision_event(record.username))
+    state.audit_writer.write(_make_provision_event(record.username, account_tier=record.account_tier))
 
     return {
         "status": "ok",
@@ -827,13 +837,18 @@ class StepUpRequest(BaseModel):
 @router.post("/stepup")
 async def stepup_verify(
     body: StepUpRequest,
-    session: AdminSession,
+    session: AnySession,
     store=Depends(get_session_store),
 ):
     """
-    Step-up TOTP verification for high-value admin flows (ASVS V6.8.4).
+    Step-up TOTP verification for high-value flows (ASVS V6.8.4).
 
-    The admin submits their current TOTP code.  On success, the session's
+    Accepts any authenticated session (admin OR regular user) so that
+    user-tier accounts can satisfy the assert_fresh_stepup prerequisite
+    required by POST /me/api-key.  Anonymous and expired sessions are
+    rejected by the AnySession dependency before this handler runs.
+
+    The caller submits their current TOTP code.  On success, the session's
     last_totp_verified_at is updated.  The caller may then retry the
     high-value endpoint that returned step_up_required.  The verification
     window is YASHIGANI_STEPUP_TTL_SECONDS (default 300 s / 5 min).
@@ -845,6 +860,11 @@ async def stepup_verify(
       incremented on the session prefix.
     - No credential enumeration: same HTTP 401 body for wrong code or
       no session.
+    - Cross-tenant isolation: account is resolved by session.account_id
+      against the platform DB; a session with a fabricated/wrong-tenant
+      account_id will find no record → 403 totp_not_configured.
+    - Tier scope: widened from admin-only to any-session. Admin step-up
+      semantics (audit events, replay cache, failure counter) are identical.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -877,7 +897,7 @@ async def stepup_verify(
 
     if not ok:
         _totp_failures[session_prefix] = failure_count + 1
-        state.audit_writer.write(_make_stepup_event(admin_record.username, "failure"))
+        state.audit_writer.write(_make_stepup_event(admin_record.username, "failure", admin_record.account_tier))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -889,7 +909,7 @@ async def stepup_verify(
     # Success — record step-up timestamp in Redis session, clear failure counter.
     _totp_failures.pop(session_prefix, None)
     store.record_totp_stepup(session.token)
-    state.audit_writer.write(_make_stepup_event(admin_record.username, "success"))
+    state.audit_writer.write(_make_stepup_event(admin_record.username, "success", admin_record.account_tier))
 
     from yashigani.auth.stepup import STEPUP_TTL_SECONDS
 
@@ -1074,22 +1094,36 @@ async def _get_record_by_id(account_id: str):
     return await state.auth_service.get_account_by_id(account_id)
 
 
-def _make_login_event(username: str, outcome: str, reason):
+def _make_login_event(username: str, outcome: str, reason, account_tier: str = "admin"):
+    """ASVS V7.3.4: account_tier reflects the actual session/record tier.
+
+    Safe default "admin" is intentional for the pre-auth failure call site at
+    login() line ~299 where authenticate() returned (False, None, reason) and
+    no record is available.  All post-auth call sites MUST pass
+    record.account_tier or session.account_tier explicitly.
+    """
     from yashigani.audit.schema import AdminLoginEvent
 
     return AdminLoginEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         outcome=outcome,
         failure_reason=reason,
     )
 
 
-def _make_config_event(username: str, setting: str, prev: str, new: str):
+def _make_config_event(username: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    """ASVS V7.3.4: account_tier reflects the actual session tier, not a hardcoded value.
+
+    This helper is currently unused (callers construct ConfigChangedEvent directly),
+    but the parameter is wired for defence-in-depth: if RBAC gates break, an audit
+    record constructed via this helper will still record the actual tier.
+    Safe default "admin" matches the admin-only routes that would use this helper.
+    """
     from yashigani.audit.schema import ConfigChangedEvent
 
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         setting=setting,
         previous_value=prev,
@@ -1097,28 +1131,34 @@ def _make_config_event(username: str, setting: str, prev: str, new: str):
     )
 
 
-def _make_provision_event(username: str):
+def _make_provision_event(username: str, account_tier: str = "admin"):
+    """ASVS V7.3.4: account_tier reflects the actual session tier, not a hardcoded value."""
     from yashigani.audit.schema import TotpProvisionCompletedEvent
 
     return TotpProvisionCompletedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         user_handle=username,
     )
 
 
-def _make_stepup_event(username: str, outcome: str):
+def _make_stepup_event(username: str, outcome: str, account_tier: str = "admin"):
     from yashigani.audit.schema import AdminLoginEvent
 
     return AdminLoginEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         outcome=f"stepup_{outcome}",
         failure_reason=None if outcome == "success" else "invalid_totp",
     )
 
 
-def _make_login_attempt_event(username: str, client_ip: str):
-    """ACS gap #95: emit AUTH_LOGIN_ATTEMPT before auth result."""
+def _make_login_attempt_event(username: str, client_ip: str, account_tier: str = "admin"):
+    """ACS gap #95: emit AUTH_LOGIN_ATTEMPT before auth result.
+
+    account_tier defaults to "admin" for the pre-auth call site in login() where
+    the account record has not yet been fetched.  Pass record.account_tier
+    explicitly wherever the record is already in scope.
+    """
     from yashigani.audit.schema import AuthLoginAttemptEvent
 
     # Mask the last octet of the IP for lower-assurance sinks.
@@ -1126,7 +1166,7 @@ def _make_login_attempt_event(username: str, client_ip: str):
     parts = client_ip.rsplit(".", 1)
     ip_prefix = f"{parts[0]}.0" if len(parts) == 2 else client_ip
     return AuthLoginAttemptEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         client_ip_prefix=ip_prefix,
         outcome="attempt",
@@ -1139,12 +1179,14 @@ def _make_password_changed_event(
     change_type: str,
     old_hash_tail: str,
     new_hash_tail: str,
+    account_tier: str = "admin",
 ):
-    """ACS gap #95: dedicated PASSWORD_CHANGED event."""
+    """ACS gap #95: dedicated PASSWORD_CHANGED event.
+    ASVS V7.3.4: account_tier reflects the actual session tier, not a hardcoded value."""
     from yashigani.audit.schema import PasswordChangedEvent
 
     return PasswordChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=username,
         change_type=change_type,
         old_hash_tail=old_hash_tail,
@@ -1159,14 +1201,189 @@ def _make_sessions_invalidated_event(
     acting_admin: str,
     reason: str,
     sessions_count: int = -1,
+    account_tier: str = "admin",
 ):
-    """ACS gap #95: SESSIONS_INVALIDATED event for session lifecycle audit."""
+    """ACS gap #95: SESSIONS_INVALIDATED event for session lifecycle audit.
+    ASVS V7.3.4: account_tier reflects the actual session tier, not a hardcoded value."""
     from yashigani.audit.schema import SessionsInvalidatedEvent
 
     return SessionsInvalidatedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_account,
         acting_admin=acting_admin,
         reason=reason,
         sessions_count=sessions_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gap 3 / v2.23.4 arch-completion: HUMAN identity registration on local-auth login
+#
+# SSO callbacks create a HUMAN identity in identity_registry (sso.py:271).
+# Local-auth login (username + password + TOTP) did not — leaving users without
+# a Bearer-issuable identity for /v1/*.  This helper closes that gap.
+#
+# Security invariants:
+#   - Only account_tier == "user" triggers registration. admins MUST NOT be
+#     registered as HUMAN identities (Gap 2 indirect separation).
+#   - Idempotent: get_by_slug() check prevents duplicate entries on re-login.
+#   - Seat-limit hard error: LicenseLimitExceeded → 403, login rejected.
+#   - Community-tier graceful-skip: identity_registry is None → skip, allow login.
+#   - Legacy account with no email: falls back to {username}@yashigani.local
+#     (mirrors existing pattern at auth.py:533 / /auth/verify).  This
+#     preserves backward compatibility with pre-email-as-username accounts while
+#     still giving them a stable, deterministic slug.  The fallback email is
+#     logged at WARNING so operators can backfill real emails during a Gap 1
+#     migration.
+# ---------------------------------------------------------------------------
+
+_AUTH_SLUG_RE = re.compile(r"[^a-z0-9\-]")
+
+
+def _auth_email_to_slug(email: str) -> str:
+    """
+    Derive a stable registry slug from an email address.
+    Mirrors sso.py::_email_to_slug — kept separate to avoid coupling auth.py
+    to the SSO module, which has its own heavy import chain.
+
+    e.g. alice@example.com → alice-example-com
+    """
+    local, _, domain = email.partition("@")
+    raw = f"{local}-{domain}".lower()
+    slug = _AUTH_SLUG_RE.sub("-", raw).strip("-")
+    return slug[:64]
+
+
+def _register_human_identity_on_login(record, state) -> None:
+    """
+    Register a HUMAN identity in the identity_registry for a successfully
+    authenticated local-auth user (account_tier == "user").
+
+    Called BEFORE session creation in the login handler so that a seat-limit
+    rejection prevents the session from being issued (fail-closed).
+
+    Raises HTTPException(403) if the licence seat limit is exhausted.
+    Silently skips if identity_registry is None (community-tier deployment).
+    """
+    # Only user-tier accounts get HUMAN identities.
+    # Admin and totp_provisioning tiers must NOT be registered here.
+    if record.account_tier != "user":
+        return
+
+    registry = getattr(state, "identity_registry", None)
+    if registry is None:
+        # Community-tier or pre-init: identity stack not available.
+        # Preserve today's behaviour — login succeeds without Bearer identity.
+        _log.warning(
+            "identity_registry unavailable on login for %s — "
+            "HUMAN identity not created (community-tier or pre-init); "
+            "user will have no Bearer identity for /v1/*",
+            record.username,
+        )
+        return
+
+    from yashigani.identity.registry import IdentityKind
+    from yashigani.licensing.enforcer import LicenseLimitExceeded
+
+    # Resolve the email for the slug.  Use the record email if set; otherwise
+    # fall back to the @yashigani.local synthetic email (Gap 1 legacy accounts).
+    email = record.email
+    if not email:
+        email = f"{record.username}@yashigani.local"
+        _log.warning(
+            "User %s has no email set — using synthetic slug email %s for "
+            "identity_registry. Backfill real email to resolve (Gap 1).",
+            record.username,
+            email,
+        )
+
+    slug = _auth_email_to_slug(email)
+
+    # Idempotency guard: if already registered, check status.
+    # Q3 / v2.23.4 (Tiago directive 2026-05-15): auto-reactivate on login
+    # REVERTED. A suspended identity is an admin-action-only reactivation.
+    # If identity is suspended/inactive:
+    #   - Block the login (403)
+    #   - Audit-log LOGIN_BLOCKED_SUSPENDED_IDENTITY
+    #   - Do NOT reactivate, do NOT issue session
+    # Admin must call POST /admin/users/{username}/reactivate (StepUp required)
+    # to restore access.
+    existing = registry.get_by_slug(slug)
+    if existing is not None:
+        identity_id = existing.get("identity_id", "")
+        existing_status = existing.get("status", "active")
+        if existing_status in ("suspended", "inactive"):
+            # Audit-log before raising so the forensic record is present
+            # even if an upstream exception handler swallows the 403.
+            from yashigani.audit.schema import LoginBlockedSuspendedIdentityEvent
+            _blocked_state = state
+            if getattr(_blocked_state, "audit_writer", None) is not None:
+                _blocked_state.audit_writer.write(LoginBlockedSuspendedIdentityEvent(
+                    username=record.username,
+                    identity_id=identity_id,
+                    identity_status=existing_status,
+                    slug=slug,
+                ))
+            _log.warning(
+                "Q3 LOGIN BLOCKED: user=%s identity_id=%s status=%s slug=%s — "
+                "admin must reactivate via POST /admin/users/%s/reactivate",
+                record.username,
+                identity_id,
+                existing_status,
+                slug,
+                record.username,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "account_suspended",
+                    "message": (
+                        "Account suspended. Contact your administrator to restore access."
+                    ),
+                },
+            )
+        _log.debug(
+            "HUMAN identity already active for %s (slug=%s, identity_id=%s) — skip re-register",
+            record.username,
+            slug,
+            identity_id,
+        )
+        return
+
+    # New user — register with HUMAN kind.
+    # description carries the account_id for cross-system linkage (Gap 3 / v2.23.4).
+    try:
+        identity_id, _plaintext_key = registry.register(
+            kind=IdentityKind.HUMAN,
+            name=record.username,
+            slug=slug,
+            description=f"local-auth user; account_id={record.account_id}",
+        )
+    except LicenseLimitExceeded as exc:
+        _log.warning(
+            "Seat limit reached: cannot register HUMAN identity for %s "
+            "(%d/%d used). Login rejected.",
+            record.username,
+            exc.current,
+            exc.max_val,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "seat_limit_exceeded",
+                "message": (
+                    "The maximum number of user seats for this licence has been reached. "
+                    "Contact your administrator to increase the seat limit."
+                ),
+                "current": exc.current,
+                "max": exc.max_val,
+            },
+        ) from exc
+
+    _log.info(
+        "HUMAN identity registered on local-auth login: "
+        "identity_id=%s slug=%s account_id=%s",
+        identity_id,
+        slug,
+        record.account_id,
     )

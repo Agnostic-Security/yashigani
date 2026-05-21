@@ -559,27 +559,39 @@ class TestXssResidualSinks:
 
 # ---------------------------------------------------------------------------
 # LAURA-V232-002 — SPIFFE identity forge via client-supplied X-SPIFFE-ID
+# (updated for ISSUE-019 correction 2026-05-19)
 # ---------------------------------------------------------------------------
 
 class TestSpiffeForgeV232002:
     """
-    LAURA-V232-002 regression: SpiffePeerCertMiddleware must strip the
-    client-supplied X-SPIFFE-ID header so it never reaches require_spiffe_id().
+    LAURA-V232-002 / ISSUE-019 regression suite for SpiffePeerCertMiddleware.
 
-    Without this fix: attacker with gateway_client.crt + forged
-    X-SPIFFE-ID: spiffe://yashigani.internal/prometheus → HTTP 200 on
-    /internal/metrics when uvicorn lacks peer_cert in ASGI scope.
+    ISSUE-019 correction (2026-05-19): Su's LAURA-V232-002 fix stripped
+    x-spiffe-id from all requests, which broke the Caddy→backoffice path:
+    Caddy injects x-spiffe-id in the request it sends to backoffice, and
+    that header IS present in the ASGI scope this middleware processes.
+    Stripping it caused 401 no_spiffe_id for every SPIFFE-gated mutation
+    route (POST /admin/agents, PUT /admin/agents/{id}, etc.).
+
+    Corrected contract:
+    - x-spiffe-id-peer-cert is ALWAYS overwritten (server-controlled).
+    - x-spiffe-id is PRESERVED (Caddy-injected on Caddy→upstream path, or
+      install.sh-injected on the direct-backoffice path).
+    - Primary forge-prevention is CaddyVerifiedMiddleware Layer B (HMAC).
+    - Residual risk: a direct-mesh attacker holding a CA cert + HMAC secret
+      can forge x-spiffe-id.  Accepted for v2.23.4; tracked in YSG-RISK-012b.
+      Long-term fix: Option A from LAURA-V232-002 (all access via Caddy only).
     """
 
     def _import_middleware(self):
         from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
         return SpiffePeerCertMiddleware
 
-    def test_client_forged_x_spiffe_id_stripped_by_middleware(self):
+    def test_x_spiffe_id_peer_cert_overwritten_by_middleware(self):
         """
-        LAURA-V232-002: client-supplied X-SPIFFE-ID must be stripped before
-        the request reaches any route handler.  After stripping, the header
-        must be absent (None on lookup).
+        LAURA-V232-002 / ISSUE-019: x-spiffe-id-peer-cert supplied by the
+        client must be overwritten (not passed through).  When the ASGI TLS
+        extension is absent, it becomes "" (empty = no peer cert extracted).
         """
         MW = self._import_middleware()
 
@@ -588,21 +600,21 @@ class TestSpiffeForgeV232002:
         async def fake_app(scope, receive, send):
             from starlette.datastructures import Headers
             hdrs = Headers(scope=scope)
-            # Use a sentinel so we can distinguish "absent" from "empty string"
             received_headers["x_spiffe_id"] = hdrs.get("x-spiffe-id")
             received_headers["peer_cert"] = hdrs.get("x-spiffe-id-peer-cert", "MISSING")
 
         middleware = MW(fake_app)
 
-        # Simulate direct-mesh attack: no TLS extension (uvicorn < 0.34 path),
-        # but attacker supplies forged X-SPIFFE-ID.
+        # Simulate a request with a forged x-spiffe-id-peer-cert and a
+        # legitimate x-spiffe-id (Caddy-injected or install.sh-injected).
         scope = {
             "type": "http",
-            "method": "GET",
-            "path": "/internal/metrics",
+            "method": "POST",
+            "path": "/admin/agents",
             "headers": [
-                (b"x-spiffe-id", b"spiffe://yashigani.internal/prometheus"),
-                (b"authorization", b"Bearer gateway_client_cert_token"),
+                (b"x-spiffe-id", b"spiffe://yashigani.internal/backoffice"),
+                (b"x-spiffe-id-peer-cert", b"spiffe://yashigani.internal/fake"),
+                (b"authorization", b"Bearer whatever"),
             ],
             "extensions": {},  # No TLS extension — peer_cert absent
         }
@@ -610,20 +622,22 @@ class TestSpiffeForgeV232002:
         import asyncio
         asyncio.run(middleware(scope, None, None))
 
-        # X-SPIFFE-ID must have been stripped — absent from downstream headers.
-        assert received_headers["x_spiffe_id"] is None, (
-            "LAURA-V232-002: forged X-SPIFFE-ID must be stripped by middleware — "
-            f"downstream still sees x-spiffe-id={received_headers['x_spiffe_id']!r}"
+        # x-spiffe-id must be preserved (Caddy/install.sh injected).
+        assert received_headers["x_spiffe_id"] == "spiffe://yashigani.internal/backoffice", (
+            "ISSUE-019: x-spiffe-id must be preserved by middleware — "
+            f"got x-spiffe-id={received_headers['x_spiffe_id']!r}"
         )
-        # x-spiffe-id-peer-cert must be set to empty string (no TLS ext, no cert).
+        # x-spiffe-id-peer-cert must be overwritten to "" (TLS ext absent).
         assert received_headers["peer_cert"] == "", (
-            "LAURA-V232-002: x-spiffe-id-peer-cert must be empty when TLS ext absent"
+            "LAURA-V232-002: x-spiffe-id-peer-cert must be empty when TLS ext absent, "
+            f"got {received_headers['peer_cert']!r}"
         )
 
-    def test_client_forged_x_spiffe_id_header_absent_after_middleware(self):
+    def test_x_spiffe_id_preserved_caddy_path(self):
         """
-        LAURA-V232-002: after middleware processes the scope, x-spiffe-id must
-        not appear in the headers list passed to the downstream app.
+        ISSUE-019: x-spiffe-id injected by Caddy on the Caddy→backoffice path
+        must reach the downstream app unchanged.  This is the fix for the
+        regression introduced by LAURA-V232-002 Su fix (commit 4a7a5a8).
         """
         MW = self._import_middleware()
 
@@ -636,11 +650,11 @@ class TestSpiffeForgeV232002:
 
         scope = {
             "type": "http",
-            "method": "GET",
-            "path": "/internal/metrics",
+            "method": "POST",
+            "path": "/admin/agents",
             "headers": [
-                (b"x-spiffe-id", b"spiffe://yashigani.internal/prometheus"),
-                (b"host", b"gateway"),
+                (b"x-spiffe-id", b"spiffe://yashigani.internal/caddy"),
+                (b"host", b"backoffice"),
             ],
             "extensions": {},
         }
@@ -648,18 +662,21 @@ class TestSpiffeForgeV232002:
         import asyncio
         asyncio.run(middleware(scope, None, None))
 
-        # Check that x-spiffe-id is absent from downstream headers
-        header_names = [k.lower() for k, v in downstream_scope.get("headers", [])]
-        assert b"x-spiffe-id" not in header_names, (
-            "LAURA-V232-002: middleware must strip x-spiffe-id from inbound client "
-            "request — forged header must not reach downstream route handler"
+        header_names_and_values = {
+            k.lower(): v for k, v in downstream_scope.get("headers", [])
+        }
+        assert b"x-spiffe-id" in header_names_and_values, (
+            "ISSUE-019: x-spiffe-id must be preserved on Caddy→backoffice path"
+        )
+        assert header_names_and_values[b"x-spiffe-id"] == b"spiffe://yashigani.internal/caddy", (
+            "ISSUE-019: x-spiffe-id value must be Caddy's SPIFFE identity"
         )
 
-    def test_middleware_strips_both_spiffe_headers_no_tls_ext(self):
+    def test_middleware_overwrites_peer_cert_header_preserves_spiffe_id(self):
         """
-        LAURA-V232-002: when ASGI TLS extension is absent, both
-        x-spiffe-id AND x-spiffe-id-peer-cert supplied by client must be
-        stripped.  Downstream sees x-spiffe-id-peer-cert="" and no x-spiffe-id.
+        ISSUE-019 / LAURA-V232-002: when ASGI TLS extension is absent,
+        x-spiffe-id-peer-cert supplied by the client is overwritten to "".
+        x-spiffe-id (Caddy/install.sh injected) is preserved.
         """
         MW = self._import_middleware()
 
@@ -672,10 +689,10 @@ class TestSpiffeForgeV232002:
 
         scope = {
             "type": "http",
-            "method": "GET",
-            "path": "/internal/metrics",
+            "method": "POST",
+            "path": "/admin/agents",
             "headers": [
-                (b"x-spiffe-id", b"spiffe://yashigani.internal/prometheus"),
+                (b"x-spiffe-id", b"spiffe://yashigani.internal/backoffice"),
                 (b"x-spiffe-id-peer-cert", b"spiffe://yashigani.internal/fake"),
             ],
             "extensions": {},
@@ -686,11 +703,12 @@ class TestSpiffeForgeV232002:
 
         headers_dict = {k.lower(): v for k, v in downstream_scope.get("headers", [])}
 
-        # x-spiffe-id-peer-cert must be empty (server-set from absent TLS ext)
+        # x-spiffe-id-peer-cert must be empty (server-set from absent TLS ext;
+        # client-supplied value overwritten).
         assert headers_dict.get(b"x-spiffe-id-peer-cert") == b"", (
             "LAURA-V232-002: x-spiffe-id-peer-cert must be empty when TLS ext absent"
         )
-        # x-spiffe-id must not appear at all (client-supplied, stripped)
-        assert b"x-spiffe-id" not in headers_dict, (
-            "LAURA-V232-002: x-spiffe-id must be stripped from client requests"
+        # x-spiffe-id must be preserved (install.sh / Caddy injected).
+        assert headers_dict.get(b"x-spiffe-id") == b"spiffe://yashigani.internal/backoffice", (
+            "ISSUE-019: x-spiffe-id must be preserved — Caddy/install.sh injected value"
         )

@@ -67,10 +67,15 @@ def _k8s_available() -> bool:
     """Return True if kubectl can reach the cluster and the namespace exists."""
     if not shutil.which("kubectl"):
         return False
-    result = subprocess.run(
-        ["kubectl", "get", "namespace", "yashigani", "--no-headers"],
-        capture_output=True, text=True, timeout=5,
-    )
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "namespace", "yashigani", "--no-headers"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        # kubectl present but cluster not reachable (no kubeconfig, no cluster running).
+        # Treat as unavailable so the test fixture skips gracefully.
+        return False
     return result.returncode == 0
 
 

@@ -27,10 +27,19 @@ RUN groupadd --gid 1001 yashigani \
 
 # libpq5 for asyncpg/psycopg2, xmlsec1 for python3-saml SAML assertion signing
 # age (v1.2.1-1+b5, debian bookworm) for MP.L2-3.8.9 backup encryption — CWE-312
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt-get upgrade pulls Debian trixie security-updated base packages so we ship
+# the most recent CVE-patched glibc / openssl / libxml2 / libgcrypt / etc. at
+# image build time, rather than only the snapshot baked into the python:slim base.
+# Closes 9 of 12 NOT-EXPLOITABLE-CVA HIGH/CRIT base-image CVEs identified by
+# Lu's 2026-05-13 Trivy rescan; hygiene-grade — supplements per-CVE compensating
+# controls already in place (YSG-RISK-044 + 045 RSA-only / entity-forbid).
+RUN apt-get update \
+    && apt-get -y upgrade \
+    && apt-get install -y --no-install-recommends \
         libpq5 \
         libxmlsec1-openssl \
         age=1.2.1-1+b5 \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -60,8 +69,17 @@ RUN sed -i 's|script_location = src/yashigani/db/migrations|script_location = /u
 COPY scripts/bootstrap_postgres.py /app/scripts/bootstrap_postgres.py
 
 RUN mkdir -p /data/audit /data/bootstrap /var/log/yashigani && \
-    chown -R yashigani:yashigani /data /var/log/yashigani /app
+    chown -R yashigani:yashigani /data /var/log/yashigani /app 2>/dev/null || true && \
+    chmod -R a+rX /usr/local/lib/python3.14/site-packages/yashigani/
 
+# umask 0077 wrapper — sets file-creation mask before uvicorn starts so
+# every runtime-written file (audit logs, alembic state, Python open())
+# defaults to 0600 (owner-only), not 0644. Defence-in-depth; closes the
+# class of world-readable runtime files regardless of caller remembering
+# os.chmod(). Ref: Tom audit finding on 214c4fd collateral to ISSUE-027.
+COPY --chown=root:root docker/backoffice-start.sh /usr/local/bin/backoffice-start.sh
+USER root
+RUN chmod 0755 /usr/local/bin/backoffice-start.sh
 USER yashigani
 
 EXPOSE 8443
@@ -82,11 +100,5 @@ ENV PYTHONUNBUFFERED=1 \
 # Internal mTLS (v2.23.1) — mutual TLS terminated by uvicorn.
 # Pattern A for Python ssl: ca_root.crt is the trust anchor; private root key
 # never enters this image (root.key is host-only 0400).
-CMD ["uvicorn", "yashigani.backoffice.entrypoint:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8443", \
-     "--ssl-keyfile", "/run/secrets/backoffice_client.key", \
-     "--ssl-certfile", "/run/secrets/backoffice_client.crt", \
-     "--ssl-ca-certs", "/run/secrets/ca_root.crt", \
-     "--ssl-cert-reqs", "2", \
-     "--no-access-log"]
+# backoffice-start.sh sets umask 0077 then exec's uvicorn.
+CMD ["/bin/sh", "/usr/local/bin/backoffice-start.sh"]

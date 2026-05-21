@@ -1,0 +1,64 @@
+# Last updated: 2026-05-16T21:00:00+01:00 (v2.23.4: YSG-RISK-008 close — compose hardening parity gate)
+name: Compose Hardening Parity Gate
+
+# YSG-RISK-008 (v2.23.4): CI gate to prevent compose hardening regression.
+#
+# Checks enforced:
+#   1. Every service in docker/docker-compose.yml must have cap_drop: [ALL]
+#      (was already universal before this gate — verified as baseline).
+#   2. Every service must have no-new-privileges:true in security_opt.
+#   3. Every service must have read_only: true OR be in the documented
+#      exemption list (wazuh suite: wazuh-manager, wazuh-indexer, wazuh-dashboard).
+#
+# Admission-control parity decision (per brief §6):
+#   Option B — YAML-only + CI gate.
+#   K8s gets Kyverno admission enforcement (ccc7abf+adf6fda+782bf2f).
+#   Compose gets this CI gate as the equivalent admission check.
+#   Rationale: Conftest/OPA (Option A) requires rego toolchain install and
+#   compose-schema rego rules that are not standardised; the Python-based
+#   YAML parse approach is simpler, verifiable, and aligned with existing
+#   contract test patterns in tests/contracts/.
+#
+# Historical incidents this gate would have caught:
+#   YSG-RISK-008 (pre-fix): 24/27 services had no read_only, 17/27 missing
+#   no-new-privileges. Any new service added without these would drift silently.
+
+on:
+  push:
+    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    paths:
+      - "docker/docker-compose.yml"
+      - ".github/workflows/compose-hardening-gate.yml"
+      - "tests/contracts/test_compose_hardening.py"
+  pull_request:
+    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    paths:
+      - "docker/docker-compose.yml"
+      - ".github/workflows/compose-hardening-gate.yml"
+      - "tests/contracts/test_compose_hardening.py"
+  workflow_dispatch:
+
+concurrency:
+  group: compose-hardening-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compose-hardening-parity:
+    name: Compose hardening parity (YSG-RISK-008)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install "pytest>=8" "PyYAML>=6"
+
+      - name: Compose hardening parity (cap_drop + no-new-privileges + read_only)
+        run: python3 -m pytest tests/contracts/test_compose_hardening.py -v --tb=short

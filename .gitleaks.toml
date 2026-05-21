@@ -1,0 +1,108 @@
+# gitleaks.toml — Yashigani secret-scan configuration
+# Last updated: 2026-05-17T00:00:00+01:00 (F-V232-003 / ASVS V10.3.4)
+#
+# gitleaks v8.x configuration. Extends the built-in ruleset with
+# Yashigani-specific patterns and allowlist entries for known false positives.
+#
+# References:
+#   - https://github.com/gitleaks/gitleaks/blob/main/config/gitleaks.toml
+#   - F-V232-003 (V10.3.4) CI gate
+#   - feedback_image_pinning.md (action pins in secret-scan.yml)
+
+[extend]
+# Extend the default gitleaks ruleset shipped with the binary.
+# This picks up AWS, GCP, GitHub tokens, generic high-entropy keys, etc.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Baseline — pre-existing findings that are known false positives.
+# CI workflow uses `--baseline-path .gitleaks-baseline.json` so only NEW
+# findings (added after this baseline was generated) cause CI to fail.
+# The baseline was generated on 2026-05-17 at HEAD 763a434 by running:
+#   gitleaks detect --source . --config .gitleaks.toml \
+#     --report-format json --report-path .gitleaks-baseline.json
+# The 230 pre-existing findings are all false positives:
+#   - 216 generic-api-key: SHA-256 hashes, Vault path kwarg fragments,
+#     Python keyword args with high entropy (e.g. mount_point=_KV_MOUNT)
+#   - 7 private-key-pem-block + 1 private-key: synthetic test-fixture keys
+#     in src/tests/unit/ (not real credentials)
+#   - 2 pgp-gpg-private-key: example PGP block in docs/release-process.md
+#   - 2 curl-auth-header + 2 jwt: yashigani-internal token in test-ui.py
+#     and example JWT in test_audit.py (not real credentials)
+# Any finding NOT in the baseline will cause CI to fail — that is the intent.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Yashigani-specific rules
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "yashigani-db-aes-key"
+description = "Yashigani DB_AES_KEY secret (32-byte hex or base64 literal)"
+# YASHIGANI_DB_AES_KEY must be randomly generated at install time and never
+# hard-coded. This rule catches any variable assignment that looks like a
+# literal value for the key rather than a variable reference.
+regex = '''(?i)YASHIGANI_DB_AES_KEY\s*[=:]\s*["']?[A-Za-z0-9+/]{32,}["']?'''
+tags = ["yashigani", "secret", "aes-key"]
+
+[[rules]]
+id = "yashigani-bootstrap-token"
+description = "Yashigani admin bootstrap token (hex 64-char shape)"
+# Bootstrap tokens are 32-byte secrets.token_hex(32) output = 64 hex chars.
+# Any literal 64-char hex string assigned to YASHIGANI_BOOTSTRAP_TOKEN or
+# ADMIN_BOOTSTRAP_TOKEN is a hard-coded credential.
+regex = '''(?i)(YASHIGANI_BOOTSTRAP_TOKEN|ADMIN_BOOTSTRAP_TOKEN)\s*[=:]\s*["']?[0-9a-f]{64}["']?'''
+tags = ["yashigani", "secret", "bootstrap-token"]
+
+[[rules]]
+id = "yashigani-internal-hmac"
+description = "Yashigani Caddy internal HMAC secret literal"
+regex = '''(?i)(CADDY_INTERNAL_HMAC|yashigani_internal_hmac)\s*[=:]\s*["']?[A-Za-z0-9+/]{20,}["']?'''
+tags = ["yashigani", "secret", "hmac"]
+
+[[rules]]
+id = "private-key-pem-block"
+description = "PEM-encoded private key block"
+# SSH private keys, RSA private keys, EC private keys, PKCS#8 keys.
+# The chart mounts certs from K8s Secrets — no private key should ever be
+# in source files.
+regex = '''-----BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----'''
+tags = ["key", "private-key", "pem"]
+
+[[rules]]
+id = "pgp-gpg-private-key"
+description = "PGP / GPG private key block"
+regex = '''-----BEGIN PGP PRIVATE KEY BLOCK-----'''
+tags = ["key", "pgp", "gpg"]
+
+# ---------------------------------------------------------------------------
+# Global allowlist — known false positives in test fixtures and examples
+# ---------------------------------------------------------------------------
+
+[allowlist]
+description = "Known false positives in test fixtures, examples, and docs"
+
+# Test fixture directories: synthetic credentials, not real secrets.
+paths = [
+    "tests/.*fixtures/.*",
+    "tests/.*mocks/.*",
+    "docs/.*examples/.*",
+    "docs/.*quickstart/.*",
+    # gitleaks baseline file itself (may contain pattern excerpts)
+    ".gitleaks-baseline.json",
+]
+
+# Regex-based allowlist for specific patterns we know are safe.
+regexes = [
+    # Placeholder values used in docs and values.yaml comments
+    '''admin@example\.com''',
+    '''yashigani\.example\.com''',
+    '''POSTGRES_PASSWORD.*\$\(POSTGRES_PASSWORD\)''',
+    # Dummy CA blobs in test code (base64 of obviously fake data)
+    '''LS0tLS1CRUdJTiBDRVJUSUZJQ0FU''',
+]
+
+# Commit-level allowlist: generated migration files occasionally contain
+# hex identifiers that trip generic high-entropy rules.
+# Allowlist is narrowed to the specific pattern — not a blanket bypass.
+commits = []

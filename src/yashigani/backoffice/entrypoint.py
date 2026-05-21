@@ -11,7 +11,7 @@ First-run behaviour:
   Prints all credentials once to stdout in a clearly delimited block.
   Marks bootstrap complete via sentinel file so this never repeats.
 
-Last updated: 2026-05-07T00:00:00+01:00
+Last updated: 2026-05-17T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -180,25 +180,49 @@ def _bootstrap():
         logger.warning("Rate limiter Redis unavailable (%s) — rate limiting disabled", exc)
 
     # ── RBAC store + Agent registry (Redis db/3) ─────────────────────────────
+    # F3 / v2.23.4: retry-with-backoff on RBAC+Agent Redis init.
+    # K8s DNS for headless Services (ClusterIP: None) may not resolve at
+    # container startup — the backing Endpoints object is populated by kube-dns
+    # only after the Pod IP is registered, which can take a few seconds after
+    # the first pod is scheduled.  A single-attempt init silently sets
+    # agent_registry=None for the entire pod lifetime → every /admin/agents
+    # call returns 503.  Five attempts with 1/2/4/8/16 s backoff covers the
+    # typical kube-dns propagation window without blocking readiness probes.
     rbac_store = None
     agent_registry = None
-    try:
-        import redis as _redis
-        redis_rbac_url = _backoffice_redis_url(3)
-        redis_rbac_client = _redis.from_url(redis_rbac_url, decode_responses=False)
-        rbac_store = RBACStore(redis_client=redis_rbac_client)
-        logger.info(
-            "RBAC store initialised: %d group(s) loaded from Redis",
-            len(rbac_store.list_groups()),
-        )
-        # Agent registry shares the same Redis db/3 instance (different key namespace)
-        agent_registry = AgentRegistry(redis_client=redis_rbac_client)
-        logger.info(
-            "Agent registry initialised: %d agent(s) in index",
-            agent_registry.count("all"),
-        )
-    except Exception as exc:
-        logger.warning("RBAC/Agent Redis unavailable (%s) — RBAC and agent registry disabled", exc)
+    _RBAC_MAX_ATTEMPTS = 5
+    _rbac_backoff = 1.0
+    for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
+        try:
+            import redis as _redis
+            redis_rbac_url = _backoffice_redis_url(3)
+            redis_rbac_client = _redis.from_url(redis_rbac_url, decode_responses=False)
+            rbac_store = RBACStore(redis_client=redis_rbac_client)
+            logger.info(
+                "RBAC store initialised: %d group(s) loaded from Redis",
+                len(rbac_store.list_groups()),
+            )
+            # Agent registry shares the same Redis db/3 instance (different key namespace)
+            agent_registry = AgentRegistry(redis_client=redis_rbac_client)
+            logger.info(
+                "Agent registry initialised: %d agent(s) in index",
+                agent_registry.count("all"),
+            )
+            break  # success
+        except Exception as exc:
+            if _rbac_attempt < _RBAC_MAX_ATTEMPTS:
+                logger.warning(
+                    "RBAC/Agent Redis unavailable (attempt %d/%d): %s — retrying in %.0f s",
+                    _rbac_attempt, _RBAC_MAX_ATTEMPTS, exc, _rbac_backoff,
+                )
+                time.sleep(_rbac_backoff)
+                _rbac_backoff *= 2
+            else:
+                logger.warning(
+                    "RBAC/Agent Redis unavailable after %d attempts (%s) — "
+                    "RBAC and agent registry disabled",
+                    _RBAC_MAX_ATTEMPTS, exc,
+                )
 
     # ── Backend registry + config store (Redis db/1, separate key namespace) ─
     backend_registry = None
@@ -363,8 +387,8 @@ def _bootstrap():
 
     # v0.9.0 — WebAuthn + EventBus (optional, graceful degradation if unavailable)
     try:
-        from yashigani.auth.webauthn import WebAuthnService
-        backoffice_state.webauthn_service = WebAuthnService()
+        from yashigani.auth.webauthn import WebAuthnService, WebAuthnConfig
+        backoffice_state.webauthn_service = WebAuthnService(config=WebAuthnConfig())
         logger.info("WebAuthn service initialized")
     except Exception as exc:
         logger.warning("WebAuthn service unavailable (%s) — passkey routes will return 503", exc)
@@ -382,28 +406,52 @@ def _bootstrap():
         tier_name = license_state.tier.value if license_state else "community"
         identity_broker = IdentityBroker(tier=tier_name)
 
-        # Read IdP configurations from environment
-        # Format: YASHIGANI_IDP_<N>_ID, _NAME, _PROTOCOL, _DISCOVERY_URL, _CLIENT_ID, _CLIENT_SECRET, _EMAIL_DOMAINS
+        # Read IdP configurations from environment.
+        # OIDC format: YASHIGANI_IDP_<N>_ID, _NAME, _PROTOCOL, _DISCOVERY_URL,
+        #              _CLIENT_ID, _CLIENT_SECRET, _EMAIL_DOMAINS, _REDIRECT_URI
+        # SAML format: above + _SAML_IDP_SSO_URL, _SAML_IDP_SLS_URL,
+        #              _SAML_IDP_X509_CERT, _SAML_SP_SLS_URL,
+        #              _SAML_SP_PRIVATE_KEY, _SAML_SP_CERT,
+        #              _ENTITY_ID (SP entity ID), _CLIENT_ID (legacy alias)
+        #
+        # For SAML IdPs, _REDIRECT_URI is the SP ACS URL.
+        # _SAML_SP_PRIVATE_KEY must be an RSA key — non-RSA rejects startup
+        # via _assert_rsa_sp_key() in SAMLProvider.__init__ (YSG-RISK-044).
         idp_index = 1
         while True:
             prefix = f"YASHIGANI_IDP_{idp_index}_"
             idp_id = os.getenv(f"{prefix}ID", "")
             if not idp_id:
                 break
+            protocol = os.getenv(f"{prefix}PROTOCOL", "oidc")
+            tls_domain = os.getenv("YASHIGANI_TLS_DOMAIN", "localhost")
+            if protocol == "saml":
+                default_redirect = (
+                    f"https://{tls_domain}/auth/sso/saml/{idp_id}/acs"
+                )
+            else:
+                default_redirect = (
+                    f"https://{tls_domain}/auth/sso/oidc/{idp_id}/callback"
+                )
+            redirect_uri = os.getenv(f"{prefix}REDIRECT_URI", default_redirect)
             idp_config = IdPConfig(
                 id=idp_id,
                 name=os.getenv(f"{prefix}NAME", idp_id),
-                protocol=os.getenv(f"{prefix}PROTOCOL", "oidc"),
+                protocol=protocol,
                 metadata_url=os.getenv(f"{prefix}DISCOVERY_URL", ""),
                 client_id=os.getenv(f"{prefix}CLIENT_ID", ""),
                 client_secret=os.getenv(f"{prefix}CLIENT_SECRET", ""),
+                entity_id=os.getenv(f"{prefix}ENTITY_ID", ""),
                 email_domains=[
                     d.strip() for d in os.getenv(f"{prefix}EMAIL_DOMAINS", "").split(",") if d.strip()
                 ],
-            )
-            redirect_uri = os.getenv(
-                f"{prefix}REDIRECT_URI",
-                f"https://{os.getenv('YASHIGANI_TLS_DOMAIN', 'localhost')}/auth/sso/oidc/{idp_id}/callback",
+                # SAML-specific fields — empty string for OIDC IdPs.
+                saml_idp_sso_url=os.getenv(f"{prefix}SAML_IDP_SSO_URL", ""),
+                saml_idp_sls_url=os.getenv(f"{prefix}SAML_IDP_SLS_URL", ""),
+                saml_idp_x509_cert=os.getenv(f"{prefix}SAML_IDP_X509_CERT", ""),
+                saml_sp_sls_url=os.getenv(f"{prefix}SAML_SP_SLS_URL", ""),
+                saml_sp_private_key=os.getenv(f"{prefix}SAML_SP_PRIVATE_KEY", ""),
+                saml_sp_certificate=os.getenv(f"{prefix}SAML_SP_CERT", ""),
             )
             try:
                 identity_broker.add_idp(idp_config, redirect_uri=redirect_uri)

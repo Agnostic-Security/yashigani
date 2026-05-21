@@ -349,6 +349,80 @@ This image does not match the pinned manifest. ABORTING — do not use this bund
 }
 
 # ---------------------------------------------------------------------------
+# Write image config-ID (.Id) into airgap/manifest.yml for a given ref.
+# Called after pull_and_verify so the image is present in the local store.
+# The id: field enables install.sh to verify images loaded from tar (which
+# have no RepoDigests) using the content-addressable image config SHA-256.
+# Backwards-compat: existing manifests without id: fields are valid; install.sh
+# treats them as verify_warn_no_id (warn + skip, never fail).
+# ---------------------------------------------------------------------------
+write_image_id_to_manifest() {
+  local ref="$1"
+  local manifest="$2"
+
+  [[ "$DRY_RUN" == "true" ]] && return 0
+
+  local img_id
+  img_id="$("$RUNTIME" inspect --format='{{.Id}}' "${ref}" 2>/dev/null || true)"
+  if [[ -z "$img_id" ]]; then
+    warn "Could not capture .Id for ${ref} — id: field not written to manifest"
+    return 0
+  fi
+
+  # Use python3 to insert/update id: field for the matching ref in manifest.yml.
+  # Operates on a temp file + atomic rename to avoid partial writes.
+  python3 - "${manifest}" "${ref}" "${img_id}" <<'PYEOF'
+import sys, re, os
+
+manifest_path, target_ref, img_id = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(manifest_path) as f:
+    lines = f.readlines()
+
+out = []
+in_matching_block = False
+id_written = False
+
+for i, line in enumerate(lines):
+    # Detect start of new image block — reset tracking state
+    if re.match(r'^      - name:', line) or re.match(r'^        name:', line):
+        in_matching_block = False
+        id_written = False
+
+    # Mark block as matching once we see the target ref: line
+    if re.search(r'ref:\s*"?' + re.escape(target_ref) + r'"?', line):
+        in_matching_block = True
+
+    # Emit ref: line then immediately append id: (insert or replace)
+    if in_matching_block and re.search(r'ref:\s*"?' + re.escape(target_ref) + r'"?', line):
+        out.append(line)
+        # Detect indentation from ref: line
+        indent = re.match(r'^(\s+)', line)
+        indent_str = indent.group(1) if indent else '        '
+        out.append(f'{indent_str}id: "{img_id}"\n')
+        id_written = True
+        continue
+
+    # Drop stale id: line in same block (already re-emitted above)
+    if in_matching_block and id_written and re.match(r'\s+id:', line):
+        continue
+
+    out.append(line)
+
+tmp = manifest_path + '.tmp'
+with open(tmp, 'w') as f:
+    f.writelines(out)
+os.replace(tmp, manifest_path)
+PYEOF
+  local _py_rc=$?
+  if [[ $_py_rc -ne 0 ]]; then
+    warn "Could not write id: field for ${ref} to manifest — skipping"
+    return 0
+  fi
+  ok "  id: field written for ${ref}: ${img_id:0:19}..."
+}
+
+# ---------------------------------------------------------------------------
 # Build in-tree images (gateway / backoffice)
 # ---------------------------------------------------------------------------
 build_in_tree_images() {
@@ -514,6 +588,9 @@ print('unknown')
     else
       # External: pull + verify digest
       pull_and_verify "${ref}" "${digest}"
+      # Capture image config .Id and write into manifest.yml for air-gap
+      # load-path verification (YSG-RISK-038 / Iris Batch 2 item 2B).
+      write_image_id_to_manifest "${ref}" "${MANIFEST_FILE}"
       sidecar_entries+=("${ref}|${digest}")
     fi
 

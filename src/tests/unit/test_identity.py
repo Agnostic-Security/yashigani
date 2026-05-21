@@ -191,6 +191,35 @@ class TestIdentityRegistry:
         # Old key works during grace period
         assert registry.verify_key(identity_id, old_key)
 
+    def test_rotate_key_grace_seconds_zero_does_not_raise(self, registry):
+        """
+        SF-010 regression: rotate_key(grace_seconds=0) must NOT raise.
+
+        Before the fix, registry.py:509 executed:
+            pipe.set(f"identity:key:grace:{identity_id}", current, ex=0)
+        Real Redis rejects EX 0 with:
+            redis.exceptions.ResponseError: invalid expire time in 'set' command
+
+        After the fix the grace-key SET is skipped entirely when grace_seconds=0,
+        so no EX 0 is sent to Redis and rotate_key completes normally.
+
+        This is the exact call path triggered by POST /me/api-key → me.py:239:
+            registry.rotate_key(identity_id, grace_seconds=0)
+        """
+        identity_id, old_key = registry.register(
+            kind=IdentityKind.HUMAN, name="G0", slug="grace-zero",
+        )
+        # Must not raise — pre-fix this would raise ResponseError via fakeredis
+        new_key = registry.rotate_key(identity_id, grace_seconds=0)
+        assert new_key != old_key
+        # New key is valid
+        assert registry.verify_key(identity_id, new_key)
+        # Old key must NOT be valid — grace_seconds=0 means immediate invalidation
+        assert not registry.verify_key(identity_id, old_key)
+        # Grace key must not exist in Redis
+        grace_key = f"identity:key:grace:{identity_id}"
+        assert registry._r.get(grace_key) is None
+
     def test_last_seen_updated_on_verify(self, registry):
         identity_id, key = registry.register(
             kind=IdentityKind.HUMAN, name="LS", slug="lastseen",

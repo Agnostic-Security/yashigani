@@ -1,6 +1,6 @@
-# Yashigani v2.23.2 — Umbrella Chart Top-Level Values
+# Yashigani v2.23.4 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-10 (fix: G16 image-pin — langgraph floating-tag stub replaced with not-yet-available hold-back)
+# Last updated: 2026-05-17 (feat: internalBearer per-install secret — Captain Bucket-C; remove hardcoded yashigani-internal)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -78,21 +78,25 @@ networkPolicies:
   enabled: true
 
 # ---------------------------------------------------------------------------
-# Admission Control (ACS-RISK-008 — v2.23.2 P1)
+# Admission Control (YSG-RISK-008 — v2.23.2 P1)
 # ---------------------------------------------------------------------------
 # When enabled, the chart renders Kyverno ClusterPolicy resources that REJECT
-# pods missing the ACS-RISK-008 container hardening baseline:
+# pods missing the YSG-RISK-008 container hardening baseline:
 #   - runAsNonRoot: true (pod or container level)
 #   - allowPrivilegeEscalation: false (every container)
 #   - seccompProfile.type: RuntimeDefault (pod level)
 #   - capabilities.drop: [ALL] (every container)
 #   - No runAsUser: 0 (except documented exceptions)
 #
-# PREREQUISITE: Kyverno must be installed cluster-wide BEFORE applying the
-# release. See helm/yashigani/policies/admission/README.md for install steps.
+# Set to true only AFTER installing Kyverno cluster-wide
+# (`helm install kyverno kyverno/kyverno -n kyverno --create-namespace`).
+# The chart does not bundle Kyverno.
 #
-# Set to false if the cluster does not have Kyverno (e.g. during initial
-# bootstrap before Kyverno is installed). Document in risk register.
+# In CNI environments or clusters without Kyverno the ClusterPolicy CRD will
+# not be present and helm install/upgrade will fail with an opaque API-server
+# error. Leaving this false means application-layer mTLS + SPIFFE gate remain
+# active; document any disablement in the risk register with maintainer
+# sign-off, referencing YSG-RISK-008.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # LIC-002 SECURITY NOTICE — YASHIGANI_LICENSE_TIER is NOT an operator-settable
@@ -109,7 +113,7 @@ networkPolicies:
 # as a HIGH-severity finding and remove it before deploying.
 # ---------------------------------------------------------------------------
 admissionPolicies:
-  enabled: true
+  enabled: false
   # Kyverno policy action: Enforce (hard reject) or Audit (log only).
   # Must be Enforce in production. Audit only during rollout evaluation.
   validationFailureAction: Enforce
@@ -207,12 +211,12 @@ adminBootstrap:
   # bundles python3 + pyotp + secrets which is everything we need; reusing
   # it avoids another image pull.
   image:
-    # Built locally by install.sh from the v2.23.3 tagged source.
+    # Built locally by install.sh from the v2.23.4 tagged source.
     # For K8s deployments: push to your own private registry and update
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.23.3"
+    tag: "2.23.4"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -223,17 +227,39 @@ adminBootstrap:
       memory: "128Mi"
 
 # ---------------------------------------------------------------------------
+# Internal Bearer Token (Captain Bucket-C — per-install, rotatable secret)
+# ---------------------------------------------------------------------------
+# YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (open-webui,
+# langflow, letta) present as the OpenAI `Authorization: Bearer <token>` when
+# calling gateway:8081/v1. The gateway's AgentAuthMiddleware validates it at
+# the app layer. Previously hardcoded to "yashigani-internal"; now per-install.
+#
+# Fail-closed: if internalBearer.value is empty AND no existingSecretName is
+# set, helm template/install/upgrade will fail (see validate-security.yaml).
+# Generate with: openssl rand -hex 32
+#
+# Upgrade-safe: the auto-generated Secret uses helm lookup so the value is
+# preserved on `helm upgrade` and only generated fresh on first install.
+internalBearer:
+  # Set a non-empty value here, or leave empty to auto-generate on first install.
+  # In production: pass via --set internalBearer.value="$(openssl rand -hex 32)"
+  # or supply an existingSecretName with key `yashigani_internal_bearer`.
+  value: ""
+  # Optionally point to a pre-created K8s Secret (key: yashigani_internal_bearer).
+  existingSecretName: ""
+
+# ---------------------------------------------------------------------------
 # Gateway — MCP reverse proxy (data plane)
 # ---------------------------------------------------------------------------
 gateway:
   enabled: true
   image:
-    # Built locally by install.sh from the v2.23.3 tagged source.
+    # Built locally by install.sh from the v2.23.4 tagged source.
     # For K8s deployments: push to your own private registry and update
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.23.3"
+    tag: "2.23.4"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -294,12 +320,12 @@ backoffice:
     - letta
     - openclaw
   image:
-    # Built locally by install.sh from the v2.23.3 tagged source.
+    # Built locally by install.sh from the v2.23.4 tagged source.
     # For K8s deployments: push to your own private registry and update
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "2.23.3"
+    tag: "2.23.4"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -503,6 +529,27 @@ ollama:
     # Verified 2026-05-03 — no root required.
     home: "/data"
     ollamaModels: "/data/models"
+  # initJob — one-shot Kubernetes Job to pull the default model on first deploy.
+  # Activated only when openWebui.enabled=true (no model needed for API-only).
+  # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
+  #   chat surface shows it as an available backend.
+  # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
+  #   Set to "skip" after an upstream model update that changes the digest.
+  # minDiskGiB: minimum free gigabytes required on the ollama volume before pull.
+  #   If free space < minDiskGiB the Job logs a warning and exits 0 (warn-only).
+  initJob:
+    # defaultModel: qwen2.5:3b — 1.9 GB, Qwen 2.5 3B-parameter instruct model.
+    # Good balance of size and capability for a single-node deployment.
+    defaultModel: "qwen2.5:3b"
+    modelDigest: "357c53fb659c"
+    minDiskGiB: 3
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
 
 # ---------------------------------------------------------------------------
 # Prometheus — metrics collection
@@ -789,6 +836,264 @@ agentBundles:
     tokenSecretName: "yashigani-openclaw-token"
     tokenSecretKey: "token"
 
+  # Langflow — Visual multi-agent workflow builder (MIT)
+  # https://github.com/langflow-ai/langflow
+  # Single container, embedded SQLite. OpenAI-compatible API on port 7860.
+  # Users build custom agent workflows visually via the Langflow UI.
+  # All LLM calls route through Yashigani gateway (OpenAI-compatible).
+  langflow:
+    enabled: false
+    image:
+      # Pinned to 1.9.2 to match docker-compose.yml.
+      # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
+      repository: docker.io/langflowai/langflow
+      tag: "1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    env:
+      # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
+      OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
+      # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
+      # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
+      LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
+      DO_NOT_TRACK: "true"
+      LANGFLOW_AUTO_LOGIN: "true"
+      # FAIL-002 parity (v2.23.4): langflow 1.9.2 writes alembic migration log to
+      # /app/.venv/lib/python3.12/site-packages/langflow/alembic/alembic.log — inside
+      # the image rootfs. readOnlyRootFilesystem:false already prevents EROFS in K8s,
+      # but this env var is defence-in-depth: redirects alembic output to stdout
+      # (langflow.services.database.service._run_migrations uses nullcontext(sys.stdout)
+      # when alembic_log_to_stdout=True, bypassing the file open entirely).
+      LANGFLOW_ALEMBIC_LOG_TO_STDOUT: "true"
+    service:
+      port: 7860
+      type: ClusterIP
+    # YSG-RISK-005 #3av: requests = 50% of limit.
+    # Langflow is heavier than letta (visual UI + workflow engine): 1 GiB limit.
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1024Mi"
+    # Persistent volume for Langflow SQLite DB and flow data.
+    persistence:
+      enabled: true
+      mountPath: /app/langflow
+      size: 5Gi
+      storageClass: ""
+      accessMode: ReadWriteOnce
+    tokenSecretName: "yashigani-langflow-token"
+    tokenSecretKey: "token"
+    # Langflow image (1.9.2) runs as uid=1000 with named user "user" (non-numeric).
+    # K8s runAsNonRoot rejects non-numeric USER directives without runAsUser set.
+    # Fix: explicit runAsUser: 1000 so K8s can verify non-root. Risk: LOW (image
+    # is non-root by design; UID matches upstream image USER directive).
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — langflow receives
+      # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups
+      # is not functionally required here. Added for Compose↔Helm parity.
+      # Laura GID-001: openclaw excluded (bearer via env var, no file read).
+      supplementalGroups: [2002]
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop: ["ALL"]
+
+  # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
+  # https://github.com/letta-ai/letta
+  # Agent with long-term memory, tool use, and conversation persistence.
+  # Exposes REST API on port 8283. Uses shared Postgres (separate `letta` DB).
+  # Dependency: Postgres must be available and the `letta` database must exist.
+  # The install.sh installer creates the `letta` database; for K8s deployments
+  # run `CREATE DATABASE letta OWNER yashigani_app;` before enabling this bundle.
+  letta:
+    enabled: false
+    image:
+      # Pinned to 0.16.7 to match docker-compose.yml.
+      # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
+      repository: docker.io/letta/letta
+      tag: "0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    env:
+      # Route LLM calls through Yashigani gateway
+      OPENAI_API_BASE: "http://yashigani-gateway:8080/v1"
+      # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
+      # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
+      LETTA_LLM_MODEL: "qwen2.5:3b"
+      LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
+    # Letta connects to Postgres via the letta-pgbouncer sidecar (pod loopback).
+    # The URI is assembled from the postgres secret by agent-bundles.yaml:
+    #   LETTA_PG_URI=postgresql://yashigani_app:<pw>@127.0.0.1:5432/letta
+    # Secret must contain a `postgres_password` key (same secret as Yashigani core).
+    # The sidecar pgbouncer dials yashigani-postgres:5432 over full mTLS using
+    # letta-pgbouncer_client.crt (issued by mtls-bootstrap-job, UID 70:0400).
+    dbPasswordSecretName: "yashigani-postgres-secrets"
+    dbPasswordSecretKey: "postgres_password"
+    service:
+      port: 8283
+      type: ClusterIP
+    # YSG-RISK-005 #3av: requests = 50% of limit.
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1024Mi"
+    # Persistent volume for Letta agent memory store.
+    persistence:
+      enabled: true
+      mountPath: /root/.letta
+      size: 5Gi
+      storageClass: ""
+      accessMode: ReadWriteOnce
+    tokenSecretName: "yashigani-letta-token"
+    tokenSecretKey: "token"
+    # Letta image (0.16.7) runs as uid=0 (root). Upstream requires root for
+    # /root/.letta persistence path. runAsNonRoot must be false for this bundle.
+    # Compensating controls: seccomp RuntimeDefault, CAP_ALL dropped,
+    # allowPrivilegeEscalation: false, network policy restricts egress to gateway
+    # + pgbouncer only. Risk: YSG-RISK-005 (agent bundle third-party).
+    # Re-evaluate if letta ships a non-root image variant.
+    podSecurityContext:
+      runAsNonRoot: false
+      runAsUser: 0
+      # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — letta receives
+      # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups
+      # is not functionally required here. Added for Compose↔Helm parity.
+      # Laura GID-001: openclaw excluded (bearer via env var, no file read).
+      supplementalGroups: [2002]
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).
+      # letta 0.16.7 write paths handled via extraVolumeMounts below:
+      #   /app/openapi_letta.json  — emptyDir (app.py:162 writes openapi schema at startup)
+      #   /root/nltk_data          — emptyDir (lifespan NLTK punkt_tab fallback download)
+      # All other writes go to /root/.letta (PVC) or /tmp (tmpfs via emptyDir medium:Memory).
+      # Detection-lane parity finding 2026-05-20: readOnlyRootFilesystem:false was never
+      # correct — set since agent-bundles.yaml introduction, missed by Lu/Iris/Laura across
+      # multiple releases. Closed as part of letta read_only:true security debt closure.
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+    # Extra volumes for letta write paths that cannot go to the persistent /root/.letta PVC.
+    extraVolumeMounts:
+      # letta app.py:162 writes openapi_letta.json relative to CWD (/app) at module import.
+      # emptyDir provides a writable inode at /app/openapi_letta.json without opening the
+      # rest of /app. subPath mounts the single file path only.
+      - name: letta-runtime
+        mountPath: /app/openapi_letta.json
+        subPath: openapi_letta.json
+      # NLTK punkt_tab download in lifespan (fallback — not pre-baked in Docker image).
+      # Silently fails without a writable path; emptyDir here avoids the silent failure.
+      - name: letta-nltk
+        mountPath: /root/nltk_data
+      # /tmp for Python runtime temp files.
+      - name: letta-tmp
+        mountPath: /tmp
+    extraVolumes:
+      - name: letta-runtime
+        emptyDir: {}
+      - name: letta-nltk
+        emptyDir: {}
+      - name: letta-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Mi
+      # PKI secrets volume — provides ca_root.crt + letta-pgbouncer_client.crt/key
+      # to the letta-pgbouncer sidecar for mTLS toward postgres.
+      # auth_type=plain: no pgbouncer_userlist Secret needed (YSG-RISK-049 revert).
+      - name: letta-pgbouncer-pki
+        secret:
+          secretName: "yashigani-pki-certs"
+          defaultMode: 0400
+      # letta-pgbouncer-ini — ConfigMap with pgbouncer-letta.ini content.
+      # Mounted at /etc/pgbouncer/pgbouncer.ini:ro inside the sidecar.
+      # ConfigMap is generated by the Helm chart from docker/pgbouncer/pgbouncer-letta.ini.
+      - name: letta-pgbouncer-ini
+        configMap:
+          name: "{{ include \"yashigani.fullname\" . }}-letta-pgbouncer-ini"
+          defaultMode: 0444
+    # letta-pgbouncer sidecar — pgbouncer session-mode proxy for letta→postgres mTLS.
+    # YSG-RISK-048 CLOSED 2026-05-20 — replaces stunnel+socat sidecar (e694127).
+    # Iris design doc: iris-letta-postgres-mtls-design-review.md (Option 1, 33/35).
+    # Laura threat model: laura-pgbouncer-letta-threat-model.md (F1–F4 all fixed).
+    #
+    # letta connects to 127.0.0.1:5432 (pod loopback — pod network namespace shared
+    # between all containers in the pod). pgbouncer sidecar dials yashigani-postgres:5432
+    # over full mTLS presenting letta-pgbouncer_client.crt (UID 70:0400, no C4 violation).
+    # session mode required for alembic DDL advisory locks.
+    #
+    # Multi-arch: edoburu/pgbouncer:v1.25.1-p0 publishes arm64+amd64. No buildx required.
+    # Same image as existing yashigani-pgbouncer Deployment. No new registry dependency.
+    extraContainers:
+      - name: letta-pgbouncer
+        image: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          # pgbouncer runs as UID 70 (edoburu image USER pgbouncer). runAsNonRoot:true
+          # is correct and is an improvement over the stunnel sidecar (runAsNonRoot:false).
+          # Laura threat model §5: this is a security improvement over stunnel.
+          runAsNonRoot: true
+          runAsUser: 70
+          runAsGroup: 70
+          allowPrivilegeEscalation: false
+          # readOnlyRootFilesystem: pgbouncer entrypoint writes userlist.txt at startup.
+          # Same documented exception as the existing pgbouncer Deployment (pgbouncer.yaml).
+          # Compensating controls: cap_drop ALL + no-new-privileges + runAsUser:70.
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop: ["ALL"]
+        # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
+        # auth_type=plain (YSG-RISK-049 ACCEPTED-LOW non-KMS-only — Tiago directive 2026-05-21).
+        # edoburu entrypoint writes cleartext userlist.txt from DATABASE_URL at startup.
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
+        env:
+          # edoburu image uses DATABASE_URL to populate [databases] section at container start.
+          # LETTA_PG_PASSWORD declared first — K8s $(VAR) forward-ref constraint.
+          - name: LETTA_PG_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: "yashigani-postgres-secrets"
+                key: "postgres_password"
+          - name: DATABASE_URL
+            value: "postgresql://yashigani_app:$(LETTA_PG_PASSWORD)@yashigani-postgres:5432/letta"
+          - name: AUTH_TYPE
+            value: "plain"
+          - name: POOL_MODE
+            value: "session"
+          - name: MAX_CLIENT_CONN
+            value: "50"
+          - name: DEFAULT_POOL_SIZE
+            value: "20"
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "16Mi"
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
+        volumeMounts:
+          # pgbouncer-letta.ini — session mode config with server_tls_sslmode=verify-full.
+          - name: letta-pgbouncer-ini
+            mountPath: /etc/pgbouncer/pgbouncer.ini
+            subPath: pgbouncer-letta.ini
+            readOnly: true
+          # PKI secrets — ca_root.crt + letta-pgbouncer_client.crt/key for mTLS to postgres.
+          - name: letta-pgbouncer-pki
+            mountPath: /run/secrets
+            readOnly: true
+
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
 # Image pulled unmodified from ghcr.io/open-webui/open-webui (upstream).
@@ -838,8 +1143,12 @@ openWebui:
     enableSignup: "true"
     webuiSecretKeySecretName: "yashigani-open-webui-secrets"
     webuiSecretKeySecretKey: "secret_key"
-    openaiApiBaseUrl: "http://yashigani-gateway:8080/v1"
-    openaiApiKey: "yashigani-internal"
+    # BUG-2 (v2.23.4): gateway:8080 is mTLS-only. Use the internal mesh port
+    # (8081, plain HTTP). Network isolation (K8s NetworkPolicy) is the transport
+    # guard; AgentAuthMiddleware enforces token auth at the app layer.
+    openaiApiBaseUrl: "http://yashigani-gateway:8081/v1"
+    # openaiApiKey is now wired via secretKeyRef (internalBearer Secret) in
+    # open-webui.yaml — Captain Bucket-C fix. This field is intentionally absent.
     ollamaBaseUrl: ""
     enableOllamaApi: "false"
     defaultModels: "qwen2.5:3b"
@@ -929,6 +1238,9 @@ pgbouncer:
     poolMode: transaction
     maxClientConn: "100"
     defaultPoolSize: "20"
+  # auth_type=plain (YSG-RISK-049 ACCEPTED-LOW non-KMS-only — Tiago directive 2026-05-21).
+  # No pgbouncer-auth Secret required. KMS-configured deployments bypass on-disk
+  # cleartext entirely via src/yashigani/kms/.
 
 # ---------------------------------------------------------------------------
 # Partition maintenance CronJob — DB partition pre-creation (runs monthly)
@@ -979,16 +1291,18 @@ ddosProtection:
 responseInspection:
   enabled: false
 
-# SSO / Identity Provider configuration (v2.1).
+# SSO / Identity Provider configuration (v2.1 — OIDC; v2.23.4 — SAMLv2).
 # Mirrors the YASHIGANI_IDP_<N>_* env vars used by docker-compose.
-# Up to 10 IdPs may be configured. Secrets (clientSecret) must be stored in
-# a Kubernetes Secret and referenced via existingSecretName.
+# Up to 10 IdPs may be configured. Secrets (clientSecret, samlSpPrivateKey)
+# must be stored in a Kubernetes Secret and referenced via existingSecretName.
 sso:
   twoFactorRequired: false
   # existingSecretName: yashigani-sso-secrets
-  # The secret must contain keys idp_<n>_client_secret for each IdP index.
+  # The secret must contain keys idp_<n>_client_secret for OIDC IdPs,
+  # and idp_<n>_saml_sp_private_key for SAML IdPs (RSA keys only —
+  # non-RSA keys reject startup per YSG-RISK-044 mitigation).
   idps: []
-  # Example:
+  # OIDC example:
   # - id: "keycloak-dev"
   #   name: "Keycloak Dev"
   #   protocol: "oidc"
@@ -997,6 +1311,20 @@ sso:
   #   clientSecretKey: "idp_1_client_secret"   # key inside existingSecretName
   #   emailDomains: "example.com"
   #   redirectUri: "https://yashigani.example.com/admin/sso/callback"
+  #
+  # SAMLv2 example (requires Professional tier or above):
+  # - id: "entra-saml"
+  #   name: "Entra ID (SAML)"
+  #   protocol: "saml"
+  #   entityId: "https://yashigani.example.com/saml"   # SP entity ID
+  #   samlIdpSsoUrl: "https://login.microsoftonline.com/<tenant>/saml2"
+  #   samlIdpSlsUrl: "https://login.microsoftonline.com/<tenant>/saml2"
+  #   samlIdpX509Cert: "<base64-cert-body-no-headers>"
+  #   samlSpSlsUrl: "https://yashigani.example.com/auth/sso/saml/entra-saml/sls"
+  #   samlSpPrivateKeySecretKey: "idp_2_saml_sp_private_key"  # RSA key in existingSecretName
+  #   samlSpCertSecretKey: "idp_2_saml_sp_cert"
+  #   redirectUri: "https://yashigani.example.com/auth/sso/saml/entra-saml/acs"
+  #   emailDomains: "example.com"
 
 # Model Aliases — Redis-backed alias-to-model routing (v2.3 backoffice feature).
 # Aliases are managed at runtime via the backoffice UI/API.

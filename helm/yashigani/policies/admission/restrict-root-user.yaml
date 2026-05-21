@@ -1,4 +1,4 @@
-# ACS-RISK-008 — Container hardening: block explicit root user (UID 0)
+# YSG-RISK-008 — Container hardening: block explicit root user (UID 0)
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # Rejects pods where runAsUser: 0 is set explicitly at pod or container level.
@@ -8,7 +8,7 @@
 # catches it explicitly.
 #
 # Exception — ollama: see require-run-as-non-root.yaml for rationale.
-#   Risk-register ref: ACS-RISK-008-EX-OLLAMA-2026-05-02
+#   Risk-register ref: YSG-RISK-008-EX-OLLAMA-2026-05-02
 ---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -21,7 +21,7 @@ metadata:
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
       Pods must not set runAsUser: 0 at the pod or container level.
-      Implements ACS-RISK-008.
+      Implements YSG-RISK-008.
 spec:
   validationFailureAction: Enforce
   background: true
@@ -46,7 +46,7 @@ spec:
                   app.kubernetes.io/name: ollama
       validate:
         message: >-
-          ACS-RISK-008: Pod '{{ request.object.metadata.name }}' sets
+          YSG-RISK-008: Pod '{{ request.object.metadata.name }}' sets
           runAsUser: 0 at the pod level. Root containers are not permitted
           in the yashigani namespace.
         deny:
@@ -75,7 +75,7 @@ spec:
                   app.kubernetes.io/name: ollama
       validate:
         message: >-
-          ACS-RISK-008: Container '{{ element.name }}' in pod
+          YSG-RISK-008: Container '{{ element.name }}' in pod
           '{{ request.object.metadata.name }}' sets runAsUser: 0.
           Root containers are not permitted in the yashigani namespace.
         foreach:

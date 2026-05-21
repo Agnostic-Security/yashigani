@@ -26,3 +26,26 @@ Access:
 Logs:
   kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name=yashigani-gateway --tail=50
   kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name=yashigani-backoffice --tail=50
+
+AGENT BUNDLES — notes for operators:
+
+  ARM64 (Apple Silicon / Graviton): The default agent-bundle image tags are
+  multi-arch (linux/amd64 + linux/arm64). If you see ImagePullBackOff with
+  "no match for platform", your cluster node is ARM64 and the cached image
+  index does not include an ARM64 manifest for that tag. Override at install:
+    --set agentBundles.langflow.image.repository=docker.io/langflowai/langflow
+    --set agentBundles.langflow.image.tag=1.9.2
+    --set agentBundles.letta.image.repository=docker.io/letta/letta
+    --set agentBundles.letta.image.tag=0.16.7
+  If the platform error persists, use `docker buildx imagetools inspect
+  <image>:<tag>` to confirm ARM64 manifest presence before enabling the bundle.
+  Finding: HELM-K8S-ARM64-IMAGE-DEFAULT (secondary, 2026-05-13).
+
+  Kyverno admission policies (admissionPolicies.enabled) default to FALSE.
+  To enable, install Kyverno cluster-wide first:
+    helm repo add kyverno https://kyverno.github.io/kyverno/
+    helm repo update
+    helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+  Then deploy Yashigani with --set admissionPolicies.enabled=true.
+  The chart will fail-loud with remediation steps if Kyverno CRDs are absent.
+  Finding: ccc7abf/adf6fda (2026-05-15).

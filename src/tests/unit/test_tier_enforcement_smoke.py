@@ -232,32 +232,49 @@ def test_register_agent_route_returns_402_at_limit(tier_name: str):
     state_mod.backoffice_state.audit_writer = None
 
     try:
-        app = FastAPI()
-        app.include_router(agents_mod.router)
+        import unittest.mock as _mock
+        from yashigani.auth import spiffe as _spiffe_mod
 
-        # Override the step-up admin session dep — produce a benign Session.
-        async def _fake_session():
-            s = Session.__new__(Session)
-            s.account_id = "test-admin"
-            s.username = "test-admin"
-            return s
-        app.dependency_overrides[require_stepup_admin_session] = _fake_session
+        # YSG-RISK-012b: POST /admin/agents now has require_spiffe_id gate.
+        # Stub _load_acls to bypass the SPIFFE gate in this tier-limit test —
+        # the gate is separately tested in test_acs_risk_012b_spiffe_admin_agents.py;
+        # this test's contract is "tier limit → HTTP 402", not SPIFFE identity.
+        _ADMIN_AGENTS_ACL = {"/admin/agents": frozenset({
+            "spiffe://yashigani.internal/caddy",
+            "spiffe://yashigani.internal/backoffice",
+        })}
 
-        client = TestClient(app, raise_server_exceptions=False)
-        # Minimal valid AgentRegisterRequest body — name + upstream_url required.
-        body = {"name": "smoke-test-agent", "upstream_url": "http://upstream.example.com"}
-        resp = client.post("/admin/agents", json=body)
+        with _mock.patch.object(_spiffe_mod, "_load_acls", return_value=_ADMIN_AGENTS_ACL):
+            app = FastAPI()
+            app.include_router(agents_mod.router)
 
-        assert resp.status_code == 402, (
-            f"{tier_name}: expected 402 at agent boundary, got {resp.status_code} "
-            f"body={resp.text}"
-        )
-        detail = resp.json().get("detail", {})
-        assert detail.get("error") == "agent_limit_exceeded", (
-            f"{tier_name}: 402 body missing agent_limit_exceeded sentinel: {detail}"
-        )
-        assert detail.get("limit") == max_agents
-        assert detail.get("current") == max_agents
+            # Override the step-up admin session dep — produce a benign Session.
+            async def _fake_session():
+                s = Session.__new__(Session)
+                s.account_id = "test-admin"
+                s.username = "test-admin"
+                return s
+            app.dependency_overrides[require_stepup_admin_session] = _fake_session
+
+            # Simulate the Caddy-proxied path: inject the allowlisted SPIFFE header
+            # so the gate passes and tier-limit enforcement is exercised.
+            client = TestClient(app, raise_server_exceptions=False, headers={
+                "X-SPIFFE-ID-Peer-Cert": "spiffe://yashigani.internal/caddy",
+            })
+            # Minimal valid AgentRegisterRequest body — name + upstream_url required.
+            body = {"name": "smoke-test-agent", "upstream_url": "http://upstream.example.com"}
+            resp = client.post("/admin/agents", json=body)
+
+            assert resp.status_code == 402, (
+                f"{tier_name}: expected 402 at agent boundary, got {resp.status_code} "
+                f"body={resp.text}"
+            )
+            detail = resp.json().get("detail", {})
+            assert detail.get("error") == "agent_limit_exceeded", (
+                f"{tier_name}: 402 body missing agent_limit_exceeded sentinel: {detail}"
+            )
+            assert detail.get("limit") == max_agents
+            assert detail.get("current") == max_agents
     finally:
         state_mod.backoffice_state.agent_registry = original_registry
         state_mod.backoffice_state.audit_writer = original_audit
@@ -303,24 +320,38 @@ def test_register_agent_route_returns_201_below_limit():
     state_mod.backoffice_state.audit_writer = None
 
     try:
-        app = FastAPI()
-        app.include_router(agents_mod.router)
+        import unittest.mock as _mock
+        from yashigani.auth import spiffe as _spiffe_mod
 
-        async def _fake_session():
-            s = _Session.__new__(_Session)
-            s.account_id = "test-admin"
-            s.username = "test-admin"
-            return s
-        app.dependency_overrides[_req_step_up] = _fake_session
+        # YSG-RISK-012b: POST /admin/agents now has require_spiffe_id gate.
+        # Stub _load_acls to bypass the SPIFFE gate here — gate behaviour is
+        # separately tested in test_acs_risk_012b_spiffe_admin_agents.py.
+        _ADMIN_AGENTS_ACL = {"/admin/agents": frozenset({
+            "spiffe://yashigani.internal/caddy",
+            "spiffe://yashigani.internal/backoffice",
+        })}
 
-        client = TestClient(app, raise_server_exceptions=False)
-        body = {"name": "smoke-test-agent", "upstream_url": "http://upstream.example.com"}
-        resp = client.post("/admin/agents", json=body)
+        with _mock.patch.object(_spiffe_mod, "_load_acls", return_value=_ADMIN_AGENTS_ACL):
+            app = FastAPI()
+            app.include_router(agents_mod.router)
 
-        assert resp.status_code != 402, (
-            f"starter: at count = max - 1 ({max_agents - 1}) the enforcer must "
-            f"NOT 402 — got {resp.status_code} body={resp.text}"
-        )
+            async def _fake_session():
+                s = _Session.__new__(_Session)
+                s.account_id = "test-admin"
+                s.username = "test-admin"
+                return s
+            app.dependency_overrides[_req_step_up] = _fake_session
+
+            client = TestClient(app, raise_server_exceptions=False, headers={
+                "X-SPIFFE-ID-Peer-Cert": "spiffe://yashigani.internal/caddy",
+            })
+            body = {"name": "smoke-test-agent", "upstream_url": "http://upstream.example.com"}
+            resp = client.post("/admin/agents", json=body)
+
+            assert resp.status_code != 402, (
+                f"starter: at count = max - 1 ({max_agents - 1}) the enforcer must "
+                f"NOT 402 — got {resp.status_code} body={resp.text}"
+            )
     finally:
         state_mod.backoffice_state.agent_registry = original_registry
         state_mod.backoffice_state.audit_writer = original_audit

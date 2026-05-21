@@ -1,4 +1,4 @@
-# Last updated: 2026-05-07T01:00:00+01:00
+# Last updated: 2026-05-17T00:00:00+00:00 (v2.23.4: F6 CSP parity tests + Helm CSP align)
 """
 Caddyfile family contract tests — anti-rot gate.
 
@@ -7,6 +7,12 @@ blocks audited, all missing inject-caddy-verified imports detected and fixed).
 
 Contract assertions (all three Caddyfiles: selfsigned / acme / ca)
 -------------------------------------------------------------------
+0. Per-listener security directive parity (YSG-RISK-026 Step 3):
+   The main public HTTPS site block must have identical TLS protocol set,
+   cipher list, and client_auth verifier mode across all three Caddyfile
+   variants.  cert source (tls internal / tls acme / tls cert+key) differs
+   legitimately; security posture must not.
+
 1. inject-caddy-verified coverage:
    Every ``reverse_proxy`` block targeting the mTLS services (gateway:8080,
    backoffice:8443, grafana:3443, prometheus:9090) MUST be followed by
@@ -297,6 +303,365 @@ def test_inject_count_consistent_across_family(name: str, path: Path) -> None:
         + "\n".join(f"  Caddyfile.{n}: {c}" for n, c in sorted(counts.items()))
         + "\n\nAll three files must have the same count — a divergence means one "
         "file lost imports that the others retained."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-listener security directive parity (YSG-RISK-026 Step 3)
+# ---------------------------------------------------------------------------
+
+
+def _extract_main_site_block(text: str) -> str:
+    """
+    Return the raw text of the main HTTPS site block from a Caddyfile.
+    Returns empty string if not found.
+
+    The main site block opener varies by TLS mode:
+    - selfsigned: ``https://{$YASHIGANI_TLS_DOMAIN}:443 {``
+    - acme:       ``{$YASHIGANI_TLS_DOMAIN} {``
+    - ca:         ``{$YASHIGANI_TLS_DOMAIN} {``
+
+    We match any line at column 0 that:
+    - starts with ``https://`` (selfsigned mode), OR
+    - starts with ``{$YASHIGANI_TLS_DOMAIN}`` (acme/ca mode)
+
+    and ends with ``{`` (opening brace), indicating a site block opener.
+    The plain HTTP redirect block (``http://{$...}`` or ``:80``) is NOT matched.
+    """
+    # The main HTTPS site block opener pattern covers all three TLS modes:
+    #   selfsigned: "https://{$YASHIGANI_TLS_DOMAIN}:443 {"
+    #   acme/ca:    "{$YASHIGANI_TLS_DOMAIN} {"
+    # We match lines at column 0 that start with "https://" or "{$" (bare domain),
+    # do NOT start with "http://" (HTTP redirect block), and end with " {".
+    def _is_main_site_opener(line: str) -> bool:
+        if line.startswith("http://"):
+            return False
+        return (
+            (line.startswith("https://") or re.match(r"^\{[$!]", line))
+            and line.rstrip().endswith("{")
+        )
+
+    lines = text.splitlines()
+    in_block = False
+    depth = 0
+    block_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not in_block:
+            if _is_main_site_opener(line):
+                in_block = True
+                # Net brace depth from opener: count braces in opener line
+                depth = stripped.count("{") - stripped.count("}")
+                block_lines = [line]
+                continue
+        else:
+            block_lines.append(line)
+            depth += stripped.count("{") - stripped.count("}")
+            if depth <= 0:
+                # Closed the site block
+                break
+
+    return "\n".join(block_lines)
+
+
+def _site_protocols(block: str) -> set[str]:
+    """
+    Extract the set of ``protocols`` values from the main tls directive.
+    e.g. returns ``{'tls1.3'}`` for ``protocols tls1.3``.
+    """
+    result: set[str] = set()
+    for line in block.splitlines():
+        m = re.match(r"\s+protocols\s+(.*)", line)
+        if m:
+            result.update(m.group(1).split())
+    return result
+
+
+def _site_ciphers(block: str) -> set[str]:
+    """
+    Extract the set of cipher names from ``ciphers ...`` lines in the block.
+    """
+    result: set[str] = set()
+    for line in block.splitlines():
+        m = re.match(r"\s+ciphers\s+(.*)", line)
+        if m:
+            result.update(m.group(1).split())
+    return result
+
+
+def _site_client_auth_mode(block: str) -> str | None:
+    """
+    Extract the ``mode`` value from the first ``client_auth {}`` block found.
+    Returns None if client_auth is absent.
+    """
+    lines = block.splitlines()
+    in_ca = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"client_auth\s*\{", stripped):
+            in_ca = True
+            continue
+        if in_ca:
+            m = re.match(r"mode\s+(\S+)", stripped)
+            if m:
+                return m.group(1)
+            if stripped == "}":
+                break
+    return None
+
+
+def test_main_site_listener_parity_across_family() -> None:
+    """
+    YSG-RISK-026 Step 3 — Per-listener security directive parity.
+
+    The three Caddyfile variants differ legitimately in cert source:
+    - selfsigned: ``tls internal { ... }``
+    - acme:       ``tls { ... }`` (ACME/Let's Encrypt)
+    - ca:         ``tls /cert/path /key/path { ... }`` (pre-provisioned CA cert)
+
+    They must NOT differ in:
+    - ``protocols`` set (must be {'tls1.3'} on every variant)
+    - ``ciphers`` set (must be {'TLS_AES_256_GCM_SHA384', 'TLS_AES_128_GCM_SHA256'})
+    - ``client_auth mode`` (must be 'verify_if_given' on every variant — browsers
+      don't present a cert; mTLS service agents do; rejecting either is a bug)
+
+    Historical drift class: bc9cd0d removed protocols tls1.3 from one variant
+    only.  63c5351 had client_auth at wrong mode in the ca variant.
+    """
+    blocks = {name: _extract_main_site_block(_load(path)) for name, path in CADDYFILES.items()}
+
+    failures: list[str] = []
+
+    # -- protocols ------------------------------------------------------------
+    protocols_per_file = {name: _site_protocols(block) for name, block in blocks.items()}
+    unique_protocols = set(frozenset(v) for v in protocols_per_file.values())
+    if len(unique_protocols) != 1:
+        failures.append(
+            "  PROTOCOL DIVERGENCE across variants:\n"
+            + "\n".join(f"    Caddyfile.{n}: {sorted(v)}" for n, v in sorted(protocols_per_file.items()))
+        )
+    else:
+        proto = next(iter(unique_protocols))
+        if "tls1.3" not in proto:
+            failures.append(
+                f"  PROTOCOL MISSING: all variants agree on {sorted(proto)} "
+                "but 'tls1.3' is absent — TLS 1.2 downgrade possible."
+            )
+
+    # -- ciphers --------------------------------------------------------------
+    ciphers_per_file = {name: _site_ciphers(block) for name, block in blocks.items()}
+    unique_ciphers = set(frozenset(v) for v in ciphers_per_file.values())
+    if len(unique_ciphers) != 1:
+        failures.append(
+            "  CIPHER DIVERGENCE across variants:\n"
+            + "\n".join(f"    Caddyfile.{n}: {sorted(v)}" for n, v in sorted(ciphers_per_file.items()))
+        )
+
+    # -- client_auth mode -----------------------------------------------------
+    modes_per_file = {name: _site_client_auth_mode(block) for name, block in blocks.items()}
+    unique_modes = set(v for v in modes_per_file.values())
+    if len(unique_modes) != 1:
+        failures.append(
+            "  CLIENT_AUTH MODE DIVERGENCE across variants:\n"
+            + "\n".join(f"    Caddyfile.{n}: {v!r}" for n, v in sorted(modes_per_file.items()))
+        )
+    else:
+        mode = next(iter(unique_modes))
+        if mode != "verify_if_given":
+            failures.append(
+                f"  CLIENT_AUTH MODE: all variants agree on {mode!r} "
+                "but expected 'verify_if_given' for the public listener "
+                "(allows browser connections while enforcing SPIFFE on agent connections)."
+            )
+
+    assert not failures, (
+        "\nPer-listener security directive parity FAILED — YSG-RISK-026 Step 3.\n\n"
+        + "\n".join(failures)
+        + "\n\nThe three Caddyfile variants must have identical security posture on "
+        "the main HTTPS listener (protocols, ciphers, client_auth mode).\n"
+        "Cert source (tls internal / tls acme / tls cert+key) may differ."
+    )
+
+
+def test_mutation_listener_parity_is_caught() -> None:
+    """
+    Mutation guard for test_main_site_listener_parity_across_family.
+    Remove 'protocols tls1.3' from the selfsigned fixture's main site block
+    and verify the parity check fires.
+    """
+    name = "selfsigned"
+    path = CADDYFILES[name]
+    original = _load(path)
+
+    # Mutate: remove the 'protocols tls1.3' line from the main site block
+    mutated = re.sub(
+        r"^(\s+protocols\s+tls1\.3)\s*$",
+        "",
+        original,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    # Check mutation took effect
+    assert mutated != original, (
+        "Mutation helper failed to remove 'protocols tls1.3' from the file text"
+    )
+
+    # Re-parse through the same logic as the parity check
+    mutated_block = _extract_main_site_block(mutated)
+    original_blocks = {n: _extract_main_site_block(_load(p)) for n, p in CADDYFILES.items()}
+    mutated_blocks = dict(original_blocks)
+    mutated_blocks[name] = mutated_block
+
+    protocols_per_file = {n: _site_protocols(b) for n, b in mutated_blocks.items()}
+    unique_protocols = set(frozenset(v) for v in protocols_per_file.values())
+
+    assert len(unique_protocols) != 1 or "tls1.3" not in next(iter(unique_protocols)), (
+        "MUTATION TEST FAILED: removing 'protocols tls1.3' from Caddyfile.selfsigned "
+        "was NOT detected by the per-listener parity check. The contract is broken."
+    )
+
+
+# ---------------------------------------------------------------------------
+# F6 / v2.23.4 — CSP header parity: compose variants vs Helm Caddyfile
+# ---------------------------------------------------------------------------
+
+# The canonical CSP directive set shared by all Caddyfile variants.
+# Must stay in sync with:
+#   docker/Caddyfile.acme        (line ~126)
+#   docker/Caddyfile.ca          (line ~110)
+#   docker/Caddyfile.selfsigned  (line ~157)
+#   helm/yashigani/templates/configmaps.yaml  (header block)
+_CSP_REQUIRED_DIRECTIVES: frozenset[str] = frozenset({
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+})
+
+_HELM_CONFIGMAP = (
+    Path(__file__).parent.parent.parent
+    / "helm" / "yashigani" / "templates" / "configmaps.yaml"
+)
+
+
+def _extract_csp_value(text: str) -> str:
+    """
+    Extract the Content-Security-Policy header value from a Caddyfile or
+    Helm configmap snippet.  Returns the raw directive string (everything
+    after the CSP header name, unquoted).
+    """
+    for line in text.splitlines():
+        # Matches: Content-Security-Policy   "..."
+        m = re.search(r'Content-Security-Policy\s+"([^"]+)"', line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _csp_directives(csp_value: str) -> frozenset[str]:
+    """
+    Parse a CSP directive string into a frozenset of directive tokens.
+    Splits on ';' and strips whitespace.
+    """
+    return frozenset(d.strip() for d in csp_value.split(";") if d.strip())
+
+
+@pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+def test_csp_directives_present_in_compose_caddyfiles(name: str, path: Path) -> None:
+    """
+    Every compose Caddyfile must have a Content-Security-Policy header
+    containing all required directives defined in _CSP_REQUIRED_DIRECTIVES.
+
+    Regression: if a directive is removed, the browser will fall back to
+    default-src which is less specific and may allow unintended sources.
+    """
+    text = _load(path)
+    csp_value = _extract_csp_value(text)
+    assert csp_value, f"Caddyfile.{name}: no Content-Security-Policy header found"
+
+    directives = _csp_directives(csp_value)
+    missing = _CSP_REQUIRED_DIRECTIVES - directives
+    assert not missing, (
+        f"\nCaddyfile.{name} — CSP missing required directives:\n"
+        + "\n".join(f"  - {d}" for d in sorted(missing))
+        + f"\n\nFound CSP value: {csp_value!r}"
+    )
+
+
+def test_csp_helm_matches_compose() -> None:
+    """
+    YSG-RISK-026 F6 parity: the Helm Caddyfile (configmaps.yaml) must have
+    the same Content-Security-Policy directives as the compose Caddyfiles.
+
+    Historical drift: Helm had only ``default-src 'self'; object-src 'none';
+    base-uri 'none'`` — missing script-src, style-src, img-src, font-src,
+    connect-src, frame-ancestors, form-action.  Browser console: "style-src
+    was not explicitly set, so default-src is used as a fallback."
+
+    Root cause: F6 (Ava A5 E2E v2.23.4 Track C — 2026-05-16).
+    """
+    assert _HELM_CONFIGMAP.exists(), f"Helm configmaps.yaml not found: {_HELM_CONFIGMAP}"
+    helm_text = _HELM_CONFIGMAP.read_text(encoding="utf-8")
+    helm_csp = _extract_csp_value(helm_text)
+    assert helm_csp, f"Helm configmaps.yaml: no Content-Security-Policy header found"
+
+    helm_directives = _csp_directives(helm_csp)
+    missing_from_helm = _CSP_REQUIRED_DIRECTIVES - helm_directives
+    assert not missing_from_helm, (
+        "\nHelm configmaps.yaml CSP missing required directives "
+        "(diverged from compose Caddyfiles — F6 regression class):\n"
+        + "\n".join(f"  - {d}" for d in sorted(missing_from_helm))
+        + f"\n\nHelm CSP value: {helm_csp!r}\n\n"
+        "Fix: align helm/yashigani/templates/configmaps.yaml header block "
+        "to match docker/Caddyfile.{selfsigned,acme,ca}."
+    )
+
+    # Also verify compose CSP matches Helm (bidirectional parity)
+    for name, path in CADDYFILES.items():
+        compose_csp = _extract_csp_value(_load(path))
+        compose_directives = _csp_directives(compose_csp)
+        in_compose_not_helm = compose_directives - helm_directives
+        # Allow compose to have report-uri/report-to (Helm may omit these)
+        non_report = frozenset(
+            d for d in in_compose_not_helm
+            if not d.startswith("report-uri") and not d.startswith("report-to")
+        )
+        assert not non_report, (
+            f"\nCaddyfile.{name} has CSP directives absent from Helm configmaps.yaml "
+            f"(excluding report-uri/report-to):\n"
+            + "\n".join(f"  - {d}" for d in sorted(non_report))
+            + f"\n\nCompose CSP: {compose_csp!r}\nHelm CSP: {helm_csp!r}"
+        )
+
+
+def test_mutation_csp_drift_is_caught() -> None:
+    """
+    Mutation guard for CSP parity tests.
+    Remove 'style-src' from a compose Caddyfile in-memory and verify the
+    CSP directives check fires.
+    """
+    name = "selfsigned"
+    path = CADDYFILES[name]
+    original = _load(path)
+    # Mutate: remove style-src 'self' from the CSP value
+    mutated = original.replace("style-src 'self'; ", "")
+    assert mutated != original, "Mutation failed — style-src not found in CSP"
+
+    csp_value = _extract_csp_value(mutated)
+    directives = _csp_directives(csp_value)
+    missing = _CSP_REQUIRED_DIRECTIVES - directives
+
+    assert "style-src 'self'" in missing, (
+        "MUTATION TEST FAILED: removing 'style-src' from CSP was NOT detected "
+        "by the CSP directives check. The contract is broken."
     )
 
 

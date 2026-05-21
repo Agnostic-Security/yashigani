@@ -39,6 +39,10 @@ spec:
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
+        # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — redis reads
+        # redis_password via secretKeyRef (env var) in K8s so supplementalGroups
+        # is not functionally required here. Added for Compose↔Helm parity.
+        supplementalGroups: [2002]
         seccompProfile:
           type: RuntimeDefault
       containers:

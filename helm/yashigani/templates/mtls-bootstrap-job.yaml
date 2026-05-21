@@ -224,6 +224,17 @@ spec:
                 [ -f "$f" ] || continue
                 cp -- "$f" /tmp/leaves/
               done
+              # Bootstrap tokens: yashigani.pki.identity.current_service() calls
+              # _verify_bootstrap_token() which reads <service>_bootstrap_token from
+              # YASHIGANI_INTERNAL_CA_DIR (/run/secrets).  Without these files in the
+              # K8s Secret, every call to internal_httpx_client() raises TamperError
+              # (caught by _opa_v1_check as opa_unreachable → HTTP 403).
+              # The token files are written by the issuer alongside certs; include
+              # them in the leaves payload so workload pods can verify mesh identity.
+              for f in *_bootstrap_token; do
+                [ -f "$f" ] || continue
+                cp -- "$f" /tmp/leaves/
+              done
               # CA private keys: ca_root.key + ca_intermediate.key only.
               # Anything matching ca_*.key (literal underscore, not glob).
               for f in ca_root.key ca_intermediate.key; do
@@ -282,10 +293,10 @@ spec:
               cd /tmp/leaves
               kubectl create secret generic {{ .Values.mtls.secretName }} \
                 --namespace {{ .Release.Namespace }} \
-                $(for f in *.crt *.key caddy_internal_hmac; do [ -f "$f" ] && echo "--from-file=$f=$f"; done) \
+                $(for f in *.crt *.key caddy_internal_hmac *_bootstrap_token; do [ -f "$f" ] && echo "--from-file=$f=$f"; done) \
                 --dry-run=client -o yaml \
               | kubectl apply -n {{ .Release.Namespace }} -f -
-              echo "[applier] Secret {{ .Values.mtls.secretName }} applied (leaves + CA pubs + caddy_internal_hmac)."
+              echo "[applier] Secret {{ .Values.mtls.secretName }} applied (leaves + CA pubs + caddy_internal_hmac + bootstrap_tokens)."
               cd /tmp/cakeys
               kubectl create secret generic {{ .Values.mtls.caKeysSecretName }} \
                 --namespace {{ .Release.Namespace }} \

@@ -50,9 +50,10 @@ Streaming limitations
   response-path inspection. This adds ~2-3s latency but ensures PII
   cannot leak through streamed responses.
 """
-# Last updated: 2026-05-03T00:00:00+01:00
+# Last updated: 2026-05-18T00:00:00+00:00
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
@@ -66,8 +67,61 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from yashigani.pki.client import internal_httpx_client
+from yashigani.metrics.registry import _C as _metric_counter
+from yashigani.audit.schema import (
+    OpaResponseCheckFailedEvent,
+    PIIDetectedEvent,
+    ResponseInjectionDetectedEvent,
+    StreamTerminatedEvent,
+)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# OPA fail-closed Prometheus counter (Path 1 + Path 3)
+#
+# yashigani_opa_response_check_failures_total — increments whenever the
+# OPA response-check path (or opa_not_configured guard) fires a deny because
+# OPA is unreachable/erroring or not configured.
+#
+# Alert on sustained rate: an OPA outage causes request denials; operators
+# must restore OPA connectivity.  This is intentional zero-trust behaviour
+# per feedback_zero_trust_default.md.
+# ---------------------------------------------------------------------------
+opa_response_check_failures_total = _metric_counter(
+    "yashigani_opa_response_check_failures_total",
+    "OPA response-check failures resulting in fail-closed deny. "
+    "Labels: outcome=exception|not_configured, reason=<exception class or 'opa_not_configured'>. "
+    "Alert on sustained rate — OPA outage = request denials (intentional zero-trust fail-closed).",
+    ["outcome", "reason"],
+)
+
+# ---------------------------------------------------------------------------
+# Internal service-mesh Bearer token
+#
+# YASHIGANI_INTERNAL_BEARER is a per-install-rotated secret that grants
+# service-to-service identity (Open WebUI, in-mesh agents). It MUST be set
+# by the installer (docker/secrets/yashigani_internal_bearer).  A missing or
+# empty value fails closed at import time so a misconfigured deployment
+# surfaces immediately rather than silently accepting any Bearer value.
+#
+# Use hmac.compare_digest() at every comparison site to avoid timing leaks.
+# ---------------------------------------------------------------------------
+
+def _load_internal_bearer() -> str:
+    """Read YASHIGANI_INTERNAL_BEARER from env; raise RuntimeError if absent."""
+    _val = os.environ.get("YASHIGANI_INTERNAL_BEARER", "")
+    if not _val:
+        raise RuntimeError(
+            "YASHIGANI_INTERNAL_BEARER is not set. "
+            "The gateway cannot start without a per-install internal service token. "
+            "See docker/secrets/yashigani_internal_bearer."
+        )
+    return _val
+
+
+# Cached at module load — fails fast if env-var is absent.
+_INTERNAL_BEARER: str = _load_internal_bearer()
 
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
@@ -193,7 +247,18 @@ def configure(
     opa_url: str = "https://policy:8181",
     content_relay_detector=None,
 ) -> None:
-    """Configure the OpenAI router with dependencies. Called once at startup."""
+    """Configure the OpenAI router with dependencies. Called once at startup.
+
+    Zero-trust startup validation (Path 3 — ASVS V14.5.*):
+    In production (YASHIGANI_ENV=production), OPA is mandatory.  If opa_url is
+    empty the gateway REFUSES to start rather than silently serving with no
+    policy enforcement.  In development mode the same fail-closed behaviour
+    applies UNLESS YASHIGANI_OPA_OPTIONAL=true is explicitly set.
+
+    Operator runbook:
+      Set YASHIGANI_OPA_URL to the reachable OPA endpoint.
+      In dev-only environments with no OPA, set YASHIGANI_OPA_OPTIONAL=true.
+    """
     _state.identity_registry = identity_registry
     _state.sensitivity_classifier = sensitivity_classifier
     _state.complexity_scorer = complexity_scorer
@@ -211,6 +276,39 @@ def configure(
     _state.pii_cloud_bypass = pii_cloud_bypass
     _state.opa_url = opa_url
     _state.content_relay_detector = content_relay_detector
+
+    # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
+    # OPA is mandatory in production.  In development mode, fail-closed by
+    # default; opt into fail-open with YASHIGANI_OPA_OPTIONAL=true (explicit,
+    # auditable opt-in only — never the default).
+    if not opa_url:
+        _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+        _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+        if _ysg_env == "production":
+            raise RuntimeError(
+                "YASHIGANI_OPA_URL is required in production (YASHIGANI_ENV=production). "
+                "The gateway cannot start without OPA policy enforcement. "
+                "Set YASHIGANI_OPA_URL to the reachable OPA endpoint. "
+                "This is a zero-trust fail-closed guard — ASVS V14.5.* / feedback_zero_trust_default.md."
+            )
+        elif _opa_optional:
+            logger.warning(
+                "YASHIGANI_OPA_URL is not set and YASHIGANI_OPA_OPTIONAL=true — "
+                "OPA policy enforcement is DISABLED for this deployment. "
+                "All /v1/* requests will be ALLOWED without policy check. "
+                "This is only permitted in non-production environments. "
+                "YASHIGANI_ENV=%s",
+                _ysg_env or "(not set)",
+            )
+        else:
+            raise RuntimeError(
+                "YASHIGANI_OPA_URL is not set. The gateway will not start without OPA policy "
+                "enforcement (fail-closed by default). "
+                "In development/test environments, set YASHIGANI_OPA_OPTIONAL=true to "
+                "explicitly opt into running without OPA. "
+                "In production, set YASHIGANI_OPA_URL to the reachable OPA endpoint. "
+                "YASHIGANI_ENV=%s" % (_ysg_env or "(not set)",)
+            )
     # F-T10-001: low-confidence step-up threshold (env-configurable).
     # Guard: empty or non-numeric env var must not crash configure().
     _thresh_raw = os.getenv("YASHIGANI_LOW_CONFIDENCE_STEPUP_THRESHOLD", "0.50")
@@ -244,6 +342,40 @@ def configure(
     )
 
 
+# ── Audit adapters ──────────────────────────────────────────────────────
+
+
+def _make_streaming_audit_adapter(audit_writer):
+    """Return a Callable[[str, dict], None] that bridges the
+    StreamingInspector ``on_audit(name, data)`` convention to
+    ``AuditLogWriter.write(AuditEvent)``.
+
+    Returns None when audit_writer is None (StreamingInspector treats None
+    as a no-op).
+
+    Iris FINDING-004: AuditLogWriter has no __call__; callers must use .write().
+    """
+    if audit_writer is None:
+        return None
+
+    def _adapter(name: str, data: dict) -> None:
+        if name == "STREAM_TERMINATED":
+            audit_writer.write(
+                StreamTerminatedEvent(
+                    trigger=data.get("trigger", ""),
+                    request_id=data.get("request_id", ""),
+                    session_id=data.get("session_id", ""),
+                    agent_id=data.get("agent_id", ""),
+                    accumulated_chars=int(data.get("accumulated_chars", 0)),
+                )
+            )
+        # Unknown event names are silently dropped — the adapter is
+        # intentionally narrow.  New streaming event types should get their
+        # own EventType + dataclass and a branch here.
+
+    return _adapter
+
+
 # ── PII helpers ─────────────────────────────────────────────────────────
 
 
@@ -253,16 +385,15 @@ def _pii_audit(request_id: str, direction: str, pii_result, action: str, destina
         return
     try:
         pii_types = [f.pii_type.value for f in pii_result.findings]
-        _state.audit_writer(
-            "PII_DETECTED",
-            {
-                "request_id": request_id,
-                "direction": direction,       # "request" | "response"
-                "pii_types": pii_types,
-                "action_taken": action,
-                "destination": destination,   # "local" | "cloud"
-                "finding_count": len(pii_result.findings),
-            },
+        _state.audit_writer.write(
+            PIIDetectedEvent(
+                request_id=request_id,
+                direction=direction,
+                pii_types=pii_types,
+                action_taken=action,
+                destination=destination,
+                finding_count=len(pii_result.findings),
+            )
         )
     except Exception as exc:
         logger.warning("PII audit write failed (request_id=%s): %s", request_id, exc)
@@ -318,6 +449,36 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── 1. Identity resolution ────────────────────────────────────────
     identity = _resolve_identity(request)
     identity_id = identity.get("identity_id", "anonymous") if identity else "anonymous"
+
+    # ── 1b. Anonymous-caller reject (Path 2 — ASVS V14.5.* / zero-trust) ─
+    # OPA is an AUTHORISATION layer for AUTHENTICATED principals.  Anonymous
+    # callers must be rejected HERE — before OPA is reached — so that OPA
+    # never evaluates unauthenticated requests (correct separation of concerns).
+    #
+    # The yashigani-internal Bearer (YASHIGANI_INTERNAL_BEARER env-var) resolves
+    # to identity_id="internal", kind="service" — NOT anonymous — so in-mesh
+    # Open WebUI traffic is unaffected by this guard.
+    #
+    # Callers that lack an API key, a valid SSO header, or the internal Bearer
+    # receive HTTP 401 here, before any downstream processing occurs.
+    if identity is None:
+        logger.warning(
+            "Anonymous /v1/chat/completions caller rejected (request_id=%s) — "
+            "zero-trust fail-closed (Path 2)",
+            request_id,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "AUTHENTICATION_REQUIRED",
+                "detail": (
+                    "POST /v1/chat/completions requires an authenticated identity. "
+                    "Provide Authorization: Bearer <api_key> or authenticate via "
+                    "the SSO flow (X-Forwarded-User header from Caddy)."
+                ),
+                "request_id": request_id,
+            },
+        )
 
     # ── 2. Extract prompt text for classification ─────────────────────
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
@@ -585,7 +746,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 request_id=request_id,
                 session_id=stream_session_id,
                 agent_id=stream_agent_id,
-                on_audit=_state.audit_writer if _state.audit_writer else None,
+                on_audit=_make_streaming_audit_adapter(_state.audit_writer),
             )
 
             # Token accounting — called once after stream end
@@ -896,9 +1057,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 # Write audit event for the block
                 if _state.audit_writer:
                     try:
-                        _state.audit_writer(
-                            "RESPONSE_INJECTION_DETECTED",
-                            resp_result.audit_fields,
+                        _af = resp_result.audit_fields
+                        _state.audit_writer.write(
+                            ResponseInjectionDetectedEvent(
+                                verdict=_af.get("verdict", ""),
+                                request_id=_af.get("request_id", ""),
+                                session_id=_af.get("session_id", ""),
+                                agent_id=_af.get("agent_id", ""),
+                                confidence_score=float(_af.get("confidence_score", 0.0)),
+                                action_taken=_af.get("action_taken", ""),
+                                content_type=_af.get("content_type", ""),
+                                response_content_hash=_af.get("response_content_hash", ""),
+                                fasttext_only_mode=bool(_af.get("fasttext_only_mode", False)),
+                            )
                         )
                     except Exception as _exc:
                         logger.warning("Audit write failed for response block: %s", _exc)
@@ -979,7 +1150,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # Check if the caller is authorised to receive this response based on
     # the detected sensitivity level. Defence-in-depth: even if routing was
     # allowed, the RESPONSE content may have a higher sensitivity than expected.
-    if _state.opa_url and identity:
+    #
+    # Path 2 (ASVS V14.5.*): identity is guaranteed non-None here — the
+    # anonymous-caller reject at step 1b raised HTTP 401 before we reached
+    # this point.  The `and identity` guard is removed; `_opa_response_check`
+    # handles None identity defensively regardless.
+    if _state.opa_url:
         resp_opa = await _opa_response_check(
             identity=identity,
             response_sensitivity=sensitivity_level,
@@ -1153,9 +1329,30 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     Resolve identity from request.
 
     Priority:
-    1. X-Forwarded-User header (SSO via Caddy)
-    2. Authorization: Bearer <api_key>
+    1. yashigani-internal Bearer token (mesh-port internal service calls)
+    2. X-Forwarded-User header (SSO via Caddy)
+    3. Authorization: Bearer <api_key> (registry lookup)
+
+    The yashigani-internal check is intentionally placed BEFORE the
+    identity_registry null-guard so that Open WebUI's hardcoded internal
+    token resolves even when the identity registry is temporarily
+    unavailable (e.g. Redis not yet reachable at startup).  Network
+    isolation on the data bridge / K8s NetworkPolicy is the transport-
+    layer guard for this token; it must never be reachable from the
+    public-facing port.
     """
+    # Fast path: hardcoded internal service-to-service token (Open WebUI,
+    # in-mesh agents).  Must be checked before identity_registry to avoid
+    # a 401 when the registry Redis is slow to start.
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        key = auth[7:]
+        if hmac.compare_digest(key, _INTERNAL_BEARER):
+            # Internal service-to-service calls (Open WebUI, agents)
+            # Treated as authenticated internal identity — same OPA rules apply
+            return {"identity_id": "internal", "status": "active", "kind": "service",
+                    "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
+
     if not _state.identity_registry:
         return None
 
@@ -1166,15 +1363,9 @@ def _resolve_identity(request: Request) -> Optional[dict]:
         if identity:
             return identity
 
-    # API key
-    auth = request.headers.get("Authorization", "")
+    # API key (registry lookup)
     if auth.startswith("Bearer "):
         key = auth[7:]
-        if key == "yashigani-internal":
-            # Internal service-to-service calls (Open WebUI, agents)
-            # Treated as authenticated internal identity — same OPA rules apply
-            return {"identity_id": "internal", "status": "active", "kind": "service",
-                    "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
         if key:
             identity = _state.identity_registry.get_by_api_key(key)
             if identity is None:
@@ -1242,9 +1433,32 @@ async def _opa_v1_check(
       input.trusted_cloud_providers — list of trusted providers (from config)
 
     Returns {"allow": bool, "reason": str} or deny on any error (fail-closed).
+
+    Path 3 (ASVS V14.5.*): if OPA is not configured, deny unconditionally.
+    The startup guard in configure() prevents reaching this branch in production
+    without YASHIGANI_OPA_URL.  In dev with YASHIGANI_OPA_OPTIONAL=true the
+    guard was bypassed with explicit operator consent — we still deny here so
+    that accidental calls to _opa_v1_check with no opa_url surface clearly.
     """
     if not _state.opa_url:
-        return {"allow": True, "reason": "opa_not_configured"}
+        _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+        _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+        if _opa_optional and _ysg_env != "production":
+            # Explicit dev-mode opt-in only (non-production + YASHIGANI_OPA_OPTIONAL=true)
+            logger.warning(
+                "OPA not configured (YASHIGANI_OPA_OPTIONAL=true, env=%s) — "
+                "allowing request without policy check (dev opt-in)",
+                _ysg_env,
+            )
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+        logger.error(
+            "OPA not configured and fail-closed triggered (env=%s, opa_optional=%s)",
+            _ysg_env, _opa_optional,
+        )
+        opa_response_check_failures_total.labels(
+            outcome="not_configured", reason="opa_not_configured"
+        ).inc()
+        return {"allow": False, "reason": "opa_not_configured"}
 
     identity_doc = {
         "status": identity.get("status", "active") if identity else "anonymous",
@@ -1302,12 +1516,58 @@ async def _opa_response_check(
     Checks whether the caller's sensitivity ceiling permits receiving
     content at the detected sensitivity level.
 
-    Returns {"allow": bool, "reason": str} or allow on any error (fail-open
-    on response path — content is already generated, blocking creates
-    confusing empty turns; the audit trail captures the violation).
+    Zero-trust fail-closed behaviour (ASVS V8.* + V14.5.*):
+
+    When OPA responds with allow: False  → audit event written, request denied.
+    When OPA is unreachable / errors     → audit event written, REQUEST DENIED
+                                           (fail-closed), Prometheus counter
+                                           increments.  OPA outage = response
+                                           delivery outage (intentional).
+    When OPA is not configured           → REQUEST DENIED (fail-closed) unless
+                                           YASHIGANI_OPA_OPTIONAL=true in a
+                                           non-production YASHIGANI_ENV.
+
+    Operator runbook:
+      Alert on yashigani_opa_response_check_failures_total rate.
+      An OPA outage causes response-delivery denials until OPA recovers.
+      This is the CORRECT behaviour for a zero-trust system per
+      feedback_zero_trust_default.md.  Do not bypass — fix OPA instead.
+
+    NOTE: The previous docstring stated "allow on any error (fail-open)".
+    That was incorrect.  This function is fail-closed since v2.23.4.
     """
     if not _state.opa_url:
-        return {"allow": True, "reason": "opa_not_configured"}
+        _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+        _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+        if _opa_optional and _ysg_env != "production":
+            logger.warning(
+                "OPA not configured (YASHIGANI_OPA_OPTIONAL=true, env=%s) — "
+                "allowing response without policy check (dev opt-in)",
+                _ysg_env,
+            )
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+        logger.error(
+            "OPA response check: OPA not configured — denying (fail-closed) "
+            "(env=%s, opa_optional=%s)",
+            _ysg_env, _opa_optional,
+        )
+        opa_response_check_failures_total.labels(
+            outcome="not_configured", reason="opa_not_configured"
+        ).inc()
+        if _state.audit_writer:
+            try:
+                _state.audit_writer.write(
+                    OpaResponseCheckFailedEvent(
+                        reason="opa_not_configured",
+                        outcome="not_configured",
+                        identity_id=identity.get("identity_id", "unknown") if identity else "anonymous",
+                        response_sensitivity=str(response_sensitivity),
+                        action="denied_fail_closed",
+                    )
+                )
+            except Exception as _aw_exc:
+                logger.warning("Audit write failed for OPA not-configured event: %s", _aw_exc)
+        return {"allow": False, "reason": "opa_not_configured"}
 
     identity_doc = {
         "status": identity.get("status", "active") if identity else "anonymous",
@@ -1336,5 +1596,33 @@ async def _opa_response_check(
                 "reason": result.get("reason", "ok"),
             }
     except Exception as exc:
-        logger.warning("OPA response check failed: %s — allowing (fail-open on response)", exc)
-        return {"allow": True, "reason": "opa_response_check_failed"}
+        # Path 1 (ASVS V8.* + V14.5.*): fail-closed on any OPA error.
+        # Previous behaviour was fail-open (allow: True) with a misleading
+        # comment "the audit trail captures the violation" — the audit was
+        # NEVER written (OPA was unreachable).  Fixed in v2.23.4.
+        exc_class = type(exc).__name__
+        logger.error(
+            "OPA response check FAILED — denying (fail-closed zero-trust). "
+            "exc_class=%s exc=%s. OPA must be restored to re-enable response delivery. "
+            "Alert on yashigani_opa_response_check_failures_total.",
+            exc_class, exc,
+        )
+        opa_response_check_failures_total.labels(
+            outcome="exception", reason=exc_class
+        ).inc()
+        if _state.audit_writer:
+            try:
+                _state.audit_writer.write(
+                    OpaResponseCheckFailedEvent(
+                        reason="opa_exception",
+                        outcome="exception",
+                        exc_class=exc_class,
+                        exc_str=str(exc)[:256],
+                        identity_id=identity.get("identity_id", "unknown") if identity else "anonymous",
+                        response_sensitivity=str(response_sensitivity),
+                        action="denied_fail_closed",
+                    )
+                )
+            except Exception as _aw_exc:
+                logger.warning("Audit write failed for OPA exception event: %s", _aw_exc)
+        return {"allow": False, "reason": "opa_response_check_failed"}

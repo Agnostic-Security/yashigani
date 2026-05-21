@@ -1,7 +1,7 @@
 """
 Yashigani Auth — Multi-IdP Identity Broker.
 
-Last updated: 2026-05-03
+Last updated: 2026-05-15T22:00:00+01:00
 
 Yashigani IS the identity broker (Decision 11). Supports OIDC and SAML v2
 with multiple IdPs per deployment. Caddy delegates auth to the backoffice,
@@ -57,6 +57,20 @@ class IdPConfig:
     # A non-None value must be a fully-qualified hostname or a *.example.com-style
     # suffix glob (matched via fnmatch, case-insensitive).
     allowed_auth_endpoint_pattern: Optional[str] = None
+
+    # SAML SP / IdP credentials (ignored for protocol="oidc").
+    # sp_private_key: RSA private key PEM body (no headers) or full PEM.
+    #   Enforcement: _assert_rsa_sp_key() fires at add_idp() time — non-RSA keys
+    #   reject startup (YSG-RISK-044 / CVE-2026-41989 mitigation).
+    # idp_sso_url / idp_sls_url: SAML SSO and SLS endpoints from IdP metadata.
+    # idp_x509_cert / sp_certificate: X.509 PEM bodies (no headers).
+    # sp_sls_url: SP Single Logout Service URL.
+    saml_idp_sso_url: str = ""
+    saml_idp_sls_url: str = ""
+    saml_idp_x509_cert: str = ""
+    saml_sp_sls_url: str = ""
+    saml_sp_private_key: str = ""
+    saml_sp_certificate: str = ""
 
     # V6.8.4 — acr/amr allowlist validation (ASVS V6.3.3).
     # Both fields are Optional[List[str]] with None meaning "no enforcement".
@@ -145,12 +159,43 @@ class IdentityBroker:
             )
             self._oidc_providers[config.id] = OIDCProvider(oidc_cfg)
 
+        elif config.protocol == "saml":
+            # Build SAMLConfig from the IdPConfig SAML fields and register the
+            # provider.  SAMLProvider.__init__ calls _assert_rsa_sp_key() —
+            # non-RSA SP keys raise ValueError here, fail-closing at config-load
+            # (YSG-RISK-044 / CVE-2026-41989 mitigation).
+            #
+            # entity_id on IdPConfig serves as the SAML SP entity ID (the SP's
+            # own public identifier).  sp_acs_url defaults to metadata_url when
+            # the caller does not supply a separate ACS URL via redirect_uri.
+            sp_entity_id = config.entity_id or config.client_id or config.id
+            sp_acs_url = redirect_uri or config.metadata_url
+            saml_cfg = SAMLConfig(
+                sp_entity_id=sp_entity_id,
+                sp_acs_url=sp_acs_url,
+                sp_sls_url=config.saml_sp_sls_url or sp_acs_url.replace("/acs", "/sls"),
+                idp_entity_id=config.saml_idp_sso_url or config.metadata_url,
+                idp_sso_url=config.saml_idp_sso_url or config.metadata_url,
+                idp_sls_url=config.saml_idp_sls_url,
+                idp_x509_cert=config.saml_idp_x509_cert,
+                sp_private_key=config.saml_sp_private_key,
+                sp_certificate=config.saml_sp_certificate,
+            )
+            # Raises ValueError for non-RSA keys — propagate to fail the
+            # container at startup (SOP 1: lifespan fail-closed discipline).
+            self._saml_providers[config.id] = SAMLProvider(saml_cfg)
+            logger.info(
+                "IdentityBroker: SAML SP registered for IdP %s — RSA key enforced",
+                config.id,
+            )
+
         logger.info("IdentityBroker: added IdP %s (%s, %s)", config.id, config.name, config.protocol)
 
     def remove_idp(self, idp_id: str) -> None:
         """Remove an IdP configuration."""
         self._idps.pop(idp_id, None)
         self._oidc_providers.pop(idp_id, None)
+        self._saml_providers.pop(idp_id, None)
 
     def list_idps(self) -> list[IdPConfig]:
         """List all configured IdPs."""

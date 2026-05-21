@@ -1,4 +1,4 @@
-# airgap/manifest.yml — Yashigani v2.23.3 air-gap image manifest
+# airgap/manifest.yml — Yashigani v2.23.4 air-gap image manifest
 # last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
 #
 # PURPOSE
@@ -36,7 +36,7 @@
 # spire        — Smallstep CA for internal service-to-service TLS (--with-internal-ca)
 # full         — Alias that includes core + observability + openwebui
 
-version: "2.23.3"
+version: "2.23.4"
 
 profiles:
 
@@ -87,16 +87,16 @@ profiles:
       # These entries document the expected digest after the isolated-host build;
       # they are verified by install.sh --air-gap against the sidecar manifest.
       - name: "yashigani/gateway"
-        tag: "2.23.3"
+        tag: "2.23.4"
         digest: ""
-        ref: "yashigani/gateway:2.23.3"
+        ref: "yashigani/gateway:2.23.4"
         note: "Built from source — digest populated by prepare-airgap-bundle.sh after build"
         source: "in-tree"
 
       - name: "yashigani/backoffice"
-        tag: "2.23.3"
+        tag: "2.23.4"
         digest: ""
-        ref: "yashigani/backoffice:2.23.3"
+        ref: "yashigani/backoffice:2.23.4"
         note: "Built from source — digest populated by prepare-airgap-bundle.sh after build"
         source: "in-tree"
 

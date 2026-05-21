@@ -1,4 +1,5 @@
-<!-- last-updated: 2026-05-03T00:00:00+01:00 -->
+<!-- last-updated: 2026-05-15T12:00:00+01:00 (docs: also clean v0.6.0 version-table cell — Linux/macOS/cloud/VM → Linux/macOS — v2.23.4) -->
+<!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal/no-container install claims — v2.23.4) -->
 # Yashigani Architecture and Feature History
 
 ---
@@ -48,7 +49,7 @@ AI Agent / Human (via Open WebUI or API)
         v
 [ Sensitivity Pipeline ]    <-- Three layers (all ON by default):
         |                       1. Regex pattern matching
-        |                       2. FastText ML classifier (<5ms, v2.20: baked into image)
+        |                       2. scikit-learn ML classifier (<5ms, v2.23.3: TF-IDF + LogisticRegression replaces FastText; baked into image)
         |                       3. Ollama LLM classification
         |                       + CHS credential detection
         |                       + Payload masking before AI send
@@ -95,8 +96,8 @@ AI Agent / Human (response)
 | **Identity Broker** | Multi-IdP identity broker: OIDC + SAML v2; Caddy delegates auth (since v2.0) |
 | **Pool Manager** | Per-identity container lifecycle: create, route, health, replace, scale, postmortem forensics (since v2.0) |
 | **OPA Policy Engine** | Declarative, version-controlled authorization for every tool call; routing safety net with LLM policy review (since v2.0) |
-| **Sensitivity Pipeline** | Three-layer classification: regex + FastText ML + Ollama; all ON by default (since v2.0) |
-| **Inspection Pipeline** | FastText ML + multi-backend LLM inspection with fail-closed sentinel |
+| **Sensitivity Pipeline** | Three-layer classification: regex + scikit-learn ML + Ollama; all ON by default (since v2.0; ML backend swapped FastText → scikit-learn TF-IDF + LogisticRegression in v2.23.3) |
+| **Inspection Pipeline** | scikit-learn ML + multi-backend LLM inspection with fail-closed sentinel |
 | **Audit Pipeline** | Multi-sink writer: file, PostgreSQL, Splunk, Elasticsearch, Wazuh; P1-P5 alert severity with SIEM integration (since v2.0) |
 | **PgBouncer** | PostgreSQL connection pooler, prevents connection exhaustion (password from .env since v1.09.5) |
 | **Redis** | Rate limiting, response caching, anomaly detection sliding windows |
@@ -131,12 +132,14 @@ Incoming bearer tokens identify the calling identity and the Optimization Engine
 
 ## 4. Security Features by Version
 
-The current release narrative (v2.23.0 + v2.23.1 + v2.23.2) is in the [README](README.md#current-release-highlights). This section preserves the full per-version history.
+The current release narrative (v2.23.0 + v2.23.1 + v2.23.2 + v2.23.3 + v2.23.4) is in the [README](README.md#current-release-highlights). This section preserves the full per-version history.
 
 ### 4.1 Version Progression Summary
 
 | Version | Theme | Key Additions |
 |---|---|---|
+| **v2.23.4** | **Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, KMS Posture Reframe** | **Cleanup-system architectural close (state file `docker/.yashigani-install-state` mode 0644 records RUNTIME/UID/USER for cross-UID handoff; uninstall.sh state-file-beats-heuristic; container-fallback rm for `docker/{data,certs,logs}` and sudo-free secrets wipe; dotfile-aware wipe glob `.[!.]*` + `..?*`; rmdir after wipe; `.env` cross-UID skip-with-WARN; `log_info` helper restored; `_do_chgrp` hoisted to script scope — closes BACKLOG-V240-003/004/006 and root cause of 5 cascading uninstall blockers); `letta-pgbouncer` mTLS sidecar (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, read_only:true, cap_drop:[ALL], session-mode, presents client cert to postgres — pg_hba catch-all `hostssl all all clientcert=verify-ca` applies with no letta carveout; closes YSG-RISK-048); KMS-architectural reframe for credentials (cleartext userlist.txt documented as non-KMS dev posture at `docs/yashigani_install_config.md` §6.1, YSG-RISK-049 ACCEPTED-LOW; production configures `YSG_KMS_PROVIDER=vault|azure|aws|gcp|keeper` to fetch via `src/yashigani/kms/` providers); Open WebUI in-mesh path (gateway dual-port :8080 mTLS edge + :8081 plain in-mesh w/ Bearer); Ollama default-model auto-pull on `--with-openwebui`; `/me/api-key` self-service Bearer issuance (step-up TOTP, ASVS V6.8.4); HUMAN identity registration on local-auth login; OPA fail-closed posture (all exception paths return `allow:False`, Prometheus `yashigani_opa_response_check_failures_total` counter, Helm validate-security `OPA-URL-001`); `yashigani-internal` Bearer rotated to per-install 36-char secret (literal gone from source); SAML BYOK config-load surface (`YASHIGANI_IDP_<N>_SAML_*`, RSA-key enforcement at __init__); container auto-start on host reboot (`systemd --user` + `loginctl enable-linger`); install.sh:5101 `\|\| true` cp-fallback guard; air-gap install Step 9 `.Id`-fallback for image-digest verification (docker load doesn't populate RepoDigests — closes YSG-RISK-038); uninstall.sh runtime detection prefers Podman with liveness probe (closes YSG-RISK-004); dead-code `fasttext_backend.py` removed (LU-YSG-009); air-gap docs `config/` added (closes YSG-RISK-039); pgbouncer admin console lockdown (`admin_users` empty + `stats_users` empty on yashigani-pgbouncer, Laura F2 sibling); Iris+Laura design-review-first sequencing across 10+ cycles persisted at `internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`; Ava E2E 13/13 PASS at tag (Phase 1 6/6 + Phase 2 6/6 + crucible test of `.env` cross-UID class-of-bug close).** |
+| **v2.23.3** | **DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, Password-History Reuse Rejection** | **DNS-rebinding defence for outbound HTTP (`yashigani.net.pinned_resolver` resolves hostname once at context entry, verifies against SSRF allow/block, patches `socket.getaddrinfo` for the transport so subsequent DNS changes can't redirect; OWUI agent push wired through; new audit event `SSRF_PINNED_RESOLVER_USED`; security doc `docs/security/ssrf.md`; closes issue #91 / OWASP API7); PKI admin UI + BYO-CA driver (`/api/v1/admin/pki/*` chain inspection / leaf rotation step-up TOTP / bundle download / status — private key never included; BYO-CA driver `YASHIGANI_PKI_CA_MODE=byo` issues EC P-256 CSR against external signing endpoint w/ step-ca/Vault PKI, validates chain, atomic install; auth modes token/mtls/none; fail-closed on driver error; closes #51 + #53); air-gap deployment support (`scripts/prepare-airgap-bundle.sh` builds offline bundle from pinned `airgap/manifest.yml`; `install.sh --air-gap --bundle <path>`; per-image digest verification fail-closed; zstd-compressed tar + SHA256 sidecar; pre-flight G20 gate; closes #58); OWASP API3 BOPLA per-property allowlist (explicit deny-by-default Pydantic public-view schemas w/ `model_config extra='forbid'` for admin/user accounts + SIEM target + IdP + JWT config/test — sensitive fields never serialised; 54 regression tests; ASVS V4.2.1, CWE-213); age-encrypted backups (`scripts/backup.sh` produces `<timestamp>.tar.gz.age` via AES-256-GCM/age X25519; `restore.sh --encrypted`; Helm `backup-cronjob.yaml`; closes CMMC L2 MP.L2-3.8.9 / CWE-312); password reuse history (`password_history` table migration 0010; default 12 Argon2id hashes range 1-24; HTTP 422 `password_reuse` + `PASSWORD_REUSE_REJECTED` audit; CMMC L2 IA.L2-3.5.8); `fasttext-wheel` → scikit-learn swap in prompt-injection classifier (closes YSG-RISK-040 abandoned dep); N-1 upgrade matrix v2.23.2→v2.23.3 across macOS+Linux × Podman+Docker.** |
 | **v2.23.2** | **Security Hardening, Supply-Chain Controls, ASVS L3 92%** | **XFF spoofing closed (Caddy strips and re-sets `X-Forwarded-For`); rate-limiter fail-closed default with `Retry-After` on 503; login throttle `Retry-After` header (RFC 6585); OPA and Jaeger mTLS on Docker Compose and Kubernetes Helm; Kyverno admission policies (non-root UID, read-only root filesystem, no-new-privileges, dropped caps); all Ollama containers migrated to UID 1000; all 73 Caddy `reverse_proxy` blocks carry `X-Caddy-Verified-Secret` injection; Caddyfile contract test in CI (asserts inject-caddy-verified count, TLS 1.3 presence, client_auth placement); GPG release tag signing infrastructure complete (CI workflow + public key in-repo); GitHub Actions steps SHA-pinned; pip removed from runtime images (CVE surface reduction); SBOM service-identity SHA gate; install + N-1 upgrade smoke matrix (macOS Podman / macOS Docker / Linux Podman / Linux Docker); backslash open-redirect patch on admin `next=` with regression tests; safe_error_envelope for all error responses; host /tmp eliminated from install.sh + restore.sh + CI; OWASP ASVS v5 L3 92% (166/180), zero release-blocking FAILs** |
 | **v2.23.1** | **Core-Plane mTLS + Two-Tier PKI + Release Hardening** | **Core-plane mTLS default-on across gateway / backoffice / postgres / pgbouncer / redis / opa (in-tree two-tier PKI issuer: root → intermediate → per-service leafs with SPIFFE-style URIs, automatic issuance + rotation; the optional Smallstep step-ca service `--with-internal-ca` provides separate ACME-style runtime cert management), seccomp + AppArmor default-on for all runtimes, fail-closed on missing HMAC + OWUI secrets (no silent dev-mode fallback), centralised SSRF allowlist helper for outbound HTTP, per-endpoint body-size limits (ASVS 4.3.1), log-injection sanitisation across audit/app logs, session rotation on password change (ASVS V7.4.2), uniformised 401 vs 404 on unauth admin endpoints, CSP explicit `script-src` + working `/admin/csp-report` handler, algorithm allowlist on license ECDSA verifier, Caddy header hygiene (stripped Server + stale alt-svc), PCI-compliant password expiry profile (≤90 days), TOTP enrolment API split provision/confirm, auth-throttle admin self-visibility (admin-session view of own + all throttled/blocked IPs), agent tier-limit returns 402 (was 500), AGENT_REGISTERED audit events now persisted, /.well-known/security.txt (RFC 9116), symbol-bearing generated passwords (`!*,-._~` with category guarantees), `YSG_RUNTIME` stale-env bleed fix, AppArmor mmap permission for shared libraries, ACS v3 dogfood-scan release-blocker batch closed (YSG-RISK-001 partition_maintenance SQLi, YSG-RISK-002 Alembic migration SQLi, YSG-RISK-003 OIDC scheme/host validation, YSG-RISK-004 compose mem_limit/cpus, YSG-RISK-005 Helm resources.limits/requests, YSG-RISK-006 OpenClaw 18789 loopback bind, YSG-RISK-007 SSRF allowlists across agents/oidc/audit), macOS Podman + Docker / Linux Podman + Docker / K8s Helm all clean-slate tested** |
 | **v2.23.0** | **Single Branch, API-First Admin, Strict CSP, Compose Profiles, Internal CA** | **Branch consolidation (release/1.x eliminated — Open WebUI is `--with-openwebui` flag), API-first admin UI (static SPA, external JS/CSS, no Jinja2 templates, no inline code), strict CSP (`script-src 'self'; style-src 'self'`, zero `unsafe-inline`, object-src none, base-uri none, COOP same-origin, CSP report endpoint), optional services via compose profiles (openwebui, wazuh, internal-ca, langflow, letta, openclaw), admin service management (enable/disable any service from admin panel, no SSH), Internal CA (Smallstep step-ca for service-to-service TLS, `--with-internal-ca`), Podman socket detection on macOS, restore.sh backup recovery, admin-configurable password policy (max 13 months), domain-bound licensing (ECDSA P-256 signed), container socket mount read-only** |
@@ -156,7 +159,7 @@ The current release narrative (v2.23.0 + v2.23.1 + v2.23.2) is in the [README](R
 | v0.7.0 | Operational hardening + OPA Policy Assistant | ECDSA P-256 key active, DB partition automation + monitoring, OPA Policy Assistant (NL → RBAC JSON), MCP quick-start snippets, direct webhook alerting (Slack/Teams/PagerDuty), CIDR IP allowlisting per agent, path matching parity fix, runtime-configurable rate limit thresholds |
 | v0.6.2 | Starter tier + three-dimensional limits | 5-tier model adds Starter (OIDC-only), max_end_users + max_admin_seats split, v3 license payload schema |
 | v0.6.1 | Tier restructuring + open-source licensing | 4-tier model (Community/Professional/Professional Plus/Enterprise), Apache 2.0 community license, CLA framework |
-| v0.6.0 | Universal installer + licensing | Linux/macOS/cloud/VM installer, 3-tier licensing (Community/Professional/Enterprise), ECDSA P-256 license verification, feature gates |
+| v0.6.0 | Universal installer + licensing | Linux/macOS installer (Docker/Podman runtime required), 3-tier licensing (Community/Professional/Enterprise), ECDSA P-256 license verification, feature gates |
 | v0.5.0 | Data plane hardening + observability | PostgreSQL 16 RLS + AES-256-GCM, pg_partman, PgBouncer, JWT introspection (JWKS waterfall), multi-sink audit, OTEL/Jaeger, FastText ML, Vault KMS, Loki, Alertmanager, per-endpoint rate limiting, response caching, Wazuh, anomaly detection, inference logging, container hardening, structured JSON logging |
 | v0.4.0 | Cloud-native operations | Kubernetes Helm charts, GitHub Actions CI/CD, KEDA autoscaling, pod disruption budgets, network policies, Trivy scanning, CODEOWNERS |
 | v0.3.0 | Enterprise identity + inspection | RBAC via OPA, agent routing, multi-backend inspection (5 providers), OIDC + SAML v2 SSO, SCIM, fail-closed sentinel, response masking, payload masking |
@@ -288,7 +291,7 @@ v2.0 is Yashigani's first production-grade release, adding five major subsystems
 
 **Multi-IdP Identity Broker** -- Yashigani is the identity broker. It supports multiple identity providers natively via OIDC and SAML v2. Caddy delegates all authentication decisions to the backoffice. SCIM provisions users and groups. Group policies govern model and agent access. IdP limits are tier-gated: Community supports local auth only, Non-profit & Education supports 1 OIDC + 1 SAML (matching Professional, free with verification), Starter supports 1 OIDC provider, Professional supports 1 OIDC + 1 SAML, Professional Plus supports 5 IdPs, Enterprise is unlimited.
 
-**Sensitivity Classification Pipeline** -- Every prompt passes through a three-layer sensitivity classification pipeline, all layers ON by default. Layer 1 (regex) matches patterns for PII, PCI, intellectual property, and PHI. Layer 2 (FastText ML) provides sub-5ms offline classification. Layer 3 (Ollama qwen2.5) performs deep semantic analysis. Administrators can customize patterns per tenant and opt out of the Ollama layer, but cannot disable regex. Classification results feed directly into the Optimization Engine's routing decisions.
+**Sensitivity Classification Pipeline** -- Every prompt passes through a three-layer sensitivity classification pipeline, all layers ON by default. Layer 1 (regex) matches patterns for PII, PCI, intellectual property, and PHI. Layer 2 (scikit-learn ML, TF-IDF + LogisticRegression since v2.23.3 — previously FastText) provides sub-5ms offline classification. Layer 3 (Ollama qwen2.5) performs deep semantic analysis. Administrators can customize patterns per tenant and opt out of the Ollama layer, but cannot disable regex. Classification results feed directly into the Optimization Engine's routing decisions.
 
 **P1-P5 Alert Severity with SIEM Integration** -- Routing decisions are audit events written through the existing audit pipeline to all SIEM sinks. A P1-P5 severity scale triggers on specific conditions: sensitivity breach (P1), OPA override (P1), classification conflict (P2), spending anomaly (P2), budget auto-switch (P3), and others.
 
@@ -368,7 +371,7 @@ v0.6.1 restructured the licensing tiers to reflect real-world deployment segment
 
 ### 4.18 v0.6.0 — Universal Installer and Licensing
 
-Yashigani became self-distributable. The universal installer auto-detects OS, architecture, and cloud provider, then performs a full production-grade installation on Linux, MacOS, cloud VMs, and bare-metal. Three licensing tiers were introduced: Community (free, no key), Professional (paid, signed key), and Enterprise (paid, signed key with multi-tenancy). License verification uses ECDSA P-256 offline signature validation — no license server call-home required. Feature gates enforce SAML, OIDC, and SCIM access at the tier boundary. Agent and organization limits are enforced per tier.
+Yashigani became self-distributable. The universal installer auto-detects OS, architecture, and cloud provider, then performs a full production-grade installation on Linux and macOS hosts (Docker or Podman runtime required). Three licensing tiers were introduced: Community (free, no key), Professional (paid, signed key), and Enterprise (paid, signed key with multi-tenancy). License verification uses ECDSA P-256 offline signature validation — no license server call-home required. Feature gates enforce SAML, OIDC, and SCIM access at the tier boundary. Agent and organization limits are enforced per tier.
 
 ### 4.19 v0.5.0 — Data Platform and Full Observability
 
@@ -438,7 +441,7 @@ The initial release established the core security envelope. Yashigani began as a
 
 ### 5.3 Content Inspection and AI Safety
 
-- FastText ML first-pass classifier (offline, under 5ms latency)
+- scikit-learn ML first-pass classifier (TF-IDF + LogisticRegression, joblib serialised, offline, under 5ms latency; replaced FastText in v2.23.3)
 - Multi-backend LLM inspection chain:
   - Ollama (local)
   - Anthropic Claude
@@ -452,7 +455,7 @@ The initial release established the core security envelope. Yashigani began as a
 - Response masking and sanitization
 - Anomaly detection: repeated-small-call pattern detection (Redis ZSET sliding window)
 - Inference payload logging (AES-256-GCM encrypted, stored in Postgres)
-- **Sensitivity classification pipeline (since v2.0)** — three layers, all ON by default: regex pattern matching (PII, PCI, IP, PHI), FastText ML classifier, Ollama LLM classification; admin can opt out of Ollama but cannot disable regex; results feed into Optimization Engine routing
+- **Sensitivity classification pipeline (since v2.0)** — three layers, all ON by default: regex pattern matching (PII, PCI, IP, PHI), scikit-learn ML classifier (TF-IDF + LogisticRegression since v2.23.3; FastText pre-v2.23.3), Ollama LLM classification; admin can opt out of Ollama but cannot disable regex; results feed into Optimization Engine routing
 - **Optimization Engine (since v2.0)** — four-dimensional routing (sensitivity + complexity + budget + cost); P1-P9 priority matrix; CONFIDENTIAL/RESTRICTED always local; budget exhaustion degrades to local, never rejects
 - **Model alias table (since v2.0)** — DB-driven via admin API, Postgres + Redis cache, CRUD at `/admin/models/aliases`
 - **Agent personas (since v2.22)** — Lala (Langflow), Julietta (Letta), Scout (OpenClaw) with descriptions and example prompts
@@ -539,7 +542,7 @@ The initial release established the core security envelope. Yashigani began as a
 
 ### 5.9 Infrastructure and Deployment
 
-- Universal installer (Linux, macOS, cloud VM, bare-metal; auto-detects OS, arch, cloud provider, GPU, and container runtime)
+- Universal installer (Linux, macOS, cloud VM; auto-detects OS, arch, cloud provider, GPU, and container runtime)
 - GPU detection at install time: Apple Silicon M-series (unified memory, Metal, ANE), NVIDIA (nvidia-smi, CUDA), AMD (rocm-smi, ROCm), lspci fallback; model recommendations printed based on detected VRAM (since v0.8.4)
 - Podman support as first-class runtime alongside Docker Engine and Docker Desktop (v0.8.4; runtime detection, compose command selection, and auto-apply podman override in v1.09.5)
 - Interactive fallback prompts when OS, runtime, or GPU detection fails (since v0.8.4)
@@ -692,22 +695,6 @@ The universal installer auto-detects the cloud provider via instance metadata an
 | Load Balancer | ALB / NLB | Cloud Load Balancing | Azure Load Balancer |
 
 Gateway nodes run on EC2 / GCE / Azure VMs or as Kubernetes deployments on EKS / GKE / AKS. All stateful services (Postgres, Redis, Vault) can be replaced with cloud-managed equivalents — the gateway configuration accepts standard connection strings.
-
-### 6.4 Bare-Metal and On-Premises VM
-
-The universal installer supports bare-metal Linux and macOS hosts without container runtimes (though Docker and Kubernetes are the recommended paths). On bare-metal, the installer:
-
-1. Detects OS and architecture (x86_64, arm64)
-2. Installs required system packages via the native package manager
-3. Configures systemd units for all Yashigani services
-4. Bootstraps TLS (self-signed by default, ACME if a public hostname is provided)
-5. Initializes PostgreSQL, Redis, and Vault with generated credentials
-6. Prints all auto-generated passwords and the admin bootstrap token at install time
-
-Suitable for: regulated industries with no-cloud or no-container requirements, air-gapped environments, on-premises data centers.
-
-**Minimum hardware (production bare-metal):** 8 vCPU, 16 GB RAM, 100 GB NVMe SSD.
-**Recommended hardware (production bare-metal):** 12 vCPU, 32 GB RAM, 180 GB NVMe SSD.
 
 ---
 

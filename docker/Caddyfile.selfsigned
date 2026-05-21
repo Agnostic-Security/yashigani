@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (self-signed certificate mode)
-# Last updated: 2026-05-09T00:00:00+00:00 (v2.23.3: add /api/v1/admin/* route — SWEEP-16 release blocker)
+# Last updated: 2026-05-18T00:00:00+00:00 (v2.23.4: add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing)
 #
 # ╔══════════════════════════════════════════════════════════╗
 # ║  WARNING: SELF-SIGNED MODE — LOCAL / DEMO USE ONLY      ║
@@ -226,8 +226,41 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── Gateway OpenAPI surface — /openapi.json + /docs ───────────────
+    # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
+    # GET /docs (Swagger UI) via gateway identity-resolution middleware.
+    # Without explicit handles these requests fell through to the Open WebUI
+    # catch-all and were functionally unreachable.
+    handle /openapi.json {
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /docs {
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
     # ── Backoffice routes: /admin/*, /auth/*, /dashboard/*, /scim/* ───────
+    # ISSUE-019 (2026-05-19): inject Caddy's own SPIFFE identity on the
+    # Caddy→backoffice leg so require_spiffe_id("/admin/agents") can verify the
+    # caller.  Browser sessions arrive at Caddy without a client cert; Caddy
+    # presents caddy_client.crt to backoffice via internal-mtls.  require_spiffe_id
+    # trusts x-spiffe-id when x-spiffe-id-peer-cert is absent (uvicorn does not
+    # expose the ASGI TLS peer_cert extension — see spiffe_middleware.py).
+    # The hardcoded "spiffe://yashigani.internal/caddy" matches the ACL entry in
+    # service_identities.yaml endpoint_acls["/admin/agents"].
     handle /admin/* {
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
         reverse_proxy https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
@@ -237,6 +270,15 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /auth/* {
+        reverse_proxy https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /me/* {
         reverse_proxy https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified

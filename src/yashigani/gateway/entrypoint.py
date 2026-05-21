@@ -3,13 +3,14 @@ Yashigani Gateway — ASGI entrypoint.
 Wires all services together and creates the FastAPI app.
 Environment variables configure service endpoints and behaviour.
 
-Last updated: 2026-05-08T00:00:00+00:00
+Last updated: 2026-05-17T00:00:00+00:00
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+from typing import Callable, Literal, cast
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
@@ -36,11 +37,11 @@ from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def _build_app():
+def _build_app(mesh_mode: bool = False):
     # ── OTEL tracing — initialise before anything else ─────────────────────
     try:
         from yashigani.tracing import setup_tracer
-        setup_tracer("yashigani-gateway")
+        setup_tracer("yashigani-gateway-mesh" if mesh_mode else "yashigani-gateway")
     except Exception as exc:
         logger.warning("OTEL setup skipped: %s", exc)
 
@@ -61,7 +62,7 @@ def _build_app():
     chs = CredentialHandleService(
         kms_provider=kms_provider,
         resource_monitor=resource_monitor,
-        on_audit=audit_writer,
+        on_audit=cast(Callable[..., object], audit_writer),  # AuditLogWriter is callable at runtime
     )
 
     # Inspection pipeline
@@ -119,7 +120,7 @@ def _build_app():
         )
 
     # Rate limiter — Redis DB 2
-    _rl_fail_mode = resolve_rate_limit_fail_mode()
+    _rl_fail_mode = cast(Literal["open", "closed"], resolve_rate_limit_fail_mode())
     logger.info("Rate limiter fail mode: %s", _rl_fail_mode)
     rate_limiter = None
     try:
@@ -388,20 +389,28 @@ def _build_app():
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 
-    # Layer B: Caddy-verified shared-secret middleware (EX-231-10 Layer B).
-    # Checks X-Caddy-Verified-Secret on every non-healthcheck request. Must run
-    # second from outermost — added BEFORE SpiffePeerCertMiddleware so that in
-    # Starlette LIFO order, Spiffe runs outermost and CaddyVerified runs second.
-    # load_caddy_secret() is called in the gateway _lifespan (proxy.py), not here,
-    # so the module-level secret is populated before any request dispatch.
-    gateway_app.add_middleware(CaddyVerifiedMiddleware)
+    if not mesh_mode:
+        # Layer B: Caddy-verified shared-secret middleware (EX-231-10 Layer B).
+        # Checks X-Caddy-Verified-Secret on every non-healthcheck request. Must run
+        # second from outermost — added BEFORE SpiffePeerCertMiddleware so that in
+        # Starlette LIFO order, Spiffe runs outermost and CaddyVerified runs second.
+        # load_caddy_secret() is called in the gateway _lifespan (proxy.py), not here,
+        # so the module-level secret is populated before any request dispatch.
+        # Skipped in mesh_mode (port 8081): no Caddy layer; network isolation guards instead.
+        gateway_app.add_middleware(CaddyVerifiedMiddleware)
 
-    # SPIFFE peer-cert middleware — LF-SPIFFE-FORGE fix (V10.3.5).
-    # Extracts the TLS peer cert URI SAN from the ASGI handshake scope and
-    # injects it as X-SPIFFE-ID-Peer-Cert.  This is a server-controlled header
-    # that cannot be forged by the client, closing the direct-to-gateway bypass.
-    # Must run outermost (added last = executed first in starlette middleware stack).
-    gateway_app.add_middleware(SpiffePeerCertMiddleware)
+        # SPIFFE peer-cert middleware — LF-SPIFFE-FORGE fix (V10.3.5).
+        # Extracts the TLS peer cert URI SAN from the ASGI handshake scope and
+        # injects it as X-SPIFFE-ID-Peer-Cert.  This is a server-controlled header
+        # that cannot be forged by the client, closing the direct-to-gateway bypass.
+        # Must run outermost (added last = executed first in starlette middleware stack).
+        # Skipped in mesh_mode: no TLS handshake, no peer cert to extract.
+        gateway_app.add_middleware(SpiffePeerCertMiddleware)
+    else:
+        logger.info(
+            "mesh_mode=True: CaddyVerifiedMiddleware + SpiffePeerCertMiddleware skipped. "
+            "Port 8081 is protected by network isolation only (data network / K8s NetworkPolicy)."
+        )
 
     # Licence enforcement middleware — converts GatewayBlockedError → 503 and
     # GatewayReadOnlyError → 403.  Runs AFTER Spiffe+Caddy verification (inbound
@@ -465,4 +474,13 @@ def _build_app():
     return gateway_app
 
 
-app = _build_app()
+# Guard: when imported by mesh_entrypoint.py (YASHIGANI_IS_MESH_PROCESS=1),
+# do not build the mTLS app here — mesh_entrypoint calls _build_app(mesh_mode=True).
+# Without this guard, importing entrypoint from mesh_entrypoint would execute
+# _build_app(mesh_mode=False) as a side-effect, creating duplicate background threads
+# and overwriting shared module-level state in openai_router._state.
+import os as _os
+if not _os.getenv("YASHIGANI_IS_MESH_PROCESS"):
+    app = _build_app(mesh_mode=False)
+else:
+    app = None  # mesh_entrypoint.py will assign the real app

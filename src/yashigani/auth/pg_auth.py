@@ -161,7 +161,7 @@ class PostgresLocalAuthService:
                         username,
                     )
                     # ACS gap #95: emit structured ACCOUNT_LOCKOUT event.
-                    _emit_lockout_event(audit_writer, username, "password", record.failed_attempts)
+                    _emit_lockout_event(audit_writer, username, "password", record.failed_attempts, account_tier=record.account_tier)
                 await self._update(conn, record)
                 return False, None, generic_fail
 
@@ -188,7 +188,7 @@ class PostgresLocalAuthService:
                         username,
                     )
                     # ACS gap #95: emit structured ACCOUNT_LOCKOUT event.
-                    _emit_lockout_event(audit_writer, username, "totp", _MAX_FAILED_ATTEMPTS)
+                    _emit_lockout_event(audit_writer, username, "totp", _MAX_FAILED_ATTEMPTS, account_tier=record.account_tier)
                 else:
                     delay = _TOTP_BACKOFF_SECONDS[min(n, len(_TOTP_BACKOFF_SECONDS) - 1)]
                     record.totp_backoff_until = time.time() + delay
@@ -848,12 +848,16 @@ def _emit_lockout_event(
     username: str,
     lockout_type: str,
     failed_attempts: int,
+    account_tier: str = "admin",
 ) -> None:
     """
     Emit an ACCOUNT_LOCKOUT audit event.  ACS gap #95 (auth_log).
 
     Called inside authenticate() when a lockout is triggered.  Swallows
     exceptions so an audit failure never blocks the auth response.
+
+    account_tier is derived from the fetched AccountRecord at call site —
+    defence-in-depth: RBAC bypass visible in audit (ASVS V7.3.4).
     """
     if audit_writer is None:
         return
@@ -861,7 +865,7 @@ def _emit_lockout_event(
         from yashigani.audit.schema import AccountLockoutEvent
 
         evt = AccountLockoutEvent(
-            account_tier="admin",
+            account_tier=account_tier,
             admin_account=username,
             lockout_type=lockout_type,
             failed_attempts=failed_attempts,

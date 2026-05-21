@@ -73,6 +73,10 @@ class EventType(str, Enum):
     SELFSERVICE_POLICY_DENY = "SELFSERVICE_POLICY_DENY"
     # User management
     USER_FULL_RESET = "USER_FULL_RESET"
+    # Gap 4 / v2.23.4 — self-service Bearer issuance + revocation
+    USER_API_KEY_ISSUED = "USER_API_KEY_ISSUED"
+    USER_API_KEY_REVOKED = "USER_API_KEY_REVOKED"
+    ADMIN_USER_API_KEY_ISSUED = "ADMIN_USER_API_KEY_ISSUED"
     # Gateway
     GATEWAY_REQUEST = "GATEWAY_REQUEST"
     RATE_LIMIT_VIOLATION = "RATE_LIMIT_VIOLATION"
@@ -143,6 +147,28 @@ class EventType(str, Enum):
     PASSWORD_REUSE_REJECTED = "PASSWORD_REUSE_REJECTED"
     # v2.23.3 — OWASP API7 DNS-rebinding defence (issue #91)
     SSRF_PINNED_RESOLVER_USED = "SSRF_PINNED_RESOLVER_USED"
+    # v2.23.4 — Q3 arch-completion: admin-action reactivation + blocked login
+    # LOGIN_BLOCKED_SUSPENDED_IDENTITY: emitted when a user-tier login attempt
+    # is blocked because the HUMAN identity is suspended/inactive.
+    # Admin must use POST /admin/users/{username}/reactivate to restore access.
+    LOGIN_BLOCKED_SUSPENDED_IDENTITY = "LOGIN_BLOCKED_SUSPENDED_IDENTITY"
+    # IDENTITY_REACTIVATED: emitted when an admin explicitly reactivates a
+    # suspended identity via POST /admin/users/{username}/reactivate.
+    IDENTITY_REACTIVATED = "IDENTITY_REACTIVATED"
+    # v2.23.4 — OPA fail-closed (ASVS V8.* + V14.5.*)
+    # OPA_RESPONSE_CHECK_FAILED: emitted when the OPA response-check path is
+    # unreachable, errors, or not configured.  Request is DENIED (fail-closed).
+    # Alert on sustained rate — an OPA outage causes response-delivery denials.
+    OPA_RESPONSE_CHECK_FAILED = "OPA_RESPONSE_CHECK_FAILED"
+    # v2.23.4 — PII detection events (ASVS V7.3.4 / Iris FINDING-004)
+    # PII_DETECTED: emitted when the PII detector finds sensitive data in a
+    # request or response body.  Raw PII values are NEVER logged — only
+    # pii_type labels and a count.
+    PII_DETECTED = "PII_DETECTED"
+    # v2.23.4 — Streaming stream-termination event (Iris FINDING-004)
+    # STREAM_TERMINATED: emitted when a streaming response is terminated
+    # early by the StreamingInspector due to sensitive content detection.
+    STREAM_TERMINATED = "STREAM_TERMINATED"
 
 
 # ---------------------------------------------------------------------------
@@ -1231,3 +1257,209 @@ class PasswordReuseRejectedEvent(AuditEvent):
     # The exact match position is intentionally not recorded (no ordering
     # information that could assist an attacker in narrowing the history).
     history_depth_checked: int = 0  # == PASSWORD_HISTORY_DEPTH at call time
+
+
+# ---------------------------------------------------------------------------
+# Gap 4 / v2.23.4 — User self-service Bearer issuance + admin override
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class UserApiKeyIssuedEvent(AuditEvent):
+    """Written when a user self-issues or rotates their HUMAN-identity Bearer.
+
+    Security invariants (immutable floors):
+      - The plaintext token is NEVER stored here. Only last4 is logged.
+      - masking_applied is always True.
+      - actor is the account_id of the user performing the action.
+
+    ASVS V7.1.1 — all auth decisions logged with forensic context.
+    Gap 4 / v2.23.4 arch-completion.
+    """
+
+    event_type: str = EventType.USER_API_KEY_ISSUED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True  # immutable floor — plaintext never logged
+    actor: str = ""      # account_id of the user (not username — avoids PII in lower sinks)
+    identity_id: str = ""
+    key_last4: str = ""  # last 4 chars of plaintext token — sufficient for forensics
+    rotation: bool = False  # True if a prior token existed and was immediately invalidated
+
+
+@dataclass
+class UserApiKeyRevokedEvent(AuditEvent):
+    """Written when a user or admin revokes a HUMAN-identity Bearer key.
+
+    Security invariants: same as UserApiKeyIssuedEvent.
+    """
+
+    event_type: str = EventType.USER_API_KEY_REVOKED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    actor: str = ""          # account_id of the principal performing the revocation
+    identity_id: str = ""
+    key_id: str = ""         # key_id being revoked (Redis field or identity_id)
+    revoked_by_admin: bool = False
+
+
+@dataclass
+class AdminUserApiKeyIssuedEvent(AuditEvent):
+    """Written when an admin issues/rotates a user's API key via the admin override route.
+
+    Security invariants:
+      - plaintext token never logged.
+      - admin_account_id is the acting admin (account_id, not username).
+      - target_username is included for forensic correlation.
+
+    ASVS V7.1.1 / Lu audit-trail requirement (Gap 4 arch ticket).
+    """
+
+    event_type: str = EventType.ADMIN_USER_API_KEY_ISSUED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account_id: str = ""   # acting admin account_id
+    target_username: str = ""    # target user
+    target_identity_id: str = ""
+    key_last4: str = ""
+    grace_seconds: int = 30      # grace window applied to prior token
+
+
+@dataclass
+class LoginBlockedSuspendedIdentityEvent(AuditEvent):
+    """Written when a user-tier login is blocked because their HUMAN identity
+    is suspended or inactive in the identity registry.
+
+    The user must contact an admin who can call
+    POST /admin/users/{username}/reactivate (requires StepUp).
+
+    Security invariants:
+      - No session is created (login is rejected before session issuance).
+      - username is logged for forensic triage (not account_id — account_id
+        may not be meaningful to operators; username is the primary handle).
+
+    Q3 / v2.23.4 arch-completion.
+    """
+
+    event_type: str = EventType.LOGIN_BLOCKED_SUSPENDED_IDENTITY
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    username: str = ""          # target user whose login was blocked
+    identity_id: str = ""       # identity_id that is suspended
+    identity_status: str = ""   # "suspended" or "inactive"
+    slug: str = ""              # slug of the blocked identity (for correlation)
+
+
+@dataclass
+class IdentityReactivatedEvent(AuditEvent):
+    """Written when an admin explicitly reactivates a suspended HUMAN identity
+    via POST /admin/users/{username}/reactivate.
+
+    Security invariants:
+      - Admin must hold a valid StepUp session (TOTP within 5 min).
+      - acting_admin_account_id is account_id of the acting admin (not username).
+      - target_username is the user whose identity was reactivated.
+      - plaintext tokens and secrets are never logged.
+
+    ASVS V7.1.1 / Q3 arch-completion.
+    """
+
+    event_type: str = EventType.IDENTITY_REACTIVATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    acting_admin_account_id: str = ""   # admin performing the reactivation
+    target_username: str = ""           # user being reactivated
+    target_identity_id: str = ""        # identity_id being reactivated
+    reason: str = ""                    # optional reason supplied in request body
+
+
+# ---------------------------------------------------------------------------
+# v2.23.4 — OPA response-check fail-closed event (Iris FINDING-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OpaResponseCheckFailedEvent(AuditEvent):
+    """Written when the OPA response-check is unreachable, errors, or
+    not configured and the gateway denies the response (fail-closed).
+
+    Alert on sustained rate — OPA outage = sustained response-delivery
+    denials.  ASVS V8.* + V14.5.* / v2.23.4 Iris FINDING-004.
+
+    Security invariants:
+      - No response body or user content is stored here.
+      - exc_str is truncated to 256 chars to prevent log bloat.
+      - masking_applied is always True.
+    """
+
+    event_type: str = EventType.OPA_RESPONSE_CHECK_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""          # "opa_not_configured" | "opa_exception"
+    outcome: str = ""         # "not_configured" | "exception"
+    exc_class: str = ""       # exception class name (empty for not_configured)
+    exc_str: str = ""         # str(exc)[:256] (empty for not_configured)
+    identity_id: str = ""
+    response_sensitivity: str = ""
+    action: str = "denied_fail_closed"
+
+
+# ---------------------------------------------------------------------------
+# v2.23.4 — PII detection event (Iris FINDING-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PIIDetectedEvent(AuditEvent):
+    """Written when the PII detector identifies sensitive data in a
+    gateway request or response body.
+
+    Security invariants (immutable floors):
+      - Raw PII values are NEVER stored — only pii_type labels and counts.
+      - masking_applied is always True.
+      - direction is "request" or "response".
+      - destination is "local" (Ollama) or "cloud" (remote LLM API).
+
+    ASVS V7.3.4 / v2.23.4 Iris FINDING-004.
+    """
+
+    event_type: str = EventType.PII_DETECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True   # immutable floor — PII labels are still sensitive
+    request_id: str = ""
+    direction: str = ""            # "request" | "response"
+    pii_types: list = None         # type: ignore[assignment]
+    action_taken: str = ""         # "logged" | "redacted" | "blocked"
+    destination: str = ""          # "local" | "cloud" | "upstream"
+    finding_count: int = 0
+
+    def __post_init__(self):
+        if self.pii_types is None:
+            self.pii_types = []
+
+
+# ---------------------------------------------------------------------------
+# v2.23.4 — Stream termination event (Iris FINDING-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StreamTerminatedEvent(AuditEvent):
+    """Written when a streaming response is terminated early by the
+    StreamingInspector due to sensitive content detection.
+
+    Security invariants:
+      - accumulated_chars is a character count only — no content is stored.
+      - masking_applied is always True.
+      - trigger format: "<layer>:<level>" e.g. "regex:CONFIDENTIAL".
+
+    ASVS V7.3.4 / v2.23.4 Iris FINDING-004.
+    """
+
+    event_type: str = EventType.STREAM_TERMINATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    trigger: str = ""          # e.g. "regex:CONFIDENTIAL" | "fasttext:RESTRICTED"
+    request_id: str = ""
+    session_id: str = ""
+    agent_id: str = ""
+    accumulated_chars: int = 0

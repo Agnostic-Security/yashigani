@@ -16,7 +16,7 @@
     "providers": {
       "yashigani": {
         "baseUrl": "http://gateway:8080/v1",
-        "apiKey": "yashigani-internal",
+        "apiKey": "__YASHIGANI_INTERNAL_BEARER__",
         "api": "openai-completions",
         "models": [
           {

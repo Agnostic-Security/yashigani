@@ -2,7 +2,7 @@
 Yashigani SSO — SAMLv2 Service Provider.
 Validates assertions from the IdP and resolves user identity.
 
-Last updated: 2026-04-28T23:58:36+01:00
+Last updated: 2026-05-14T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -10,9 +10,77 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
 from yashigani.licensing.enforcer import require_feature
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_rsa_sp_key(sp_private_key: str) -> None:
+    """
+    Enforce that the SAML SP private key is RSA.
+
+    YSG-RISK-044 (CVE-2026-41989): libgcrypt ECDH heap-buffer-overflow is
+    only reachable when the SP key is EC-type (ECDH-ES key-transport path).
+    RSA SP keys route to a different decryption path and do not reach the
+    vulnerable C code in gcry_pk_decrypt.
+
+    This check is performed once at SAMLProvider init time — not on every
+    SAML request.  Fail-closed: any non-RSA key type disables SAML entirely.
+
+    python3-saml stores the private key as a PEM body without headers, so
+    we reconstruct the full PEM before parsing.
+    """
+    # Reconstruct the full PEM block from the stripped body that python3-saml
+    # uses internally.  The key may already carry headers if the caller passes
+    # a full PEM — strip and reformat to be safe.
+    stripped = sp_private_key.strip()
+    if "BEGIN" in stripped:
+        # Full PEM already — pass through as-is.
+        pem_bytes = stripped.encode("ascii")
+    else:
+        # python3-saml format: base64 body, no headers.
+        # Wrap as PRIVATE KEY (PKCS#8) first; if that fails, try RSA PRIVATE KEY.
+        pem_bytes = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            + stripped
+            + "\n-----END PRIVATE KEY-----\n"
+        ).encode("ascii")
+
+    try:
+        key = load_pem_private_key(pem_bytes, password=None)
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        # The PKCS#8 wrapper failed — try legacy RSA PEM header.
+        pem_bytes_rsa = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            + stripped
+            + "\n-----END RSA PRIVATE KEY-----\n"
+        ).encode("ascii")
+        try:
+            key = load_pem_private_key(pem_bytes_rsa, password=None)
+        except Exception as exc:
+            raise ValueError(
+                f"SAML SP key could not be parsed as a PEM private key "
+                f"(YSG-RISK-044). "
+                f"Regenerate with: openssl genrsa -out sp_key.pem 4096"
+            ) from exc
+    except Exception as exc:
+        raise ValueError(
+            f"SAML SP key could not be loaded: {exc!r} "
+            f"(YSG-RISK-044). "
+            f"Regenerate with: openssl genrsa -out sp_key.pem 4096"
+        ) from exc
+
+    if not isinstance(key, RSAPrivateKey):
+        raise ValueError(
+            f"SAML SP key must be RSA (mitigates YSG-RISK-044 / CVE-2026-41989). "
+            f"Got: {type(key).__name__}. "
+            f"EC/EdDSA/DSA SP keys are not permitted — PQR support is deferred. "
+            f"Regenerate with: openssl genrsa -out sp_key.pem 4096"
+        )
 
 
 def _import_saml():
@@ -61,6 +129,9 @@ class SAMLProvider:
     """
 
     def __init__(self, config: SAMLConfig) -> None:
+        # YSG-RISK-044 (CVE-2026-41989): enforce RSA SP key at init time.
+        # Raises ValueError immediately if the key is non-RSA.
+        _assert_rsa_sp_key(config.sp_private_key)
         self._config = config
 
     def get_login_url(self, request_data: dict) -> str:

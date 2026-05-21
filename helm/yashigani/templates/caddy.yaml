@@ -30,7 +30,7 @@ spec:
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
       securityContext:
-        # ACS-RISK-008: caddy runs as UID 1000 (caddy user baked into the
+        # YSG-RISK-008: caddy runs as UID 1000 (caddy user baked into the
         # official image). NET_BIND_SERVICE retained to bind :80/:443 without
         # root. ROFS: /data and /config are emptyDir mounts so read-only root
         # is safe — all filesystem writes go to volume mounts.
@@ -40,7 +40,7 @@ spec:
         # fsGroup triggers chgrp on Secret volumes so UID 1000 (caddy) can
         # read /run/secrets/* at mode 0440. Without this, files stay root:root
         # and caddy errors: open /run/secrets/caddy_client.crt: permission denied.
-        # ACS-RISK-008 omitted this; parity fix per G9 K8s restore round-trip.
+        # YSG-RISK-008 omitted this; parity fix per G9 K8s restore round-trip.
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault

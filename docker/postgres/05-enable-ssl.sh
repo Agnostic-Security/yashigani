@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Yashigani v2.23.3 — enable TLS + client-cert verification on Postgres.
-# Last updated: 2026-04-27T20:40:49Z (BUG-59-01: trust intermediate CA, not root)
+# Yashigani v2.23.4 — enable TLS + client-cert verification on Postgres.
+# Last updated: 2026-05-20 (feat(pki): YSG-RISK-048 close — pgbouncer sidecar replaces stunnel; remove letta pg_hba carveout; restore clean catch-all everywhere)
 #
 # This init script runs ONCE on first initdb of the postgres container (the
 # stock postgres entrypoint executes /docker-entrypoint-initdb.d/*.sh in
@@ -80,20 +80,29 @@ PGCONF
 
 # Rewrite pg_hba.conf so plaintext connections from the network are rejected.
 # local + 127.0.0.1 remain for the postgres entrypoint bootstrap flows.
+#
+# YSG-RISK-048 CLOSED 2026-05-20: the former letta-specific plain-TCP carveout
+# (host letta yashigani_app ... scram-sha-256) was removed when the stunnel sidecar
+# was implemented and remains removed under the pgbouncer design. Letta now connects
+# via letta-pgbouncer sidecar (edoburu/pgbouncer:v1.25.1-p0, UID 70) which presents
+# letta-pgbouncer_client.crt to postgres over full mTLS. clientcert=verify-ca
+# catch-all applies to all services including letta's sidecar.
 cat > "${PGDATA}/pg_hba.conf" <<'HBA'
-# TYPE  DATABASE  USER  ADDRESS        METHOD
+# TYPE  DATABASE  USER           ADDRESS        METHOD
 # Local socket — used by the postgres docker-entrypoint itself for init.
-local   all       all                  trust
+local   all       all                           trust
 # Loopback — postgres image runs its own bootstrap on 127.0.0.1.
-host    all       all   127.0.0.1/32   trust
-host    all       all   ::1/128        trust
-# Everything else must come in over TLS with a client cert signed by our
+host    all       all            127.0.0.1/32   trust
+host    all       all            ::1/128        trust
+# All network connections must use TLS with a client cert signed by our
 # internal CA, AND present a valid scram-sha-256 password. Three factors.
-hostssl all       all   0.0.0.0/0      scram-sha-256  clientcert=verify-ca
-hostssl all       all   ::/0           scram-sha-256  clientcert=verify-ca
+# Letta reaches postgres via the letta-pgbouncer sidecar which presents
+# letta-pgbouncer_client.crt — no carveout required (YSG-RISK-048 closed).
+hostssl all       all            0.0.0.0/0      scram-sha-256  clientcert=verify-ca
+hostssl all       all            ::/0           scram-sha-256  clientcert=verify-ca
 # Defence in depth — explicitly reject any plaintext attempt.
-hostnossl all     all   0.0.0.0/0      reject
-hostnossl all     all   ::/0           reject
+hostnossl all     all            0.0.0.0/0      reject
+hostnossl all     all            ::/0           reject
 HBA
 
 chown postgres:postgres "${PGDATA}/pg_hba.conf"

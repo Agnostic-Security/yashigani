@@ -1,7 +1,7 @@
 # Yashigani — Installation and Configuration Guide
 
-**Version:** 2.23.2
-**Last updated:** 2026-05-07T01:00:00+01:00
+**Version:** 2.23.4
+**Last updated:** 2026-05-15T00:00:00+00:00
 **Applies to:** Docker Compose and Kubernetes (Helm) deployments
 
 ---
@@ -104,6 +104,33 @@ Before starting, confirm the following network conditions are met:
 
 > **Warning:** Do not expose Redis (6379), budget-redis (6380), Postgres (5432), or Prometheus (9090) ports to the host in production. These services are intentionally not bound to host interfaces in the default `docker-compose.yml`.
 
+#### Iptables FORWARD policy for rootful Podman installs
+
+On Linux hosts running rootful Podman, traffic to the install's external HTTP/HTTPS ports is delivered via iptables DNAT to the container. If the host's iptables `FORWARD` chain has policy `DROP` and no matching `ACCEPT` rule for the DNATed traffic, external clients will see TCP timeouts to the install's ports.
+
+Check: `sudo iptables -L FORWARD -n | head -5` — if `policy DROP` and dropped-packet counters increase when you `curl` from outside, this is your symptom.
+
+Remediation (operator's choice, depending on local policy):
+
+- Add an explicit ACCEPT rule for the container subnet (preferred — minimum permissive):
+
+  ```
+  sudo iptables -I FORWARD -i <container-bridge> -j ACCEPT
+  sudo iptables -I FORWARD -o <container-bridge> -j ACCEPT
+  ```
+
+  Replace `<container-bridge>` with the bridge interface Podman created for the stack (typically visible via `ip link show` after `podman network ls`).
+
+- Or set the chain policy (broader, simpler):
+
+  ```
+  sudo iptables -P FORWARD ACCEPT
+  ```
+
+If your network config prevents binding ports 80/443, `install.sh` now accepts `--http-port` and `--https-port` flags to bind on higher ports (e.g. `--http-port 8080 --https-port 8443`) — the same ports the installer defaults to on macOS and rootless Podman.
+
+This is an environmental operator precondition outside `install.sh`'s scope: the installer cannot safely modify host iptables policy without the operator's awareness.
+
 ---
 
 ### 1.4 Privileges and Security Posture
@@ -128,6 +155,32 @@ Yashigani is designed for sysadmin operators. The privilege model is layered to 
 - All workloads enforce non-root via Kubernetes admission policies (Kyverno) — any pod that drifts is rejected at the admission webhook.
 - The Ollama persistent volume is sized for both model weights AND per-user inference data (default 100 GiB; increase via `ollama.persistence.size` for heavy multi-user document workloads).
 - For a fully root-free runtime, replace `edoburu/pgbouncer` with a managed connection pooler that ships non-root upstream — Yashigani's gateway and backoffice support direct PostgreSQL connections when PgBouncer is removed from the topology.
+
+#### Pre-flight: enable linger (rootless Podman only)
+
+If installing Yashigani as rootless Podman (`--runtime=podman` as a non-root user),
+you MUST enable systemd linger for the install user before running `install.sh`.
+Without linger, containers will not auto-start on host boot.
+
+Run this once, as root:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+This is a one-time setup. Subsequent re-installs do not require re-running it.
+
+To verify linger is enabled:
+
+```bash
+loginctl show-user $USER --property=Linger --value
+# expected output: yes
+```
+
+If you do not enable linger, `install.sh` will emit a pre-flight warning with a
+copy-pasteable command and pause for 3 seconds; the install will continue but the
+auto-start service unit will not function until linger is enabled and the system is
+restarted.
 
 ---
 
@@ -812,6 +865,8 @@ Yashigani stores all sensitive credentials (API keys, passwords, tokens) through
 
 No configuration required. Secrets are stored as files in `docker/secrets/` on the host and mounted read-only into containers at `/run/secrets/`. The backoffice bootstrap manages creation and rotation.
 
+**PostgreSQL credential posture (YSG-RISK-049):** The default non-KMS deployment stores the PostgreSQL application password as cleartext in `docker/secrets/postgres_password` (mode 0600). PgBouncer's edoburu entrypoint writes a cleartext `userlist.txt` at startup from the `DATABASE_URL` environment variable. This is the dev/standalone posture (YSG-RISK-049 accepted LOW for non-KMS deployments). Production deployments should configure a KMS provider (`YSG_KMS_PROVIDER=vault|azure|aws|gcp|keeper`); KMS-configured deployments fetch credentials at runtime via `src/yashigani/kms/` and do not rely on the on-disk cleartext userlist path.
+
 Verify secrets are present after first run:
 
 ```bash
@@ -1074,6 +1129,38 @@ curl -sk https://<your-domain>/auth/sso/select
 
 SAML v2 requires Professional tier or higher. The SAML ACS endpoint (`/auth/sso/saml/<idp-id>/acs`) validates assertions using python3-saml (OneLogin) with RSA-SHA256 signatures.
 
+#### SAML SP key — RSA REQUIRED
+
+The SAML Service Provider (SP) private key **must** be RSA. Yashigani enforces
+this at runtime and refuses to enable SAML if the SP key is EC, DSA, or any
+other algorithm.
+
+**Rationale (YSG-RISK-044 / CVE-2026-41989):** libgcrypt contains a
+heap-buffer-overflow in `gcry_pk_decrypt` on the ECDH decryption path (CVSS 7.5).
+This path is only exercised when the SP key is EC-type and the IdP sends an
+EncryptedAssertion with ECDH-ES key transport. RSA SP keys route through a
+different code path entirely and do not reach the vulnerable function. Using RSA
+makes the vulnerability dead code in a standard Yashigani deployment.
+
+`install.sh` generates a 4096-bit RSA key and a self-signed SP certificate in
+`docker/secrets/` during install. This is the recommended default.
+
+**If you bring your own SP key (BYOK)**, generate it with:
+
+```bash
+openssl genrsa -out sp.key 4096
+openssl req -new -x509 -key sp.key -out sp.crt -days 3650 \
+  -subj "/CN=<your-domain>/O=<your-org>/OU=SAML-SP"
+```
+
+**DO NOT** use `openssl ecparam`, `openssl genpkey -algorithm EC`, or any
+EC-key-generation tool. Yashigani will refuse to start the SAML feature if
+a non-RSA key is supplied.
+
+**Future:** When post-quantum (PQR) key algorithms (ML-KEM / Kyber) are
+supported across the SAML 2.0 + xmlsec + IdP ecosystem, this requirement will
+be revisited (YSG-RISK-044 forward-tracking note).
+
 **Step 1.** Configure your IdP with the following ACS URL:
 
 ```
@@ -1090,7 +1177,16 @@ YASHIGANI_IDP_2_DISCOVERY_URL=https://login.microsoftonline.com/<tenant>/federat
 YASHIGANI_IDP_2_EMAIL_DOMAINS=example.com
 ```
 
-**Step 3.** Configure SAML SP certificates via KMS or Docker secrets. The SP certificate and private key must be available for assertion signing.
+**Step 3.** Activate the SAML SP key by uncommenting in `docker/.env`:
+
+```bash
+YASHIGANI_SAML_SP_PRIVATE_KEY_FILE=/run/secrets/saml_sp.key
+YASHIGANI_SAML_SP_CERT_FILE=/run/secrets/saml_sp.crt
+```
+
+These paths point to the key and certificate that `install.sh` generated in
+`docker/secrets/`. If you are using a custom key, place the PEM files in
+`docker/secrets/` (private key at `0400` permissions) and update the paths.
 
 **Step 4.** Test by navigating to your IdP's SSO URL — the SAML assertion will POST to the ACS endpoint.
 
@@ -3017,4 +3113,4 @@ Recovery steps:
 
 ---
 
-*Yashigani v2.23.3 — Installation and Configuration Guide — 2026-05-08T00:00:00+01:00*
+*Yashigani v2.23.4 — Installation and Configuration Guide — 2026-05-15T14:00:00+00:00*

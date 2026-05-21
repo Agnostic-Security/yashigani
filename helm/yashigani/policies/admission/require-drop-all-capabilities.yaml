@@ -1,4 +1,4 @@
-# ACS-RISK-008 — Container hardening: require capabilities.drop: [ALL]
+# YSG-RISK-008 — Container hardening: require capabilities.drop: [ALL]
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # Rejects pods where any container does not drop ALL Linux capabilities.
@@ -22,7 +22,7 @@ metadata:
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
       All containers in the yashigani namespace must set
-      capabilities.drop containing ALL. Implements ACS-RISK-008.
+      capabilities.drop containing ALL. Implements YSG-RISK-008.
 spec:
   validationFailureAction: Enforce
   background: true
@@ -37,7 +37,7 @@ spec:
                 - yashigani
       validate:
         message: >-
-          ACS-RISK-008: Container '{{ element.name }}' in pod
+          YSG-RISK-008: Container '{{ element.name }}' in pod
           '{{ request.object.metadata.name }}' must set
           securityContext.capabilities.drop containing ALL.
         foreach:
@@ -58,7 +58,7 @@ spec:
                 - yashigani
       validate:
         message: >-
-          ACS-RISK-008: Init container '{{ element.name }}' in pod
+          YSG-RISK-008: Init container '{{ element.name }}' in pod
           '{{ request.object.metadata.name }}' must set
           securityContext.capabilities.drop containing ALL.
         foreach:

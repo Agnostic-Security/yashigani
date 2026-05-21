@@ -1,3 +1,4 @@
+/* last-updated: 2026-05-13T00:00:00+01:00 — v2.23.4 CSP-INLINE-STYLE-SPA */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f1f5f9; }
 nav { background: #0f172a; color: #fff; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
@@ -23,6 +24,8 @@ h2 { font-size: 1.25rem; font-weight: 600; color: #1e293b; margin-bottom: 16px; 
 .badge-yellow { background: #fefce8; color: #a16207; }
 .badge-blue { background: #dbeafe; color: #1d4ed8; }
 .badge-purple { background: #f3e8ff; color: #7c3aed; }
+.badge-p4 { background: #f1f5f9; color: #475569; }
+.badge-p5 { background: #f8fafc; color: #94a3b8; }
 table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 th { text-align: left; padding: 10px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
 td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; color: #334155; }
@@ -38,3 +41,189 @@ tr:hover { background: #f8fafc; }
 .progress-bar .fill.green { background:#22c55e; }
 .progress-bar .fill.amber { background:#f59e0b; }
 .progress-bar .fill.red { background:#ef4444; }
+
+/* ── Layout helpers ─────────────────────────────────────────── */
+/* nav brand row */
+.nav-brand { display: flex; align-items: center; gap: 24px; }
+/* panel-header with action button */
+.panel-header-flex { display: flex; justify-content: space-between; align-items: center; }
+/* collapsible inline-form panels */
+.form-panel { display: none; padding: 12px 16px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }
+/* flex form row */
+.form-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+.form-row--no-wrap { display: flex; gap: 8px; align-items: flex-end; }
+.form-row--mt { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-top: 8px; }
+.form-row--gap12 { display: flex; gap: 8px; margin-top: 8px; }
+.form-row--col { display: flex; flex-direction: column; gap: 12px; max-width: 600px; }
+.form-row--col-sm { display: flex; flex-direction: column; gap: 8px; }
+.form-result { margin-top: 6px; font-size: 0.8rem; }
+
+/* ── Labels ────────────────────────────────────────────────── */
+.lbl { font-size: 0.75rem; color: #64748b; }
+.lbl-block { font-size: 0.75rem; color: #64748b; display: block; margin-bottom: 4px; }
+.lbl-block-sm { font-size: 0.75rem; color: #64748b; display: block; margin-bottom: 3px; }
+
+/* ── Form inputs / selects ──────────────────────────────────── */
+.fi { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; }
+.fi-sm { padding: 4px 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.8rem; }
+.fi-url { padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 100%; }
+.fi-hibp { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 340px; max-width: 100%; }
+/* width variants */
+.w-120 { width: 120px; }
+.w-140 { width: 140px; }
+.w-150 { width: 150px; }
+.w-160 { width: 160px; }
+.w-180 { width: 180px; }
+.w-200 { width: 200px; }
+.w-220 { width: 220px; }
+.w-250 { width: 250px; }
+.w-280 { width: 280px; }
+
+/* ── Buttons ────────────────────────────────────────────────── */
+/* base action button */
+.btn { border: none; border-radius: 4px; cursor: pointer; }
+/* xs add button (+ Register / + Add) */
+.btn-xs-add { padding: 4px 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* sm save/create (green) */
+.btn-sm-save { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* sm primary (blue) */
+.btn-sm-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* sm secondary (slate) */
+.btn-sm-secondary { padding: 6px 16px; background: #64748b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* sm danger (red) */
+.btn-sm-danger { padding: 6px 16px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* sm amber (test/warning) */
+.btn-sm-amber { padding: 8px 16px; background: #f59e0b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* md primary (save config) */
+.btn-md-primary { padding: 8px 20px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* sm primary-xs for idp/crypto (0.8rem) */
+.btn-xs-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* crypto export button */
+.btn-export { margin-top: 12px; padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* dismiss (outline-blue) */
+.btn-dismiss-outline { margin-top: 10px; padding: 4px 12px; background: transparent; border: 1px solid #93c5fd; border-radius: 4px; cursor: pointer; font-size: 0.8rem; color: #3b82f6; }
+/* dismiss secondary */
+.btn-dismiss { margin-top: 8px; padding: 6px 16px; background: #64748b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* pki close button */
+.btn-pki-close { margin-top: 12px; padding: 6px 16px; background: #f1f5f9; color: #334155; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; }
+/* backup verify button */
+.btn-verify { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* HIBP save */
+.btn-hibp-save { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* HIBP clear */
+.btn-hibp-clear { padding: 6px 16px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* HIBP test */
+.btn-hibp-test { padding: 6px 16px; background: #64748b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+/* stepup submit */
+.btn-stepup-submit { flex: 1; padding: 10px; background: #2563eb; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
+/* stepup cancel */
+.btn-stepup-cancel { flex: 1; padding: 10px; background: #f1f5f9; color: #334155; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+/* allowlist add (green) */
+.btn-allowlist-add { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+
+/* ── Onboarding checklist ───────────────────────────────────── */
+.onboarding { display: none; margin-bottom: 20px; padding: 16px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; }
+.onboarding-title { margin: 0 0 12px; font-size: 1rem; color: #1e40af; }
+.onboarding-items { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; }
+.onboarding-lbl { color: #64748b; }
+
+/* ── Credentials / token panels ────────────────────────────── */
+/* hidden until shown once */
+.once-panel { display: none; margin-top: 16px; }
+/* panel-header variants */
+.panel-header-warn { padding: 12px 16px; font-weight: 600; font-size: 0.9rem; background: #fefce8; color: #a16207; border-bottom: 1px solid #f1f5f9; }
+.panel-header-success { padding: 12px 16px; font-weight: 600; font-size: 0.9rem; background: #f0fdf4; color: #166534; border-bottom: 1px solid #f1f5f9; }
+/* credential lines */
+.cred-line { font-size: 0.85rem; margin-bottom: 8px; }
+.cred-line-sm { font-size: 0.75rem; color: #64748b; margin-top: 8px; }
+.cred-line-note { font-size: 0.75rem; color: #64748b; margin-top: 12px; }
+/* copyable code span */
+.cred-code { user-select: all; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }
+.cred-code-uri { user-select: all; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 0.7rem; word-break: break-all; }
+/* agent token value */
+.agent-token-val { user-select: all; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; word-break: break-all; }
+/* HIBP code inline */
+.code-hibp-key { font-size: 0.75rem; background: #f1f5f9; padding: 1px 4px; border-radius: 3px; }
+
+/* ── Section h2 margin variant ──────────────────────────────── */
+.h2-mt { font-size: 1.25rem; font-weight: 600; color: #1e293b; margin-bottom: 16px; margin-top: 24px; }
+
+/* ── Monitoring cards ───────────────────────────────────────── */
+.card-clickable { cursor: pointer; }
+.card-value-lg { font-size: 1.2rem; font-weight: 700; color: #1e293b; }
+.card-desc { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+
+/* ── Text helpers ───────────────────────────────────────────── */
+.txt-sm { font-size: 0.85rem; }
+.txt-xs { font-size: 0.8rem; }
+.txt-xxs { font-size: 0.75rem; color: #94a3b8; }
+.txt-muted { font-size: 0.8rem; color: #64748b; }
+.txt-muted-sm { font-size: 0.75rem; color: #64748b; }
+.txt-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; }
+.txt-note-sm { font-size: 0.75rem; color: #94a3b8; margin-bottom: 8px; }
+.txt-body { font-size: 0.85rem; color: #334155; margin-bottom: 12px; }
+.txt-body-mb8 { font-size: 0.85rem; color: #334155; margin-bottom: 8px; }
+.txt-info { font-size: 0.8rem; color: #64748b; }
+.txt-version { font-size: 0.85rem; color: #64748b; }
+.txt-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+.txt-mt8 { margin-top: 8px; }
+.txt-mt16 { margin-top: 16px; }
+/* panel body prose: PKI CA mode */
+.panel-body-prose { font-size: 0.82rem; color: #334155; }
+.panel-body-prose p + p { margin-top: 8px; }
+
+/* ── PKI page ───────────────────────────────────────────────── */
+.pki-status-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; }
+.pki-rotate-result { font-size: 0.85rem; min-height: 1.2em; margin-bottom: 8px; display: none; }
+.pki-chain-detail { display: none; }
+.pki-chain-table { font-size: 0.82rem; width: 100%; border-collapse: collapse; }
+
+/* ── Backup page ────────────────────────────────────────────── */
+.backup-actions { margin-top: 12px; }
+.backup-verify-result { margin-top: 10px; font-size: 0.85rem; display: none; }
+
+/* ── Audit pagination ───────────────────────────────────────── */
+.audit-pagination { padding: 8px 16px; font-size: 0.8rem; }
+/* inline result divs below audit search */
+.audit-result { font-size: 0.8rem; min-height: 1.2em; margin-bottom: 4px; }
+
+/* ── Settings page ──────────────────────────────────────────── */
+.settings-services-result { margin-top: 6px; font-size: 0.8rem; }
+.settings-h3 { font-size: 0.9rem; font-weight: 600; margin-bottom: 8px; }
+.settings-h3-mt { font-size: 0.9rem; font-weight: 600; margin-bottom: 8px; margin-top: 16px; }
+.ip-list-display { font-size: 0.85rem; color: #64748b; margin-bottom: 8px; }
+.ip-access-result { margin-top: 6px; font-size: 0.8rem; }
+.ip-allowlist-row { display: flex; gap: 8px; align-items: flex-end; margin-top: 8px; }
+/* IdP section */
+.idp-config-box { font-size: 0.8rem; color: #64748b; background: #f8fafc; padding: 12px; border-radius: 6px; }
+.idp-cards-mb { margin-bottom: 12px; }
+.idp-grid { display: grid; grid-template-columns: 140px 1fr; gap: 6px; margin-top: 8px; }
+.idp-result { margin-left: 8px; font-size: 0.8rem; }
+.idp-section-mt { margin-top: 16px; }
+
+/* ── HIBP section ───────────────────────────────────────────── */
+.hibp-description { font-size: 0.8rem; color: #64748b; margin-bottom: 12px; }
+.hibp-status-container { margin-bottom: 14px; }
+.hibp-input-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
+.hibp-key-result { font-size: 0.8rem; min-height: 1.2em; margin-bottom: 4px; }
+.hibp-probe-result { font-size: 0.8rem; min-height: 1.2em; color: #334155; }
+.hibp-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+
+/* ── Classify textarea ──────────────────────────────────────── */
+.classify-textarea { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; resize: vertical; }
+.classify-result { margin-top: 8px; font-size: 0.85rem; }
+.classify-btn { margin-top: 8px; padding: 8px 16px; background: #2563eb; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+
+/* ── Alerts page ─────────────────────────────────────────────── */
+.alert-config-result { font-size: 0.8rem; margin-top: 4px; }
+.alert-trigger-lbl { font-size: 0.85rem; }
+
+/* ── Step-up TOTP modal ──────────────────────────────────────── */
+.stepup-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 9999; align-items: center; justify-content: center; }
+.stepup-dialog { background: #fff; border-radius: 8px; padding: 32px; width: 320px; max-width: 90vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+.stepup-title { margin: 0 0 8px; font-size: 1.1rem; color: #1e293b; }
+.stepup-desc { font-size: 0.85rem; color: #475569; margin: 0 0 20px; }
+.stepup-lbl { font-size: 0.8rem; font-weight: 600; color: #334155; display: block; margin-bottom: 6px; }
+.stepup-input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1.5px solid #cbd5e1; border-radius: 6px; font-size: 1.1rem; letter-spacing: 0.15em; text-align: center; outline: none; margin-bottom: 8px; }
+.stepup-error { color: #dc2626; font-size: 0.8rem; min-height: 1.2em; margin: 0 0 16px; }
+.stepup-buttons { display: flex; gap: 10px; }

@@ -1,0 +1,386 @@
+# Last updated: 2026-05-16T00:00:00+00:00 (v2.23.4: YSG-RISK-026 close)
+name: Caddyfile Family Parity
+
+# YSG-RISK-026: Caddyfile family drift CI gate.
+#
+# Historical incidents this gate would have caught:
+#   e0d3869 — LAURA-V231-007: inject-caddy-verified missing from Caddyfile.ca
+#              (caught by Step 3 — static parity test, inject-caddy-verified coverage)
+#   63c5351 — LAURA-V231-008: client_auth misplaced inside handle{} block
+#              (caught by Step 3 — static parity test, client_auth placement check)
+#   bc9cd0d — TLS 1.3 directive missing on one Caddyfile variant
+#              (caught by Step 3 — static parity test, TLS 1.3 minimum check)
+#   cfa72f3 — inject-caddy-verified missing on residual reverse_proxy blocks
+#              (caught by Step 1 — caddy adapt, Step 3 — inject-caddy-verified coverage)
+#   service_identities drift between docker/ and helm/files/
+#              (caught by Step 4 — diff gate / symlink validation)
+#   1a6db9f — YASHIGANI_DB_DSN_DIRECT stripped from gateway.yaml
+#              (caught by Step 5 — helm env-parity, now promoted from ci.yml)
+
+on:
+  push:
+    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    paths:
+      - "docker/Caddyfile.*"
+      - "helm/yashigani/templates/configmaps.yaml"
+      - "docker/service_identities.yaml"
+      - "helm/yashigani/files/service_identities.yaml"
+      - "helm/yashigani/templates/gateway.yaml"
+      - "helm/yashigani/templates/backoffice.yaml"
+      - "tests/contracts/test_caddyfile_family.py"
+      - "tests/contracts/test_helm_env_parity.py"
+      - ".github/workflows/caddy-family-parity.yml"
+  pull_request:
+    branches: [main, "release/**", "v2.23.*", "2.23.x"]
+    paths:
+      - "docker/Caddyfile.*"
+      - "helm/yashigani/templates/configmaps.yaml"
+      - "docker/service_identities.yaml"
+      - "helm/yashigani/files/service_identities.yaml"
+      - "helm/yashigani/templates/gateway.yaml"
+      - "helm/yashigani/templates/backoffice.yaml"
+      - "tests/contracts/test_caddyfile_family.py"
+      - "tests/contracts/test_helm_env_parity.py"
+      - ".github/workflows/caddy-family-parity.yml"
+  # Allow manual trigger for release-gate verification
+  workflow_dispatch:
+
+concurrency:
+  group: caddy-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Step 1 + Step 2: caddy adapt — compose variants + helm Caddyfile
+  # ─────────────────────────────────────────────────────────────────────────────
+  caddy-adapt:
+    name: caddy adapt (compose + helm)
+    runs-on: ubuntu-latest
+    # Pinned to the project caddy version: docker.io/library/caddy:2.11.2-alpine
+    # Same digest as docker/docker-compose.yml line 92.
+    container:
+      image: caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Helper: check caddy adapt output for non-trivial warnings.
+      # caddy adapt emits one known-benign formatting advisory:
+      #   "Caddyfile input is not formatted; run 'caddy fmt --overwrite'"
+      # This fires whenever the file is not the output of `caddy fmt` —
+      # it is cosmetic (no config change) and fires on our comment-rich files.
+      # We filter it out and fail only on genuine configuration warnings
+      # (e.g. "unrecognized directive", "deprecated option", etc.).
+      #
+      # check_adapt_warnings <name> <output>
+      #   name  — Caddyfile variant name for error messages
+      #   output — captured caddy adapt stdout+stderr
+
+      # Step 1a: adapt compose Caddyfile.selfsigned
+      - name: caddy adapt — Caddyfile.selfsigned
+        run: |
+          set -euo pipefail
+          # Expand {$VAR} placeholders so caddy adapt sees literals
+          sed \
+            -e 's|{$YASHIGANI_TLS_DOMAIN}|localhost|g' \
+            -e 's|{$CADDY_INTERNAL_HMAC}|deadbeefdeadbeefdeadbeefdeadbeefdeadbeef|g' \
+            docker/Caddyfile.selfsigned > /tmp/Caddyfile.selfsigned.expanded
+          output=$(caddy adapt --config /tmp/Caddyfile.selfsigned.expanded 2>&1) || {
+            echo "FAIL: caddy adapt exited non-zero for Caddyfile.selfsigned"
+            echo "$output"
+            exit 1
+          }
+          # Filter the known-benign "not formatted" advisory before the warn check.
+          # That advisory fires on any file not output by `caddy fmt`; it is
+          # cosmetic and does not indicate a config or security issue.
+          real_warns=$(echo "$output" | grep -i 'warn' | grep -v 'is not formatted' || true)
+          if [ -n "$real_warns" ]; then
+            echo "FAIL: caddy adapt produced warnings for Caddyfile.selfsigned:"
+            echo "$real_warns"
+            exit 1
+          fi
+          echo "OK: Caddyfile.selfsigned adapts cleanly (no config warnings)"
+
+      # Step 1b: adapt compose Caddyfile.acme
+      - name: caddy adapt — Caddyfile.acme
+        run: |
+          set -euo pipefail
+          sed \
+            -e 's|{$YASHIGANI_TLS_DOMAIN}|localhost|g' \
+            -e 's|{$CADDY_INTERNAL_HMAC}|deadbeefdeadbeefdeadbeefdeadbeefdeadbeef|g' \
+            -e 's|{$PROMETHEUS_BASICAUTH_USER}|prometheus|g' \
+            -e 's|{$PROMETHEUS_BASICAUTH_HASH}|\$2a\$14\$placeholder|g' \
+            docker/Caddyfile.acme > /tmp/Caddyfile.acme.expanded
+          output=$(caddy adapt --config /tmp/Caddyfile.acme.expanded 2>&1) || {
+            echo "FAIL: caddy adapt exited non-zero for Caddyfile.acme"
+            echo "$output"
+            exit 1
+          }
+          real_warns=$(echo "$output" | grep -i 'warn' | grep -v 'is not formatted' || true)
+          if [ -n "$real_warns" ]; then
+            echo "FAIL: caddy adapt produced warnings for Caddyfile.acme:"
+            echo "$real_warns"
+            exit 1
+          fi
+          echo "OK: Caddyfile.acme adapts cleanly (no config warnings)"
+
+      # Step 1c: adapt compose Caddyfile.ca
+      # The ca variant references cert files by path; create placeholder files
+      # so caddy adapt can validate structure without real PKI material.
+      - name: caddy adapt — Caddyfile.ca
+        run: |
+          set -euo pipefail
+          # Create the mount path caddy adapt expects for ca-mode cert files
+          mkdir -p /run/secrets
+          printf 'placeholder\n' > /run/secrets/caddy_client.crt
+          printf 'placeholder\n' > /run/secrets/caddy_client.key
+          printf 'placeholder\n' > /run/secrets/ca_intermediate.crt
+          printf 'placeholder\n' > /run/secrets/ca_bundle.crt
+          # caddy adapt reads paths at parse time for `tls` directives
+          sed \
+            -e 's|{$YASHIGANI_TLS_DOMAIN}|localhost|g' \
+            -e 's|{$CADDY_INTERNAL_HMAC}|deadbeefdeadbeefdeadbeefdeadbeefdeadbeef|g' \
+            docker/Caddyfile.ca > /tmp/Caddyfile.ca.expanded
+          output=$(caddy adapt --config /tmp/Caddyfile.ca.expanded 2>&1) || {
+            echo "FAIL: caddy adapt exited non-zero for Caddyfile.ca"
+            echo "$output"
+            exit 1
+          }
+          real_warns=$(echo "$output" | grep -i 'warn' | grep -v 'is not formatted' || true)
+          if [ -n "$real_warns" ]; then
+            echo "FAIL: caddy adapt produced warnings for Caddyfile.ca:"
+            echo "$real_warns"
+            exit 1
+          fi
+          echo "OK: Caddyfile.ca adapts cleanly (no config warnings)"
+
+      # Step 2 is a separate job (helm-caddy-adapt) below.
+      # Reason: extracting the Helm Caddyfile requires `helm template` to fully
+      # render Helm conditionals ({{- if .Values.caddy.internalMetricsListener.enabled }})
+      # before adapting. helm is not in the caddy:alpine image; the separate job
+      # installs both helm and caddy on ubuntu-latest and runs the full pipeline.
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Step 2: caddy adapt — Helm rendered Caddyfile (separate job, ubuntu-latest)
+  # ─────────────────────────────────────────────────────────────────────────────
+  helm-caddy-adapt:
+    name: caddy adapt (Helm rendered Caddyfile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install helm
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: "v3.14.0"
+
+      - name: Install caddy (same version as project pin)
+        # Download the caddy 2.11.2 linux/amd64 binary from GitHub releases.
+        # We use the binary for syntax/semantic validation (caddy adapt is
+        # version-agnostic at 2.11.x). The alpine image digest used in compose/k8s
+        # is a separate artefact; the adapt parser is identical across platforms.
+        # SHA-256 of caddy_2.11.2_linux_amd64.tar.gz verified against GitHub release.
+        env:
+          CADDY_VERSION: "2.11.2"
+          # sha256sum of caddy_2.11.2_linux_amd64.tar.gz — computed from
+          # https://github.com/caddyserver/caddy/releases/download/v2.11.2/
+          CADDY_SHA256: "94391dfefe1f278ac8f387ab86162f0e88d87ff97df367f360e51e3cda3df56f"
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+            -o caddy.tar.gz
+          echo "${CADDY_SHA256}  caddy.tar.gz" | sha256sum -c -
+          tar -xzf caddy.tar.gz caddy
+          chmod +x caddy
+          sudo mv caddy /usr/local/bin/caddy
+          caddy version
+
+      - name: helm template + extract Caddyfile + caddy adapt
+        run: |
+          set -euo pipefail
+          # Render the Helm chart with default values (caddy.enabled=true,
+          # mtls.enabled=true, caddy.internalMetricsListener.enabled=true).
+          # This produces a fully-rendered YAML that includes the Caddyfile ConfigMap.
+          # Note: helm emits informational symlink warnings on stderr (from the
+          # helm/yashigani/files/service_identities.yaml → docker/ symlink).
+          # Capture stderr separately so we can distinguish symlink advisory from
+          # real helm errors.
+          helm template yashigani helm/yashigani \
+            --namespace yashigani-validate \
+            --set caddy.enabled=true \
+            --set mtls.enabled=true \
+            --set "caddy.internalMetricsListener.enabled=true" \
+            --set "caddy.internalMetricsListenerBackoffice.enabled=true" \
+            > /tmp/helm-rendered.yaml \
+            2> /tmp/helm-stderr.txt || {
+              echo "FAIL: helm template failed"
+              echo "--- stderr ---"
+              cat /tmp/helm-stderr.txt
+              exit 1
+            }
+          # Warn if helm emitted any unexpected stderr beyond the known symlink advisory
+          unexpected_stderr=$(grep -v 'symbolic link' /tmp/helm-stderr.txt || true)
+          if [ -n "$unexpected_stderr" ]; then
+            echo "WARNING: helm template produced unexpected stderr:"
+            echo "$unexpected_stderr"
+          fi
+
+          # Extract the Caddyfile value from the yashigani-caddy-config ConfigMap.
+          # The configmap data key is "Caddyfile"; we use Python to parse the YAML
+          # docs and find the right one (no yq dependency required).
+          python3 - << 'PYEOF'
+          import yaml, sys, pathlib
+
+          rendered = pathlib.Path("/tmp/helm-rendered.yaml").read_text()
+          caddyfile_text = None
+          for doc in yaml.safe_load_all(rendered):
+              if doc and doc.get("kind") == "ConfigMap":
+                  name = doc.get("metadata", {}).get("name", "")
+                  if "caddy-config" in name:
+                      data = doc.get("data", {})
+                      if "Caddyfile" in data:
+                          caddyfile_text = data["Caddyfile"]
+                          break
+          if caddyfile_text is None:
+              print("FAIL: could not find Caddyfile key in yashigani-caddy-config ConfigMap")
+              sys.exit(1)
+          # Substitute {$VAR} placeholders so caddy adapt parses clean
+          import re
+          stubs = {
+              "YASHIGANI_TLS_DOMAIN": "localhost",
+              "CADDY_INTERNAL_HMAC": "deadbeef" * 8,
+          }
+          def replace_var(m):
+              return stubs.get(m.group(1), m.group(0))
+          expanded = re.sub(r"\{\$([A-Z0-9_]+)\}", replace_var, caddyfile_text)
+          pathlib.Path("/tmp/helm-Caddyfile").write_text(expanded)
+          print(f"Extracted Caddyfile ({len(expanded)} chars, {expanded.count(chr(10))} lines)")
+          PYEOF
+
+          # Create placeholder secret files for path-referencing directives
+          sudo mkdir -p /run/secrets
+          printf 'placeholder\n' | sudo tee /run/secrets/caddy_client.crt > /dev/null
+          printf 'placeholder\n' | sudo tee /run/secrets/caddy_client.key > /dev/null
+          printf 'placeholder\n' | sudo tee /run/secrets/ca_bundle.crt > /dev/null
+
+          # caddy adapt — assert exit 0 + no config warnings
+          output=$(caddy adapt --config /tmp/helm-Caddyfile 2>&1) || {
+            echo "FAIL: caddy adapt exited non-zero for Helm Caddyfile"
+            echo "--- Caddyfile (first 60 lines) ---"
+            head -60 /tmp/helm-Caddyfile
+            echo "--- caddy adapt output ---"
+            echo "$output"
+            exit 1
+          }
+          real_warns=$(echo "$output" | grep -i 'warn' | grep -v 'is not formatted' || true)
+          if [ -n "$real_warns" ]; then
+            echo "FAIL: caddy adapt produced config warnings for Helm Caddyfile:"
+            echo "$real_warns"
+            exit 1
+          fi
+          echo "OK: Helm Caddyfile adapts cleanly (no config warnings)"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Step 3: per-listener security directive parity (compose-side only)
+  # ─────────────────────────────────────────────────────────────────────────────
+  caddyfile-static-parity:
+    name: Caddyfile static parity (regex contract tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install "pytest>=8"
+
+      - name: Caddyfile family contract tests (inject-caddy-verified + TLS1.3 + GCM ciphers + client_auth placement)
+        # YSG-RISK-026 Step 3: per-listener directive parity across all 3 compose variants.
+        # Catches: e0d3869 (inject-caddy-verified missing in .ca), 63c5351 (client_auth inside handle),
+        # bc9cd0d (TLS 1.3 missing on one variant), cfa72f3 (inject-caddy-verified on residual blocks).
+        # The caddy-adapt job (Step 1) does not run here — it's in the caddy-adapt job above.
+        # CADDY_BIN is unset so the adapt sub-tests are skipped (that check is in caddy-adapt job).
+        run: python3 -m pytest tests/contracts/test_caddyfile_family.py -v --tb=short
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Step 4: service_identities.yaml dedup (symlink integrity)
+  # ─────────────────────────────────────────────────────────────────────────────
+  service-identities-parity:
+    name: service_identities.yaml parity (symlink + SHA gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install "pytest>=8"
+
+      - name: service_identities.yaml SHA parity (pytest)
+        # YSG-RISK-026 Step 4: canonical docker/ copy and helm/files/ copy must
+        # be byte-identical. The helm/files/ entry is a symlink to docker/; the
+        # sha256 test validates the symlink resolves to the correct content.
+        run: python3 -m pytest tests/contracts/test_service_identities_sha.py -v
+
+      - name: service_identities.yaml symlink health (shell gate)
+        # Independent shell check: verify helm/yashigani/files/service_identities.yaml
+        # is a symlink AND resolves to the canonical docker/ source.
+        # A broken symlink (dangling reference after docker/ rename) would pass
+        # the diff check but break `helm template`. Catch it explicitly.
+        run: |
+          set -euo pipefail
+          HELM_COPY="helm/yashigani/files/service_identities.yaml"
+          CANONICAL="docker/service_identities.yaml"
+
+          if [ -L "$HELM_COPY" ]; then
+            # Symlink path: verify it resolves and content matches
+            resolved=$(readlink -f "$HELM_COPY")
+            canonical_abs=$(readlink -f "$CANONICAL")
+            if [ "$resolved" != "$canonical_abs" ]; then
+              echo "FAIL: symlink $HELM_COPY resolves to $resolved, expected $canonical_abs"
+              exit 1
+            fi
+            echo "OK: $HELM_COPY is a symlink → $canonical_abs"
+          else
+            # Regular file path (fallback if symlink not used): diff must be empty
+            if ! diff -q "$CANONICAL" "$HELM_COPY" > /dev/null 2>&1; then
+              echo "FAIL: $HELM_COPY has diverged from $CANONICAL"
+              diff "$CANONICAL" "$HELM_COPY" || true
+              exit 1
+            fi
+            echo "OK: $HELM_COPY is a regular file and matches $CANONICAL"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Step 5: Helm env-block parity (gateway + backoffice)
+  # ─────────────────────────────────────────────────────────────────────────────
+  helm-env-parity:
+    name: Helm env-block parity (gateway + backoffice)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install "pytest>=8"
+
+      - name: Helm env-block parity (YASHIGANI_DB_DSN_DIRECT + all shared env vars)
+        # YSG-RISK-026 Step 5 (Lu add-on): verifies YASHIGANI_DB_DSN_DIRECT,
+        # YASHIGANI_DB_DSN, CADDY_INTERNAL_HMAC, OTEL_EXPORTER_OTLP_CERTIFICATE,
+        # and YASHIGANI_SECRETS_DIR are present with correct values in BOTH
+        # gateway.yaml and backoffice.yaml.
+        # Catches the BUG-GATEWAY-DSN-DIRECT-MISSING class (1a6db9f regression).
+        run: python3 -m pytest tests/contracts/test_helm_env_parity.py -v --tb=short

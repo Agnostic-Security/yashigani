@@ -100,6 +100,37 @@ def test_bootstrap_populates_manifest_hashes(paths: IssuerPaths):
     assert len(gw.bootstrap_token_sha256) == 64  # SHA-256 hex
 
 
+def test_rotate_leaves_updates_manifest_hashes(paths: IssuerPaths):
+    """Regression: rotate_leaves() must update bootstrap_token_sha256 in the manifest.
+
+    Before the fix, rotate_leaves() called _ensure_bootstrap_token() but discarded
+    the hash and never called _update_manifest_hashes(), leaving stale hashes in the
+    manifest that no longer matched on-disk tokens → TamperError at gateway startup
+    (compose-path SHA mismatch, v2.23.4 Track B bug).
+    """
+    bootstrap(paths)
+    # Capture the hashes written by bootstrap
+    before = load_manifest(str(paths.manifest_path))
+    gw_hash_before = before.get("gateway").bootstrap_token_sha256
+
+    # Rotate leaves — this should re-generate bootstrap tokens and update the manifest
+    rotate_leaves(paths)
+    after = load_manifest(str(paths.manifest_path))
+    gw_hash_after = after.get("gateway").bootstrap_token_sha256
+
+    # Hash is still present (non-empty, SHA-256 length)
+    assert gw_hash_after
+    assert len(gw_hash_after) == 64
+    # The on-disk token must match the manifest hash after rotation
+    tok = paths.bootstrap_token("gateway")
+    import hashlib
+    actual = hashlib.sha256(tok.read_bytes().strip()).hexdigest()
+    assert actual == gw_hash_after, (
+        f"rotate_leaves left manifest hash {gw_hash_after!r} but "
+        f"on-disk token hashes to {actual!r}"
+    )
+
+
 def test_bootstrap_refuses_overwrite(paths: IssuerPaths):
     bootstrap(paths)
     with pytest.raises(RuntimeError, match="already exists"):

@@ -1,4 +1,4 @@
-# ACS-RISK-008 — Container hardening: require seccomp RuntimeDefault or Localhost
+# YSG-RISK-008 — Container hardening: require seccomp RuntimeDefault or Localhost
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # Rejects pods where seccompProfile is missing at both pod AND container level.
@@ -20,7 +20,7 @@ metadata:
     policies.kyverno.io/description: >-
       Pods in the yashigani namespace must specify seccompProfile.type of
       RuntimeDefault or Localhost at the pod level (or per-container).
-      Implements ACS-RISK-008.
+      Implements YSG-RISK-008.
 spec:
   validationFailureAction: Enforce
   background: true
@@ -35,7 +35,7 @@ spec:
                 - yashigani
       validate:
         message: >-
-          ACS-RISK-008: Pod '{{ request.object.metadata.name }}' must set
+          YSG-RISK-008: Pod '{{ request.object.metadata.name }}' must set
           seccompProfile.type to RuntimeDefault or Localhost at the pod level
           (spec.securityContext.seccompProfile). Unconfined seccomp is not
           permitted in the yashigani namespace.

@@ -1,4 +1,4 @@
-# ACS-RISK-008 admission test — NON-COMPLIANT pod fixture (root user)
+# YSG-RISK-008 admission test — NON-COMPLIANT pod fixture (root user)
 # Last updated: 2026-05-02T00:00:00+01:00
 #
 # This pod deliberately sets runAsUser: 0. It MUST be REJECTED by Kyverno
@@ -7,7 +7,7 @@
 #
 # Expected result:
 #   Error from server: admission webhook "validate.kyverno.svc" denied the request:
-#   [...] ACS-RISK-008: Pod 'yashigani-test-noncompliant-root' sets runAsUser: 0
+#   [...] YSG-RISK-008: Pod 'yashigani-test-noncompliant-root' sets runAsUser: 0
 #
 # Usage:
 #   kubectl apply -f tests/admission/fixture-noncompliant-root.yaml

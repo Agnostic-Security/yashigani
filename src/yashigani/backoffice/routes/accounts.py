@@ -110,7 +110,7 @@ async def create_admin(body: CreateAdminRequest, session: AdminSession):
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned
 
-    state.audit_writer.write(_config_event(session.account_id, "admin_account_created", "", body.username))
+    state.audit_writer.write(_config_event(session.account_id, "admin_account_created", "", body.username, account_tier=session.account_tier))
     # BOPLA allowlist (#90): AdminCreateResponse is the ONLY response type
     # permitted to include totp_secret/temporary_password. This is an explicit
     # one-time-delivery exception documented in bopla-allowlist.md.
@@ -145,7 +145,7 @@ async def delete_admin(username: str, session: StepUpAdminSession):
         )
 
     await state.auth_service.delete_account(username)
-    state.audit_writer.write(_config_event(session.account_id, "admin_account_deleted", username, ""))
+    state.audit_writer.write(_config_event(session.account_id, "admin_account_deleted", username, "", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -176,7 +176,7 @@ async def disable_admin(username: str, session: StepUpAdminSession):
     state.session_store.invalidate_all_for_account(record.account_id)
     # LF-DISABLE-PARTIAL: suspend identity-registry entries for this admin.
     _suspend_identity_registry_for_account(record.account_id)
-    state.audit_writer.write(_config_event(session.account_id, "admin_account_disabled", username, "disabled"))
+    state.audit_writer.write(_config_event(session.account_id, "admin_account_disabled", username, "disabled", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -208,7 +208,7 @@ async def enable_admin(username: str, session: AdminSession):
 
     if not await state.auth_service.enable(username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
-    state.audit_writer.write(_config_event(session.account_id, "admin_account_enabled", username, "enabled"))
+    state.audit_writer.write(_config_event(session.account_id, "admin_account_enabled", username, "enabled", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -230,7 +230,7 @@ async def force_reset(username: str, body: ForceResetRequest, session: StepUpAdm
         await state.auth_service.force_totp_reprovision(username)
         state.session_store.invalidate_all_for_account(record.account_id)
 
-    state.audit_writer.write(_config_event(session.account_id, f"admin_{body.action}", username, "forced"))
+    state.audit_writer.write(_config_event(session.account_id, f"admin_{body.action}", username, "forced", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -270,11 +270,12 @@ def _suspend_identity_registry_for_account(account_id: str) -> None:
         )
 
 
-def _config_event(admin_id: str, setting: str, prev: str, new: str):
+def _config_event(admin_id: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    # account_tier derived from session at call site — defence-in-depth: RBAC bypass visible in audit.
     from yashigani.audit.schema import ConfigChangedEvent
 
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_id,
         setting=setting,
         previous_value=prev,

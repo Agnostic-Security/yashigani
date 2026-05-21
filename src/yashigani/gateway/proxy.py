@@ -15,11 +15,14 @@ All inbound requests are:
 
 Responses from MCP servers are forwarded back as-is.
 Audit events are written for every request regardless of disposition.
+
+Last updated: 2026-05-17T00:00:00+01:00
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import logging
 import math
@@ -31,13 +34,48 @@ from dataclasses import dataclass
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from yashigani.auth.spiffe import require_spiffe_id
 from yashigani.pki.client import internal_httpx_client
+from yashigani.audit.schema import PIIDetectedEvent
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Internal service-mesh Bearer token
+#
+# YASHIGANI_INTERNAL_BEARER is a per-install-rotated secret that grants
+# service-to-service identity (Open WebUI, in-mesh agents). It MUST be set
+# by the installer (docker/secrets/yashigani_internal_bearer).  A missing or
+# empty value fails closed at import time so a misconfigured deployment
+# surfaces immediately rather than silently accepting any Bearer value.
+#
+# Use hmac.compare_digest() at every comparison site to avoid timing leaks.
+# ---------------------------------------------------------------------------
+
+def _load_internal_bearer() -> str:
+    """Read YASHIGANI_INTERNAL_BEARER from env; raise RuntimeError if absent."""
+    _val = os.environ.get("YASHIGANI_INTERNAL_BEARER", "")
+    if not _val:
+        raise RuntimeError(
+            "YASHIGANI_INTERNAL_BEARER is not set. "
+            "The gateway cannot start without a per-install internal service token. "
+            "See docker/secrets/yashigani_internal_bearer."
+        )
+    return _val
+
+
+# Cached at module load — fails fast if env-var is absent.
+_INTERNAL_BEARER: str = _load_internal_bearer()
+
+
+def _internal_bearer() -> str:
+    """Return the cached internal Bearer constant."""
+    return _INTERNAL_BEARER
+
 
 _HOP_BY_HOP_HEADERS = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -152,6 +190,8 @@ def create_gateway_app(
     app = FastAPI(
         title="Yashigani Gateway",
         version="2.1.0",
+        # Disabled at root — schema and docs are mounted at explicit paths below,
+        # behind identity auth (v2.23.4: re-enable OpenAPI behind auth).
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -195,6 +235,63 @@ def create_gateway_app(
     # Mount extra routers BEFORE the catch-all (e.g. /v1/* OpenAI-compat)
     for _router in (extra_routers or []):
         app.include_router(_router)
+
+    # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
+    #
+    # OpenAPI schema and Swagger UI are gated behind identity resolution —
+    # the same Bearer/X-Forwarded-User check used for /v1/* routes.
+    # Anonymous requests (no resolved identity) → 401.
+    # Mounted BEFORE the catch-all so they are not proxied upstream.
+    #
+    #   GET /openapi.json — raw OpenAPI 3.x JSON (requires valid Bearer)
+    #   GET /docs         — Swagger UI        (requires valid Bearer)
+    #
+    # Swagger UI JS+CSS are self-hosted from /static/swagger-ui/
+    # (swagger-ui-dist@5.32.6) — no CDN dependency, satisfies no-inline-js rule.
+    import pathlib as _pathlib
+    _gw_static_dir = _pathlib.Path(__file__).parent / "static"
+    if _gw_static_dir.exists():
+        from fastapi.staticfiles import StaticFiles as _StaticFiles
+        app.mount("/static", _StaticFiles(directory=str(_gw_static_dir)), name="gw-static")
+
+    def _require_gateway_identity(request: Request) -> dict:
+        """FastAPI dependency: resolve identity like /v1/* routes.
+
+        Reuses _resolve_identity from openai_router — same Bearer / SSO logic.
+        Raises HTTP 401 when no identity resolves.
+        """
+        from yashigani.gateway.openai_router import _resolve_identity as _ri
+        identity = _ri(request)
+        if identity is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "authentication_required"},
+            )
+        return identity
+
+    @app.get(
+        "/openapi.json",
+        include_in_schema=False,
+        dependencies=[Depends(_require_gateway_identity)],
+    )
+    async def gateway_openapi_schema() -> JSONResponse:
+        """Serve the OpenAPI schema behind identity auth."""
+        return JSONResponse(app.openapi())
+
+    @app.get("/docs", include_in_schema=False)
+    async def gateway_swagger_ui(
+        identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
+    ) -> HTMLResponse:
+        """Swagger UI — gated behind identity resolution (Bearer / SSO).
+
+        Assets self-hosted from /static/swagger-ui/ (no CDN).
+        """
+        return get_swagger_ui_html(
+            openapi_url="/openapi.json",
+            title="Yashigani Gateway — API Reference",
+            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+            swagger_css_url="/static/swagger-ui/swagger-ui.css",
+        )
 
     # Catch-all reverse proxy route
     @app.api_route(
@@ -421,7 +518,7 @@ async def _proxy_request_body(
     if auth_header.startswith("Bearer ") and state.get("jwt_inspector") is not None:
         token = auth_header[len("Bearer "):]
         # Skip JWT validation for internal service keys (Open WebUI, etc.)
-        if token in ("yashigani-internal",):
+        if hmac.compare_digest(token, _internal_bearer()):
             jwt_claims = {"sub": "internal", "iss": "yashigani"}
         else:
             jwt_result = await state["jwt_inspector"].inspect(
@@ -519,16 +616,15 @@ async def _proxy_request_body(
                 )
                 if audit_writer is not None:
                     try:
-                        audit_writer(
-                            "PII_DETECTED",
-                            {
-                                "request_id": request_id,
-                                "direction": "request",
-                                "pii_types": pii_types,
-                                "action_taken": _req_pii_result.action_taken,
-                                "destination": "upstream",
-                                "finding_count": len(_req_pii_result.findings),
-                            },
+                        audit_writer.write(
+                            PIIDetectedEvent(
+                                request_id=request_id,
+                                direction="request",
+                                pii_types=pii_types,
+                                action_taken=_req_pii_result.action_taken,
+                                destination="upstream",
+                                finding_count=len(_req_pii_result.findings),
+                            )
                         )
                     except Exception as _exc:
                         logger.warning("PII audit write failed (request_id=%s): %s", request_id, _exc)
@@ -654,16 +750,15 @@ async def _proxy_request_body(
                 )
                 if audit_writer is not None:
                     try:
-                        audit_writer(
-                            "PII_DETECTED",
-                            {
-                                "request_id": request_id,
-                                "direction": "response",
-                                "pii_types": pii_resp_types,
-                                "action_taken": _resp_pii_result.action_taken,
-                                "destination": "upstream",
-                                "finding_count": len(_resp_pii_result.findings),
-                            },
+                        audit_writer.write(
+                            PIIDetectedEvent(
+                                request_id=request_id,
+                                direction="response",
+                                pii_types=pii_resp_types,
+                                action_taken=_resp_pii_result.action_taken,
+                                destination="upstream",
+                                finding_count=len(_resp_pii_result.findings),
+                            )
                         )
                     except Exception as _exc:
                         logger.warning("PII audit write failed (request_id=%s): %s", request_id, _exc)

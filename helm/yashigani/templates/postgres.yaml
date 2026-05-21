@@ -45,7 +45,7 @@ spec:
         # fsGroup: 70 chowns Secret + PVC volumes to GID 70 (postgres),
         # giving the postgres user read access via group membership without
         # broadening permissions beyond the pod.
-        # ACS-RISK-008: runAsNonRoot enforced at K8s level. postgres:16-alpine
+        # YSG-RISK-008: runAsNonRoot enforced at K8s level. postgres:16-alpine
         # drops to UID/GID 70 (postgres) after init. readOnlyRootFilesystem is
         # NOT set — postgres writes PGDATA (PVC), /var/run/postgresql (socket),
         # /tmp. Full ROFS would break initdb. Documented exception.
@@ -53,6 +53,11 @@ spec:
         runAsUser: 70
         runAsGroup: 70
         fsGroup: 70
+        # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — postgres reads
+        # postgres_password via secretKeyRef (env var) in K8s so supplementalGroups
+        # is not functionally required here (no file read path). Added for
+        # Compose↔Helm parity per the brief; harmless in K8s.
+        supplementalGroups: [2002]
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -61,7 +66,7 @@ spec:
           imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
-            # ACS-RISK-008: drop ALL capabilities. postgres:16-alpine does not
+            # YSG-RISK-008: drop ALL capabilities. postgres:16-alpine does not
             # use setuid/setgid or raw sockets — only POSIX file I/O and TCP.
             # readOnlyRootFilesystem is NOT set (PGDATA + socket writes needed).
             capabilities:

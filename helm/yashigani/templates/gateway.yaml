@@ -58,6 +58,12 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            # BUG-2 (v2.23.4): internal mesh port — plain HTTP, data-network-only.
+            # Open WebUI connects here; protected by K8s NetworkPolicy (no egress
+            # to 8080 from open-webui; only 8081 allowed via allow-open-webui-egress).
+            - name: http-mesh
+              containerPort: 8081
+              protocol: TCP
           env:
             # LIC-001: YASHIGANI_ENV is hardcoded to "production" to prevent
             # operators from disabling license integrity checks via --set.
@@ -165,6 +171,14 @@ spec:
                   name: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
                   key: caddy_internal_hmac
             {{- end }}
+            # YSG-COMPOSE-ENV-001 Helm parity: gateway reads YASHIGANI_INTERNAL_BEARER
+            # from env (os.environ.get) — must be injected via secretKeyRef, not only
+            # present in yashigani-agent-bearer for agent-bundle shims.
+            - name: YASHIGANI_INTERNAL_BEARER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internalBearer.existingSecretName | default "yashigani-agent-bearer" }}
+                  key: yashigani_internal_bearer
           envFrom:
             - secretRef:
                 name: {{ .Values.gateway.existingSecretName | default "yashigani-gateway-secrets" }}
@@ -274,5 +288,10 @@ spec:
     - name: http
       port: {{ .Values.gateway.service.port }}
       targetPort: 8080
+      protocol: TCP
+    # BUG-2 (v2.23.4): expose internal mesh port so open-webui service DNS resolves.
+    - name: http-mesh
+      port: 8081
+      targetPort: 8081
       protocol: TCP
 {{- end }}

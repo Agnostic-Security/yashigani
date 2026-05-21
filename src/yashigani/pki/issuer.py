@@ -1,7 +1,7 @@
 """
 Yashigani internal PKI issuer — generates root, intermediate, and leaf certs.
 
-Last updated: 2026-05-11T00:00:00Z
+Last updated: 2026-05-18T00:00:00+01:00
 
 Invoked by:
   * install.sh bootstrap_internal_pki()  — first-install cert generation
@@ -303,7 +303,19 @@ def build_leaf(
     intermediate_key: ec.EllipticCurvePrivateKey,
     policy: CertPolicy,
     lifetime_days: Optional[int] = None,
+    *,
+    extra_dns_sans: Optional[list[str]] = None,
+    extra_ip_sans: Optional[list[str]] = None,
 ) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
+    """Build a leaf cert.
+
+    extra_dns_sans / extra_ip_sans — operator-supplied SANs injected for the
+    caddy service only (YSG-CERT-SAN-001). Allows demo / system-use installs to
+    include the VM hostname + IP in the Caddy server cert so browsers can reach
+    the gateway without a separate CA / Let's Encrypt deployment.
+
+    Ignored for non-caddy services (passed as None from rotate_leaves for those).
+    """
     lifetime_days = policy.clamp_leaf(lifetime_days or policy.leaf_lifetime_days_default)
     key = _gen_keypair()
     now = _utcnow()
@@ -320,6 +332,39 @@ def build_leaf(
     import ipaddress as _ipaddr
     sans.append(x509.IPAddress(_ipaddr.IPv4Address("127.0.0.1")))
     sans.append(x509.IPAddress(_ipaddr.IPv6Address("::1")))
+
+    # YSG-CERT-SAN-001 — public-access SANs (demo / system-use path).
+    # Operator-supplied hostname + IP are added to the Caddy server cert so
+    # TLS handshakes from a browser pointed at the VM IP / hostname succeed
+    # without a CA-signed cert. Other services receive no extra SANs.
+    if extra_dns_sans:
+        for dns_san in extra_dns_sans:
+            dns_san = dns_san.strip()
+            if dns_san and dns_san not in existing_dns:
+                sans.append(x509.DNSName(dns_san))
+                existing_dns.add(dns_san)
+    if extra_ip_sans:
+        import ipaddress as _ipaddr2
+        existing_ips = {
+            str(n.value) for n in sans if isinstance(n, x509.IPAddress)
+        }
+        for ip_san in extra_ip_sans:
+            ip_san = ip_san.strip()
+            if not ip_san or ip_san in existing_ips:
+                continue
+            try:
+                # Accept both IPv4 and IPv6.
+                addr = _ipaddr2.ip_address(ip_san)
+                if isinstance(addr, _ipaddr2.IPv4Address):
+                    sans.append(x509.IPAddress(_ipaddr2.IPv4Address(ip_san)))
+                else:
+                    sans.append(x509.IPAddress(_ipaddr2.IPv6Address(ip_san)))
+                existing_ips.add(ip_san)
+            except ValueError:
+                logger.warning(
+                    "YSG-CERT-SAN-001: skipping invalid IP SAN %r for service %s",
+                    ip_san, service.name,
+                )
     # SPIFFE URI SAN (v2.23.1 — EX-231-08). All DNS + URI SANs live in the
     # SAME SubjectAlternativeName extension — cryptography emits one extension
     # per add_extension() call, so we must assemble the full GeneralName list
@@ -461,8 +506,14 @@ def bootstrap(
     root_lifetime_years: Optional[int] = None,
     intermediate_lifetime_days: Optional[int] = None,
     leaf_lifetime_days: Optional[int] = None,
+    caddy_extra_dns_sans: Optional[list[str]] = None,
+    caddy_extra_ip_sans: Optional[list[str]] = None,
 ) -> dict[str, str]:
     """First-install: generate root + intermediate + leaves for every non-revoked service.
+
+    caddy_extra_dns_sans / caddy_extra_ip_sans — appended to the caddy leaf cert
+    SAN only (YSG-CERT-SAN-001). Enables demo / system-use access via VM IP or
+    hostname without a CA-signed cert. Other services are unaffected.
 
     Returns a dict of service_name -> sha256 of the bootstrap token written.
     """
@@ -489,7 +540,13 @@ def bootstrap(
     # 3. Leaves + bootstrap tokens
     hashes_by_service: dict[str, str] = {}
     for service in manifest.live_services():
-        leaf_cert, leaf_key = build_leaf(service, int_cert, int_key, policy, leaf_lifetime_days)
+        # YSG-CERT-SAN-001: inject public-access SANs only into the caddy leaf.
+        _extra_dns = caddy_extra_dns_sans if service.name == "caddy" else None
+        _extra_ip = caddy_extra_ip_sans if service.name == "caddy" else None
+        leaf_cert, leaf_key = build_leaf(
+            service, int_cert, int_key, policy, leaf_lifetime_days,
+            extra_dns_sans=_extra_dns, extra_ip_sans=_extra_ip,
+        )
         _write_leaf(paths, service, leaf_cert, leaf_key, int_cert)
         hashes_by_service[service.name] = _ensure_bootstrap_token(paths, service.name)
         logger.info(
@@ -507,8 +564,15 @@ def rotate_leaves(
     *,
     leaf_lifetime_days: Optional[int] = None,
     only_service: Optional[str] = None,
+    caddy_extra_dns_sans: Optional[list[str]] = None,
+    caddy_extra_ip_sans: Optional[list[str]] = None,
 ) -> list[str]:
-    """Re-issue leaf certs using the existing intermediate. Returns rotated names."""
+    """Re-issue leaf certs using the existing intermediate. Returns rotated names.
+
+    caddy_extra_dns_sans / caddy_extra_ip_sans — injected into the caddy leaf cert
+    SAN only (YSG-CERT-SAN-001). Enables demo / system-use access via VM IP or
+    hostname. Other services are unaffected.
+    """
     if not paths.intermediate_cert.exists() or not paths.intermediate_key.exists():
         raise RuntimeError(
             "Intermediate CA missing — run bootstrap or rotate-intermediate first."
@@ -517,19 +581,41 @@ def rotate_leaves(
     int_cert = _load_cert(paths.intermediate_cert)
     int_key = _load_key(paths.intermediate_key)
     rotated: list[str] = []
+    hashes_by_service: dict[str, str] = {}
     for service in manifest.live_services():
         if only_service and service.name != only_service:
             continue
+        # YSG-CERT-SAN-001: inject public-access SANs only into the caddy leaf.
+        _extra_dns = caddy_extra_dns_sans if service.name == "caddy" else None
+        _extra_ip = caddy_extra_ip_sans if service.name == "caddy" else None
         leaf_cert, leaf_key = build_leaf(
-            service, int_cert, int_key, manifest.cert_policy, leaf_lifetime_days
+            service, int_cert, int_key, manifest.cert_policy, leaf_lifetime_days,
+            extra_dns_sans=_extra_dns, extra_ip_sans=_extra_ip,
         )
         _write_leaf(paths, service, leaf_cert, leaf_key, int_cert)
+        # Ensure bootstrap token exists for this service (idempotent) and capture
+        # the hash so we can update the manifest.
+        # Compose upgrade path: rotate_leaves() previously discarded the hash and
+        # never called _update_manifest_hashes(), leaving stale committed
+        # bootstrap_token_sha256 values in the manifest that no longer matched
+        # the on-disk token → TamperError at gateway startup.  Fix: collect hashes
+        # here and write them back at the end, matching the bootstrap() flow.
+        # K8s: _update_manifest_hashes still runs (harmlessly writing into the
+        # container's copy of /manifest.yaml) but K8s verification is skipped via
+        # _IN_KUBERNETES in ssl_context.py, so the manifset write-back is not load-
+        # bearing on that path.
+        hashes_by_service[service.name] = _ensure_bootstrap_token(paths, service.name)
         rotated.append(service.name)
         logger.info(
             "internal-pki: rotated leaf for %s, valid until %s",
             service.name,
             leaf_cert.not_valid_after_utc,
         )
+    # Write bootstrap_token_sha256 back to the manifest for ALL rotated services.
+    # When only_service is set, hashes_by_service contains exactly one entry and
+    # only that service's line is touched; other entries are left as-is.
+    if hashes_by_service:
+        _update_manifest_hashes(paths.manifest_path, hashes_by_service)
     return rotated
 
 
@@ -634,10 +720,45 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--root-lifetime-years", type=int)
     b.add_argument("--intermediate-lifetime-days", type=int)
     b.add_argument("--leaf-lifetime-days", type=int)
+    # YSG-CERT-SAN-001: public-access SANs for demo / system-use deployments.
+    b.add_argument(
+        "--caddy-extra-dns",
+        dest="caddy_extra_dns",
+        action="append",
+        default=[],
+        metavar="HOSTNAME",
+        help="Extra DNS SAN to add to the caddy cert (repeatable). Enables demo/system-use access.",
+    )
+    b.add_argument(
+        "--caddy-extra-ip",
+        dest="caddy_extra_ip",
+        action="append",
+        default=[],
+        metavar="IP",
+        help="Extra IP SAN to add to the caddy cert (repeatable). Enables demo/system-use access.",
+    )
 
     rl = sub.add_parser("rotate-leaves", help="Re-issue all leaf certs")
     rl.add_argument("--leaf-lifetime-days", type=int)
     rl.add_argument("--only", help="Rotate only this service's leaf")
+    # YSG-CERT-SAN-001: same extra-SAN flags on rotate-leaves so re-installs
+    # and cert-rotation maintenance runs preserve the public-access SANs.
+    rl.add_argument(
+        "--caddy-extra-dns",
+        dest="caddy_extra_dns",
+        action="append",
+        default=[],
+        metavar="HOSTNAME",
+        help="Extra DNS SAN to add to the caddy cert on rotation (repeatable).",
+    )
+    rl.add_argument(
+        "--caddy-extra-ip",
+        dest="caddy_extra_ip",
+        action="append",
+        default=[],
+        metavar="IP",
+        help="Extra IP SAN to add to the caddy cert on rotation (repeatable).",
+    )
 
     ri = sub.add_parser("rotate-intermediate", help="Re-issue intermediate + all leaves")
     ri.add_argument("--intermediate-lifetime-days", type=int)
@@ -670,11 +791,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 root_lifetime_years=args.root_lifetime_years,
                 intermediate_lifetime_days=args.intermediate_lifetime_days,
                 leaf_lifetime_days=args.leaf_lifetime_days,
+                caddy_extra_dns_sans=args.caddy_extra_dns or None,
+                caddy_extra_ip_sans=args.caddy_extra_ip or None,
             )
             print(f"Bootstrap complete. Issued {len(hashes)} leaf certs.")
         elif args.cmd == "rotate-leaves":
             rotated = rotate_leaves(
-                paths, leaf_lifetime_days=args.leaf_lifetime_days, only_service=args.only
+                paths,
+                leaf_lifetime_days=args.leaf_lifetime_days,
+                only_service=args.only,
+                caddy_extra_dns_sans=args.caddy_extra_dns or None,
+                caddy_extra_ip_sans=args.caddy_extra_ip or None,
             )
             print(f"Rotated {len(rotated)} leaves: {', '.join(rotated)}")
         elif args.cmd == "rotate-intermediate":

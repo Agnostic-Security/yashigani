@@ -1,0 +1,114 @@
+# Podman macOS virtiofs secrets :U override — applied by install.sh on macOS Podman ONLY
+# Usage: podman compose \
+#   -f docker/docker-compose.yml \
+#   -f docker/docker-compose.podman-override.yml \
+#   -f docker/docker-compose.podman-virtiofs-override.yml \
+#   up -d
+# Last updated: 2026-05-13T00:00:00+00:00 (fix(podman): scope :U-override-load to macOS only — LINUX-SHARED-MOUNT-UID-CLOBBER)
+#
+# WHY THIS FILE EXISTS (LINUX-SHARED-MOUNT-UID-CLOBBER regression — PR #138):
+#
+#   PR #135 added :U to all secrets bind-mounts in docker-compose.podman-override.yml.
+#   :U tells Podman to lchown the host-side mount source to the subuid-mapped UID of
+#   the container user before mounting. This is REQUIRED on macOS because:
+#     1. podman unshare is unavailable on the macOS remote client.
+#     2. _pki_chown_client_keys() uses podman_run mode (ephemeral container) on macOS,
+#        which cannot pre-set per-file UIDs via unshare.
+#     3. Without :U the virtiofs layer returns statfs EPERM on secret file reads.
+#
+#   On Linux rootless, :U is NOT safe on a SHARED bind-mount directory:
+#     - _pki_chown_client_keys() uses `podman unshare chown` to set per-file UIDs
+#       (redis_client.key → UID 999, backoffice cert → UID 1001, etc.).
+#     - When :U is applied to a shared dir mounted by multiple containers, Podman
+#       lchowns the ENTIRE host-side source directory to the subuid-mapped UID of
+#       whichever container it processes last. This clobbers the per-file UIDs that
+#       `podman unshare chown` set, so services get the wrong ownership.
+#     - Root cause: :U applies to the mount source, not the mount target. A shared
+#       source dir mounted N times with :U gets clobbered N-1 times. Only the last
+#       container's mapped UID survives.
+#   Example: if backoffice (UID 1001) mounts last, its lchown maps the whole
+#   docker/secrets/ dir to subuid_base+1001. Redis (UID 999) can no longer read
+#   redis_client.key because the file's ownership changed from subuid_base+999 to
+#   subuid_base+1001. Redis healthcheck fails → install hangs at `podman wait`.
+#
+#   FIX (Option α per brief — smallest scope, preserves macOS fix):
+#     Split :U mounts into this file, loaded macOS-only in install.sh.
+#     Linux rootless uses `podman unshare` pre-chown (correct) without :U (safe).
+#     docker-compose.podman-override.yml retains security_opt and other overrides
+#     and is always loaded on Podman (Linux + macOS).
+#
+# RUNTIME MATRIX:
+#   macOS Podman:     podman-override.yml + this file  ← :U applied
+#   Linux rootless:   podman-override.yml only          ← no :U; unshare pre-chown
+#   Linux rootful:    podman-override.yml only          ← :U N/A (root)
+#   Docker (any):     neither file                      ← not loaded
+#   K8s:              neither file                      ← helm chart handles
+#
+# VERIFICATION:
+#   Linux rootless: `grep -r ":U" docker/` must NOT match the override file that
+#   is loaded. Confirmed: install.sh only loads this file when uname == Darwin.
+
+services:
+  gateway:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  backoffice:
+    volumes:
+      - ./secrets:/run/secrets:rw,U
+
+  policy:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  redis:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  prometheus:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  grafana:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  caddy:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  postgres:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  pgbouncer:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  alertmanager:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  loki:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  otel-collector:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  jaeger:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  vault:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  open-webui:
+    volumes:
+      - ./secrets:/run/secrets:ro,U
+
+  budget-redis:
+    volumes:
+      - ./secrets:/run/secrets:ro,U

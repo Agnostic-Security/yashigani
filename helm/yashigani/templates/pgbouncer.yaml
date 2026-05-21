@@ -43,7 +43,7 @@ spec:
           imagePullPolicy: {{ .Values.pgbouncer.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
-            # ACS-RISK-008: readOnlyRootFilesystem NOT set — edoburu/pgbouncer
+            # YSG-RISK-008: readOnlyRootFilesystem NOT set — edoburu/pgbouncer
             # writes userlist.txt to /etc/pgbouncer/ at startup. An emptyDir
             # overlay is incompatible with the subPath config mount already in
             # place. Documented exception; deferred to v2.23.3.
@@ -53,13 +53,17 @@ spec:
             - name: pgbouncer
               containerPort: 5432
               protocol: TCP
+          # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
+          # auth_type=plain (YSG-RISK-049 ACCEPTED-LOW non-KMS-only — Tiago directive 2026-05-21).
+          # edoburu entrypoint writes cleartext userlist.txt from DATABASE_URL at startup.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
           env:
             # K8s $(VAR) interpolation only resolves FORWARD references — any var
-            # that uses $(POSTGRES_PASSWORD) MUST be declared after it. The
-            # edoburu/pgbouncer entrypoint extracts the password from
-            # DATABASE_URL into userlist.txt; if the literal "$(POSTGRES_PASSWORD)"
-            # leaks in, password auth fails on every connect (internal K8s integration
-            # evidence).
+            # that uses $(POSTGRES_PASSWORD) MUST be declared after it.
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:

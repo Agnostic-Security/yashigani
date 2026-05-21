@@ -4,7 +4,7 @@ Last updated: 2026-05-02T00:00:00+01:00
 
 ## Overview
 
-Kyverno ClusterPolicy resources that enforce the ACS-RISK-008 container
+Kyverno ClusterPolicy resources that enforce the YSG-RISK-008 container
 hardening baseline across the Yashigani namespace. These policies **REJECT**
 pods that violate the security posture defined in CLAUDE.md §4.
 

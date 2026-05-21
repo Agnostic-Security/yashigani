@@ -1,4 +1,4 @@
-# Last updated: 2026-05-08T00:00:00+01:00
+# Last updated: 2026-05-17T10:00:00+01:00 (G16 dep-bump: azure/setup-helm v3 5119fcb9 → v5.0.0 dda3372f)
 # v2.23.3 retro action — adds kubectl apply --dry-run=server to the
 # helm-template-parity gate.
 #
@@ -65,7 +65,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Set up Helm v3.14.0
-        uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78 # v3
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
         with:
           version: v3.14.0
 

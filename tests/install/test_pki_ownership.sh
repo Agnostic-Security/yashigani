@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # tests/install/test_pki_ownership.sh — PKI key ownership regression tests
+# last-updated: 2026-05-18T00:00:00+01:00 (fix(install): T7 updated — no-rotation branch chown now Podman-rootless gated; YSG-INSTALL-PKI-001)
 # last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): PR#122 — per-service CWE-732 assertion; bash 3.2 header fix; runtime mock T13)
 #
 # Tests:
@@ -180,29 +181,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7: Upgrade no-rotation path does not call _pki_chown_client_keys
-#          (maintainer directive 2026-05-10)
+# Test 7: Upgrade no-rotation path — chown is Podman-gated, not unconditional
+#          (maintainer directive 2026-05-10 / GATE5-BUG-01 + YSG-INSTALL-PKI-001)
 # ---------------------------------------------------------------------------
-printf "\n--- Test 7: Upgrade no-rotation path does not chown existing keys ---\n"
-# Verify the "Certs current — no rotation needed" branch in install.sh does NOT
-# call _pki_chown_client_keys. We check this statically: the branch must contain
-# the "upgrade no-touch rule" comment and must NOT contain _pki_chown_client_keys
-# in the no-rotation else clause.
-#
-# Heuristic: extract the else branch of "needs_rotation" and check it has the
-# upgrade no-touch comment.
+printf "\n--- Test 7: Upgrade no-rotation branch — chown is Podman-rootless gated only ---\n"
+# The no-rotation else branch:
+#   - MUST contain the "upgrade no-touch rule" comment (GATE5-BUG-01 guard intact).
+#   - MUST contain a YSG_PODMAN_RUNTIME guard around _pki_chown_client_keys
+#     (YSG-INSTALL-PKI-001 fix: Podman rootless re-applies chown; Docker/rootful does not).
+#   - Must NOT call _pki_chown_client_keys unconditionally (i.e. the call must only
+#     appear inside the Podman-rootless if block in the no-rotation branch).
 if grep -q "upgrade no-touch rule" "$INSTALL_SH"; then
   _pass "Upgrade no-touch rule comment present in install.sh"
 else
   _fail "Upgrade no-touch rule comment missing from install.sh (check needs_rotation=false branch)"
 fi
 
-# The no-rotation path should NOT immediately follow "Certs current" with
-# _pki_chown_client_keys (old "always re-apply" pattern).
-if grep -A2 "Certs current.*no rotation needed" "$INSTALL_SH" | grep -q '_pki_chown_client_keys'; then
-  _fail "GATE5-BUG-01 regression: _pki_chown_client_keys still called immediately after 'Certs current' (no-rotation path)"
+# The no-rotation branch must contain the YSG_PODMAN_RUNTIME guard for the chown call.
+if grep -q 'YSG-INSTALL-PKI-001' "$INSTALL_SH"; then
+  _pass "YSG-INSTALL-PKI-001 reference present in install.sh (Podman rootless chown exception)"
 else
-  _pass "No _pki_chown_client_keys on no-rotation branch"
+  _fail "YSG-INSTALL-PKI-001 reference missing from install.sh — Podman-rootless chown gate not applied"
+fi
+
+# The Podman-rootless guard must gate _pki_chown_client_keys in the no-rotation branch.
+# Check: the guard pattern and the chown call both exist in the no-rotation else block.
+if grep -q 'YSG_PODMAN_RUNTIME.*true.*id -u.*0\|YSG_PODMAN_RUNTIME.*true.*id -u' "$INSTALL_SH"; then
+  _pass "YSG_PODMAN_RUNTIME + non-root guard present in install.sh no-rotation branch"
+else
+  _fail "YSG_PODMAN_RUNTIME non-root guard missing from no-rotation branch — YSG-INSTALL-PKI-001 fix absent"
+fi
+
+# Regression: unconditional call immediately after "Certs current" is still forbidden.
+# The line right after "Certs current — no rotation needed" must NOT be _pki_chown_client_keys.
+if grep -A1 "Certs current.*no rotation needed" "$INSTALL_SH" | grep -q '_pki_chown_client_keys'; then
+  _fail "GATE5-BUG-01 regression: _pki_chown_client_keys called unconditionally after 'Certs current' (should be Podman-gated)"
+else
+  _pass "No unconditional _pki_chown_client_keys immediately after 'Certs current' (Podman-gated call is correct)"
 fi
 
 # ---------------------------------------------------------------------------

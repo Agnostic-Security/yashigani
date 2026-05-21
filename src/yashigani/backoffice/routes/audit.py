@@ -193,6 +193,7 @@ async def set_masking_default(body: MaskingScopeDefaultRequest, session: AdminSe
             "masking.default",
             str(prev),
             str(body.mask_all_by_default),
+            account_tier=session.account_tier,
         )
     )
     return {"status": "ok", "mask_all_by_default": body.mask_all_by_default}
@@ -213,6 +214,7 @@ async def set_agent_override(body: AgentOverrideRequest, session: AdminSession):
             f"masking.agent.{body.agent_id}",
             "",
             str(body.mask),
+            account_tier=session.account_tier,
         )
     )
     return {"status": "ok"}
@@ -224,7 +226,7 @@ async def remove_agent_override(agent_id: str, session: AdminSession):
     removed = writer._masking_scope.agent_overrides.pop(agent_id, None)
     if removed is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "override_not_found"})
-    writer.write(_masking_config_event(session.account_id, f"masking.agent.{agent_id}", str(removed), "removed"))
+    writer.write(_masking_config_event(session.account_id, f"masking.agent.{agent_id}", str(removed), "removed", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -243,6 +245,7 @@ async def set_user_override(body: UserOverrideRequest, session: AdminSession):
             f"masking.user.{body.user_handle}",
             "",
             str(body.mask),
+            account_tier=session.account_tier,
         )
     )
     return {"status": "ok"}
@@ -254,7 +257,7 @@ async def remove_user_override(handle: str, session: AdminSession):
     removed = writer._masking_scope.user_overrides.pop(handle, None)
     if removed is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "override_not_found"})
-    writer.write(_masking_config_event(session.account_id, f"masking.user.{handle}", str(removed), "removed"))
+    writer.write(_masking_config_event(session.account_id, f"masking.user.{handle}", str(removed), "removed", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -273,6 +276,7 @@ async def set_component_override(body: ComponentOverrideRequest, session: AdminS
             f"masking.component.{body.component}",
             "",
             str(body.mask),
+            account_tier=session.account_tier,
         )
     )
     return {"status": "ok"}
@@ -284,7 +288,7 @@ async def remove_component_override(component: str, session: AdminSession):
     removed = writer._masking_scope.component_overrides.pop(component, None)
     if removed is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "override_not_found"})
-    writer.write(_masking_config_event(session.account_id, f"masking.component.{component}", str(removed), "removed"))
+    writer.write(_masking_config_event(session.account_id, f"masking.component.{component}", str(removed), "removed", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -333,7 +337,7 @@ async def add_siem_target(body: SiemTargetRequest, session: AdminSession):
     )
     writer.add_siem_target(target)
 
-    writer.write(_config_event(session.account_id, "siem_target_added", "", body.name))
+    writer.write(_config_event(session.account_id, "siem_target_added", "", body.name, account_tier=session.account_tier))
     return {"status": "ok", "name": body.name}
 
 
@@ -346,7 +350,7 @@ async def remove_siem_target(name: str, session: AdminSession):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "siem_target_not_found"})
 
     targets.pop(idx)
-    writer.write(_config_event(session.account_id, "siem_target_removed", name, ""))
+    writer.write(_config_event(session.account_id, "siem_target_removed", name, "", account_tier=session.account_tier))
     return {"status": "ok"}
 
 
@@ -412,7 +416,7 @@ async def test_siem_target(name: str, session: AdminSession):
             detail=payload,
         )
 
-    writer.write(_config_event(session.account_id, "siem_connection_test", name, f"http_{http_status}"))
+    writer.write(_config_event(session.account_id, "siem_connection_test", name, f"http_{http_status}", account_tier=session.account_tier))
     return {"status": "ok", "http_status": http_status}
 
 
@@ -421,11 +425,12 @@ async def test_siem_target(name: str, session: AdminSession):
 # ---------------------------------------------------------------------------
 
 
-def _config_event(admin_id: str, setting: str, prev: str, new: str):
+def _config_event(admin_id: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    # account_tier derived from session at call site — defence-in-depth: RBAC bypass visible in audit.
     from yashigani.audit.schema import ConfigChangedEvent
 
     return ConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_id,
         setting=setting,
         previous_value=prev,
@@ -433,11 +438,12 @@ def _config_event(admin_id: str, setting: str, prev: str, new: str):
     )
 
 
-def _masking_config_event(admin_id: str, setting: str, prev: str, new: str):
+def _masking_config_event(admin_id: str, setting: str, prev: str, new: str, account_tier: str = "admin"):
+    # account_tier derived from session at call site — defence-in-depth: RBAC bypass visible in audit.
     from yashigani.audit.schema import MaskingConfigChangedEvent
 
     return MaskingConfigChangedEvent(
-        account_tier="admin",
+        account_tier=account_tier,
         admin_account=admin_id,
         change_target=setting,
         target_identifier="",

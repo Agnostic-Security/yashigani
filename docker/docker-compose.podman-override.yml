@@ -1,6 +1,6 @@
 # Podman rootless overrides — applied automatically by install.sh when RUNTIME=podman
 # Usage: podman compose -f docker/docker-compose.yml -f docker/docker-compose.podman-override.yml up -d
-# Last updated: 2026-05-07T00:00:00+01:00 (fix: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES parity with docker-compose.yml)
+# Last updated: 2026-05-13T00:00:00+00:00 (fix(podman): scope :U mounts to docker-compose.podman-virtiofs-override.yml — LINUX-SHARED-MOUNT-UID-CLOBBER)
 #
 # P-9 healthcheck strategy (podman-healthcheck-silent-drop):
 #   Podman silently drops image-baked OCI HEALTHCHECK directives when compose
@@ -22,6 +22,10 @@
 #     automatically without keep-id. Volumes work because the container runs
 #     as the mapped root user.
 #   - All services: label=disable to prevent SELinux/AppArmor blocking volume access.
+#
+# :U volume mounts are in docker-compose.podman-virtiofs-override.yml (macOS only).
+# See that file and install.sh for the full split rationale
+# (LINUX-SHARED-MOUNT-UID-CLOBBER regression from PR #138).
 #
 # EX-231-10 network topology (2026-04-29):
 #   Podman compose honours the four-network topology from docker-compose.yml
@@ -64,11 +68,11 @@ services:
   ollama:
     security_opt:
       - label=disable
-    environment:
-      # Ollama writes to /root/.ollama by default. In Podman rootless,
-      # the home dir is / not /root. Override to use the volume mount.
-      OLLAMA_MODELS: /root/.ollama/models
-      HOME: /root
+    # OLLAMA_MODELS + HOME env overrides removed: the main compose now mounts
+    # ollama_data at /root/.ollama directly (the standard ollama-in-container
+    # path), so defaults work without env redirection. Earlier override here
+    # set env without moving the volume mount, which caused model partials to
+    # try to write to a tmpfs at /root/.ollama (8MB) → no-space-left.
 
   ollama-init:
     security_opt:

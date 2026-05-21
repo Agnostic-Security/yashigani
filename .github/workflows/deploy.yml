@@ -1,4 +1,4 @@
-# Last updated: 2026-05-03
+# Last updated: 2026-05-17 (G16 dep-bump: azure/setup-helm v3 5119fcb9 → v5.0.0 dda3372f)
 name: Deploy
 
 on:
@@ -30,7 +30,7 @@ jobs:
     environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78 # v3
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
         with:
           version: v3.14.0
       # V232-CSCAN-01c sweep: validate workflow_dispatch inputs before use in

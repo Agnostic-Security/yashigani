@@ -1,6 +1,6 @@
-{{- /* Last updated: 2026-05-02T00:00:00+01:00 */ -}}
+{{- /* Last updated: 2026-05-17T00:00:00+01:00 */ -}}
 {{- /*
-ACS-RISK-008 — Kyverno ClusterPolicy admission control.
+YSG-RISK-008 — Kyverno ClusterPolicy admission control.
 
 When admissionPolicies.enabled is true, this template renders five Kyverno
 ClusterPolicy resources that enforce the container-hardening baseline for the
@@ -8,13 +8,30 @@ yashigani namespace. Pods that violate the baseline are REJECTED at admission
 time (validationFailureAction: Enforce) rather than discovered post-deployment.
 
 PREREQUISITE: Kyverno must be installed cluster-wide before helm install/upgrade.
-See helm/yashigani/policies/admission/README.md.
+Install with: helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+The chart does not bundle Kyverno.
 
 NOTE: ClusterPolicy is a cluster-scoped CRD — it does not live inside the
 yashigani namespace but it is owned by this Helm release (release name in labels).
 Helm will delete these policies on helm uninstall.
 */ -}}
 {{- if .Values.admissionPolicies.enabled }}
+{{- /*
+Pre-install guard: verify that the Kyverno ClusterPolicy CRD is present in the
+cluster before attempting to render ClusterPolicy resources. If the CRD is
+absent, helm install/upgrade would fail with an opaque "no matches for kind
+ClusterPolicy" API-server error. We surface a clear remediation message instead.
+
+lookup returns an empty dict when the object does not exist. A non-empty dict
+(i.e. the CRD is registered) allows rendering to proceed normally.
+This guard runs during helm template rendering against a live cluster (helm
+install/upgrade). It is silently skipped in --dry-run=client mode because
+lookup always returns empty in that context (correct: no cluster connection).
+*/ -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "clusterpolicies.kyverno.io" }}
+{{- if not $crd }}
+{{- fail "admissionPolicies.enabled=true but the Kyverno ClusterPolicy CRD is not installed in this cluster.\n\nREMEDIATION: Install Kyverno first, then re-run helm install/upgrade:\n\n  helm repo add kyverno https://kyverno.github.io/kyverno/\n  helm repo update\n  helm install kyverno kyverno/kyverno -n kyverno --create-namespace\n\nWait for Kyverno to become ready before deploying Yashigani:\n  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=kyverno -n kyverno --timeout=120s\n\nThen re-run your helm install/upgrade command.\nAlternatively, set --set admissionPolicies.enabled=false to install without Kyverno (document in risk register per YSG-RISK-008)." }}
+{{- end }}
 ---
 # Policy 1/5: require runAsNonRoot
 apiVersion: kyverno.io/v1
@@ -30,7 +47,7 @@ metadata:
     policies.kyverno.io/severity: "high"
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
-      ACS-RISK-008: Pods in the yashigani namespace must set runAsNonRoot: true
+      YSG-RISK-008: Pods in the yashigani namespace must set runAsNonRoot: true
       at pod or container level, or provide a non-zero runAsUser.
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
@@ -46,7 +63,7 @@ spec:
                 - {{ .Release.Namespace }}
       validate:
         message: >-
-          ACS-RISK-008: Pod must set runAsNonRoot: true or a non-zero runAsUser
+          YSG-RISK-008: Pod must set runAsNonRoot: true or a non-zero runAsUser
           at the pod level. Pod: {{ "{{" }} request.object.metadata.name {{ "}}" }}.
         deny:
           conditions:
@@ -54,7 +71,7 @@ spec:
               - key: "{{ "{{" }} request.object.spec.securityContext.runAsNonRoot || false {{ "}}" }}"
                 operator: Equals
                 value: false
-              - key: "{{ "{{" }} request.object.spec.securityContext.runAsUser || 0 {{ "}}" }}"
+              - key: "{{ "{{" }} request.object.spec.securityContext.runAsUser || `0` {{ "}}" }}"
                 operator: Equals
                 value: 0
 ---
@@ -72,7 +89,7 @@ metadata:
     policies.kyverno.io/severity: "high"
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
-      ACS-RISK-008: All containers must set allowPrivilegeEscalation: false.
+      YSG-RISK-008: All containers must set allowPrivilegeEscalation: false.
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
   background: true
@@ -87,17 +104,18 @@ spec:
                 - {{ .Release.Namespace }}
       validate:
         message: >-
-          ACS-RISK-008: Container '{{ "{{" }} element.name {{ "}}" }}' in pod
-          '{{ "{{" }} request.object.metadata.name {{ "}}" }}' must set
-          allowPrivilegeEscalation: false.
+          YSG-RISK-008: All containers in pod
+          '{{ "{{" }} request.object.metadata.name {{ "}}" }}' must explicitly set
+          allowPrivilegeEscalation: false. Omitting the field is not permitted
+          (K8s defaults to true when absent).
         foreach:
           - list: "request.object.spec.containers"
             deny:
               conditions:
                 any:
-                  - key: "{{ "{{" }} element.securityContext.allowPrivilegeEscalation || true {{ "}}" }}"
-                    operator: Equals
-                    value: true
+                  - key: "{{ "{{" }} element.securityContext.allowPrivilegeEscalation {{ "}}" }}"
+                    operator: NotEquals
+                    value: false
 ---
 # Policy 3/5: require seccomp RuntimeDefault or Localhost
 apiVersion: kyverno.io/v1
@@ -113,7 +131,7 @@ metadata:
     policies.kyverno.io/severity: "medium"
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
-      ACS-RISK-008: Pods must specify seccompProfile.type of RuntimeDefault
+      YSG-RISK-008: Pods must specify seccompProfile.type of RuntimeDefault
       or Localhost at the pod level.
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
@@ -129,7 +147,7 @@ spec:
                 - {{ .Release.Namespace }}
       validate:
         message: >-
-          ACS-RISK-008: Pod '{{ "{{" }} request.object.metadata.name {{ "}}" }}'
+          YSG-RISK-008: Pod '{{ "{{" }} request.object.metadata.name {{ "}}" }}'
           must set seccompProfile.type to RuntimeDefault or Localhost.
           Unconfined is not permitted.
         deny:
@@ -155,7 +173,7 @@ metadata:
     policies.kyverno.io/severity: "high"
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
-      ACS-RISK-008: All containers must set capabilities.drop containing ALL.
+      YSG-RISK-008: All containers must set capabilities.drop containing ALL.
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
   background: true
@@ -170,7 +188,7 @@ spec:
                 - {{ .Release.Namespace }}
       validate:
         message: >-
-          ACS-RISK-008: Container '{{ "{{" }} element.name {{ "}}" }}' in pod
+          YSG-RISK-008: All containers in pod
           '{{ "{{" }} request.object.metadata.name {{ "}}" }}' must set
           capabilities.drop containing ALL.
         foreach:
@@ -196,7 +214,7 @@ metadata:
     policies.kyverno.io/severity: "critical"
     policies.kyverno.io/subject: "Pod"
     policies.kyverno.io/description: >-
-      ACS-RISK-008: Pods must not set runAsUser: 0 at pod or container level.
+      YSG-RISK-008: Pods must not set runAsUser: 0 at pod or container level.
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
   background: true
@@ -211,12 +229,12 @@ spec:
                 - {{ .Release.Namespace }}
       validate:
         message: >-
-          ACS-RISK-008: Pod '{{ "{{" }} request.object.metadata.name {{ "}}" }}'
+          YSG-RISK-008: Pod '{{ "{{" }} request.object.metadata.name {{ "}}" }}'
           sets runAsUser: 0 at pod level. Root containers are not permitted.
         deny:
           conditions:
             all:
-              - key: "{{ "{{" }} request.object.spec.securityContext.runAsUser || 1 {{ "}}" }}"
+              - key: "{{ "{{" }} request.object.spec.securityContext.runAsUser || `1` {{ "}}" }}"
                 operator: Equals
                 value: 0
     - name: restrict-root-container-level
@@ -229,15 +247,15 @@ spec:
                 - {{ .Release.Namespace }}
       validate:
         message: >-
-          ACS-RISK-008: Container '{{ "{{" }} element.name {{ "}}" }}' in pod
-          '{{ "{{" }} request.object.metadata.name {{ "}}" }}' sets runAsUser: 0.
-          Root containers are not permitted.
+          YSG-RISK-008: All containers in pod
+          '{{ "{{" }} request.object.metadata.name {{ "}}" }}' must not set
+          runAsUser: 0. Root containers are not permitted.
         foreach:
           - list: "request.object.spec.containers"
             deny:
               conditions:
                 all:
-                  - key: "{{ "{{" }} element.securityContext.runAsUser || 1 {{ "}}" }}"
+                  - key: "{{ "{{" }} element.securityContext.runAsUser || `1` {{ "}}" }}"
                     operator: Equals
                     value: 0
 {{- end }}

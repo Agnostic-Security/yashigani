@@ -20,12 +20,25 @@ Both contexts enforce:
   * Hostname verification ON for clients (matches cert SANs)
   * System roots are never loaded — internal mesh only.
 
-Last updated: 2026-04-28T00:00:00+00:00
+Bootstrap token verification (current_service(verify_token=...)):
+  In compose / bare-metal deployments the bootstrap token is written to the
+  secrets bind-mount by install.sh and acts as a tamper-detection seal on
+  the secrets directory.  In Kubernetes deployments the secrets directory is
+  populated from the yashigani-pki-certs K8s Secret (RBAC-controlled) which
+  is the trust anchor — the bootstrap token files are not included in the
+  Secret because they are generated ephemerally by the PKI Job and do not
+  need to outlive the job.  Attempting to verify the token in K8s would
+  always raise TamperError.  We detect the K8s runtime by the presence of
+  KUBERNETES_SERVICE_HOST (injected by the kubelet into every pod) and skip
+  token verification in that context only.
+
+Last updated: 2026-05-17T00:00:00+00:00
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import ssl
 from pathlib import Path
 from typing import Optional
@@ -33,6 +46,11 @@ from typing import Optional
 from yashigani.pki.identity import ServiceIdentity, current_service
 
 logger = logging.getLogger(__name__)
+
+# Kubernetes injects KUBERNETES_SERVICE_HOST into every pod.  In K8s the
+# PKI secrets come from the yashigani-pki-certs Secret (RBAC trust anchor);
+# bootstrap token files are not included, so token verification is skipped.
+_IN_KUBERNETES: bool = bool(os.environ.get("KUBERNETES_SERVICE_HOST", ""))
 
 
 def server_ssl_context(identity: Optional[ServiceIdentity] = None) -> ssl.SSLContext:
@@ -44,7 +62,7 @@ def server_ssl_context(identity: Optional[ServiceIdentity] = None) -> ssl.SSLCon
     * Requires every connecting client to present a cert signed by the
       internal CA chain (mutual TLS).
     """
-    ident = identity or current_service()
+    ident = identity or current_service(verify_token=not _IN_KUBERNETES)
     cert_path, key_path, ca_root = ident.expect_cert_files()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -67,7 +85,7 @@ def client_ssl_context(identity: Optional[ServiceIdentity] = None) -> ssl.SSLCon
     Presents this service's client cert to peers and verifies the peer
     cert chain against ca_root.crt (Pattern A for Python ssl).
     """
-    ident = identity or current_service()
+    ident = identity or current_service(verify_token=not _IN_KUBERNETES)
     cert_path, key_path, ca_root = ident.expect_cert_files()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

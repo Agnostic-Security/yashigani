@@ -4,9 +4,36 @@
   Each bundle is controlled by .Values.agentBundles.<name>.enabled.
   Disabled by default — opt-in only.
 
+  Supported per-bundle keys (all optional unless noted):
+    image.repository / image.tag / image.pullPolicy — container image (required)
+    replicaCount          — defaults to 1
+    env                   — map of plain env vars (key: value)
+    tokenSecretName /
+      tokenSecretKey      — injects YASHIGANI_AGENT_TOKEN from a K8s secret
+    dbPasswordSecretName /
+      dbPasswordSecretKey / pgbouncerServiceName
+                          — assembles LETTA_PG_URI (letta only; generic enough to
+                            extend to other bundles needing postgres)
+    service.port /
+      service.type        — renders a ClusterIP Service for the bundle
+    persistence.enabled /
+      persistence.mountPath / persistence.size /
+      persistence.storageClass / persistence.accessMode
+                          — renders a PVC and volumeMount for stateful bundles
+    resources             — requests/limits block (required by policy)
+    extraContainers       — list of additional container specs injected verbatim into
+                            the pod's containers[] array (used for TLS-terminating
+                            sidecars, e.g. letta-pgbouncer). Each entry is a full
+                            Kubernetes container spec. Values.yaml controls image,
+                            env, securityContext, resources, and volumeMounts.
+                            Additional volumes for the sidecar MUST be declared via
+                            extraVolumes on the bundle; they are merged with persistence
+                            volumes in the pod spec.
+
   DISCLAIMER: These integrations are provided AS IS by Agnostic Security.
   Image digests are pinned per release. All support goes to upstream maintainers.
 */}}
+{{- /* Last updated: 2026-05-20T12:00:00+01:00 — fix: readOnlyRootFilesystem:true default + extraVolumes/extraVolumeMounts for per-bundle writable paths (letta openapi_letta.json + nltk_data) */ -}}
 
 {{- $root := . -}}
 
@@ -40,7 +67,11 @@ spec:
         app.kubernetes.io/component: agent-bundle
     spec:
       securityContext:
+        {{- if hasKey $bundle "podSecurityContext" }}
+        {{- toYaml $bundle.podSecurityContext | nindent 8 }}
+        {{- else }}
         runAsNonRoot: true
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -48,15 +79,32 @@ spec:
           image: "{{ $bundle.image.repository }}:{{ $bundle.image.tag | default "latest" }}"
           imagePullPolicy: {{ $bundle.image.pullPolicy | default "IfNotPresent" }}
           securityContext:
+            {{- if hasKey $bundle "containerSecurityContext" }}
+            {{- toYaml $bundle.containerSecurityContext | nindent 12 }}
+            {{- else }}
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false
+            # readOnlyRootFilesystem: true is the secure default.
+            # Per-bundle writable paths are handled via extraVolumeMounts (emptyDir/tmpfs)
+            # rather than degrading the whole rootfs to writable.
+            # Detection-lane parity finding (2026-05-20): this was incorrectly set to
+            # false since agent-bundles.yaml was introduced — Lu/Iris/Laura all missed it
+            # across multiple releases. Fixed as part of letta read_only:true closure.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+            {{- end }}
           env:
             {{- range $key, $value := $bundle.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            # Captain Bucket-C: inject OPENAI_API_KEY from per-install internalBearer Secret.
+            # Replaces the former hardcoded "yashigani-internal" literal in values.yaml.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.internalBearer.existingSecretName | default "yashigani-agent-bearer" }}
+                  key: yashigani_internal_bearer
             {{- if and $bundle.tokenSecretName $bundle.tokenSecretKey }}
             - name: YASHIGANI_AGENT_TOKEN
               valueFrom:
@@ -64,8 +112,46 @@ spec:
                   name: {{ $bundle.tokenSecretName }}
                   key: {{ $bundle.tokenSecretKey }}
             {{- end }}
+            {{- if and $bundle.dbPasswordSecretName $bundle.dbPasswordSecretKey }}
+            - name: LETTA_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bundle.dbPasswordSecretName }}
+                  key: {{ $bundle.dbPasswordSecretKey }}
+            # letta connects to 127.0.0.1:5432 (pod-local loopback) — the letta-pgbouncer
+            # sidecar listens there and dials yashigani-postgres:5432 over full mTLS,
+            # presenting letta-pgbouncer_client.crt (UID 70:0400). No plain-TCP carveout
+            # in pg_hba required. YSG-RISK-048 CLOSED 2026-05-20 via pgbouncer session-mode
+            # sidecar (Iris design doc Option 1; replaces stunnel+socat).
+            - name: LETTA_PG_URI
+              value: {{ printf "postgresql://yashigani_app:$(LETTA_PG_PASSWORD)@127.0.0.1:5432/letta" | quote }}
+            {{- end }}
           resources:
             {{- toYaml $bundle.resources | nindent 12 }}
+          {{- if or (and $bundle.persistence $bundle.persistence.enabled) $bundle.extraVolumeMounts }}
+          volumeMounts:
+            {{- if and $bundle.persistence $bundle.persistence.enabled }}
+            - name: {{ printf "%s-data" $bundleID }}
+              mountPath: {{ $bundle.persistence.mountPath }}
+            {{- end }}
+            {{- if $bundle.extraVolumeMounts }}
+            {{- toYaml $bundle.extraVolumeMounts | nindent 12 }}
+            {{- end }}
+          {{- end }}
+        {{- if $bundle.extraContainers }}
+        {{- toYaml $bundle.extraContainers | nindent 8 }}
+        {{- end }}
+      {{- if or (and $bundle.persistence $bundle.persistence.enabled) $bundle.extraVolumes }}
+      volumes:
+        {{- if and $bundle.persistence $bundle.persistence.enabled }}
+        - name: {{ printf "%s-data" $bundleID }}
+          persistentVolumeClaim:
+            claimName: {{ printf "yashigani-%s-data" $bundleID }}
+        {{- end }}
+        {{- if $bundle.extraVolumes }}
+        {{- toYaml $bundle.extraVolumes | nindent 8 }}
+        {{- end }}
+      {{- end }}
 {{- if $bundle.service }}
 ---
 apiVersion: v1
@@ -88,6 +174,28 @@ spec:
       port: {{ $bundle.service.port }}
       targetPort: {{ $bundle.service.port }}
       protocol: TCP
+{{- end }}
+{{- if and $bundle.persistence $bundle.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "yashigani-%s-data" $bundleID }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $bundleID }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: agent-bundle
+    app.kubernetes.io/managed-by: Helm
+spec:
+  accessModes:
+    - {{ $bundle.persistence.accessMode | default "ReadWriteOnce" }}
+  resources:
+    requests:
+      storage: {{ $bundle.persistence.size | default "5Gi" }}
+  {{- if $bundle.persistence.storageClass }}
+  storageClassName: {{ $bundle.persistence.storageClass }}
+  {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
