@@ -473,13 +473,21 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# BUG-3-MULTI-USER-INSTALL-PKI: wipe docker/secrets/ on --remove-volumes.
+# BUG-3-MULTI-USER-INSTALL-PKI / BACKLOG-V240-006: wipe docker/secrets/ on
+# --remove-volumes (sudo-free, container-fallback — Iris+Laura 2026-05-21).
 #
 # Symptom: uninstall.sh --remove-volumes leaves docker/secrets/ populated with
 # PKI files owned by the install user. A subsequent install from a different
 # user (e.g. root vs tom) fails because the new installer cannot overwrite
-# files it does not own. `sudo rm -rf` is required because cross-user ownership
-# is precisely why the bug exists.
+# files it does not own.
+#
+# Fix: three-tier fallback (no sudo):
+#   1. Direct rm -rf (same-user / root caller — common clean-install case)
+#   2. podman unshare rm -rf (Podman rootless path; lighter than container)
+#   3. Ephemeral container as UID 0 (required for mixed-UID secrets ownership:
+#      maxine, root, ava, 472, 70, 10001, dnsmasq). --pull=never first;
+#      pull fallback for airgap/post-prune paths.
+#   HARD WARN if all fail — operator told exactly what to do; never silent.
 #
 # Wiped files include (non-exhaustive):
 #   - PKI keys + certs (ca_root.key, ca_intermediate.key, *_client.key, etc.)
@@ -496,7 +504,15 @@ fi
 #      Prevents accidental rm if SCRIPT_DIR is mis-resolved.
 #   3. Preserves the directory itself (only contents are removed).
 #   4. If docker/secrets/ does not exist, skips silently.
+#
+# _ALPINE_IMAGE: hoisted here so it is available to BOTH the secrets-wipe
+# block (BACKLOG-V240-006) and the bind-mount cleanup block (BACKLOG-V240-003)
+# below. MUST match install.sh _alpine_image — co-rotate on any digest update.
+# Search: grep -n "_ALPINE_IMAGE\|_alpine_image" uninstall.sh install.sh
 # ---------------------------------------------------------------------------
+# Alpine digest: MUST match install.sh _alpine_image (SIB-2D-02 co-rotation).
+_ALPINE_IMAGE="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+
 if [ "$REMOVE_VOLUMES" = "true" ]; then
     _secrets_dir="${SCRIPT_DIR}/docker/secrets"
     # Path-validation guard: only proceed if the resolved path is exactly canonical.
@@ -506,12 +522,44 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
         echo "  [skip] docker/secrets/ does not exist — nothing to wipe"
     else
         echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
-        if sudo rm -rf "${_secrets_dir:?}"/*; then
-            echo "  [removed] docker/secrets/* — directory preserved, contents wiped"
+        # Tier 1: direct rm (same-user caller — no overhead for common case).
+        if rm -rf "${_secrets_dir:?}/"* 2>/dev/null; then
+            echo "  [removed] docker/secrets/* — direct rm succeeded"
         else
-            echo "  [WARN] sudo rm -rf docker/secrets/* failed — manual cleanup may be required" >&2
-            echo "  [WARN] On Podman rootless try: podman unshare rm -rf '${_secrets_dir}'" >&2
-            echo "  [WARN] (SIB-2D-01 / BACKLOG-V240-006: podman unshare path for secrets deferred to v2.24.0)" >&2
+            # Cross-UID ownership (Iris BACKLOG-V240-006 / Laura 2D GO 2026-05-21).
+            _secrets_wiped=false
+            # Tier 2: Podman unshare (lighter; no container overhead on Podman paths).
+            if [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
+                if podman unshare rm -rf "${_secrets_dir:?}/"* 2>/dev/null; then
+                    echo "  [removed] docker/secrets/* — podman unshare rm succeeded"
+                    _secrets_wiped=true
+                fi
+            fi
+            if [ "$_secrets_wiped" = "false" ]; then
+                # Tier 3: ephemeral container as UID 0 — can unlink any UID's files.
+                # Volume scope: docker/secrets:/t only (path-validated above).
+                # No --privileged, no extra caps. Same surface as Laura-GO'd 2D pattern.
+                # --pull=never first (image in cache after compose down); pull fallback
+                # for airgap / post-manual-prune paths.
+                if "$RUNTIME" run --rm --pull=never \
+                        --volume "${_secrets_dir}:/t:rw" \
+                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
+                        sh -c 'rm -rf /t/*' 2>/dev/null \
+                   || "$RUNTIME" run --rm \
+                        --volume "${_secrets_dir}:/t:rw" \
+                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
+                        sh -c 'rm -rf /t/*' 2>/dev/null; then
+                    echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
+                    _secrets_wiped=true
+                fi
+            fi
+            # Tier 4: hard WARN — never silent swallow.
+            if [ "$_secrets_wiped" = "false" ]; then
+                printf '[ERROR] secrets/ cleanup failed — manual remediation required:\n' >&2
+                printf '[ERROR]   rm -rf '"'"'%s'"'"'  (as root or file owner)\n' "${_secrets_dir}" >&2
+                printf '[ERROR]   or: podman unshare rm -rf '"'"'%s'"'"'\n' "${_secrets_dir}" >&2
+                printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
+            fi
         fi
     fi
 fi
@@ -536,8 +584,7 @@ fi
 # Search: grep -n "_ALPINE_IMAGE\|_alpine_image" uninstall.sh install.sh
 # ---------------------------------------------------------------------------
 if [ "$REMOVE_VOLUMES" = "true" ]; then
-    # Alpine digest — must match install.sh _alpine_image (SIB-2D-02 co-rotation)
-    _ALPINE_IMAGE="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+    # _ALPINE_IMAGE is hoisted above (BACKLOG-V240-006 hoist — co-rotation comment there).
     echo "=== Bind-mount directory cleanup (BACKLOG-V240-003) ==="
     for _bm_dir in \
             "${SCRIPT_DIR}/docker/data" \
