@@ -8280,6 +8280,17 @@ main() {
     # step ONCE BEFORE pgbouncer starts with the new auth_query configuration.
     # The script is idempotent (IF NOT EXISTS guards) — safe to re-run; no-op on
     # fresh installs where postgres init already executed it automatically.
+    #
+    # YSG-RISK-050 (v2.24.0): pgbouncer authenticator now uses dedicated
+    # pgbouncer-auth_client.{crt,key} on the postgres-facing connection
+    # (separate from pgbouncer_client.{crt,key} on the client-facing side).
+    # Cert issuance happens automatically via PKI iterator reading
+    # docker/service_identities.yaml + lib/pki_ownership.sh. No additional
+    # install.sh logic required.
+    #
+    # The updated 10-pgbouncer-auth.sh (v2.24.0) also removes the pg_hba A2
+    # carveout (Amendment A2/YSG-RISK-049) when re-run. Re-running the migration
+    # step below achieves both: role/function idempotency + carveout removal.
     if [[ "${UPGRADE:-false}" == "true" ]]; then
       log_warn "v2.23.4 → v2.24.0 upgrade detected. The new YSG-RISK-049 auth_query"
       log_warn "design requires running the pgbouncer_authenticator role + function"
@@ -8290,6 +8301,8 @@ main() {
       log_warn ""
       log_warn "(The script is idempotent — safe to re-run; no-op on fresh installs"
       log_warn "  where the init script already executed.)"
+      log_warn "v2.24.x cert-separation upgrade: this also removes the pg_hba A2 carveout"
+      log_warn "(YSG-RISK-050) — pgbouncer-auth now uses a dedicated client cert."
     fi
 
     # Step 10: docker compose up -d

@@ -212,6 +212,21 @@ services:
     bootstrap_token_sha256: "6286076bbe4c6ff3d145f927c673b7923dc44fca380efc8811489c71160950c4"
     revoked: false
 
+  - name: pgbouncer-auth
+    # pgbouncer-auth: dedicated outbound cert for pgbouncer→postgres connections.
+    # YSG-RISK-050 CLOSED v2.24.0 — replaces shared pgbouncer_client.crt on the
+    # server_tls_* (outbound) side. pgbouncer_client.crt/key is retained for the
+    # inbound client_tls_* side only. CN=pgbouncer-auth satisfies clientcert=verify-ca;
+    # NOTE: clientcert=verify-ca (not verify-full) is required — CN does NOT match
+    # role pgbouncer_authenticator. If upgrading to verify-full, rename CN accordingly.
+    # pg_hba catch-all applies uniformly post-carveout-removal (10-pgbouncer-auth.sh).
+    dns_sans: [pgbouncer-auth, pgbouncer-auth.internal, yashigani-pgbouncer-auth]
+    spiffe_id: spiffe://yashigani.internal/pgbouncer-auth
+    purpose: "Dedicated outbound cert for pgbouncer→postgres connections (YSG-RISK-050 close)"
+    mtls_capable: true
+    bootstrap_token_sha256: ""  # populated by install.sh on first deploy
+    revoked: false
+
   - name: letta-pgbouncer
     # letta-pgbouncer: session-mode pgbouncer sidecar for letta→postgres mTLS.
     # YSG-RISK-048 CLOSED 2026-05-20 — replaces the stunnel+socat design (e694127).
