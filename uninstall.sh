@@ -10,6 +10,13 @@
 # Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
 
 set -euo pipefail
+
+# Minimal logging helper — mirrors the install.sh format exactly.
+# log_info is called in the state-file runtime-detection block (57ea226);
+# without this definition, set -euo pipefail aborts before any cleanup runs.
+# (UNINSTALL-LOG_INFO-BUG — Ava phase2-verdict.md:69, v2.23.4)
+log_info() { printf "    --> %s\n" "$1"; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
 REMOVE_VOLUMES="false"

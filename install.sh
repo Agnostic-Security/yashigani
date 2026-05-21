@@ -5464,6 +5464,51 @@ generate_secrets() {
       echo "YASHIGANI_VERSION=${YASHIGANI_VERSION}" >> "$env_file"
     fi
 
+    # pgbouncer_userlist upgrade path: generate if absent (e.g. upgrading from pre-SCRAM install).
+    # Mirrors the fresh-install block below. Reads postgres_password from file (already preserved above).
+    local _userlist_file_up="${secrets_dir}/pgbouncer_userlist"
+    if [[ ! -s "$_userlist_file_up" ]]; then
+      local _pg_pw_up
+      _pg_pw_up="$(cat "${secrets_dir}/postgres_password" 2>/dev/null || echo "")"
+      if [[ -z "$_pg_pw_up" ]]; then
+        log_warn "pgbouncer_userlist: cannot read postgres_password — skipping SCRAM generation on upgrade"
+      elif ! command -v python3 >/dev/null 2>&1; then
+        log_warn "pgbouncer_userlist: python3 not found — skipping SCRAM generation on upgrade"
+      else
+        local _scram_verifier_up
+        _scram_verifier_up="$(YASHIGANI_PG_PW="${_pg_pw_up}" python3 -c "
+import hashlib, hmac as _hmac, base64, os
+password = os.environ['YASHIGANI_PG_PW'].encode()
+iterations = 4096
+salt = os.urandom(16)
+salted = hashlib.pbkdf2_hmac('sha256', password, salt, iterations, dklen=32)
+client_key = _hmac.new(salted, b'Client Key', hashlib.sha256).digest()
+stored_key = hashlib.sha256(client_key).digest()
+server_key = _hmac.new(salted, b'Server Key', hashlib.sha256).digest()
+b64 = base64.b64encode
+verifier = 'SCRAM-SHA-256\${iter}:{salt}\${stored}:{server}'.format(
+    iter=iterations,
+    salt=b64(salt).decode(),
+    stored=b64(stored_key).decode(),
+    server=b64(server_key).decode()
+)
+print('\"yashigani_app\" \"{}\"'.format(verifier))
+" 2>&1)"
+        if ! printf '%s\n' "$_scram_verifier_up" | grep -qE '^"yashigani_app" "SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*"$'; then
+          log_warn "pgbouncer_userlist: SCRAM verifier format validation failed on upgrade — skipping"
+        else
+          umask 027
+          printf "%s\n" "$_scram_verifier_up" > "$_userlist_file_up"
+          umask 077
+          chmod 0640 "$_userlist_file_up"
+          _do_chgrp "2002" "$_userlist_file_up" "pgbouncer_userlist" || true
+          log_info "Generated pgbouncer_userlist (upgrade path) → ${_userlist_file_up} (SCRAM-SHA-256, mode 0640, chgrp 2002)"
+        fi
+      fi
+    else
+      log_info "pgbouncer_userlist already present — preserving (upgrade path)"
+    fi
+
     return 0
   fi
 
@@ -5671,6 +5716,77 @@ generate_secrets() {
     mv "$tmp_env" "$env_file"
   else
     echo "YASHIGANI_INTERNAL_BEARER=${_bearer_token}" >> "$env_file"
+  fi
+
+  # --- pgbouncer SCRAM-SHA-256 userlist (YSG-RISK-049 close) ----------------
+  # Generates docker/secrets/pgbouncer_userlist containing a pre-computed
+  # SCRAM-SHA-256 verifier for the yashigani_app postgres user.
+  #
+  # Design rationale (Iris iris-v234-pgbouncer-scram-decision.md §Option(a)):
+  #   - edoburu pgbouncer image is busybox-only; PBKDF2-HMAC-SHA256 not available
+  #     in busybox sh → verifier MUST be computed on the host by install.sh.
+  #   - install.sh has python3 on all supported runtimes (macOS/Linux).
+  #   - The entrypoint shim simplifies to: cp /run/secrets/pgbouncer_userlist
+  #     /etc/pgbouncer/userlist.txt && exec /entrypoint.sh pgbouncer ...
+  #     (no DATABASE_URL parsing, no busybox math — Captain scope).
+  #   - asyncpg>=0.29 supports SCRAM-SHA-256; asyncpg dropped MD5 with PG16.
+  #   - postgres pg_hba: scram-sha-256 clientcert=verify-ca on upstream leg.
+  #   - Full stack (asyncpg→pgbouncer, pgbouncer→postgres) all SCRAM-aligned.
+  #
+  # Laura threat model (laura-v234-pgbouncer-scram-threat-model.md §2.2):
+  #   - SCRAM verifier on disk is NOT the password; replay is not possible.
+  #   - PBKDF2 at 4096 iter + 16-byte random salt; 204-bit entropy is crack-proof.
+  #   - Mode 0640 chgrp 2002: same as postgres_password, redis_password, bearer.
+  #
+  # Both pgbouncer instances (yashigani + letta) use the same yashigani_app user
+  # with the same postgres_password; the [databases] section in pgbouncer.ini
+  # differentiates them. A single userlist file is sufficient.
+  #
+  # Algorithm (RFC 5802):
+  #   salt = os.urandom(16)
+  #   salted_password = PBKDF2_HMAC_SHA256(password, salt, 4096, dklen=32)
+  #   client_key = HMAC_SHA256(salted_password, "Client Key")
+  #   stored_key = SHA256(client_key)
+  #   server_key = HMAC_SHA256(salted_password, "Server Key")
+  #   verifier = "SCRAM-SHA-256$4096:<b64(salt)>$<b64(stored_key)>:<b64(server_key)>"
+  local _userlist_file="${secrets_dir}/pgbouncer_userlist"
+  if [[ ! -s "$_userlist_file" ]] || [[ "${REINSTALL:-false}" == "true" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      log_error "python3 required for SCRAM-SHA-256 verifier generation but not found in PATH"
+      return 1
+    fi
+    local _scram_verifier
+    _scram_verifier="$(YASHIGANI_PG_PW="${GEN_POSTGRES_PASSWORD}" python3 -c "
+import hashlib, hmac as _hmac, base64, os, sys
+password = os.environ['YASHIGANI_PG_PW'].encode()
+iterations = 4096
+salt = os.urandom(16)
+salted = hashlib.pbkdf2_hmac('sha256', password, salt, iterations, dklen=32)
+client_key = _hmac.new(salted, b'Client Key', hashlib.sha256).digest()
+stored_key = hashlib.sha256(client_key).digest()
+server_key = _hmac.new(salted, b'Server Key', hashlib.sha256).digest()
+b64 = base64.b64encode
+verifier = 'SCRAM-SHA-256\${iter}:{salt}\${stored}:{server}'.format(
+    iter=iterations,
+    salt=b64(salt).decode(),
+    stored=b64(stored_key).decode(),
+    server=b64(server_key).decode()
+)
+print('\"yashigani_app\" \"{}\"'.format(verifier))
+" 2>&1)"
+    # Validate format: must match SCRAM-SHA-256$<int>:<b64>$<b64>:<b64>
+    if ! printf '%s\n' "$_scram_verifier" | grep -qE '^"yashigani_app" "SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*"$'; then
+      log_error "SCRAM-SHA-256 verifier format validation failed — generated: ${_scram_verifier}"
+      return 1
+    fi
+    umask 027
+    printf "%s\n" "$_scram_verifier" > "$_userlist_file"
+    umask 077
+    chmod 0640 "$_userlist_file"
+    _do_chgrp "2002" "$_userlist_file" "pgbouncer_userlist" || return 1
+    log_info "Generated pgbouncer_userlist → ${_userlist_file} (SCRAM-SHA-256, mode 0640, chgrp 2002)"
+  else
+    log_info "pgbouncer_userlist already present — preserving (use REINSTALL=true to rotate)"
   fi
 
   # --- HIBP breach check on generated passwords (defense-in-depth) ---
