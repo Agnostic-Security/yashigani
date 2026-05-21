@@ -16,6 +16,8 @@ metadata:
 data:
   05-enable-ssl.sh: |
 {{ .Files.Get "files/postgres-05-enable-ssl.sh" | indent 4 }}
+  10-pgbouncer-auth.sh: |
+{{ .Files.Get "files/10-pgbouncer-auth.sh" | indent 4 }}
 ---
 apiVersion: v1
 kind: ConfigMap
