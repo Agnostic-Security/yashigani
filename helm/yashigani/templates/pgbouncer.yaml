@@ -54,9 +54,9 @@ spec:
               containerPort: 5432
               protocol: TCP
           # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
-          # edoburu /entrypoint.sh generates userlist.txt from DATABASE_URL (cleartext, plain mode).
-          # YSG-RISK-049 OPEN-MEDIUM interim: auth_type=plain — asyncpg 0.28+ dropped MD5;
-          # SCRAM-SHA-256 ships in Step 2 before push (Iris+Laura two-step plan).
+          # SCRAM-SHA-256 Step 2 (YSG-RISK-049 CLOSED): auth_file in pgbouncer.ini points
+          # to /run/secrets/pgbouncer_userlist (K8s Secret pgbouncer-auth-secret — see below).
+          # Option c: pgbouncer reads verifier directly; no cp shim; readOnlyRootFilesystem compatible.
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -73,7 +73,7 @@ spec:
             - name: DATABASE_URL
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
             - name: AUTH_TYPE
-              value: "plain"
+              value: "scram-sha-256"
             - name: POOL_MODE
               value: {{ .Values.pgbouncer.env.poolMode | quote }}
             - name: MAX_CLIENT_CONN
@@ -125,6 +125,15 @@ spec:
               mountPath: /etc/pgbouncer/pgbouncer.ini
               subPath: pgbouncer.ini
               readOnly: true
+            # SCRAM-SHA-256 Step 2 (YSG-RISK-049 CLOSED): pgbouncer_userlist mounted as a
+            # subPath into /run/secrets/ alongside the PKI certs volume. The pgbouncer.ini
+            # auth_file = /run/secrets/pgbouncer_userlist reads the SCRAM verifier directly.
+            # K8s Secret pgbouncer-auth-secret populated by install.sh output (operator provides
+            # via helm install --set-file pgbouncer.userlistContent=docker/secrets/pgbouncer_userlist).
+            - name: pgbouncer-auth
+              mountPath: /run/secrets/pgbouncer_userlist
+              subPath: pgbouncer_userlist
+              readOnly: true
           {{- end }}
       {{- if .Values.mtls.enabled }}
       volumes:
@@ -135,6 +144,10 @@ spec:
         - name: pgbouncer-config
           configMap:
             name: yashigani-pgbouncer-config
+        - name: pgbouncer-auth
+          secret:
+            secretName: {{ .Values.pgbouncer.authSecretName | default "yashigani-pgbouncer-auth" }}
+            defaultMode: 0440
       {{- end }}
 ---
 apiVersion: v1

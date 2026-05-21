@@ -1126,17 +1126,19 @@ services:
     dns_search: ["."]
     environment:
       DATABASE_URL: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/yashigani
-      # YSG-RISK-049 OPEN-MEDIUM interim: auth_type=plain — asyncpg 0.28+ dropped MD5
-      # protocol support; md5 interim (19ff55c) caused ProtocolViolationError crash-loop.
-      # Reverted to plain to unblock Ava E2E. SCRAM-SHA-256 ships in Step 2 before push.
-      # clientcert=verify-ca compensating control intact (see pgbouncer.ini).
-      AUTH_TYPE: plain
+      # YSG-RISK-049 CLOSED — SCRAM-SHA-256 Step 2 (Iris+Laura two-step plan).
+      # auth_file in pgbouncer.ini points to /run/secrets/pgbouncer_userlist (Su 8dd4c41).
+      # Verifier pre-computed by install.sh PKI block — no cleartext on disk.
+      # asyncpg 0.29+ supports SCRAM-SHA-256; full stack aligned (asyncpg→pgbouncer→postgres).
+      AUTH_TYPE: scram-sha-256
       POOL_MODE: transaction
       MAX_CLIENT_CONN: "100"
       DEFAULT_POOL_SIZE: "20"
     # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
-    # edoburu /entrypoint.sh generates userlist.txt from DATABASE_URL (cleartext, plain mode).
-    # No md5 hash computation — shim is minimal: exec the entrypoint with the ini path.
+    # SCRAM-SHA-256 Step 2: auth_file in pgbouncer.ini points to /run/secrets/pgbouncer_userlist
+    # (Option c — no cp shim; pgbouncer reads verifier directly from bind-mount; read_only-safe).
+    # edoburu entrypoint still generates /etc/pgbouncer/userlist.txt from DATABASE_URL — that
+    # file is unused; pgbouncer honours auth_file from pgbouncer.ini over the default.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -1622,17 +1624,19 @@ services:
     mem_limit: 64m
     cpus: 0.2
     environment:
-      # edoburu image uses DATABASE_URL to generate userlist.txt at startup.
+      # edoburu image uses DATABASE_URL to populate [databases] section at startup.
       # Points at the `letta` database (separate DB from yashigani — clean isolation).
       DATABASE_URL: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/letta
-      # YSG-RISK-049 OPEN-MEDIUM interim: auth_type=plain — same asyncpg MD5 regression
-      # as yashigani-pgbouncer; reverted to plain. SCRAM-SHA-256 ships in Step 2 before push.
-      AUTH_TYPE: plain
+      # YSG-RISK-049 CLOSED — SCRAM-SHA-256 Step 2 (Iris+Laura two-step plan).
+      # Same yashigani_app user as yashigani-pgbouncer; single pgbouncer_userlist file
+      # sufficient — [databases] section differentiates backends (Iris §81 / Laura §2.8).
+      AUTH_TYPE: scram-sha-256
       POOL_MODE: session
       MAX_CLIENT_CONN: "50"
       DEFAULT_POOL_SIZE: "20"
     # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
-    # edoburu /entrypoint.sh generates userlist.txt from DATABASE_URL (cleartext, plain mode).
+    # SCRAM-SHA-256 Step 2: auth_file in pgbouncer.ini points to /run/secrets/pgbouncer_userlist
+    # (Option c — no cp shim; pgbouncer reads verifier directly from bind-mount; read_only-safe).
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
