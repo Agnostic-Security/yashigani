@@ -3001,7 +3001,8 @@ load_airgap_bundle() {
   local verify_fails=0
   local verify_ok=0
 
-  # Extract all external images with digests from manifest using python3
+  # Extract all external images with digests (and optional id: field) from manifest.
+  # Emits: ref|digest|id  (id may be empty for pre-2B manifests — backwards-compat).
   local manifest_refs
   manifest_refs="$(python3 - "${manifest_file}" <<'PYEOF'
 import sys, re
@@ -3014,18 +3015,22 @@ current_profile = None
 current_image = {}
 in_images = False
 
+def flush(img, profile):
+    if img and profile:
+        src = img.get('source', 'external')
+        ref = img.get('ref', '')
+        digest = img.get('digest', '')
+        img_id = img.get('id', '')
+        if src == 'external' and ref and digest:
+            print(f"{ref}|{digest}|{img_id}")
+
 i = 0
 while i < len(lines):
     line = lines[i]
 
     m = re.match(r'^  (\w+):$', line)
     if m:
-        if current_image and current_profile:
-            src = current_image.get('source', 'external')
-            ref = current_image.get('ref', '')
-            digest = current_image.get('digest', '')
-            if src == 'external' and ref and digest:
-                print(f"{ref}|{digest}")
+        flush(current_image, current_profile)
         current_image = {}
         current_profile = m.group(1)
         in_images = False
@@ -3038,22 +3043,12 @@ while i < len(lines):
         continue
 
     if re.match(r'^profile_aliases:', line):
-        if current_image and current_profile:
-            src = current_image.get('source', 'external')
-            ref = current_image.get('ref', '')
-            digest = current_image.get('digest', '')
-            if src == 'external' and ref and digest:
-                print(f"{ref}|{digest}")
+        flush(current_image, current_profile)
         break
 
     if in_images and current_profile:
         if re.match(r'^      - name:', line):
-            if current_image:
-                src = current_image.get('source', 'external')
-                ref = current_image.get('ref', '')
-                digest = current_image.get('digest', '')
-                if src == 'external' and ref and digest:
-                    print(f"{ref}|{digest}")
+            flush(current_image, current_profile)
             current_image = {}
         m2 = re.match(r'^        (\w+): "?([^"#\n]*)"?', line)
         if not m2:
@@ -3065,8 +3060,11 @@ while i < len(lines):
 PYEOF
   2>/dev/null || echo "")"
 
+  # Counters: verify_ok = full match; verify_warn_no_id = old bundle, no id field
+  local verify_warn_no_id=0
+
   # Only verify images actually present in the local store (some profiles may not be in bundle)
-  while IFS='|' read -r ref expected_digest; do
+  while IFS='|' read -r ref expected_digest manifest_id; do
     [[ -z "$ref" || -z "$expected_digest" ]] && continue
 
     # Check if image was loaded (it may not be in this profile's bundle — skip if absent)
@@ -3078,7 +3076,7 @@ PYEOF
     fi
     [[ "$img_present" -eq 0 ]] && continue
 
-    # Get actual digest
+    # --- Primary path: RepoDigests (populated for registry-pulled images) ---
     local actual_digest=""
     actual_digest="$("$rt" inspect --format='{{index .RepoDigests 0}}' "${ref}" 2>/dev/null \
       | awk -F@ '{print $2}' || true)"
@@ -3087,17 +3085,44 @@ PYEOF
       actual_digest="$("$rt" inspect --format='{{.Digest}}' "${ref}" 2>/dev/null || true)"
     fi
 
-    if [[ -z "$actual_digest" ]]; then
-      log_warn "Cannot read digest for ${ref} — skipping verification (inspect returned empty)"
+    if [[ -n "$actual_digest" ]]; then
+      # Registry-pull path: compare RepoDigest against manifest digest field
+      if [[ "$actual_digest" == "$expected_digest" ]]; then
+        verify_ok=$((verify_ok + 1))
+      else
+        log_error "DIGEST MISMATCH: ${ref}"
+        log_error "  Manifest: ${expected_digest}"
+        log_error "  Loaded:   ${actual_digest}"
+        verify_fails=$((verify_fails + 1))
+      fi
       continue
     fi
 
-    if [[ "$actual_digest" == "$expected_digest" ]]; then
+    # --- Fallback path: image config .Id (populated for docker/podman load) ---
+    # YSG-RISK-038 / Iris Batch 2 item 2B: docker load does not populate
+    # RepoDigests; compare image config SHA-256 (.Id) against manifest id: field.
+    local actual_id=""
+    actual_id="$("$rt" inspect --format='{{.Id}}' "${ref}" 2>/dev/null || true)"
+
+    if [[ -z "$actual_id" ]]; then
+      log_warn "Cannot read digest or id for ${ref} — skipping verification (inspect returned empty)"
+      continue
+    fi
+
+    if [[ -z "$manifest_id" ]]; then
+      # Pre-2B manifest without id: field — warn and skip (backwards-compat).
+      # Primary integrity gate is bundle SHA256 (already verified above).
+      log_warn "manifest.yml has no id: field for ${ref} — regenerate bundle for full load-path verification"
+      verify_warn_no_id=$((verify_warn_no_id + 1))
+      continue
+    fi
+
+    if [[ "$actual_id" == "$manifest_id" ]]; then
       verify_ok=$((verify_ok + 1))
     else
-      log_error "DIGEST MISMATCH: ${ref}"
-      log_error "  Manifest: ${expected_digest}"
-      log_error "  Loaded:   ${actual_digest}"
+      log_error "IMAGE ID MISMATCH: ${ref}"
+      log_error "  Manifest id: ${manifest_id}"
+      log_error "  Loaded   id: ${actual_id}"
       verify_fails=$((verify_fails + 1))
     fi
   done <<< "$manifest_refs"
@@ -3109,6 +3134,9 @@ PYEOF
   fi
 
   log_success "Digest verification complete: ${verify_ok} image(s) verified"
+  if [[ "$verify_warn_no_id" -gt 0 ]]; then
+    log_warn "${verify_warn_no_id} image(s) skipped load-path id verification (pre-2B manifest — regenerate bundle to enable full verification)"
+  fi
   log_info "Air-gap: HIBP check disabled (--air-gap implies --no-hibp)"
   log_info "  If a breach is suspected, rotate all passwords after reinstating network access"
 }
@@ -5098,7 +5126,7 @@ for r in results:
     local init_script="${WORK_DIR}/scripts/init-openwebui-agents.py"
     if [[ -f "$init_script" ]]; then
       "${COMPOSE_CMD[@]}" "${compose_files[@]}" cp "$init_script" open-webui:/tmp/init-agents.py 2>/dev/null || \
-        podman cp "$init_script" docker_open-webui_1:/tmp/init-agents.py 2>/dev/null
+        podman cp "$init_script" docker_open-webui_1:/tmp/init-agents.py 2>/dev/null || true
       "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T open-webui python3 /tmp/init-agents.py 2>&1 || \
         podman exec docker_open-webui_1 python3 /tmp/init-agents.py 2>&1 || true
     fi
