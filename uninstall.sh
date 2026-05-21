@@ -182,14 +182,18 @@ EOF
     esac
 done
 
-# Detect runtime
+# Detect runtime — prefer Podman (mirrors install.sh auto-detect order).
+# Rationale: on dual-runtime hosts where the install was done via Podman, Docker
+# may also answer `docker info`, causing volume rm to target the wrong store.
+# The --runtime=docker|podman override (parsed above) wins because this block is
+# guarded by [ -z "$RUNTIME" ].
 if [ -z "$RUNTIME" ]; then
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        RUNTIME="docker"
-    elif command -v podman >/dev/null 2>&1; then
+    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
         RUNTIME="podman"
+    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        RUNTIME="docker"
     else
-        echo "ERROR: No container runtime found."
+        echo "ERROR: No container runtime found (tried podman, docker)." >&2
         exit 1
     fi
 fi
@@ -506,8 +510,78 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
             echo "  [removed] docker/secrets/* — directory preserved, contents wiped"
         else
             echo "  [WARN] sudo rm -rf docker/secrets/* failed — manual cleanup may be required" >&2
+            echo "  [WARN] On Podman rootless try: podman unshare rm -rf '${_secrets_dir}'" >&2
+            echo "  [WARN] (SIB-2D-01 / BACKLOG-V240-006: podman unshare path for secrets deferred to v2.24.0)" >&2
         fi
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# Bind-mount directory cleanup — chown-fallback (BACKLOG-V240-003)
+#
+# install.sh chowns docker/{data,certs,logs} to UID 1001 (or subuid-mapped
+# equivalent) so PKI/service containers can write to them.  After uninstall the
+# operator cannot `rm -rf` those dirs from the host without privilege
+# escalation (EPERM from non-root shell).
+#
+# Fix: attempt host-side rm -rf first; on failure use:
+#   Podman rootless → podman unshare rm -rf (no daemon root needed)
+#   Podman rootless fallback / Docker → ephemeral container (mirrors the
+#     cycle-3 install-side chown pattern at install.sh:_alpine_image,
+#     GO'd by Laura 2026-05-21).
+#
+# Alpine digest: SAME pin as install.sh _alpine_image variable.
+# CO-ROTATION NOTE (SIB-2D-02): when install.sh rotates the alpine digest,
+# update _ALPINE_IMAGE here in the same commit.
+# Search: grep -n "_ALPINE_IMAGE\|_alpine_image" uninstall.sh install.sh
+# ---------------------------------------------------------------------------
+if [ "$REMOVE_VOLUMES" = "true" ]; then
+    # Alpine digest — must match install.sh _alpine_image (SIB-2D-02 co-rotation)
+    _ALPINE_IMAGE="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+    echo "=== Bind-mount directory cleanup (BACKLOG-V240-003) ==="
+    for _bm_dir in \
+            "${SCRIPT_DIR}/docker/data" \
+            "${SCRIPT_DIR}/docker/certs" \
+            "${SCRIPT_DIR}/docker/logs"; do
+        [ -d "$_bm_dir" ] || { echo "  [skip] $_bm_dir (absent)"; continue; }
+        if rm -rf "$_bm_dir" 2>/dev/null; then
+            echo "  [removed] $_bm_dir"
+        else
+            echo "  [info]   $_bm_dir: host rm failed (likely chowned to UID 1001) — using container fallback"
+            if [ "$RUNTIME" = "podman" ]; then
+                # Podman rootless: unshare remaps UID into the user namespace so rm
+                # runs as the effective owner of the chowned files.
+                if podman unshare rm -rf "$_bm_dir" 2>/dev/null; then
+                    echo "  [removed] $_bm_dir (podman unshare)"
+                else
+                    # podman unshare also failed — fall back to ephemeral container.
+                    if podman run --rm \
+                           -v "${_bm_dir}:/t:rw" \
+                           "$_ALPINE_IMAGE" rm -rf /t 2>/dev/null \
+                       && rm -rf "$_bm_dir" 2>/dev/null; then
+                        echo "  [removed] $_bm_dir (podman container fallback)"
+                    else
+                        echo "  [WARN] Cannot remove $_bm_dir" >&2
+                        echo "  [WARN] Manual cleanup: podman unshare rm -rf '$_bm_dir'" >&2
+                    fi
+                fi
+            else
+                # Docker: run an ephemeral container as UID 1001 to rm contents,
+                # then host rm -rf drops the now-empty dir.
+                if "$RUNTIME" run --rm \
+                       -v "${_bm_dir}:/t" \
+                       --user 1001:1001 \
+                       "$_ALPINE_IMAGE" \
+                       sh -c 'rm -rf /t/*' 2>/dev/null \
+                   && rm -rf "$_bm_dir" 2>/dev/null; then
+                    echo "  [removed] $_bm_dir (docker container fallback)"
+                else
+                    echo "  [WARN] Cannot remove $_bm_dir" >&2
+                    echo "  [WARN] Manual cleanup: sudo rm -rf '$_bm_dir'" >&2
+                fi
+            fi
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
