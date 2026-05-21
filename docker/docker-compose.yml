@@ -1152,7 +1152,7 @@ services:
         export DB_PASSWORD="md5$${_hash}"
         unset DATABASE_URL
         echo "[yashigani-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
-        exec /entrypoint.sh
+        exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
@@ -1657,7 +1657,7 @@ services:
         export DB_PASSWORD="md5$${_hash}"
         unset DATABASE_URL
         echo "[letta-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
-        exec /entrypoint.sh
+        exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro
       - ./pgbouncer/pgbouncer-letta.ini:/etc/pgbouncer/pgbouncer.ini:ro

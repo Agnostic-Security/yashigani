@@ -68,7 +68,7 @@ spec:
               export DB_USER=yashigani_app
               export DB_PASSWORD="md5${_hash}"
               echo "[yashigani-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
-              exec /entrypoint.sh
+              exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
           env:
             # K8s $(VAR) interpolation only resolves FORWARD references — any var
             # that uses $(POSTGRES_PASSWORD) MUST be declared after it.

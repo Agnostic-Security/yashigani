@@ -1066,7 +1066,7 @@ agentBundles:
             export DB_USER=yashigani_app
             export DB_PASSWORD="md5${_hash}"
             echo "[letta-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
-            exec /entrypoint.sh
+            exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
         env:
           # edoburu image generates userlist.txt from DATABASE_URL at container start.
           # LETTA_PG_PASSWORD declared first — K8s $(VAR) forward-ref constraint.
