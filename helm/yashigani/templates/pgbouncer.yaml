@@ -53,21 +53,14 @@ spec:
             - name: pgbouncer
               containerPort: 5432
               protocol: TCP
-          # YSG-RISK-049 entrypoint shim: pre-set DB_USER + DB_PASSWORD=md5<hash>
-          # before /entrypoint.sh runs. POSTGRES_PASSWORD is already available from
-          # secretKeyRef — no DATABASE_URL parsing needed on K8s path (cleaner than
-          # Compose). edoburu entrypoint uses pre-set vars and writes hashed credential.
-          # Upstream leg (pgbouncer→postgres) uses the ini [databases] entry + TLS
-          # certs; scram-sha-256 pg_hba gate intact (auth_type controls client-facing
-          # auth only). Forward close: v2.24.0 auth_query pattern (BACKLOG-V240-003).
+          # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
+          # edoburu /entrypoint.sh generates userlist.txt from DATABASE_URL (cleartext, plain mode).
+          # YSG-RISK-049 OPEN-MEDIUM interim: auth_type=plain — asyncpg 0.28+ dropped MD5;
+          # SCRAM-SHA-256 ships in Step 2 before push (Iris+Laura two-step plan).
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -e
-              _hash=$(printf '%s' "${POSTGRES_PASSWORD}yashigani_app" | md5sum | cut -c1-32)
-              export DB_USER=yashigani_app
-              export DB_PASSWORD="md5${_hash}"
-              echo "[yashigani-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
               exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
           env:
             # K8s $(VAR) interpolation only resolves FORWARD references — any var
@@ -80,7 +73,7 @@ spec:
             - name: DATABASE_URL
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
             - name: AUTH_TYPE
-              value: "md5"
+              value: "plain"
             - name: POOL_MODE
               value: {{ .Values.pgbouncer.env.poolMode | quote }}
             - name: MAX_CLIENT_CONN
