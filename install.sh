@@ -5480,10 +5480,19 @@ _do_chown() {
   local _mount_base="${5:-}"
   [[ -n "$_mount_base" ]] || _mount_base="$_secrets_dir"
 
+  # Handle both "uid" (integer) and "uid:gid" (pair) input formats.
+  # When _uid is already a pair, use it verbatim; otherwise synthesise uid:uid.
+  local _chown_spec
+  if [[ "${_uid}" == *:* ]]; then
+    _chown_spec="${_uid}"
+  else
+    _chown_spec="${_uid}:${_uid}"
+  fi
+
   case "$_chown_mode" in
     direct)
-      if ! chown "${_uid}:${_uid}" "$_file"; then
-        log_error "chown ${_uid}:${_uid} failed on ${_label} — aborting (fix file ownership manually)"
+      if ! chown "${_chown_spec}" "$_file"; then
+        log_error "chown ${_chown_spec} failed on ${_label} — aborting (fix file ownership manually)"
         return 1
       fi
       if [[ -n "$_extra_chmod" ]]; then
@@ -5497,7 +5506,7 @@ _do_chown() {
       # gate #ROOTLESS-7 fallback: if podman unshare chown fails, attempt
       # podman_run ephemeral container before aborting.
       local _unshare_ok=0
-      if podman unshare chown "${_uid}:${_uid}" "$_file" 2>/dev/null; then
+      if podman unshare chown "${_chown_spec}" "$_file" 2>/dev/null; then
         _unshare_ok=1
         if [[ -n "$_extra_chmod" ]]; then
           if ! podman unshare chmod "$_extra_chmod" "$_file" 2>/dev/null; then
@@ -5512,7 +5521,7 @@ _do_chown() {
         # docker/secrets (e.g. check_installer_preflight with $_bm_dir) mount
         # the correct root. Mount point is /s (S7 convention).
         local _rel_file="${_file#"${_mount_base}/"}"
-        local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
+        local _container_cmd="chown ${_chown_spec} /s/${_rel_file}"
         if [[ -n "$_extra_chmod" ]]; then
           _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
         fi
@@ -5528,7 +5537,7 @@ _do_chown() {
     docker_run)
       # S5: bind _mount_base to /s (S7 convention — matches internal logic).
       local _rel_file="${_file#"${_mount_base}/"}"
-      local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
+      local _container_cmd="chown ${_chown_spec} /s/${_rel_file}"
       if [[ -n "$_extra_chmod" ]]; then
         _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
       fi
@@ -5548,7 +5557,7 @@ _do_chown() {
     podman_run)
       # S5: bind _mount_base to /s (S7 convention).
       local _rel_file="${_file#"${_mount_base}/"}"
-      local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
+      local _container_cmd="chown ${_chown_spec} /s/${_rel_file}"
       if [[ -n "$_extra_chmod" ]]; then
         _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
       fi
@@ -5929,20 +5938,18 @@ generate_secrets() {
     # at /run/secrets/pgbouncer_authenticator_password inside the container — NOT
     # GID-2002 bind-mount. YSG-SECRETS-DIST-002 blast radius unchanged.
     #
-    # NOTE: _do_chown symmetric mode (uid:uid) is used here; asymmetric uid:gid
-    # (70:0) is not yet supported by _do_chown (latent V240-002 bug — all dispatch
-    # branches emit "chown uid:gid:uid:gid" when called with a uid:gid pair).
-    # UID 70:70 ownership is functionally equivalent for Docker secrets because the
-    # daemon reads the file as root. Surfaced to Maxine for V240-002 follow-up.
+    # _do_chown now handles uid:gid pairs natively (V240-002 follow-up fix).
+    # Correct ownership is 70:0 (pgbouncer uid, root gid) — pgbouncer reads
+    # the file as UID 70; root GID ensures daemon-level access if needed.
     local _pgba_file="${secrets_dir}/pgbouncer_authenticator_password"
     if [[ ! -s "$_pgba_file" ]]; then
       local _pgba_pw
       _pgba_pw="$(_gen_password)"
       printf "%s" "$_pgba_pw" > "$_pgba_file"
       chmod 0600 "$_pgba_file"
-      _do_chown "70" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
+      _do_chown "70:0" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
       _do_chmod_0640 "$_pgba_file" "pgbouncer_authenticator_password" || true
-      log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640 uid 70, upgrade path)"
+      log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640 uid 70:0, upgrade path)"
     else
       log_info "pgbouncer_authenticator_password already present — preserving (upgrade path)"
     fi
@@ -6175,20 +6182,17 @@ generate_secrets() {
   # at /run/secrets/pgbouncer_authenticator_password inside the container — NOT
   # GID-2002 bind-mount. YSG-SECRETS-DIST-002 blast radius unchanged.
   #
-  # NOTE: _do_chown symmetric mode is used (uid:uid → 70:70); the brief requested
-  # 70:0 but _do_chown cannot handle asymmetric uid:gid pairs — all dispatch
-  # branches emit "chown uid:gid:uid:gid" which fails (latent V240-002 bug,
-  # surfaced to Maxine). UID 70:70 is functionally equivalent for Docker secrets
-  # because the daemon reads the file as root. Follow-up: fix _do_chown.
+  # _do_chown now handles uid:gid pairs natively (V240-002 follow-up fix).
+  # Correct ownership is 70:0 (pgbouncer uid, root gid).
   local _pgba_file="${secrets_dir}/pgbouncer_authenticator_password"
   if [[ ! -s "$_pgba_file" ]]; then
     local _pgba_pw
     _pgba_pw="$(_gen_password)"
     printf "%s" "$_pgba_pw" > "$_pgba_file"
     chmod 0600 "$_pgba_file"
-    _do_chown "70" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
+    _do_chown "70:0" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
     _do_chmod_0640 "$_pgba_file" "pgbouncer_authenticator_password" || true
-    log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640, uid 70)"
+    log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640, uid 70:0)"
   else
     log_info "pgbouncer_authenticator_password already present — preserving (use --remove-volumes to rotate)"
   fi
