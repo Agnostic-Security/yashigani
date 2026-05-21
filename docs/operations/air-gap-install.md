@@ -97,8 +97,8 @@ The builder will:
 Output:
 
 ```
-yashigani-airgap-v2.23.3-core.tar.zst     (the bundle — transfer this)
-yashigani-airgap-v2.23.3-core.manifest    (sidecar — transfer this)
+yashigani-airgap-v2.23.4-core.tar.zst     (the bundle — transfer this)
+yashigani-airgap-v2.23.4-core.manifest    (sidecar — transfer this)
 ```
 
 ---
@@ -109,18 +109,19 @@ Transfer the following files via removable media, secure file transfer, or
 whichever out-of-band method your security policy permits:
 
 ```
-yashigani-airgap-v2.23.3-core.tar.zst
-yashigani-airgap-v2.23.3-core.manifest
+yashigani-airgap-v2.23.4-core.tar.zst
+yashigani-airgap-v2.23.4-core.manifest
 install.sh
 airgap/manifest.yml
+config/
 ```
 
 **Verify the bundle before installation** (optional but recommended):
 
 ```bash
 # The expected SHA256 is in the sidecar .manifest file
-grep "Bundle SHA256" yashigani-airgap-v2.23.3-core.manifest
-sha256sum yashigani-airgap-v2.23.3-core.tar.zst
+grep "Bundle SHA256" yashigani-airgap-v2.23.4-core.manifest
+sha256sum yashigani-airgap-v2.23.4-core.tar.zst
 ```
 
 ---
