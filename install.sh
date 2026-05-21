@@ -3309,10 +3309,12 @@ _fix_config_perms() {
   #
   # NOTE: docker/letta-runtime/openapi_letta.json is :rw (not :ro).
   # WARNING: The letta container WRITES this file at runtime (app.py:162).
-  #          Write access depends on the container running as UID 0 (root).
-  #          If a user: directive is ever added to the letta service definition,
-  #          the write WILL fail silently — review at that time.
-  #          (A3 / Iris §2 Issue B / iris-install-umask-design-review.md 2026-05-20)
+  #          Write access requires o+w on the host file because cap_drop:ALL removes
+  #          CAP_DAC_OVERRIDE. UID 0 alone is insufficient without DAC_OVERRIDE — the
+  #          file must have the other-write bit set (mode 0666). Step 8e sets this
+  #          unconditionally on every install/reinstall. Non-secret, non-executable.
+  #          (A3 / Iris §2 / iris-letta-openapi-write-design-review.md 2026-05-21
+  #           / laura-letta-openapi-0666-threat-model.md 2026-05-21)
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
@@ -7950,23 +7952,29 @@ main() {
       fi
     done
 
-    # Step 8e: Pre-create letta-runtime bind-mount host files.
+    # Step 8e: Pre-create letta-runtime bind-mount host files and set mode 0666.
     # docker-compose.yml mounts ./letta-runtime/openapi_letta.json:/app/openapi_letta.json:rw
     # as a single-file bind mount so letta can write openapi_letta.json (app.py:162)
     # while the rootfs remains read_only:true. Docker requires the host-side path to exist
     # as a FILE before bind-mounting (if it doesn't exist, Docker creates a directory at
     # that path, causing letta startup to fail with IsADirectoryError).
-    # This only creates the file when the letta profile is active.
+    # Mode 0666 is required: cap_drop:ALL removes CAP_DAC_OVERRIDE, so UID 0 inside
+    # the container cannot write a file it does not own unless the other-write bit is set.
+    # The file contains only an OpenAPI schema (non-secret, non-executable). chmod 0666
+    # is applied unconditionally (idempotent on reinstall; survives _fix_config_perms o+rX
+    # sweep unchanged). See iris-letta-openapi-write-design-review.md (2026-05-21) and
+    # laura-letta-openapi-0666-threat-model.md (2026-05-21) for full rationale.
+    # This block only runs when the letta profile is active.
     if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^letta$"; then
       local _letta_rt_dir="${WORK_DIR}/docker/letta-runtime"
       local _letta_openapi="${_letta_rt_dir}/openapi_letta.json"
       if [[ ! -d "$_letta_rt_dir" ]]; then
         mkdir -p "$_letta_rt_dir" || log_warn "Could not create letta-runtime dir — letta openapi bind-mount may fail"
       fi
-      if [[ ! -f "$_letta_openapi" ]]; then
-        touch "$_letta_openapi" || log_warn "Could not create letta-runtime/openapi_letta.json placeholder — letta openapi bind-mount may fail"
-        log_info "Created letta-runtime/openapi_letta.json bind-mount placeholder"
-      fi
+      touch "$_letta_openapi" 2>/dev/null || true
+      chmod 0666 "$_letta_openapi" \
+        || log_warn "Could not chmod 0666 letta-runtime/openapi_letta.json — letta openapi bind-mount may fail"
+      log_info "letta-runtime/openapi_letta.json placeholder: mode 0666 (DAC_OVERRIDE-free write)"
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load
