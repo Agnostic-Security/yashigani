@@ -1126,10 +1126,33 @@ services:
     dns_search: ["."]
     environment:
       DATABASE_URL: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/yashigani
-      AUTH_TYPE: plain
+      # YSG-RISK-049 interim close: auth_type=md5 causes pgbouncer to issue MD5
+      # challenge to clients. userlist.txt holds hashed credential (not cleartext).
+      AUTH_TYPE: md5
       POOL_MODE: transaction
       MAX_CLIENT_CONN: "100"
       DEFAULT_POOL_SIZE: "20"
+    # YSG-RISK-049 entrypoint shim: pre-set DB_USER + DB_PASSWORD=md5<hash> before
+    # /entrypoint.sh runs. edoburu entrypoint uses pre-set vars directly (skips
+    # DATABASE_URL parsing) and writes "yashigani_app" "md5<hash>" to userlist.txt.
+    # DATABASE_URL is unset after hash computation — [databases] section is already
+    # complete in the bind-mounted pgbouncer.ini (no fallback to DATABASE_URL needed).
+    # Upstream leg (pgbouncer→postgres) uses the ini [databases] entry + TLS certs,
+    # not DATABASE_URL — scram-sha-256 pg_hba gate is preserved end-to-end.
+    # Note: $$ escaping is required for compose-level variable interpolation safety;
+    # the shell inside the container receives single $.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        _user=$$(printf '%s' "$$DATABASE_URL" | sed 's|.*://\([^:]*\):.*|\1|')
+        _pass=$$(printf '%s' "$$DATABASE_URL" | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+        _hash=$$(printf '%s' "$${_pass}$${_user}" | md5sum | cut -c1-32)
+        export DB_USER="$$_user"
+        export DB_PASSWORD="md5$${_hash}"
+        unset DATABASE_URL
+        echo "[yashigani-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
+        exec /entrypoint.sh
     volumes:
       - ./secrets:/run/secrets:ro
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
@@ -1613,10 +1636,28 @@ services:
       # edoburu image uses DATABASE_URL to generate userlist.txt at startup.
       # Points at the `letta` database (separate DB from yashigani — clean isolation).
       DATABASE_URL: postgresql://yashigani_app:${POSTGRES_PASSWORD}@postgres:5432/letta
-      AUTH_TYPE: plain
+      # YSG-RISK-049 interim close: auth_type=md5 causes pgbouncer to issue MD5
+      # challenge to clients. userlist.txt holds hashed credential (not cleartext).
+      AUTH_TYPE: md5
       POOL_MODE: session
       MAX_CLIENT_CONN: "50"
       DEFAULT_POOL_SIZE: "20"
+    # YSG-RISK-049 entrypoint shim — identical pattern to yashigani-pgbouncer above.
+    # DATABASE_URL unset after hash computation; [databases] section is complete in
+    # the bind-mounted pgbouncer-letta.ini (host=postgres dbname=letta, no password).
+    # Note: $$ escaping required for compose variable interpolation safety.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        _user=$$(printf '%s' "$$DATABASE_URL" | sed 's|.*://\([^:]*\):.*|\1|')
+        _pass=$$(printf '%s' "$$DATABASE_URL" | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+        _hash=$$(printf '%s' "$${_pass}$${_user}" | md5sum | cut -c1-32)
+        export DB_USER="$$_user"
+        export DB_PASSWORD="md5$${_hash}"
+        unset DATABASE_URL
+        echo "[letta-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
+        exec /entrypoint.sh
     volumes:
       - ./secrets:/run/secrets:ro
       - ./pgbouncer/pgbouncer-letta.ini:/etc/pgbouncer/pgbouncer.ini:ro

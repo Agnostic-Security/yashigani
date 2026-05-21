@@ -53,13 +53,25 @@ spec:
             - name: pgbouncer
               containerPort: 5432
               protocol: TCP
+          # YSG-RISK-049 entrypoint shim: pre-set DB_USER + DB_PASSWORD=md5<hash>
+          # before /entrypoint.sh runs. POSTGRES_PASSWORD is already available from
+          # secretKeyRef — no DATABASE_URL parsing needed on K8s path (cleaner than
+          # Compose). edoburu entrypoint uses pre-set vars and writes hashed credential.
+          # Upstream leg (pgbouncer→postgres) uses the ini [databases] entry + TLS
+          # certs; scram-sha-256 pg_hba gate intact (auth_type controls client-facing
+          # auth only). Forward close: v2.24.0 auth_query pattern (BACKLOG-V240-003).
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              _hash=$(printf '%s' "${POSTGRES_PASSWORD}yashigani_app" | md5sum | cut -c1-32)
+              export DB_USER=yashigani_app
+              export DB_PASSWORD="md5${_hash}"
+              echo "[yashigani-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
+              exec /entrypoint.sh
           env:
             # K8s $(VAR) interpolation only resolves FORWARD references — any var
-            # that uses $(POSTGRES_PASSWORD) MUST be declared after it. The
-            # edoburu/pgbouncer entrypoint extracts the password from
-            # DATABASE_URL into userlist.txt; if the literal "$(POSTGRES_PASSWORD)"
-            # leaks in, password auth fails on every connect (internal K8s integration
-            # evidence).
+            # that uses $(POSTGRES_PASSWORD) MUST be declared after it.
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -68,7 +80,7 @@ spec:
             - name: DATABASE_URL
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
             - name: AUTH_TYPE
-              value: "plain"
+              value: "md5"
             - name: POOL_MODE
               value: {{ .Values.pgbouncer.env.poolMode | quote }}
             - name: MAX_CLIENT_CONN

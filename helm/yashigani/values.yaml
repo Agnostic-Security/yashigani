@@ -1053,8 +1053,23 @@ agentBundles:
           readOnlyRootFilesystem: false
           capabilities:
             drop: ["ALL"]
+        # YSG-RISK-049 entrypoint shim: pre-set DB_USER + DB_PASSWORD=md5<hash>
+        # before /entrypoint.sh runs. LETTA_PG_PASSWORD sourced from secretKeyRef;
+        # K8s $(VAR) forward-ref resolves it before DATABASE_URL is built.
+        # Upstream leg (pgbouncer→postgres) uses the ini [databases] entry + TLS certs.
+        # Forward close: v2.24.0 auth_query pattern (BACKLOG-V240-003).
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            _hash=$(printf '%s' "${LETTA_PG_PASSWORD}yashigani_app" | md5sum | cut -c1-32)
+            export DB_USER=yashigani_app
+            export DB_PASSWORD="md5${_hash}"
+            echo "[letta-pgbouncer-init] userlist.txt written with md5-hashed credential (YSG-RISK-049)" >&2
+            exec /entrypoint.sh
         env:
           # edoburu image generates userlist.txt from DATABASE_URL at container start.
+          # LETTA_PG_PASSWORD declared first — K8s $(VAR) forward-ref constraint.
           - name: LETTA_PG_PASSWORD
             valueFrom:
               secretKeyRef:
@@ -1063,7 +1078,7 @@ agentBundles:
           - name: DATABASE_URL
             value: "postgresql://yashigani_app:$(LETTA_PG_PASSWORD)@yashigani-postgres:5432/letta"
           - name: AUTH_TYPE
-            value: "plain"
+            value: "md5"
           - name: POOL_MODE
             value: "session"
           - name: MAX_CLIENT_CONN
