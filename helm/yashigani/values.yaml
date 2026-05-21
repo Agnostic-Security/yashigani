@@ -1238,9 +1238,25 @@ pgbouncer:
     poolMode: transaction
     maxClientConn: "100"
     defaultPoolSize: "20"
-  # auth_type=plain (YSG-RISK-049 ACCEPTED-LOW non-KMS-only — Tiago directive 2026-05-21).
-  # No pgbouncer-auth Secret required. KMS-configured deployments bypass on-disk
-  # cleartext entirely via src/yashigani/kms/.
+  # ---------------------------------------------------------------------------
+  # YSG-RISK-049 CLOSED v2.24.0 — auth_query credential (Amendments A2+C6)
+  # ---------------------------------------------------------------------------
+  # authSecretName: Name of the K8s Secret containing pgbouncer_authenticator_password.
+  #   Default: "" (secrets.yaml auto-generates yashigani-pgbouncer-auth-secret).
+  #   Override: set to an operator-provisioned or ExternalSecret-backed Secret name.
+  #   The Secret MUST contain key: pgbouncer_authenticator_password
+  #   Option C isolation: dedicated Secret, NOT merged into yashigani-postgres-secrets.
+  #   See secrets.yaml comment block for full provisioning instructions.
+  authSecretName: ""
+  # authNetworkCidr: CIDR of the compose `data` internal Docker bridge network.
+  #   Used by Tom's 10-pgbouncer-auth.sh (postgres init) to scope the pg_hba
+  #   carveout rule for pgbouncer_authenticator (Amendment A2 — no clientcert).
+  #   Compose: Docker assigns this dynamically; default bridge range is 172.20.0.0/16.
+  #   Tom: grep the actual subnet from `docker network inspect yashigani_data`
+  #   after compose up, or use this default if the compose data network is unassigned.
+  #   K8s: use the cluster pod CIDR (e.g. 10.244.0.0/16 for flannel, 192.168.0.0/16
+  #   for Calico). Tom's Helm init ConfigMap substitutes this value.
+  authNetworkCidr: "172.20.0.0/16"
 
 # ---------------------------------------------------------------------------
 # Partition maintenance CronJob — DB partition pre-creation (runs monthly)
