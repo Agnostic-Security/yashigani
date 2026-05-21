@@ -2,7 +2,30 @@
 SPIFFE URI ACL gate — application-layer identity check for service-to-service
 callers.
 
-Last updated: 2026-04-30T04:30:00+01:00
+Last updated: 2026-05-21T00:00:00+01:00 (V240-001: remove peer_cert dual-resolution — architecture-accepted)
+
+Architectural decision (V240-001, 2026-05-21)
+----------------------------------------------
+``scope["extensions"]["tls"]["peer_cert"]`` is NOT populated by any production-grade
+ASGI server (uvicorn, granian, hypercorn) — confirmed by Tom spike 2026-05-21.
+The ``x-spiffe-id-peer-cert`` dual-resolution preference path (previously: prefer
+peer-cert header over Caddy-set header) has been removed.  The sole SPIFFE
+identity source is the Caddy-injected ``X-SPIFFE-ID`` header.
+
+Trust model: ``X-SPIFFE-ID`` on the Caddy-proxied path is trustworthy because:
+1. Caddy strips any inbound ``X-SPIFFE-ID`` at the client→Caddy hop.
+2. Caddy re-injects from ``{http.request.tls.client.san.uris.0}`` (validated
+   TLS peer cert URI SAN).
+3. ``SpiffePeerCertMiddleware`` (Option C) AND-couples header preservation with
+   a valid ``X-Caddy-Verified-Secret`` HMAC — without the HMAC secret the header
+   is stripped before this gate runs.
+4. This ACL gate enforces an endpoint-level allow-list from
+   ``service_identities.yaml``.
+
+The install.sh direct-path injection (``X-SPIFFE-ID: spiffe://yashigani.internal/backoffice``)
+is trustworthy because install.sh runs inside the backoffice container (the
+only entity holding backoffice_client.crt) and because the HMAC check is
+enforced before this gate via ``CaddyVerifiedMiddleware`` Layer B.
 
 Threat model and trust boundary
 -------------------------------
@@ -73,24 +96,20 @@ _CACHE_LOCK = Lock()
 
 _DEFAULT_MANIFEST_PATH = "/etc/yashigani/service_identities.yaml"
 
-# Two header names — both lower-case (FastAPI lowercases on lookup):
+# Sole identity header — both lower-case (FastAPI lowercases on lookup):
 #
-# `x-spiffe-id-peer-cert` is the SERVER-CONTROLLED header injected by
-# `SpiffePeerCertMiddleware` from the validated TLS peer cert URI SAN.
-# It cannot be forged by the HTTP client. Used on the direct-mesh path
-# (peer connects straight to gateway:8080 / backoffice:8443).
-#
-# `x-spiffe-id` is the CADDY-SET header on the Caddy-proxied path
-# (Caddy validates the peer cert and re-emits the URI SAN here).
+# `x-spiffe-id` is the CADDY-SET header on the Caddy-proxied path.
+# Caddy validates the peer cert and re-emits the URI SAN here.
 # Caddy strips any inbound `x-spiffe-id` before setting its own value,
-# so on the Caddy-proxied path this is also trustworthy.
+# so on the Caddy-proxied path this is trustworthy.
 #
-# Resolution rule (same as gateway/openai_router.py:_resolve_identity at
-# `a054877` — Internal F-1B EX-231-10 closure 2026-04-29 for the backoffice leg):
-# prefer the peer-cert header when present, fall back to the Caddy-set
-# header. This closes the LF-SPIFFE-FORGE bypass uniformly across both
-# `/internal/metrics` consumers (gateway proxy.py:166 + backoffice app.py:488).
-_HEADER_NAME_PEER_CERT = "x-spiffe-id-peer-cert"
+# `x-spiffe-id-peer-cert` (previously: server-controlled peer-cert header
+# from SpiffePeerCertMiddleware) is still STRIPPED and overwritten to an
+# empty byte string by SpiffePeerCertMiddleware — but it is no longer read
+# here.  The peer_cert ASGI extension is permanently absent on all production
+# ASGI servers (Tom V240-001 spike 2026-05-21: uvicorn 0.47.0 / granian 2.7.4 /
+# hypercorn 0.18.0 — all FAIL the peer_cert gate).  YSG-RISK-047 closed as
+# ARCHITECTURE-ACCEPTED.  Caddy-mediated identity is the architectural answer.
 _HEADER_NAME = "x-spiffe-id"
 _DEFAULT_TTL_SECONDS = 60
 
@@ -265,39 +284,26 @@ def require_spiffe_id(path: str) -> Callable[[Request], Coroutine[Any, Any, str]
                 detail="no_acl_for_path",
             )
 
-        # Prefer the server-controlled peer-cert header (direct-mesh path,
-        # set by SpiffePeerCertMiddleware from the validated TLS handshake).
-        # Fall back to the Caddy-set header (Caddy-proxied path; Caddy strips
-        # inbound x-spiffe-id at the client→Caddy hop and re-sets it from
-        # {http.request.tls.client.san.uris.0} at the Caddy→upstream hop —
-        # SpiffePeerCertMiddleware does NOT see the Caddy-injected header
-        # because it runs on the upstream side, after Caddy injects it).
-        # Internal F-1B EX-231-10 (2026-04-29). LAURA-V232-002 (2026-04-30).
+        # Sole identity source: Caddy-set x-spiffe-id header.
         #
-        # LAURA-V232-002 defence-in-depth note: SpiffePeerCertMiddleware now
-        # strips client-supplied x-spiffe-id before route handlers run, so
-        # any x-spiffe-id present here was injected by Caddy (trusted).
-        # A direct-mesh attacker who supplies a forged X-SPIFFE-ID has it
-        # stripped by the middleware — the forge never reaches this gate.
-        peer_cert_uri = request.headers.get(_HEADER_NAME_PEER_CERT)
-        caddy_uri = request.headers.get(_HEADER_NAME)
-        caller = peer_cert_uri or caddy_uri
-        if peer_cert_uri:
-            # Direct-mesh path — ASGI TLS extension extracted by middleware.
-            pass
-        elif caddy_uri:
-            # Caddy-proxied path — header injected by Caddy after peer cert
-            # validation.  Log at DEBUG so operators can trace the path taken.
-            logger.debug(
-                "spiffe-gate: using Caddy-set x-spiffe-id for path=%s caller=%r "
-                "(peer_cert extension absent — Caddy-proxied path)",
-                path, caddy_uri,
-            )
+        # Caddy validates the peer cert and injects this header from
+        # {http.request.tls.client.san.uris.0}; Caddy strips any inbound
+        # x-spiffe-id before setting its own value — a co-tenant cannot forge.
+        #
+        # SpiffePeerCertMiddleware (Option C) AND-couples header preservation
+        # with a valid X-Caddy-Verified-Secret HMAC, so a direct-mesh attacker
+        # without the HMAC secret has x-spiffe-id stripped before reaching here.
+        #
+        # The x-spiffe-id-peer-cert dual-resolution path (previously preferred
+        # over x-spiffe-id) has been REMOVED.  No ASGI server populates the
+        # peer_cert TLS extension (V240-001 spike, 2026-05-21); that header is
+        # always empty.  YSG-RISK-047 closed as ARCHITECTURE-ACCEPTED.
+        caller = request.headers.get(_HEADER_NAME)
         if not caller:
             logger.warning(
                 "spiffe-gate: 401 no_spiffe_id for path=%s — "
-                "both x-spiffe-id-peer-cert and x-spiffe-id absent "
-                "(direct-mesh with no TLS extension or stripped forge attempt)",
+                "x-spiffe-id absent (Caddy-proxied path: Caddy HMAC check failed "
+                "or request did not transit Caddy)",
                 path,
             )
             raise HTTPException(

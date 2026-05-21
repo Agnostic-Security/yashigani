@@ -3,6 +3,7 @@
 <!-- last-updated: 2026-05-16T18:30:00+01:00 (v2.23.4: draft [Unreleased] entry covering 62 commits since v2.23.3) -->
 <!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
+<!-- last-updated: 2026-05-21T00:00:00+01:00 (v2.24.0: V240-001 Option (e) — remove SpiffePeerCertMiddleware._get_peer_cert_uri() dead-code path; YSG-RISK-047 closed-architecture-accepted) -->
 <!-- last-updated: 2026-05-11T22:00:00+01:00 (v2.23.3 GA — flip [Unreleased] block to [v2.23.3]) -->
 
 # Changelog
@@ -12,6 +13,28 @@ All notable changes to Yashigani are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 For full release narratives, design rationale, and per-feature detail, see [`README.md`](README.md) section 4 (Security Features by Version).
+
+---
+
+## [Unreleased] — v2.24.0
+
+### Changed
+
+- **Remove `SpiffePeerCertMiddleware._get_peer_cert_uri()` dead-code path (V240-001 Option e).**
+  Tom spike 2026-05-21 confirmed no production-grade ASGI server (uvicorn 0.47.0,
+  granian 2.7.4, hypercorn 0.18.0) populates `scope["extensions"]["tls"]["peer_cert"]`.
+  Granian terminates TLS in Rust (Rustls) — the Python ssl layer is inaccessible by design.
+  Hypercorn mTLS is broken on Python 3.14 (connection reset on every `CERT_REQUIRED`
+  connection).  The ASGI server swap slot is definitively the wrong architectural slot for
+  this problem.  `_get_peer_cert_uri()` and the `x-spiffe-id-peer-cert` dual-resolution
+  preference in `require_spiffe_id()` and `openai_router._resolve_identity()` have been
+  removed.  Caddy-mediated identity injection with HMAC-AND-SPIFFE coupling (Tom Option C,
+  v2.23.4) is the permanent architectural answer.  YSG-RISK-047 closed as
+  `CLOSED-ARCHITECTURE-ACCEPTED`.  Caddy-only edge (remove direct-TLS listeners entirely)
+  deferred to v2.25.0 as BACKLOG-V240-001-renamed; prerequisite: install.sh Caddy-health
+  gate before `https://localhost:8443/admin/agents` call.
+  References: Iris post-spike reframe 2026-05-21; Laura post-spike threat-model 2026-05-21;
+  Tom V240-001 spike 2026-05-21; Tiago decision 2026-05-21.
 
 ---
 
@@ -532,12 +555,13 @@ on triage; the cleanup-system architectural class fully closed.
   userlist.txt cleartext — non-KMS deployment posture; production KMS path
   bypasses). YSG-SECRETS-DIST-002 (GID 2002 cross-secret-read — forward-close
   v2.24.0 per-consumer creds).
-- **Forward-tracked to v2.24.0 backlog** (explicit Tiago sign-off + named
+- **Forward-tracked to v2.24.0+ backlog** (explicit Tiago sign-off + named
   forward-close target per `feedback_debt_before_features` rule):
-  BACKLOG-V240-001 (uvicorn → granian/hypercorn ASGI swap, closes
-  YSG-RISK-012b + YSG-RISK-047 + YSG-RISK-013 partial; Iris+Laura
-  second-opinion validated 3-5 days realistic effort), BACKLOG-V240-002
-  (`_do_chown` top-level shared helper refactor).
+  BACKLOG-V240-001-renamed (Caddy-only edge — remove direct-TLS listeners from
+  backoffice/gateway; prerequisite: install.sh Caddy-health gate; target v2.25.0
+  — ASGI swap thesis closed by Tom V240-001 spike 2026-05-21: no ASGI server
+  exposes peer_cert; YSG-RISK-047 closed-architecture-accepted in v2.24.0),
+  BACKLOG-V240-002 (`_do_chown` top-level shared helper refactor).
 
 ---
 

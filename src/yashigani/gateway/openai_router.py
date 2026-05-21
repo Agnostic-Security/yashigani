@@ -1372,41 +1372,32 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                 return None
             # V10.3.5 — sender-constrained token check (LF-SPIFFE-FORGE fix).
             # When the identity has a bound_spiffe_uri set, the bearer key is
-            # SPIFFE-URI-bound.  The SPIFFE URI is resolved in priority order:
+            # SPIFFE-URI-bound.  The SPIFFE URI is read from X-SPIFFE-ID, which
+            # is the sole Caddy-mediated identity source (V240-001, 2026-05-21).
             #
-            #   1. X-SPIFFE-ID-Peer-Cert (set by SpiffePeerCertMiddleware from
-            #      the actual TLS handshake peer cert URI SAN — cannot be forged
-            #      by the client even on a direct-to-gateway connection).
-            #   2. X-SPIFFE-ID (set by Caddy from the peer cert when the request
-            #      is routed through Caddy; Caddy strips any inbound value first).
+            # X-SPIFFE-ID is set by Caddy from {http.request.tls.client.san.uris.0}
+            # after Caddy strips any inbound value; it is AND-coupled with a valid
+            # X-Caddy-Verified-Secret HMAC by SpiffePeerCertMiddleware (Option C)
+            # before this route handler runs.
             #
-            # The Caddy path (2) is the normal path for external callers.
-            # The direct-gateway path (1) covers internal-mesh peers that bypass
-            # Caddy — those connections must present their OWN cert, so the
-            # middleware extracts the real URI from the handshake.
-            #
-            # LF-SPIFFE-FORGE threat: a compromised internal peer connects
-            # directly to gateway:8080 and sets X-SPIFFE-ID: <stolen bound_uri>.
-            # Without the middleware, only check (2) runs and the stolen header
-            # passes.  With the middleware, check (1) runs first — the peer's
-            # OWN cert URI SAN (e.g. spiffe://…/wazuh-agent) replaces the
-            # forged header, and the binding check rejects the mismatch.
+            # The X-SPIFFE-ID-Peer-Cert preference path has been removed:
+            # no ASGI server populates scope["extensions"]["tls"]["peer_cert"]
+            # (Tom V240-001 spike 2026-05-21 — uvicorn/granian/hypercorn all
+            # FAIL).  That header is always empty.  YSG-RISK-047 closed as
+            # ARCHITECTURE-ACCEPTED.
             #
             # If no binding is set (empty string) the check is skipped —
             # community agents and Open WebUI internal traffic are unaffected.
             bound_uri = identity.get("bound_spiffe_uri", "")
             if bound_uri:
-                # Prefer the server-extracted cert URI (cryptographically bound).
-                peer_cert_uri = request.headers.get("x-spiffe-id-peer-cert", "")
-                presented_uri = peer_cert_uri if peer_cert_uri else request.headers.get("X-SPIFFE-ID", "")
+                presented_uri = request.headers.get("X-SPIFFE-ID", "")
                 if presented_uri != bound_uri:
                     # Fail-closed: stolen/replayed token without matching cert.
                     import logging as _logging
                     _logging.getLogger(__name__).warning(
                         "V10.3.5 LF-SPIFFE-FORGE: SPIFFE-URI mismatch for identity %s — "
-                        "bound=%r presented=%r (peer_cert=%r x-spiffe-id=%r) — rejecting",
+                        "bound=%r presented=%r (x-spiffe-id=%r) — rejecting",
                         identity.get("identity_id"), bound_uri, presented_uri,
-                        peer_cert_uri,
                         request.headers.get("X-SPIFFE-ID", ""),
                     )
                     return None

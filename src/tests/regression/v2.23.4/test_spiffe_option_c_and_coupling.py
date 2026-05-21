@@ -17,6 +17,11 @@ Positive path also tested:
   C. Valid HMAC + valid x-spiffe-id → header preserved → require_spiffe_id()
      passes (simulates Caddy-proxied path).
 
+V240-001 architecture-accepted regression guards (added 2026-05-21):
+  D. _get_peer_cert_uri() is ABSENT from SpiffePeerCertMiddleware — the method
+     was dead code (no ASGI server populates peer_cert); its presence created
+     false security confidence.  An assertion guards against re-introduction.
+
 All tests are pure unit tests (no live service required).  The ASGI call chain
 is exercised directly by instantiating SpiffePeerCertMiddleware with a capture
 app and running the middleware loop synchronously with asyncio.run().
@@ -29,7 +34,7 @@ not set (fail-closed by design).  We import the module directly via
 matching the approach used in test_v2231_postfix_bypass_regression.py — except
 we fix the import cycle that file had by loading directly from the filesystem.
 
-Last updated: 2026-05-19T00:00:00+01:00
+Last updated: 2026-05-21T00:00:00+01:00 (V240-001: add _get_peer_cert_uri absence guard)
 """
 from __future__ import annotations
 
@@ -156,6 +161,10 @@ class TestForgeMissingHmac:
     def test_peer_cert_header_set_to_empty_when_hmac_absent(self):
         """
         x-spiffe-id-peer-cert must still be injected (empty) even when HMAC absent.
+
+        V240-001 (2026-05-21): peer_cert ASGI extension is permanently absent on
+        all production ASGI servers (uvicorn/granian/hypercorn).  The header is
+        always overwritten to empty bytes as forge-prevention.
         """
         with patch("yashigani.auth.caddy_verified._caddy_secret", _VALID_SECRET):
             scope = _make_scope([
@@ -168,7 +177,8 @@ class TestForgeMissingHmac:
             "x-spiffe-id-peer-cert must always be set by SpiffePeerCertMiddleware"
         )
         assert headers[b"x-spiffe-id-peer-cert"] == b"", (
-            "x-spiffe-id-peer-cert must be empty when uvicorn TLS extension absent"
+            "x-spiffe-id-peer-cert must be empty — peer_cert ASGI extension absent "
+            "on all production ASGI servers (V240-001 spike, 2026-05-21)"
         )
 
 
@@ -373,4 +383,39 @@ class TestValidateCaddySecret:
         src = inspect.getsource(caddy_verified.validate_caddy_secret)
         assert "compare_digest" in src, (
             "validate_caddy_secret must use hmac.compare_digest for constant-time comparison"
+        )
+
+
+# ---------------------------------------------------------------------------
+# V240-001 architecture-accepted guard: _get_peer_cert_uri must not exist
+# ---------------------------------------------------------------------------
+
+
+class TestV240001ArchitectureAccepted:
+    """V240-001 regression guard (2026-05-21).
+
+    ``SpiffePeerCertMiddleware._get_peer_cert_uri()`` was dead code — the method
+    read ``scope["extensions"]["tls"]["peer_cert"]``, which is not populated by
+    any production ASGI server (uvicorn 0.47.0 / granian 2.7.4 / hypercorn 0.18.0
+    — all confirmed by Tom spike 2026-05-21).  Its presence created false security
+    confidence (implied peer_cert was working when it was not) and a maintenance
+    trap (any future mock of the scope extension would produce a false-green).
+
+    This test asserts the method is ABSENT.  If it reappears (e.g. merged from a
+    stale branch), the test fails immediately — YSG-RISK-047 would be re-opened.
+    """
+
+    def test_get_peer_cert_uri_method_absent(self):
+        """_get_peer_cert_uri must NOT exist on SpiffePeerCertMiddleware.
+
+        Guards against accidental re-introduction of the dead-code path.
+        V240-001: YSG-RISK-047 CLOSED-ARCHITECTURE-ACCEPTED 2026-05-21.
+        """
+        mod = _load_spiffe_middleware_module()
+        SpiffePeerCertMiddlewareCls = mod.SpiffePeerCertMiddleware
+        assert getattr(SpiffePeerCertMiddlewareCls, "_get_peer_cert_uri", None) is None, (
+            "V240-001 regression: SpiffePeerCertMiddleware._get_peer_cert_uri() must "
+            "not exist — it was dead code (no ASGI server populates peer_cert). "
+            "YSG-RISK-047 CLOSED-ARCHITECTURE-ACCEPTED 2026-05-21. "
+            "Re-introduction requires a new risk-register entry and Tiago sign-off."
         )
