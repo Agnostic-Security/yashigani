@@ -1379,48 +1379,26 @@ check_installer_preflight() {
       if [[ "${YSG_OS:-}" == "macos" ]]; then
         log_info "macOS+Docker: skipping host chown for $_bm_dir (virtiofs UID mapping — PKI container will see UID 1001)"
       else
-        # Non-root Docker caller: attempt direct chown; if EPERM, escalate via
-        # ephemeral container (same pattern as _do_chown docker_run mode in
-        # _pki_chown_client_keys). No host sudo required — Docker daemon grants
-        # root inside the container. TM-004 (accepted): install user must already
-        # be in the docker group to run Yashigani; docker socket grants effective
-        # root regardless of this chown pattern. No new attack surface introduced.
-        #
-        # TM-001 + TM-002 (Laura): declare digest-pinned alpine here so both
-        # docker run branches use the pinned ref. ASVS V14.3.1 / V14.2.5.
-        local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+        # Non-root Docker caller: delegate to _do_chown (V240-002 refactor).
+        # _do_chown handles: direct chown attempt → docker_run ephemeral container
+        # fallback. The 5th arg passes $_bm_dir as _mount_base (S5/S7): the helper
+        # mounts $_bm_dir to /s and chowns /s/$(basename $_bm_dir) — correct because
+        # each $_bm_dir IS the mount root (not a file inside docker/secrets).
+        # TM-004 (accepted): docker socket grants effective root inside container;
+        # same accepted risk as the pre-V240-002 inline block.
+        # Error propagation: _do_chown logs + returns 1 on failure; set flag here.
         local _dir_uid
         # shellcheck disable=SC2012
         _dir_uid="$(ls -nd "$_bm_dir" 2>/dev/null | awk '{print $3}')"
         if [[ "$_dir_uid" != "1001" ]]; then
-          if chown 1001:1001 "$_bm_dir" 2>/dev/null; then
-            log_info "chown 1001:1001 applied to $_bm_dir"
-          else
-            # Direct chown failed (EPERM — install user not root).
-            # Escalate via ephemeral container: try local cache first (--pull=never),
-            # fall back to digest-pinned pull. Both branches use $_alpine_image
-            # (TM-002: no floating alpine:3 tag pull on cache miss).
-            log_info "direct chown failed — using docker run to chown $_bm_dir (non-root Docker caller)"
-            if ! docker info >/dev/null 2>&1; then
-              log_error "Cannot chown $_bm_dir to 1001:1001: direct chown failed (EPERM) and docker daemon is unreachable."
-              log_error "Ensure your user is in the docker group, or run the installer as root:"
-              log_error "  sudo groupadd docker && sudo usermod -aG docker \$USER && newgrp docker"
-              log_error "  # OR: sudo bash install.sh"
-              _bm_failed=1
-            elif docker run --rm --pull=never \
-                   --volume "${_bm_dir}:/t:rw" \
-                   "$_alpine_image" chown 1001:1001 /t 2>/dev/null || \
-                 docker run --rm \
-                   --volume "${_bm_dir}:/t:rw" \
-                   "$_alpine_image" chown 1001:1001 /t; then
-              log_info "docker run chown 1001:1001 applied to $_bm_dir"
-            else
-              log_error "Cannot chown $_bm_dir to 1001:1001 (direct chown and docker run container fallback both failed)."
-              log_error "Ensure your user is in the docker group, or run the installer as root:"
-              log_error "  sudo groupadd docker && sudo usermod -aG docker \$USER && newgrp docker"
-              log_error "  # OR: sudo bash install.sh"
-              _bm_failed=1
-            fi
+          # S7: _do_chown uses /s mount convention internally (not legacy /t).
+          # S5: pass $_bm_dir as _mount_base (5th arg) — target is the dir itself.
+          if ! _do_chown "1001:1001" "$_bm_dir" "$(basename "$_bm_dir")" "" "$_bm_dir"; then
+            log_error "Cannot chown $_bm_dir to 1001:1001 (direct chown and container fallback both failed)."
+            log_error "Ensure your user is in the docker group, or run the installer as root:"
+            log_error "  sudo groupadd docker && sudo usermod -aG docker \$USER && newgrp docker"
+            log_error "  # OR: sudo bash install.sh"
+            _bm_failed=1
           fi
         fi
       fi
@@ -5424,6 +5402,370 @@ _do_chgrp() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# _do_chown — top-level helper: chown a single file to <uid>:<uid> using the
+# correct runtime dispatch strategy (direct / unshare / podman_run / docker_run).
+#
+# Hoisted from the nested definition inside _pki_chown_client_keys() so that
+# check_installer_preflight() can call it for docker/data, docker/certs, and
+# docker/logs BEFORE _pki_chown_client_keys first executes (V240-002).
+# Behaviour is identical to the nested version — only scope changes.
+#
+# Signature: _do_chown <uid> <file> <label> [chmod_mode] [mount_base]
+#   $1  _uid        — numeric UID[:GID] to chown to (integer guard applied)
+#   $2  _file       — absolute path to the file/dir
+#   $3  _label      — human-readable label for log messages
+#   $4  _extra_chmod — optional octal mode (e.g. "0640") applied after chown
+#   $5  _mount_base  — optional mount root for container bind (default: $_secrets_dir)
+#                      Use when targeting a dir that is NOT under docker/secrets
+#                      (e.g. docker/data, docker/certs, docker/logs).
+#                      Uses := assignment-default (S4): empty-string arg is treated
+#                      as missing and falls back to $_secrets_dir correctly under
+#                      set -u. The /s mount point convention applies in all branches.
+#
+# All callers passing only 3 or 4 args are backward-compatible — the 5th arg
+# defaults to $_secrets_dir identically to the nested version.
+#
+# Deps: YSG_RUNTIME / YSG_PODMAN_RUNTIME for mode selection; WORK_DIR for
+# _secrets_dir used in container bind-mount paths. All computed locally (S1).
+# Alpine image digest pinned identically to _pki_chown_client_keys.
+#
+# V240-002: Iris AMENDED design (iris-v240-002-do-chown-refactor.md)
+# Laura threat-model: laura-v240-002-do-chown-threat-model.md (S1-S7 applied)
+# Pattern reference: git 79c2f5d (_do_chgrp hoist — established pattern)
+# ---------------------------------------------------------------------------
+_do_chown() {
+  local _uid="$1" _file="$2" _label="$3" _extra_chmod="${4:-}"
+
+  # S6: integer guard — reject any non-numeric uid before shell interpolation.
+  # Defends against accidental non-integer args from future callers; all current
+  # callers supply integer literals or values from pki_service_uid() (hardcoded
+  # integers). Fail-closed under set -euo pipefail.
+  if ! [[ "$_uid" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+    log_error "_do_chown: uid '${_uid}' is not a valid integer (or uid:gid pair) — refusing"
+    return 1
+  fi
+
+  # S1: Determine dispatch mode locally — same logic as _do_chgrp and
+  # _pki_chown_client_keys(); does NOT rely on parent-scope closure variables.
+  local _effective_runtime="${YSG_RUNTIME:-}"
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    _effective_runtime="podman"
+  fi
+
+  local _chown_mode
+  if [[ "$_effective_runtime" == "docker" ]]; then
+    _chown_mode="docker_run"
+  elif [[ "$_effective_runtime" == "podman" ]]; then
+    if [[ "$(id -u)" == "0" ]]; then
+      _chown_mode="direct"
+    elif awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
+           /etc/subuid 2>/dev/null; then
+      _chown_mode="unshare"
+    else
+      _chown_mode="podman_run"
+    fi
+  else
+    _chown_mode="direct"
+  fi
+
+  local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+
+  # S4: two-step default for _mount_base — bash prohibits := assignment on
+  # positional parameters. Use ${5:-} to capture the arg (empty-string-safe
+  # under set -u), then apply a conditional fallback to $_secrets_dir if the
+  # result is empty. This covers both the unset case (caller passes fewer than
+  # 5 args) and the empty-string case (caller passes "" as arg 5).
+  local _mount_base="${5:-}"
+  [[ -n "$_mount_base" ]] || _mount_base="$_secrets_dir"
+
+  case "$_chown_mode" in
+    direct)
+      if ! chown "${_uid}:${_uid}" "$_file"; then
+        log_error "chown ${_uid}:${_uid} failed on ${_label} — aborting (fix file ownership manually)"
+        return 1
+      fi
+      if [[ -n "$_extra_chmod" ]]; then
+        if ! chmod "$_extra_chmod" "$_file"; then
+          log_error "chmod ${_extra_chmod} failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    unshare)
+      # gate #ROOTLESS-7 fallback: if podman unshare chown fails, attempt
+      # podman_run ephemeral container before aborting.
+      local _unshare_ok=0
+      if podman unshare chown "${_uid}:${_uid}" "$_file" 2>/dev/null; then
+        _unshare_ok=1
+        if [[ -n "$_extra_chmod" ]]; then
+          if ! podman unshare chmod "$_extra_chmod" "$_file" 2>/dev/null; then
+            log_warn "podman unshare chmod ${_extra_chmod} failed on ${_label} — falling back to podman_run"
+            _unshare_ok=0
+          fi
+        fi
+      fi
+      if [[ "$_unshare_ok" == "0" ]]; then
+        log_warn "podman unshare chown/chmod failed on ${_label} — falling back to podman_run"
+        # S5: bind _mount_base (not hard-coded _secrets_dir) so callers outside
+        # docker/secrets (e.g. check_installer_preflight with $_bm_dir) mount
+        # the correct root. Mount point is /s (S7 convention).
+        local _rel_file="${_file#"${_mount_base}/"}"
+        local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
+        if [[ -n "$_extra_chmod" ]]; then
+          _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
+        fi
+        if ! podman run --rm \
+               --volume "${_mount_base}:/s:rw" \
+               "$_alpine_image" \
+               sh -c "$_container_cmd" 2>/dev/null; then
+          log_error "podman_run fallback chown/chmod also failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    docker_run)
+      # S5: bind _mount_base to /s (S7 convention — matches internal logic).
+      local _rel_file="${_file#"${_mount_base}/"}"
+      local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
+      if [[ -n "$_extra_chmod" ]]; then
+        _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
+      fi
+      if ! docker run --rm --pull=never \
+             --volume "${_mount_base}:/s:rw" \
+             "alpine:3" \
+             sh -c "$_container_cmd" 2>/dev/null; then
+        if ! docker run --rm \
+               --volume "${_mount_base}:/s:rw" \
+               "$_alpine_image" \
+               sh -c "$_container_cmd"; then
+          log_error "docker run chown/chmod failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    podman_run)
+      # S5: bind _mount_base to /s (S7 convention).
+      local _rel_file="${_file#"${_mount_base}/"}"
+      local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
+      if [[ -n "$_extra_chmod" ]]; then
+        _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
+      fi
+      if ! podman run --rm \
+             --network=none \
+             --volume "${_mount_base}:/s:rw,U" \
+             "$_alpine_image" \
+             sh -c "$_container_cmd" 2>/dev/null; then
+        log_warn "podman run chown/chmod failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
+        log_warn "  virtiofs UID remapping should compensate — verifying at service start"
+        log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# _do_chmod_dir — top-level helper: chmod a directory using the correct runtime
+# dispatch strategy (direct / unshare / podman_run / docker_run).
+#
+# Hoisted from the nested definition inside _pki_chown_client_keys() (V240-002).
+# Behaviour is identical to the nested version — only scope changes.
+#
+# Signature: _do_chmod_dir <dir> <mode>
+# CHM-001 (S3): only mode 755 is permitted. Any other value is rejected
+# fail-closed. Prevents accidental 0777 / 4755 (setuid). The allowlist guard
+# is the FIRST statement in the body, before dispatch.
+#
+# S1: dispatch state (_chown_mode, _alpine_image, _secrets_dir) computed locally.
+# S2: mode hard-coded in each branch (no caller-supplied mode used in commands —
+#     the allowlist guard already enforces 755; the case branches pass $_mode but
+#     that value has already been validated against the allowlist).
+#
+# V240-002: Iris AMENDED design / Laura S1, S3.
+# ---------------------------------------------------------------------------
+_do_chmod_dir() {
+  local _dir="$1" _mode="$2"
+
+  # S3: CHM-001 allowlist guard — carried verbatim from nested definition.
+  # Must be first statement before dispatch block.
+  case "$_mode" in
+    755) ;;
+    *)
+      log_error "_do_chmod_dir: refusing unsupported mode '${_mode}' — only 755 allowed by design (LAURA-TM-CHMOD-001 CHM-001)"
+      return 1
+      ;;
+  esac
+
+  # S1: compute dispatch state locally.
+  local _effective_runtime="${YSG_RUNTIME:-}"
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    _effective_runtime="podman"
+  fi
+
+  local _chown_mode
+  if [[ "$_effective_runtime" == "docker" ]]; then
+    _chown_mode="docker_run"
+  elif [[ "$_effective_runtime" == "podman" ]]; then
+    if [[ "$(id -u)" == "0" ]]; then
+      _chown_mode="direct"
+    elif awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
+           /etc/subuid 2>/dev/null; then
+      _chown_mode="unshare"
+    else
+      _chown_mode="podman_run"
+    fi
+  else
+    _chown_mode="direct"
+  fi
+
+  local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+
+  case "$_chown_mode" in
+    direct)
+      if ! chmod "$_mode" "$_dir"; then
+        log_warn "_do_chmod_dir: direct chmod ${_mode} failed on ${_dir}"
+      fi
+      ;;
+    unshare)
+      # Try podman unshare first; fall back to podman_run on failure (gate #ROOTLESS-7 pattern).
+      if ! podman unshare chmod "$_mode" "$_dir" 2>/dev/null; then
+        log_warn "_do_chmod_dir: podman unshare chmod ${_mode} failed — trying podman_run fallback"
+        if ! podman run --rm \
+               --volume "${_dir}:/d:rw" \
+               "$_alpine_image" \
+               chmod "$_mode" /d 2>/dev/null; then
+          log_warn "_do_chmod_dir: podman_run fallback chmod ${_mode} also failed on ${_dir}"
+        fi
+      fi
+      ;;
+    docker_run)
+      # Prefer cached alpine:3 tag (--pull=never); fall back to digest-pinned image.
+      # CHM-002/CHM-003 (ACCEPTED): container root has CAP_FOWNER; blast radius is
+      # the single dir bound at this call site. Ephemeral --rm, no network.
+      if ! docker run --rm --pull=never \
+             --volume "${_dir}:/d:rw" \
+             "alpine:3" \
+             chmod "$_mode" /d 2>/dev/null; then
+        if ! docker run --rm \
+               --volume "${_dir}:/d:rw" \
+               "$_alpine_image" \
+               chmod "$_mode" /d 2>/dev/null; then
+          log_warn "_do_chmod_dir: docker_run chmod ${_mode} failed on ${_dir}"
+        fi
+      fi
+      ;;
+    podman_run)
+      # Podman remote-client (macOS): podman unshare not supported; use container.
+      # WARN-not-ABORT: same rationale as _do_chown podman_run path (macOS TCC / virtiofs).
+      if ! podman run --rm \
+             --network=none \
+             --volume "${_dir}:/d:rw" \
+             "$_alpine_image" \
+             chmod "$_mode" /d 2>/dev/null; then
+        log_warn "_do_chmod_dir: podman_run chmod ${_mode} failed on ${_dir} (macOS TCC Privacy may block virtiofs)"
+        log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# _do_chmod_0640 — top-level helper: chmod 0640 a single file using the correct
+# runtime dispatch strategy (direct / unshare / podman_run / docker_run).
+#
+# Hoisted from the nested definition inside _pki_chown_client_keys() (V240-002).
+# Behaviour is identical to the nested version — only scope changes.
+#
+# Signature: _do_chmod_0640 <file> <label>
+# S2: mode 0640 is hard-coded in every branch — no parameterisation.
+# The mode is not in the function name by accident; it is the security invariant
+# (LAURA-TM-CHMOD-001). Any new mode requires a new function + CHM approval.
+#
+# S1: dispatch state computed locally.
+#
+# V240-002: Iris AMENDED design / Laura S1, S2.
+# ---------------------------------------------------------------------------
+_do_chmod_0640() {
+  local _file="$1" _label="$2"
+
+  # S1: compute dispatch state locally.
+  local _effective_runtime="${YSG_RUNTIME:-}"
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    _effective_runtime="podman"
+  fi
+
+  local _chown_mode
+  if [[ "$_effective_runtime" == "docker" ]]; then
+    _chown_mode="docker_run"
+  elif [[ "$_effective_runtime" == "podman" ]]; then
+    if [[ "$(id -u)" == "0" ]]; then
+      _chown_mode="direct"
+    elif awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
+           /etc/subuid 2>/dev/null; then
+      _chown_mode="unshare"
+    else
+      _chown_mode="podman_run"
+    fi
+  else
+    _chown_mode="direct"
+  fi
+
+  local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+
+  case "$_chown_mode" in
+    direct)
+      # S2: literal 0640 — no parameter.
+      if ! chmod 0640 "$_file"; then
+        log_error "chmod 0640 failed on ${_label} — aborting"
+        return 1
+      fi
+      ;;
+    unshare)
+      if ! podman unshare chmod 0640 "$_file" 2>/dev/null; then
+        log_warn "podman unshare chmod 0640 failed on ${_label} — falling back to podman_run"
+        local _rel_file="${_file#"${_secrets_dir}/"}"
+        if ! podman run --rm \
+               --volume "${_secrets_dir}:/s:rw" \
+               "$_alpine_image" \
+               sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
+          log_error "podman_run fallback chmod 0640 also failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    docker_run)
+      local _rel_file="${_file#"${_secrets_dir}/"}"
+      if ! docker run --rm --pull=never \
+             --volume "${_secrets_dir}:/s:rw" \
+             "alpine:3" \
+             sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
+        if ! docker run --rm \
+               --volume "${_secrets_dir}:/s:rw" \
+               "$_alpine_image" \
+               sh -c "chmod 0640 /s/${_rel_file}"; then
+          log_error "docker_run chmod 0640 failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    podman_run)
+      local _rel_file="${_file#"${_secrets_dir}/"}"
+      if ! podman run --rm \
+             --network=none \
+             --volume "${_secrets_dir}:/s:rw,U" \
+             "$_alpine_image" \
+             sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
+        log_warn "podman run chmod 0640 failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
+      fi
+      ;;
+  esac
+  return 0
+}
+
 generate_secrets() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
 
@@ -6970,75 +7312,13 @@ _pki_chown_client_keys() {
   local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
   local _secrets_dir="${WORK_DIR}/docker/secrets"
 
-  # Helper: chmod a directory using the active _chown_mode dispatch strategy.
-  # IRIS-DESIGN-004 / LAURA-TM-CHMOD-001 CHM-001.
-  # Mirrors _do_chown / _do_chgrp / _do_chmod_0640 — same 4-mode dispatch.
-  # Directory chmod (no -R): sets the mode on $1 only, not its contents.
-  # CHM-001: only mode 755 is permitted; any other value is rejected fail-closed.
-  # On failure: log_warn (not log_error) — dir mode failure is not install-fatal
-  # because files inside are readable by GID 2002 regardless; mode 755 is needed
-  # for OPA inotify (V232-SMOKE-012). Warn and continue so install proceeds.
-  _do_chmod_dir() {
-    local _dir="$1" _mode="$2"
-    # CHM-001 — mode allowlist guard. Only 755 is approved for directory ops.
-    # Any future caller needing a different mode must extend this list and cite
-    # the threat model that approved it. Prevents accidental 0777 / 4755 (setuid).
-    case "$_mode" in
-      755) ;;
-      *)
-        log_error "_do_chmod_dir: refusing unsupported mode '${_mode}' — only 755 allowed by design (LAURA-TM-CHMOD-001 CHM-001)"
-        return 1
-        ;;
-    esac
-    case "$_chown_mode" in
-      direct)
-        if ! chmod "$_mode" "$_dir"; then
-          log_warn "_do_chmod_dir: direct chmod ${_mode} failed on ${_dir}"
-        fi
-        ;;
-      unshare)
-        # Try podman unshare first; fall back to podman_run on failure (gate #ROOTLESS-7 pattern).
-        if ! podman unshare chmod "$_mode" "$_dir" 2>/dev/null; then
-          log_warn "_do_chmod_dir: podman unshare chmod ${_mode} failed — trying podman_run fallback"
-          if ! podman run --rm \
-                 --volume "${_dir}:/d:rw" \
-                 "$_alpine_image" \
-                 chmod "$_mode" /d 2>/dev/null; then
-            log_warn "_do_chmod_dir: podman_run fallback chmod ${_mode} also failed on ${_dir}"
-          fi
-        fi
-        ;;
-      docker_run)
-        # Prefer cached alpine:3 tag (--pull=never); fall back to digest-pinned image.
-        # CHM-002/CHM-003 (ACCEPTED): container root has CAP_FOWNER; blast radius is
-        # the single dir bound at this call site. Ephemeral --rm, no network.
-        if ! docker run --rm --pull=never \
-               --volume "${_dir}:/d:rw" \
-               "alpine:3" \
-               chmod "$_mode" /d 2>/dev/null; then
-          if ! docker run --rm \
-                 --volume "${_dir}:/d:rw" \
-                 "$_alpine_image" \
-                 chmod "$_mode" /d 2>/dev/null; then
-            log_warn "_do_chmod_dir: docker_run chmod ${_mode} failed on ${_dir}"
-          fi
-        fi
-        ;;
-      podman_run)
-        # Podman remote-client (macOS): podman unshare not supported; use container.
-        # WARN-not-ABORT: same rationale as _do_chown podman_run path (macOS TCC / virtiofs).
-        if ! podman run --rm \
-               --network=none \
-               --volume "${_dir}:/d:rw" \
-               "$_alpine_image" \
-               chmod "$_mode" /d 2>/dev/null; then
-          log_warn "_do_chmod_dir: podman_run chmod ${_mode} failed on ${_dir} (macOS TCC Privacy may block virtiofs)"
-          log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
-        fi
-        ;;
-    esac
-    return 0
-  }
+  # _do_chmod_dir — hoisted to top-level scope (V240-002).
+  # See the top-level _do_chmod_dir() definition (above generate_secrets()) for
+  # the full implementation with local dispatch recomputation (S1) and the
+  # CHM-001 allowlist guard (S3). The nested definition was removed to close
+  # BACKLOG-V240-002 (Iris AMENDED design, iris-v240-002-do-chown-refactor.md).
+  # IRIS-DESIGN-004 / LAURA-TM-CHMOD-001 CHM-001 / Laura S1+S3.
+  # The top-level _do_chmod_dir() is called directly below.
 
   # V232-SMOKE-012 fix: ensure the secrets directory is mode 0755 (rwxr-xr-x)
   # so ALL container UIDs (including OPA=1000, otel-collector=10001, etc.) can
@@ -7050,131 +7330,12 @@ _pki_chown_client_keys() {
   # and fell through to host-direct chmod, causing EPERM for Docker non-root callers).
   _do_chmod_dir "${_secrets_dir}" 755 || return 1
 
-  # Helper: chown a single file to <uid>:<uid> using the active strategy.
-  # Optional 4th arg: _extra_chmod — an octal mode string (e.g. "0640") to
-  # apply AFTER chown. For docker_run and podman_run modes the chmod is
-  # performed INSIDE the container alongside the chown (BUG-2 fix: a non-root
-  # host caller cannot chmod a file it does not own after the in-container
-  # chown transfers ownership to a different UID). For direct/unshare modes the
-  # caller IS root (direct) or owns the file in the mapped namespace (unshare
-  # with root in container), so a host-side chmod is safe; we still do it
-  # inside the container for direct consistency.
-  # On error: log_error + propagate non-zero (fail-closed, SOP 1).
-  _do_chown() {
-    local _uid="$1" _file="$2" _label="$3" _extra_chmod="${4:-}"
-    case "$_chown_mode" in
-      direct)
-        if ! chown "${_uid}:${_uid}" "$_file"; then
-          log_error "chown ${_uid}:${_uid} failed on ${_label} — aborting (fix file ownership manually)"
-          return 1
-        fi
-        if [[ -n "$_extra_chmod" ]]; then
-          if ! chmod "$_extra_chmod" "$_file"; then
-            log_error "chmod ${_extra_chmod} failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      unshare)
-        # gate #ROOTLESS-7 fallback: if podman unshare chown fails (e.g., file
-        # owned by a subuid-range UID outside the current unshare namespace, or
-        # a transient storage lock), attempt a podman_run ephemeral container
-        # before aborting. This makes unshare mode resilient to edge cases while
-        # still preferring the lower-overhead unshare path.
-        local _unshare_ok=0
-        if podman unshare chown "${_uid}:${_uid}" "$_file" 2>/dev/null; then
-          _unshare_ok=1
-          if [[ -n "$_extra_chmod" ]]; then
-            # BUG-2 fix: chmod must also run inside unshare; host-side chmod
-            # would fail with EPERM on a subuid-mapped file.
-            if ! podman unshare chmod "$_extra_chmod" "$_file" 2>/dev/null; then
-              log_warn "podman unshare chmod ${_extra_chmod} failed on ${_label} — falling back to podman_run"
-              _unshare_ok=0
-            fi
-          fi
-        fi
-        if [[ "$_unshare_ok" == "0" ]]; then
-          # Fall back to podman_run (same as macOS path).
-          log_warn "podman unshare chown/chmod failed on ${_label} — falling back to podman_run"
-          local _rel_file="${_file#"${_secrets_dir}/"}"
-          local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
-          if [[ -n "$_extra_chmod" ]]; then
-            _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
-          fi
-          if ! podman run --rm \
-                 --volume "${_secrets_dir}:/s:rw" \
-                 "$_alpine_image" \
-                 sh -c "$_container_cmd" 2>/dev/null; then
-            log_error "podman_run fallback chown/chmod also failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      docker_run)
-        # BUG-2 fix: combine chown + chmod into one docker run invocation so
-        # both ops execute as root inside the container. After the container
-        # exits, the file is owned by uid/gid <_uid> on the host; a non-root
-        # installer (e.g. uid 1003) cannot chmod a file owned by uid 1001.
-        # Bind-mount the secrets dir into a minimal container; chown+chmod the
-        # specific file path relative to the mount root /s.
-        # The container is rm'd immediately; no persistent state.
-        # Prefer --pull=never with tag-only ref if alpine:3 is cached locally
-        # (avoids Docker Hub rate-limit hits); fall back to digest-pinned pull.
-        local _rel_file="${_file#"${_secrets_dir}/"}"
-        local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
-        if [[ -n "$_extra_chmod" ]]; then
-          _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
-        fi
-        if ! docker run --rm --pull=never \
-               --volume "${_secrets_dir}:/s:rw" \
-               "alpine:3" \
-               sh -c "$_container_cmd" 2>/dev/null; then
-          if ! docker run --rm \
-                 --volume "${_secrets_dir}:/s:rw" \
-                 "$_alpine_image" \
-                 sh -c "$_container_cmd"; then
-            log_error "docker run chown/chmod failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      podman_run)
-        # Podman remote-client (macOS tunnels to VM): `podman unshare` is not
-        # supported. Use an ephemeral container instead — same approach as
-        # docker_run but invoking `podman run`. The Podman VM provides root
-        # inside the container, so it can chown to any UID.
-        # BUG-2 fix: same rationale as docker_run — chmod must be inside the
-        # container, not on the host, to avoid EPERM for non-root callers.
-        #
-        # WARN-not-ABORT: macOS Podman virtiofs may not expose the secrets path
-        # (~/Documents/ can be blocked by macOS TCC Privacy settings after a
-        # machine restart). When this happens, `podman run --volume` fails with
-        # "statfs ... operation not permitted". This is safe to soft-warn:
-        # virtiofs + Podman rootless user-namespace already maps the macOS host
-        # user (UID 502) to the container owner UID dynamically — the chown is
-        # not required for the container to read its own key files.
-        # Evidence: R3 gate 2026-04-29 — gateway started without explicit chown.
-        # Hard-abort would block install on a working macOS Podman configuration.
-        # TM-V231-005: upgrade chown to hard-requirement in v2.23.2 by requiring
-        # the admin to grant Podman Full Disk Access before install.
-        local _rel_file="${_file#"${_secrets_dir}/"}"
-        local _container_cmd="chown ${_uid}:${_uid} /s/${_rel_file}"
-        if [[ -n "$_extra_chmod" ]]; then
-          _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
-        fi
-        if ! podman run --rm \
-               --network=none \
-               --volume "${_secrets_dir}:/s:rw,U" \
-               "$_alpine_image" \
-               sh -c "$_container_cmd" 2>/dev/null; then
-          log_warn "podman run chown/chmod failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
-          log_warn "  virtiofs UID remapping should compensate — verifying at service start"
-          log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
-        fi
-        ;;
-    esac
-    return 0
-  }
+  # _do_chown — hoisted to top-level scope (V240-002).
+  # See the top-level _do_chown() definition (above generate_secrets()) for the
+  # full implementation with S1 local dispatch recomputation, S4 _mount_base,
+  # S5 unshare/docker_run fallback binding, S6 uid integer guard, S7 /s convention.
+  # The nested definition was removed to close BACKLOG-V240-002.
+  # iris-v240-002-do-chown-refactor.md / laura-v240-002-do-chown-threat-model.md
 
   # _do_chgrp — hoisted to top-level scope (defined before generate_secrets).
   # See the top-level _do_chgrp() definition above generate_secrets() for the
@@ -7185,58 +7346,11 @@ _pki_chown_client_keys() {
   # calls _do_chgrp at step 6/13 before _pki_chown_client_keys runs (step 7+).
   # (Ava blocker: install.sh line 5786 "_do_chgrp: command not found" — 8dd4c41.)
 
-  # Helper: chmod 0640 a file using the active strategy.
-  # Called paired with _do_chgrp for the shared secrets (GID-003).
-  _do_chmod_0640() {
-    local _file="$1" _label="$2"
-    case "$_chown_mode" in
-      direct)
-        if ! chmod 0640 "$_file"; then
-          log_error "chmod 0640 failed on ${_label} — aborting"
-          return 1
-        fi
-        ;;
-      unshare)
-        if ! podman unshare chmod 0640 "$_file" 2>/dev/null; then
-          log_warn "podman unshare chmod 0640 failed on ${_label} — falling back to podman_run"
-          local _rel_file="${_file#"${_secrets_dir}/"}"
-          if ! podman run --rm \
-                 --volume "${_secrets_dir}:/s:rw" \
-                 "$_alpine_image" \
-                 sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
-            log_error "podman_run fallback chmod 0640 also failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      docker_run)
-        local _rel_file="${_file#"${_secrets_dir}/"}"
-        if ! docker run --rm --pull=never \
-               --volume "${_secrets_dir}:/s:rw" \
-               "alpine:3" \
-               sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
-          if ! docker run --rm \
-                 --volume "${_secrets_dir}:/s:rw" \
-                 "$_alpine_image" \
-                 sh -c "chmod 0640 /s/${_rel_file}"; then
-            log_error "docker_run chmod 0640 failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      podman_run)
-        local _rel_file="${_file#"${_secrets_dir}/"}"
-        if ! podman run --rm \
-               --network=none \
-               --volume "${_secrets_dir}:/s:rw,U" \
-               "$_alpine_image" \
-               sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
-          log_warn "podman run chmod 0640 failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
-        fi
-        ;;
-    esac
-    return 0
-  }
+  # _do_chmod_0640 — hoisted to top-level scope (V240-002).
+  # See the top-level _do_chmod_0640() definition (above generate_secrets()) for
+  # the full implementation with S1 local dispatch recomputation and S2 hard-coded
+  # 0640 mode invariant. The nested definition was removed to close BACKLOG-V240-002.
+  # iris-v240-002-do-chown-refactor.md / laura-v240-002-do-chown-threat-model.md
 
   # Iterate all services from the shared map (lib/pki_ownership.sh).
   # pki_service_uid + pki_key_mode replace the inline array and the prometheus
