@@ -5316,6 +5316,114 @@ _gen_admin_usernames() {
   GEN_ADMIN2_USERNAME="${chosen_list[$idx2]}"
 }
 
+# ---------------------------------------------------------------------------
+# _do_chgrp — top-level helper: chgrp a single file to group <gid> using the
+# correct runtime dispatch strategy (direct / unshare / podman_run / docker_run).
+#
+# Hoisted from the nested definition inside _pki_chown_client_keys() so that
+# generate_secrets() can call it at step 6/13 BEFORE _pki_chown_client_keys
+# is first executed by the PKI bootstrap (which runs after step 6).
+# Behaviour is identical to the nested version — only scope changes.
+#
+# Caller: generate_secrets() (pgbouncer_userlist chgrp 2002).
+# Also consumed by _pki_chown_client_keys() shared-secrets loop (the nested
+# definition inside that function is removed; this top-level definition takes
+# its place — bash picks up the most-recently defined function by that name,
+# but since there is now only one definition, there is no ambiguity).
+#
+# Deps: YSG_RUNTIME / YSG_PODMAN_RUNTIME for mode selection; WORK_DIR for
+# _secrets_dir used in container bind-mount paths. All computed locally.
+# Alpine image digest pinned identically to _pki_chown_client_keys.
+#
+# IRIS-DESIGN-002 §8 / LAURA-TM-GID-001 GID-003 / GID-006.
+# Introduced: hoist from 8dd4c41 nested scope (Ava blocker install.sh:5786
+# "_do_chgrp: command not found" / phase1-verdict.md Step 2 FAIL).
+# Pattern reference: Iris BACKLOG-V240-002 (_do_chown top-level refactor).
+# ---------------------------------------------------------------------------
+_do_chgrp() {
+  local _gid="$1" _file="$2" _label="$3"
+
+  # Determine dispatch mode — same logic as _pki_chown_client_keys().
+  local _effective_runtime="${YSG_RUNTIME:-}"
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    _effective_runtime="podman"
+  fi
+
+  local _chown_mode
+  if [[ "$_effective_runtime" == "docker" ]]; then
+    _chown_mode="docker_run"
+  elif [[ "$_effective_runtime" == "podman" ]]; then
+    if [[ "$(id -u)" == "0" ]]; then
+      _chown_mode="direct"
+    elif awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
+           /etc/subuid 2>/dev/null; then
+      _chown_mode="unshare"
+    else
+      _chown_mode="podman_run"
+    fi
+  else
+    # Unknown / k8s runtime — fall back to direct; caller logs context.
+    _chown_mode="direct"
+  fi
+
+  local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+
+  case "$_chown_mode" in
+    direct)
+      if ! chgrp "${_gid}" "$_file"; then
+        log_error "chgrp ${_gid} failed on ${_label} — aborting"
+        return 1
+      fi
+      ;;
+    unshare)
+      # GID-006: MUST use podman unshare — NOT host-side chgrp.
+      local _unshare_grp_ok=0
+      if podman unshare chgrp "${_gid}" "$_file" 2>/dev/null; then
+        _unshare_grp_ok=1
+      fi
+      if [[ "$_unshare_grp_ok" == "0" ]]; then
+        log_warn "podman unshare chgrp ${_gid} failed on ${_label} — falling back to podman_run"
+        local _rel_file="${_file#"${_secrets_dir}/"}"
+        if ! podman run --rm \
+               --volume "${_secrets_dir}:/s:rw" \
+               "$_alpine_image" \
+               sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
+          log_error "podman_run fallback chgrp ${_gid} also failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    docker_run)
+      local _rel_file="${_file#"${_secrets_dir}/"}"
+      if ! docker run --rm --pull=never \
+             --volume "${_secrets_dir}:/s:rw" \
+             "alpine:3" \
+             sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
+        if ! docker run --rm \
+               --volume "${_secrets_dir}:/s:rw" \
+               "$_alpine_image" \
+               sh -c "chgrp ${_gid} /s/${_rel_file}"; then
+          log_error "docker_run chgrp ${_gid} failed on ${_label} — aborting"
+          return 1
+        fi
+      fi
+      ;;
+    podman_run)
+      local _rel_file="${_file#"${_secrets_dir}/"}"
+      if ! podman run --rm \
+             --network=none \
+             --volume "${_secrets_dir}:/s:rw,U" \
+             "$_alpine_image" \
+             sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
+        log_warn "podman run chgrp ${_gid} failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
+        log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
+      fi
+      ;;
+  esac
+  return 0
+}
+
 generate_secrets() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
 
@@ -7176,73 +7284,14 @@ _pki_chown_client_keys() {
     return 0
   }
 
-  # Helper: chgrp a single file to group <gid> using the active strategy.
-  # Mirrors _do_chown exactly (same 3-mode dispatch) but issues chgrp not chown.
-  #
-  # CRITICAL (Laura GID-006): on Podman rootless the host-side GID is subgid-mapped.
-  # `podman unshare chgrp 2002 <file>` resolves GID 2002 in the user-namespace
-  # and writes the correct host subgid-mapped value to the inode automatically.
-  # A plain `chgrp 2002 <file>` on the host would set raw host GID 2002 which does
-  # NOT match the container-presented GID 2002 after subgid mapping — the file
-  # becomes unreadable. The unshare case MUST use `podman unshare chgrp`.
-  #
-  # Design: IRIS-DESIGN-002 §8 + LAURA-TM-GID-001 GID-003 + GID-006.
-  _do_chgrp() {
-    local _gid="$1" _file="$2" _label="$3"
-    case "$_chown_mode" in
-      direct)
-        if ! chgrp "${_gid}" "$_file"; then
-          log_error "chgrp ${_gid} failed on ${_label} — aborting"
-          return 1
-        fi
-        ;;
-      unshare)
-        # GID-006: MUST use podman unshare — NOT host-side chgrp.
-        local _unshare_grp_ok=0
-        if podman unshare chgrp "${_gid}" "$_file" 2>/dev/null; then
-          _unshare_grp_ok=1
-        fi
-        if [[ "$_unshare_grp_ok" == "0" ]]; then
-          log_warn "podman unshare chgrp ${_gid} failed on ${_label} — falling back to podman_run"
-          local _rel_file="${_file#"${_secrets_dir}/"}"
-          if ! podman run --rm \
-                 --volume "${_secrets_dir}:/s:rw" \
-                 "$_alpine_image" \
-                 sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
-            log_error "podman_run fallback chgrp ${_gid} also failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      docker_run)
-        local _rel_file="${_file#"${_secrets_dir}/"}"
-        if ! docker run --rm --pull=never \
-               --volume "${_secrets_dir}:/s:rw" \
-               "alpine:3" \
-               sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
-          if ! docker run --rm \
-                 --volume "${_secrets_dir}:/s:rw" \
-                 "$_alpine_image" \
-                 sh -c "chgrp ${_gid} /s/${_rel_file}"; then
-            log_error "docker_run chgrp ${_gid} failed on ${_label} — aborting"
-            return 1
-          fi
-        fi
-        ;;
-      podman_run)
-        local _rel_file="${_file#"${_secrets_dir}/"}"
-        if ! podman run --rm \
-               --network=none \
-               --volume "${_secrets_dir}:/s:rw,U" \
-               "$_alpine_image" \
-               sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
-          log_warn "podman run chgrp ${_gid} failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
-          log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
-        fi
-        ;;
-    esac
-    return 0
-  }
+  # _do_chgrp — hoisted to top-level scope (defined before generate_secrets).
+  # See the top-level _do_chgrp() definition above generate_secrets() for the
+  # full implementation. That version computes _chown_mode/_alpine_image/_secrets_dir
+  # locally using the same logic as this function, so it is fully equivalent here.
+  # The nested definition was removed to fix the bash scoping bug: nested functions
+  # are only registered when the outer function executes, but generate_secrets()
+  # calls _do_chgrp at step 6/13 before _pki_chown_client_keys runs (step 7+).
+  # (Ava blocker: install.sh line 5786 "_do_chgrp: command not found" — 8dd4c41.)
 
   # Helper: chmod 0640 a file using the active strategy.
   # Called paired with _do_chgrp for the shared secrets (GID-003).
