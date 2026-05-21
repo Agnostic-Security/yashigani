@@ -5915,8 +5915,37 @@ generate_secrets() {
     fi
 
     # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
-    # YSG-RISK-049 ACCEPTED-LOW non-KMS-only. auth_type=plain; edoburu entrypoint writes
-    # cleartext userlist.txt from DATABASE_URL. KMS deployments bypass on-disk path entirely.
+    # YSG-RISK-049 ACCEPTED-LOW non-KMS-only. YSG-RISK-049 is now CLOSED by the
+    # auth_query design (v2.24.0). pgbouncer_authenticator_password replaces this.
+
+    # --- pgbouncer_authenticator_password (YSG-RISK-049 close — v2.24.0) -------
+    # KMS-architectural posture (per docs/yashigani_install_config.md §6.1):
+    # In production with YSG_KMS_PROVIDER set, pgbouncer_authenticator_password
+    # is fetched at runtime via the KMS provider and bypasses this cleartext
+    # path entirely. Non-KMS dev/standalone deployments use this on-disk
+    # cleartext at 0640 owned by pgbouncer UID 70 (dedicated mount, not GID 2002).
+    #
+    # Option C isolation (Iris + Laura 2026-05-21): dedicated Docker secret mount
+    # at /run/secrets/pgbouncer_authenticator_password inside the container — NOT
+    # GID-2002 bind-mount. YSG-SECRETS-DIST-002 blast radius unchanged.
+    #
+    # NOTE: _do_chown symmetric mode (uid:uid) is used here; asymmetric uid:gid
+    # (70:0) is not yet supported by _do_chown (latent V240-002 bug — all dispatch
+    # branches emit "chown uid:gid:uid:gid" when called with a uid:gid pair).
+    # UID 70:70 ownership is functionally equivalent for Docker secrets because the
+    # daemon reads the file as root. Surfaced to Maxine for V240-002 follow-up.
+    local _pgba_file="${secrets_dir}/pgbouncer_authenticator_password"
+    if [[ ! -s "$_pgba_file" ]]; then
+      local _pgba_pw
+      _pgba_pw="$(_gen_password)"
+      printf "%s" "$_pgba_pw" > "$_pgba_file"
+      chmod 0600 "$_pgba_file"
+      _do_chown "70" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
+      _do_chmod_0640 "$_pgba_file" "pgbouncer_authenticator_password" || true
+      log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640 uid 70, upgrade path)"
+    else
+      log_info "pgbouncer_authenticator_password already present — preserving (upgrade path)"
+    fi
 
     return 0
   fi
@@ -6128,8 +6157,41 @@ generate_secrets() {
   fi
 
   # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
-  # YSG-RISK-049 ACCEPTED-LOW non-KMS-only. auth_type=plain; edoburu entrypoint writes
-  # cleartext userlist.txt from DATABASE_URL. KMS deployments bypass on-disk path entirely.
+  # YSG-RISK-049 is now CLOSED by the auth_query design (v2.24.0).
+  # pgbouncer_authenticator_password (below) replaces the cleartext userlist.txt path.
+
+  # --- pgbouncer_authenticator_password (YSG-RISK-049 close — v2.24.0) -----------
+  # This credential is used exclusively by pgbouncer for the auth_query connection
+  # to postgres (as the pgbouncer_authenticator role). It is never used by any
+  # application service and grants only EXECUTE on ysg_pgbouncer_get_auth().
+  #
+  # KMS-architectural posture (per docs/yashigani_install_config.md §6.1):
+  # In production with YSG_KMS_PROVIDER set, pgbouncer_authenticator_password
+  # is fetched at runtime via the KMS provider and bypasses this cleartext
+  # path entirely. Non-KMS dev/standalone deployments use this on-disk
+  # cleartext at 0640 owned by pgbouncer UID 70 (dedicated mount, not GID 2002).
+  #
+  # Option C isolation (Iris + Laura 2026-05-21): dedicated Docker secret mount
+  # at /run/secrets/pgbouncer_authenticator_password inside the container — NOT
+  # GID-2002 bind-mount. YSG-SECRETS-DIST-002 blast radius unchanged.
+  #
+  # NOTE: _do_chown symmetric mode is used (uid:uid → 70:70); the brief requested
+  # 70:0 but _do_chown cannot handle asymmetric uid:gid pairs — all dispatch
+  # branches emit "chown uid:gid:uid:gid" which fails (latent V240-002 bug,
+  # surfaced to Maxine). UID 70:70 is functionally equivalent for Docker secrets
+  # because the daemon reads the file as root. Follow-up: fix _do_chown.
+  local _pgba_file="${secrets_dir}/pgbouncer_authenticator_password"
+  if [[ ! -s "$_pgba_file" ]]; then
+    local _pgba_pw
+    _pgba_pw="$(_gen_password)"
+    printf "%s" "$_pgba_pw" > "$_pgba_file"
+    chmod 0600 "$_pgba_file"
+    _do_chown "70" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
+    _do_chmod_0640 "$_pgba_file" "pgbouncer_authenticator_password" || true
+    log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640, uid 70)"
+  else
+    log_info "pgbouncer_authenticator_password already present — preserving (use --remove-volumes to rotate)"
+  fi
 
   # --- HIBP breach check on generated passwords (defense-in-depth) ---
   _hibp_check_passwords
@@ -8206,6 +8268,25 @@ main() {
     # invariant check can assert secrets/ was not accidentally widened.
     # (fix: umask-077-bleed / Ava phase-1 failure 2026-05-20)
     _fix_config_perms
+
+    # YSG-RISK-049 upgrade migration notice (Amendment B — Iris design 2026-05-21).
+    # Shown on UPGRADE=true only. The 10-pgbouncer-auth.sh init script creates the
+    # pgbouncer_authenticator role and ysg_pgbouncer_get_auth function on FIRST BOOT
+    # of a fresh postgres volume. Existing clusters (UPGRADE path) must run this
+    # step ONCE BEFORE pgbouncer starts with the new auth_query configuration.
+    # The script is idempotent (IF NOT EXISTS guards) — safe to re-run; no-op on
+    # fresh installs where postgres init already executed it automatically.
+    if [[ "${UPGRADE:-false}" == "true" ]]; then
+      log_warn "v2.23.4 → v2.24.0 upgrade detected. The new YSG-RISK-049 auth_query"
+      log_warn "design requires running the pgbouncer_authenticator role + function"
+      log_warn "migration once. Run this command ONCE after install completes:"
+      log_warn ""
+      log_warn "  docker exec yashigani-postgres psql -U postgres -d yashigani \\"
+      log_warn "    -f /docker-entrypoint-initdb.d/10-pgbouncer-auth.sh"
+      log_warn ""
+      log_warn "(The script is idempotent — safe to re-run; no-op on fresh installs"
+      log_warn "  where the init script already executed.)"
+    fi
 
     # Step 10: docker compose up -d
     compose_up
