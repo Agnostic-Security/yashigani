@@ -15,12 +15,17 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [Unreleased] — v2.23.4 (pre-tag)
+## [v2.23.4] — 2026-05-21
 
 > The v2.23.4 release closes the v2.23.3 follow-up backlog, ships the SAML BYOK
-> config-load surface, multi-platform install robustness improvements, and a
+> config-load surface, multi-platform install robustness improvements, a
 > new CI gate that prevents Caddyfile / service-identity drift between compose
-> and Helm. Tag pending pre-flight gate completion.
+> and Helm, an architectural close of the cleanup-system class (state file +
+> container-fallback rm + cross-UID handlers across install/uninstall), the
+> pgbouncer mTLS sidecar (`letta-pgbouncer`) closing YSG-RISK-048, and the
+> KMS-architectural reframe for credential handling (non-KMS dev posture vs
+> KMS-configured production posture documented at
+> `docs/yashigani_install_config.md` §6.1).
 
 ### Added
 
@@ -363,6 +368,176 @@ drift on the rebased branch. They cover the post-FINDING-001 work:
   `feedback_detection_lane_parity_audit.md` (one audit lane catches a
   class — every other lane must demonstrate it would catch the same class
   or document the gap).
+
+### Security (tag close-out addendum 2026-05-21 — Batches 1+2+3 + cleanup-system architectural close)
+
+These entries cover the final pre-tag arc: 16 commits between `b03029f` and
+`03dd494` closing the v2.23.4 backlog. Iris+Laura review-first pattern
+executed across 10+ design+threat-model cycles (docs persisted at
+`internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`). Ava E2E
+13/13 PASS at tip `03dd494` (Phase 1 6/6 + Phase 2 6/6 + crucible test of
+the cross-UID `.env` class-of-bug close). All YSG-RISK entries triaged
+through Iris+Laura independent reviews; 7 register items confirmed CLOSED
+on triage; the cleanup-system architectural class fully closed.
+
+- **`letta-pgbouncer` mTLS sidecar** — letta's postgres connection now
+  routes through a dedicated `letta-pgbouncer` session-mode sidecar
+  (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, `read_only:true`, `cap_drop:[ALL]`,
+  `no-new-privileges`). The sidecar presents `letta-pgbouncer_client.crt`
+  to postgres over mTLS; the postgres `pg_hba.conf` catch-all
+  (`hostssl all all 0.0.0.0/0 scram-sha-256 clientcert=verify-ca`) applies
+  uniformly with no letta carveout. asyncpg+pg8000 limitation (cannot
+  present client certs via URI params) is closed at the sidecar boundary.
+  Closes YSG-RISK-048 (was MEDIUM open through Phase 3 arc).
+- **pgbouncer `auth_type=plain` posture documented as non-KMS-only**
+  (YSG-RISK-049 ACCEPTED-LOW). The cleartext userlist.txt is the expected
+  posture for the non-KMS dev/standalone deployment scenario. Production
+  deployments configure a KMS provider via `YSG_KMS_PROVIDER=vault|azure|
+  aws|gcp|keeper` which fetches credentials at runtime via the abstractions
+  in `src/yashigani/kms/` — the cleartext userlist.txt path is bypassed
+  entirely in KMS-configured deployments. Documented at
+  `docs/yashigani_install_config.md` §6.1.
+- **YSG-SECRETS-DIST-002 LOW filed** — GID 2002 (numeric, no `/etc/group`
+  entry) full-bind-mount cross-secret read. Compromised container with GID
+  2002 supplementary can read all three shared secrets, not just the one
+  it needs. Forward-close target v2.24.0 via per-consumer credentials.
+  No exploit chain in v2.23.4 (compensating control: cap_drop:ALL +
+  read_only:true rootfs + container-boundary trust posture).
+- **pgbouncer admin console lockdown** — both yashigani-pgbouncer and
+  letta-pgbouncer `pgbouncer.ini` now set `admin_users =` empty and
+  `stats_users =` empty, disabling the admin console (was inadvertently
+  open to `yashigani_app` cred on yashigani-pgbouncer). Closes Laura F2
+  finding from the Batch 3 threat-model.
+
+### Fixed (tag close-out addendum 2026-05-21)
+
+- **Cleanup-system architectural close — state file + container-fallback rm
+  + cross-UID handlers across install/uninstall.** Root cause of five
+  cascading uninstall/clean-slate blockers: install.sh and uninstall.sh
+  shared a working directory but shared no persisted state, forcing every
+  cleanup heuristic (runtime detect, ownership assumption, stale-dir
+  detection) to guess. Architectural close:
+  - **State file** `docker/.yashigani-install-state` (mode 0644, key=value:
+    `RUNTIME`, `INSTALL_UID`, `INSTALL_USER`, `INSTALL_TIMESTAMP`,
+    `YASHIGANI_VERSION`) written by install.sh at install completion.
+    Mode 0644 is correct (0600 would re-introduce the cross-UID problem).
+    `.gitignore` entry added.
+  - **uninstall.sh reads state file before auto-detect** — state-file
+    `RUNTIME` value beats `podman info`/`docker info` heuristic on
+    dual-runtime hosts. Falls back to auto-detect if state file absent
+    (backwards-compatible with pre-v2.23.4 installs).
+  - **Container-fallback rm for `docker/{data,certs,logs}`** — when host-side
+    `rm -rf` fails on chown'd dirs (cycle-3 install-side chown to 1001:1001),
+    fall back to `podman unshare rm` → ephemeral runtime container `rm -rf
+    /t/*`. No sudo required.
+  - **Sudo-free secrets wipe** (`BACKLOG-V240-006` closed) — `sudo rm -rf
+    docker/secrets/*` silently failed on non-PTY SSH. Replaced with the
+    same three-tier fallback (direct → `podman unshare` → container-root
+    `rm` against `docker/secrets:/t:rw`). Hard WARN on all-fail (no silent
+    swallow). `${_ALPINE_IMAGE:?...}` guard against unset variable.
+  - **Dotfile-aware wipe glob** — bare `rm -rf /t/*` does NOT match
+    dotfiles. `.pki-status` (written by `_pki_run_issuer`) survived the
+    wipe → `rmdir` then failed → blocker re-manifested. All three wipe
+    tiers updated to POSIX-portable glob: `rm -rf /t/* /t/.[!.]* /t/..?*`
+    (matches dotfiles excluding `.` and `..`; works in Alpine `sh`).
+  - **`rmdir` after content wipe** — empty `docker/secrets/` dir rmdir
+    works regardless of host owner; closes the stale-dir blocker.
+  - **`uninstall.sh` `log_info` helper** — was missing from uninstall.sh,
+    breaking the state-file detect block under `set -euo pipefail`. Helper
+    restored.
+  - **`.env` cross-UID handler** — `BUG-UNINSTALL-PARTIAL-ENV` now
+    skip-with-WARN on unreadable `.env` (test-infra contamination scenario
+    where a prior install ran as a different UID and wrote `docker/.env`
+    as `root:root`). `docker compose down` proceeds via Docker socket
+    without host-side `.env` read; `--env-file /dev/null` + process-env
+    stubs satisfy `:?` declarations. Three `.env` read sites guarded.
+  - **`_do_chgrp` hoisted to script scope** — bash nested-function bug
+    where `_do_chgrp` was defined inside `_pki_chown_client_keys()` but
+    called from `generate_secrets()` (earlier in install sequence) →
+    `command not found` under `set -euo pipefail`. Lifted to top-level
+    helper; sibling check confirmed `_do_chown` and `_do_chmod_dir` are
+    still nested-only-callers from within `_pki_chown_client_keys`.
+- **pgbouncer entrypoint CMD chain restored** — the MD5 shim experiment
+  ended with `exec /entrypoint.sh` (no args). edoburu's entrypoint last
+  line is `exec "$@"` — with empty `$@`, exec exits cleanly without
+  launching pgbouncer. Fixed in all four sites (compose × 2 services +
+  helm template + values.yaml sidecar): `exec /entrypoint.sh pgbouncer
+  /etc/pgbouncer/pgbouncer.ini` restored.
+- **pgbouncer `auth_file = /etc/pgbouncer/userlist.txt` directive restored
+  in all three ini files** (`docker/pgbouncer/pgbouncer.ini`,
+  `docker/pgbouncer/pgbouncer-letta.ini`,
+  `helm/yashigani/files/pgbouncer.ini`). The SCRAM-revert dropped the
+  directive entirely instead of restoring its pre-SCRAM value, leaving
+  pgbouncer with no user lookup mechanism even though userlist.txt was on
+  disk.
+- **Air-gap install Step 9 image-digest verification** — `docker load`
+  does not populate `RepoDigests`, so the prior verification loop reported
+  silent `0 image(s) verified`. `scripts/prepare-airgap-bundle.sh` now
+  captures `docker inspect --format '{{.Id}}'` at bundle-build time and
+  writes an `id:` field into each manifest entry; install.sh verification
+  falls back to `.Id` (content-addressable SHA-256) when `RepoDigests` is
+  empty. Backwards-compatible for pre-extension manifests (warn-and-skip;
+  bundle SHA + helm/compose digest-pin remain primary integrity controls).
+  Closes YSG-RISK-038 / BUG-AG-003.
+- **`install.sh:5101` `|| true` guard on podman cp fallback** — the
+  compose-cp/podman-cp fallback chain at lines 5100-5101 had `|| true`
+  on the subsequent exec lines but not on the cp fallback itself. When
+  open-webui is absent from `COMPOSE_PROFILES` (e.g.,
+  `--agent-bundles letta,langflow` without `all`), the cp tried to copy
+  into a non-existent container and hung indefinitely under
+  `set -euo pipefail`. Closes the Ava-found Phase 1 cp-hang.
+- **uninstall.sh runtime detection prefers Podman with liveness probe** —
+  was misdetecting runtime as Docker on Podman-only VMs (and via
+  symmetrical inversion on dual-runtime hosts), calling `docker volume rm`
+  against Podman volumes which silently no-oped. Detection now uses
+  `podman info` liveness probe first, `docker info` fallback. Operator
+  `--runtime=` override preserved. Closes BACKLOG-V240-004.
+- **uninstall.sh chown container-fallback for `docker/{data,certs,logs}`** —
+  mirror of install-side cycle-3 container-fallback pattern. Closes
+  BACKLOG-V240-003.
+
+### Changed (tag close-out addendum 2026-05-21)
+
+- **Dead-code `fasttext_backend.py` removed** — `src/yashigani/inspection/backends/fasttext_backend.py`
+  deleted; was a 130-line vestigial leftover from the v2.23.3 fasttext→sklearn
+  swap (`e966e55`). Zero live imports verified before removal (collected
+  2511 tests collected with no import errors). Closes LU-YSG-009.
+- **Air-gap install docs (`docs/operations/air-gap-install.md`)** — `config/`
+  added to Step 2 transfer file list (closes YSG-RISK-039 / BUG-AG-004);
+  v2.23.3 version refs swept to v2.23.4 in the same docs commit.
+
+### Documentation — tag close-out addendum
+
+- **KMS posture note** at `docs/yashigani_install_config.md` §6.1 — clarifies
+  that the cleartext userlist.txt is the non-KMS dev/standalone posture and
+  that production deployments configure `YSG_KMS_PROVIDER=vault|azure|aws|
+  gcp|keeper` to bypass the cleartext-on-disk path entirely. Captures the
+  YSG-RISK-049 architectural framing.
+
+### YSG-RISK register — tag close-out state
+
+- **CLOSED via tag close-out work:** YSG-RISK-048 (letta postgres mTLS via
+  pgbouncer sidecar), BACKLOG-V240-003 (uninstaller chown), BACKLOG-V240-004
+  (uninstaller runtime detect), BACKLOG-V240-006 (sudo secrets wipe), and
+  the cleanup-system class root cause (state file + cross-UID handlers).
+- **CLOSED via Iris+Laura triage:** YSG-RISK-013 (SPIFFE ACL TTL — closed
+  since April), YSG-RISK-014 (OIDC acr/amr — closed since April), YSG-RISK-036
+  (PR #71 CVE chain — Laura-validated CLOSED), YSG-RISK-040 (fasttext —
+  closed via v2.23.3 sklearn swap), YSG-RISK-044/045 (NOT-EXPLOITABLE-CVA
+  compensating controls active), YSG-RISK-046 (Podman host-reboot —
+  confirmed CLOSED), LU-YSG-012 (`apt-get -y upgrade` — already applied
+  in both Dockerfiles), YSG-RISK-007 (SSRF — register heading reconciled,
+  6 sites closed via 84aab78/64ec325/1209055).
+- **ACCEPTED-LOW non-customer-scenario in v2.23.4:** YSG-RISK-049 (pgbouncer
+  userlist.txt cleartext — non-KMS deployment posture; production KMS path
+  bypasses). YSG-SECRETS-DIST-002 (GID 2002 cross-secret-read — forward-close
+  v2.24.0 per-consumer creds).
+- **Forward-tracked to v2.24.0 backlog** (explicit Tiago sign-off + named
+  forward-close target per `feedback_debt_before_features` rule):
+  BACKLOG-V240-001 (uvicorn → granian/hypercorn ASGI swap, closes
+  YSG-RISK-012b + YSG-RISK-047 + YSG-RISK-013 partial; Iris+Laura
+  second-opinion validated 3-5 days realistic effort), BACKLOG-V240-002
+  (`_do_chown` top-level shared helper refactor).
 
 ---
 
