@@ -50,10 +50,12 @@ If model unavailable, returns UNCERTAIN (always routes to LLM).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,43 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("SKLEARN_MODEL_PATH", "/app/models/sensitivity_classifier.joblib")
 DEFAULT_HIGH_THRESHOLD = 0.57  # Calibrated per Laura re-probe LAURA-CVA-V233-SKLEARN-REPROBE 2026-05-10: OOD FPR 0.35→0.05, INJECTION recall 0.9455 (see module docstring)
 DEFAULT_LOW_THRESHOLD = 0.4
+
+# ---------------------------------------------------------------------------
+# Model integrity guard (F4 — ACS scan defence-in-depth, 2026-05-21)
+# ---------------------------------------------------------------------------
+# SHA256 of the production sensitivity_classifier.joblib baked into the Docker
+# image at build time (Dockerfile.gateway trainer stage → runtime COPY).
+#
+# The model is NOT present in the source tree; it is produced by the trainer
+# stage at image build time and copied to /app/models/ in the runtime image.
+#
+# Update procedure: after re-training or rebuilding the image, compute:
+#   sha256sum /app/models/sensitivity_classifier.joblib
+# or:
+#   python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" /app/models/sensitivity_classifier.joblib
+# and commit the result here.
+#
+# Empty string "" disables the check (opt-in). This is the source-committed
+# default because the model does not exist in the repository — the hash is
+# computed at Docker build time and can be passed via the env-var below.
+# In production, set SKLEARN_MODEL_SHA256 to the expected hash, or update
+# this constant after re-training.
+#
+# Override via environment: SKLEARN_MODEL_SHA256=<hex> takes precedence over
+# this constant (allows operator-supplied hash without code change).
+#
+# ASVS V1.14.1, CWE-502.
+_EXPECTED_MODEL_SHA256: str = os.getenv("SKLEARN_MODEL_SHA256", "")
+
+
+class ModelIntegrityError(Exception):
+    """Raised when the sklearn model file SHA256 does not match the expected hash.
+
+    This indicates possible supply-chain tampering of the model artifact.
+    The model will NOT be loaded when this is raised -- fail-closed.
+
+    ASVS V1.14.1, CWE-502.
+    """
 
 
 @dataclass
@@ -79,28 +118,59 @@ class SklearnBackend:
         model_path: str = MODEL_PATH,
         high_threshold: float = DEFAULT_HIGH_THRESHOLD,
         low_threshold: float = DEFAULT_LOW_THRESHOLD,
+        expected_sha256: str = "",
     ) -> None:
         self._model_path = model_path
         self._high_threshold = high_threshold
         self._low_threshold = low_threshold
+        # Instance-level SHA256 override; takes precedence over module-level constant
+        # and SKLEARN_MODEL_SHA256 env-var when non-empty.
+        self._expected_sha256 = expected_sha256
         self._pipeline = None
         self._available = False
         self._load_model()
 
     def _load_model(self) -> None:
-        if not os.path.exists(self._model_path):
+        model_path = Path(self._model_path)
+        if not model_path.exists():
             logger.warning(
-                "sklearn model not found at %s — disabled. All requests use LLM second-pass.",
+                "sklearn model not found at %s -- disabled. All requests use LLM second-pass.",
                 self._model_path,
             )
             return
+
+        # Integrity check (F4 -- ACS scan defence-in-depth, 2026-05-21).
+        # Verify the model file SHA256 before passing it to joblib.
+        # joblib uses pickle under the hood; a tampered model is equivalent
+        # to arbitrary-code execution at load time.
+        # If _EXPECTED_MODEL_SHA256 is empty, the check is skipped (opt-in).
+        expected = self._expected_sha256 or _EXPECTED_MODEL_SHA256
+        if expected:
+            actual = hashlib.sha256(model_path.read_bytes()).hexdigest()
+            if actual != expected:
+                raise ModelIntegrityError(
+                    f"Model SHA256 mismatch for {self._model_path!r}: "
+                    f"expected {expected!r}, got {actual!r}. "
+                    "Refusing to load potentially tampered model. "
+                    "Update _EXPECTED_MODEL_SHA256 or SKLEARN_MODEL_SHA256 after re-training. "
+                    "ASVS V1.14.1, CWE-502."
+                )
+            logger.info(
+                "sklearn model integrity check PASSED (sha256=%s...) for %s",
+                actual[:16],
+                self._model_path,
+            )
+
         try:
-            import joblib  # noqa: PLC0415 — intentional lazy import
+            import joblib  # noqa: PLC0415 -- intentional lazy import
             self._pipeline = joblib.load(self._model_path)
             self._available = True
             logger.info("sklearn sensitivity model loaded from %s", self._model_path)
         except ImportError:
-            logger.warning("joblib not installed — sklearn classifier disabled")
+            logger.warning("joblib not installed -- sklearn classifier disabled")
+        except ModelIntegrityError:
+            # Re-raise: integrity failures must not be swallowed.
+            raise
         except Exception as exc:
             logger.error("sklearn model load error: %s", exc)
 
