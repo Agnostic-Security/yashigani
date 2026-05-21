@@ -6824,21 +6824,85 @@ _pki_chown_client_keys() {
   local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
   local _secrets_dir="${WORK_DIR}/docker/secrets"
 
+  # Helper: chmod a directory using the active _chown_mode dispatch strategy.
+  # IRIS-DESIGN-004 / LAURA-TM-CHMOD-001 CHM-001.
+  # Mirrors _do_chown / _do_chgrp / _do_chmod_0640 — same 4-mode dispatch.
+  # Directory chmod (no -R): sets the mode on $1 only, not its contents.
+  # CHM-001: only mode 755 is permitted; any other value is rejected fail-closed.
+  # On failure: log_warn (not log_error) — dir mode failure is not install-fatal
+  # because files inside are readable by GID 2002 regardless; mode 755 is needed
+  # for OPA inotify (V232-SMOKE-012). Warn and continue so install proceeds.
+  _do_chmod_dir() {
+    local _dir="$1" _mode="$2"
+    # CHM-001 — mode allowlist guard. Only 755 is approved for directory ops.
+    # Any future caller needing a different mode must extend this list and cite
+    # the threat model that approved it. Prevents accidental 0777 / 4755 (setuid).
+    case "$_mode" in
+      755) ;;
+      *)
+        log_error "_do_chmod_dir: refusing unsupported mode '${_mode}' — only 755 allowed by design (LAURA-TM-CHMOD-001 CHM-001)"
+        return 1
+        ;;
+    esac
+    case "$_chown_mode" in
+      direct)
+        if ! chmod "$_mode" "$_dir"; then
+          log_warn "_do_chmod_dir: direct chmod ${_mode} failed on ${_dir}"
+        fi
+        ;;
+      unshare)
+        # Try podman unshare first; fall back to podman_run on failure (gate #ROOTLESS-7 pattern).
+        if ! podman unshare chmod "$_mode" "$_dir" 2>/dev/null; then
+          log_warn "_do_chmod_dir: podman unshare chmod ${_mode} failed — trying podman_run fallback"
+          if ! podman run --rm \
+                 --volume "${_dir}:/d:rw" \
+                 "$_alpine_image" \
+                 chmod "$_mode" /d 2>/dev/null; then
+            log_warn "_do_chmod_dir: podman_run fallback chmod ${_mode} also failed on ${_dir}"
+          fi
+        fi
+        ;;
+      docker_run)
+        # Prefer cached alpine:3 tag (--pull=never); fall back to digest-pinned image.
+        # CHM-002/CHM-003 (ACCEPTED): container root has CAP_FOWNER; blast radius is
+        # the single dir bound at this call site. Ephemeral --rm, no network.
+        if ! docker run --rm --pull=never \
+               --volume "${_dir}:/d:rw" \
+               "alpine:3" \
+               chmod "$_mode" /d 2>/dev/null; then
+          if ! docker run --rm \
+                 --volume "${_dir}:/d:rw" \
+                 "$_alpine_image" \
+                 chmod "$_mode" /d 2>/dev/null; then
+            log_warn "_do_chmod_dir: docker_run chmod ${_mode} failed on ${_dir}"
+          fi
+        fi
+        ;;
+      podman_run)
+        # Podman remote-client (macOS): podman unshare not supported; use container.
+        # WARN-not-ABORT: same rationale as _do_chown podman_run path (macOS TCC / virtiofs).
+        if ! podman run --rm \
+               --network=none \
+               --volume "${_dir}:/d:rw" \
+               "$_alpine_image" \
+               chmod "$_mode" /d 2>/dev/null; then
+          log_warn "_do_chmod_dir: podman_run chmod ${_mode} failed on ${_dir} (macOS TCC Privacy may block virtiofs)"
+          log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
+        fi
+        ;;
+    esac
+    return 0
+  }
+
   # V232-SMOKE-012 fix: ensure the secrets directory is mode 0755 (rwxr-xr-x)
   # so ALL container UIDs (including OPA=1000, otel-collector=10001, etc.) can
   # both traverse AND read-list the directory. OPA's inotify TLS cert watcher
   # requires read on the directory; 0751 (others --x) prevents it → OPA unhealthy.
   # restore.sh previously set 0751; install.sh did not enforce a canonical mode.
   # This call normalises it regardless of what set it previously.
-  if [[ "$_effective_runtime" == "podman" ]] && \
-     awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
-       /etc/subuid 2>/dev/null; then
-    podman unshare chmod 755 "${_secrets_dir}" 2>/dev/null || \
-      log_warn "_pki_chown_client_keys: could not chmod 755 ${_secrets_dir} via podman unshare"
-  else
-    chmod 755 "${_secrets_dir}" 2>/dev/null || \
-      log_warn "_pki_chown_client_keys: could not chmod 755 ${_secrets_dir}"
-  fi
+  # IRIS-DESIGN-004: replaced broken inline if/else block (which ignored _chown_mode
+  # and fell through to host-direct chmod, causing EPERM for Docker non-root callers).
+  _do_chmod_dir "${_secrets_dir}" 755 || return 1
 
   # Helper: chown a single file to <uid>:<uid> using the active strategy.
   # Optional 4th arg: _extra_chmod — an octal mode string (e.g. "0640") to
