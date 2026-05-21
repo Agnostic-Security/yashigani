@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# update.sh — Yashigani v2.23.3
-# last-updated: 2026-05-10T12:00:00+01:00 (fix: BUG-AG-005 bump header to 2.23.3)
+# update.sh — Yashigani v2.23.4
+# last-updated: 2026-05-21T00:00:00+00:00 (v2.23.4 release: bump header from 2.23.3)
 # last-updated: 2026-05-04T00:00:00+01:00 (feat: verify_health + auto-rollback wiring — retro #59)
 # Updates an existing Yashigani installation to the latest version.
 #

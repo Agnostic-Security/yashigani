@@ -16,12 +16,14 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.3 (2026-05-11) — macOS Podman promoted to hard CI gate, per-runtime PKI bootstrap split, manifest pre/post SHA-256 audit-trail logging, OpenSSL 4.0.x aarch64 SVE-probe stopgap, bash 3.2 portability for macOS system bash; see `CHANGELOG.md` for the release entry.
+**Latest Tagged Release:** v2.23.4 (2026-05-21) — cleanup-system architectural close (state file + container-fallback rm + cross-UID handlers across install/uninstall), `letta-pgbouncer` mTLS sidecar closing YSG-RISK-048, KMS-architectural posture documented for credentials, Open WebUI in-mesh path through gateway, `/me/api-key` self-service Bearer issuance, OPA fail-closed posture; see `CHANGELOG.md` for the release entry.
 
-> **Upgrade notice:** v2.23.2 ships a security hardening batch. Existing v2.23.1 deployments should upgrade.
+> **Upgrade notice:** v2.23.4 carries a behavioural change — OPA now fails-CLOSED on every exception path (timeout, 5xx, connection refused). Operators with intermittently-reachable OPA should alert on `yashigani_opa_response_check_failures_total`. Dev opt-in to prior fail-open behaviour: `YASHIGANI_OPA_OPTIONAL=true` (non-production only).
 
-> **Notable behaviour changes in v2.23.2:**
-> - **Rate limiter fails closed** by default in v2.23.2 (was open in v2.23.1). Set `RATE_LIMITER_FAIL_MODE=open` if your deployment requires high-availability behaviour during Redis instability.
+> **Notable behaviour changes in v2.23.4:**
+> - **OPA fails closed** on every exception path (was prior `allow:True` in some paths). New Prometheus counter `yashigani_opa_response_check_failures_total{outcome, reason}`.
+> - **letta postgres** now routes through dedicated `letta-pgbouncer` mTLS sidecar — clean pg_hba `clientcert=verify-ca` catch-all, no carveouts.
+> - **Cleanup system** — `docker/.yashigani-install-state` file written at install completion; uninstall reads it for cross-UID runtime selection. Required for correct dual-runtime / multi-user host behaviour.
 
 ---
 **Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.

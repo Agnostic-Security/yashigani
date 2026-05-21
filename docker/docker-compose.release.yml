@@ -1,5 +1,5 @@
 ---
-# Yashigani v2.23.3 — Release digest overlay
+# Yashigani v2.23.4 — Release digest overlay
 # Last updated: 2026-05-07T10:30:00+01:00 (chore: convert floating-tag stubs to specific verified-existing versions)
 #
 # Purpose: overrides every `image:` field in docker-compose.yml to pin the

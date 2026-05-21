@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/prepare-airgap-bundle.sh — Yashigani v2.23.3
+# scripts/prepare-airgap-bundle.sh — Yashigani v2.23.4
 # last-updated: 2026-05-09T00:00:00+01:00 (feat: air-gap mode + customer-built offline bundle #58)
 #
 # PURPOSE

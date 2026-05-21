@@ -1,5 +1,5 @@
 {{- /*
-Yashigani v2.23.3 — age-encrypted backup CronJob (MP.L2-3.8.9 / CMMC L2)
+Yashigani v2.23.4 — age-encrypted backup CronJob (MP.L2-3.8.9 / CMMC L2)
 
 Runs scripts/backup.sh daily (default: 02:00 UTC) and pipes the archive
 through age encryption before writing to the output PersistentVolume.
