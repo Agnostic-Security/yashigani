@@ -282,6 +282,16 @@ _remove_auto_start
 
 _ENV_FILE="${SCRIPT_DIR}/docker/.env"
 _STUB_ENV_CREATED="false"
+_ENV_READABLE="true"
+
+# Cross-UID guard (cleanup-system arch — extends 57ea226 + d4e2337 class):
+# If docker/.env exists but is owned by a different UID (e.g. prior agent
+# installed as root), host-side read fails with EACCES. Compose down does NOT
+# need host-side .env read — process-env exports from Phase B are sufficient.
+if [ -f "$_ENV_FILE" ] && [ ! -r "$_ENV_FILE" ]; then
+    _ENV_READABLE="false"
+    echo "  [warn] docker/.env present but unreadable (cross-UID ownership) — skipping partial-env parse; compose down will use process-env stubs (BUG-UNINSTALL-PARTIAL-ENV cross-UID)"
+fi
 
 if [ ! -f "$_ENV_FILE" ]; then
     echo "  [info] docker/.env not found — writing uninstall stub to allow compose parse (BUG-UNINSTALL-NO-ENV)"
@@ -349,7 +359,8 @@ if [ -f "$COMPOSE_FILE" ]; then
         fi
 
         # Check 2: present (non-empty) in docker/.env?
-        if [ -f "$_ENV_FILE" ] && grep -qE "^${_var}=.+" "$_ENV_FILE" 2>/dev/null; then
+        # Skip grep when .env is unreadable (cross-UID) — will stub unconditionally.
+        if [ "$_ENV_READABLE" = "true" ] && [ -f "$_ENV_FILE" ] && grep -qE "^${_var}=.+" "$_ENV_FILE" 2>/dev/null; then
             continue
         fi
 
@@ -365,8 +376,17 @@ if [ -n "$_PARTIAL_ENV_STUBBED" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# When docker/.env is cross-UID unreadable, override compose's auto-load of
+# .env by pointing --env-file at /dev/null (empty, always readable). All
+# required vars are already present in the process environment via Phase B
+# exports above, so compose parse succeeds via process-env precedence.
+_COMPOSE_ENV_ARGS=""
+if [ "$_ENV_READABLE" = "false" ]; then
+    _COMPOSE_ENV_ARGS="--env-file /dev/null"
+fi
+
 # shellcheck disable=SC2086
-$COMPOSE -f "$COMPOSE_FILE" down $DOWN_ARGS
+$COMPOSE -f "$COMPOSE_FILE" ${_COMPOSE_ENV_ARGS} down $DOWN_ARGS
 
 # ---------------------------------------------------------------------------
 # BUG-UNINSTALL-DEPGRAPH-LEAK: belt-and-braces container force-removal.
