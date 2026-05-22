@@ -37,10 +37,10 @@ spec:
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
-        # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — budget-redis reads
-        # redis_password via secretKeyRef (env var) in K8s so supplementalGroups
-        # is not functionally required here. Added for Compose↔Helm parity.
-        supplementalGroups: [2002]
+        # YSG-SECRETS-DIST-002 CLOSED: redis_password delivered via secretKeyRef
+        # env var in K8s. supplementalGroups: [2002] was vestigial (no file-read
+        # path in K8s). Removed per Laura A1 amendment — GID 2002 narrowed to
+        # langflow-only on Compose path; K8s never needed it.
         seccompProfile:
           type: RuntimeDefault
       containers:

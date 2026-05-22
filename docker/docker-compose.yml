@@ -558,12 +558,10 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (open-webui.yaml:90,110).
     # No cap_add: open-webui binds port 8080 (non-privileged).
     cap_drop: [ALL]
-    # IRIS-DESIGN-002 / LAURA-TM-GID-001: open-webui Bucket-C shim reads
-    # yashigani_internal_bearer via `cat /run/secrets/yashigani_internal_bearer`
-    # at startup. GID 2002 (ysg-secrets) grants group-read on the 0640 file.
-    # Laura GID-001: openclaw excluded (bearer via OPENCLAW_GATEWAY_TOKEN env var).
-    group_add:
-      - "2002"
+    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): open-webui UID 0 reads
+    # yashigani_internal_bearer as file owner (host file chowned 0:2002 0640).
+    # cap_drop:[ALL] drops DAC_OVERRIDE — UID 0 == file UID 0, so owner-read
+    # applies without needing DAC_OVERRIDE. GID 2002 removed from this service.
     # EX-231-10 (v2.23.4 BUG-1 fix): open-webui joins BOTH caddy_internal AND data.
     # caddy_internal — Caddy reverse-proxies TO open-webui:8080. Without this
     #   network, the DNS name "open-webui" is unresolvable from Caddy's namespace
@@ -611,7 +609,11 @@ services:
           --appendonly yes
     volumes:
       - budget_redis_data:/data
+      # YSG-SECRETS-DIST-002 CLOSED: blanket ./secrets mount retained for PKI
+      # material (certs/keys). redis_password additionally mounted per-file so
+      # budget-redis cannot read postgres_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
+      - ./secrets/redis_password:/run/secrets/redis_password:ro
     healthcheck:
       # trust anchor: ca_root.crt — libssl strict-mode (error:0A000086 with intermediate)
       test: ["CMD-SHELL", "redis-cli --tls --cert /run/secrets/budget-redis_client.crt --key /run/secrets/budget-redis_client.key --cacert /run/secrets/ca_root.crt -p 6380 -a \"$(cat /run/secrets/redis_password)\" ping 2>/dev/null | grep -q PONG"]
@@ -630,11 +632,9 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (budget-redis.yaml:49).
     # No cap_add: redis binds port 6380 (non-privileged).
     cap_drop: [ALL]
-    # IRIS-DESIGN-002 / LAURA-TM-GID-001: budget-redis reads redis_password via
-    # `cat /run/secrets/redis_password` in the startup command (UID 999,
-    # cap_drop ALL, no DAC_OVERRIDE). GID 2002 (ysg-secrets) grants group-read.
-    group_add:
-      - "2002"
+    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): budget-redis UID 999 reads
+    # redis_password as file owner (host file chowned 999:999 0600 by install.sh).
+    # GID 2002 removed — per-file mount eliminates cross-secret read path.
     # EX-231-10: budget-redis is a data-plane dep of gateway/backoffice only.
     networks:
       - data
@@ -720,7 +720,11 @@ services:
       --requirepass "$$(cat /run/secrets/redis_password)"'
     volumes:
       - redis_data:/data
+      # YSG-SECRETS-DIST-002 CLOSED: blanket ./secrets mount retained for PKI
+      # material (certs/keys). redis_password additionally mounted per-file so
+      # redis cannot read postgres_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
+      - ./secrets/redis_password:/run/secrets/redis_password:ro
     healthcheck:
       # redis-cli over TLS with our client cert.
       # trust anchor: ca_root.crt — libssl strict-mode (error:0A000086 with intermediate)
@@ -745,11 +749,9 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (redis.yaml:51).
     # No cap_add: redis binds port 6380 (non-privileged).
     cap_drop: [ALL]
-    # IRIS-DESIGN-002 / LAURA-TM-GID-001: redis reads redis_password via
-    # `cat /run/secrets/redis_password` in the startup command (UID 999,
-    # cap_drop ALL, no DAC_OVERRIDE). GID 2002 (ysg-secrets) grants group-read.
-    group_add:
-      - "2002"
+    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): redis UID 999 reads
+    # redis_password as file owner (host file chowned 999:999 0600 by install.sh).
+    # GID 2002 removed — per-file mount eliminates cross-secret read path.
     # EX-231-10: redis is a data-plane dep only.
     networks:
       - data
@@ -1070,7 +1072,11 @@ services:
       # Bind-mount host secrets directory directly (not the shared named volume).
       # Postgres starts before backoffice populates secrets_volume, so it needs
       # the installer-generated password file from disk immediately.
+      # YSG-SECRETS-DIST-002 CLOSED: blanket ./secrets mount retained for PKI
+      # material (certs/keys). postgres_password additionally mounted per-file so
+      # postgres cannot read redis_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
+      - ./secrets/postgres_password:/run/secrets/postgres_password:ro
       # Init scripts run in alphabetical order — 05 must come before 10.
       # 05 enables TLS + client-cert verification on first initdb.
       - ./postgres/05-enable-ssl.sh:/docker-entrypoint-initdb.d/05-enable-ssl.sh:ro
@@ -1097,12 +1103,10 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (postgres.yaml:67).
     # No cap_add: postgres binds port 5432 (non-privileged).
     cap_drop: [ALL]
-    # IRIS-DESIGN-002 / LAURA-TM-GID-001: postgres reads postgres_password via
-    # POSTGRES_PASSWORD_FILE at startup (UID 999, cap_drop ALL, no DAC_OVERRIDE).
-    # GID 2002 (ysg-secrets) grants group-read on the 0640 file.
-    # Laura GID-001: openclaw excluded (bearer via env var, no file read).
-    group_add:
-      - "2002"
+    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): postgres UID 999 reads
+    # postgres_password as file owner (host file chowned 999:999 0600 by install.sh).
+    # cap_drop:[ALL] + user:999:999 — UID 999 == file UID 999, owner-read applies.
+    # GID 2002 removed — per-file mount eliminates cross-secret read path.
     # EX-231-10: postgres is data-plane only.
     networks:
       - data
@@ -1585,10 +1589,11 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
     # No cap_add: langflow binds port 7860 (non-privileged).
     cap_drop: [ALL]
-    # IRIS-DESIGN-002 / LAURA-TM-GID-001: langflow Bucket-C shim reads
-    # yashigani_internal_bearer via `cat /run/secrets/yashigani_internal_bearer`
-    # at startup. GID 2002 (ysg-secrets) grants group-read on the 0640 file.
-    # Laura GID-001: openclaw excluded (bearer via OPENCLAW_GATEWAY_TOKEN env var).
+    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): langflow UID 1000 cannot read
+    # yashigani_internal_bearer as owner (host file chowned 0:2002 0640) and
+    # cap_drop:[ALL] drops DAC_OVERRIDE. GID 2002 retained on langflow ONLY —
+    # it is the sole remaining group-read consumer. All other services removed.
+    # See: cap_drop+CAP_DAC_OVERRIDE doc note (compose lines 587-591 budget-redis).
     group_add:
       - "2002"
     # EX-231-10: langflow calls gateway via http://gateway:8080/v1 (same as
@@ -1758,12 +1763,10 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
     # No cap_add: letta binds port 8283 (non-privileged).
     cap_drop: [ALL]
-    # IRIS-DESIGN-002 / LAURA-TM-GID-001: letta Bucket-C shim reads
-    # yashigani_internal_bearer via `cat /run/secrets/yashigani_internal_bearer`
-    # at startup. GID 2002 (ysg-secrets) grants group-read on the 0640 file.
-    # Laura GID-001: openclaw excluded (bearer via OPENCLAW_GATEWAY_TOKEN env var).
-    group_add:
-      - "2002"
+    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): letta UID 0 reads
+    # yashigani_internal_bearer as file owner (host file chowned 0:2002 0640).
+    # cap_drop:[ALL] drops DAC_OVERRIDE — UID 0 == file UID 0, so owner-read
+    # applies without needing DAC_OVERRIDE. GID 2002 removed from this service.
     # EX-231-10: letta calls gateway + postgres, both on `data`.
     networks:
       - data

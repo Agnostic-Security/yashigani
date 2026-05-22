@@ -893,10 +893,12 @@ agentBundles:
     podSecurityContext:
       runAsNonRoot: true
       runAsUser: 1000
-      # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — langflow receives
-      # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups
-      # is not functionally required here. Added for Compose↔Helm parity.
-      # Laura GID-001: openclaw excluded (bearer via env var, no file read).
+      # YSG-SECRETS-DIST-002 CLOSED (Laura A1): langflow UID 1000 is the sole
+      # remaining GID 2002 consumer on Compose path (reads bearer as group).
+      # In K8s, bearer is delivered via secretKeyRef env var — supplementalGroups
+      # is not functionally required here but retained for documentation parity.
+      # All other services (postgres, redis, budget-redis, open-webui, letta)
+      # have had supplementalGroups: [2002] removed.
       supplementalGroups: [2002]
     containerSecurityContext:
       allowPrivilegeEscalation: false
@@ -964,11 +966,10 @@ agentBundles:
     podSecurityContext:
       runAsNonRoot: false
       runAsUser: 0
-      # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — letta receives
-      # yashigani_internal_bearer via secretKeyRef in K8s so supplementalGroups
-      # is not functionally required here. Added for Compose↔Helm parity.
-      # Laura GID-001: openclaw excluded (bearer via env var, no file read).
-      supplementalGroups: [2002]
+      # YSG-SECRETS-DIST-002 CLOSED: yashigani_internal_bearer delivered via
+      # secretKeyRef env var in K8s. supplementalGroups: [2002] was vestigial.
+      # Removed per Laura A1 amendment — GID 2002 narrowed to langflow-only on
+      # Compose path; K8s never needed it.
     containerSecurityContext:
       allowPrivilegeEscalation: false
       # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).

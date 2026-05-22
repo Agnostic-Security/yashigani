@@ -53,11 +53,10 @@ spec:
         runAsUser: 70
         runAsGroup: 70
         fsGroup: 70
-        # IRIS-DESIGN-002 / LAURA-TM-GID-001: compose parity — postgres reads
-        # postgres_password via secretKeyRef (env var) in K8s so supplementalGroups
-        # is not functionally required here (no file read path). Added for
-        # Compose↔Helm parity per the brief; harmless in K8s.
-        supplementalGroups: [2002]
+        # YSG-SECRETS-DIST-002 CLOSED: postgres_password delivered via secretKeyRef
+        # env var in K8s. supplementalGroups: [2002] was vestigial (no file-read
+        # path in K8s). Removed per Laura A1 amendment — GID 2002 narrowed to
+        # langflow-only on Compose path; K8s never needed it.
         seccompProfile:
           type: RuntimeDefault
       containers:
