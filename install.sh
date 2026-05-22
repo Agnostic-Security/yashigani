@@ -5939,17 +5939,18 @@ generate_secrets() {
     # GID-2002 bind-mount. YSG-SECRETS-DIST-002 blast radius unchanged.
     #
     # _do_chown now handles uid:gid pairs natively (V240-002 follow-up fix).
-    # Correct ownership is 70:0 (pgbouncer uid, root gid) — pgbouncer reads
-    # the file as UID 70; root GID ensures daemon-level access if needed.
+    # Correct ownership is 70:999 (pgbouncer uid:postgres gid) — pgbouncer (UID 70)
+    # reads as owner; postgres (UID 999) reads as group at init time via
+    # 10-pgbouncer-auth.sh. Symmetric with postgres_password 1001:999 0640.
     local _pgba_file="${secrets_dir}/pgbouncer_authenticator_password"
     if [[ ! -s "$_pgba_file" ]]; then
       local _pgba_pw
       _pgba_pw="$(_gen_password)"
       printf "%s" "$_pgba_pw" > "$_pgba_file"
       chmod 0600 "$_pgba_file"
-      _do_chown "70:0" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
+      _do_chown "70:999" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
       _do_chmod_0640 "$_pgba_file" "pgbouncer_authenticator_password" || true
-      log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640 uid 70:0, upgrade path)"
+      log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640 uid 70:999, upgrade path)"
     else
       log_info "pgbouncer_authenticator_password already present — preserving (upgrade path)"
     fi
@@ -6183,16 +6184,18 @@ generate_secrets() {
   # GID-2002 bind-mount. YSG-SECRETS-DIST-002 blast radius unchanged.
   #
   # _do_chown now handles uid:gid pairs natively (V240-002 follow-up fix).
-  # Correct ownership is 70:0 (pgbouncer uid, root gid).
+  # Correct ownership is 70:999 (pgbouncer uid:postgres gid) — pgbouncer (UID 70)
+  # reads as owner; postgres (UID 999) reads as group at init time via
+  # 10-pgbouncer-auth.sh. Symmetric with postgres_password 1001:999 0640.
   local _pgba_file="${secrets_dir}/pgbouncer_authenticator_password"
   if [[ ! -s "$_pgba_file" ]]; then
     local _pgba_pw
     _pgba_pw="$(_gen_password)"
     printf "%s" "$_pgba_pw" > "$_pgba_file"
     chmod 0600 "$_pgba_file"
-    _do_chown "70:0" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
+    _do_chown "70:999" "$_pgba_file" "pgbouncer_authenticator_password" "" "${secrets_dir}" || true
     _do_chmod_0640 "$_pgba_file" "pgbouncer_authenticator_password" || true
-    log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640, uid 70:0)"
+    log_info "Generated pgbouncer_authenticator_password → ${_pgba_file} (mode 0640, uid 70:999)"
   else
     log_info "pgbouncer_authenticator_password already present — preserving (use --remove-volumes to rotate)"
   fi

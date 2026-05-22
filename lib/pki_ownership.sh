@@ -43,6 +43,17 @@
 #     postgres (UID 999, GID 999): read as group at startup via POSTGRES_PASSWORD_FILE.
 #     Same rotator write constraint as redis_password.
 #
+#   pgbouncer_authenticator_password → 70:999 0640
+#     pgbouncer (UID 70): FILE-READ as owner — auth_query lookup user password source.
+#     postgres (UID 999): FILE-READ as group at init time — 10-pgbouncer-auth.sh
+#       ALTER ROLE pgbouncer_authenticator PASSWORD '...' creates the role on first init.
+#     No rotation consumer (not in src/yashigani/secrets/rotator.py SecretName enum).
+#     K8s path: fsGroup: 70 + defaultMode 0440 + postgres UID 70 → owner-read only;
+#       no GID-999 needed in K8s (postgres pod runs as UID 70 there via fsGroup).
+#     Cap_drop:[ALL] sanity: owner-read (UID 70 match) and group-read (GID 999 match)
+#       both work without DAC_OVERRIDE. Symmetric with postgres_password 1001:999 0640.
+#     NOT in _YSG_PKI_SERVICE_MAP below (that map covers TLS *_client.key files only).
+#
 #   yashigani_internal_bearer → 0:2002 0640  (UNCHANGED)
 #     open-webui (UID 0) + letta (UID 0): read as owner.
 #     langflow (UID 1000): reads via group GID 2002 (group_add:["2002"] retained
