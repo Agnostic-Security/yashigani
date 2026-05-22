@@ -263,8 +263,10 @@ class SecretRotator:
             raise
 
         # Step 2: Write new secret file — if this fails we must revert DB
+        # mode=0o640, gid=999: postgres (UID 999, GID 999) reads as group at
+        # restart; backoffice/gateway (UID 1001) read as owner.  Laura A2.
         try:
-            _write_secret_file(secret_path, new_pw)
+            _write_secret_file(secret_path, new_pw, mode=0o640, gid=999)
         except Exception as exc:
             _log.error("Failed writing postgres_password file: %s — reverting DB", exc)
             reverted, revert_failed = await _pg_revert(self._db_dsn_direct, "yashigani_app", old_pw)
@@ -327,8 +329,12 @@ class SecretRotator:
             raise
 
         # Step 2: Write new secret file
+        # mode=0o640, gid=999: redis/budget-redis (UID 999, GID 999) read as
+        # group at next restart; backoffice/gateway (UID 1001) read as owner.
+        # Laura A2 — explicit chown guarantees GID 999 regardless of backoffice
+        # process primary GID.
         try:
-            _write_secret_file(secret_path, new_pw)
+            _write_secret_file(secret_path, new_pw, mode=0o640, gid=999)
         except Exception as exc:
             _log.error("Failed writing redis_password file: %s — reverting", exc)
             # Revert Redis requirepass to old
@@ -442,21 +448,45 @@ def _read_secret_file_optional(path: Path) -> Optional[str]:
         return None
 
 
-def _write_secret_file(path: Path, value: str) -> None:
+def _write_secret_file(
+    path: Path,
+    value: str,
+    *,
+    mode: int = 0o400,
+    gid: int = -1,
+) -> None:
     """
-    Atomically write a secret file with 0400 permissions.
+    Atomically write a secret file with configurable permissions.
 
     Uses a temp file + rename for atomicity (readers never see a partial write).
     The temp file is in the same directory as the target to guarantee same-device rename.
+
+    Args:
+        path:  Target secret file path.
+        value: Secret value to write (UTF-8).
+        mode:  File permission mode applied to the temp file BEFORE rename.
+               Default 0o400 (owner-read-only) preserves legacy behaviour for
+               bearer tokens, JWT keys, HMAC keys.
+               Pass 0o640 for secrets that must also be group-readable
+               (redis_password, postgres_password — GID 999 consumers).
+        gid:   Group ID to set on the temp file before rename.
+               Default -1 means no chown (GID inherited from process).
+               Pass 999 alongside mode=0o640 for redis/postgres passwords so
+               that post-rotation files carry GID 999 regardless of the
+               backoffice process's primary GID (Laura amendment A2).
     """
     tmp_path = path.parent / (path.name + ".tmp")
     try:
         tmp_path.write_text(value, encoding="utf-8")
-        # chmod 0400 before rename so the file is always permission-safe
-        tmp_path.chmod(0o400)
+        # Apply explicit GID before chmod so the correct group sees group-read.
+        # chown(-1, gid) leaves UID unchanged and only sets GID.
+        if gid != -1:
+            os.chown(tmp_path, -1, gid)
+        # chmod after chown — sets the final mode on the inode before rename.
+        tmp_path.chmod(mode)
         tmp_path.rename(path)
     except OSError:
-        # Clean up the temp file if rename failed
+        # Clean up the temp file if any step failed before rename.
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:

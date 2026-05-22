@@ -1,5 +1,5 @@
 """
-Unit tests for admin-triggered secret rotation (v2.23.3).
+Unit tests for admin-triggered secret rotation (v2.23.3 + YSG-SECRETS-DIST-002 rework).
 
 Test matrix:
   R01 — generate_password: charset compliance (A-Za-z0-9!*,-._~)
@@ -8,7 +8,7 @@ Test matrix:
   R04 — generate_password: no forbidden shell-unsafe chars
   R05 — generate_hex_key: correct length (32 bytes → 64 hex, 64 bytes → 128 hex)
   R06 — _write_secret_file: atomic rename (tmp file removed on success)
-  R07 — _write_secret_file: permissions are 0400
+  R07 — _write_secret_file: default mode is 0400, no chown when gid=-1 (default)
   R08 — _read_secret_file: raises RuntimeError on missing file
   R09 — SecretName enum values are exactly the five expected literals
   R10 — RotationResult.success=False when handler raises
@@ -27,6 +27,11 @@ Test matrix:
   R23 — Audit schema: SecretRotationRequestedEvent has masking_applied=True floor
   R24 — Audit schema: SecretRotationFailedEvent has severity="CRITICAL" when revert_failed=True
   R25 — SecretName barrel export from yashigani.secrets
+  R26 — _write_secret_file: mode parameter is applied when non-default
+  R27 — _write_secret_file: gid parameter triggers os.chown; default gid=-1 skips chown
+  R28 — _rotate_redis_password: post-rotation file is 0640 and os.chown called with gid=999
+  R29 — _rotate_postgres_password: post-rotation file is 0640 and os.chown called with gid=999
+  R30 — Bearer/JWT/HMAC callers: _write_secret_file defaults unaffected (0400, no chown)
 """
 from __future__ import annotations
 
@@ -126,11 +131,15 @@ class TestSecretFileIO:
         assert not tmp.exists()
         assert target.read_text() == "my-value"
 
-    def test_r07_file_permissions_are_0400(self, tmp_path):
-        """R07: Written secret file has mode 0400."""
+    def test_r07_default_mode_is_0400_and_no_chown(self, tmp_path):
+        """R07: Default call (no mode/gid args) writes 0400 and does NOT call os.chown."""
+        import os
+        from unittest.mock import patch
         from yashigani.secrets.rotator import _write_secret_file
         target = tmp_path / "secret_perm_test"
-        _write_secret_file(target, "s3cr3t")
+        with patch("os.chown") as mock_chown:
+            _write_secret_file(target, "s3cr3t")
+            mock_chown.assert_not_called()
         mode = oct(target.stat().st_mode & 0o777)
         assert mode == oct(0o400), f"Expected 0400, got {mode}"
 
@@ -140,6 +149,134 @@ class TestSecretFileIO:
         missing = tmp_path / "no_such_file"
         with pytest.raises(RuntimeError, match="Cannot read secret file"):
             _read_secret_file(missing)
+
+    def test_r26_mode_param_applied(self, tmp_path):
+        """R26: Passing mode=0o640 produces a 0640 file (real filesystem, no mock)."""
+        from yashigani.secrets.rotator import _write_secret_file
+        target = tmp_path / "mode_test"
+        _write_secret_file(target, "group-readable", mode=0o640)
+        mode = oct(target.stat().st_mode & 0o777)
+        assert mode == oct(0o640), f"Expected 0640, got {mode}"
+
+    def test_r27_gid_triggers_chown_default_skips(self, tmp_path):
+        """R27: gid != -1 calls os.chown with (-1, gid); gid=-1 (default) never calls chown."""
+        from unittest.mock import patch
+        from yashigani.secrets.rotator import _write_secret_file
+
+        target = tmp_path / "chown_test"
+
+        # --- Case A: explicit gid → chown called ---
+        with patch("os.chown") as mock_chown:
+            _write_secret_file(target, "val", mode=0o640, gid=999)
+            assert mock_chown.called, "os.chown must be called when gid=999"
+            # First positional arg is the path (tmp_path), UID arg is -1, GID arg is 999
+            args = mock_chown.call_args[0]
+            assert args[1] == -1, f"UID arg must be -1 (no-change), got {args[1]}"
+            assert args[2] == 999, f"GID arg must be 999, got {args[2]}"
+
+        # --- Case B: default gid → chown NOT called ---
+        target2 = tmp_path / "chown_test2"
+        with patch("os.chown") as mock_chown2:
+            _write_secret_file(target2, "val2")
+            mock_chown2.assert_not_called()
+
+    def test_r28_rotate_redis_password_writes_0640_gid999(self, tmp_path):
+        """R28: _rotate_redis_password calls _write_secret_file with mode=0o640, gid=999."""
+        from unittest.mock import patch, MagicMock, call
+        from yashigani.secrets.rotator import SecretRotator, _write_secret_file
+
+        secrets_dir = tmp_path
+        _write_secret_file(secrets_dir / "redis_password", "old-redis-pw-123456")
+
+        mock_redis = MagicMock()
+        rotator = SecretRotator(secrets_dir=str(secrets_dir), redis_client=mock_redis)
+
+        write_calls = []
+
+        def _capture_write(path, value, *, mode=0o400, gid=-1):
+            write_calls.append({"path": path, "mode": mode, "gid": gid})
+            # Delegate to real implementation so the file is actually written
+            _write_secret_file.__wrapped__(path, value, mode=mode, gid=gid) if hasattr(
+                _write_secret_file, "__wrapped__"
+            ) else None
+
+        with patch("yashigani.secrets.rotator._redis_config_set_requirepass"), \
+             patch("yashigani.secrets.rotator._write_secret_file", side_effect=_capture_write):
+            import asyncio
+            asyncio.run(rotator._rotate_redis_password())
+
+        assert len(write_calls) == 1, "Expected exactly one _write_secret_file call"
+        wc = write_calls[0]
+        assert wc["mode"] == 0o640, f"redis_password must be written 0640, got {oct(wc['mode'])}"
+        assert wc["gid"] == 999, f"redis_password must be written with gid=999, got {wc['gid']}"
+
+    def test_r29_rotate_postgres_password_writes_0640_gid999(self, tmp_path):
+        """R29: _rotate_postgres_password calls _write_secret_file with mode=0o640, gid=999."""
+        from unittest.mock import patch
+        from yashigani.secrets.rotator import SecretRotator, _write_secret_file
+
+        secrets_dir = tmp_path
+        _write_secret_file(secrets_dir / "postgres_password", "old-postgres-pw-123456")
+
+        rotator = SecretRotator(
+            secrets_dir=str(secrets_dir),
+            db_dsn_direct="postgresql://postgres:pw@localhost/yashigani",
+        )
+
+        write_calls = []
+
+        def _capture_write(path, value, *, mode=0o400, gid=-1):
+            write_calls.append({"path": path, "mode": mode, "gid": gid})
+
+        with patch("yashigani.secrets.rotator._pg_alter_user_password"), \
+             patch("yashigani.secrets.rotator._restart_service"), \
+             patch("yashigani.secrets.rotator._write_secret_file", side_effect=_capture_write):
+            import asyncio
+            asyncio.run(rotator._rotate_postgres_password())
+
+        assert len(write_calls) == 1, "Expected exactly one _write_secret_file call"
+        wc = write_calls[0]
+        assert wc["mode"] == 0o640, f"postgres_password must be written 0640, got {oct(wc['mode'])}"
+        assert wc["gid"] == 999, f"postgres_password must be written with gid=999, got {wc['gid']}"
+
+    def test_r30_jwt_hmac_callers_use_default_mode_no_gid(self, tmp_path):
+        """R30: JWT + HMAC rotation callers do NOT pass mode/gid — use defaults (0400, -1)."""
+        from unittest.mock import patch
+        from yashigani.secrets.rotator import SecretRotator, _write_secret_file
+
+        secrets_dir = tmp_path
+        _write_secret_file(secrets_dir / "jwt_signing_key", "old-key-" + "a" * 120)
+        _write_secret_file(secrets_dir / "caddy_internal_hmac", "old-hmac-" + "a" * 55)
+
+        rotator = SecretRotator(secrets_dir=str(secrets_dir))
+
+        jwt_calls = []
+        hmac_calls = []
+
+        def _capture_jwt(path, value, *, mode=0o400, gid=-1):
+            if "jwt" in str(path):
+                jwt_calls.append({"mode": mode, "gid": gid})
+
+        def _capture_hmac(path, value, *, mode=0o400, gid=-1):
+            if "hmac" in str(path):
+                hmac_calls.append({"mode": mode, "gid": gid})
+
+        import asyncio
+
+        with patch("yashigani.secrets.rotator._signal_service_reload"), \
+             patch("yashigani.secrets.rotator._write_secret_file", side_effect=_capture_jwt):
+            asyncio.run(rotator._rotate_jwt_signing_key())
+
+        with patch("yashigani.secrets.rotator._signal_service_reload"), \
+             patch("yashigani.secrets.rotator._write_secret_file", side_effect=_capture_hmac):
+            asyncio.run(rotator._rotate_hmac_key())
+
+        assert jwt_calls, "JWT rotation must call _write_secret_file"
+        assert hmac_calls, "HMAC rotation must call _write_secret_file"
+        assert jwt_calls[0]["mode"] == 0o400, "JWT must use default mode=0o400"
+        assert jwt_calls[0]["gid"] == -1, "JWT must use default gid=-1"
+        assert hmac_calls[0]["mode"] == 0o400, "HMAC must use default mode=0o400"
+        assert hmac_calls[0]["gid"] == -1, "HMAC must use default gid=-1"
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +397,10 @@ class TestPostgresRotation:
             db_dsn_direct="postgresql://postgres:pw@localhost/yashigani",
         )
 
+        # Patch os.chown so the test doesn't require root to chown to GID 999.
         with patch("yashigani.secrets.rotator._pg_alter_user_password", mock_alter_user), \
-             patch("yashigani.secrets.rotator._restart_service"):
+             patch("yashigani.secrets.rotator._restart_service"), \
+             patch("os.chown"):
             reverted, revert_failed = await rotator._rotate_postgres_password()
 
         assert reverted is False
@@ -330,7 +469,9 @@ class TestRedisRotation:
         mock_redis = MagicMock()
         rotator = SecretRotator(secrets_dir=str(secrets_dir), redis_client=mock_redis)
 
-        with patch("yashigani.secrets.rotator._redis_config_set_requirepass", mock_config_set):
+        # Patch os.chown so the test doesn't require root to chown to GID 999.
+        with patch("yashigani.secrets.rotator._redis_config_set_requirepass", mock_config_set), \
+             patch("os.chown"):
             reverted, revert_failed = await rotator._rotate_redis_password()
 
         assert reverted is False
