@@ -5303,11 +5303,11 @@ _gen_admin_usernames() {
 # is first executed by the PKI bootstrap (which runs after step 6).
 # Behaviour is identical to the nested version — only scope changes.
 #
-# Caller: generate_secrets() (pgbouncer_userlist chgrp 2002).
-# Also consumed by _pki_chown_client_keys() shared-secrets loop (the nested
-# definition inside that function is removed; this top-level definition takes
-# its place — bash picks up the most-recently defined function by that name,
-# but since there is now only one definition, there is no ambiguity).
+# Caller: _pki_chown_client_keys() — retained for future per-consumer-but-shared-
+# via-group cases. The pgbouncer_userlist caller was removed (Tiago directive
+# 2026-05-21). The shared-secrets GID 2002 loop was replaced in v2.24.0 by
+# explicit per-consumer _do_chown calls (YSG-SECRETS-DIST-002 CLOSED, Laura A1).
+# No active call site in generate_secrets() as of v2.24.0.
 #
 # Deps: YSG_RUNTIME / YSG_PODMAN_RUNTIME for mode selection; WORK_DIR for
 # _secrets_dir used in container bind-mount paths. All computed locally.
@@ -7462,10 +7462,14 @@ _pki_chown_client_keys() {
   # by the backoffice (to bootstrap TOTP) — they are included in the list below.
   # This is correct: the admin password files are "installer-display-only" on the
   # host side; ownership by UID 1001 does not weaken them (mode stays 0600).
+  # YSG-SECRETS-DIST-002 CLOSED (v2.24.0 — Laura A1 amendment):
+  # postgres_password, redis_password, and yashigani_internal_bearer are no longer
+  # chowned to UID 1001 then widened to GID 2002. Each file is now set to a single
+  # per-consumer owner at 0600/0640 further below. gateway + backoffice receive all
+  # three via .env env var — no file read — so removing them from the 1001 list is
+  # correct (they were never file-readers for these three secrets).
   log_info "Chown'ing password files + bootstrap tokens + HMAC to UID 1001 (gate #ROOTLESS-11)"
   local _uid1001_secrets=(
-    redis_password
-    postgres_password
     license_key
     admin_initial_password
     admin1_password
@@ -7476,16 +7480,6 @@ _pki_chown_client_keys() {
     admin2_totp_secret
     grafana_admin_password
     caddy_internal_hmac
-    # YSG-INSTALL-PKI-002: yashigani_internal_bearer is read by gateway + backoffice
-    # (UID 1001) to authenticate internal service-to-service calls. On the
-    # "preserving (upgrade path)" branch in generate_secrets() the file is NOT
-    # regenerated and NOT chowned. Podman rootless: file stays host:host owned
-    # (UID 1000); container UID 1001 (host mapping 101001) cannot read it →
-    # gateway + backoffice crash-loop with "YASHIGANI_INTERNAL_BEARER is not set".
-    # Adding it here closes the class: _pki_chown_client_keys runs on fresh install,
-    # rotation, and the no-rotation Podman-rootless branch (YSG-INSTALL-PKI-001)
-    # so all three code paths now correctly chown this file.
-    yashigani_internal_bearer
     openclaw_gateway_token
     # wazuh passwords are read by the wazuh containers (run as root inside docker),
     # not by the UID 1001 services. Chowning them to 1001 is harmless: root (UID 0)
@@ -7501,50 +7495,51 @@ _pki_chown_client_keys() {
     fi
   done
 
-  # GID 2002 — numeric-only group ID for cross-container secret-read access.
+  # Per-consumer secret ownership — YSG-SECRETS-DIST-002 CLOSED (Laura A1 amendment).
   #
-  # CONTEXT (resolved by Option B — IRIS-DESIGN-002 + LAURA-TM-GID-001):
-  # Three secrets require multi-UID read access from containers running with
-  # cap_drop: [ALL] (which strips CAP_DAC_OVERRIDE):
-  #   postgres_password      — postgres UID 999 reads via POSTGRES_PASSWORD_FILE
-  #   redis_password         — redis/budget-redis UID 999 reads via --requirepass
-  #   yashigani_internal_bearer — open-webui/langflow/letta (UID 0 in container)
-  #                               read via Bucket-C entrypoint shim
-  # gateway/backoffice/pgbouncer receive all three via .env env var — no file read.
-  # openclaw receives bearer via OPENCLAW_GATEWAY_TOKEN env var — no file read.
+  # Each of the three shared secrets is now chowned to a single consumer UID at mode
+  # 0600 (or 0640 for the bearer, which has a second consumer via GID 2002). This
+  # replaces the old blanket chgrp 2002 + chmod 0640 applied to all three files.
   #
-  # SOLUTION: chgrp 2002 + chmod 0640 on each file.
-  # Containers that need file-read get group_add: ["2002"] in compose (Captain scope).
-  # No world-readable bit — S1 invariant (_fix_config_perms -perm -004) passes cleanly.
-  # ASVS V6.4.1 PASS. CWE-732 S1 clean. Prometheus already uses this pattern (GID 1001).
+  # Why the old approach was wrong (Laura B1 BLOCKER):
+  #   cap_drop:[ALL] removes CAP_DAC_OVERRIDE. Root inside a cap_drop:[ALL] container
+  #   cannot read a file it does not own by UID. The old "chown 1001:1001 then chgrp 2002
+  #   0640" model gave postgres/redis (UID 999) group-read access but set owner UID to
+  #   1001, not 999. Under cap_drop:[ALL], UID 999 cannot read a 1001-owned file without
+  #   DAC_OVERRIDE — so the group bit was the only read path, and GID 2002 on all six
+  #   consumers meant any compromised container could read all three secrets.
+  #   Ref: compose lines 588–590 (budget-redis DAC_OVERRIDE note).
   #
-  # NUMERIC GID — NO /etc/group ENTRY REQUIRED BY DESIGN (IRIS-DESIGN-003 Option C /
-  # LAURA-TM-GROUPADD-001): Linux file permission checks are numeric (kernel inode GID
-  # comparison). `chgrp 2002`, `group_add: ["2002"]` in compose/Podman, and
-  # `supplementalGroups: [2002]` in Helm all operate on the raw GID integer and do not
-  # consult /etc/group. No `groupadd` call and no sudo escalation are required.
-  # K8s already uses numeric-only GID; this aligns Compose with that semantic.
-  # `ls -l` will show "2002" rather than a group name — this is expected and correct.
-  # See internal-docs/yashigani/iris-install-groupadd-design-review.md (IRIS-DESIGN-003)
-  # and internal-docs/yashigani/laura-install-groupadd-threat-model.md (LAURA-TM-GROUPADD-001).
+  # Fix — per-consumer single-UID ownership:
+  #   postgres_password   → 999:999 0600  (postgres UID; only postgres reads file directly)
+  #   redis_password      → 999:999 0600  (redis/budget-redis UID; both read as owner)
+  #   yashigani_internal_bearer → 0:2002 0640
+  #       open-webui (UID 0) + letta (UID 0): read as owner (UID 0 == file UID 0)
+  #       langflow (UID 1000): reads via group GID 2002 (retains group_add:["2002"] — Captain scope)
+  #       GID 2002 scope reduced from 6 consumers to 1 file + 1 service (langflow only).
   #
-  # GID-006 (LAURA-TM-GID-001 GO-BLOCKING): Podman rootless chgrp MUST go through
-  # `podman unshare` (the unshare case in _do_chgrp). Host-side `chgrp 2002` sets
-  # raw host GID 2002, not the subgid-mapped container GID — file becomes unreadable.
+  # YSG-RISK-049 pattern: identical to pgbouncer_authenticator_password (70:0 0640,
+  # dedicated mount). postgres_password + redis_password now follow the same class.
   #
-  # GID-003 (LAURA-TM-GID-001 GO-BLOCKING): chgrp+chmod applied at every write site.
-  # This block covers fresh-install + upgrade/preserve paths.
-  # Residual YSG-SECRETS-DIST-002 (LOW): full ./secrets:/run/secrets:ro bind-mount
-  # means a GID-2002-member container can read all three files — filed in risk register.
-  log_info "Applying GID 2002 (numeric, no /etc/group entry) + mode 0640 to shared secrets (IRIS-DESIGN-003 Option C)"
-  for _shared_pw in postgres_password redis_password yashigani_internal_bearer; do
-    local _pwpath="${_secrets_dir}/${_shared_pw}"
-    if [[ -f "$_pwpath" ]]; then
-      _do_chgrp "2002" "$_pwpath" "${_shared_pw}" || return 1
-      _do_chmod_0640 "$_pwpath" "${_shared_pw}" || return 1
-    fi
-  done
-  log_info "Set ${#_uid1001_secrets[@]} password files to 1001:1001; shared secrets (postgres/redis/bearer) chgrp 2002 + chmod 0640 (IRIS-DESIGN-002 Option B — replaces 0644)"
+  # Upgrade path: _pki_chown_client_keys() is re-run by install.sh upgrade path.
+  # Existing v2.24.0-pre files at GID 2002 0640 are rechowned here on upgrade.
+  #
+  # Iris design: iris-v240-ysg-secrets-dist-002-close-design.md
+  # Laura A1 amendment: laura-v240-ysg-secrets-dist-002-close-threat-model.md
+  local _pp_path="${_secrets_dir}/postgres_password"
+  local _rp_path="${_secrets_dir}/redis_password"
+  local _ib_path="${_secrets_dir}/yashigani_internal_bearer"
+  if [[ -f "$_pp_path" ]]; then
+    _do_chown "999:999" "$_pp_path" "postgres_password" "0600" || return 1
+  fi
+  if [[ -f "$_rp_path" ]]; then
+    _do_chown "999:999" "$_rp_path" "redis_password" "0600" || return 1
+  fi
+  if [[ -f "$_ib_path" ]]; then
+    _do_chown "0:2002" "$_ib_path" "yashigani_internal_bearer" || return 1
+    _do_chmod_0640 "$_ib_path" "yashigani_internal_bearer" || return 1
+  fi
+  log_info "Per-consumer ownership set: postgres_password+redis_password → 999:999 0600; yashigani_internal_bearer → 0:2002 0640 (YSG-SECRETS-DIST-002 CLOSED, Laura A1)"
 
   # Chown all *_bootstrap_token files to UID 1001. Each service reads its own
   # bootstrap token at startup to verify identity; all services run as UID 1001

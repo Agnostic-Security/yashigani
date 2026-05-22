@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # lib/pki_ownership.sh — Shared PKI service-key ownership map
+# last-updated: 2026-05-22T00:00:00+01:00 (feat(install): YSG-SECRETS-DIST-002 CLOSED — per-consumer ownership; GID 2002 narrowed to bearer+langflow)
 # last-updated: 2026-05-18T00:00:00+01:00 (fix(secrets): YSG-SECRETS-DIST-001 — document multi-UID consumer class)
 # last-updated: 2026-05-10T00:00:00+01:00 (fix(pki): GATE5-BUG-01 — shared ownership map; install + restore unified)
 #
@@ -19,28 +20,33 @@
 # All other service keys are mode 0600 (owner-read-write only).
 #
 # Multi-UID secret distribution class (YSG-SECRETS-DIST-001, 2026-05-18):
-# Some secrets in docker/secrets/ are consumed by MORE THAN ONE container UID.
-# These secrets CANNOT be chowned to a single UID and remain readable by all
-# consumers without using OS-level ACLs or a shared group (both fragile across
-# Docker / Podman rootless / K8s). They are set to mode 0644 in
-# _pki_chown_client_keys() to allow all consumers to read them.
-# The host trust boundary is shell access to docker/secrets/ — the directory is
-# already mode 0755 (V232-SMOKE-012), so 0644 adds no new host-level exposure.
+# DISSOLVED as of v2.24.0 (YSG-SECRETS-DIST-002 CLOSED, Laura A1 amendment).
 #
-# Multi-UID secrets (as of v2.23.4):
-#   postgres_password   — gateway:1001, backoffice:1001, postgres:999, redis:999
-#                         (postgres/redis lose CAP_DAC_OVERRIDE via cap_drop ALL)
-#   redis_password      — gateway:1001, backoffice:1001, redis:999, budget-redis:999
-#   yashigani_internal_bearer
-#                       — gateway:1001+backoffice:1001 (via env); plus
-#                         langflow:1000, letta:0 (rootless→host-user), open-webui:0
-#                         via entrypoint shim `cat /run/secrets/yashigani_internal_bearer`
-#                         (YSG-SECRETS-DIST-001 — close class cycle from 86872a7→5a341cb)
+# All three former multi-UID members are now set to single per-consumer ownership
+# in _pki_chown_client_keys(). GID 2002 is narrowed to one file + one service:
+#
+#   postgres_password   → 999:999 0600
+#     Only postgres (UID 999) reads this directly via POSTGRES_PASSWORD_FILE.
+#     gateway + backoffice receive it via .env env var — no file read.
+#
+#   redis_password      → 999:999 0600
+#     redis + budget-redis (both UID 999) read as owner. gateway + backoffice
+#     receive it via .env env var — no file read.
+#
+#   yashigani_internal_bearer → 0:2002 0640
+#     open-webui (UID 0) + letta (UID 0): read as owner.
+#     langflow (UID 1000): reads via group GID 2002 (group_add:["2002"] retained
+#     on langflow only in compose — Captain scope, YSG-SECRETS-DIST-002).
+#     gateway + backoffice receive it via .env env var — no file read.
+#
+# Design authority: iris-v240-ysg-secrets-dist-002-close-design.md (Option i)
+# Blocking amendment: laura-v240-ysg-secrets-dist-002-close-threat-model.md (A1)
+# cap_drop:[ALL] + CAP_DAC_OVERRIDE interaction that drove A1: compose lines 588–590.
 #
 # When adding a new service that reads a secret already owned by another UID,
-# FIRST check if it belongs to the multi-UID class above. If yes, add it there
-# and set the file to 0644 in _pki_chown_client_keys(). Do NOT just add a chown
-# to the new service's UID — that breaks the existing consumers.
+# prefer a per-consumer dedicated bind-mount (YSG-RISK-049/050 pattern) rather
+# than widening to a shared group. Only use GID-based sharing if per-consumer
+# mounts are architecturally infeasible — document the reason in this file.
 #
 # Canonical service → UID reference:
 #   caddy:0           Caddy root (cap_drop ALL strips DAC_OVERRIDE — must be 0:0)
