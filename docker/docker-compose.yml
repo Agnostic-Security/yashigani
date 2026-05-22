@@ -1134,24 +1134,32 @@ services:
     # the full rationale now that every service inherits the same setting.
     dns_search: ["."]
     environment:
-      # YSG-RISK-049 CLOSED v2.24.0 — auth_query replaces plain + userlist.txt.
-      # DATABASE_URL removed: edoburu only needs it to write userlist.txt
-      # (plain/md5 auth_type). Under scram-sha-256 + auth_query, edoburu does
-      # not write userlist.txt — DATABASE_URL is no longer required here.
-      # pgbouncer_authenticator_password: edoburu reads this file and injects
-      # the cleartext into the auth_query connection as pgbouncer_authenticator's
-      # credential. Option C dedicated secret mount — NOT GID-2002 bind-mount.
+      # YSG-RISK-049 INIT-003 fix (v2.24.0): DATABASE_URL IS required even under
+      # scram-sha-256 + auth_query. The edoburu/pgbouncer entrypoint does NOT
+      # implement PGBOUNCER_AUTH_PASSWORD_FILE — that env var is a no-op.
+      # The entrypoint reads DATABASE_URL to write the pgbouncer_authenticator
+      # userlist.txt entry (SCRAM verifier computed from cleartext). This entry
+      # is the auth_user credential pgbouncer presents to postgres when running
+      # the auth_query for each connecting client.
+      # DATABASE_URL is constructed at runtime by the wrapper command below,
+      # reading the password from /run/secrets/pgbouncer_authenticator_password.
+      # Option C dedicated secret mount — NOT GID-2002 bind-mount.
       # YSG-SECRETS-DIST-002 blast radius unchanged (pgbouncer not in GID 2002).
-      PGBOUNCER_AUTH_PASSWORD_FILE: /run/secrets/pgbouncer_authenticator_password
       POOL_MODE: transaction
       MAX_CLIENT_CONN: "100"
       DEFAULT_POOL_SIZE: "20"
-    # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
-    # auth_type=scram-sha-256 + auth_query in pgbouncer.ini — no userlist.txt generated.
+    # INIT-003 fix: wrapper reads pgbouncer_authenticator_password secret at
+    # runtime, exports DATABASE_URL so edoburu writes userlist.txt with the
+    # cleartext password for pgbouncer_authenticator (AUTH_TYPE=scram-sha-256
+    # causes edoburu to write cleartext; pgbouncer uses it to perform the SCRAM
+    # handshake with postgres). auth_query in pgbouncer.ini handles client auth.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
+        PASS=$(cat /run/secrets/pgbouncer_authenticator_password)
+        export AUTH_TYPE=scram-sha-256
+        export DATABASE_URL="postgresql://pgbouncer_authenticator:${PASS}@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro
@@ -1633,24 +1641,31 @@ services:
     mem_limit: 64m
     cpus: 0.2
     environment:
-      # YSG-RISK-049 CLOSED v2.24.0 — auth_query replaces plain + userlist.txt.
-      # DATABASE_URL removed: not needed under scram-sha-256 + auth_query.
-      # The [databases] section in pgbouncer-letta.ini defines the letta DB route
-      # directly (host=postgres port=5432 dbname=letta) — no env-based override.
-      # pgbouncer_authenticator_password: same credential as the main pgbouncer
-      # instance. auth_dbname = yashigani in pgbouncer-letta.ini (Amendment C6 —
-      # function lives once in yashigani DB; pg_shadow is a global catalog view).
+      # YSG-RISK-049 INIT-003 fix (v2.24.0): same fix as main pgbouncer service.
+      # DATABASE_URL IS required — PGBOUNCER_AUTH_PASSWORD_FILE is a no-op in
+      # the edoburu image. The wrapper command below reads the password secret
+      # at runtime and exports DATABASE_URL so edoburu writes the
+      # pgbouncer_authenticator userlist.txt entry (SCRAM verifier).
+      # auth_dbname = yashigani in pgbouncer-letta.ini (Amendment C6) — the
+      # auth_query function lives in yashigani DB; DATABASE_URL also uses yashigani
+      # so edoburu writes the correct SCRAM hash for pgbouncer_authenticator.
       # Option C dedicated secret mount — NOT GID-2002 bind-mount.
-      PGBOUNCER_AUTH_PASSWORD_FILE: /run/secrets/pgbouncer_authenticator_password
       POOL_MODE: session
       MAX_CLIENT_CONN: "50"
       DEFAULT_POOL_SIZE: "20"
-    # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
-    # auth_type=scram-sha-256 + auth_query in pgbouncer-letta.ini — no userlist.txt generated.
+    # INIT-003 fix: wrapper reads pgbouncer_authenticator_password secret at
+    # runtime, exports DATABASE_URL so edoburu writes userlist.txt with the
+    # cleartext password for pgbouncer_authenticator (AUTH_TYPE=scram-sha-256
+    # causes edoburu to write cleartext; pgbouncer uses it to perform the SCRAM
+    # handshake with postgres). auth_query in pgbouncer-letta.ini handles
+    # client auth; userlist.txt entry is only for the auth_user → postgres leg.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
+        PASS=$(cat /run/secrets/pgbouncer_authenticator_password)
+        export AUTH_TYPE=scram-sha-256
+        export DATABASE_URL="postgresql://pgbouncer_authenticator:${PASS}@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro

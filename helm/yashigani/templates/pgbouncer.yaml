@@ -53,25 +53,31 @@ spec:
             - name: pgbouncer
               containerPort: 5432
               protocol: TCP
-          # exec-chain fix (9b9d2b8): pass pgbouncer.ini explicitly to edoburu entrypoint.
-          # auth_type=plain (YSG-RISK-049 ACCEPTED-LOW non-KMS-only — Tiago directive 2026-05-21).
-          # edoburu entrypoint writes cleartext userlist.txt from DATABASE_URL at startup.
+          # INIT-003 fix: wrapper reads pgbouncer_authenticator_password secret at
+          # runtime, exports DATABASE_URL so edoburu writes userlist.txt with the
+          # cleartext password for pgbouncer_authenticator (AUTH_TYPE=scram-sha-256
+          # causes edoburu to write cleartext; pgbouncer uses it to perform the SCRAM
+          # handshake with postgres). PGBOUNCER_AUTH_PASSWORD_FILE is a no-op — removed.
+          # auth_type=scram-sha-256 + auth_query in pgbouncer.ini — clients auth via
+          # auth_query; userlist.txt entry is only for the auth_user → postgres leg.
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -e
+              PASS=$(cat /run/secrets/pgbouncer_authenticator_password)
+              export AUTH_TYPE=scram-sha-256
+              export DATABASE_URL="postgresql://pgbouncer_authenticator:${PASS}@${POSTGRES_HOST}:5432/yashigani"
               exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
           env:
-            # YSG-RISK-049 CLOSED v2.24.0 — auth_query replaces plain + userlist.txt.
-            # DATABASE_URL removed: not needed under scram-sha-256 + auth_query.
-            # AUTH_TYPE removed: auth_type = scram-sha-256 is now hardcoded in pgbouncer.ini.
-            # PGBOUNCER_AUTH_PASSWORD_FILE: edoburu reads this file and uses its contents
-            # as pgbouncer_authenticator's password for the auth_query postgres connection.
+            # YSG-RISK-049 INIT-003 fix: DATABASE_URL is constructed in the wrapper
+            # command above from PGBOUNCER_AUTH_PASSWORD_FILE secret + POSTGRES_HOST.
+            # PGBOUNCER_AUTH_PASSWORD_FILE was a no-op in edoburu — removed.
+            # AUTH_TYPE removed: auth_type = scram-sha-256 hardcoded in pgbouncer.ini.
             # Sourced from yashigani-pgbouncer-auth-secret (Option C — dedicated Secret,
             # NOT merged into yashigani-postgres-secrets, per Laura C7 + Iris §7).
             # YSG-SECRETS-DIST-002 blast radius unchanged.
-            - name: PGBOUNCER_AUTH_PASSWORD_FILE
-              value: "/run/secrets/pgbouncer_authenticator_password"
+            - name: POSTGRES_HOST
+              value: {{ include "yashigani.fullname" . }}-postgres
             - name: POOL_MODE
               value: {{ .Values.pgbouncer.env.poolMode | quote }}
             - name: MAX_CLIENT_CONN
