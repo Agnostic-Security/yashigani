@@ -43,7 +43,7 @@ fi
 
 # ─── 1. Create pgbouncer_authenticator role ──────────────────────────────────
 echo "[10-pgbouncer-auth] Creating pgbouncer_authenticator role"
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<SQL
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgbouncer_authenticator') THEN
@@ -92,7 +92,7 @@ SQL
 
 # ─── 3. REVOKE CONNECT on non-auth databases ─────────────────────────────────
 echo "[10-pgbouncer-auth] Restricting pgbouncer_authenticator database CONNECT privileges"
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres <<'SQL'
 GRANT CONNECT ON DATABASE yashigani TO pgbouncer_authenticator;
 
 DO $$
@@ -132,7 +132,7 @@ fi
 # on next server start. This is correct for the init-script path.
 # For the upgrade path, pg_reload_conf() fires immediately and the updated
 # pg_hba.conf is picked up by the live server.
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" -c "SELECT pg_reload_conf();" 2>/dev/null || true
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres -c "SELECT pg_reload_conf();" 2>/dev/null || true
 
 echo "[10-pgbouncer-auth] pg_hba.conf state (hostssl lines):"
 grep "^hostssl" "${PGDATA}/pg_hba.conf" || echo "  (no hostssl lines — fresh initdb, normal)"

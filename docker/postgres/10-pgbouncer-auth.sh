@@ -64,7 +64,7 @@ fi
 # Grants: LOGIN + CONNECT to yashigani only + EXECUTE on ysg_pgbouncer_get_auth.
 # No table grants, no schema grants, no access to letta or postgres databases.
 echo "[10-pgbouncer-auth] Creating pgbouncer_authenticator role"
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<SQL
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgbouncer_authenticator') THEN
@@ -123,7 +123,7 @@ SQL
 # Remove implicit CONNECT privilege from letta and postgres system databases
 # so a credential leak cannot be leveraged to connect elsewhere.
 echo "[10-pgbouncer-auth] Restricting pgbouncer_authenticator database CONNECT privileges"
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres <<'SQL'
 -- Ensure CONNECT to yashigani is retained (it is by default; explicit for clarity).
 GRANT CONNECT ON DATABASE yashigani TO pgbouncer_authenticator;
 
@@ -168,7 +168,7 @@ fi
 # For the upgrade path (docker exec psql -U "${POSTGRES_USER:-yashigani_app}" -d yashigani -f
 # /docker-entrypoint-initdb.d/10-pgbouncer-auth.sh), pg_reload_conf() fires
 # immediately and the updated pg_hba.conf is picked up by the live server.
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" -c "SELECT pg_reload_conf();" 2>/dev/null || true
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres -c "SELECT pg_reload_conf();" 2>/dev/null || true
 
 echo "[10-pgbouncer-auth] pg_hba.conf state (hostssl lines):"
 grep "^hostssl" "${PGDATA}/pg_hba.conf" || echo "  (no hostssl lines — fresh initdb, normal)"
