@@ -16,7 +16,7 @@
 # IDEMPOTENT: safe to re-run on an existing cluster (IF NOT EXISTS / OR REPLACE
 # guards throughout). For v2.23.4→v2.24.0 upgrades, the operator runs this
 # script once via:
-#   docker exec yashigani-postgres psql -U postgres -d yashigani \
+#   docker exec yashigani-postgres psql -U "${POSTGRES_USER:-yashigani_app}" -d yashigani \
 #     -f /docker-entrypoint-initdb.d/10-pgbouncer-auth.sh
 # before starting the updated pgbouncer containers.
 #
@@ -64,7 +64,7 @@ fi
 # Grants: LOGIN + CONNECT to yashigani only + EXECUTE on ysg_pgbouncer_get_auth.
 # No table grants, no schema grants, no access to letta or postgres databases.
 echo "[10-pgbouncer-auth] Creating pgbouncer_authenticator role"
-psql -v ON_ERROR_STOP=1 --username postgres <<SQL
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgbouncer_authenticator') THEN
@@ -92,7 +92,9 @@ SQL
 # auth_dbname = yashigani on both pgbouncer.ini and pgbouncer-letta.ini (Amendment C6).
 # pg_shadow is a global catalog view — function lives once, in yashigani database.
 echo "[10-pgbouncer-auth] Creating ysg_pgbouncer_get_auth function in yashigani database"
-psql -v ON_ERROR_STOP=1 --username postgres --dbname yashigani <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" \
+     -v owner="${POSTGRES_USER:-yashigani_app}" \
+     --dbname yashigani <<'SQL'
 CREATE OR REPLACE FUNCTION ysg_pgbouncer_get_auth(uname text)
   RETURNS TABLE(usename text, passwd text)
   LANGUAGE sql
@@ -106,10 +108,10 @@ AS $$
   LIMIT 1;
 $$;
 
--- Ownership: postgres superuser (function must run as superuser to read pg_shadow).
--- ALTER FUNCTION ownership is a no-op when already owned by postgres, but
--- explicit for audit trail.
-ALTER FUNCTION ysg_pgbouncer_get_auth(text) OWNER TO postgres;
+-- Ownership: postgres superuser / POSTGRES_USER (function must run as superuser to read pg_shadow).
+-- ALTER FUNCTION ownership is a no-op when already owned by the postgres superuser (POSTGRES_USER),
+-- but explicit for audit trail.
+ALTER FUNCTION ysg_pgbouncer_get_auth(text) OWNER TO :"owner";
 
 -- Restrict execute: revoke from PUBLIC, grant only to pgbouncer_authenticator.
 REVOKE ALL ON FUNCTION ysg_pgbouncer_get_auth(text) FROM PUBLIC;
@@ -121,7 +123,7 @@ SQL
 # Remove implicit CONNECT privilege from letta and postgres system databases
 # so a credential leak cannot be leveraged to connect elsewhere.
 echo "[10-pgbouncer-auth] Restricting pgbouncer_authenticator database CONNECT privileges"
-psql -v ON_ERROR_STOP=1 --username postgres <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<'SQL'
 -- Ensure CONNECT to yashigani is retained (it is by default; explicit for clarity).
 GRANT CONNECT ON DATABASE yashigani TO pgbouncer_authenticator;
 
@@ -163,10 +165,10 @@ fi
 # Reload pg_hba.conf so the change takes effect without a full restart.
 # During initdb, postgres is not running in server mode yet — the file is read
 # on next server start. This is correct for the init-script path.
-# For the upgrade path (docker exec psql -U postgres -d yashigani -f
+# For the upgrade path (docker exec psql -U "${POSTGRES_USER:-yashigani_app}" -d yashigani -f
 # /docker-entrypoint-initdb.d/10-pgbouncer-auth.sh), pg_reload_conf() fires
 # immediately and the updated pg_hba.conf is picked up by the live server.
-psql -v ON_ERROR_STOP=1 --username postgres -c "SELECT pg_reload_conf();" 2>/dev/null || true
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" -c "SELECT pg_reload_conf();" 2>/dev/null || true
 
 echo "[10-pgbouncer-auth] pg_hba.conf state (hostssl lines):"
 grep "^hostssl" "${PGDATA}/pg_hba.conf" || echo "  (no hostssl lines — fresh initdb, normal)"

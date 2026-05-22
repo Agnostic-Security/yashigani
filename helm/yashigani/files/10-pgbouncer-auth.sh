@@ -43,7 +43,7 @@ fi
 
 # ─── 1. Create pgbouncer_authenticator role ──────────────────────────────────
 echo "[10-pgbouncer-auth] Creating pgbouncer_authenticator role"
-psql -v ON_ERROR_STOP=1 --username postgres <<SQL
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgbouncer_authenticator') THEN
@@ -65,7 +65,9 @@ SQL
 
 # ─── 2. Create SECURITY DEFINER function in yashigani database ───────────────
 echo "[10-pgbouncer-auth] Creating ysg_pgbouncer_get_auth function in yashigani database"
-psql -v ON_ERROR_STOP=1 --username postgres --dbname yashigani <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" \
+     -v owner="${POSTGRES_USER:-yashigani_app}" \
+     --dbname yashigani <<'SQL'
 CREATE OR REPLACE FUNCTION ysg_pgbouncer_get_auth(uname text)
   RETURNS TABLE(usename text, passwd text)
   LANGUAGE sql
@@ -79,7 +81,10 @@ AS $$
   LIMIT 1;
 $$;
 
-ALTER FUNCTION ysg_pgbouncer_get_auth(text) OWNER TO postgres;
+-- Ownership: postgres superuser / POSTGRES_USER (function must run as superuser to read pg_shadow).
+-- ALTER FUNCTION ownership is a no-op when already owned by the postgres superuser (POSTGRES_USER),
+-- but explicit for audit trail.
+ALTER FUNCTION ysg_pgbouncer_get_auth(text) OWNER TO :"owner";
 
 REVOKE ALL ON FUNCTION ysg_pgbouncer_get_auth(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ysg_pgbouncer_get_auth(text) TO pgbouncer_authenticator;
@@ -87,7 +92,7 @@ SQL
 
 # ─── 3. REVOKE CONNECT on non-auth databases ─────────────────────────────────
 echo "[10-pgbouncer-auth] Restricting pgbouncer_authenticator database CONNECT privileges"
-psql -v ON_ERROR_STOP=1 --username postgres <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" <<'SQL'
 GRANT CONNECT ON DATABASE yashigani TO pgbouncer_authenticator;
 
 DO $$
@@ -127,7 +132,7 @@ fi
 # on next server start. This is correct for the init-script path.
 # For the upgrade path, pg_reload_conf() fires immediately and the updated
 # pg_hba.conf is picked up by the live server.
-psql -v ON_ERROR_STOP=1 --username postgres -c "SELECT pg_reload_conf();" 2>/dev/null || true
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" -c "SELECT pg_reload_conf();" 2>/dev/null || true
 
 echo "[10-pgbouncer-auth] pg_hba.conf state (hostssl lines):"
 grep "^hostssl" "${PGDATA}/pg_hba.conf" || echo "  (no hostssl lines — fresh initdb, normal)"
