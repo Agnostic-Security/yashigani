@@ -1077,10 +1077,15 @@ services:
       # postgres cannot read redis_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
       - ./secrets/postgres_password:/run/secrets/postgres_password:ro
-      # Init scripts run in alphabetical order — 05 must come before 10.
-      # 05 enables TLS + client-cert verification on first initdb.
+      # Init scripts run in alphabetical order — 05 must come before 10/11.
+      # 05: TLS + client-cert verification on first initdb.
+      # 10: pgbouncer_authenticator role + ysg_pgbouncer_get_auth function (YSG-RISK-049 close).
+      # 11: create agent databases (letta, langflow).
+      # 10 runs before 11 — pgbouncer_authenticator role is cluster-global and must exist
+      # before agent-db init scripts attempt any auth-adjacent operations.
       - ./postgres/05-enable-ssl.sh:/docker-entrypoint-initdb.d/05-enable-ssl.sh:ro
-      - ./postgres/init-agent-dbs.sh:/docker-entrypoint-initdb.d/10-agent-dbs.sh:ro
+      - ./postgres/10-pgbouncer-auth.sh:/docker-entrypoint-initdb.d/10-pgbouncer-auth.sh:ro
+      - ./postgres/init-agent-dbs.sh:/docker-entrypoint-initdb.d/11-agent-dbs.sh:ro
     healthcheck:
       # pg_isready over a local socket — doesn't need TLS.
       test: ["CMD-SHELL", "pg_isready -U yashigani_app -d yashigani"]

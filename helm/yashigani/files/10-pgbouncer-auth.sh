@@ -25,8 +25,20 @@ set -euo pipefail
 
 echo "[10-pgbouncer-auth] Starting pgbouncer auth_query postgres-side setup (K8s)"
 
-# Fail-closed: password must be injected via env var (from K8s Secret mount).
-: "${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD must be set — mount yashigani-pgbouncer-auth-secret and set the env var}"
+# Fail-closed: read pgbouncer_authenticator password from mounted secret file.
+# K8s path: pgbouncer-auth-secret mounted into postgres pod at
+#   /run/secrets/pgbouncer_authenticator_password (subPath, defaultMode 0440).
+#   fsGroup: 70 in pod securityContext ensures postgres (UID 70) can read it.
+_pwfile="/run/secrets/pgbouncer_authenticator_password"
+if [[ ! -r "${_pwfile}" ]]; then
+  printf 'FATAL: %s not readable — yashigani-pgbouncer-auth-secret must be mounted\n' "${_pwfile}" >&2
+  exit 1
+fi
+PGBOUNCER_AUTH_PASSWORD="$(cat "${_pwfile}")"
+if [[ -z "${PGBOUNCER_AUTH_PASSWORD}" ]]; then
+  printf 'FATAL: %s is empty — secrets.yaml must generate pgbouncer_authenticator_password\n' "${_pwfile}" >&2
+  exit 1
+fi
 : "${PGDATA:?PGDATA must be set by the postgres image}"
 
 # ─── 1. Create pgbouncer_authenticator role ──────────────────────────────────

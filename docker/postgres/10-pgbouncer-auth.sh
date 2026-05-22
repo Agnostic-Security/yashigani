@@ -34,8 +34,29 @@ set -euo pipefail
 
 echo "[10-pgbouncer-auth] Starting pgbouncer auth_query postgres-side setup"
 
-# Fail-closed: password must be injected via env var (from Docker secret mount).
-: "${PGBOUNCER_AUTH_PASSWORD:?PGBOUNCER_AUTH_PASSWORD must be set — mount docker/secrets/pgbouncer_auth_password as a secret and set the env var}"
+# Fail-closed: read pgbouncer_authenticator password from mounted secret file.
+# Compose path: blanket ./secrets:/run/secrets:ro mount provides the file.
+# K8s path: pgbouncer-auth-secret mounted into postgres pod at /run/secrets/pgbouncer_authenticator_password.
+# NOTE (compose ownership): pgbouncer_authenticator_password is chowned 70:0 0640 by install.sh for pgbouncer
+# (UID 70). The postgres init script runs as UID 999 (pgvector/pgvector compose user). Install.sh must also
+# set GID-999 group-read on this file (per-consumer ownership step, same pattern as postgres_password 1001:999 0640).
+# Until Su adds that step, set PGBOUNCER_AUTH_PASSWORD via env var as a fallback for the compose path.
+_pwfile="/run/secrets/pgbouncer_authenticator_password"
+if [[ -r "${_pwfile}" ]]; then
+  PGBOUNCER_AUTH_PASSWORD="$(cat "${_pwfile}")"
+  if [[ -z "${PGBOUNCER_AUTH_PASSWORD}" ]]; then
+    printf 'FATAL: %s is empty — install.sh must generate pgbouncer_authenticator_password\n' "${_pwfile}" >&2
+    exit 1
+  fi
+elif [[ -n "${PGBOUNCER_AUTH_PASSWORD:-}" ]]; then
+  # Env-var fallback: compose path when file not yet readable by UID 999.
+  # Remove once install.sh adds 999-group-read ownership step for this file.
+  printf 'INFO: %s not readable by this process — falling back to PGBOUNCER_AUTH_PASSWORD env var\n' "${_pwfile}" >&2
+else
+  printf 'FATAL: %s not readable AND PGBOUNCER_AUTH_PASSWORD env var not set\n' "${_pwfile}" >&2
+  printf 'FATAL: Mount docker/secrets/pgbouncer_authenticator_password or set the env var\n' >&2
+  exit 1
+fi
 : "${PGDATA:?PGDATA must be set by the postgres image}"
 
 # ─── 1. Create pgbouncer_authenticator role ──────────────────────────────────
