@@ -2739,11 +2739,28 @@ _validate_byo_ca_path() {
 # Returns 0 (EC key) or 1 (not EC key / undetectable).
 _check_byo_ca_key_type() {
   local _key="$1"
-  # `openssl ec -noout` returns 0 for any EC key (P-256/P-384/P-521 etc.) and
-  # non-zero for RSA/DSA/EdDSA. Works on OpenSSL 1.1 and 3.x (both LibreSSL and
-  # OpenSSL upstream); the legacy `openssl pkey -text` first-line format changed
-  # between OpenSSL 1.1 ("EC Private Key:") and 3.x ("Private-Key: (N bit)").
-  if ! openssl ec -in "$_key" -noout 2>/dev/null; then
+  # EC detection strategy (BYOCA-BUG-003 fix, v2.24.0):
+  #
+  # DO NOT use `openssl ec -in "$_key" -noout`: on OpenSSL 3.0.x (Ubuntu 22.04)
+  # this command exits 0 for RSA keys because it only parses the PEM header, not
+  # the key type. Confirmed bug: RSA keys silently pass the gate on 3.0.13.
+  #
+  # DO NOT use `openssl pkey -text | head -1` with an "EC" regex: the first line
+  # on OpenSSL 3.x is "Private-Key: (N bit)" for all key types — no type word in
+  # head -1. The same pattern fails on LibreSSL 3.x for EC keys.
+  #
+  # DO NOT use `openssl pkey -algorithm`: flag absent on LibreSSL.
+  #
+  # CORRECT APPROACH: `openssl pkey -noout -text` on EC keys always emits an
+  # "ASN1 OID:" line (e.g. "ASN1 OID: secp384r1") and/or a "NIST CURVE:" line.
+  # RSA/DSA/EdDSA keys produce neither. This holds across:
+  #   - LibreSSL 3.3.6 (macOS 13/14/15)
+  #   - OpenSSL 1.1.1 (Ubuntu 20.04)
+  #   - OpenSSL 3.0.x (Ubuntu 22.04)  — this is the platform where the old gate failed
+  #   - OpenSSL 3.x   (Ubuntu 24.04, RHEL 9, Alpine 3.19+)
+  # Also correctly handles PKCS#8-wrapped EC keys (BEGIN PRIVATE KEY) in addition
+  # to the traditional format (BEGIN EC PRIVATE KEY).
+  if ! openssl pkey -in "$_key" -noout -text 2>/dev/null | grep -qiE "ASN1 OID:|NIST CURVE:"; then
     # Determine type for a helpful error message (best-effort, not security-critical)
     local _first_line
     _first_line="$(openssl pkey -in "$_key" -noout -text 2>/dev/null | head -1)" || _first_line=""
