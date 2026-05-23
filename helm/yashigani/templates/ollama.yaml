@@ -25,6 +25,9 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      # BUG-NEW-003 sibling: readOnlyRootFilesystem: true blocks K8s serviceaccount
+      # token mount. ollama has no K8s API access requirement.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -142,6 +145,9 @@ spec:
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      # BUG-NEW-003 sibling: readOnlyRootFilesystem: true blocks K8s serviceaccount
+      # token mount on initContainer + ollama-init container. No K8s API access needed.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: false
         runAsUser: 0

@@ -27,9 +27,11 @@ echo "[10-pgbouncer-auth] Starting pgbouncer auth_query postgres-side setup (K8s
 
 # Fail-closed: read pgbouncer_authenticator password from mounted secret file.
 # K8s path: pgbouncer-auth-secret mounted into postgres pod at
-#   /run/secrets/pgbouncer_authenticator_password (subPath, defaultMode 0440).
+#   /run/secrets/pgbouncer-auth/pgbouncer_authenticator_password (directory mount, defaultMode 0440).
+#   BUG-NEW-002 fix: moved from subPath at /run/secrets/ to a separate directory to avoid
+#   the containerd "not a directory" error when pki-certs already owns /run/secrets.
 #   fsGroup: 70 in pod securityContext ensures postgres (UID 70) can read it.
-_pwfile="/run/secrets/pgbouncer_authenticator_password"
+_pwfile="/run/secrets/pgbouncer-auth/pgbouncer_authenticator_password"
 if [[ ! -r "${_pwfile}" ]]; then
   printf 'FATAL: %s not readable — yashigani-pgbouncer-auth-secret must be mounted\n' "${_pwfile}" >&2
   exit 1

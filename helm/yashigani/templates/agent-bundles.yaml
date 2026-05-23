@@ -66,6 +66,12 @@ spec:
         app.kubernetes.io/instance: {{ $root.Release.Name }}
         app.kubernetes.io/component: agent-bundle
     spec:
+      # BUG-NEW-003 fix: readOnlyRootFilesystem: true (default for all bundles) blocks
+      # K8s from creating /var/run/secrets/kubernetes.io/serviceaccount/ in the container
+      # rootfs at runtime. Agent bundles (langflow, letta, openclaw) do not need K8s API
+      # access — disable automount entirely. Same pattern as gateway, backoffice, postgres,
+      # pgbouncer, caddy, redis, and all other Yashigani core deployments.
+      automountServiceAccountToken: false
       securityContext:
         {{- if hasKey $bundle "podSecurityContext" }}
         {{- toYaml $bundle.podSecurityContext | nindent 8 }}

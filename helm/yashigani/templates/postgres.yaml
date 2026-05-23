@@ -160,14 +160,18 @@ spec:
               mountPath: /run/secrets
               readOnly: true
             # YSG-RISK-049 (v2.24.0): mount pgbouncer_authenticator_password into
-            # /run/secrets/ so 10-pgbouncer-auth.sh can read it via file path.
-            # subPath overlays the single key into the pki-certs directory mount
-            # without disturbing the rest of /run/secrets. fsGroup: 70 in the pod
-            # securityContext chowns the projected file to GID 70 (postgres GID),
-            # giving the postgres process (UID 70) owner-read access.
+            # a SEPARATE directory /run/secrets/pgbouncer-auth/ to avoid the
+            # containerd subPath overlap bug (BUG-NEW-002).
+            # Background: mounting pki-certs to /run/secrets (a directory with ~80
+            # files) and then using subPath to overlay a single file at
+            # /run/secrets/pgbouncer_authenticator_password fails on k3s v1.35.5+
+            # containerd 2.2.3: "not a directory" — containerd tries to use the
+            # projected path as a bind-mount target but the parent dir is already
+            # owned by the pki-certs volume. Fix: mount to a non-overlapping path.
+            # 10-pgbouncer-auth.sh reads from /run/secrets/pgbouncer-auth/pgbouncer_authenticator_password.
+            # fsGroup: 70 chowns the projected file to GID 70 (postgres GID).
             - name: pgbouncer-auth-secret
-              mountPath: /run/secrets/pgbouncer_authenticator_password
-              subPath: pgbouncer_authenticator_password
+              mountPath: /run/secrets/pgbouncer-auth
               readOnly: true
             # Retro #3an — mount the WHOLE ConfigMap as a directory, not via
             # subPath. With subPath the postgres entrypoint occasionally sees

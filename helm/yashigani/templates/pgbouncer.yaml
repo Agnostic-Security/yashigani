@@ -64,7 +64,7 @@ spec:
           args:
             - |
               set -e
-              PASS=$(cat /run/secrets/pgbouncer_authenticator_password)
+              PASS=$(cat /run/secrets/pgbouncer-auth/pgbouncer_authenticator_password)
               export AUTH_TYPE=scram-sha-256
               export DATABASE_URL="postgresql://pgbouncer_authenticator:${PASS}@${POSTGRES_HOST}:5432/yashigani"
               exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
@@ -131,10 +131,12 @@ spec:
               readOnly: true
             # YSG-RISK-049 CLOSED v2.24.0 — auth_query credential.
             # Option C: dedicated Secret mount, not co-located in yashigani-postgres-secrets.
-            # Mode 0640: readable by pgbouncer UID 70 (fsGroup: 70); inaccessible to other pods.
+            # BUG-NEW-002 sibling fix: moved from subPath overlay at /run/secrets/ to a
+            # separate /run/secrets/pgbouncer-auth/ directory. The subPath+pki-certs overlap
+            # fails on k3s v1.35.5+containerd 2.2.3 ("not a directory"). The wrapper script
+            # reads from /run/secrets/pgbouncer-auth/pgbouncer_authenticator_password.
             - name: pgbouncer-auth-secret
-              mountPath: /run/secrets/pgbouncer_authenticator_password
-              subPath: pgbouncer_authenticator_password
+              mountPath: /run/secrets/pgbouncer-auth
               readOnly: true
           {{- end }}
       {{- if .Values.mtls.enabled }}

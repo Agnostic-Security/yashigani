@@ -22,6 +22,9 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      # BUG-NEW-003 sibling: readOnlyRootFilesystem: true blocks K8s serviceaccount
+      # token mount. alertmanager has no K8s API access requirement.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
