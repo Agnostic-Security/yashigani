@@ -5363,10 +5363,13 @@ _do_chgrp() {
       if [[ "$_unshare_grp_ok" == "0" ]]; then
         log_warn "podman unshare chgrp ${_gid} failed on ${_label} — falling back to podman_run"
         local _rel_file="${_file#"${_secrets_dir}/"}"
+        # Defensive: when _file == _secrets_dir, strip is a no-op; target is /s (mount root).
+        [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+        local _chgrp_target="/s${_rel_file:+/${_rel_file}}"
         if ! podman run --rm \
                --volume "${_secrets_dir}:/s:rw" \
                "$_alpine_image" \
-               sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
+               sh -c "chgrp ${_gid} ${_chgrp_target}" 2>/dev/null; then
           log_error "podman_run fallback chgrp ${_gid} also failed on ${_label} — aborting"
           return 1
         fi
@@ -5374,14 +5377,17 @@ _do_chgrp() {
       ;;
     docker_run)
       local _rel_file="${_file#"${_secrets_dir}/"}"
+      # Defensive: when _file == _secrets_dir, strip is a no-op; target is /s (mount root).
+      [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+      local _chgrp_target="/s${_rel_file:+/${_rel_file}}"
       if ! docker run --rm --pull=never \
              --volume "${_secrets_dir}:/s:rw" \
              "alpine:3" \
-             sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
+             sh -c "chgrp ${_gid} ${_chgrp_target}" 2>/dev/null; then
         if ! docker run --rm \
                --volume "${_secrets_dir}:/s:rw" \
                "$_alpine_image" \
-               sh -c "chgrp ${_gid} /s/${_rel_file}"; then
+               sh -c "chgrp ${_gid} ${_chgrp_target}"; then
           log_error "docker_run chgrp ${_gid} failed on ${_label} — aborting"
           return 1
         fi
@@ -5389,11 +5395,14 @@ _do_chgrp() {
       ;;
     podman_run)
       local _rel_file="${_file#"${_secrets_dir}/"}"
+      # Defensive: when _file == _secrets_dir, strip is a no-op; target is /s (mount root).
+      [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+      local _chgrp_target="/s${_rel_file:+/${_rel_file}}"
       if ! podman run --rm \
              --network=none \
              --volume "${_secrets_dir}:/s:rw,U" \
              "$_alpine_image" \
-             sh -c "chgrp ${_gid} /s/${_rel_file}" 2>/dev/null; then
+             sh -c "chgrp ${_gid} ${_chgrp_target}" 2>/dev/null; then
         log_warn "podman run chgrp ${_gid} failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
         log_warn "  To fix permanently: grant Podman Full Disk Access in System Settings > Privacy"
       fi
@@ -5521,9 +5530,13 @@ _do_chown() {
         # docker/secrets (e.g. check_installer_preflight with $_bm_dir) mount
         # the correct root. Mount point is /s (S7 convention).
         local _rel_file="${_file#"${_mount_base}/"}"
-        local _container_cmd="chown ${_chown_spec} /s/${_rel_file}"
+        # Defensive (VEB-Strip): when _file == _mount_base (e.g. install.sh:1396
+        # bind-mount-dir chown), strip is a no-op; target is /s (mount root).
+        [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+        local _chown_target="/s${_rel_file:+/${_rel_file}}"
+        local _container_cmd="chown ${_chown_spec} ${_chown_target}"
         if [[ -n "$_extra_chmod" ]]; then
-          _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
+          _container_cmd="${_container_cmd} && chmod ${_extra_chmod} ${_chown_target}"
         fi
         if ! podman run --rm \
                --volume "${_mount_base}:/s:rw" \
@@ -5537,9 +5550,13 @@ _do_chown() {
     docker_run)
       # S5: bind _mount_base to /s (S7 convention — matches internal logic).
       local _rel_file="${_file#"${_mount_base}/"}"
-      local _container_cmd="chown ${_chown_spec} /s/${_rel_file}"
+      # Defensive (VEB-Strip): when _file == _mount_base (e.g. install.sh:1396
+      # bind-mount-dir chown), strip is a no-op; target is /s (mount root).
+      [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+      local _chown_target="/s${_rel_file:+/${_rel_file}}"
+      local _container_cmd="chown ${_chown_spec} ${_chown_target}"
       if [[ -n "$_extra_chmod" ]]; then
-        _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
+        _container_cmd="${_container_cmd} && chmod ${_extra_chmod} ${_chown_target}"
       fi
       if ! docker run --rm --pull=never \
              --volume "${_mount_base}:/s:rw" \
@@ -5557,9 +5574,13 @@ _do_chown() {
     podman_run)
       # S5: bind _mount_base to /s (S7 convention).
       local _rel_file="${_file#"${_mount_base}/"}"
-      local _container_cmd="chown ${_chown_spec} /s/${_rel_file}"
+      # Defensive (VEB-Strip): when _file == _mount_base (e.g. install.sh:1396
+      # bind-mount-dir chown), strip is a no-op; target is /s (mount root).
+      [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+      local _chown_target="/s${_rel_file:+/${_rel_file}}"
+      local _container_cmd="chown ${_chown_spec} ${_chown_target}"
       if [[ -n "$_extra_chmod" ]]; then
-        _container_cmd="${_container_cmd} && chmod ${_extra_chmod} /s/${_rel_file}"
+        _container_cmd="${_container_cmd} && chmod ${_extra_chmod} ${_chown_target}"
       fi
       if ! podman run --rm \
              --network=none \
@@ -5737,10 +5758,13 @@ _do_chmod_0640() {
       if ! podman unshare chmod 0640 "$_file" 2>/dev/null; then
         log_warn "podman unshare chmod 0640 failed on ${_label} — falling back to podman_run"
         local _rel_file="${_file#"${_secrets_dir}/"}"
+        # Defensive (VEB-Strip): when _file == _secrets_dir, strip is a no-op; target is /s.
+        [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+        local _chmod_target="/s${_rel_file:+/${_rel_file}}"
         if ! podman run --rm \
                --volume "${_secrets_dir}:/s:rw" \
                "$_alpine_image" \
-               sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
+               sh -c "chmod 0640 ${_chmod_target}" 2>/dev/null; then
           log_error "podman_run fallback chmod 0640 also failed on ${_label} — aborting"
           return 1
         fi
@@ -5748,14 +5772,17 @@ _do_chmod_0640() {
       ;;
     docker_run)
       local _rel_file="${_file#"${_secrets_dir}/"}"
+      # Defensive (VEB-Strip): when _file == _secrets_dir, strip is a no-op; target is /s.
+      [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+      local _chmod_target="/s${_rel_file:+/${_rel_file}}"
       if ! docker run --rm --pull=never \
              --volume "${_secrets_dir}:/s:rw" \
              "alpine:3" \
-             sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
+             sh -c "chmod 0640 ${_chmod_target}" 2>/dev/null; then
         if ! docker run --rm \
                --volume "${_secrets_dir}:/s:rw" \
                "$_alpine_image" \
-               sh -c "chmod 0640 /s/${_rel_file}"; then
+               sh -c "chmod 0640 ${_chmod_target}"; then
           log_error "docker_run chmod 0640 failed on ${_label} — aborting"
           return 1
         fi
@@ -5763,11 +5790,14 @@ _do_chmod_0640() {
       ;;
     podman_run)
       local _rel_file="${_file#"${_secrets_dir}/"}"
+      # Defensive (VEB-Strip): when _file == _secrets_dir, strip is a no-op; target is /s.
+      [[ "$_rel_file" == "$_file" ]] && _rel_file=""
+      local _chmod_target="/s${_rel_file:+/${_rel_file}}"
       if ! podman run --rm \
              --network=none \
              --volume "${_secrets_dir}:/s:rw,U" \
              "$_alpine_image" \
-             sh -c "chmod 0640 /s/${_rel_file}" 2>/dev/null; then
+             sh -c "chmod 0640 ${_chmod_target}" 2>/dev/null; then
         log_warn "podman run chmod 0640 failed on ${_label} (macOS TCC Privacy may block virtiofs access)"
       fi
       ;;

@@ -850,24 +850,24 @@ services:
         # Disk-space pre-check: require ≥3 GB free on the ollama data volume.
         # The model (qwen2.5:3b) is 1.9 GB; 3 GB leaves headroom for staging.
         # Uses df on /data (the ollama volume mount) in 1K blocks.
-        AVAIL_KB=$(df -k /data 2>/dev/null | awk 'NR==2{print $4}')
+        AVAIL_KB=$$(df -k /data 2>/dev/null | awk 'NR==2{print $$4}')
         REQUIRED_KB=3145728  # 3 GB in KB
-        if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt "$REQUIRED_KB" ]; then
-          AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
-          echo "WARNING: Ollama volume has only ~${AVAIL_GB} GB free (need ≥3 GB for model pull)."
+        if [ -n "$$AVAIL_KB" ] && [ "$$AVAIL_KB" -lt "$$REQUIRED_KB" ]; then
+          AVAIL_GB=$$(( AVAIL_KB / 1024 / 1024 ))
+          echo "WARNING: Ollama volume has only ~$$AVAIL_GB GB free (need ≥3 GB for model pull)."
           echo "Skipping model pull to avoid failed install. Free space on the docker volume and re-run install.sh."
           exit 0
         fi
-        echo "Disk space OK (${AVAIL_KB} KB free). Pulling model..."
+        echo "Disk space OK ($$AVAIL_KB KB free). Pulling model..."
         OLLAMA_HOST=http://ollama:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
         # Verify model digest — detect tampered/poisoned models (SOL-SC-03)
         EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-357c53fb659c}"
-        ACTUAL_DIGEST=$(OLLAMA_HOST=http://ollama:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $2}')
-        if [ -n "$EXPECTED_DIGEST" ] && [ "$EXPECTED_DIGEST" != "skip" ]; then
-          if echo "$ACTUAL_DIGEST" | grep -q "$EXPECTED_DIGEST"; then
-            echo "Model digest verified: $ACTUAL_DIGEST"
+        ACTUAL_DIGEST=$$(OLLAMA_HOST=http://ollama:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $$2}')
+        if [ -n "$$EXPECTED_DIGEST" ] && [ "$$EXPECTED_DIGEST" != "skip" ]; then
+          if echo "$$ACTUAL_DIGEST" | grep -q "$$EXPECTED_DIGEST"; then
+            echo "Model digest verified: $$ACTUAL_DIGEST"
           else
-            echo "WARNING: Model digest mismatch! Expected=$EXPECTED_DIGEST Actual=$ACTUAL_DIGEST"
+            echo "WARNING: Model digest mismatch! Expected=$$EXPECTED_DIGEST Actual=$$ACTUAL_DIGEST"
             echo "This may indicate a tampered or updated model. Set OLLAMA_MODEL_DIGEST=skip to bypass."
             exit 1
           fi
@@ -1159,7 +1159,7 @@ services:
         set -e
         PASS=$(cat /run/secrets/pgbouncer_authenticator_password)
         export AUTH_TYPE=scram-sha-256
-        export DATABASE_URL="postgresql://pgbouncer_authenticator:${PASS}@postgres:5432/yashigani"
+        export DATABASE_URL="postgresql://pgbouncer_authenticator:$$PASS@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro
@@ -1665,7 +1665,7 @@ services:
         set -e
         PASS=$(cat /run/secrets/pgbouncer_authenticator_password)
         export AUTH_TYPE=scram-sha-256
-        export DATABASE_URL="postgresql://pgbouncer_authenticator:${PASS}@postgres:5432/yashigani"
+        export DATABASE_URL="postgresql://pgbouncer_authenticator:$$PASS@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro

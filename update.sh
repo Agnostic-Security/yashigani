@@ -493,7 +493,12 @@ do_rollback() {
   local restore_count=0
   # Use find + exec instead of process substitution (bash 3.2 compatible)
   find "$latest_backup" -type f -print 2>/dev/null | while IFS= read -r f; do
-    rel_path="${f#${latest_backup}/}"
+    rel_path="${f#"${latest_backup}/"}"
+    # Defensive (VEB-Strip): when find returns latest_backup itself (file == dir),
+    # strip is a no-op and rel_path == f (full absolute path). Skip it — it would
+    # produce an invalid destination path. find -type f should not return the dir
+    # itself, but guard defensively against edge cases (symlink, unusual fs).
+    [[ "$rel_path" == "$f" ]] && continue
     dest="${INSTALL_DIR}/${rel_path}"
     dest_dir="$(dirname "$dest")"
     mkdir -p "$dest_dir"

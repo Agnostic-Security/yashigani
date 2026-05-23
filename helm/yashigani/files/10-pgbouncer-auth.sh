@@ -42,25 +42,36 @@ fi
 : "${PGDATA:?PGDATA must be set by the postgres image}"
 
 # ─── 1. Create pgbouncer_authenticator role ──────────────────────────────────
+# VEB-SQL hardening: psql -v auth_pw + :'auth_pw' quote-literal substitution.
+# - <<'SQL' (quoted heredoc) — shell never interpolates; only psql sees $...
+# - -v auth_pw="$PGBOUNCER_AUTH_PASSWORD" — passes value via psql variable mechanism
+# - :'auth_pw' in CREATE/ALTER statements — psql quote-literal substitution; correctly
+#   escapes any ' in the value (doubles it: ' → '') before sending to the server
+# - \gset + \if meta-commands for idempotency — avoids DO $$ block where psql
+#   variable substitution does NOT apply (psql tokeniser treats $$ as opaque)
+# Defense-in-depth: install.sh:5184 charset 'A-Za-z0-9!*,._~-' excludes ' today,
+# but this fix makes the SQL safe regardless of future charset changes.
 echo "[10-pgbouncer-auth] Creating pgbouncer_authenticator role"
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres <<SQL
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgbouncer_authenticator') THEN
-    CREATE ROLE pgbouncer_authenticator
-      LOGIN
-      NOSUPERUSER
-      NOCREATEDB
-      NOCREATEROLE
-      NOREPLICATION
-      NOINHERIT
-      PASSWORD '${PGBOUNCER_AUTH_PASSWORD}';
-  ELSE
-    -- On re-run: update password to current value (rotation support).
-    ALTER ROLE pgbouncer_authenticator PASSWORD '${PGBOUNCER_AUTH_PASSWORD}';
-  END IF;
-END
-\$\$;
+psql -v ON_ERROR_STOP=1 -v auth_pw="$PGBOUNCER_AUTH_PASSWORD" \
+     --username "${POSTGRES_USER:-yashigani_app}" --dbname postgres <<'SQL'
+\pset tuples_only on
+\pset format unaligned
+SELECT NOT EXISTS (
+  SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgbouncer_authenticator'
+) AS needs_create \gset
+\if :needs_create
+  CREATE ROLE pgbouncer_authenticator
+    LOGIN
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    NOREPLICATION
+    NOINHERIT
+    PASSWORD :'auth_pw';
+\else
+  -- On re-run: update password to current value (rotation support).
+  ALTER ROLE pgbouncer_authenticator PASSWORD :'auth_pw';
+\endif
 SQL
 
 # ─── 2. Create SECURITY DEFINER function in yashigani database ───────────────
