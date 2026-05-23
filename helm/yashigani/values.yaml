@@ -805,7 +805,7 @@ agentBundles:
     # NOTE: Node.js 24 image — approximately 800 MB (larger than Python agent images).
     # OpenClaw runs its own Gateway on port 18789.
     # Integration: OpenClaw Gateway -> Yashigani Gateway -> LLM providers.
-    # License: TBD — verify at openclaw.ai before production use.
+    # License: MIT (github.com/openclaw/openclaw)
     enabled: false
     image:
       # Pinned to 2026.5.6 to match docker-compose.yml. INDEX digest verified

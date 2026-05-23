@@ -2559,7 +2559,7 @@ select_agent_bundles() {
   printf "${C_BOLD}Available agent bundles:${C_RESET}\n\n"
   printf "    1) Langflow    — Visual multi-agent workflow builder (MIT)\n"
   printf "    2) Letta       — Stateful agent with persistent memory (Apache 2.0)\n"
-  printf "    3) OpenClaw    — Node.js 24 personal AI, 30+ channels (${C_YELLOW}~800 MB${C_RESET}, license TBD)\n"
+  printf "    3) OpenClaw    — Node.js 24 personal AI, 30+ channels (${C_YELLOW}~800 MB${C_RESET}, MIT)\n"
   printf "    4) All of the above\n"
   printf "    0) None — skip agent bundles\n"
   printf "\n"

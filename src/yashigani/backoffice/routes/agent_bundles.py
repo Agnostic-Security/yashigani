@@ -97,7 +97,7 @@ _BUNDLES: list[dict] = [
             "Draft a Slack message announcing the new security policy",
         ],
         "upstream_url": "https://openclaw.ai",
-        "license": "TBD — verify at openclaw.ai before production use",
+        "license": "MIT",
         "stack": "Node.js 24",
         "image": "ghcr.io/openclaw/openclaw:2026.3.1",
         "integration": "OpenClaw Gateway (:18789) → Yashigani Gateway → LLM providers",

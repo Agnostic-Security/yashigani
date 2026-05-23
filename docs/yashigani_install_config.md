@@ -2013,7 +2013,7 @@ Three agent bundles are available as opt-in installs. They are **not installed b
 |------------|-----------|---------|-------------|-----------------|
 | Lala | Langflow | Apache 2.0 | Visual flow orchestration → Yashigani → tools | `langflow` |
 | Julietta | Letta | Apache 2.0 | Memory-augmented agent → Yashigani → tools | `letta` |
-| Scout | OpenClaw (Node.js 24) | TBD (verify at openclaw.ai) | OpenClaw Gateway (:18789) → Yashigani → LLMs | `openclaw` |
+| Scout | OpenClaw (Node.js 24) | MIT | OpenClaw Gateway (:18789) → Yashigani → LLMs | `openclaw` |
 
 **Agent chaining** is supported: `@Scout` -> `@Julietta` -> `@qwen`. Use the `@Help` agent for a chaining guide.
 
@@ -2026,7 +2026,7 @@ Available agent bundles:
 
     1) Lala (Langflow) — Visual flow-based agent orchestration (Apache 2.0)
     2) Julietta (Letta) — Memory-augmented conversational agent (Apache 2.0)
-    3) Scout (OpenClaw)  — Node.js 24 personal AI, 30+ channels (~800 MB, license TBD)
+    3) Scout (OpenClaw)  — Node.js 24 personal AI, 30+ channels (~800 MB, MIT)
     4) All of the above
     0) None — skip agent bundles
 
