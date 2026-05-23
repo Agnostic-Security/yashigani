@@ -29,13 +29,23 @@ Design:
   The driver NEVER silently falls back to the internal CA if signing fails.
   A DriverError is raised and the rotation is surfaced as a failure in the admin UI.
 
-Last updated: 2026-05-09T00:00:00+01:00
+Security hardening (v2.24.0):
+  H1 — chmod failure on leaf key is a hard error (delete key + raise).
+  H2 — Cryptographic chain validation via verify_directly_issued_by (not DN-only).
+  H3 — Basic Constraints CA:TRUE + keyUsage keyCertSign required on CA cert.
+  M2 — Validity window checked; --accept-expired-ca override via accept_expired_ca param.
+  M3 — Minimum key strength: RSA >= 3072 or EC P-256/P-384/P-521.
+  compute_ca_fingerprint() — SHA-256 fingerprint helper for install.sh wizard.
+
+Last updated: 2026-05-23T00:00:00+01:00
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +56,19 @@ from yashigani.pki.drivers.internal_ca import (
 )
 
 _log = logging.getLogger("yashigani.pki.byo_ca_driver")
+
+# Minimum RSA key size in bits (NIST SP 800-57 Part 1 Rev 5 §5.6.1, through 2030)
+_MIN_RSA_BITS = 3072
+
+# EC curves accepted as CA key material (P-192 and smaller rejected)
+_ALLOWED_EC_CURVES = frozenset({
+    "secp256r1",   # P-256
+    "secp384r1",   # P-384
+    "secp521r1",   # P-521
+    "brainpoolP256r1",
+    "brainpoolP384r1",
+    "brainpoolP512r1",
+})
 
 
 def _require_env(name: str) -> str:
@@ -71,6 +94,148 @@ def _resolve_token(raw: str) -> str:
     return raw
 
 
+def compute_ca_fingerprint(cert_path: str | Path) -> str:
+    """Return the SHA-256 fingerprint of the CA cert at cert_path.
+
+    Format: 64 uppercase hex chars separated by colons every 2 chars,
+    e.g. ``3A:F1:2B:...`` (standard 'fingerprint display' format, 95 chars total).
+
+    Used by install.sh wizard to display the fingerprint for operator
+    out-of-band verification before accepting a BYO CA.
+
+    Callable from install.sh::
+
+        fp=$(python3 -c "from yashigani.pki.drivers.byo_ca import compute_ca_fingerprint; \\
+                         print(compute_ca_fingerprint('$path'))")
+
+    Raises ValueError if cert_path doesn't exist or isn't a valid PEM cert.
+    """
+    path = Path(cert_path)
+    if not path.exists():
+        raise ValueError(f"CA cert path does not exist: {path}")
+    try:
+        from cryptography import x509  # noqa: PLC0415
+        from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+        pem_data = path.read_bytes()
+        try:
+            cert = x509.load_pem_x509_certificate(pem_data)
+        except Exception as parse_exc:
+            raise ValueError(f"Cannot parse PEM cert at {path}: {parse_exc}") from parse_exc
+        der = cert.public_bytes(serialization.Encoding.DER)
+        digest = hashlib.sha256(der).hexdigest().upper()
+        # Insert colon every 2 hex chars: "AABB..." -> "AA:BB:..."
+        return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Cannot parse PEM cert at {path}: {exc}") from exc
+
+
+def _validate_ca_cert(ca_cert_path: Path, *, accept_expired: bool = False) -> None:
+    """Validate a CA cert file before accepting it as the BYO trust anchor.
+
+    Checks (in order):
+      H3 — Basic Constraints CA:TRUE + keyUsage keyCertSign
+      M2 — Validity window (notBefore ≤ now ≤ notAfter) unless accept_expired
+      M3 — Minimum key strength (RSA ≥ 3072, EC P-256/P-384/P-521)
+
+    Raises DriverError on any failure.
+    """
+    try:
+        from cryptography import x509  # noqa: PLC0415
+        from cryptography.hazmat.primitives.asymmetric import (  # noqa: PLC0415
+            ec,
+            rsa,
+        )
+
+        pem_data = ca_cert_path.read_bytes()
+        ca_cert = x509.load_pem_x509_certificate(pem_data)
+
+        # --- H3: Basic Constraints ---
+        try:
+            bc_ext = ca_cert.extensions.get_extension_for_class(x509.BasicConstraints)
+            if not bc_ext.value.ca:
+                raise DriverError(
+                    f"BYO CA cert at {ca_cert_path} does not have basicConstraints CA:TRUE. "
+                    "Supply a CA certificate, not a leaf certificate."
+                )
+        except x509.ExtensionNotFound:
+            raise DriverError(
+                f"BYO CA cert at {ca_cert_path} is missing the BasicConstraints extension. "
+                "A valid CA certificate must carry basicConstraints CA:TRUE."
+            )
+
+        # --- H3: Key Usage keyCertSign ---
+        try:
+            ku_ext = ca_cert.extensions.get_extension_for_class(x509.KeyUsage)
+            if not ku_ext.value.key_cert_sign:
+                raise DriverError(
+                    f"BYO CA cert at {ca_cert_path} does not have keyUsage keyCertSign. "
+                    "A CA certificate must be permitted to sign certificates."
+                )
+        except x509.ExtensionNotFound:
+            # KeyUsage extension is SHOULD per RFC 5280 §4.2.1.3 for CA certs.
+            # Enforce presence to be safe — a CA cert without keyUsage is non-conformant.
+            raise DriverError(
+                f"BYO CA cert at {ca_cert_path} is missing the KeyUsage extension. "
+                "A CA certificate must carry keyUsage with at least keyCertSign."
+            )
+
+        # --- M2: Validity window ---
+        now = datetime.now(timezone.utc)
+        not_before = ca_cert.not_valid_before_utc
+        not_after = ca_cert.not_valid_after_utc
+
+        if now < not_before:
+            raise DriverError(
+                f"BYO CA cert at {ca_cert_path} is not yet valid "
+                f"(notBefore={not_before.isoformat()}, now={now.isoformat()}). "
+                "Check the cert's validity period."
+            )
+        if now > not_after:
+            if accept_expired:
+                _log.warning(
+                    "CRITICAL: BYO CA cert at %s is EXPIRED (notAfter=%s). "
+                    "Accepting because accept_expired_ca=True was passed. "
+                    "This should only be used in test environments.",
+                    ca_cert_path,
+                    not_after.isoformat(),
+                )
+            else:
+                raise DriverError(
+                    f"BYO CA cert at {ca_cert_path} is expired "
+                    f"(notAfter={not_after.isoformat()}, now={now.isoformat()}). "
+                    "Provide a current CA certificate, or pass accept_expired_ca=True "
+                    "if this is a test environment."
+                )
+
+        # --- M3: Key strength ---
+        pub_key = ca_cert.public_key()
+        if isinstance(pub_key, rsa.RSAPublicKey):
+            bits = pub_key.key_size
+            if bits < _MIN_RSA_BITS:
+                raise DriverError(
+                    f"BYO CA cert at {ca_cert_path} has an RSA-{bits} key. "
+                    f"Minimum required is RSA-{_MIN_RSA_BITS} "
+                    "(NIST SP 800-57 Part 1 Rev 5). "
+                    "Re-generate the CA with a stronger key."
+                )
+        elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+            curve_name = pub_key.curve.name
+            if curve_name not in _ALLOWED_EC_CURVES:
+                raise DriverError(
+                    f"BYO CA cert at {ca_cert_path} uses EC curve {curve_name!r}. "
+                    f"Allowed curves: {sorted(_ALLOWED_EC_CURVES)}. "
+                    "P-192 and smaller are not permitted. Re-generate with P-256 or stronger."
+                )
+        # Ed25519 / Ed448 / X25519 are always accepted (no key-size concept; inherently strong)
+
+    except DriverError:
+        raise
+    except Exception as exc:
+        raise DriverError(f"CA cert validation failed for {ca_cert_path}: {exc}") from exc
+
+
 class ByoCADriver(CADriver):
     """CA driver that submits CSRs to a customer-supplied signing endpoint.
 
@@ -91,6 +256,7 @@ class ByoCADriver(CADriver):
         secrets_dir: Optional[str] = None,
         manifest_path: Optional[str] = None,
         timeout_s: float = 30.0,
+        accept_expired_ca: bool = False,
     ) -> None:
         self._ca_cert_path = Path(
             ca_cert_path or _require_env("YASHIGANI_BYO_CA_CERT_PATH")
@@ -127,6 +293,7 @@ class ByoCADriver(CADriver):
             or "/etc/yashigani/service_identities.yaml"
         )
         self._timeout_s = timeout_s
+        self._accept_expired_ca = accept_expired_ca
 
         # Auth mode validation first (before filesystem checks)
         if self._auth_mode not in ("token", "mtls", "none"):
@@ -144,6 +311,9 @@ class ByoCADriver(CADriver):
                 f"BYO CA cert not found at {self._ca_cert_path}. "
                 "Check YASHIGANI_BYO_CA_CERT_PATH."
             )
+
+        # Validate the CA cert (H3, M2, M3) — fail hard at construction time
+        _validate_ca_cert(self._ca_cert_path, accept_expired=self._accept_expired_ca)
 
     # -------------------------------------------------------------------------
     # CADriver interface
@@ -348,21 +518,41 @@ class ByoCADriver(CADriver):
                 f"Content-Type: {content_type!r}  Body start: {signed_pem[:200]!r}"
             )
 
-        # Atomically install the key now that we have the signed cert
+        # Atomically install the key now that we have the signed cert.
+        # H1 — chmod failure is a hard error: delete the key + raise DriverError.
+        # The key cannot be trusted to be secure if we cannot set its permissions.
         tmp_key_path.replace(key_path)
         try:
             key_path.chmod(0o400)
-        except OSError:
-            _log.warning("chmod 0o400 failed on %s — continuing", key_path)
+        except OSError as exc:
+            # Delete the now-live key file — it has wrong permissions.
+            try:
+                key_path.unlink(missing_ok=True)
+            except OSError as del_exc:
+                _log.error(
+                    "CRITICAL: could not delete %s after chmod failure: %s",
+                    key_path,
+                    del_exc,
+                )
+            raise DriverError(
+                f"chmod 0o400 failed on leaf private key {key_path}: {exc}. "
+                "The key file has been deleted to prevent insecure persistence. "
+                "Check filesystem permissions (noexec mount? ownership mismatch?)."
+            ) from exc
 
         return signed_pem
 
     def _validate_chain(self, signed_pem: bytes) -> None:
-        """Validate that the signed cert chains back to the BYO CA cert.
+        """Validate that the signed cert is cryptographically issued by the BYO CA cert.
 
-        Uses cryptography's basic issuer/AKI check.  For stronger validation
-        the operator should also configure their signing endpoint to enforce
-        path length constraints.
+        H2 — Uses cryptography's verify_directly_issued_by() for cryptographic
+        signature verification, not just issuer DN string comparison.
+
+        Raises DriverError if:
+          - The cert cannot be parsed.
+          - The cert's signature is not verifiable against the CA cert's public key
+            (i.e. the cert was NOT signed by the private key corresponding to the
+            supplied CA cert, even if the issuer DN matches).
         """
         try:
             from cryptography import x509  # noqa: PLC0415
@@ -370,20 +560,19 @@ class ByoCADriver(CADriver):
             leaf = x509.load_pem_x509_certificate(_extract_first_pem(signed_pem))
             ca_cert = x509.load_pem_x509_certificate(self._ca_cert_path.read_bytes())
 
-            # Subject of CA must match issuer of leaf
-            if leaf.issuer != ca_cert.subject:
-                # Could be an intermediate — check if CA's subject appears
-                # anywhere in the chain. For now we check direct issuer only
-                # and log a warning for intermediate chains.
-                _log.warning(
-                    "Leaf issuer %s does not directly match BYO CA subject %s. "
-                    "If using an intermediate CA, ensure it chains to YASHIGANI_BYO_CA_CERT_PATH.",
-                    leaf.issuer.rfc4514_string(),
-                    ca_cert.subject.rfc4514_string(),
-                )
-                # Do not hard-fail — the endpoint may have signed with an
-                # intermediate that chains to the provided CA root.  The TLS
-                # stack will enforce the full chain at connection time.
+            # Cryptographic verification: verify the leaf's signature against the
+            # CA cert's public key. This rejects a rogue CA cert with a matching
+            # subject DN but a different private key (trust-store poisoning).
+            try:
+                leaf.verify_directly_issued_by(ca_cert)
+            except Exception as verify_exc:
+                raise DriverError(
+                    f"Signed cert failed cryptographic chain verification against "
+                    f"BYO CA at {self._ca_cert_path}. "
+                    "The cert was not issued by this CA (signature mismatch). "
+                    f"Detail: {verify_exc}"
+                ) from verify_exc
+
         except DriverError:
             raise
         except Exception as exc:
