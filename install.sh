@@ -144,8 +144,15 @@ WORK_DIR=""
 AGENT_BUNDLES=""          # comma-separated: langflow,letta,openclaw
 INSTALL_WAZUH=false       # opt-in: --wazuh flag
 INSTALL_OPENWEBUI=false   # opt-in: --with-openwebui flag
-INSTALL_INTERNAL_CA=false # opt-in: --with-internal-ca flag
-COMPOSE_PROFILES=()       # populated by select_agent_bundles()
+INSTALL_INTERNAL_CA=false    # opt-in: --with-internal-ca flag
+INTERNAL_CA_CERT=""          # --internal-ca-cert path; empty = no BYO CA or deferred
+INTERNAL_CA_KEY=""           # --internal-ca-key path
+INTERNAL_CA_ROOT=""          # --internal-ca-root path (customer root cert for trust anchor)
+INTERNAL_CA_FINGERPRINT=""   # --byo-ca-fingerprint sha256 (REQUIRED in non-interactive when BYO is enabled)
+INTERNAL_CA_ACCEPT_EXPIRED=false  # --accept-expired-ca for test environments
+INTERNAL_CA_DEFER=false      # true when --with-internal-ca is passed without cert/key paths
+TLS_MODE_EXPLICITLY_SET=""   # set to "true" when --tls-mode flag is parsed
+COMPOSE_PROFILES=()          # populated by select_agent_bundles()
 REUSE_VOLUMES=false        # --reuse-volumes: skip contaminated-volume pre-check (BUG-INSTALL-ON-CONTAMINATED-VOLUMES)
 
 # Internal mTLS PKI — two-tier (root → intermediate → leaf).
@@ -197,7 +204,23 @@ OPTIONS
                                           ("Will Yashigani be used by humans with a web UI? [Y/n]").
                                           Pulls image unmodified from ghcr.io/open-webui/open-webui;
                                           Open WebUI is governed by its own licence terms.
-  --with-internal-ca                      Include Smallstep CA for internal service-to-service TLS
+  --with-internal-ca                      Enable BYO internal CA for service-to-service mTLS.
+                                          Without --internal-ca-cert/--internal-ca-key, activates
+                                          deferred mode (install runs with Yashigani-generated PKI;
+                                          supply CA files later via install.sh re-run).
+  --internal-ca-cert PATH                Path to BYO intermediate CA certificate (PEM, absolute).
+                                          Requires --internal-ca-key. Use with --with-internal-ca.
+  --internal-ca-key  PATH                Path to BYO intermediate CA private key (PEM, absolute).
+                                          Requires --internal-ca-cert. Use with --with-internal-ca.
+  --internal-ca-root PATH                Path to BYO root CA certificate (PEM, absolute).
+                                          Required when --internal-ca-cert is supplied so services
+                                          can verify the full chain.
+  --byo-ca-fingerprint SHA256            Expected SHA-256 fingerprint of the BYO CA cert.
+                                          REQUIRED in --non-interactive mode when BYO CA is enabled.
+                                          The installer computes the actual fingerprint and aborts
+                                          if they do not match (anti-substitution guard, MUST-1).
+  --accept-expired-ca                    Allow an expired BYO CA cert (test environments only).
+                                          Logs a CRITICAL warning when used.
   --wazuh                                 Install Wazuh SIEM (manager + indexer + dashboard)
   --offline                               Legacy offline flag (no ACME, no image pulls). Use
                                           --air-gap --bundle <path> for full air-gap installs.
@@ -283,6 +306,7 @@ parse_args() {
         ;;
       --tls-mode)
         TLS_MODE="${2:?'--tls-mode requires a value: acme|ca|selfsigned'}"
+        TLS_MODE_EXPLICITLY_SET="true"
         shift 2
         ;;
       --admin-email)
@@ -311,6 +335,26 @@ parse_args() {
         ;;
       --with-openwebui)  INSTALL_OPENWEBUI=true;  shift ;;
       --with-internal-ca) INSTALL_INTERNAL_CA=true; shift ;;
+      --internal-ca-cert)
+        INTERNAL_CA_CERT="${2:?'--internal-ca-cert requires a path'}"
+        shift 2
+        ;;
+      --internal-ca-key)
+        INTERNAL_CA_KEY="${2:?'--internal-ca-key requires a path'}"
+        shift 2
+        ;;
+      --internal-ca-root)
+        INTERNAL_CA_ROOT="${2:?'--internal-ca-root requires a path'}"
+        shift 2
+        ;;
+      --byo-ca-fingerprint)
+        INTERNAL_CA_FINGERPRINT="${2:?'--byo-ca-fingerprint requires a sha256 value'}"
+        shift 2
+        ;;
+      --accept-expired-ca)
+        INTERNAL_CA_ACCEPT_EXPIRED=true
+        shift
+        ;;
       --wazuh)           INSTALL_WAZUH=true;     shift ;;
       --offline)         OFFLINE=true;           shift ;;
       --air-gap)         AIR_GAP=true;           shift ;;
@@ -2506,6 +2550,240 @@ handle_license() {
 # =============================================================================
 # STEP 8 (compose/vm): Optional agent bundle selection
 # =============================================================================
+# =============================================================================
+# BYO Internal CA wizard helpers
+# Scope: Q1 / Q1a interactive flow + validation callable from re-run path.
+# Tom's Python scope: src/yashigani/pki/drivers/byo_ca.py (compute_ca_fingerprint,
+# validate_byo_ca_files). These shell helpers delegate to that module once
+# Tom's work lands on mustui main.
+# =============================================================================
+
+# _realpath_portable <path>
+# Cross-platform realpath: uses GNU coreutils realpath when available,
+# falls back to Python3 os.path.realpath (macOS ships without GNU coreutils
+# by default — feedback_local_test_must_work_on_macos_and_linux.md).
+_realpath_portable() {
+  local _p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -- "$_p" 2>/dev/null || printf '%s' "$_p"
+  else
+    python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" -- "$_p" 2>/dev/null || printf '%s' "$_p"
+  fi
+}
+
+# _validate_byo_ca_path <path> <label>
+# Path safety: reject paths containing shell metacharacters, '..' components,
+# or non-absolute paths. Also rejects /proc, /sys, /dev prefixes (information
+# disclosure via special files — Laura §2.1).
+# Returns 0 (safe) or 1 (unsafe).
+_validate_byo_ca_path() {
+  local _path="$1"
+  local _label="$2"
+
+  # Must be an absolute path (no ~ expansion, no relative paths)
+  if [[ "$_path" != /* ]]; then
+    log_error "BYO CA ${_label}: path must be absolute (no ~ or relative paths): ${_path}"
+    return 1
+  fi
+
+  # Reject '..' path traversal components
+  if [[ "$_path" == *..* ]]; then
+    log_error "BYO CA ${_label}: path contains '..' traversal component: ${_path}"
+    return 1
+  fi
+
+  # Reject paths containing shell metacharacters (Laura M1 — CWE-78)
+  # Allowed charset: alphanumeric, /, ., -, _
+  if [[ "$_path" =~ [^a-zA-Z0-9./_-] ]]; then
+    log_error "BYO CA ${_label}: path contains unsafe characters (only a-z A-Z 0-9 . / _ - allowed): ${_path}"
+    return 1
+  fi
+
+  # Reject special kernel pseudo-filesystems
+  local _canon
+  _canon="$(_realpath_portable "$_path")"
+  case "$_canon" in
+    /proc/*|/sys/*|/dev/*)
+      log_error "BYO CA ${_label}: path resolves to a kernel pseudo-filesystem: ${_canon}"
+      return 1
+      ;;
+  esac
+
+  # File must exist and be readable
+  if [[ ! -f "$_path" || ! -r "$_path" ]]; then
+    log_error "BYO CA ${_label}: file not found or not readable: ${_path}"
+    return 1
+  fi
+
+  # File size cap: 64 KB maximum (rejects PEM-bomb / multi-MB garbage — Laura C7)
+  local _size
+  _size="$(wc -c < "$_path" 2>/dev/null || printf '0')"
+  if [[ "$_size" -gt 65536 ]]; then
+    log_error "BYO CA ${_label}: file exceeds 64 KB size limit (${_size} bytes) — rejecting"
+    return 1
+  fi
+
+  return 0
+}
+
+# _validate_byo_ca_files
+# Validates INTERNAL_CA_CERT + INTERNAL_CA_KEY (and optionally INTERNAL_CA_ROOT).
+# Invokes Tom's Python validator for crypto checks (Basic Constraints, key match,
+# expiry, key strength). Computes and displays SHA-256 fingerprint.
+# In interactive mode: prompts operator to confirm fingerprint.
+# In non-interactive mode: requires --byo-ca-fingerprint to match (Laura MUST-1).
+# Reads globals: INTERNAL_CA_CERT, INTERNAL_CA_KEY, INTERNAL_CA_ROOT,
+#                INTERNAL_CA_FINGERPRINT, INTERNAL_CA_ACCEPT_EXPIRED, NON_INTERACTIVE
+# Returns 0 on success, 1 on failure.
+_validate_byo_ca_files() {
+  local _cert="$INTERNAL_CA_CERT"
+  local _key="$INTERNAL_CA_KEY"
+  local _root="${INTERNAL_CA_ROOT:-}"
+
+  # --- Path safety checks ---
+  _validate_byo_ca_path "$_cert" "cert" || return 1
+  _validate_byo_ca_path "$_key"  "key"  || return 1
+  if [[ -n "$_root" ]]; then
+    _validate_byo_ca_path "$_root" "root" || return 1
+  fi
+
+  # --- Python crypto validation (Tom's scope: byo_ca.py) ---
+  # When Tom's module is not yet installed, this block fails with an import error.
+  # That is expected — flag parsing and wizard UX are tested independently of
+  # Tom's module. The gate here is explicit and documented.
+  local _accept_expired_arg=""
+  [[ "$INTERNAL_CA_ACCEPT_EXPIRED" == "true" ]] && _accept_expired_arg=", accept_expired=True"
+
+  if python3 -c "from yashigani.pki.drivers.byo_ca import validate_byo_ca_files" 2>/dev/null; then
+    local _root_arg=""
+    [[ -n "$_root" ]] && _root_arg=", root_cert_path='${_root}'"
+    if ! python3 -c "
+from yashigani.pki.drivers.byo_ca import validate_byo_ca_files
+validate_byo_ca_files('${_cert}', '${_key}'${_root_arg}${_accept_expired_arg})
+" 2>&1; then
+      log_error "BYO CA crypto validation failed — see error above"
+      return 1
+    fi
+  else
+    log_warn "yashigani.pki.drivers.byo_ca not yet importable — skipping Python crypto validation (Tom's module pending)"
+    log_warn "Basic path + size checks passed; install may fail at PKI bootstrap if files are invalid"
+  fi
+
+  # --- SHA-256 fingerprint (Laura MUST-1 / C4) ---
+  # Compute fingerprint of the intermediate CA cert. This is what gets shown to
+  # the operator for out-of-band verification. Quoted double-expansion below is
+  # safe because _cert passed _validate_byo_ca_path (no metacharacters).
+  local _fp
+  if python3 -c "from yashigani.pki.drivers.byo_ca import compute_ca_fingerprint" 2>/dev/null; then
+    _fp="$(python3 -c "from yashigani.pki.drivers.byo_ca import compute_ca_fingerprint; print(compute_ca_fingerprint('${_cert}'))" 2>/dev/null)" || _fp=""
+  fi
+
+  # Fallback to openssl if Python module unavailable
+  if [[ -z "$_fp" ]]; then
+    _fp="$(openssl x509 -in "$_cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*Fingerprint=//' | tr -d ':' | tr '[:upper:]' '[:lower:]')" || _fp=""
+  fi
+
+  if [[ -z "$_fp" ]]; then
+    log_error "Failed to compute BYO CA cert fingerprint — cannot verify"
+    return 1
+  fi
+
+  printf "\n${C_BOLD}BYO CA cert fingerprint (SHA-256):${C_RESET}\n  %s\n" "$_fp"
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # Non-interactive: --byo-ca-fingerprint MUST be supplied and must match (Laura MUST-1)
+    if [[ -z "$INTERNAL_CA_FINGERPRINT" ]]; then
+      log_error "Non-interactive BYO CA install requires --byo-ca-fingerprint <sha256>"
+      log_error "  This is an anti-substitution guard (Laura MUST-1 / CWE-295)."
+      log_error "  Compute the fingerprint on a trusted machine and pass it as a flag."
+      return 1
+    fi
+    # Normalise both sides: strip colons + lowercase
+    local _fp_norm _supplied_norm
+    _fp_norm="$(printf '%s' "$_fp" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+    _supplied_norm="$(printf '%s' "$INTERNAL_CA_FINGERPRINT" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+    if [[ "$_fp_norm" != "$_supplied_norm" ]]; then
+      log_error "Fingerprint mismatch:"
+      log_error "  Supplied: ${INTERNAL_CA_FINGERPRINT}"
+      log_error "  Actual:   ${_fp}"
+      log_error "REFUSING to proceed — possible CA substitution attack"
+      return 1
+    fi
+    log_success "BYO CA fingerprint matches --byo-ca-fingerprint (MUST-1 verified)"
+  else
+    # Interactive: operator must acknowledge fingerprint out-of-band
+    printf "\n  ${C_BOLD}Verify this fingerprint with your CA owner before continuing.${C_RESET}\n"
+    printf "  (This is a standard anti-substitution check — same as SSH host key verification.)\n\n"
+    if ! prompt_yn "Does this fingerprint match what your CA owner provided?" "n"; then
+      log_error "BYO CA rejected by operator — fingerprint mismatch or unverified"
+      return 1
+    fi
+  fi
+
+  log_success "BYO CA accepted — will be staged for PKI bootstrap"
+  return 0
+}
+
+# _prompt_byo_ca_paths_interactive
+# Interactive "provide now" path: prompts for cert + key paths, validates each.
+# Loops on unreadable paths. Calls _validate_byo_ca_files after both paths
+# are collected. Sets INTERNAL_CA_CERT, INTERNAL_CA_KEY (+ optionally
+# INTERNAL_CA_ROOT) globals.
+_prompt_byo_ca_paths_interactive() {
+  local _cert _key _root _ans
+
+  # Prompt for intermediate CA cert
+  while true; do
+    printf "  CA intermediate certificate (PEM, absolute path): "
+    read -r _cert </dev/tty 2>/dev/null || _cert=""
+    _cert="${_cert:-}"
+    if [[ -z "$_cert" ]]; then
+      log_warn "No path entered — try again, or Ctrl-C to abort"
+      continue
+    fi
+    # Trim any accidental surrounding whitespace
+    _cert="$(printf '%s' "$_cert" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -f "$_cert" && -r "$_cert" ]]; then
+      break
+    fi
+    log_warn "File not found or not readable: ${_cert} — try again"
+  done
+  INTERNAL_CA_CERT="$_cert"
+
+  # Prompt for intermediate CA private key
+  while true; do
+    printf "  CA private key (PEM, absolute path): "
+    read -r _key </dev/tty 2>/dev/null || _key=""
+    _key="${_key:-}"
+    if [[ -z "$_key" ]]; then
+      log_warn "No path entered — try again, or Ctrl-C to abort"
+      continue
+    fi
+    _key="$(printf '%s' "$_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -f "$_key" && -r "$_key" ]]; then
+      break
+    fi
+    log_warn "File not found or not readable: ${_key} — try again"
+  done
+  INTERNAL_CA_KEY="$_key"
+
+  # Prompt for root CA cert (optional but recommended for Mode B)
+  printf "\n  Root CA certificate (PEM, absolute path; press Enter to skip): "
+  read -r _root </dev/tty 2>/dev/null || _root=""
+  _root="$(printf '%s' "${_root:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [[ -n "$_root" ]]; then
+    if [[ -f "$_root" && -r "$_root" ]]; then
+      INTERNAL_CA_ROOT="$_root"
+    else
+      log_warn "Root CA cert not readable: ${_root} — skipping root cert (chain verification will be limited)"
+      INTERNAL_CA_ROOT=""
+    fi
+  fi
+
+  # Run full validation (includes fingerprint display + operator confirmation)
+  _validate_byo_ca_files || return 1
+}
+
 select_agent_bundles() {
   set_step "8" "Agent bundle selection"
   log_step "8/${TOTAL_STEPS}" "Optional agent bundles..."
@@ -7971,6 +8249,108 @@ bootstrap_internal_pki() {
   log_info "  Service certs are bind-mounted into each container via compose"
 }
 
+# =============================================================================
+# _postgres_byo_ca_trust_sync — post-BYO-CA-activation postgres trust-bundle sync
+# =============================================================================
+# Called by Su's _activate_byo_ca() AFTER the new ca_root.crt + ca_intermediate.crt
+# have been written into docker/secrets/ but BEFORE services are restarted.
+#
+# Problem: PGDATA/root.crt is written once by 05-enable-ssl.sh at first initdb
+# and never auto-updated. When a BYO CA is activated (deferred or rotation path),
+# the postgres container must re-read the new trust bundle or it will reject client
+# certs signed by the new CA.
+#
+# This function:
+#   1. Detects whether postgres is already running.
+#   2. If running: invokes the now-idempotent 05-enable-ssl.sh inside the container.
+#      The script detects the trust-bundle change via SHA-256 comparison, writes the
+#      new PGDATA/root.crt atomically, and issues pg_ctl reload so postgres picks
+#      it up without a full restart.
+#   3. If not running: the updated docker/secrets/ca_root.crt + ca_intermediate.crt
+#      will be consumed by 05-enable-ssl.sh naturally at next container start
+#      (first-init path). No action needed.
+#   4. Falls back to a warn (not error) if docker/podman exec cannot reach postgres;
+#      in that case the operator must restart postgres manually.
+#
+# Cross-platform: works on Docker Engine (macOS + Linux) and Podman (rootful +
+# rootless) by trying the docker exec path first, then the podman exec path.
+# The postgres container name follows the compose project naming convention:
+#   Docker Engine: docker-postgres-1 (project prefix "docker")
+#   Podman Compose: docker_postgres_1 (project prefix "docker", underscore separator)
+# Both patterns are tried.
+#
+# IMPORTANT: This function is Captain's scope only. It does NOT perform any
+# validation of the BYO CA files (Su's scope) or any PKI issuer operations
+# (Tom's scope). It is called AFTER those are complete.
+# =============================================================================
+_postgres_byo_ca_trust_sync() {
+  log_info "BYO CA trust-bundle sync: checking postgres container state"
+
+  local _script_path="/docker-entrypoint-initdb.d/05-enable-ssl.sh"
+  local _sync_ok=false
+
+  # Enumerate candidate container names in order of likelihood.
+  # Docker Compose v2 uses hyphen separator; Podman Compose uses underscore.
+  local _pg_names=(
+    "docker-postgres-1"
+    "docker_postgres_1"
+    "yashigani-postgres-1"
+    "yashigani_postgres_1"
+  )
+
+  # Fall back to trying docker then podman directly.
+  local _exec_tools=()
+  if command -v docker >/dev/null 2>&1; then
+    _exec_tools+=("docker")
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    _exec_tools+=("podman")
+  fi
+
+  if [[ ${#_exec_tools[@]} -eq 0 ]]; then
+    log_warn "BYO CA trust-bundle sync: no container runtime found (docker/podman) — skipping exec path"
+    log_warn "  Manual remediation: restart postgres after BYO CA activation:"
+    log_warn "  docker compose restart postgres"
+    return 0
+  fi
+
+  for _tool in "${_exec_tools[@]}"; do
+    for _cname in "${_pg_names[@]}"; do
+      # Check if the container exists and is running.
+      if "${_tool}" inspect --format '{{.State.Running}}' "${_cname}" 2>/dev/null | grep -q '^true$'; then
+        log_info "  Found running postgres container: ${_cname} (via ${_tool})"
+        log_info "  Invoking trust-bundle sync inside container..."
+
+        # Run the idempotent 05-enable-ssl.sh inside the container.
+        # It will detect the checksum change, update root.crt atomically, and
+        # issue pg_ctl reload. Output is forwarded to the installer log.
+        if "${_tool}" exec "${_cname}" bash "${_script_path}" 2>&1 | while IFS= read -r _line; do
+            log_info "    [postgres] ${_line}"
+          done; then
+          log_success "BYO CA trust-bundle synced in running postgres container (${_cname})"
+          log_info "  Postgres re-reads root.crt via pg_ctl reload — no restart required"
+          _sync_ok=true
+          break 2
+        else
+          log_warn "BYO CA trust-bundle sync via ${_tool} exec ${_cname} failed (exit non-zero)"
+          log_warn "  Manual remediation: docker compose restart postgres"
+          _sync_ok=false
+          break 2
+        fi
+      fi
+    done
+  done
+
+  if [[ "$_sync_ok" == "false" ]]; then
+    # Postgres is not running. Trust bundle will be picked up at next start.
+    log_info "BYO CA trust-bundle sync: postgres container not running"
+    log_info "  Updated ca_root.crt + ca_intermediate.crt will be consumed by"
+    log_info "  05-enable-ssl.sh at next postgres container start — no action needed now."
+  fi
+
+  return 0
+}
+
 # Subcommand entry — for `install.sh --pki-action=<action>` used in maintenance.
 handle_pki_subcommand() {
   case "$PKI_ACTION" in
@@ -8195,6 +8575,101 @@ main() {
 
     # Step 8: Optional agent bundle selection
     select_agent_bundles
+
+    # Step 8b-0: BYO Internal CA wizard — Q1 + Q1a (Tiago directive 2026-05-23).
+    # Q1 (BYO internal CA) and Q2 (edge TLS mode) are INDEPENDENT decisions.
+    # A customer can: BYO CA for mTLS + ACME for edge, or BYO CA for both, or
+    # no BYO CA + ACME for edge (default), or no BYO CA + self-signed (demo).
+    # Rule: these prompts are additive — Journey A and Journey B shapes unchanged.
+    # BYO CA for internal mTLS (Q1) — interactive path
+    if [[ "$NON_INTERACTIVE" != "true" ]]; then
+      printf "\n${C_BOLD}Internal CA for service-to-service mTLS${C_RESET}\n"
+      printf "  Yashigani uses mTLS for inter-service traffic. By default it generates\n"
+      printf "  its own internal CA. If your organisation has an existing internal CA,\n"
+      printf "  you can supply its certificate + key here so Yashigani signs service\n"
+      printf "  leaf certs against your CA instead of a Yashigani-generated one.\n\n"
+      if prompt_yn "Do you want to provide your own internal CA?" "n"; then
+        INSTALL_INTERNAL_CA=true
+        printf "\n${C_BOLD}Provide files now or later?${C_RESET}\n"
+        printf "  now    — paste paths to cert + key files (validated immediately)\n"
+        printf "  later  — install proceeds with Yashigani-generated PKI; supply files\n"
+        printf "            post-install via: install.sh --internal-ca-cert /path --internal-ca-key /path\n\n"
+        printf "  ${C_BOLD}Provide now or later? [now/later, default=now]: ${C_RESET}"
+        local _byo_ca_when
+        read -r _byo_ca_when </dev/tty 2>/dev/null || _byo_ca_when="now"
+        _byo_ca_when="${_byo_ca_when:-now}"
+        case "$_byo_ca_when" in
+          now|"")
+            if ! _prompt_byo_ca_paths_interactive; then
+              log_error "BYO CA setup failed — aborting. Correct the errors above and re-run."
+              exit 1
+            fi
+            ;;
+          later|defer)
+            INTERNAL_CA_DEFER=true
+            log_info "BYO CA deferred. After install, run:"
+            log_info "  install.sh --internal-ca-cert /path/to/cert --internal-ca-key /path/to/key"
+            ;;
+          *)
+            log_warn "Unknown answer '${_byo_ca_when}' — treating as 'later' (deferred)"
+            INTERNAL_CA_DEFER=true
+            log_info "BYO CA deferred. After install, run:"
+            log_info "  install.sh --internal-ca-cert /path/to/cert --internal-ca-key /path/to/key"
+            ;;
+        esac
+      fi
+    fi
+
+    # Non-interactive: honour explicit BYO CA flags
+    if [[ "$NON_INTERACTIVE" == "true" && "$INSTALL_INTERNAL_CA" == "true" ]]; then
+      if [[ -n "$INTERNAL_CA_CERT" && -n "$INTERNAL_CA_KEY" ]]; then
+        # Provide-now path via explicit flags
+        if ! _validate_byo_ca_files; then
+          log_error "BYO CA validation failed — aborting. Check the flags and retry."
+          exit 1
+        fi
+      else
+        # --with-internal-ca alone (no cert/key paths) = deferred
+        INTERNAL_CA_DEFER=true
+        log_info "BYO CA deferred (--with-internal-ca without --internal-ca-cert/--internal-ca-key)"
+        log_info "After install, run: install.sh --internal-ca-cert /path/to/cert --internal-ca-key /path/to/key"
+      fi
+    fi
+
+    # Write BYO CA mode to .env for re-run / upgrade path detection
+    if [[ "$INSTALL_INTERNAL_CA" == "true" ]]; then
+      local _byo_mode_env="${WORK_DIR}/docker/.env"
+      if [[ "$INTERNAL_CA_DEFER" == "true" ]]; then
+        grep -q "^YASHIGANI_BYO_CA_MODE=" "$_byo_mode_env" 2>/dev/null \
+          || echo "YASHIGANI_BYO_CA_MODE=deferred" >> "$_byo_mode_env"
+        log_info "YASHIGANI_BYO_CA_MODE=deferred written to .env"
+      else
+        grep -q "^YASHIGANI_BYO_CA_MODE=" "$_byo_mode_env" 2>/dev/null \
+          || echo "YASHIGANI_BYO_CA_MODE=byo_intermediate" >> "$_byo_mode_env"
+        log_info "YASHIGANI_BYO_CA_MODE=byo_intermediate written to .env"
+      fi
+    fi
+
+    # Q2 — Edge TLS mode interactive cascade.
+    # Only runs when: (a) interactive mode AND (b) --tls-mode was NOT explicitly
+    # passed as a CLI flag AND (c) deploy mode is not demo (demo forces selfsigned
+    # via _apply_deploy_defaults, no prompt needed).
+    # Non-interactive: --tls-mode flag (or default acme) is honoured as-is.
+    if [[ "$NON_INTERACTIVE" != "true" \
+       && -z "$TLS_MODE_EXPLICITLY_SET" \
+       && "$DEPLOY_MODE" != "demo" ]]; then
+      printf "\n${C_BOLD}Edge TLS — how should Caddy present its certificate to clients?${C_RESET}\n"
+      printf "  Let's Encrypt ACME issues a trusted public certificate.\n"
+      printf "    Requires: public DNS pointing to this host + port 443 reachable.\n"
+      printf "  Self-signed is for demo / localhost / offline use only.\n\n"
+      if prompt_yn "Use Let's Encrypt ACME for edge TLS?" "y"; then
+        TLS_MODE="acme"
+        log_info "Edge TLS: Let's Encrypt ACME selected"
+      else
+        TLS_MODE="selfsigned"
+        log_info "Edge TLS: self-signed selected (demo / localhost)"
+      fi
+    fi
 
     # Step 8b: Open WebUI — interactive wizard or honour --with-openwebui flag.
     # Non-interactive: INSTALL_OPENWEBUI is false (default) or true (--with-openwebui).
