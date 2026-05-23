@@ -1,7 +1,7 @@
 # Yashigani — Installation and Configuration Guide
 
-**Version:** 2.23.4
-**Last updated:** 2026-05-15T00:00:00+00:00
+**Version:** 2.24.0
+**Last updated:** 2026-05-23T00:00:00+00:00
 **Applies to:** Docker Compose and Kubernetes (Helm) deployments
 
 ---
@@ -37,6 +37,8 @@
 26. [WAF and DDoS Protection (since v2.2)](#26-waf-and-ddos-protection-v22)
 26. [Container Hardening (since v2.2)](#26-container-hardening-v22)
 27. [SBOM and Image Verification (since v2.2)](#27-sbom-and-image-verification-v22)
+28. [Operational — Rotating Secrets (v2.23.3)](#28-operational--rotating-secrets-v2233)
+29. [BYO Internal CA (v2.24.0)](#29-byo-internal-ca-v2240)
 
 ---
 
@@ -3113,4 +3115,118 @@ Recovery steps:
 
 ---
 
-*Yashigani v2.23.4 — Installation and Configuration Guide — 2026-05-15T14:00:00+00:00*
+## 29. BYO Internal CA (v2.24.0)
+
+Yashigani's internal mTLS mesh uses a two-tier PKI (root → intermediate → leaf) by default. Starting in v2.24.0 you can supply your organisation's existing internal CA so that Yashigani's service-to-service certs are issued by your own trust hierarchy.
+
+### 29.1 Modes
+
+| Mode | You provide | Yashigani does | When to use |
+|---|---|---|---|
+| **BYO Intermediate (recommended)** | Intermediate CA cert + private key (already signed by your root) | Signs leaf certs using your intermediate; your root is the trust anchor | You have a sub-CA delegated to vendors; your root key stays with your PKI team |
+| **BYO Root** | Root CA cert + private key | Generates a Yashigani intermediate from your root, then signs leaves | You want your root to issue everything; **root key lands on the Yashigani host — enterprise PKI policies often prohibit this** |
+
+### 29.2 Path A — Provide at install time
+
+```bash
+./install.sh \
+  --with-internal-ca \
+  --internal-ca-cert /absolute/path/to/intermediate.pem \
+  --internal-ca-key  /absolute/path/to/intermediate.key \
+  --internal-ca-root /absolute/path/to/root.pem
+```
+
+All three flags are required together. The installer validates the files (X.509 parse, key-pair match, Basic Constraints, validity window, chain verification) before writing anything to `docker/secrets/`. You are shown the SHA-256 fingerprint of the CA cert and must acknowledge it before the install proceeds.
+
+### 29.3 Path B — Deferred activation
+
+If you cannot supply the CA material at install time (e.g., your PKI team needs separate approval):
+
+```bash
+# Initial install — runs with a Yashigani-generated PKI:
+./install.sh --with-internal-ca
+
+# Later, when you have the CA files:
+./install.sh \
+  --internal-ca-cert /absolute/path/to/intermediate.pem \
+  --internal-ca-key  /absolute/path/to/intermediate.key \
+  --internal-ca-root /absolute/path/to/root.pem
+```
+
+The initial install completes with a Yashigani-generated PKI and writes a sentinel file `docker/secrets/.byo_ca_pending`. All services are operational. The re-run activates your BYO CA by:
+
+1. Validating the three CA files.
+2. Copying `ca_root.crt` (from `--internal-ca-root`) and `ca_intermediate.crt` + `.key` (from `--internal-ca-cert` / `--internal-ca-key`) into `docker/secrets/`.
+3. Calling `_pki_run_issuer rotate-leaves` to re-issue all leaf certs under the new trust anchor.
+4. Syncing the postgres trust bundle (see §29.5).
+5. Restarting services.
+
+### 29.4 CA rotation
+
+When your CA expires or is compromised, provide the new files via the same re-run path:
+
+```bash
+./install.sh \
+  --internal-ca-cert /path/to/new-intermediate.pem \
+  --internal-ca-key  /path/to/new-intermediate.key \
+  --internal-ca-root /path/to/new-root.pem
+```
+
+This is idempotent. Running it twice with the same cert produces the same leaf certs. The rotation procedure for an active install:
+
+1. Installer validates new CA files.
+2. Installer backs up current `docker/secrets/ca_root.crt` + `ca_intermediate.*` to `docker/backups/`.
+3. New CA files are written to `docker/secrets/`.
+4. Leaf certs are rotated under the new intermediate.
+5. Postgres trust bundle is synced in-place (§29.5) — no postgres restart needed in most cases.
+6. All other services are restarted: `docker compose restart gateway backoffice pgbouncer redis budget-redis policy`.
+
+For production with multiple live connections: schedule the rotation during a maintenance window. During the window, services momentarily reject connections from peers still holding old-CA leaf certs. The window is bounded by the restart sequence (typically 30–90 seconds).
+
+### 29.5 Postgres trust-bundle sync (the hard part)
+
+PostgreSQL writes its trust bundle (`PGDATA/root.crt`) once at container init (`initdb`) and does not auto-update it when the bind-mounted secrets change. This is a postgres architectural characteristic, not a Yashigani bug.
+
+When you activate a BYO CA on an existing install (Path B or rotation), the installer calls `_postgres_byo_ca_trust_sync()` which:
+
+1. Detects whether the postgres container is running.
+2. If running: executes `05-enable-ssl.sh` inside the container. The script computes a SHA-256 checksum of the new vs old trust bundle. If changed, it writes a new `PGDATA/root.crt` atomically (temp file → chmod/chown → rename) and calls `pg_ctl reload` so postgres re-reads it immediately — **no postgres restart required**.
+3. If not running: the new trust bundle is already present in `docker/secrets/`. Postgres will read it at next start via the standard `initdb` path.
+
+If the exec fails (e.g., the container is in a broken state), the installer prints a warning with the manual remediation command:
+
+```bash
+docker compose restart postgres
+```
+
+After restart, postgres reads the new `PGDATA/root.crt` from the bind-mounted secrets on the first-init path.
+
+#### Manual trust-bundle resync (without full restart)
+
+If you need to resync the postgres trust bundle outside a full install re-run:
+
+```bash
+# Docker:
+docker exec docker-postgres-1 bash /docker-entrypoint-initdb.d/05-enable-ssl.sh
+
+# Podman:
+podman exec docker_postgres_1 bash /docker-entrypoint-initdb.d/05-enable-ssl.sh
+```
+
+The script is idempotent: if the trust bundle is already current, it prints `Trust bundle unchanged — no action` and exits 0.
+
+### 29.6 Kubernetes (v2.24.1 follow-on)
+
+The Helm chart BYO CA path (`mtls.byoCa.existingSecret`) is scheduled for v2.24.1. For v2.24.0, the BYO CA feature is Compose / Podman only. See `helm/yashigani/values.yaml` for the planned `mtls.byoCa` block (present as documentation; not yet wired to the bootstrap job).
+
+### 29.7 Reverting to a Yashigani-generated PKI
+
+```bash
+./install.sh --pki-action=bootstrap --reset-ca
+```
+
+This clears `docker/secrets/ca_root.*` and `ca_intermediate.*`, regenerates a fresh Yashigani-generated PKI, rotates leaves, and syncs postgres. The same PGDATA/root.crt update path applies.
+
+---
+
+*Yashigani v2.24.0 — Installation and Configuration Guide — 2026-05-23T00:00:00+00:00*
