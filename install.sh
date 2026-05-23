@@ -293,6 +293,23 @@ EOF
 # Argument parsing
 # -----------------------------------------------------------------------------
 parse_args() {
+  # BUG-WAVE1-P1-001: normalise --flag=value to --flag value before the main
+  # parsing loop.  GNU getopt-style equals-form (--runtime=podman) is conventional
+  # for long options; without this step bash's case-esac only matches the space
+  # form (--runtime podman) and rejects the equals form with "Unknown option".
+  # The normalisation reconstructs $@ in-place so the main while loop is unchanged
+  # and no future flag additions require a parallel equals-case block.
+  local _args=()
+  for _a in "$@"; do
+    if [[ "$_a" == --*=* ]]; then
+      # Split --flag=value → "--flag" "value"
+      _args+=("${_a%%=*}" "${_a#*=}")
+    else
+      _args+=("$_a")
+    fi
+  done
+  set -- "${_args[@]+"${_args[@]}"}"
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode)
@@ -4027,7 +4044,8 @@ compose_up() {
       if ! echo "# placeholder — auto-generated at first bootstrap" > "$_token_file" 2>/dev/null; then
         log_warn "Could not create token placeholder ${_profile}_token (secrets_dir owned by PKI UID — expected for Podman rootless; step 8d should have written this)"
       else
-        chmod 600 "$_token_file" 2>/dev/null || true
+        # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001) can read at runtime.
+        chmod 0640 "$_token_file" 2>/dev/null || true
         log_info "Created token placeholder: ${_profile}_token"
       fi
     fi
@@ -5285,13 +5303,15 @@ for agent in agents:
                 with open(token_path, "w") as f:
                     f.write(token)
                 try:
-                    os.chmod(token_path, 0o600)
+                    # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read at
+                    # runtime when installer wrote the file as a different UID.
+                    os.chmod(token_path, 0o640)
                 except OSError as _chmod_err:
                     # best-effort; host-side chmod applied below.
                     # Log so the issue is visible in install.log (e.g. owner mismatch
                     # on Podman rootless where file owner is UID 101000 inside the
                     # container but a different UID on the host).
-                    print(f"WARNING:chmod_600_failed:{token_path}:{_chmod_err}", file=sys.stderr)
+                    print(f"WARNING:chmod_640_failed:{token_path}:{_chmod_err}", file=sys.stderr)
             except PermissionError:
                 pass  # token printed below for host-side capture
             results.append("OK:" + aname + ":" + profile + ":" + token)
@@ -5343,10 +5363,13 @@ for r in results:
               # Podman rootless: Python wrote the file as UID 101000; host chmod may
               # fail (owner mismatch) but try anyway — os.chmod() in Python above
               # already ran as the file owner and is the primary hardening mechanism.
-              chmod 600 "${secrets_dir}/${_profile}_token" 2>/dev/null || true
+              # BUG-WAVE1-P1-002 (part B): use 0640 not 0600 so gateway (GID 1001)
+              # can read the token at runtime via group permission.
+              chmod 0640 "${secrets_dir}/${_profile}_token" 2>/dev/null || true
             fi
           else
-            chmod 600 "${secrets_dir}/${_profile}_token" 2>/dev/null || true
+            # BUG-WAVE1-P1-002 (part B): 0640 preserves gateway GID 1001 group-read.
+            chmod 0640 "${secrets_dir}/${_profile}_token" 2>/dev/null || true
           fi
         fi
         log_success "  ${_agent_name}: registered"
@@ -7898,6 +7921,39 @@ _pki_chown_client_keys() {
   while IFS= read -r -d '' _btoken; do
     _do_chown "1001" "$_btoken" "$(basename "$_btoken")" || return 1
   done < <(find "${_secrets_dir}" -maxdepth 1 -name '*_bootstrap_token' -print0 2>/dev/null)
+
+  # BUG-WAVE1-P1-002: agent bundle token files — chown to installer-UID:1001 0640.
+  #
+  # WHY this is needed: the PKI issuer container runs with -v secrets:/secrets:rw,Z,U
+  # (Linux Podman rootless) or via docker run --rm alpine chown 1001:1001 (Docker).
+  # Both paths remap the ENTIRE secrets dir, clobbering the token placeholder
+  # ownership set at step 8d (installer UID, e.g. 1000:1000 0600). After remap,
+  # token files land at subuid_base+1001 (Podman) or 1001:1001 (Docker).
+  #
+  # Ownership goal: host installer (installer_uid) can overwrite the placeholder
+  # with the real token during register_agent_bundles(); gateway container (UID 1001)
+  # can read the file at runtime.
+  #
+  # Pattern: installer_uid:1001 0640 — mirrors 1001:999 0640 for postgres_password.
+  #   installer_uid = $(id -u) at function call time (same UID that ran install.sh).
+  #   GID 1001 = gateway container primary group; gateway reads as group at runtime.
+  #
+  # Gating: only chown when the file exists (profile not selected → no file).
+  # Three agent-bundle token files (langflow, letta, openclaw).
+  #
+  # Cross-ref: register_agent_bundles() chmod 0640 change (BUG-WAVE1-P1-002 part B)
+  # ensures the mode stays 0640 after the host-side write at line 5356.
+  local _installer_uid
+  _installer_uid="$(id -u)"
+  log_info "Chown'ing agent bundle token files to ${_installer_uid}:1001 0640 (BUG-WAVE1-P1-002)"
+  local _agent_token_files=(langflow_token letta_token openclaw_token)
+  for _atf in "${_agent_token_files[@]}"; do
+    local _atpath="${_secrets_dir}/${_atf}"
+    if [[ -f "$_atpath" ]]; then
+      _do_chown "${_installer_uid}:1001" "$_atpath" "$_atf" || return 1
+      _do_chmod_0640 "$_atpath" "$_atf" || return 1
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -9008,7 +9064,9 @@ main() {
         if ! echo "# placeholder — auto-generated at first bootstrap" > "$_tok_file" 2>/dev/null; then
           log_warn "Could not create token placeholder ${_profile}_token (secrets_dir may be stale-owned — compose_up safety-net will retry)"
         else
-          chmod 600 "$_tok_file" 2>/dev/null || true
+          # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001) can read at runtime.
+          # _pki_chown_client_keys re-chowns to installer_uid:1001 0640 post-PKI.
+          chmod 0640 "$_tok_file" 2>/dev/null || true
           log_info "Created token placeholder: ${_profile}_token"
         fi
       fi
