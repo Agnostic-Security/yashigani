@@ -75,7 +75,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="2.23.4"
+YASHIGANI_VERSION="2.24.0"
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 YSG_INSTALL_DIR="${YSG_INSTALL_DIR:-$HOME/.yashigani}"
@@ -3635,7 +3635,7 @@ _fix_config_perms() {
   if [[ -d "$_secrets_dir" ]]; then
     # A1 (Iris BLOCKING / iris-install-umask-design-review.md):
     # Check only WORLD-readable (-perm -004), NOT group-readable (-perm -040).
-    # caddy_internal_hmac is intentionally 0440 (group-readable for caddy<->backoffice
+    # caddy_internal_hmac is intentionally 0640 (group-readable for caddy<->backoffice
     # HMAC handoff); checking -perm -040 caused a false-positive abort on every install.
     # Group-readable is a legitimate design choice for specific files in docker/secrets/;
     # world-readable (o+r) on ANY secret file there is always wrong.
@@ -6206,8 +6206,8 @@ generate_secrets() {
         return 1
       fi
       printf "%s" "$_hmac_secret" > "$hmac_file"
-      chmod 0440 "$hmac_file"
-      log_info "Generated caddy_internal_hmac → ${hmac_file} (mode 0440, upgrade path)"
+      chmod 0640 "$hmac_file"
+      log_info "Generated caddy_internal_hmac → ${hmac_file} (mode 0640, upgrade path)"
     else
       log_info "caddy_internal_hmac already present — preserving (use REINSTALL=true to rotate)"
     fi
@@ -6449,8 +6449,8 @@ generate_secrets() {
       return 1
     fi
     printf "%s" "$_hmac_secret" > "$hmac_file"
-    chmod 0440 "$hmac_file"
-    log_info "Generated caddy_internal_hmac → ${hmac_file} (mode 0440)"
+    chmod 0640 "$hmac_file"
+    log_info "Generated caddy_internal_hmac → ${hmac_file} (mode 0640)"
   else
     log_info "caddy_internal_hmac already present — preserving (use REINSTALL=true to rotate)"
   fi
