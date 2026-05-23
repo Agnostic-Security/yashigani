@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-23T00:00:00+00:00 (fix(install): BYOCA-BUG-001/002/003/004 — _fp init + podman unshare BYO staging + EC key gate + podman unshare YAML update)
 # last-updated: 2026-05-19T00:00:00+01:00 (fix(install): inject X-SPIFFE-ID on POST /admin/agents — close ISSUE-019)
 # last-updated: 2026-05-17T17:00:00+00:00 (feat(install): per-install YASHIGANI_INTERNAL_BEARER token generation — close Captain Bucket-C finding)
 # last-updated: 2026-05-17T09:00:00+01:00 (fix(pki): host-side bootstrap_token_sha256 update in _pki_run_issuer_podman_macos — compose-path SHA mismatch fix)
@@ -2729,6 +2730,34 @@ _validate_byo_ca_path() {
   return 0
 }
 
+# _check_byo_ca_key_type <key_path>
+# BYOCA-BUG-003 (v2.24.0): Tom's issuer.py:bootstrap() requires EC key for the
+# BYO intermediate signing CA. RSA intermediates are not supported in v2.24.0 —
+# they cause an opaque failure deep in the PKI bootstrap step.
+# This check surfaces the constraint early with an actionable error message.
+# v2.24.1 may broaden to RSA — see internal-docs/yashigani/iris-v240-byo-internal-ca-design.md §3.
+# Returns 0 (EC key) or 1 (not EC key / undetectable).
+_check_byo_ca_key_type() {
+  local _key="$1"
+  # `openssl ec -noout` returns 0 for any EC key (P-256/P-384/P-521 etc.) and
+  # non-zero for RSA/DSA/EdDSA. Works on OpenSSL 1.1 and 3.x (both LibreSSL and
+  # OpenSSL upstream); the legacy `openssl pkey -text` first-line format changed
+  # between OpenSSL 1.1 ("EC Private Key:") and 3.x ("Private-Key: (N bit)").
+  if ! openssl ec -in "$_key" -noout 2>/dev/null; then
+    # Determine type for a helpful error message (best-effort, not security-critical)
+    local _first_line
+    _first_line="$(openssl pkey -in "$_key" -noout -text 2>/dev/null | head -1)" || _first_line=""
+    local _short_type
+    _short_type="$(printf '%s' "$_first_line" | grep -oE "(RSA|DSA|ED25519|ED448|X25519|X448)" || printf 'unknown')"
+    log_error "BYO CA intermediate key type '${_short_type}' is not supported in v2.24.0."
+    log_error "  v2.24.0 requires an EC key (P-256 / P-384 / P-521)."
+    log_error "  Regenerate: openssl ecparam -name secp384r1 -genkey -noout -out intermediate.key"
+    log_error "  v2.24.1 may broaden to RSA — see internal-docs/yashigani/iris-v240-byo-internal-ca-design.md §3"
+    return 1
+  fi
+  return 0
+}
+
 # _validate_byo_ca_files
 # Validates INTERNAL_CA_CERT + INTERNAL_CA_KEY (and optionally INTERNAL_CA_ROOT).
 # Invokes Tom's Python validator for crypto checks (Basic Constraints, key match,
@@ -2749,6 +2778,11 @@ _validate_byo_ca_files() {
   if [[ -n "$_root" ]]; then
     _validate_byo_ca_path "$_root" "root" || return 1
   fi
+
+  # --- Key-type gate: EC required (BYOCA-BUG-003) ---
+  # issuer.py:bootstrap() requires EC for BYO intermediate in v2.24.0.
+  # Check here for an early, actionable error rather than a silent PKI bootstrap failure.
+  _check_byo_ca_key_type "$_key" || return 1
 
   # --- Python crypto validation (Tom's scope: byo_ca.py) ---
   # When Tom's module is not yet installed, this block fails with an import error.
@@ -2776,7 +2810,7 @@ validate_byo_ca_files('${_cert}', '${_key}'${_root_arg}${_accept_expired_arg})
   # Compute fingerprint of the intermediate CA cert. This is what gets shown to
   # the operator for out-of-band verification. Quoted double-expansion below is
   # safe because _cert passed _validate_byo_ca_path (no metacharacters).
-  local _fp
+  local _fp=""
   if python3 -c "from yashigani.pki.drivers.byo_ca import compute_ca_fingerprint" 2>/dev/null; then
     _fp="$(python3 -c "from yashigani.pki.drivers.byo_ca import compute_ca_fingerprint; print(compute_ca_fingerprint('${_cert}'))" 2>/dev/null)" || _fp=""
   fi
@@ -8608,15 +8642,32 @@ _activate_byo_ca() {
   # Key is owner-only (0600) — only the PKI issuer container reads it.
   log_info "Staging BYO CA files into docker/secrets/"
 
-  install -m 0644 -p "${_cert}" "${_secrets_dir}/byo_ca_intermediate.crt" \
-    || { log_error "_activate_byo_ca: failed to copy BYO cert to secrets dir"; return 1; }
-  install -m 0600 -p "${_key}" "${_secrets_dir}/byo_ca_intermediate.key" \
-    || { log_error "_activate_byo_ca: failed to copy BYO key to secrets dir"; return 1; }
-
-  if [[ -n "$_root" ]]; then
-    install -m 0644 -p "${_root}" "${_secrets_dir}/byo_ca_root.crt" \
-      || { log_error "_activate_byo_ca: failed to copy BYO root cert to secrets dir"; return 1; }
-    log_info "  byo_ca_root.crt staged (customer root)"
+  # BYOCA-BUG-002: after _prepare_secrets_dir_for_pki() the secrets dir is
+  # chowned to UID 1001 via `podman unshare chown` on Podman rootless. The host
+  # UID (typically 1000) no longer owns the dir, so plain install(1) fails with
+  # EACCES. Fix: run the install(1) calls inside `podman unshare` so they
+  # execute within the user-namespace mapping and see the dir as owned by 1001.
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && [[ "$(id -u)" != "0" ]] \
+       && podman unshare true 2>/dev/null; then
+    podman unshare bash -c "install -m 0644 '${_cert}' '${_secrets_dir}/byo_ca_intermediate.crt'" \
+      || { log_error "_activate_byo_ca: failed to copy BYO cert (podman unshare)"; return 1; }
+    podman unshare bash -c "install -m 0600 '${_key}' '${_secrets_dir}/byo_ca_intermediate.key'" \
+      || { log_error "_activate_byo_ca: failed to copy BYO key (podman unshare)"; return 1; }
+    if [[ -n "$_root" ]]; then
+      podman unshare bash -c "install -m 0644 '${_root}' '${_secrets_dir}/byo_ca_root.crt'" \
+        || { log_error "_activate_byo_ca: failed to copy BYO root cert (podman unshare)"; return 1; }
+      log_info "  byo_ca_root.crt staged (customer root)"
+    fi
+  else
+    install -m 0644 -p "${_cert}" "${_secrets_dir}/byo_ca_intermediate.crt" \
+      || { log_error "_activate_byo_ca: failed to copy BYO cert to secrets dir"; return 1; }
+    install -m 0600 -p "${_key}" "${_secrets_dir}/byo_ca_intermediate.key" \
+      || { log_error "_activate_byo_ca: failed to copy BYO key to secrets dir"; return 1; }
+    if [[ -n "$_root" ]]; then
+      install -m 0644 -p "${_root}" "${_secrets_dir}/byo_ca_root.crt" \
+        || { log_error "_activate_byo_ca: failed to copy BYO root cert to secrets dir"; return 1; }
+      log_info "  byo_ca_root.crt staged (customer root)"
+    fi
   fi
 
   log_info "  byo_ca_intermediate.crt staged"
@@ -8638,7 +8689,16 @@ _activate_byo_ca() {
   local _has_root=0
   [[ -n "$_root" ]] && _has_root=1
 
-  python3 - "${_manifest}" "${_has_root}" <<'PYEOF' \
+  # BYOCA-BUG-004: service_identities.yaml may be owned by the Podman user-namespace
+  # UID after _prepare_secrets_dir_for_pki (EACCES for host UID 1000 on rootless).
+  # Fix: use `podman unshare python3` when on Podman rootless.
+  local _py_cmd="python3"
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && [[ "$(id -u)" != "0" ]] \
+       && podman unshare true 2>/dev/null; then
+    _py_cmd="podman unshare python3"
+  fi
+
+  ${_py_cmd} - "${_manifest}" "${_has_root}" <<'PYEOF' \
     || { log_error "_activate_byo_ca: failed to update service_identities.yaml ca_source fields"; return 1; }
 import sys, yaml, pathlib
 
