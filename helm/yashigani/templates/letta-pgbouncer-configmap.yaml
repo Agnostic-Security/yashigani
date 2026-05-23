@@ -1,0 +1,31 @@
+{{- if .Values.agentBundles.letta.enabled }}
+{{- /*
+  ConfigMap for the letta-pgbouncer sidecar pgbouncer.ini.
+  Source of truth: docker/pgbouncer/pgbouncer-letta.ini — shipped into the
+  chart via .Files.Get and mirrored to helm/yashigani/files/pgbouncer-letta.ini.
+
+  BUG-WAVE5-002 fix: the values.yaml extraVolumes reference to this ConfigMap
+  previously contained a Go template expression ({{ include "yashigani.fullname" . }})
+  which Helm does NOT evaluate in values files — the literal string was used as the
+  ConfigMap name, causing MountVolume.SetUp failed: configmap not found.
+  Fix: values.yaml now hardcodes "yashigani-letta-pgbouncer-ini"; this template
+  creates that ConfigMap when agentBundles.letta.enabled=true.
+
+  K8s service name substitution: the source file declares `host=postgres` (Docker
+  Compose DNS). For K8s the ClusterIP service is `<release>-postgres` (typically
+  `yashigani-postgres`). The replace filter patches this at render time — same
+  pattern as yashigani-pgbouncer-config in mtls-config-configmaps.yaml.
+*/ -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yashigani-letta-pgbouncer-ini
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-letta
+    {{- include "yashigani.labels" . | nindent 4 }}
+data:
+  pgbouncer-letta.ini: |
+{{ .Files.Get "files/pgbouncer-letta.ini" | replace "host=postgres " (printf "host=%s-postgres " (include "yashigani.fullname" .)) | indent 4 }}
+{{- end }}

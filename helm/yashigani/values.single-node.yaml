@@ -1,0 +1,278 @@
+# Yashigani — Single-node overlay (dev / eval / single-node k3s / kind)
+#
+# USAGE:
+#   helm install yashigani helm/yashigani \
+#     -f helm/yashigani/values.yaml \
+#     -f helm/yashigani/values.single-node.yaml \
+#     [--set agentBundles.letta.enabled=true ...]
+#
+# PURPOSE:
+#   Default values.yaml is sized for a production multi-node cluster.
+#   Total CPU requests in a full Tier 1 MAX install (~8500m) exceed the
+#   allocatable capacity of a typical single-node VM (6000m on a 6-CPU node
+#   with ~10% reserved for system pods).
+#   This overlay reduces CPU requests to ~2650m total (all agent bundles on),
+#   leaving ~2350m headroom on a 6-CPU single-node cluster.
+#
+# WHAT CHANGES:
+#   - replicaCount: 2 → 1 for gateway, backoffice, policy (HPA still works)
+#   - HPA minReplicas: 2 → 1 for gateway, backoffice, policy
+#   - CPU requests reduced by ~50-75% across all workloads
+#   - CPU limits halved to match (requests still = 50% of limits)
+#   - Memory unchanged (memory is not the constraint on single-node k3s/kind)
+#
+# WHAT DOES NOT CHANGE:
+#   - Any security context, seccomp profile, capability drop, TLS config
+#   - Image tags / digests
+#   - Feature flags (pii, mtls, backup, etc.)
+#   - Agent bundle enable/disable decisions
+#   - The values.release.yaml overlay (for production clusters, use that instead)
+#
+# NOTE: PodDisruptionBudgets with minAvailable: 1 require at least 1 pod to be
+#   healthy at all times. With replicaCount: 1, rolling updates will be disrupted.
+#   Acceptable for single-node dev/eval; use production values for HA deployments.
+
+# ---------------------------------------------------------------------------
+# Gateway — reduce to 1 replica, halve CPU
+# ---------------------------------------------------------------------------
+gateway:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "400m"
+      memory: "1024Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 2
+
+# ---------------------------------------------------------------------------
+# Backoffice — reduce to 1 replica, halve CPU
+# ---------------------------------------------------------------------------
+backoffice:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "400m"
+      memory: "1024Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 2
+
+# ---------------------------------------------------------------------------
+# Policy (OPA) — reduce to 1 replica, halve CPU
+# ---------------------------------------------------------------------------
+policy:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "256Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 2
+
+# ---------------------------------------------------------------------------
+# Redis — halve CPU
+# ---------------------------------------------------------------------------
+redis:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "256Mi"
+
+# ---------------------------------------------------------------------------
+# Budget Redis — halve CPU
+# ---------------------------------------------------------------------------
+budgetRedis:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "256Mi"
+
+# ---------------------------------------------------------------------------
+# Ollama — 1 replica, halve CPU (still memory-bound; kept at original)
+# ---------------------------------------------------------------------------
+ollama:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "2048Mi"
+    limits:
+      cpu: "1000m"
+      memory: "4096Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 2
+
+# ---------------------------------------------------------------------------
+# Prometheus — halve CPU
+# ---------------------------------------------------------------------------
+prometheus:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "512Mi"
+    limits:
+      cpu: "200m"
+      memory: "1024Mi"
+
+# ---------------------------------------------------------------------------
+# Grafana — halve CPU
+# ---------------------------------------------------------------------------
+grafana:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "256Mi"
+    limits:
+      cpu: "100m"
+      memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# Alertmanager — halve CPU
+# ---------------------------------------------------------------------------
+alertmanager:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "256Mi"
+
+# ---------------------------------------------------------------------------
+# Loki — halve CPU
+# ---------------------------------------------------------------------------
+loki:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "256Mi"
+    limits:
+      cpu: "100m"
+      memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# Jaeger — halve CPU
+# ---------------------------------------------------------------------------
+jaeger:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "200m"
+      memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# OTel Collector — halve CPU
+# ---------------------------------------------------------------------------
+otelCollector:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "200m"
+      memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# Caddy — halve CPU
+# ---------------------------------------------------------------------------
+caddy:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+
+# ---------------------------------------------------------------------------
+# PostgreSQL — halve CPU
+# ---------------------------------------------------------------------------
+postgres:
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "400m"
+      memory: "1024Mi"
+
+# ---------------------------------------------------------------------------
+# PgBouncer — halve CPU
+# ---------------------------------------------------------------------------
+pgbouncer:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "256Mi"
+
+# ---------------------------------------------------------------------------
+# Agent bundles — halve CPU for each
+# ---------------------------------------------------------------------------
+agentBundles:
+  langflow:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "400m"
+        memory: "1024Mi"
+  letta:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "400m"
+        memory: "1024Mi"
+  openclaw:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "400m"
+        memory: "1024Mi"
+  langgraph:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "400m"
+        memory: "1024Mi"
+
+# ---------------------------------------------------------------------------
+# Open WebUI — halve CPU
+# ---------------------------------------------------------------------------
+openWebui:
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "1536Mi"
+    limits:
+      cpu: "400m"
+      memory: "3072Mi"
