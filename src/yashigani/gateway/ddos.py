@@ -216,6 +216,31 @@ class DDoSProtector:
         except Exception:
             return 0
 
+    def update_limits(
+        self,
+        max_connections_per_ip: int | None = None,
+        window_seconds: int | None = None,
+    ) -> None:
+        """
+        Hot-update the per-IP limit and/or window without restart.
+
+        Called by the runtime settings live-reload subscriber when
+        gateway.ddos.per_ip_limit or gateway.ddos.window_seconds changes.
+        Thread-safe for the GIL-protected int attribute assignments used here.
+        """
+        if max_connections_per_ip is not None:
+            self.max_connections_per_ip = int(max_connections_per_ip)
+            logger.info(
+                "DDoSProtector.max_connections_per_ip updated to %d (live reload)",
+                self.max_connections_per_ip,
+            )
+        if window_seconds is not None:
+            self.window_seconds = int(window_seconds)
+            logger.info(
+                "DDoSProtector.window_seconds updated to %d (live reload)",
+                self.window_seconds,
+            )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

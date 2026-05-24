@@ -465,6 +465,156 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("DDoSProtector unavailable (%s) — DDoS throttle disabled", exc)
 
+    # v2.24.1 — RuntimeSettingsService: read live settings from DB + subscribe
+    # to yashigani:settings:changed pub/sub so DDoSProtector + RateLimiter
+    # reload on admin change without a restart.
+    #
+    # Adjacent-abstraction notes (feedback_brief_cue_adjacent_abstractions):
+    #   - The gateway is a sync ASGI process (no asyncpg pool here).
+    #     We use a lightweight sync psycopg2-based stub to read settings
+    #     on startup, then rely on the pub/sub subscriber thread for live
+    #     updates.  The DB read at startup ensures we pick up any values
+    #     the admin changed since the last gateway restart.
+    #   - Redis DB 1 (session Redis) is used for pub/sub — same instance
+    #     as backoffice uses for pub/sub publishes.
+    #   - If DB is unavailable the gateway falls back to env vars / class
+    #     defaults (fail-open for the settings layer, not the auth layer).
+    _settings_service = None
+    try:
+        from yashigani.runtime_settings.service import RuntimeSettingsService as _RSS_GW
+        from yashigani.runtime_settings.keys import (
+            KEY_RATE_LIMIT_PER_USER_RPS as _KEY_RL,
+            KEY_DDOS_PER_IP_LIMIT as _KEY_DI,
+            KEY_DDOS_WINDOW_SECONDS as _KEY_DW,
+        )
+
+        # Sync DB read: use psycopg2 directly so we don't need an asyncpg pool.
+        # Falls back gracefully if DB is unavailable.
+        def _sync_read_setting(key: str):
+            import psycopg2, json as _json
+            db_dsn_gw = os.getenv("YASHIGANI_DB_DSN", "")
+            if not db_dsn_gw or "${POSTGRES_PASSWORD}" in db_dsn_gw:
+                return None
+            try:
+                conn = psycopg2.connect(db_dsn_gw, connect_timeout=5)
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM runtime_settings WHERE key = %s", (key,))
+                    row = cur.fetchone()
+                conn.close()
+                return _json.loads(row[0]) if row else None
+            except Exception as _e:
+                logger.debug("_sync_read_setting(%r) failed: %s", key, _e)
+                return None
+
+        # Override startup values with DB values if present
+        _db_per_user_rps = _sync_read_setting(_KEY_RL)
+        if _db_per_user_rps is not None and rate_limiter is not None:
+            try:
+                _db_rps_float = float(_db_per_user_rps)
+                if _db_rps_float > 0:
+                    cfg_curr = rate_limiter.current_config()
+                    import dataclasses as _dc
+                    new_cfg = _dc.replace(
+                        cfg_curr,
+                        per_user_rps=_db_rps_float,
+                        per_user_burst=max(1, int(_db_rps_float * 2)),
+                    )
+                    rate_limiter.update_config(new_cfg)
+                    logger.info(
+                        "Gateway: per_user_rps overridden from DB runtime_settings: %.1f",
+                        _db_rps_float,
+                    )
+            except Exception as _rps_exc:
+                logger.warning("Could not apply DB per_user_rps: %s", _rps_exc)
+
+        _db_ddos_limit = _sync_read_setting(_KEY_DI)
+        _db_ddos_window = _sync_read_setting(_KEY_DW)
+        if ddos_protector is not None:
+            if _db_ddos_limit is not None:
+                ddos_protector.update_limits(max_connections_per_ip=int(_db_ddos_limit))
+                logger.info(
+                    "Gateway: ddos.per_ip_limit overridden from DB runtime_settings: %d",
+                    int(_db_ddos_limit),
+                )
+            if _db_ddos_window is not None:
+                ddos_protector.update_limits(window_seconds=int(_db_ddos_window))
+                logger.info(
+                    "Gateway: ddos.window_seconds overridden from DB runtime_settings: %d",
+                    int(_db_ddos_window),
+                )
+
+        # Start pub/sub subscriber thread for live reload.
+        # On yashigani:settings:changed message, updates DDoSProtector and
+        # RateLimiter in-process without a restart.
+        import threading as _threading, json as _json_ps
+        import redis as _redis_ps
+
+        _pubsub_client = _redis_ps.from_url(
+            _gw_redis_url(1), decode_responses=True
+        )
+
+        def _settings_subscriber():
+            """Background thread: subscribe to settings changes and apply live."""
+            try:
+                pubsub = _pubsub_client.pubsub()
+                pubsub.subscribe("yashigani:settings:changed")
+                for message in pubsub.listen():
+                    if message["type"] != "message":
+                        continue
+                    try:
+                        payload = _json_ps.loads(message["data"])
+                        changed_key = payload.get("key")
+                        changed_val = payload.get("value")
+                        if changed_key == _KEY_RL and rate_limiter is not None:
+                            _v = float(changed_val)
+                            if _v > 0:
+                                cfg_now = rate_limiter.current_config()
+                                import dataclasses as _dcs
+                                rate_limiter.update_config(_dcs.replace(
+                                    cfg_now,
+                                    per_user_rps=_v,
+                                    per_user_burst=max(1, int(_v * 2)),
+                                ))
+                                logger.info(
+                                    "Live reload: per_user_rps → %.1f (pub/sub)", _v
+                                )
+                        elif changed_key == _KEY_DI and ddos_protector is not None:
+                            ddos_protector.update_limits(
+                                max_connections_per_ip=int(changed_val)
+                            )
+                            logger.info(
+                                "Live reload: ddos.per_ip_limit → %d (pub/sub)",
+                                int(changed_val),
+                            )
+                        elif changed_key == _KEY_DW and ddos_protector is not None:
+                            ddos_protector.update_limits(
+                                window_seconds=int(changed_val)
+                            )
+                            logger.info(
+                                "Live reload: ddos.window_seconds → %d (pub/sub)",
+                                int(changed_val),
+                            )
+                    except Exception as _msg_exc:
+                        logger.warning("Settings subscriber msg error: %s", _msg_exc)
+            except Exception as _sub_exc:
+                logger.warning(
+                    "Settings pub/sub subscriber exited: %s — live reload disabled", _sub_exc
+                )
+
+        _sub_thread = _threading.Thread(
+            target=_settings_subscriber,
+            name="ysg-settings-subscriber",
+            daemon=True,
+        )
+        _sub_thread.start()
+        logger.info("Gateway: runtime settings subscriber started (live reload active)")
+
+    except Exception as exc:
+        logger.warning(
+            "RuntimeSettings gateway wiring failed (%s) — using startup values only", exc
+        )
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(

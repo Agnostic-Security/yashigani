@@ -95,6 +95,8 @@ from yashigani.backoffice.routes import (
     me_router,
     # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
     manifest_history_router,
+    # v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
+    runtime_settings_router,
 )
 
 
@@ -308,6 +310,32 @@ async def lifespan(app: FastAPI):
             anomaly_client = _redis.from_url(anomaly_redis_url, decode_responses=False)
             backoffice_state.anomaly_detector = AnomalyDetector(redis_client=anomaly_client)
             _log.info("Backoffice: DB pool + inference logger + anomaly detector ready (lifespan)")
+
+            # v2.24.1 — RuntimeSettingsService: admin-surfaces-all-runtime-settings rule.
+            # Seeded from env vars on first boot; subsequent boots read from DB.
+            # A separate Redis client on DB 1 (session Redis) is used for pub/sub.
+            try:
+                from yashigani.runtime_settings.service import RuntimeSettingsService as _RSS
+                from yashigani.gateway._redis_url import build_redis_url as _build_rs_redis_url
+                _rs_redis_url = _build_rs_redis_url(
+                    1,
+                    use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+                    secrets_dir=os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+                    client_cert_name="backoffice_client",
+                )
+                import redis as _redis_rs
+                _rs_redis_client = _redis_rs.from_url(_rs_redis_url, decode_responses=False)
+                _rs = _RSS(pool=get_pool(), redis_client=_rs_redis_client)
+                await _rs.seed_defaults()
+                backoffice_state.runtime_settings = _rs
+                _log.info("RuntimeSettingsService initialised and defaults seeded (v2.24.1)")
+            except Exception as _rs_exc:
+                _log.warning(
+                    "RuntimeSettingsService init failed (%s) — runtime settings admin API "
+                    "unavailable; settings will fall back to env vars / class defaults",
+                    _rs_exc,
+                )
+                # Non-fatal: all consumers fall back to env vars / class defaults.
 
             # v2.23.3 — PgWebAuthnService: DB+Redis backed FIDO2 service.
             # Initialised here (after create_pool) so the credential store can
@@ -807,6 +835,13 @@ def create_backoffice_app() -> FastAPI:
     # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
     # Routes carry /admin/manifest-registrations/ paths defined in the router itself.
     app.include_router(manifest_history_router, tags=["manifest-registry"])
+
+    # v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
+    app.include_router(
+        runtime_settings_router,
+        prefix="/admin/runtime-settings",
+        tags=["runtime-settings"],
+    )
 
     # v0.9.0 — Phase 6: WebAuthn/Passkeys
     # webauthn_router carries its own full path segments (no prefix stripping needed)

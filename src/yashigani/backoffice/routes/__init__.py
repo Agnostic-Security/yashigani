@@ -50,6 +50,8 @@ from yashigani.backoffice.routes.pki_v1 import router as pki_v1_router
 from yashigani.backoffice.routes.me import router as me_router
 # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
 from yashigani.backoffice.routes.manifest_history import router as manifest_history_router
+# v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
+from yashigani.backoffice.routes.runtime_settings import router as runtime_settings_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -87,4 +89,6 @@ __all__ = [
     "me_router",
     # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
     "manifest_history_router",
+    # v2.24.1 — admin-surfaces-all-runtime-settings
+    "runtime_settings_router",
 ]
