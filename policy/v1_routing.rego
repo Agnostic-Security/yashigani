@@ -66,6 +66,19 @@ sensitivity_rank(level) := 1 if level == "INTERNAL"
 sensitivity_rank(level) := 2 if level == "CONFIDENTIAL"
 sensitivity_rank(level) := 3 if level == "RESTRICTED"
 
+# GAP-1 catch-all (defence-in-depth, fail-closed):
+# Any sensitivity string not in the canonical set is assigned rank 4 — above RESTRICTED.
+# This means an unrecognised label (classifier bug, future label, empty string, injection)
+# will never silently allow delivery; it will be blocked for every identity whose ceiling
+# is below a hypothetical rank-4 level, i.e., all identities. Without this rule,
+# `sensitivity_rank("UNKNOWN")` is undefined, the comparison is undefined, and
+# `response_allowed` defaults to true — a silent allow. Rank 4 closes that gap.
+# ASVS V4.1.3: access control must default-deny on input validation failure.
+# Ava GAP-1 finding: ava-v241-opa-response-ceiling-verification.md, EDGE-1.
+sensitivity_rank(level) := 4 if {
+    not level in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}
+}
+
 # ── Response-path enforcement ─────────────────────────────────────────────
 #
 # Evaluates whether a response can be delivered to the caller.

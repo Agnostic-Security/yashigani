@@ -542,3 +542,75 @@ test_edge_both_empty_deny_reason_is_caller_group if {
     }
     r == "caller_group_not_in_allowed_caller_groups"
 }
+
+# ---------------------------------------------------------------------------
+# 7. GAP-1 closure — sensitivity_rank catch-all (v1_routing.rego)
+#
+# Ava GAP-1 finding (ava-v241-opa-response-ceiling-verification.md EDGE-1):
+# Unknown sensitivity strings previously produced undefined rank, causing
+# response_allowed to default true (silent allow). The catch-all assigns
+# rank 4 (above RESTRICTED) to any unrecognised string, ensuring fail-closed
+# behaviour per ASVS V4.1.3.
+#
+# Tests exercise:
+#   7a. sensitivity_rank("FOO_BAR") == 4
+#   7b. response_decision denies delivery of "FOO_BAR"-sensitivity to an
+#       INTERNAL-ceiling identity (rank 4 > rank 1 → block)
+#   7c. response_decision denies delivery of "FOO_BAR"-sensitivity even to a
+#       RESTRICTED-ceiling identity (rank 4 > rank 3 → block)
+#   7d. Empty string is also caught by the catch-all (rank 4 → block)
+# ---------------------------------------------------------------------------
+
+# 7a. Unknown sensitivity string gets rank 4
+test_sensitivity_rank_unknown_string_is_4 if {
+    data.yashigani.v1.sensitivity_rank("FOO_BAR") == 4
+}
+
+# 7b. Unknown sensitivity → DENY for INTERNAL-ceiling identity
+test_response_decision_unknown_sensitivity_denies_internal_ceiling if {
+    d := data.yashigani.v1.response_decision with input as {
+        "identity": {
+            "status": "active",
+            "kind": "agent",
+            "sensitivity_ceiling": "INTERNAL",
+        },
+        "response_sensitivity": "FOO_BAR",
+        "response_verdict": "clean",
+        "pii_detected": false,
+    }
+    d.allow == false
+    d.reason == "response_sensitivity_exceeds_ceiling"
+}
+
+# 7c. Unknown sensitivity → DENY even for RESTRICTED-ceiling identity
+#     (rank 4 > rank 3 — no identity has an unbounded ceiling)
+test_response_decision_unknown_sensitivity_denies_restricted_ceiling if {
+    d := data.yashigani.v1.response_decision with input as {
+        "identity": {
+            "status": "active",
+            "kind": "agent",
+            "sensitivity_ceiling": "RESTRICTED",
+        },
+        "response_sensitivity": "FOO_BAR",
+        "response_verdict": "clean",
+        "pii_detected": false,
+    }
+    d.allow == false
+    d.reason == "response_sensitivity_exceeds_ceiling"
+}
+
+# 7d. Empty string sensitivity → also caught (rank 4 → block)
+test_response_decision_empty_sensitivity_denies_internal_ceiling if {
+    d := data.yashigani.v1.response_decision with input as {
+        "identity": {
+            "status": "active",
+            "kind": "agent",
+            "sensitivity_ceiling": "INTERNAL",
+        },
+        "response_sensitivity": "",
+        "response_verdict": "clean",
+        "pii_detected": false,
+    }
+    d.allow == false
+    d.reason == "response_sensitivity_exceeds_ceiling"
+}
