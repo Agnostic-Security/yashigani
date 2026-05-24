@@ -37,4 +37,893 @@ schema_version: "1.0"
 last_updated: "2026-05-24"
 maintainer: "lu@agnosticsec.com"
 
-risks: []
+risks:
+- id: YSG-RISK-001
+  description: SQL f-string interpolation in scripts/partition_maintenance.py (CWE-89, HIGH). Asyncpg/PostgreSQL
+    do not accept bind parameters in DDL parser positions for PARTITION OF ... FOR VALUES FROM ... TO ... .
+  severity: high
+  controls_impacted:
+  - ASVS V5.3.5
+  - CWE-89
+  - OWASP API8:2023
+  - PCI DSS 6.2.4
+  compensating_controls:
+  - Allowlist regex on identifier names
+  - Date arithmetic in Python, never user input
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - commit: 75536a5
+    rationale: _quote_ident allowlist [a-zA-Z_][a-zA-Z0-9_]*
+  - commit: af114f7
+    rationale: DDL date-literal exception with internal re-audit YCS-20260502-v2.23.1-CWE89-reaudit-001 PASS
+  last_threat_model_review: 2026-05-02
+  source_grep: CHANGELOG.md:713
+- id: YSG-RISK-002
+  description: op.execute(f"DROP TABLE IF EXISTS {name}") in Alembic migration 0003_prepartition_audit_2026_2027.py
+    (CWE-89, MEDIUM).
+  severity: medium
+  controls_impacted:
+  - ASVS V5.3.5
+  - CWE-89
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - commit: 9d867be
+    rationale: Replaced with op.drop_table() native API
+  last_threat_model_review: 2026-05-02
+  source_grep: CHANGELOG.md:714
+- id: YSG-RISK-003
+  description: OIDC discovery validator accepted authorization_endpoint, token_endpoint, jwks_uri with non-https
+    scheme or host mismatch (CWE-601 open-redirect class, MEDIUM). Post-admin-compromise insider scenario TA-3.
+  severity: medium
+  controls_impacted:
+  - ASVS V3.5
+  - CWE-601
+  - OWASP API1:2023
+  compensating_controls:
+  - Admin compromise prerequisite
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - commit: c5839e4
+    rationale: scheme=https + host match against discovery_url enforced
+  last_threat_model_review: 2026-05-02
+  source_grep: CHANGELOG.md:715
+- id: YSG-RISK-004
+  description: Docker Compose services lacked mem_limit and cpus (CWE-400, MEDIUM). Container resource-exhaustion
+    DoS.
+  severity: medium
+  controls_impacted:
+  - ASVS V12.5
+  - CWE-400
+  - NIST SP 800-190 §4.5
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - commit: 0143fb4
+    rationale: 21 compose services + 3 wazuh services with env-overridable limits
+  last_threat_model_review: 2026-05-02
+  source_grep: CHANGELOG.md:716
+- id: YSG-RISK-005
+  description: Helm chart containers lacked resources.limits and resources.requests (CWE-400, MEDIUM). K8s scheduler
+    eviction / noisy-neighbour DoS.
+  severity: medium
+  controls_impacted:
+  - ASVS V12.5
+  - CWE-400
+  - NIST SP 800-190
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - commit: 6c35d28
+    rationale: limits+requests on every container, requests=50% limits
+  last_threat_model_review: 2026-05-02
+  source_grep: CHANGELOG.md:717
+- id: YSG-RISK-006
+  description: OpenClaw bound host port 0.0.0.0:18789 (CWE-668, MEDIUM). Exposure of resource to wrong sphere; reachable
+    from non-gateway network.
+  severity: medium
+  controls_impacted:
+  - ASVS V12.6
+  - CWE-668
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - commit: 33f7318
+    rationale: Bind moved to 127.0.0.1:18789; bridge access unaffected
+  last_threat_model_review: 2026-05-02
+  source_grep: CHANGELOG.md:718
+- id: YSG-RISK-007
+  description: SSRF exposure at multiple call sites (CWE-918, HIGH worst-case). Server-side request forgery to internal
+    metadata/cloud endpoints.
+  severity: high
+  controls_impacted:
+  - ASVS V10.2 / V5.2.6
+  - CWE-918
+  - OWASP API7:2023 SSRF
+  compensating_controls:
+  - SSRF allowlists added at every flagged call site
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: Register heading reconciled; allowlists in place
+    location: docs/security/ssrf.md
+  last_threat_model_review: 2026-05-21
+  source_grep: CHANGELOG.md:719, CHANGELOG.md:529
+- id: YSG-RISK-008
+  description: Container-hardening absent-key gaps (CWE-732/CWE-250, LOW-MEDIUM batch). No read_only:true in compose,
+    no readOnlyRootFilesystem:true in Helm securityContext, no security_opt:["no-new-privileges:true"].
+  severity: medium
+  controls_impacted:
+  - CWE-732
+  - CWE-250
+  - NIST SP 800-190 §4.5
+  - CIS Docker Benchmark
+  - ASVS V14.1
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: read_only+tmpfs on 24/27 services, no-new-privileges on 27/27
+    location: docker/docker-compose.yml:9
+  - rationale: Kyverno admission policies enforce at runtime
+    commit: cde404a
+  - rationale: Checkov allowlist documents enforcement
+    location: .checkov.yml:14,21
+  last_threat_model_review: 2026-05-17
+  source_grep: CHANGELOG.md:725, .checkov.yml:14
+- id: YSG-RISK-012b
+  description: Direct-mesh forge risk on SPIFFE-bound admin/agents write routes. A workload with SPIFFE cert in
+    the trust domain could in principle forge x-spiffe-id if header trust were not strictly tied to mTLS peer. ASVS
+    V10.3.5 sender-constrained tokens.
+  severity: low
+  controls_impacted:
+  - ASVS V10.3.5
+  - OWASP API2:2023 Broken Authentication
+  - CWE-290
+  compensating_controls:
+  - SPIFFE peer cert validated at Caddy edge (caddy_internal network)
+  - require_spiffe_id gate on POST /admin/agents
+  - service_identities.yaml endpoint_acls binding
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: docker/service_identities.yaml:322,344
+  - location: src/yashigani/gateway/spiffe_middleware.py:65,114
+  - test: src/tests/unit/test_acs_risk_012b_spiffe_admin_agents.py
+  last_threat_model_review: 2026-05-16
+  source_grep: docker/service_identities.yaml:3,322,344
+- id: YSG-RISK-013
+  description: SPIFFE ACL TTL absent — stale workload identity could remain authorised after revocation should have
+    applied.
+  severity: low
+  controls_impacted:
+  - ASVS V10.3.5
+  - NIST SP 800-204C §4
+  compensating_controls:
+  - mTLS cert short-TTL (24h baseline)
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: Closed since April via Iris+Laura triage
+    location: CHANGELOG.md:523
+  last_threat_model_review: 2026-04-15
+  source_grep: CHANGELOG.md:523
+- id: YSG-RISK-014
+  description: OIDC acr/amr enforcement absent — assurance level not enforced on session establishment.
+  severity: medium
+  controls_impacted:
+  - ASVS V2.8.1
+  - NIST SP 800-63 AAL2/AAL3
+  - OWASP API2:2023
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: YASHIGANI_MIN_ACR_VALUE enforced at backoffice/routes/sso.py:497-525 (closed since April)
+    location: CHANGELOG.md:524
+  last_threat_model_review: 2026-04-15
+  source_grep: CHANGELOG.md:524
+- id: YSG-RISK-015
+  description: Caddyfile.ca lacked HSTS preload directive — public-resolvable hostnames could be downgrade-attacked
+    pre-HSTS-cache.
+  severity: low
+  controls_impacted:
+  - ASVS V14.4.5
+  - OWASP A05:2021 Security Misconfiguration
+  compensating_controls:
+  - Operator-controlled preload submission documented
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: docs/security/hsts-preload-operator-guidance.md:70
+  last_threat_model_review: 2026-05-15
+  source_grep: docs/security/hsts-preload-operator-guidance.md:70
+- id: YSG-RISK-025
+  description: Helm Caddyfile deprecated directive usage caused parse drift between compose/Helm Caddyfiles. SIDE-001
+    regression class.
+  severity: low
+  controls_impacted:
+  - CI/CD-3 (config drift)
+  - ASVS V14.1.1
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: v2.23.4 close; regression gate in CI
+    test: tests/contracts/test_helm_caddy_directives.py:112
+  last_threat_model_review: 2026-05-16
+  source_grep: tests/contracts/test_helm_caddy_directives.py:8
+- id: YSG-RISK-026
+  description: Caddyfile family drift across compose variants and helm Caddyfile — per-listener security directive
+    parity not gated. Risk:missed security header on one variant.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.4
+  - OWASP A05:2021
+  - CI/CD-3
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - workflow: .github/workflows/caddy-family-parity.yml
+  - test: tests/contracts/test_caddyfile_family.py:310,416,479,601
+  last_threat_model_review: 2026-05-16
+  source_grep: .github/workflows/caddy-family-parity.yml:1,4
+- id: YSG-RISK-036
+  description: PR
+  severity: medium
+  controls_impacted:
+  - ASVS V14.2
+  - CWE-1395
+  - NIST SP 800-218 PW.4
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: Laura-validated CLOSED via Iris+Laura triage
+    location: CHANGELOG.md:524-525
+  last_threat_model_review: 2026-05-21
+  source_grep: CHANGELOG.md:524
+- id: YSG-RISK-038
+  description: Agent install step missing — BUG-AG-003 install-time gap.
+  severity: low
+  controls_impacted:
+  - ASVS V14.2
+  - Install integrity
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: CHANGELOG.md:481
+  last_threat_model_review: 2026-05-15
+  source_grep: CHANGELOG.md:481
+- id: YSG-RISK-039
+  description: Step 2 air-gap transfer file list missing entry — BUG-AG-004.
+  severity: low
+  controls_impacted:
+  - Install integrity
+  - Air-gap procedure completeness
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: CHANGELOG.md:506
+  last_threat_model_review: 2026-05-15
+  source_grep: CHANGELOG.md:506
+- id: YSG-RISK-040
+  description: fasttext dependency had pinned-CVE chain; pure-Python sklearn swap eliminated the native-code attack
+    surface.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.2
+  - CWE-1395
+  - Supply chain
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: Closed via v2.23.3 sklearn swap
+    location: CHANGELOG.md:525
+  last_threat_model_review: 2026-05-15
+  source_grep: CHANGELOG.md:525-526
+- id: YSG-RISK-044
+  description: Known CVE in pinned dependency — NOT-EXPLOITABLE-CVA compensating controls active per upstream advisory
+    and our usage path.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.2
+  - CWE-1395
+  compensating_controls:
+  - VEX statement documenting non-exploitability in our usage path
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: CHANGELOG.md:526
+  last_threat_model_review: 2026-05-15
+  source_grep: CHANGELOG.md:526
+- id: YSG-RISK-045
+  description: Known CVE in pinned dependency — NOT-EXPLOITABLE-CVA compensating controls active per upstream advisory
+    and our usage path.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.2
+  - CWE-1395
+  compensating_controls:
+  - VEX statement documenting non-exploitability in our usage path
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: CHANGELOG.md:526
+  last_threat_model_review: 2026-05-15
+  source_grep: CHANGELOG.md:526
+- id: YSG-RISK-046
+  description: Podman host-reboot caused container/network state loss without auto-restart equivalence to Docker's
+    restart policy mapping.
+  severity: low
+  controls_impacted:
+  - Availability
+  - NIST SP 800-190 §4.6
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: Documented; restart=always in both Dockerfiles
+    location: CHANGELOG.md:527-529
+  last_threat_model_review: 2026-05-15
+  source_grep: CHANGELOG.md:527
+- id: YSG-RISK-047
+  description: SPIFFE ACL partial-binding gap on a subset of admin write routes (closed alongside YSG-RISK-012b
+    and YSG-RISK-013 partial).
+  severity: low
+  controls_impacted:
+  - ASVS V10.3.5
+  compensating_controls:
+  - mTLS+caddy_internal restricts who can reach admin routes
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - location: CHANGELOG.md:538
+  last_threat_model_review: 2026-05-16
+  source_grep: CHANGELOG.md:538
+- id: YSG-RISK-048
+  description: letta postgres connection lacked mTLS — asyncpg+pg8000 limitation (cannot present client certs via
+    URI params) left a MEDIUM open through the Phase 3 arc.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.4.1 (postgres TLS mode)
+  - NIST SP 800-204C §4.2
+  - CWE-319
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: letta-pgbouncer mTLS sidecar (edoburu/pgbouncer:v1.25.1-p0, UID 70, read_only, cap_drop ALL, no-new-privileges).
+      pg_hba catch-all hostssl ... scram-sha-256 clientcert=verify-ca applies uniformly with no letta carveout.
+    location: CHANGELOG.md:25,391
+  last_threat_model_review: 2026-05-21
+  source_grep: CHANGELOG.md:25,519
+- id: YSG-RISK-049
+  description: pgbouncer auth_type=plain with cleartext userlist.txt is the non-KMS dev/standalone posture. Production
+    KMS deployments bypass the cleartext path entirely.
+  severity: low
+  controls_impacted:
+  - ASVS V6.2 (credential storage)
+  - NIST SP 800-53 SC-28 / IA-5
+  - CWE-256 / CWE-312
+  compensating_controls:
+  - YSG_KMS_PROVIDER=vault|azure|aws|gcp|keeper fetches credentials at runtime via src/yashigani/kms/ abstractions
+  - SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role
+  - Dedicated 0640 UID 70 mount
+  - Documented at docs/yashigani_install_config.md §6.1
+  status: accepted
+  accepted_by: Tiago
+  accepted_at: 2026-05-21
+  review_by: 2026-08-22
+  closure_evidence: null
+  last_threat_model_review: 2026-05-22
+  source_grep: CHANGELOG.md:393,531
+  original_lu_status: accepted_known_residual
+- id: YSG-RISK-050
+  description: 'pgbouncer cert separation — pgbouncer-auth previously needed a pg_hba A2 carveout because it shared
+    a cert with another role. Risk: catch-all clientcert=verify-ca was non-uniform.'
+  severity: low
+  controls_impacted:
+  - ASVS V10.3.5 (sender-constrained certificates)
+  - NIST SP 800-204C §4
+  compensating_controls: []
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: pgbouncer-auth gains dedicated cert; pg_hba A2 carveout removed; catch-all clientcert=verify-ca uniform
+      across the cluster.
+    commits:
+    - af9fdcd
+    - f6a3bbf
+    design_doc: internal-docs/yashigani/iris-v240-ysg-risk-050-cert-separation-design.md
+    threat_model: internal-docs/yashigani/laura-v240-ysg-risk-050-cert-separation-threat-model.md
+  last_threat_model_review: 2026-05-22
+  source_grep: project_session_offline_save_20260522_v240_secrets_dist.md
+- id: YSG-SECRETS-DIST-002
+  description: GID 2002 (numeric, no /etc/group entry) full-bind-mount cross-secret read. Compromised container
+    with GID 2002 supplementary could read all three shared secrets, not just the one it needs. Filed LOW in v2.23.4
+    with cap_drop:ALL + read_only:true rootfs as compensating controls; forward-closed in v2.24.0 via per-consumer
+    credentials.
+  severity: low
+  controls_impacted:
+  - ASVS V8.3 (sensitive private data)
+  - NIST SP 800-190 §4.5
+  - CWE-732
+  - CWE-922
+  compensating_controls:
+  - cap_drop:ALL on consumer containers
+  - read_only:true rootfs
+  - Container-boundary trust posture
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: GID 2002 narrowed from 6×3 to langflow only × 1 file (bearer) via Iris Option (i) + Laura A1 amendment.
+      Tom _write_secret_file gains mode/gid kw-params (35/35 tests PASS).
+    commits:
+    - 9dd8575
+    - a3cf4a3
+    location: CHANGELOG.md:400-405,533
+  last_threat_model_review: 2026-05-22
+  source_grep: CHANGELOG.md:400,533
+- id: YSG-RISK-055
+  description: Intra-data bridge direct connect possible despite OPA agent_call_allowed being the designed inspection
+    path. A compromised agent that deviates from its OPENAI_API_BASE config could reach a peer agent over the shared
+    `data` Docker bridge by service name, bypassing the gateway intercept. PRIMARY control (OPA + gateway intercept)
+    holds for well-behaved agents; this is a network-segmentation defence-in-depth gap, not a designed bypass.
+  severity: medium
+  controls_impacted:
+  - OWASP Agentic AI Top 10 (Agent-to-agent unsafe communication)
+  - ASVS V12.6
+  - NIST SP 800-204C §4
+  - CWE-668
+  compensating_controls:
+  - OPA agent_call_allowed enforced at gateway intercept (gateway/proxy.py:364-368)
+  - policy/agents.rego principal.type=='agent' + target_agent.allowed_caller_groups + allowed_paths
+  - Both langflow + letta have OPENAI_API_BASE=http://gateway:8080/v1 (calls go via gateway)
+  - cap_drop:ALL + read_only:true on agent containers (post-RCE pivot harder)
+  - Caddy is the auth perimeter (feedback_caddy_is_the_auth_perimeter)
+  status: accepted
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-08-22
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  forward_close_plan:
+    target_release: v2.24.2-or-v2.25.0
+    planned_controls:
+    - K8s NetworkPolicy denying agent→agent direct connect on data plane (UA-10)
+    - Compose per-agent bridge OR explicit denial of agent→agent on data bridge
+    - Ava adversarial-probe log demonstrating residual gap (A2)
+  source_grep: internal-docs/yashigani/synthesis-v241-agent-infrastructure-council.md:36-47
+  original_lu_status: accepted_known_residual
+- id: HELD-NICO-V241-001
+  description: caddy_client.key mounted into all agent containers via wholesale ./secrets mount; letta UID 0 can
+    read 0640, forge SPIFFE identity for Caddy.
+  severity: high
+  controls_impacted:
+  - ASVS V10.3.5
+  - NIST SP 800-204C §4
+  - CWE-732
+  - CWE-290
+  - FIPS 140-3 boundary coherence
+  compensating_controls:
+  - Agent containers run cap_drop:ALL
+  - SPIFFE identity verified at Caddy edge; forge would need Caddy mTLS termination
+  - v2.24.0 customer base single-tenant per install
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: Auth-touching; Tiago 2026-05-23 HOLD on agent-auth changes.
+  planned_close:
+    owner: Captain
+    effort: 2h Docker named-secrets remap
+    affected_files:
+    - docker/docker-compose.yml:140
+    - docker/docker-compose.yml:1580
+    - docker/docker-compose.yml:1751
+    - docker/docker-compose.yml:1834
+  source: synthesis-v241-agent-infrastructure-council.md §3.1
+  original_lu_status: accepted_pending_revision
+- id: HELD-MUST-SU-1
+  description: Caddy compose healthcheck calls http://127.0.0.1:2019/config/ — adding `admin off` (Laura MUST-4)
+    crashes Caddy loop. Must migrate to :80/healthz.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.1.1
+  - Availability
+  - CIS Docker Benchmark
+  compensating_controls:
+  - Caddy admin API bound inside container only
+  - caddy_internal network restricts mesh-peer reachability
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: Auth-adjacent; couples with Laura MUST-4 (admin off) which Tiago holds.
+  planned_close:
+    owner: Su
+    effort: 30min + Captain validation
+    affected_files:
+    - docker/docker-compose.yml:143
+    - Caddyfile variants :80 block
+  source: synthesis-v241-agent-infrastructure-council.md §3.1
+  original_lu_status: accepted_pending_revision
+- id: HELD-IRIS-UA-01
+  description: langflow Caddy route — front langflow with Caddy + forward_auth.
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - feedback_caddy_is_the_auth_perimeter
+  compensating_controls:
+  - langflow currently bound to internal network only
+  - cap_drop:ALL on agent containers
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.4
+  original_lu_status: accepted_pending_revision
+- id: HELD-IRIS-UA-02
+  description: letta Caddy route — front letta with Caddy + forward_auth.
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - feedback_caddy_is_the_auth_perimeter
+  compensating_controls:
+  - letta currently bound to internal network only
+  - cap_drop:ALL on agent containers
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.4
+  original_lu_status: accepted_pending_revision
+- id: HELD-IRIS-UA-03
+  description: openclaw Caddy route — front openclaw with Caddy + forward_auth.
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - feedback_caddy_is_the_auth_perimeter
+  compensating_controls:
+  - openclaw bound to 127.0.0.1 (YSG-RISK-006 close)
+  - cap_drop:ALL
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.4
+  original_lu_status: accepted_pending_revision
+- id: HELD-IRIS-UA-04
+  description: caddy_internal join — bring agent containers onto caddy_internal network for forward_auth.
+  severity: medium
+  controls_impacted:
+  - ASVS V12.6
+  - NIST SP 800-204C §4
+  compensating_controls:
+  - Existing data bridge restricts blast radius
+  - OPA agent_call_allowed inspects agent-to-agent calls (gateway/proxy.py:364-368)
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) — required to enable forward_auth wiring (UA-05).
+  source: synthesis §3.4
+  original_lu_status: accepted_pending_revision
+- id: HELD-IRIS-UA-05
+  description: forward_auth wiring — Caddy forward_auth to backoffice auth endpoint for agent routes.
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - feedback_caddy_is_the_auth_perimeter
+  compensating_controls:
+  - Agent endpoints behind internal network boundary
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.4
+  original_lu_status: accepted_pending_revision
+- id: HELD-IRIS-UA-06
+  description: agent identity propagation — propagate X-Forwarded-User / X-SPIFFE-ID into agent calls.
+  severity: medium
+  controls_impacted:
+  - ASVS V10.3.5
+  - OWASP API2:2023
+  - OWASP Agentic AI Top 10 (Identity propagation)
+  compensating_controls:
+  - Caddy verified secret pattern at backoffice/routes/auth.py:542-544
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.4
+  original_lu_status: accepted_pending_revision
+- id: HELD-LAURA-MUST-1
+  description: langflow Caddy front (independent identification matching IRIS-UA-01).
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  compensating_controls:
+  - Same as HELD-IRIS-UA-01
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.5
+  original_lu_status: accepted_pending_revision
+- id: HELD-LAURA-MUST-2
+  description: letta Caddy front (independent identification matching IRIS-UA-02).
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  compensating_controls:
+  - Same as HELD-IRIS-UA-02
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.5
+  original_lu_status: accepted_pending_revision
+- id: HELD-LAURA-MUST-3
+  description: openclaw Caddy front (independent identification matching IRIS-UA-03).
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  compensating_controls:
+  - Same as HELD-IRIS-UA-03
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  source: synthesis §3.5
+  original_lu_status: accepted_pending_revision
+- id: HELD-LAURA-MUST-4
+  description: Caddy `admin off` — disable Caddy admin API to remove :2019 attack surface from inside-the-network
+    adversary.
+  severity: high
+  controls_impacted:
+  - ASVS V14.1.1
+  - CIS Docker Benchmark
+  - CWE-749 exposed dangerous method
+  compensating_controls:
+  - :2019 currently bound inside container only
+  - caddy_internal network restricts mesh-peer reachability
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (couples with MUST-SU-1 / C-CAP-001 / C-CAP-002 healthcheck migration).
+  source: synthesis §3.5
+  original_lu_status: accepted_pending_revision
+- id: HELD-TOM-2
+  description: Per-user identity propagation in gateway/letta_client.py + agent_auth.py — currently single bearer
+    + shared identity; multi-user letta separation impossible.
+  severity: high
+  controls_impacted:
+  - ASVS V10.3.5
+  - OWASP API2:2023 / API3:2023 (BOLA)
+  - OWASP Agentic AI Top 10 (Excessive agency)
+  - SOC 2 CC6.1
+  compensating_controls:
+  - v2.24.0 customer base single-tenant per install
+  - Compose/Helm bundle scoped per-install
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23.
+  planned_close:
+    owner: Tom
+    effort: 1d
+    affected_files:
+    - src/yashigani/gateway/agent_auth.py
+    - src/yashigani/gateway/letta_client.py
+  source: synthesis §3.1
+  original_lu_status: accepted_pending_revision
+- id: HELD-TOM-3
+  description: Per-user letta agent isolation — each authenticated user should get own letta agent, not shared.
+  severity: high
+  controls_impacted:
+  - ASVS V10.3.5
+  - OWASP API3:2023 (BOPLA)
+  - OWASP Agentic AI Top 10
+  - GDPR Art.32 (separation between data subjects)
+  compensating_controls:
+  - v2.24.0 customer base single-tenant per install
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-23
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-23
+  held_reason: HOLD (auth) per Tiago 2026-05-23. Depends on HELD-TOM-2.
+  planned_close:
+    owner: Tom
+    effort: 1d
+    depends_on: HELD-TOM-2
+  source: synthesis §3.1
+  original_lu_status: accepted_pending_revision
+- id: HELD-UA-07-GAP-001
+  description: agent_call_allowed has no guard on target_agent.agent_id presence. If the gateway presents a well-formed
+    target_agent struct (valid allowed_caller_groups + allowed_paths) but absent agent_id, the allow rule fires
+    true even though target_agent_not_in_data deny_reason fires in parallel. Gateway must read agent_call_deny_reason
+    as the authoritative gate, not just agent_call_allowed.
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - CWE-285 (improper authorization)
+  compensating_controls:
+  - Caddy fronting limits caller identity propagation paths
+  - gateway/agent_auth.py target_agent_id parse from path layer enforces non-empty
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-24
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-24
+  held_reason: HOLD (auth) — gateway pre-OPA validation lives in src/yashigani/gateway/agent_auth.py which is Phase
+    B HELD.
+  planned_close:
+    owner: Tom
+    effort: 2h
+    affected_files:
+    - src/yashigani/gateway/agent_auth.py
+  source: Iris UA-07 commit 049fe07; testing_runs/iris_phase_a_wave2_20260524/
+  original_lu_status: accepted_pending_revision
+- id: HELD-UA-07-GAP-002
+  description: Rego treats empty-string "" as truthy. `not input.target_agent.agent_id` is false when agent_id ==
+    "", so target_agent_not_in_data deny_reason does not fire for empty-string agent_id. If caller is in allowed
+    group with permissive path pattern, call is silently allowed. Same fix as GAP-001 — gateway pre-OPA validation
+    must reject empty-string.
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - CWE-285
+  compensating_controls:
+  - path-parse layer in gateway/agent_auth.py rejects empty path segment in practice
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-24
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-24
+  held_reason: HOLD (auth) — same fix surface as GAP-001.
+  planned_close:
+    owner: Tom
+    effort: with GAP-001
+    affected_files:
+    - src/yashigani/gateway/agent_auth.py
+  source: Iris UA-07 commit 049fe07
+  original_lu_status: accepted_pending_revision
+- id: HELD-UA-07-GAP-003
+  description: 'agent_call_deny_reason is a complete rule (:=) with three independent heads. When target_agent.agent_id
+    is absent AND caller is not in allowed_caller_groups, both "target_agent_not_in_data" and "caller_group_not_in_allowed_caller_groups"
+    conditions are true simultaneously, causing OPA eval_conflict_error: "complete rules must not produce multiple
+    outputs". Gateway must catch this OPA exception and treat as DENY with audit event. Rule should also be restructured
+    to prioritised ordered evaluation (default + else) to prevent the conflict.'
+  severity: high
+  controls_impacted:
+  - ASVS V4.1
+  - OWASP API1:2023
+  - CWE-754 (improper check for unusual condition)
+  compensating_controls:
+  - OPA hard error becomes fail-closed at the gateway HTTP layer (500 instead of allow)
+  status: deferred
+  accepted_by: Tiago
+  accepted_at: 2026-05-24
+  review_by: 2026-06-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-24
+  held_reason: HOLD (auth) — touches policy/agents.rego rule structure (Phase B HELD).
+  planned_close:
+    owner: Tom
+    effort: 4h
+    affected_files:
+    - policy/agents.rego
+    - src/yashigani/gateway/agent_auth.py
+  source: Iris UA-07 commit 049fe07
+  original_lu_status: accepted_pending_revision
