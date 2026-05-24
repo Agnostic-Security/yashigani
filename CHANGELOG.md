@@ -23,6 +23,15 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ## [Unreleased] — v2.24.1
 
 ### Security
+- **security(auth): TOTP failure counter migrated to Redis** (closes SEC-4 / ASVS V6.3.5 — YSG-RISK-063):
+  Counter now survives process restart and is consistent across multi-replica deployments. Previously
+  a module-level Python dict (`_totp_failures`) reset on every process kill/restart, allowing an
+  attacker to bypass the 3-failure lockout by triggering a restart. Migrated to Redis key
+  `yashigani:totp_fail:<session_prefix>` with 1800 s TTL. Fail-closed: HTTP 503 when Redis
+  unavailable (no silent allow). Lockout now emits `AdminSessionTotpLockoutEvent` with
+  `consecutive_failures` + `endpoint` fields. 15 unit tests + 3 integration restart-persistence
+  tests added (CMMC IA.L2-3.5.7 / ISO 27001 A.5.17).
+
 - **security(perimeter): Caddy egress restrictions — iptables OUTPUT allowlist + K8s NetworkPolicy** (YSG-RISK-061, Tiago directive 2026-05-25):
 
   **Attack chain reduced:** Post-Caddy-RCE attacker cannot reach arbitrary internet endpoints
@@ -182,6 +191,18 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   **Files changed:** `docker/docker-compose.yml` (langflow env line ~1581, letta env line
   ~1772), `helm/yashigani/values.yaml` (langflow.env.OPENAI_API_BASE, letta.env.OPENAI_API_BASE),
   `docs/risk-register.yml` (stale compensating-control note updated).
+
+- **fix(pgbouncer): restore compose-Helm admin_users + stats_users parity** (drift #8 secondary, 2026-05-25):
+  `helm/yashigani/files/pgbouncer.ini` was missing the `admin_users =` and `stats_users =`
+  directives that `docker/pgbouncer/pgbouncer.ini` has carried since the Laura F2 / ASVS V14.4.1
+  hardening (YSG-RISK-049 close). Without the explicit empty-string override the edoburu image
+  default sets `admin_users=$DB_USER` (yashigani_app), which would expose the pgbouncer admin
+  console to any client authenticated as yashigani_app reaching the pgbouncer TCP listener.
+  Both letta variants (`compose-letta` + `helm-letta`) already carried the directives and were
+  at parity — this fix closes the helm-main gap only. Empty string disables both consoles in
+  pgbouncer 1.21+. `tests/contracts/test_pgbouncer_auth_parity.py` extended with 8 new
+  parametrised assertions (tests 7 + 8: `admin_users` present + empty, `stats_users` present
+  + empty, across all four ini files). 28/28 PASS.
 
 - **fix(pgbouncer): restore compose-Helm auth_query parity** (CHANGELOG drift audit finding #8):
   `docker/pgbouncer/pgbouncer.ini` had an explicit `auth_file = /etc/pgbouncer/userlist.txt`

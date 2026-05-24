@@ -1250,3 +1250,37 @@ risks:
         infrastructure (some compliance customers require on-prem DNS)
     estimated_effort: Captain ~6-8h (DoH plugin / config + cert pinning + tests
       across compose+helm+Mac+Linux + operator-override doc)
+
+
+- id: YSG-RISK-063
+  description: >-
+    TOTP step-up failure counter was a module-level Python dict (Iris SEC-4,
+    `_totp_failures: dict[str, int] = {}`). The counter reset on every process
+    restart — an attacker aware of the 3-failure lockout could wait for or
+    trigger a restart (e.g., OOM kill, rolling deploy) and immediately retry
+    TOTP brute-force with a fresh counter. ASVS V6.3.5 / CMMC IA.L2-3.5.7 /
+    ISO 27001 A.5.17 explicit failure. Migrated to Redis
+    (key: yashigani:totp_fail:<session_prefix>, TTL: 1800 s). Counter now
+    survives process restart, is consistent across multi-replica deployments,
+    and fails closed (HTTP 503) when Redis is unavailable — no silent allow.
+  severity: medium
+  controls_impacted:
+    - ASVS V6.3.5
+    - CMMC IA.L2-3.5.7
+    - ISO 27001 A.5.17
+  compensating_controls:
+    - Lockout after 3 failures (unchanged threshold)
+    - AdminSessionTotpLockoutEvent audit event now emitted on lockout
+    - Process restart requires attacker access to deployment plane (high bar)
+  status: mitigated
+  closure_evidence:
+    - commit: TBD_REPLACED_BY_SHA
+      rationale: >-
+        Redis-backed counter (_totp_incr_failure / _totp_get_count / _totp_reset
+        in auth.py). Integration test verifies counter survives module eviction
+        (simulated restart). Fail-closed: HTTP 503 when Redis unavailable.
+        Lockout audit event (AdminSessionTotpLockoutEvent) now emitted with
+        consecutive_failures + endpoint fields.
+  fix_in_version: v2.24.1
+  closed_at: 2026-05-25
+  closed_by: Tom (SEC-4 / Iris architectural audit)

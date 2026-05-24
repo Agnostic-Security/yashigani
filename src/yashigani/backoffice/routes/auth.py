@@ -8,7 +8,7 @@ POST /auth/totp/provision          — TOTP + recovery codes provisioning
 POST /auth/stepup                  — V6.8.4 step-up TOTP verification for high-value flows
 GET  /auth/post-login-redirect     — server-side next= validator + redirect (drift audit #6)
 
-Last updated: 2026-05-24T00:00:00+00:00
+Last updated: 2026-05-25T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -37,10 +37,60 @@ def _pg_tenant_transaction():
 
 router = APIRouter()
 
+# ---------------------------------------------------------------------------
+# TOTP step-up failure counter (SEC-4 / ASVS V6.3.5)
+#
+# Migrated from module-level Python dict to Redis so the counter survives
+# process restarts and is consistent across multi-replica deployments.
+#
+# Key:   yashigani:totp_fail:<session_prefix>
+# TTL:   _TOTP_FAILURE_TTL_SECONDS (1800 s) — gives a >30-min window per
+#        RFC 6238 clock-skew allowance while still expiring eventually.
+# Limit: _TOTP_FAILURE_LIMIT (3) — unchanged from previous in-memory behaviour.
+#
+# Fail-closed: if Redis is unavailable the helper raises RuntimeError which
+# the route handler converts to HTTP 503 (same fail-closed stance as login
+# rate limiter).
+# ---------------------------------------------------------------------------
+
 _TOTP_FAILURE_LIMIT = 3
-_totp_failures: dict[str, int] = {}  # session_prefix → count
+_TOTP_FAILURE_TTL_SECONDS = 1800  # 30-minute window; covers RFC 6238 clock skew
 
 _log = logging.getLogger("yashigani.auth")
+
+
+def _totp_fail_key(session_prefix: str) -> str:
+    """Redis key for the TOTP step-up failure counter for a session prefix."""
+    return f"yashigani:totp_fail:{session_prefix}"
+
+
+def _totp_incr_failure(session_prefix: str) -> int:
+    """
+    Increment TOTP step-up failure counter for *session_prefix* and return the
+    new count.  Sets TTL to _TOTP_FAILURE_TTL_SECONDS on first increment.
+
+    Fail-closed: raises RuntimeError if Redis is unavailable.
+    """
+    r = _get_throttle_redis()
+    key = _totp_fail_key(session_prefix)
+    pipe = r.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, _TOTP_FAILURE_TTL_SECONDS)
+    results = pipe.execute()
+    return int(results[0])
+
+
+def _totp_get_count(session_prefix: str) -> int:
+    """Return current failure count for *session_prefix* (0 if key absent)."""
+    r = _get_throttle_redis()
+    raw = r.get(_totp_fail_key(session_prefix))
+    return int(raw) if raw else 0
+
+
+def _totp_reset(session_prefix: str) -> None:
+    """Delete the TOTP step-up failure counter for *session_prefix* on success."""
+    r = _get_throttle_redis()
+    r.delete(_totp_fail_key(session_prefix))
 
 # ---------------------------------------------------------------------------
 # Auth brute-force throttle (ASVS 6.3.5)
@@ -881,11 +931,34 @@ async def stepup_verify(
             detail={"error": "totp_not_configured"},
         )
 
-    # Check per-session step-up failure counter (simple in-memory dict,
-    # keyed on session token prefix — limits to 3 wrong codes then lock).
+    # Check per-session step-up failure counter.
+    # SEC-4 / ASVS V6.3.5: migrated from module-level dict to Redis so the
+    # counter survives process restarts and is consistent across replicas.
     session_prefix = session.token[:8]
-    failure_count = _totp_failures.get(session_prefix, 0)
+    try:
+        failure_count = _totp_get_count(session_prefix)
+    except Exception as exc:
+        # Redis unavailable — fail-closed per SOP 1 (no silent allow).
+        _log.error("SEC-4: Redis unavailable for TOTP step-up counter check: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "totp_service_unavailable",
+                "message": "Authentication service temporarily unavailable.",
+            },
+        )
+
     if failure_count >= _TOTP_FAILURE_LIMIT:
+        # Emit lockout audit event with full forensic context.
+        from yashigani.audit.schema import AdminSessionTotpLockoutEvent
+        state.audit_writer.write(
+            AdminSessionTotpLockoutEvent(
+                account_tier=admin_record.account_tier,
+                admin_account=admin_record.username,
+                endpoint="/auth/stepup",
+                consecutive_failures=failure_count,
+            )
+        )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
@@ -899,7 +972,12 @@ async def stepup_verify(
         ok = await state.auth_service._verify_totp_with_replay(conn, admin_record.totp_secret, body.totp_code)
 
     if not ok:
-        _totp_failures[session_prefix] = failure_count + 1
+        try:
+            _totp_incr_failure(session_prefix)
+        except Exception as exc:
+            _log.error("SEC-4: Redis unavailable for TOTP failure increment: %s", exc)
+            # Still reject the bad TOTP code even if we can't count it.
+            # (fail-closed on the auth result; counter loss is the lesser evil)
         state.audit_writer.write(_make_stepup_event(admin_record.username, "failure", admin_record.account_tier))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -910,7 +988,11 @@ async def stepup_verify(
         )
 
     # Success — record step-up timestamp in Redis session, clear failure counter.
-    _totp_failures.pop(session_prefix, None)
+    try:
+        _totp_reset(session_prefix)
+    except Exception as exc:
+        _log.warning("SEC-4: Redis unavailable for TOTP counter reset: %s", exc)
+        # Non-fatal: successful auth proceeds; counter will expire via TTL.
     store.record_totp_stepup(session.token)
     state.audit_writer.write(_make_stepup_event(admin_record.username, "success", admin_record.account_tier))
 
