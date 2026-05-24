@@ -1,0 +1,40 @@
+# Yashigani Risk Register
+#
+# Machine-readable exception/risk register. Complies with:
+#   NIST SP 800-53 r5: RA-3 / RA-7 / CA-5 (POA&M)
+#   CMMC L2: CA.L2-3.12.2 / RA.L2-3.11.1/2/3
+#   SOC 2 Type II: CC3.1 / CC4.1
+#   ISO 27001:2022: Clause 6.1.2 / 6.1.3 / A.5.36
+#   ISO 42001: A.6.1.4 / A.5.4
+#
+# Schema (LU-AMEND-05 / v2.24.1):
+#
+#   id                       string  — unique risk ID, format: YSG-RISK-NNN
+#   description              string  — human-readable description of the risk
+#   severity                 enum    — critical | high | medium | low | informational
+#   controls_impacted        list    — list of control IDs affected (ASVS / NIST / SOC 2 etc.)
+#   compensating_controls    list    — controls or mitigations that reduce residual risk
+#   status                   enum    — open | accepted | mitigated | closed | deferred
+#   accepted_by              string  — name/role of the accepting authority
+#   accepted_at              date    — ISO 8601 date of acceptance (YYYY-MM-DD)
+#   review_by                date    — ISO 8601 date by which this entry MUST be reviewed
+#                                      CI gate fails if review_by < today
+#   closure_evidence         string  — URL, commit SHA, or doc reference proving closure
+#   last_threat_model_review date    — ISO 8601 date of last threat model review
+#
+# Authoring: Lu (GRC Auditor) owns content. Su owns schema + CI gate.
+# CI gate: .github/workflows/risk-register-gate.yml
+#          Fails if any entry has review_by < today (stale exception).
+#
+# Initial content: empty — Lu is authoring risk entries in parallel.
+# Format is validated by the CI gate on every PR.
+#
+# IMPORTANT: Do NOT add placeholder entries here. Every entry MUST represent
+# a real, accepted exception with a real acceptance date and review deadline.
+# Placeholder entries violate feedback_no_fake_compliance_docs.md.
+
+schema_version: "1.0"
+last_updated: "2026-05-24"
+maintainer: "lu@agnosticsec.com"
+
+risks: []

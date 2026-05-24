@@ -33,7 +33,7 @@
   DISCLAIMER: These integrations are provided AS IS by Agnostic Security.
   Image digests are pinned per release. All support goes to upstream maintainers.
 */}}
-{{- /* Last updated: 2026-05-20T12:00:00+01:00 — fix: readOnlyRootFilesystem:true default + extraVolumes/extraVolumeMounts for per-bundle writable paths (letta openapi_letta.json + nltk_data) */ -}}
+{{- /* Last updated: 2026-05-24T07:00:00+01:00 — MUST-5/6 (v2.24.1): cap_drop:[ALL]+readOnlyRootFilesystem:true verified present as template default; langflow override in values.yaml flipped from false→true (Laura adversarial probe evidence: CapEff=0000000000000000, RO_CONFIRMED all four agents) */ -}}
 
 {{- $root := . -}}
 

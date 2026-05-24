@@ -50,11 +50,17 @@ BANNED_BEARER_LITERAL = "yashigani-internal"
 # Each entry MUST have a documented reason in docker/docker-compose.yml (see YSG-RISK-008 comments).
 READ_ONLY_EXEMPTIONS = frozenset(
     {
-        "wazuh-manager",   # OpenSearch/JVM + agent internal write paths not covered by volumes
-        "wazuh-indexer",   # OpenSearch /usr/share/wazuh-indexer implicit writes
-        "wazuh-dashboard", # Plugin assets under /usr/share/wazuh-dashboard implicit writes
-        "postgres",        # podman tmpfs no uid/gid → can't uid-restrict /var/run/postgresql
-        "pgbouncer",       # podman tmpfs no uid/gid → can't uid-restrict /var/run/pgbouncer + /etc/pgbouncer/userlist.txt
+        "wazuh-manager",    # OpenSearch/JVM + agent internal write paths not covered by volumes
+        "wazuh-indexer",    # OpenSearch /usr/share/wazuh-indexer implicit writes
+        "wazuh-dashboard",  # Plugin assets under /usr/share/wazuh-dashboard implicit writes
+        "postgres",         # podman tmpfs no uid/gid → can't uid-restrict /var/run/postgresql
+        "pgbouncer",        # podman tmpfs no uid/gid → can't uid-restrict /var/run/pgbouncer + /etc/pgbouncer/userlist.txt
+        # letta-pgbouncer: edoburu/pgbouncer entrypoint writes userlist.txt at startup.
+        # Same exception class as pgbouncer above. /var/run/pgbouncer needed for PID file.
+        # Compensating controls: cap_drop:[ALL] + no-new-privileges + user:70:70.
+        # K8s path retains readOnlyRootFilesystem:false (documented in values.yaml:1053).
+        # YSG-RISK-008 note at docker-compose.yml:1685. MUST-6 (v2.24.1) accepted residual.
+        "letta-pgbouncer",
     }
 )
 

@@ -902,9 +902,32 @@ agentBundles:
       supplementalGroups: [2002]
     containerSecurityContext:
       allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: false
+      # MUST-6 fix (v2.24.1): readOnlyRootFilesystem: true — langflow write paths
+      # handled via extraVolumeMounts below (parity with Compose read_only:true).
+      # LANGFLOW_ALEMBIC_LOG_TO_STDOUT: "true" eliminates the alembic log write at
+      # /app/.venv/.../langflow/alembic/alembic.log (redirects to stdout).
+      # Remaining write paths covered by emptyDir mounts:
+      #   /tmp       — Python runtime temp files (mode=1777, UID 1000 writes here)
+      #   /app/data  — langflow mkdir at startup (ephemeral cache; not persisted)
+      # /app/langflow — persistent volume (PVC), writable via named volume mount.
+      readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
+    # Extra writable paths for langflow with readOnlyRootFilesystem:true.
+    # Matches Compose tmpfs mounts (docker-compose.yml:1598-1599).
+    extraVolumeMounts:
+      - name: langflow-tmp
+        mountPath: /tmp
+      - name: langflow-appdata
+        mountPath: /app/data
+    extraVolumes:
+      - name: langflow-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Mi
+      - name: langflow-appdata
+        emptyDir:
+          sizeLimit: 64Mi
 
   # Letta (formerly MemGPT) — Stateful agent with persistent memory (Apache 2.0)
   # https://github.com/letta-ai/letta

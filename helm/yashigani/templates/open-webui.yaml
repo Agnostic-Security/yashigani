@@ -111,6 +111,14 @@ spec:
           imagePullPolicy: {{ .Values.openWebui.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
+            # MUST-6 fix (v2.24.1): readOnlyRootFilesystem: true — parity with
+            # Compose read_only:true (docker-compose.yml:549).
+            # Write paths handled by volume mounts below:
+            #   /app/backend/data       — PVC (persistent store)
+            #   /app/backend/open_webui/static — emptyDir (initContainer pre-pop)
+            #   /tmp                    — emptyDir Memory (Python/uvicorn temp)
+            #   /var/cache              — emptyDir (package runtime cache)
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           ports:
@@ -231,6 +239,13 @@ spec:
               mountPath: /app/backend/data
             - name: static-rw
               mountPath: /app/backend/open_webui/static
+            # MUST-6 fix (v2.24.1): emptyDir mounts for tmpfs paths required by
+            # readOnlyRootFilesystem:true. Matches Compose tmpfs config
+            # (docker-compose.yml:554-555).
+            - name: tmp
+              mountPath: /tmp
+            - name: var-cache
+              mountPath: /var/cache
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -240,6 +255,15 @@ spec:
         # initContainer before the main container starts.
         - name: static-rw
           emptyDir: {}
+        # MUST-6 fix (v2.24.1): emptyDir for /tmp and /var/cache required by
+        # readOnlyRootFilesystem:true. Matches Compose tmpfs (docker-compose.yml:554-555).
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+        - name: var-cache
+          emptyDir:
+            sizeLimit: 32Mi
 ---
 {{- if .Values.openWebui.persistence.enabled }}
 apiVersion: v1

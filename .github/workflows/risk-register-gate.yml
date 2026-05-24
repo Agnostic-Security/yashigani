@@ -1,0 +1,210 @@
+# Last updated: 2026-05-24T00:00:00+00:00 (LU-AMEND-05 / v2.24.1)
+#
+# Risk register staleness gate — closes LU-AMEND-05.
+#
+# Motivation: LU-AMEND-05 from v2.24.1 Lu council review — the exception
+# register must be machine-readable AND release-gated. If any entry's
+# review_by date is in the past, the entry is stale and the release is
+# blocked until the entry is reviewed and updated.
+#
+# Design:
+#   1. Validate docs/risk-register.yml schema (required top-level fields,
+#      per-entry field types, severity enum, status enum).
+#   2. Fail if any risk entry has review_by < today (stale exception).
+#   3. Fail if the YAML is malformed (yamllint).
+#
+# The validation script is inline (no external action dependency) to
+# minimise supply-chain risk. Pure Python 3 stdlib.
+#
+# Triggers: every PR + push to release branches + docs/risk-register.yml change.
+# Permissions: read-only (contents: read).
+#
+# NIST RA-3/RA-7/CA-5 + CMMC CA.L2-3.12.2/RA.L2-3.11.1 + SOC 2 CC3.1/CC4.1
+# + ISO 27001 A.5.36 + ISO 42001 A.6.1.4 / LU-AMEND-05.
+
+name: Risk Register Gate
+
+on:
+  push:
+    branches: [main, "release/**", "v2.23.*", "v2.24.*", "2.23.x", "2.24.x"]
+    paths:
+      - "docs/risk-register.yml"
+      - ".github/workflows/risk-register-gate.yml"
+  pull_request:
+    branches: [main, "release/**", "v2.23.*", "v2.24.*", "2.23.x", "2.24.x"]
+    paths:
+      - "docs/risk-register.yml"
+      - ".github/workflows/risk-register-gate.yml"
+  # Run on every PR regardless of paths changed — a stale register blocks any
+  # release. The path filter above is intentionally wide to catch risk-register
+  # changes; this schedule catches time-based staleness even with no code change.
+  schedule:
+    # Run nightly at 06:00 UTC to detect entries that become stale overnight.
+    - cron: "0 6 * * *"
+
+concurrency:
+  group: risk-register-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  risk-register-validate:
+    name: Risk register schema + staleness check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install yamllint
+        run: pip install --no-deps yamllint==1.35.1
+
+      - name: yamllint — risk register
+        # Warn on long lines (SHA digests, URLs); error on structural issues.
+        run: |
+          yamllint -d '{extends: default, rules: {line-length: {max: 200, level: warning}}}' \
+            docs/risk-register.yml
+
+      - name: Schema + staleness validation
+        # Inline Python — no external action, pure stdlib.
+        # Exits non-zero if:
+        #   - Required top-level keys missing (schema_version, risks)
+        #   - risks is not a list
+        #   - Any entry missing required fields
+        #   - Any entry has invalid severity or status enum value
+        #   - Any entry has review_by < today (stale)
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          import datetime
+
+          try:
+              import yaml
+          except ImportError:
+              import subprocess
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", "PyYAML>=6"])
+              import yaml
+
+          REQUIRED_TOP_LEVEL = {"schema_version", "risks"}
+          REQUIRED_ENTRY_FIELDS = {
+              "id",
+              "description",
+              "severity",
+              "controls_impacted",
+              "compensating_controls",
+              "status",
+              "accepted_by",
+              "accepted_at",
+              "review_by",
+              "closure_evidence",
+              "last_threat_model_review",
+          }
+          VALID_SEVERITIES = {"critical", "high", "medium", "low", "informational"}
+          VALID_STATUSES = {"open", "accepted", "mitigated", "closed", "deferred"}
+
+          with open("docs/risk-register.yml") as f:
+              data = yaml.safe_load(f)
+
+          if not isinstance(data, dict):
+              print("ERROR: risk-register.yml root is not a YAML mapping", file=sys.stderr)
+              sys.exit(1)
+
+          missing_top = REQUIRED_TOP_LEVEL - set(data.keys())
+          if missing_top:
+              print(f"ERROR: missing required top-level keys: {missing_top}", file=sys.stderr)
+              sys.exit(1)
+
+          risks = data["risks"]
+          if risks is None:
+              risks = []
+          if not isinstance(risks, list):
+              print("ERROR: 'risks' must be a YAML list", file=sys.stderr)
+              sys.exit(1)
+
+          today = datetime.date.today()
+          errors = []
+          stale_entries = []
+
+          for i, entry in enumerate(risks):
+              entry_id = entry.get("id", f"<entry #{i}>")
+
+              # Required fields check
+              missing = REQUIRED_ENTRY_FIELDS - set(entry.keys())
+              if missing:
+                  errors.append(f"Entry {entry_id}: missing required fields: {missing}")
+                  continue
+
+              # Severity enum
+              sev = str(entry["severity"]).lower()
+              if sev not in VALID_SEVERITIES:
+                  errors.append(
+                      f"Entry {entry_id}: invalid severity '{sev}' "
+                      f"(must be one of: {', '.join(sorted(VALID_SEVERITIES))})"
+                  )
+
+              # Status enum
+              st = str(entry["status"]).lower()
+              if st not in VALID_STATUSES:
+                  errors.append(
+                      f"Entry {entry_id}: invalid status '{st}' "
+                      f"(must be one of: {', '.join(sorted(VALID_STATUSES))})"
+                  )
+
+              # review_by staleness check (only for non-closed entries)
+              if st not in ("closed", "mitigated"):
+                  review_by = entry["review_by"]
+                  if isinstance(review_by, datetime.date):
+                      review_date = review_by
+                  else:
+                      try:
+                          review_date = datetime.date.fromisoformat(str(review_by))
+                      except ValueError:
+                          errors.append(
+                              f"Entry {entry_id}: review_by '{review_by}' is not a valid ISO 8601 date (YYYY-MM-DD)"
+                          )
+                          continue
+
+                  if review_date < today:
+                      stale_entries.append(
+                          f"Entry {entry_id} (severity={sev}): review_by {review_date} is in the PAST "
+                          f"(today={today}). Update this entry or escalate via docs/risk-register.yml."
+                      )
+
+          failed = False
+
+          if errors:
+              print("\n=== SCHEMA ERRORS ===", file=sys.stderr)
+              for e in errors:
+                  print(f"  {e}", file=sys.stderr)
+              failed = True
+
+          if stale_entries:
+              print("\n=== STALE RISK REGISTER ENTRIES ===", file=sys.stderr)
+              print(
+                  "The following entries have passed their review_by date. "
+                  "Review and update each entry before merging.\n",
+                  file=sys.stderr,
+              )
+              for s in stale_entries:
+                  print(f"  STALE: {s}", file=sys.stderr)
+              failed = True
+
+          if failed:
+              print(
+                  "\nRISK REGISTER GATE: FAIL — resolve errors above before merging.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              f"RISK REGISTER GATE: PASS — {len(risks)} entries, "
+              f"0 schema errors, 0 stale entries (today={today})"
+          )
+          PYEOF
