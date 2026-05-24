@@ -542,20 +542,36 @@ risks:
   - Both langflow + letta have OPENAI_API_BASE=http://gateway:8080/v1 (calls go via gateway)
   - cap_drop:ALL + read_only:true on agent containers (post-RCE pivot harder)
   - Caddy is the auth perimeter (feedback_caddy_is_the_auth_perimeter)
-  status: accepted
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-08-22
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
-  forward_close_plan:
-    target_release: v2.24.2-or-v2.25.0
-    planned_controls:
-    - K8s NetworkPolicy denying agent→agent direct connect on data plane (UA-10)
-    - Compose per-agent bridge OR explicit denial of agent→agent on data bridge
-    - Ava adversarial-probe log demonstrating residual gap (A2)
+  closure_evidence:
+  - rationale: "Per-agent bridge isolation (Compose): langflow moves to langflow_isolated, letta
+      to letta_isolated, openclaw to openclaw_isolated. Gateway joins all three isolated
+      bridges for the registered-upstream dispatch path. Agents cannot resolve peer
+      agents by DNS (Docker DNS is scoped to shared-network members only). L2 bridge
+      segmentation severs direct TCP at the kernel level. Laura's attack chain
+      (langflow RCE → curl letta:8283 → curl openclaw:18789) fails: DNS resolution
+      returns NXDOMAIN; TCP connect times out. letta-pgbouncer straddles letta_isolated
+      + data (documented exception: TLS sidecar only, cannot resolve langflow/openclaw).
+      Chained-agent feature (@Scout→@Julietta→@qwen per CHANGELOG:735) preserved:
+      calls route openclaw→gateway→letta via OPENAI_API_BASE, not direct bridge."
+    commit: PENDING_SHA
+    test: testing_runs/captain_ua10_isolation_20260524/
+  - rationale: "K8s NetworkPolicy (Helm): per-agent ingress policies (allow-langflow-ingress,
+      allow-letta-ingress, allow-openclaw-ingress) restrict inbound to gateway-only
+      using yashigani.io/bundle label selector. Per-agent egress policies restrict
+      outbound to gateway:8080 + postgres:5432 (letta sidecar) only. Gateway egress
+      policy extended with agent dispatch ports (7860/8283/18789). Agent-to-agent
+      egress hits default-deny-egress. helm lint PASS, helm template renders all 6
+      new NetworkPolicy objects."
+    commit: PENDING_SHA
+    test: testing_runs/captain_ua10_isolation_20260524/helm-lint.log
+  last_threat_model_review: 2026-05-24
   source_grep: internal-docs/yashigani/synthesis-v241-agent-infrastructure-council.md:36-47
   original_lu_status: accepted_known_residual
+  ua10_accelerated: "Tiago directive 2026-05-24 — accelerated from v2.24.2 to v2.24.1"
 - id: HELD-NICO-V241-001
   description: caddy_client.key mounted into all agent containers via wholesale ./secrets mount; letta UID 0 can
     read 0640, forge SPIFFE identity for Caddy.

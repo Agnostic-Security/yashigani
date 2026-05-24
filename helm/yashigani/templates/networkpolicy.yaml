@@ -111,7 +111,8 @@ spec:
           port: 8081
 
 ---
-# Gateway egress — allow outbound to policy, redis, budget-redis, ollama, postgres (via pgbouncer), OTEL
+# Gateway egress — allow outbound to policy, redis, budget-redis, ollama, postgres (via pgbouncer), OTEL,
+# and agent bundle pods (registered-upstream dispatch path; YSG-RISK-055 UA-10).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -182,6 +183,39 @@ spec:
       ports:
         - protocol: TCP
           port: 4317
+    # YSG-RISK-055 UA-10 (v2.24.1): gateway egress to agent bundle pods.
+    # Gateway must be able to reach each agent on its registered port for
+    # the registered-upstream dispatch path. These are the same ports that
+    # allow-agent-bundle-ingress permits as ingress to agent pods.
+    # Per-agent ingress policies (below) restrict WHICH pods can reach each
+    # agent — only gateway is permitted as source; agent-to-agent is denied.
+    {{- if .Values.agentBundles.langflow.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "langflow"
+      ports:
+        - protocol: TCP
+          port: 7860
+    {{- end }}
+    {{- if .Values.agentBundles.letta.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "letta"
+      ports:
+        - protocol: TCP
+          port: 8283
+    {{- end }}
+    {{- if .Values.agentBundles.openclaw.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "openclaw"
+      ports:
+        - protocol: TCP
+          port: 18789
+    {{- end }}
 
 ---
 # Backoffice — accept ingress from caddy / nginx-ingress only
@@ -1123,4 +1157,196 @@ spec:
         - protocol: TCP
           port: 5432
 {{- end }}{{- /* mtls.enabled */ -}}
+
+---
+# YSG-RISK-055 UA-10: per-agent isolation NetworkPolicies (v2.24.1).
+#
+# INGRESS: each agent accepts inbound ONLY from gateway — not from peer agents.
+# EGRESS: each agent may call gateway:8080 (LLM dispatch) and postgres:5432
+#         (letta via sidecar pgbouncer). Agent→agent egress is NOT permitted
+#         by any rule below; the default-deny-egress catches any attempt.
+#
+# Design note: allow-agent-bundle-ingress (above) is a broad rule that permits
+# gateway→ANY agent-bundle pod. The per-agent rules below REPLACE that broad
+# rule's semantic for each agent with a strict per-agent ingress policy that
+# also explicitly narrows the source to gateway-only. Both rules coexist —
+# the per-agent ingress rules narrow the effective ingress surface.
+# The egress rules complement allow-agent-bundle-egress by being per-agent
+# rather than bundle-wide, enabling future per-agent tightening.
+
+{{- if .Values.agentBundles.langflow.enabled }}
+---
+# Langflow ingress — gateway ONLY (YSG-RISK-055 UA-10).
+# No peer agent may initiate a connection to langflow.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-langflow-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: "langflow"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 7860
+
+---
+# Langflow egress — gateway:8080 only + DNS.
+# Langflow has no direct DB access; all LLM calls route through gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-langflow-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: "langflow"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
+
+{{- if .Values.agentBundles.letta.enabled }}
+---
+# Letta ingress — gateway ONLY (YSG-RISK-055 UA-10).
+# No peer agent may initiate a connection to letta.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-letta-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: "letta"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 8283
+
+---
+# Letta egress — gateway:8080 + postgres:5432 (for letta-pgbouncer sidecar) + DNS.
+# In K8s, the letta-pgbouncer sidecar shares the pod network namespace and
+# its egress to postgres is governed by the letta pod's NetworkPolicy.
+# The letta application container itself connects only to 127.0.0.1:5432 (sidecar
+# loopback — not governed by NetworkPolicy in standard K8s).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-letta-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: "letta"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+    # letta-pgbouncer sidecar egress to postgres (sidecar runs in pod netns)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+
+{{- if .Values.agentBundles.openclaw.enabled }}
+---
+# OpenClaw ingress — gateway ONLY (YSG-RISK-055 UA-10).
+# No peer agent may initiate a connection to openclaw.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-openclaw-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: "openclaw"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 18789
+
+---
+# OpenClaw egress — gateway:8080 + external HTTPS (webhook channels) + DNS.
+# External egress is necessary for openclaw's messaging channel integrations
+# (Slack, Telegram outbound webhooks). allow-openclaw-external-egress (above)
+# covers the broad HTTPS egress; this rule covers the gateway dispatch path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-openclaw-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: "openclaw"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+    # External messaging channel webhooks (Slack, Telegram, etc.)
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+{{- end }}
+
 {{- end }}{{- /* networkPolicies.enabled */ -}}

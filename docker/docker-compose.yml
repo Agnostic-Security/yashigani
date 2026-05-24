@@ -1,5 +1,6 @@
 ---
-# Yashigani v2.23.4 — Docker Compose stack
+# Yashigani v2.24.1 — Docker Compose stack
+# Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
 # Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
 # Last updated: 2026-05-20T10:50:00+01:00 (fix(compose): AGENT-RUNTIME-003c drop sslmode=require from LETTA_PG_URI — pg8000 alembic path)
 # Last updated: 2026-05-20T10:30:00+01:00 (fix(compose): AGENT-RUNTIME-003b drop cd /tmp from letta shim + langflow ALEMBIC_LOG_TO_STDOUT)
@@ -301,9 +302,16 @@ services:
     # EX-231-10: gateway joins caddy_internal (Caddy→gateway:8080) AND data
     # (gateway→redis, policy, ollama, pgbouncer outbound).
     # Does NOT join obs or edge.
+    # YSG-RISK-055 UA-10: gateway also joins all per-agent isolated bridges so
+    # it can reach each agent on the registered-upstream dispatch path.
+    # Agents cannot reach each other via these bridges (each bridge has only
+    # the agent service + gateway as members).
     networks:
       - caddy_internal
       - data
+      - langflow_isolated
+      - letta_isolated
+      - openclaw_isolated
 
   # ---------------------------------------------------------------------------
   # Backoffice — Admin control plane (generates first-run credentials)
@@ -1615,10 +1623,14 @@ services:
     # See: cap_drop+CAP_DAC_OVERRIDE doc note (compose lines 587-591 budget-redis).
     group_add:
       - "2002"
-    # EX-231-10: langflow calls gateway via http://gateway:8080/v1 (same as
-    # open-webui). Joins `data` for gateway DNS. Does NOT join caddy_internal.
+    # YSG-RISK-055 UA-10 (v2.24.1): langflow moves from `data` to
+    # `langflow_isolated`. Gateway joins langflow_isolated so langflow can still
+    # resolve `gateway` by DNS and route LLM calls via OPENAI_API_BASE.
+    # langflow CANNOT resolve letta or openclaw by DNS — they are not members
+    # of this bridge. Direct peer-to-peer TCP access is severed at L2.
+    # Does NOT join caddy_internal (auth HELD per synthesis §2.5).
     networks:
-      - data
+      - langflow_isolated
     profiles:
       - langflow
 
@@ -1699,9 +1711,15 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
-    # EX-231-10: letta-pgbouncer is a data-plane dep; sits on `data` network
-    # alongside postgres and letta.
+    # YSG-RISK-055 UA-10 (v2.24.1): letta-pgbouncer straddles letta_isolated
+    # and data. It needs letta_isolated so letta can resolve letta-pgbouncer
+    # by DNS for the LETTA_PG_URI postgresql://...@letta-pgbouncer:5432/letta
+    # connection. It needs data to dial postgres:5432 upstream (postgres lives
+    # on data). This is a deliberate and documented exception — pgbouncer is
+    # a session-mode TLS sidecar, not an agent. It cannot resolve langflow or
+    # openclaw (they are on their own isolated bridges, not data).
     networks:
+      - letta_isolated
       - data
     profiles:
       - letta
@@ -1793,9 +1811,12 @@ services:
     # yashigani_internal_bearer as file owner (host file chowned 0:2002 0640).
     # cap_drop:[ALL] drops DAC_OVERRIDE — UID 0 == file UID 0, so owner-read
     # applies without needing DAC_OVERRIDE. GID 2002 removed from this service.
-    # EX-231-10: letta calls gateway + postgres, both on `data`.
+    # YSG-RISK-055 UA-10 (v2.24.1): letta moves from `data` to `letta_isolated`.
+    # Gateway joins letta_isolated for dispatch. letta-pgbouncer also joins
+    # letta_isolated so letta can reach it via DNS (letta-pgbouncer:5432).
+    # letta CANNOT resolve langflow or openclaw — they are on separate bridges.
     networks:
-      - data
+      - letta_isolated
     profiles:
       - letta
 
@@ -1858,9 +1879,15 @@ services:
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (openclaw profile).
     # No cap_add: openclaw binds port 18789 (non-privileged).
     cap_drop: [ALL]
-    # EX-231-10: openclaw calls gateway (data) + needs internet for webhooks (edge).
+    # YSG-RISK-055 UA-10 (v2.24.1): openclaw moves from `data` to
+    # `openclaw_isolated`. Gateway joins openclaw_isolated for dispatch.
+    # openclaw CANNOT resolve langflow or letta — they are on separate bridges.
+    # `edge` retained: openclaw needs internet egress for messaging channel
+    # webhooks (Slack, Telegram inbound POST to :18789). This was the original
+    # EX-231-10 rationale. openclaw_isolated is internal:true (no host-external
+    # DNS from that bridge); edge provides the internet path.
     networks:
-      - data
+      - openclaw_isolated
       - edge      # Port 18789 must be reachable by messaging channel webhooks
     profiles:
       - openclaw
@@ -2201,3 +2228,22 @@ networks:
     internal: true
     # Observability-plane: prometheus, grafana, loki, alertmanager,
     # otel-collector, jaeger. Caddy joins to proxy /admin/grafana etc.
+  # YSG-RISK-055 UA-10: per-agent isolated bridges (v2.24.1).
+  # Each agent lives on its own bridge. Gateway joins all three for the
+  # registered-upstream dispatch path. Agents CANNOT reach each other
+  # directly — L2 bridge segmentation enforces this at the kernel level.
+  # letta-pgbouncer also joins `data` (straddling) because it must reach
+  # postgres on the data network. This is documented as a deliberate
+  # exception: letta-pgbouncer is a session-mode TLS sidecar, not an
+  # agent container. Its exposure is limited to the postgres port only
+  # and it cannot resolve langflow/openclaw by DNS (they are not members
+  # of the `data` bridge under this design).
+  langflow_isolated:
+    driver: bridge
+    internal: true
+  letta_isolated:
+    driver: bridge
+    internal: true
+  openclaw_isolated:
+    driver: bridge
+    internal: true
