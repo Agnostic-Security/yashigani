@@ -8,6 +8,17 @@ WORK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
 FAIL=0
 
+# Source FIPS helpers — manifest build is an integrity-verification path
+# (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2 directive 2026-05-24).
+# shellcheck source=../lib/yashigani-fips.sh
+if [[ -f "${WORK_DIR}/lib/yashigani-fips.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${WORK_DIR}/lib/yashigani-fips.sh"
+else
+  echo "  SKIP: lib/yashigani-fips.sh not found — test cannot run" >&2
+  exit 1
+fi
+
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
@@ -62,12 +73,13 @@ else
   # Build manifest
   MANIFEST="${TESTBAK}/MANIFEST.sha256"
   SIG="${TESTBAK}/MANIFEST.sha256.sig"
+  # _fips_sha256_manifest_stream routes through OpenSSL FIPS Provider when FIPS_MODE=1
+  # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
   (
     cd "${TESTBAK}" && \
     find . -type f ! -name 'MANIFEST.sha256' ! -name 'MANIFEST.sha256.sig' -print0 | \
       sort -z | \
-      xargs -0 sha256sum | \
-      awk '{gsub(/^\.\//,"", $2); print}' > MANIFEST.sha256
+      _fips_sha256_manifest_stream > MANIFEST.sha256
   )
   chmod 0400 "${MANIFEST}"
 
@@ -108,12 +120,13 @@ else
   # runs detect_runtime() at the bottom which calls docker/podman. Write a
   # dedicated helper that sources only the functions we need via awk extraction.
   chmod u+w "${MANIFEST}" "${SIG}" 2>/dev/null || true
+  # _fips_sha256_manifest_stream routes through OpenSSL FIPS Provider when FIPS_MODE=1
+  # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
   (
     cd "${TESTBAK}" && \
     find . -type f ! -name 'MANIFEST.sha256' ! -name 'MANIFEST.sha256.sig' -print0 | \
       sort -z | \
-      xargs -0 sha256sum | \
-      awk '{gsub(/^\.\//,"", $2); print}' > MANIFEST.sha256
+      _fips_sha256_manifest_stream > MANIFEST.sha256
   )
   chmod 0400 "${MANIFEST}"
   openssl dgst -sha256 -sign "${CA_KEY}" -out "${SIG}" "${MANIFEST}" 2>/dev/null

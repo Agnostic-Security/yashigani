@@ -172,16 +172,29 @@ detect_runtime() {
 # ---------------------------------------------------------------------------
 check_deps() {
   local missing=0
-  for cmd in python3 zstd sha256sum tar; do
+  for cmd in python3 zstd tar; do
     command -v "$cmd" >/dev/null 2>&1 || { warn "Missing required tool: ${cmd}"; missing=1; }
   done
-  # macOS: shasum -a 256 instead of sha256sum
-  if ! command -v sha256sum >/dev/null 2>&1 && command -v shasum >/dev/null 2>&1; then
-    SHA256CMD="shasum -a 256"
-  else
-    SHA256CMD="sha256sum"
+  # Require either sha256sum or shasum for non-FIPS path; openssl is always needed
+  # for FIPS path (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    if ! command -v openssl >/dev/null 2>&1; then
+      warn "Neither sha256sum/shasum nor openssl found — bundle hash cannot be computed"
+      missing=1
+    fi
   fi
   [[ "$missing" -eq 0 ]] || err "Install missing tools then retry"
+
+  # Source FIPS helpers (bundle hash is an integrity-verification path).
+  local _script_dir
+  _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=../lib/yashigani-fips.sh
+  if [[ -f "${_script_dir}/../lib/yashigani-fips.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${_script_dir}/../lib/yashigani-fips.sh"
+  else
+    err "lib/yashigani-fips.sh not found alongside scripts/ — cannot compute FIPS-compliant bundle hash"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -626,9 +639,10 @@ print('unknown')
     || err "Failed to create bundle at ${bundle_path}"
   ok "Bundle created: ${bundle_path}"
 
-  # Compute bundle SHA256
+  # Compute bundle SHA256 — routes through OpenSSL FIPS Provider when FIPS_MODE=1
+  # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
   local bundle_sha
-  bundle_sha="$(${SHA256CMD} "${bundle_path}" | awk '{print $1}')"
+  bundle_sha="$(_fips_sha256 "${bundle_path}")"
   ok "Bundle SHA256: ${bundle_sha}"
 
   # Write sidecar manifest

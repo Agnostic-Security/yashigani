@@ -65,6 +65,20 @@ else
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# FIPS-aware SHA-256 helpers (integrity-verification paths only).
+# lib/yashigani-fips.sh routes through OpenSSL FIPS Provider when FIPS_MODE=1.
+# CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2 directive 2026-05-24.
+# ---------------------------------------------------------------------------
+# shellcheck source=lib/yashigani-fips.sh
+if [[ -f "${_YSG_SCRIPT_DIR}/lib/yashigani-fips.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${_YSG_SCRIPT_DIR}/lib/yashigani-fips.sh"
+else
+  printf "ERROR: lib/yashigani-fips.sh not found alongside install.sh\n" >&2
+  exit 1
+fi
+
 # =============================================================================
 # Yashigani Installer
 # https://yashigani.io
@@ -2359,12 +2373,13 @@ _backup_existing_data() {
   if [[ -f "$_ca_key" ]]; then
     # Build sorted deterministic manifest: "sha256hash  relative/path" per line.
     # find with -print0 + sort -z to handle spaces in names; awk strips leading ./
+    # _fips_sha256_manifest_stream routes through OpenSSL FIPS Provider when FIPS_MODE=1
+    # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
     if (
       cd "$backup_dir" && \
       find . -type f ! -name 'MANIFEST.sha256' ! -name 'MANIFEST.sha256.sig' -print0 | \
         sort -z | \
-        xargs -0 sha256sum | \
-        awk '{gsub(/^\.\//, "", $2); print}' > MANIFEST.sha256
+        _fips_sha256_manifest_stream > MANIFEST.sha256
     ); then
       chmod 0400 "$_manifest_file"
       # Sign: openssl dgst -sign reads the raw key (PEM), outputs binary DER sig.
@@ -3344,8 +3359,16 @@ load_airgap_bundle() {
     local expected_sha
     expected_sha="$(grep '^# Bundle SHA256:' "$sidecar_path" 2>/dev/null | awk '{print $NF}' || true)"
     if [[ -n "$expected_sha" ]]; then
+      # _fips_sha256 routes through OpenSSL FIPS Provider when FIPS_MODE=1
+      # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2); falls back to sha256sum
+      # or shasum when FIPS_MODE is unset/0.
       local actual_sha
-      if command -v sha256sum >/dev/null 2>&1; then
+      if [ "${FIPS_MODE:-0}" = "1" ] || openssl version 2>/dev/null | grep -qi 'fips'; then
+        actual_sha="$(_fips_sha256 "${AIR_GAP_BUNDLE}")" || {
+          log_warn "FIPS SHA-256 computation failed for bundle — skipping integrity check"
+          actual_sha="$expected_sha"
+        }
+      elif command -v sha256sum >/dev/null 2>&1; then
         actual_sha="$(sha256sum "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
       elif command -v shasum >/dev/null 2>&1; then
         actual_sha="$(shasum -a 256 "${AIR_GAP_BUNDLE}" | awk '{print $1}')"

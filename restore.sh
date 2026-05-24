@@ -23,6 +23,20 @@ else
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# FIPS-aware SHA-256 helpers (integrity-verification paths only).
+# lib/yashigani-fips.sh routes through OpenSSL FIPS Provider when FIPS_MODE=1.
+# CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2 directive 2026-05-24.
+# ---------------------------------------------------------------------------
+# shellcheck source=lib/yashigani-fips.sh
+if [[ -f "${_YSG_RESTORE_SCRIPT_DIR}/lib/yashigani-fips.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${_YSG_RESTORE_SCRIPT_DIR}/lib/yashigani-fips.sh"
+else
+  printf "ERROR: lib/yashigani-fips.sh not found alongside restore.sh\n" >&2
+  exit 1
+fi
+
 # Tight umask so any files/dirs created during restore inherit 0600/0700.
 # Overrides the host default (often 022) which would leave intermediate
 # artefacts (pre-restore snapshots, temp extractions) world-readable.
@@ -412,7 +426,9 @@ validate_backup() {
             _hash_errors=$((_hash_errors + 1))
           else
             local _actual_hash
-            _actual_hash=$(sha256sum "$_fpath" | awk '{print $1}')
+            # _fips_sha256 routes through OpenSSL FIPS Provider when FIPS_MODE=1
+            # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
+            _actual_hash=$(_fips_sha256 "$_fpath")
             if [[ "$_actual_hash" != "$_hash" ]]; then
               log_error "RETRO-R4-3: Manifest hash mismatch for ${_relpath} (expected ${_hash}, got ${_actual_hash})"
               _hash_errors=$((_hash_errors + 1))
