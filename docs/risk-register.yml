@@ -467,12 +467,13 @@ risks:
   - SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role
   - Dedicated 0640 UID 70 mount
   - Documented at docs/yashigani_install_config.md §6.1
+  - Compose-Helm auth_query parity uniform (drift #8 closed v2.24.1 — auth_file removed from compose main ini)
   status: accepted
   accepted_by: Tiago
   accepted_at: 2026-05-21
   review_by: 2026-08-22
   closure_evidence: null
-  last_threat_model_review: 2026-05-22
+  last_threat_model_review: 2026-05-24
   source_grep: CHANGELOG.md:393,531
   original_lu_status: accepted_known_residual
 - id: YSG-RISK-050

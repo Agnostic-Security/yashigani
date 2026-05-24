@@ -45,7 +45,38 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
   Redis key: `yashigani:rl:user:<hashed_user_id>` (DB 2, same namespace as other RL buckets).
 
+- **feat(auth): server-side next= redirect validator** (CHANGELOG drift audit finding #6):
+  `GET /auth/post-login-redirect?next=<value>` closes the gap where the open-redirect
+  backslash bypass guard existed only in the JS layer (`login.js:safeNext()`).
+  The server-side validator enforces the same rules at the HTTP trust boundary:
+  - Relative path starting with `/` required
+  - `//` and `/\` blocked (protocol-relative / IE-Edge backslash normalisation)
+  - Any `\` anywhere blocked
+  - Absolute URL schemes (`https:`, `http:`, `javascript:`, etc.) blocked
+  - `@` blocked (URL-userinfo trick)
+  - Length capped at 2 048 characters
+  On rejection: redirects to `/` + emits `OPEN_REDIRECT_ATTEMPT_BLOCKED` audit event
+  with SHA-256-hashed source IP and truncated+sanitised attempted value.
+  `login.js` updated to route through the server-side endpoint after JS `safeNext()`
+  pre-flight (defence-in-depth — both guards stay).
+  New event type: `OPEN_REDIRECT_ATTEMPT_BLOCKED`.
+  Test suite: `src/tests/unit/test_next_redirect_validator.py` (25 cases).
+  ASVS V5.1.5 / CWE-601 / OWASP A01:2021.
+
 ### Fixed
+- **fix(pgbouncer): restore compose-Helm auth_query parity** (CHANGELOG drift audit finding #8):
+  `docker/pgbouncer/pgbouncer.ini` had an explicit `auth_file = /etc/pgbouncer/userlist.txt`
+  directive that `helm/yashigani/files/pgbouncer.ini` did not (Iris §5 removed it in v2.24.0).
+  The directive was redundant — pgbouncer 1.25.1 defaults to `/etc/pgbouncer/userlist.txt` when
+  `auth_file` is absent, and the edoburu image pre-creates that path. Both INIT-003 wrapper paths
+  (compose + Helm) continue to write `userlist.txt` via `DATABASE_URL` so the `auth_user`
+  (pgbouncer_authenticator) credential is available for the `auth_query` postgres leg.
+  Verified: pgbouncer 1.25.1 starts cleanly without the directive (no auth_file-related
+  warnings in startup logs). New contract test `tests/contracts/test_pgbouncer_auth_parity.py`
+  (20 cases) asserts compose-Helm parity across all four ini files for `auth_query`, `auth_user`,
+  `auth_dbname`, `auth_type`, and `auth_file` presence/absence. 20/20 PASS.
+  YSG-RISK-049 compensating-controls note updated in risk-register.yml.
+
 - **DDoSProtector wire-up** (CHANGELOG drift audit finding #2): `DDoSProtector` was
   instantiated in `entrypoint.py` and wired into both `configure_openai_router()` and
   `create_gateway_app()`. Previously the class existed but was never instantiated, making
@@ -699,7 +730,7 @@ Theme: **Security Hardening + Supply-Chain Controls + ASVS L3 92% + Agentic AI O
 
 ### Security
 
-- **XFF spoofing** — Caddy strips and re-sets `X-Forwarded-For` at the edge; rate limiting and audit logging now bind to the Caddy-observed address, not caller-supplied headers.
+- **XFF spoofing** — Right-to-left `X-Forwarded-For` chain-walk in application code (`gateway/proxy.py:_get_client_ip`) skips trusted-proxy CIDRs and stops at the first non-trusted hop; rate limiting and audit logging bind to the resolved client address, not caller-supplied headers. **Operators MUST set `TRUSTED_PROXY_CIDRS`** in the gateway environment to include their proxy/load-balancer CIDR range — the default trust boundary is loopback only. The CHANGELOG previously stated "Caddy strips and re-sets XFF" which was inaccurate; the defence is in app code, not Caddy config. See `docs/security/xff-trust-boundary.md`.
 - **Rate limiter fail-closed default** — `RATE_LIMITER_FAIL_MODE` now defaults to `closed`; Redis errors produce `HTTP 503` + `Retry-After: 5` rather than silent allow-through. Fail-open opt-in is documented for operators who need it. Customer-facing recovery message included.
 - **Login throttle `Retry-After` header** — RFC 6585-compliant `Retry-After` on 429/401 throttle responses; closes the locked-out operator information gap deferred from v2.23.1.
 - **OPA and Jaeger mTLS** — Both services now require mutual TLS in Docker Compose and Kubernetes Helm deployments; plaintext access from the data plane is no longer possible.
@@ -776,7 +807,7 @@ Theme: **Core-Plane mTLS + Two-Tier PKI + Release Hardening**.
 - PKI trust-store mounts aligned per library compatibility (libssl-direct services use root anchor; partial-chain-capable services use intermediate; root private key never enters a workload container)
 
 ### Security
-- PCI-compliant password expiry profile (≤90 days) selectable via `YASHIGANI_PASSWORD_MAX_AGE_DAYS=pci`
+- PCI-compliant password expiry profile (≤90 days) selectable via `YASHIGANI_PROFILE=pci`. `YASHIGANI_PASSWORD_MAX_AGE_DAYS` is a separate integer override (e.g. `YASHIGANI_PASSWORD_MAX_AGE_DAYS=90`); setting it to the string `pci` raises `ValueError` at runtime — use `YASHIGANI_PROFILE=pci` instead. See `docs/operator-guide.md §4`.
 - Auth-throttle admin self-visibility — authenticated admins see own + all throttled/blocked IPs at `/admin → Security → Blocked IPs` (backed by `/auth/blocked-ips`). Unauthenticated locked-out operator path (RFC 6585 `Retry-After` on login) deferred to v2.23.2.
 - **YSG-RISK-001 (CWE-89, HIGH)** — replaced SQL f-string interpolation in `scripts/partition_maintenance.py` with safe identifier quoting (`_quote_ident()`, allowlist `[a-zA-Z_][a-zA-Z0-9_]*`). Date literals in the `PARTITION OF … FOR VALUES FROM … TO …` DDL clause are formatted via `date.isoformat()` (deterministic `YYYY-MM-DD`); asyncpg / PostgreSQL do not accept bind parameters in DDL parser positions. The date values are derived from Python `date` arithmetic, never from user input. ACS v3 dogfood scan finding `acs-v3-sql-string-concat-exec`. Closing commits `75536a5` (identifier quoting) + `af114f7` (DDL date-literal exception; internal re-audit YCS-20260502-v2.23.1-CWE89-reaudit-001 PASS).
 - **YSG-RISK-002 (CWE-89, MEDIUM)** — replaced `op.execute(f"DROP TABLE IF EXISTS {name}")` in Alembic migration `0003_prepartition_audit_2026_2027.py` with `op.drop_table()` native API. Closing commit `9d867be`.
@@ -800,7 +831,7 @@ Theme: OPA on /v1, Agent Personas, Fail2ban, IP Access Control, OWASP Compliance
 
 ### Added
 - OPA policy enforcement on **all** `/v1/chat/completions` traffic (request + response paths, fail-closed)
-- Agent personas with chaining: **Lala** (Langflow), **Julietta** (Letta), **Scout** (OpenClaw); `@Scout` → `@Julietta` → `@qwen` syntax; `@Help` chaining guide
+- Agent personas with chaining: **Lala** (Langflow), **Julietta** (Letta), **Scout** (OpenClaw); `@Scout` → `@Julietta` → `@qwen` syntax (model strings starting with `@` are resolved as agent names in the registry)
 - Fail2ban-style auth throttle: per-IP (3 failures) + global (5 failures), ×5 escalation (30s → 625m), permanent IP block after maximum
 - IP allowlist + blocklist (IPv4 / IPv6 / CIDR, admin manageable; blocklist precedence)
 - Content relay detection (agent-to-agent content laundering)
