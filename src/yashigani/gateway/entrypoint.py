@@ -349,6 +349,43 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("PII detector unavailable (%s) — PII filtering disabled", exc)
 
+    # ── v2.4.1: Pool Manager — create early so it can be wired into the
+    # OpenAI router before create_gateway_app().  Health monitor is started
+    # after the app is created (background daemon thread).
+    # Adjacent-abstraction note: _create_container() calls ContainerBackend
+    # (Docker or Podman SDK auto-detected).  If the gateway runs inside a
+    # container without socket access, create_backend() returns None →
+    # PoolManager runs in stub mode → pool-managed dispatch fails at dispatch
+    # time with pool_backend_unavailable (502).
+    pool_manager = None
+    _pool_health = None
+    try:
+        from yashigani.pool.manager import PoolManager as _PoolManager
+        from yashigani.pool.health import PoolHealthMonitor as _PoolHealthMonitor
+        from yashigani.pool.backend import create_backend as _create_backend
+
+        _container_backend = _create_backend()
+
+        # LIC-002 / GROUP-5-1: tier from cryptographically-verified license only.
+        try:
+            from yashigani.licensing.enforcer import get_license as _get_license
+            _verified_tier = _get_license().tier.value
+        except Exception:
+            _verified_tier = "community"
+
+        pool_manager = _PoolManager(
+            backend=_container_backend,
+            tier=_verified_tier,
+        )
+        _pool_health = _PoolHealthMonitor(pool_manager)
+        logger.info(
+            "Pool Manager created (tier=%s, backend=%s)",
+            _verified_tier,
+            _container_backend.name if _container_backend else "stub",
+        )
+    except Exception as exc:
+        logger.warning("Pool Manager unavailable (%s) — pool-managed dispatch disabled", exc)
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -367,6 +404,7 @@ def _build_app(mesh_mode: bool = False):
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,
         content_relay_detector=content_relay_detector,
+        pool_manager=pool_manager,
     )
 
     gateway_app = create_gateway_app(
@@ -442,34 +480,17 @@ def _build_app(mesh_mode: bool = False):
     )
     collector.start()
 
-    # ── v2.1: Pool Manager health monitor (background daemon) ─────────────
-    try:
-        from yashigani.pool.manager import PoolManager
-        from yashigani.pool.health import PoolHealthMonitor
-        from yashigani.pool.backend import create_backend
-
-        container_backend = create_backend()
-
-        # LIC-002 / GROUP-5-1: read tier from the verified LicenseState rather
-        # than the YASHIGANI_LICENSE_TIER env var. An attacker who can set env
-        # vars could elevate the pool manager to Enterprise tier without a valid
-        # license. The env var is now removed; tier comes exclusively from the
-        # cryptographically-verified license loaded at startup.
+    # ── v2.4.1: Pool Manager — attach to app state + start health monitor ──
+    # pool_manager was created above (before configure_openai_router).
+    # Attach to ASGI app state so request handlers can reach it via
+    # request.app.state.pool_manager; start the health-monitor daemon.
+    gateway_app.state.pool_manager = pool_manager
+    if pool_manager is not None and _pool_health is not None:
         try:
-            from yashigani.licensing.enforcer import get_license as _get_license
-            _verified_tier = _get_license().tier.value
-        except Exception:
-            _verified_tier = "community"
-
-        pool_manager = PoolManager(
-            backend=container_backend,
-            tier=_verified_tier,
-        )
-        pool_health = PoolHealthMonitor(pool_manager)
-        pool_health.start()
-        logger.info("Pool Manager health monitor started (daemon thread)")
-    except Exception as exc:
-        logger.warning("Pool Manager unavailable (%s) — container isolation disabled", exc)
+            _pool_health.start()
+            logger.info("Pool Manager health monitor started (daemon thread)")
+        except Exception as exc:
+            logger.warning("Pool Manager health monitor failed to start: %s", exc)
 
     return gateway_app
 

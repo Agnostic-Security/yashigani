@@ -177,6 +177,16 @@ class EventType(str, Enum):
     # or flags as weak-identity when no token was supplied.
     # ASVS V7.2.1 + NIST AU-3 + CMMC AU.L2-3.3.1.
     ONBOARD_ATTEMPTED = "ONBOARD_ATTEMPTED"
+    # v2.24.1 — LU-AMEND-03: manifest signing ceremony record.
+    # MANIFEST_CEREMONY_RECORDED: operator confirmed the manifest SHA-256 and
+    # the explicit acknowledgement was captured + signed.
+    # NIST SR-4/SR-4(3) + CMMC SR.L2-3.11.2 + ISO 27001 A.5.21/A.5.23.
+    MANIFEST_CEREMONY_RECORDED = "MANIFEST_CEREMONY_RECORDED"
+    # v2.4.1 — PoolManager container-per-identity dispatch
+    # POOL_BACKEND_UNAVAILABLE: emitted when the PoolManager or its container
+    # backend is unreachable/erroring during a pool-managed agent dispatch.
+    # Request is returned as HTTP 502 (fail-closed per SOP 1).
+    POOL_BACKEND_UNAVAILABLE = "POOL_BACKEND_UNAVAILABLE"
 
 
 # ---------------------------------------------------------------------------
@@ -1536,3 +1546,85 @@ class OnboardAttemptedEvent(AuditEvent):
     agent_name: str = ""         # agent being onboarded
     agent_url: str = ""          # upstream URL from CLI arg
     client_ip: str = ""          # caller's IP (from X-Forwarded-For or direct)
+
+# ---------------------------------------------------------------------------
+# v2.4.1 — Pool Manager events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PoolBackendUnavailableEvent(AuditEvent):
+    """
+    Emitted when the PoolManager or its container backend fails during a
+    pool-managed agent dispatch.  Request is returned as HTTP 502.
+
+    Raised both when pool_manager is None (not initialised) and when
+    get_or_create() raises an unexpected exception (socket unreachable, etc.).
+
+    v2.4.1 — container-per-identity dispatch wiring.
+    """
+
+    event_type: str = EventType.POOL_BACKEND_UNAVAILABLE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    request_id: str = ""
+    identity_id: str = ""
+    agent_name: str = ""
+    reason: str = ""  # "pool_manager_none" | exception class name
+
+
+# ---------------------------------------------------------------------------
+# v2.24.1 — LU-AMEND-03: Manifest signing ceremony record
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ManifestCeremonyEvent(AuditEvent):
+    """
+    Emitted when an operator completes a manifest signing ceremony.
+
+    The ceremony captures:
+    - The manifest SHA-256 (so the exact blob can be traced to a
+      manifest_registrations row without re-reading the raw YAML).
+    - The operator identity (sub claim from the operator token, or "unknown").
+    - The acknowledgement text shown to the operator and their explicit "Y" response.
+    - The signature_provenance JSON used for the manifest_registrations row.
+    - The resulting manifest_registrations record id.
+
+    This event is written to audit_events AND the manifest_registrations row
+    has its signature_provenance populated from the same ceremony JSON.
+    The dual-write ensures Lu can verify the ceremony occurred without having
+    to read the manifest_registrations table from audit sinks.
+
+    Security invariants (immutable floors):
+      - masking_applied is always True (operator identities are masked in
+        lower-assurance audit sinks to limit correlation risk).
+      - The raw manifest YAML blob is NEVER stored in this event — only the
+        SHA-256 digest. The full blob lives in manifest_registrations.
+      - ack_response MUST be exactly "Y" for a ceremony to succeed; anything
+        else aborts the registration. The field is stored here for forensic
+        completeness (auditors can confirm what was captured).
+
+    NIST SR-4/SR-4(3) — supply chain / component provenance traceability.
+    CMMC SR.L2-3.11.2 — use of components from trusted sources.
+    ISO 27001 A.5.21  — managing information security in the ICT supply chain.
+    ISO 27001 A.5.23  — information security for use of cloud services.
+    LU-AMEND-03 / v2.24.1.
+    """
+
+    event_type: str = EventType.MANIFEST_CEREMONY_RECORDED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True              # immutable floor
+    manifest_sha256: str = ""                 # hex SHA-256 of the YAML blob
+    operator_identity: str = ""               # sub claim from token, or "unknown"
+    confirmed_at: str = ""                    # ISO-8601 UTC timestamp of the ack
+    ack_text_shown: str = ""                  # the exact text shown to the operator
+    ack_response: str = ""                    # always "Y" for successful ceremonies
+    # Provenance summary — not the full JSON (the full JSON lives in
+    # manifest_registrations.signature_provenance). Only the algorithm name,
+    # signer SPIFFE ID, and first/last 8 chars of the HMAC sig are stored here
+    # to avoid bloating the audit log with a large signed structure.
+    signature_alg: str = ""                   # e.g. "spiffe-internal-hmac"
+    signer_spiffe_id: str = ""                # SPIFFE ID of the signing entity
+    signature_hex_prefix: str = ""            # first 16 hex chars of the HMAC sig
+    manifest_registration_id: Optional[int] = None  # FK to manifest_registrations.id

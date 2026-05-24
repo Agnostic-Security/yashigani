@@ -71,6 +71,7 @@ from yashigani.metrics.registry import _C as _metric_counter
 from yashigani.audit.schema import (
     OpaResponseCheckFailedEvent,
     PIIDetectedEvent,
+    PoolBackendUnavailableEvent,
     ResponseInjectionDetectedEvent,
     StreamTerminatedEvent,
 )
@@ -209,6 +210,8 @@ class OpenAIRouterState:
         self.opa_url: str = "https://policy:8181"
         # Content relay detection (agent-to-agent laundering)
         self.content_relay_detector = None
+        # v2.4.1 — PoolManager for container-per-identity dispatch
+        self.pool_manager = None          # PoolManager | None
         # F-T10-001: low-confidence step-up threshold.  When response-inspection
         # confidence falls below this value AND sensitivity >= CONFIDENTIAL,
         # X-Yashigani-Low-Confidence-Stepup: required is added to the response.
@@ -246,6 +249,7 @@ def configure(
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
     opa_url: str = "https://policy:8181",
     content_relay_detector=None,
+    pool_manager=None,    # v2.4.1 — PoolManager | None
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -276,6 +280,7 @@ def configure(
     _state.pii_cloud_bypass = pii_cloud_bypass
     _state.opa_url = opa_url
     _state.content_relay_detector = content_relay_detector
+    _state.pool_manager = pool_manager  # v2.4.1
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -552,9 +557,99 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         agent_name = selected_model[1:]  # strip @
         for agent in _state.agent_registry.list_all():
             if agent.get("name") == agent_name and agent.get("status") == "active":
-                agent_upstream = agent.get("upstream_url")
+                stored_url = agent.get("upstream_url", "")
                 agent_protocol = agent.get("protocol", "openai")
+
+                # v2.4.1 — Pool-managed agent: upstream_url stored as pool://<image>
+                # Resolve to a per-identity container endpoint via PoolManager.
+                if stored_url.startswith("pool://"):
+                    pool_image = stored_url[len("pool://"):]
+                    if _state.pool_manager is None:
+                        logger.error(
+                            "Pool-managed agent %s requested but PoolManager is unavailable",
+                            agent_name,
+                        )
+                        if _state.audit_writer is not None:
+                            try:
+                                _state.audit_writer.write(PoolBackendUnavailableEvent(
+                                    request_id=request_id,
+                                    identity_id=identity_id,
+                                    agent_name=agent_name,
+                                    reason="pool_manager_none",
+                                ))
+                            except Exception:
+                                pass
+                        return JSONResponse(
+                            status_code=502,
+                            content={
+                                "error": {
+                                    "message": f"Agent {selected_model} requires container pool but PoolManager is unavailable",
+                                    "type": "agent_error",
+                                    "agent": selected_model,
+                                    "code": "pool_backend_unavailable",
+                                }
+                            },
+                            headers={"X-Yashigani-Agent-Error": "true"},
+                        )
+
+                    try:
+                        from yashigani.pool.manager import PoolLimitExceeded
+                        container_info = _state.pool_manager.get_or_create(
+                            identity_id=identity_id,
+                            service_slug=agent_name,
+                            image=pool_image,
+                        )
+                        agent_upstream = f"http://{container_info.endpoint}"
+                        logger.info(
+                            "Pool dispatch: agent=%s identity=%s container=%s endpoint=%s",
+                            agent_name, identity_id,
+                            container_info.container_name, container_info.endpoint,
+                        )
+                    except PoolLimitExceeded as _ple:
+                        logger.warning(
+                            "Pool limit exceeded for identity=%s agent=%s: %s",
+                            identity_id, agent_name, _ple,
+                        )
+                        return JSONResponse(
+                            status_code=402,
+                            content={
+                                "error": "pool_limit_exceeded",
+                                "limit": _state.pool_manager._limits.total_concurrent,
+                                "current": _state.pool_manager.count(identity_id),
+                            },
+                        )
+                    except Exception as _pool_exc:
+                        logger.error(
+                            "Pool backend error for agent=%s identity=%s: %s",
+                            agent_name, identity_id, _pool_exc,
+                        )
+                        if _state.audit_writer is not None:
+                            try:
+                                _state.audit_writer.write(PoolBackendUnavailableEvent(
+                                    request_id=request_id,
+                                    identity_id=identity_id,
+                                    agent_name=agent_name,
+                                    reason=type(_pool_exc).__name__,
+                                ))
+                            except Exception:
+                                pass
+                        return JSONResponse(
+                            status_code=502,
+                            content={
+                                "error": {
+                                    "message": f"Agent {selected_model} container backend failed",
+                                    "type": "agent_error",
+                                    "agent": selected_model,
+                                    "code": "pool_backend_unavailable",
+                                }
+                            },
+                            headers={"X-Yashigani-Agent-Error": "true"},
+                        )
+                else:
+                    # Normal externally-deployed agent — backward compatible path.
+                    agent_upstream = stored_url
                 break
+
         if not agent_upstream:
             return JSONResponse(
                 status_code=404,

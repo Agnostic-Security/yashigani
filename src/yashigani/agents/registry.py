@@ -338,10 +338,16 @@ return 1
             except Exception:
                 return []
 
+        upstream_url = _b(b"upstream_url")
+        # v2.4.1 — pool_image: derived from upstream_url when it uses pool:// scheme.
+        # Stored as pool://<image>; surfaced as a separate convenience field so
+        # callers can distinguish pool-managed from externally-deployed agents.
+        pool_image = upstream_url[len("pool://"):] if upstream_url.startswith("pool://") else None
+
         return {
             "agent_id": agent_id,
             "name": _b(b"name"),
-            "upstream_url": _b(b"upstream_url"),
+            "upstream_url": upstream_url,
             "protocol": _b(b"protocol") or "openai",
             "status": _b(b"status"),
             "created_at": _b(b"created_at"),
@@ -353,4 +359,6 @@ return 1
             # v0.9.0 — token rotation fields (F-09)
             "token_last_rotated": _b(b"token_last_rotated"),
             "token_rotation_schedule": _b(b"token_rotation_schedule"),
+            # v2.4.1 — pool_image (None for externally-deployed agents)
+            "pool_image": pool_image,
         }

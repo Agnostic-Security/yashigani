@@ -222,7 +222,13 @@ class AgentRegisterRequest(BaseModel):
             "Max 64 chars. No path traversal chars permitted (V232-CSCAN-01a / CWE-22)."
         ),
     )
-    upstream_url: str = Field(min_length=1, max_length=512)
+    # v2.4.1: upstream_url is Optional when pool_image is set.
+    # For externally-deployed agents (today's behaviour), upstream_url is required.
+    # For pool-managed agents, caller may either:
+    #   (a) Set pool_image only — upstream_url is synthesised as pool://<image>.
+    #   (b) Set both pool_image and upstream_url="pool://<image>" (must match).
+    # A request with neither upstream_url nor pool_image is rejected (HTTP 422).
+    upstream_url: Optional[str] = Field(default=None, min_length=1, max_length=512)
     protocol: str = Field(default="openai", description="Agent protocol: openai, letta, or langflow")
     groups: list[str] = Field(default_factory=list)
     allowed_caller_groups: list[str] = Field(default_factory=list)
@@ -231,6 +237,22 @@ class AgentRegisterRequest(BaseModel):
         default_factory=list,
         description="Optional CIDR allowlist. Empty = no IP restriction. E.g. ['10.0.0.0/8', '192.168.1.100/32']",
     )
+    # v2.4.1 — PoolManager support.
+    # When pool_image is set the agent is pool-managed: Yashigani will
+    # create a per-identity container for each caller using this image.
+    # The upstream_url MUST be absent or set to pool://<image> for consistency.
+    # Tier limits (LicenseLimitExceeded -> 402) still apply.
+    pool_image: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+        description=(
+            "Docker/OCI image for pool-managed agents. "
+            "When set, upstream_url is synthesised as pool://<image> and "
+            "Yashigani spawns a per-identity container at dispatch time. "
+            "Leave unset for externally-deployed agents (today's behaviour)."
+        ),
+    )
 
     @field_validator("name")
     @classmethod
@@ -238,15 +260,26 @@ class AgentRegisterRequest(BaseModel):
         """Reject HTML tags and protocol URIs in agent name (AVA-2026-04-29-001 / AVA-C006, ASVS V5.3.3, CWE-79)."""
         if _HTML_TAG_RE.search(v):
             raise ValueError(
-                "agent name must not contain HTML tags or protocol URIs — "
+                "agent name must not contain HTML tags or protocol URIs -- "
                 "strip markup and use plain text (CWE-79 / AVA-2026-04-29-001 / AVA-C006)"
             )
         return v
 
     @field_validator("upstream_url")
     @classmethod
-    def _validate_upstream_url(cls, v: str) -> str:
+    def _validate_upstream_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        # pool:// is a synthetic internal scheme for pool-managed agents.
+        # It is NOT an SSRF target -- the gateway resolves it via PoolManager.
+        if v.startswith("pool://"):
+            return v
         return _assert_safe_upstream_url(v)
+
+
+# Pydantic v2: rebuild model so Optional type hints (with __future__ annotations)
+# are correctly resolved at import time.
+AgentRegisterRequest.model_rebuild()
 
 
 class AgentUpdateRequest(BaseModel):
@@ -609,16 +642,51 @@ async def register_agent(
     audit = backoffice_state.audit_writer
 
     # GROUP-4-1 / LAURA-LIMIT-AGENTS-01: agent limit is enforced atomically
-    # inside registry.register() via a Lua script (SCARD → check → HSET+SADD).
+    # inside registry.register() via a Lua script (SCARD -> check -> HSET+SADD).
     # The previous non-atomic pre-check (check_agent_limit(registry.count()))
     # had a TOCTOU race and is removed here. LicenseLimitExceeded is raised by
     # the Lua path on breach and caught below.
     from yashigani.licensing.enforcer import LicenseLimitExceeded
 
+    # v2.4.1 -- pool_image support: synthesise upstream_url and validate consistency.
+    # Rule:
+    #   pool_image=None, upstream_url=str  -> externally-deployed agent (status quo)
+    #   pool_image=str,  upstream_url=None -> synthesise pool://<image>
+    #   pool_image=str,  upstream_url="pool://<image>" (matches) -> OK
+    #   pool_image=str,  upstream_url=<anything else> -> HTTP 422
+    #   pool_image=None, upstream_url=None -> HTTP 422 (nothing to register)
+    if body.pool_image is None and body.upstream_url is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "upstream_url_required",
+                "message": "upstream_url is required when pool_image is not set.",
+            },
+        )
+
+    effective_upstream_url: str
+    if body.pool_image is not None:
+        expected_pool_url = f"pool://{body.pool_image}"
+        if body.upstream_url is not None and body.upstream_url != expected_pool_url:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "pool_url_mismatch",
+                    "message": (
+                        f"When pool_image is set, upstream_url must be "
+                        f"'pool://{body.pool_image}' (got {body.upstream_url!r}). "
+                        "Either omit upstream_url or set it to the pool:// form."
+                    ),
+                },
+            )
+        effective_upstream_url = expected_pool_url
+    else:
+        effective_upstream_url = body.upstream_url  # type: ignore[assignment]
+
     try:
         agent_id, plaintext_token = registry.register(
             name=body.name,
-            upstream_url=body.upstream_url,
+            upstream_url=effective_upstream_url,
             groups=body.groups,
             allowed_caller_groups=body.allowed_caller_groups,
             allowed_paths=body.allowed_paths,
@@ -647,7 +715,7 @@ async def register_agent(
                 AgentRegisteredEvent(
                     agent_id=agent_id,
                     agent_name=body.name,
-                    upstream_url=body.upstream_url,
+                    upstream_url=effective_upstream_url,
                     groups=body.groups,
                     allowed_caller_groups=body.allowed_caller_groups,
                     allowed_paths=body.allowed_paths,
@@ -658,7 +726,9 @@ async def register_agent(
             logger.error("Failed to write AgentRegisteredEvent: %s", exc)
 
     _push_opa()
-    await _push_openwebui_model(body.name, body.upstream_url)
+    # Pool-managed agents have no real upstream URL; skip OWUI model push.
+    if not effective_upstream_url.startswith("pool://"):
+        await _push_openwebui_model(body.name, effective_upstream_url)
 
     return AgentRegisterResponse(
         agent_id=agent_id,
