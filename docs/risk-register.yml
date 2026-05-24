@@ -1151,3 +1151,102 @@ risks:
   source: PROBE-AG1 — code-verified by Tiago directive 2026-05-24
   related_to: NICO-V241-001
   fix_in_version: v2.24.1
+
+- id: YSG-RISK-061
+  description: >-
+    Caddy network egress restricted to allowlist (ACME providers + in-mesh
+    upstreams + DNS) via iptables OUTPUT rules in container entrypoint.
+    Reduces post-Caddy-RCE attacker impact by blocking internet exfil, C2,
+    and second-stage payload fetch. Probability of Caddy RCE itself unchanged
+    (~10⁻³/yr per Laura cost-benefit LAURA-V241-RESIDUAL-001 2026-05-25);
+    this is impact reduction. Cross-version effective (KMS-independent).
+    NET_ADMIN capability added to Caddy (was: NET_BIND_SERVICE only).
+    NET_ADMIN allows iptables manipulation within the container's network
+    namespace; does not affect host networking. K8s NetworkPolicy
+    (networkpolicy-caddy-egress.yaml) provides equivalent kernel-enforced
+    egress restriction as defence-in-depth.
+  severity: informational
+  controls_impacted:
+    - ASVS V12.6 (network segmentation)
+    - NIST SP 800-53 SC-7 (boundary protection)
+    - CIS Docker Benchmark §5.10
+  compensating_controls:
+    - Caddy SHA-pinned to known-clean version (caddy:2.11.2-alpine digest-pinned)
+    - cap_drop:[ALL] + cap_add:[NET_BIND_SERVICE, NET_ADMIN]
+    - admin API on unix socket (MUST-4 / v2.24.1 hardening)
+    - K8s NetworkPolicy networkpolicy-caddy-egress.yaml (infra-layer enforcement)
+    - Operator can override ACME allowlist via YASHIGANI_CADDY_EGRESS_ALLOWLIST
+    - Graceful fallback in entrypoint — Caddy starts without egress restrictions
+      if NET_ADMIN unavailable (Podman rootless), logged as WARN
+  status: mitigated
+  accepted_by: Tiago
+  accepted_at: 2026-05-25
+  review_by: 2026-08-25
+  closure_evidence:
+    - description: >-
+        docker/caddy/caddy-entrypoint.sh installs iptables OUTPUT allowlist before
+        Caddy starts. docker/caddy/Dockerfile.caddy bakes iptables into the image.
+        docker-compose.yml gains cap_add: [NET_ADMIN] on caddy service.
+        helm/yashigani/templates/caddy.yaml gains NET_ADMIN capability.
+        helm/yashigani/templates/networkpolicy-caddy-egress.yaml adds K8s
+        NetworkPolicy restricting Caddy external egress to :443/:80 for ACME/OCSP.
+        allow-caddy-egress gains grafana:3443 and prometheus:9090 entries (previously
+        missing — would have caused 502 on obs-plane proxying in K8s).
+      commit: TBD
+      evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_caddy_egress_20260525/
+  last_threat_model_review: 2026-05-25
+  trade_off_note: >-
+    NET_ADMIN capability added to Caddy container (previously NET_BIND_SERVICE only).
+    NET_ADMIN allows iptables manipulation within the container's Linux network
+    namespace — it does NOT grant access to the host network stack. Docker and
+    Podman enforce this isolation via Linux network namespaces. The benefit (runtime
+    egress restriction blocking post-RCE exfil/C2) outweighs the marginal capability
+    expansion. Accepted by Tiago 2026-05-25.
+  fix_in_version: v2.24.1
+
+
+- id: YSG-RISK-062
+  description: >-
+    DNS tunneling residual: Caddy's UDP/53 egress to Docker's embedded DNS
+    resolver (127.0.0.11) is allowed by YSG-RISK-061 egress allowlist (Caddy
+    needs name resolution for ACME + in-mesh upstreams). A skilled post-Caddy-
+    RCE attacker could encode exfil data in DNS query subdomains OR receive
+    second-stage payload fragments in DNS response TXT/NULL records, bypassing
+    the iptables egress restrictions. Probability skilled-attacker × Caddy-RCE
+    is ~10⁻⁴/yr — low absolute but worth documenting since the broad
+    iptables-egress mitigation does not address this specific channel.
+  severity: low
+  controls_impacted:
+    - ASVS V12.6 (network segmentation — DNS channel)
+    - NIST SP 800-53 SC-7 (boundary protection — covert channel residual)
+    - MITRE ATT&CK T1071.004 (Application Layer Protocol — DNS)
+  compensating_controls:
+    - Caddy SHA-pinned (caddy:2.11.2-alpine, zero RCE CVEs in Caddy history)
+    - cap_drop:[ALL] + cap_add minimal
+    - admin API on unix socket (f6fffa3)
+    - Egress restricted to allowlist (YSG-RISK-061)
+    - Skilled-attacker prerequisite — script-kiddie attacks don't have DNS tunneling capability
+  status: accepted_known_residual
+  accepted_by: Tiago
+  accepted_at: 2026-05-25
+  review_by: 2026-08-23
+  closure_evidence: null
+  last_threat_model_review: 2026-05-25
+  rationale: >-
+    Tiago 2026-05-25 — "skilled attacker might tunnel via DNS - true but we
+    should move to https over tls and pin the servers". Filed as accepted
+    residual with the planned closure: DNS-over-HTTPS (DoH) + DNS-server cert
+    pinning. Implementation deferred to v2.24.2+ hardening sweep.
+  planned_close:
+    target_release: v2.24.2-or-v2.25.0
+    planned_controls:
+      - Migrate Caddy DNS resolution from UDP/53 to DNS-over-HTTPS (DoH) to a
+        pinned upstream resolver (e.g., Cloudflare 1.1.1.1 or Quad9 9.9.9.9)
+      - Pin the DoH server's TLS certificate (SHA-256 fingerprint allowlist) so
+        attacker cannot redirect DNS to attacker-controlled resolver
+      - Block UDP/53 egress entirely once DoH is functional (closes the
+        traditional DNS-tunneling channel)
+      - Document operator override for customers with own internal DNS
+        infrastructure (some compliance customers require on-prem DNS)
+    estimated_effort: Captain ~6-8h (DoH plugin / config + cert pinning + tests
+      across compose+helm+Mac+Linux + operator-override doc)
