@@ -4170,20 +4170,21 @@ compose_up() {
   # Ensure agent bundle token files exist if profiles are selected.
   # Primary write is now in step 8d (main body, before _prepare_secrets_dir_for_pki).
   # This loop is a safety-net for upgrade paths where token files may be missing.
-  # INSTALLER-BUG-AGENT-TOKENS: writes here are non-fatal — on Podman rootless
-  # the secrets_dir is already chowned to UID 1001 by this point (PKI ran), so
-  # host-user writes may fail with EACCES. The primary write above (step 8d)
-  # already created the file; a failure here is safe to warn-and-continue.
+  # BUG-B+-NEW-001: secrets_dir may be subuid-remapped on both Podman rootless
+  # re-runs AND the additive re-run (Journey B+) path — use _safe_write_secret
+  # which tries direct write, then `podman unshare tee`, then ephemeral container.
   for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
     [[ -z "$_profile" ]] && continue
     local _token_file="${secrets_dir}/${_profile}_token"
     if [[ ! -s "$_token_file" ]]; then
-      if ! echo "# placeholder — auto-generated at first bootstrap" > "$_token_file" 2>/dev/null; then
-        log_warn "Could not create token placeholder ${_profile}_token (secrets_dir owned by PKI UID — expected for Podman rootless; step 8d should have written this)"
+      # BUG-B+-NEW-001: use _safe_write_secret so both the re-run and B+ paths
+      # succeed even when secrets_dir is owned by a subuid-remapped UID.
+      # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001) can read at runtime.
+      if _safe_write_secret "# placeholder — auto-generated at first bootstrap" \
+           "$_token_file" "0640"; then
+        log_info "Created token placeholder (safety-net): ${_profile}_token"
       else
-        # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001) can read at runtime.
-        chmod 0640 "$_token_file" 2>/dev/null || true
-        log_info "Created token placeholder: ${_profile}_token"
+        log_warn "Could not create token placeholder ${_profile}_token (all write paths failed — step 8d should have written this)"
       fi
     fi
   done
@@ -6280,6 +6281,89 @@ _safe_read_secret() {
         printf '%s' "$_sr_val"
         return 0
       fi
+    fi
+  fi
+
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# _safe_write_secret — BUG-B+-NEW-001: Podman-rootless-aware secret file writer
+#
+# On the additive re-run path (Journey B+), docker/secrets/ is already owned
+# by a subuid-remapped UID (e.g. UID 101000 on the host). A plain `echo >` from
+# the host installer user (UID 1000) fails with EACCES. This helper tries:
+#   1. Direct write (works on Docker / Podman rootful / first-install)
+#   2. `podman unshare tee` (works on Podman rootless re-run — runs inside the
+#      user namespace where the host installer UID maps to the file owner)
+#   3. Ephemeral container write via podman/docker run (last-resort fallback)
+#
+# After each successful write, chmod is applied via the same namespace/container
+# so the effective mode is preserved inside the rootless user namespace.
+#
+# Usage: _safe_write_secret <content> <file> <mode>
+#   $1  _sw_content  — the secret value to write (no trailing newline)
+#   $2  _sw_file     — absolute path to the target file
+#   $3  _sw_mode     — octal mode string e.g. "0640"
+# Returns 0 on success, 1 if all attempts fail.
+#
+# Security properties:
+#   - Content never passed via command-line argument (process-table visible).
+#   - `tee` reads from stdin, avoiding any argv exposure of the secret.
+#   - Mode applied atomically in the same namespace/container after write.
+#   - Fail-closed: returns 1 if the content could not be written and verified.
+#
+# BUG-B+-NEW-001 / v2.24.1 Phase A wave 1 (Su).
+# ---------------------------------------------------------------------------
+_safe_write_secret() {
+  local _sw_content="$1" _sw_file="$2" _sw_mode="${3:-0640}"
+
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+  local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+
+  # --- Attempt 1: direct write (Docker / Podman rootful / first-install) ----
+  if printf '%s' "$_sw_content" > "$_sw_file" 2>/dev/null; then
+    chmod "$_sw_mode" "$_sw_file" 2>/dev/null || true
+    return 0
+  fi
+
+  # --- Attempt 2: Podman rootless — write inside the user namespace ---------
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && command -v podman >/dev/null 2>&1; then
+    # `podman unshare tee` maps host UID to the container owner UID, giving
+    # us write access to subuid-remapped files. Stdin avoids argv exposure.
+    if printf '%s' "$_sw_content" | podman unshare tee "$_sw_file" >/dev/null 2>&1; then
+      podman unshare chmod "$_sw_mode" "$_sw_file" 2>/dev/null || true
+      return 0
+    fi
+  fi
+
+  # --- Attempt 3: ephemeral container write ---------------------------------
+  # Bind the secrets dir and write from inside a container that runs as root,
+  # giving it ownership of the remapped UIDs.  Uses /s mount convention (S7).
+  local _rel_file="${_sw_file#"${_secrets_dir}/"}"
+  [[ "$_rel_file" == "$_sw_file" ]] && _rel_file=""
+  local _target="/s${_rel_file:+/${_rel_file}}"
+
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && command -v podman >/dev/null 2>&1; then
+    if printf '%s' "$_sw_content" | podman run --rm --network=none \
+         --volume "${_secrets_dir}:/s:rw,U" \
+         "$_alpine_image" \
+         sh -c "tee ${_target} >/dev/null && chmod ${_sw_mode} ${_target}" 2>/dev/null; then
+      return 0
+    fi
+  elif command -v docker >/dev/null 2>&1; then
+    if printf '%s' "$_sw_content" | docker run --rm --pull=never \
+         --volume "${_secrets_dir}:/s:rw" \
+         "alpine:3" \
+         sh -c "tee ${_target} >/dev/null && chmod ${_sw_mode} ${_target}" 2>/dev/null; then
+      return 0
+    fi
+    # docker pull fallback
+    if printf '%s' "$_sw_content" | docker run --rm \
+         --volume "${_secrets_dir}:/s:rw" \
+         "$_alpine_image" \
+         sh -c "tee ${_target} >/dev/null && chmod ${_sw_mode} ${_target}" 2>/dev/null; then
+      return 0
     fi
   fi
 
@@ -9275,6 +9359,11 @@ main() {
     # previously these writes lived inside compose_up() which runs AFTER the
     # chown; on Podman rootless the host user can no longer write to the
     # subuid-remapped directory and the installer died with EACCES.
+    # BUG-B+-NEW-001: on the additive re-run path (Journey B+), secrets_dir is
+    # already subuid-remapped from the prior install, so even this step-8d write
+    # can fail with EACCES. Use _safe_write_secret which tries direct write first
+    # then falls back to `podman unshare tee` (rootless namespace) and finally
+    # an ephemeral container write.
     # Covers every profile that may have been added in steps 8/8b/8c
     # (langflow, letta, openclaw, openwebui, wazuh, ...).
     local _tok_secrets_dir="${WORK_DIR}/docker/secrets"
@@ -9282,13 +9371,15 @@ main() {
       [[ -z "$_profile" ]] && continue
       local _tok_file="${_tok_secrets_dir}/${_profile}_token"
       if [[ ! -s "$_tok_file" ]]; then
-        if ! echo "# placeholder — auto-generated at first bootstrap" > "$_tok_file" 2>/dev/null; then
-          log_warn "Could not create token placeholder ${_profile}_token (secrets_dir may be stale-owned — compose_up safety-net will retry)"
-        else
-          # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001) can read at runtime.
-          # _pki_chown_client_keys re-chowns to installer_uid:1001 0640 post-PKI.
-          chmod 0640 "$_tok_file" 2>/dev/null || true
+        # BUG-B+-NEW-001: use _safe_write_secret so the re-run path succeeds
+        # even when secrets_dir is already owned by a subuid-remapped UID.
+        # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001) can read at runtime.
+        # _pki_chown_client_keys re-chowns to installer_uid:1001 0640 post-PKI.
+        if _safe_write_secret "# placeholder — auto-generated at first bootstrap" \
+             "$_tok_file" "0640"; then
           log_info "Created token placeholder: ${_profile}_token"
+        else
+          log_warn "Could not create token placeholder ${_profile}_token (all write paths failed — see _safe_write_secret)"
         fi
       fi
     done

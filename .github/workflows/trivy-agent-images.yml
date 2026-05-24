@@ -1,0 +1,487 @@
+# C-CAP-004 — Trivy CVE gate for third-party agent base images
+# Authored: 2026-05-24 (v2.24.1 Phase A wave 1)
+#
+# Rationale: security.yml scans only yashigani-gateway and yashigani-backoffice
+# (our own images). It does NOT scan the third-party agent images pinned in
+# values.yaml and docker-compose.yml (langflow, letta, openclaw, open-webui).
+# Laura finding N4 + Iris UA-08 + Captain C-CAP-004 all identify this gap.
+#
+# Design (per Captain council review §4, Nico HIGH-003 amendment):
+#   - Trivy action pinned by SHA, not tag (Nico HIGH-003 requirement).
+#   - Runs on every PR + nightly schedule (same pattern as security.yml).
+#   - Scans each pinned digest directly (no pull required — Trivy fetches manifest).
+#   - Exits 1 on any HIGH/CRITICAL CVE NOT present in trivy-agent-allowlist.json.
+#   - trivy-agent-allowlist.json is a per-image list of accepted CVE IDs with
+#     documented rationale (mirrors gitleaks-baseline.json pattern).
+#   - SARIF uploaded to GitHub Security tab per image (distinct categories).
+#   - Job summary includes per-image CVE counts + digest at scan time.
+#
+# Image pins (must match values.yaml and docker-compose.yml — Captain owns parity):
+#   langflow:  docker.io/langflowai/langflow:1.9.2@sha256:45238e6...
+#   letta:     docker.io/letta/letta:0.16.7@sha256:fb7bd2c...
+#   openclaw:  ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6...
+#   open-webui: ghcr.io/open-webui/open-webui:v0.9.2@sha256:a7e4796...
+#
+# Allowlist update procedure:
+#   1. Add the CVE ID + justification to trivy-agent-allowlist.json
+#      under the relevant image key.
+#   2. Commit with body citing the risk-register entry or upstream ticket.
+#   3. CI will skip that CVE ID for the named image only (not globally).
+name: Trivy Agent Image Scan
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  pull_request:
+    branches: [main, "release/**", "2.24.x", "2.23.x"]
+  push:
+    branches: [main, "release/**", "2.24.x", "2.23.x"]
+    paths:
+      # Re-scan when agent image pins change or the allowlist changes
+      - 'helm/yashigani/values.yaml'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/trivy-agent-images.yml'
+      - 'trivy-agent-allowlist.json'
+
+permissions:
+  security-events: write
+  contents: read
+  # issues: write is needed for nightly issue-creation on new CVEs
+  issues: write
+
+env:
+  # Image references — must match helm/yashigani/values.yaml and docker/docker-compose.yml
+  # Captain owns parity; bump both files together and update these env vars in the same commit.
+  LANGFLOW_IMAGE:  "docker.io/langflowai/langflow:1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+  LETTA_IMAGE:     "docker.io/letta/letta:0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+  OPENCLAW_IMAGE:  "ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
+  OPENWEBUI_IMAGE: "ghcr.io/open-webui/open-webui:v0.9.2@sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49"
+
+jobs:
+  trivy-langflow:
+    name: Trivy / langflow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Scan langflow image
+        # Nico HIGH-003: Trivy action pinned by SHA (v0.36.0), not floating tag.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.LANGFLOW_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          # exit-code 0: we collect findings and apply allowlist in the next step.
+          # Allowlist-filtered exit happens in "Apply allowlist + gate" step below.
+          exit-code: '0'
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-langflow.sarif
+
+      - name: Scan langflow image (JSON for allowlist gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.LANGFLOW_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: json
+          output: trivy-langflow.json
+
+      - name: Apply allowlist + gate (langflow)
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, pathlib, os
+
+          image_key = "langflow"
+          findings_path = "trivy-langflow.json"
+          allowlist_path = "trivy-agent-allowlist.json"
+
+          # Load findings
+          try:
+              data = json.loads(pathlib.Path(findings_path).read_text())
+          except Exception as e:
+              print(f"[ERROR] could not parse {findings_path}: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          # Load allowlist (absent = no suppressions)
+          allowed_cves = set()
+          if pathlib.Path(allowlist_path).exists():
+              al = json.loads(pathlib.Path(allowlist_path).read_text())
+              allowed_cves = set(al.get(image_key, {}).keys())
+
+          # Collect blocking CVEs
+          blocking = []
+          for result in data.get("Results", []):
+              for vuln in result.get("Vulnerabilities", []):
+                  vid = vuln.get("VulnerabilityID", "")
+                  sev = vuln.get("Severity", "")
+                  pkg = vuln.get("PkgName", "")
+                  if sev in ("HIGH", "CRITICAL") and vid not in allowed_cves:
+                      blocking.append((sev, vid, pkg))
+
+          # Write job summary
+          summary = [f"### Trivy agent scan: {image_key}"]
+          summary.append(f"Image: `{os.environ.get('LANGFLOW_IMAGE', image_key)}`")
+          summary.append(f"Blocking CVEs (not in allowlist): {len(blocking)}")
+          if blocking:
+              summary.append("")
+              summary.append("| Severity | CVE | Package |")
+              summary.append("|---|---|---|")
+              for sev, vid, pkg in sorted(blocking, reverse=True):
+                  summary.append(f"| {sev} | {vid} | {pkg} |")
+          summary.append("")
+          summary_text = "\n".join(summary)
+          print(summary_text)
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_file:
+              with open(summary_file, "a") as f:
+                  f.write(summary_text + "\n")
+
+          if blocking:
+              print(f"\n[FAIL] {len(blocking)} blocking CVE(s) in {image_key}. "
+                    "Add to trivy-agent-allowlist.json with justification to suppress.",
+                    file=sys.stderr)
+              sys.exit(1)
+          print(f"[PASS] No unallowlisted HIGH/CRITICAL CVEs in {image_key}.")
+          PYEOF
+
+      - name: Upload SARIF (langflow)
+        uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
+        if: always() && hashFiles('trivy-langflow.sarif') != ''
+        with:
+          sarif_file: trivy-langflow.sarif
+          category: trivy-langflow
+
+      - name: Upload scan artifacts (langflow)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && hashFiles('trivy-langflow.json') != ''
+        with:
+          name: trivy-langflow-${{ github.sha }}
+          path: trivy-langflow.json
+          retention-days: 30
+
+  trivy-letta:
+    name: Trivy / letta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Scan letta image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.LETTA_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-letta.sarif
+
+      - name: Scan letta image (JSON for allowlist gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.LETTA_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: json
+          output: trivy-letta.json
+
+      - name: Apply allowlist + gate (letta)
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, pathlib, os
+
+          image_key = "letta"
+          findings_path = "trivy-letta.json"
+          allowlist_path = "trivy-agent-allowlist.json"
+
+          try:
+              data = json.loads(pathlib.Path(findings_path).read_text())
+          except Exception as e:
+              print(f"[ERROR] could not parse {findings_path}: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          allowed_cves = set()
+          if pathlib.Path(allowlist_path).exists():
+              al = json.loads(pathlib.Path(allowlist_path).read_text())
+              allowed_cves = set(al.get(image_key, {}).keys())
+
+          blocking = []
+          for result in data.get("Results", []):
+              for vuln in result.get("Vulnerabilities", []):
+                  vid = vuln.get("VulnerabilityID", "")
+                  sev = vuln.get("Severity", "")
+                  pkg = vuln.get("PkgName", "")
+                  if sev in ("HIGH", "CRITICAL") and vid not in allowed_cves:
+                      blocking.append((sev, vid, pkg))
+
+          summary = [f"### Trivy agent scan: {image_key}"]
+          summary.append(f"Image: `{os.environ.get('LETTA_IMAGE', image_key)}`")
+          summary.append(f"Blocking CVEs (not in allowlist): {len(blocking)}")
+          if blocking:
+              summary.append("")
+              summary.append("| Severity | CVE | Package |")
+              summary.append("|---|---|---|")
+              for sev, vid, pkg in sorted(blocking, reverse=True):
+                  summary.append(f"| {sev} | {vid} | {pkg} |")
+          summary.append("")
+          summary_text = "\n".join(summary)
+          print(summary_text)
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_file:
+              with open(summary_file, "a") as f:
+                  f.write(summary_text + "\n")
+
+          if blocking:
+              print(f"\n[FAIL] {len(blocking)} blocking CVE(s) in {image_key}. "
+                    "Add to trivy-agent-allowlist.json with justification to suppress.",
+                    file=sys.stderr)
+              sys.exit(1)
+          print(f"[PASS] No unallowlisted HIGH/CRITICAL CVEs in {image_key}.")
+          PYEOF
+
+      - name: Upload SARIF (letta)
+        uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
+        if: always() && hashFiles('trivy-letta.sarif') != ''
+        with:
+          sarif_file: trivy-letta.sarif
+          category: trivy-letta
+
+      - name: Upload scan artifacts (letta)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && hashFiles('trivy-letta.json') != ''
+        with:
+          name: trivy-letta-${{ github.sha }}
+          path: trivy-letta.json
+          retention-days: 30
+
+  trivy-openclaw:
+    name: Trivy / openclaw
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Scan openclaw image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.OPENCLAW_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-openclaw.sarif
+
+      - name: Scan openclaw image (JSON for allowlist gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.OPENCLAW_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: json
+          output: trivy-openclaw.json
+
+      - name: Apply allowlist + gate (openclaw)
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, pathlib, os
+
+          image_key = "openclaw"
+          findings_path = "trivy-openclaw.json"
+          allowlist_path = "trivy-agent-allowlist.json"
+
+          try:
+              data = json.loads(pathlib.Path(findings_path).read_text())
+          except Exception as e:
+              print(f"[ERROR] could not parse {findings_path}: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          allowed_cves = set()
+          if pathlib.Path(allowlist_path).exists():
+              al = json.loads(pathlib.Path(allowlist_path).read_text())
+              allowed_cves = set(al.get(image_key, {}).keys())
+
+          blocking = []
+          for result in data.get("Results", []):
+              for vuln in result.get("Vulnerabilities", []):
+                  vid = vuln.get("VulnerabilityID", "")
+                  sev = vuln.get("Severity", "")
+                  pkg = vuln.get("PkgName", "")
+                  if sev in ("HIGH", "CRITICAL") and vid not in allowed_cves:
+                      blocking.append((sev, vid, pkg))
+
+          summary = [f"### Trivy agent scan: {image_key}"]
+          summary.append(f"Image: `{os.environ.get('OPENCLAW_IMAGE', image_key)}`")
+          summary.append(f"Blocking CVEs (not in allowlist): {len(blocking)}")
+          if blocking:
+              summary.append("")
+              summary.append("| Severity | CVE | Package |")
+              summary.append("|---|---|---|")
+              for sev, vid, pkg in sorted(blocking, reverse=True):
+                  summary.append(f"| {sev} | {vid} | {pkg} |")
+          summary.append("")
+          summary_text = "\n".join(summary)
+          print(summary_text)
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_file:
+              with open(summary_file, "a") as f:
+                  f.write(summary_text + "\n")
+
+          if blocking:
+              print(f"\n[FAIL] {len(blocking)} blocking CVE(s) in {image_key}. "
+                    "Add to trivy-agent-allowlist.json with justification to suppress.",
+                    file=sys.stderr)
+              sys.exit(1)
+          print(f"[PASS] No unallowlisted HIGH/CRITICAL CVEs in {image_key}.")
+          PYEOF
+
+      - name: Upload SARIF (openclaw)
+        uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
+        if: always() && hashFiles('trivy-openclaw.sarif') != ''
+        with:
+          sarif_file: trivy-openclaw.sarif
+          category: trivy-openclaw
+
+      - name: Upload scan artifacts (openclaw)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && hashFiles('trivy-openclaw.json') != ''
+        with:
+          name: trivy-openclaw-${{ github.sha }}
+          path: trivy-openclaw.json
+          retention-days: 30
+
+  trivy-openwebui:
+    name: Trivy / open-webui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Scan open-webui image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.OPENWEBUI_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-openwebui.sarif
+
+      - name: Scan open-webui image (JSON for allowlist gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.OPENWEBUI_IMAGE }}"
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: json
+          output: trivy-openwebui.json
+
+      - name: Apply allowlist + gate (open-webui)
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, pathlib, os
+
+          image_key = "open-webui"
+          findings_path = "trivy-openwebui.json"
+          allowlist_path = "trivy-agent-allowlist.json"
+
+          try:
+              data = json.loads(pathlib.Path(findings_path).read_text())
+          except Exception as e:
+              print(f"[ERROR] could not parse {findings_path}: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          allowed_cves = set()
+          if pathlib.Path(allowlist_path).exists():
+              al = json.loads(pathlib.Path(allowlist_path).read_text())
+              allowed_cves = set(al.get(image_key, {}).keys())
+
+          blocking = []
+          for result in data.get("Results", []):
+              for vuln in result.get("Vulnerabilities", []):
+                  vid = vuln.get("VulnerabilityID", "")
+                  sev = vuln.get("Severity", "")
+                  pkg = vuln.get("PkgName", "")
+                  if sev in ("HIGH", "CRITICAL") and vid not in allowed_cves:
+                      blocking.append((sev, vid, pkg))
+
+          summary = [f"### Trivy agent scan: {image_key}"]
+          summary.append(f"Image: `{os.environ.get('OPENWEBUI_IMAGE', image_key)}`")
+          summary.append(f"Blocking CVEs (not in allowlist): {len(blocking)}")
+          if blocking:
+              summary.append("")
+              summary.append("| Severity | CVE | Package |")
+              summary.append("|---|---|---|")
+              for sev, vid, pkg in sorted(blocking, reverse=True):
+                  summary.append(f"| {sev} | {vid} | {pkg} |")
+          summary.append("")
+          summary_text = "\n".join(summary)
+          print(summary_text)
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_file:
+              with open(summary_file, "a") as f:
+                  f.write(summary_text + "\n")
+
+          if blocking:
+              print(f"\n[FAIL] {len(blocking)} blocking CVE(s) in {image_key}. "
+                    "Add to trivy-agent-allowlist.json with justification to suppress.",
+                    file=sys.stderr)
+              sys.exit(1)
+          print(f"[PASS] No unallowlisted HIGH/CRITICAL CVEs in {image_key}.")
+          PYEOF
+
+      - name: Upload SARIF (open-webui)
+        uses: github/codeql-action/upload-sarif@bc0b696b4103f5fe60f15749af68a046868d511a # codeql-bundle-v2.25.4
+        if: always() && hashFiles('trivy-openwebui.sarif') != ''
+        with:
+          sarif_file: trivy-openwebui.sarif
+          category: trivy-openwebui
+
+      - name: Upload scan artifacts (open-webui)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && hashFiles('trivy-openwebui.json') != ''
+        with:
+          name: trivy-openwebui-${{ github.sha }}
+          path: trivy-openwebui.json
+          retention-days: 30
+
+  # Nightly-only: open a GitHub issue when new CVEs appear.
+  # The issue body lists the blocking CVEs found across all agent images.
+  # On schedule runs only — prevents issue spam on every PR.
+  nightly-cve-issue:
+    name: Nightly CVE issue (if new findings)
+    runs-on: ubuntu-latest
+    needs: [trivy-langflow, trivy-letta, trivy-openclaw, trivy-openwebui]
+    if: github.event_name == 'schedule' && failure()
+    steps:
+      - name: Open GitHub issue for new CVEs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Trivy agent image CVE gate failed (nightly $(date -u +%Y-%m-%d))" \
+            --body "$(cat <<'BODY'
+          One or more third-party agent images failed the Trivy HIGH/CRITICAL CVE gate in the nightly scan.
+
+          Check the workflow run for per-image SARIF and JSON artifacts.
+
+          **Action required:**
+          1. Review the failing CVE IDs in the job summaries.
+          2. If the CVE has a fixed version: open a PR bumping the agent image pin in \`helm/yashigani/values.yaml\` and \`docker/docker-compose.yml\`.
+          3. If no fix is available and the risk is accepted: add the CVE ID to \`trivy-agent-allowlist.json\` under the relevant image key with a documented rationale and a \`review_by\` date.
+
+          Workflow: ${{ github.workflow }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BODY
+          )" \
+            --label "security,agent-images" \
+            --assignee "${{ github.repository_owner }}" \
+            2>/dev/null || echo "Issue creation failed (label/assignee may not exist) — non-fatal"
