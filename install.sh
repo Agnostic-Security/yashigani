@@ -6555,7 +6555,7 @@ generate_secrets() {
 
     # --- pgbouncer_authenticator_password (YSG-RISK-049 close — v2.24.0) -------
     # KMS-architectural posture (per docs/yashigani_install_config.md §6.1):
-    # In production with YSG_KMS_PROVIDER set, pgbouncer_authenticator_password
+    # In production with YASHIGANI_KMS_PROVIDER set, pgbouncer_authenticator_password
     # is fetched at runtime via the KMS provider and bypasses this cleartext
     # path entirely. Non-KMS dev/standalone deployments use this on-disk
     # cleartext at 0640 owned by pgbouncer UID 70 (dedicated mount, not GID 2002).
@@ -6805,7 +6805,7 @@ generate_secrets() {
   # application service and grants only EXECUTE on ysg_pgbouncer_get_auth().
   #
   # KMS-architectural posture (per docs/yashigani_install_config.md §6.1):
-  # In production with YSG_KMS_PROVIDER set, pgbouncer_authenticator_password
+  # In production with YASHIGANI_KMS_PROVIDER set, pgbouncer_authenticator_password
   # is fetched at runtime via the KMS provider and bypasses this cleartext
   # path entirely. Non-KMS dev/standalone deployments use this on-disk
   # cleartext at 0640 owned by pgbouncer UID 70 (dedicated mount, not GID 2002).

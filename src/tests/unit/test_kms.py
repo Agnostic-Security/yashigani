@@ -1,5 +1,5 @@
 """
-Unit tests for the Yashigani KSM module.
+Unit tests for the Yashigani KMS module.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from yashigani.kms.base import (
     SecretMetadata,
 )
 from yashigani.kms.providers.docker_secrets import DockerSecretsProvider
-from yashigani.kms.factory import create_provider
+from yashigani.kms.factory import create_provider, _resolve_provider_env
 from yashigani.kms.rotation import KSMRotationScheduler, _validate_cron
 
 
@@ -113,23 +113,73 @@ class TestDockerSecretsProvider:
 # KSMProviderFactory
 # ---------------------------------------------------------------------------
 
-class TestKSMProviderFactory:
-    def test_selects_docker_for_dev_env(self, tmp_path, monkeypatch):
+class TestKMSProviderFactory:
+    def _docker_patches(self):
+        """Context manager that stubs out DockerSecretsProvider construction."""
+        return (
+            patch(
+                "yashigani.kms.providers.docker_secrets.DockerSecretsProvider.__init__",
+                return_value=None,
+            ),
+            patch.object(
+                DockerSecretsProvider,
+                "provider_name",
+                new_callable=lambda: property(lambda self: "docker"),
+            ),
+            patch.object(
+                DockerSecretsProvider,
+                "environment_scope",
+                new_callable=lambda: property(lambda self: "dev"),
+            ),
+        )
+
+    def test_selects_docker_via_canonical_kms_provider(self, monkeypatch):
+        """YASHIGANI_KMS_PROVIDER=docker loads docker provider — canonical name."""
         monkeypatch.setenv("YASHIGANI_ENV", "dev")
-        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "docker")
-        # Patch DockerSecretsProvider to avoid needing real /run/secrets
-        with patch(
-            "yashigani.kms.providers.docker_secrets.DockerSecretsProvider.__init__",
-            return_value=None,
-        ), patch.object(
-            DockerSecretsProvider, "provider_name",
-            new_callable=lambda: property(lambda self: "docker"),
-        ), patch.object(
-            DockerSecretsProvider, "environment_scope",
-            new_callable=lambda: property(lambda self: "dev"),
-        ):
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "docker")
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        p1, p2, p3 = self._docker_patches()
+        with p1, p2, p3:
             provider = create_provider()
-            assert provider.provider_name == "docker"
+        assert provider.provider_name == "docker"
+
+    def test_selects_docker_via_deprecated_ksm_provider(self, monkeypatch, caplog):
+        """YASHIGANI_KSM_PROVIDER=docker loads docker provider + emits deprecation warning."""
+        import logging
+        monkeypatch.setenv("YASHIGANI_ENV", "dev")
+        monkeypatch.delenv("YASHIGANI_KMS_PROVIDER", raising=False)
+        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "docker")
+        p1, p2, p3 = self._docker_patches()
+        with caplog.at_level(logging.WARNING, logger="yashigani.kms.factory"):
+            with p1, p2, p3:
+                provider = create_provider()
+        assert provider.provider_name == "docker"
+        assert "YASHIGANI_KSM_PROVIDER is deprecated" in caplog.text
+        assert "YASHIGANI_KMS_PROVIDER" in caplog.text
+
+    def test_kms_wins_over_ksm_when_both_set_different_values(self, monkeypatch, caplog):
+        """When both are set with different values, KMS_PROVIDER wins + warning emitted."""
+        import logging
+        monkeypatch.setenv("YASHIGANI_ENV", "dev")
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "docker")
+        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "vault")
+        p1, p2, p3 = self._docker_patches()
+        with caplog.at_level(logging.WARNING, logger="yashigani.kms.factory"):
+            with p1, p2, p3:
+                provider = create_provider()
+        assert provider.provider_name == "docker"
+        assert "YASHIGANI_KMS_PROVIDER" in caplog.text
+        assert "YASHIGANI_KSM_PROVIDER" in caplog.text
+
+    def test_neither_set_uses_default(self, monkeypatch):
+        """Setting neither KMS_PROVIDER nor KSM_PROVIDER falls back to default (docker for dev)."""
+        monkeypatch.setenv("YASHIGANI_ENV", "dev")
+        monkeypatch.delenv("YASHIGANI_KMS_PROVIDER", raising=False)
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        p1, p2, p3 = self._docker_patches()
+        with p1, p2, p3:
+            provider = create_provider()
+        assert provider.provider_name == "docker"
 
     def test_missing_env_raises(self, monkeypatch):
         monkeypatch.delenv("YASHIGANI_ENV", raising=False)
@@ -138,9 +188,41 @@ class TestKSMProviderFactory:
 
     def test_unknown_provider_raises(self, monkeypatch):
         monkeypatch.setenv("YASHIGANI_ENV", "dev")
-        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "nonexistent")
-        with pytest.raises(ProviderError, match="Unknown KSM provider"):
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "nonexistent")
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        with pytest.raises(ProviderError, match="Unknown KMS provider"):
             create_provider()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_provider_env unit tests (white-box coverage of the shim logic)
+# ---------------------------------------------------------------------------
+
+class TestResolveProviderEnv:
+    def test_canonical_only(self, monkeypatch):
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "vault")
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        assert _resolve_provider_env("docker") == "vault"
+
+    def test_deprecated_only_returns_value(self, monkeypatch):
+        monkeypatch.delenv("YASHIGANI_KMS_PROVIDER", raising=False)
+        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "aws")
+        assert _resolve_provider_env("docker") == "aws"
+
+    def test_both_same_value_canonical_wins(self, monkeypatch):
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "gcp")
+        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "gcp")
+        assert _resolve_provider_env("docker") == "gcp"
+
+    def test_both_different_canonical_wins(self, monkeypatch):
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "azure")
+        monkeypatch.setenv("YASHIGANI_KSM_PROVIDER", "vault")
+        assert _resolve_provider_env("docker") == "azure"
+
+    def test_neither_returns_default(self, monkeypatch):
+        monkeypatch.delenv("YASHIGANI_KMS_PROVIDER", raising=False)
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        assert _resolve_provider_env("keeper") == "keeper"
 
 
 # ---------------------------------------------------------------------------

@@ -446,7 +446,7 @@ The following tables document every significant variable, grouped by category.
 
 | Variable | Required | Valid Values | Notes |
 |---|---|---|---|
-| `YASHIGANI_KSM_PROVIDER` | No | `docker`, `aws`, `azure`, `gcp`, `keeper`, `vault` | Default: `docker`. Set to match your secret backend. |
+| `YASHIGANI_KMS_PROVIDER` | No | `docker`, `aws`, `azure`, `gcp`, `keeper`, `vault` | Default: `docker`. Set to match your secret backend. |
 | `AWS_ACCESS_KEY_ID` | If `aws` | IAM key | Or use instance role (no key needed). |
 | `AWS_SECRET_ACCESS_KEY` | If `aws` | IAM secret | Or use instance role. |
 | `AWS_DEFAULT_REGION` | If `aws` | AWS region | e.g., `us-east-1` |
@@ -861,13 +861,13 @@ Equivalent to the backoffice UI **KMS → Secrets → Import** flow, but CLI-onl
 
 ## 6. KMS Configuration
 
-Yashigani stores all sensitive credentials (API keys, passwords, tokens) through its Key Management Service (KMS) abstraction layer. The provider is set via `YASHIGANI_KSM_PROVIDER`.
+Yashigani stores all sensitive credentials (API keys, passwords, tokens) through its Key Management Service (KMS) abstraction layer. The provider is set via `YASHIGANI_KMS_PROVIDER`.
 
 ### 6.1 Docker Secrets (Default, Community)
 
 No configuration required. Secrets are stored as files in `docker/secrets/` on the host and mounted read-only into containers at `/run/secrets/`. The backoffice bootstrap manages creation and rotation.
 
-**PostgreSQL credential posture (YSG-RISK-049):** The default non-KMS deployment stores the PostgreSQL application password as cleartext in `docker/secrets/postgres_password` (mode 0600). PgBouncer's edoburu entrypoint writes a cleartext `userlist.txt` at startup from the `DATABASE_URL` environment variable. This is the dev/standalone posture (YSG-RISK-049 accepted LOW for non-KMS deployments). Production deployments should configure a KMS provider (`YSG_KMS_PROVIDER=vault|azure|aws|gcp|keeper`); KMS-configured deployments fetch credentials at runtime via `src/yashigani/kms/` and do not rely on the on-disk cleartext userlist path.
+**PostgreSQL credential posture (YSG-RISK-049):** The default non-KMS deployment stores the PostgreSQL application password as cleartext in `docker/secrets/postgres_password` (mode 0600). PgBouncer's edoburu entrypoint writes a cleartext `userlist.txt` at startup from the `DATABASE_URL` environment variable. This is the dev/standalone posture (YSG-RISK-049 accepted LOW for non-KMS deployments). Production deployments should configure a KMS provider (`YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper`); KMS-configured deployments fetch credentials at runtime via `src/yashigani/kms/` and do not rely on the on-disk cleartext userlist path.
 
 Verify secrets are present after first run:
 
@@ -880,7 +880,7 @@ ls -la docker/secrets/
 **Step 1.** Set the provider and credentials in `.env`:
 
 ```dotenv
-YASHIGANI_KSM_PROVIDER=aws
+YASHIGANI_KMS_PROVIDER=aws
 AWS_DEFAULT_REGION=us-east-1
 ```
 
@@ -915,7 +915,7 @@ All secrets are stored under the prefix `yashigani/` in Secrets Manager.
 **Step 2.** Set in `.env`:
 
 ```dotenv
-YASHIGANI_KSM_PROVIDER=azure
+YASHIGANI_KMS_PROVIDER=azure
 AZURE_KEYVAULT_URL=https://your-vault.vault.azure.net
 ```
 
@@ -944,7 +944,7 @@ cp /path/to/gcp-sa-key.json docker/secrets/gcp_sa_key.json
 **Step 4.** Set in `.env`:
 
 ```dotenv
-YASHIGANI_KSM_PROVIDER=gcp
+YASHIGANI_KMS_PROVIDER=gcp
 GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp_sa_key.json
 ```
 
@@ -964,7 +964,7 @@ chmod 600 docker/secrets/vault_role_id docker/secrets/vault_secret_id
 **Step 2.** Set in `.env`:
 
 ```dotenv
-YASHIGANI_KSM_PROVIDER=vault
+YASHIGANI_KMS_PROVIDER=vault
 VAULT_ADDR=http://vault:8200
 ```
 

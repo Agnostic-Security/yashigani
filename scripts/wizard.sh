@@ -58,7 +58,7 @@ Options:
 
 Environment variables (used in non-interactive mode if flags not set):
   YASHIGANI_TLS_DOMAIN, YASHIGANI_TLS_MODE, YASHIGANI_ADMIN_USERNAME,
-  UPSTREAM_MCP_URL, YASHIGANI_KSM_PROVIDER,
+  UPSTREAM_MCP_URL, YASHIGANI_KMS_PROVIDER,
   YASHIGANI_INSPECTION_DEFAULT_BACKEND, YASHIGANI_DEPLOYMENT_STREAM,
   YASHIGANI_SIEM_MODE, YASHIGANI_LICENSE_FILE
 EOF
@@ -198,12 +198,12 @@ while [ -z "${UPSTREAM_MCP_URL:-}" ]; do
 done
 
 # 5. KMS provider
-YASHIGANI_KSM_PROVIDER="${CLI_KMS_PROVIDER:-${YASHIGANI_KSM_PROVIDER:-${SUGGESTED_KMS:-docker}}}"
-_ask YASHIGANI_KSM_PROVIDER "KMS provider [docker/aws/azure/gcp/keeper/vault]" \
-  "${YASHIGANI_KSM_PROVIDER}"
-case "${YASHIGANI_KSM_PROVIDER}" in
+YASHIGANI_KMS_PROVIDER="${CLI_KMS_PROVIDER:-${YASHIGANI_KMS_PROVIDER:-${SUGGESTED_KMS:-docker}}}"
+_ask YASHIGANI_KMS_PROVIDER "KMS provider [docker/aws/azure/gcp/keeper/vault]" \
+  "${YASHIGANI_KMS_PROVIDER}"
+case "${YASHIGANI_KMS_PROVIDER}" in
   docker|aws|azure|gcp|keeper|vault) ;;
-  *) _warn "Unknown KMS provider '${YASHIGANI_KSM_PROVIDER}'. Defaulting to 'docker'."; YASHIGANI_KSM_PROVIDER="docker" ;;
+  *) _warn "Unknown KMS provider '${YASHIGANI_KMS_PROVIDER}'. Defaulting to 'docker'."; YASHIGANI_KMS_PROVIDER="docker" ;;
 esac
 
 # 6. Inspection backend
@@ -284,7 +284,7 @@ _info "Writing configuration to ${ENV_FILE}..."
   printf "\n# --- MCP ---\n"
   printf "UPSTREAM_MCP_URL=%s\n"                       "$UPSTREAM_MCP_URL"
   printf "\n# --- KMS ---\n"
-  printf "YASHIGANI_KSM_PROVIDER=%s\n"                 "$YASHIGANI_KSM_PROVIDER"
+  printf "YASHIGANI_KMS_PROVIDER=%s\n"                 "$YASHIGANI_KMS_PROVIDER"
   printf "\n# --- Inspection ---\n"
   printf "YASHIGANI_INSPECTION_DEFAULT_BACKEND=%s\n"   "$YASHIGANI_INSPECTION_DEFAULT_BACKEND"
   printf "\n# --- Deployment ---\n"
@@ -321,7 +321,7 @@ printf "  %-40s %s\n" "YASHIGANI_TLS_DOMAIN"                "$YASHIGANI_TLS_DOMA
 printf "  %-40s %s\n" "YASHIGANI_TLS_MODE"                  "$YASHIGANI_TLS_MODE"
 printf "  %-40s %s\n" "YASHIGANI_ADMIN_USERNAME"            "$YASHIGANI_ADMIN_USERNAME"
 printf "  %-40s %s\n" "UPSTREAM_MCP_URL"                    "$UPSTREAM_MCP_URL"
-printf "  %-40s %s\n" "YASHIGANI_KSM_PROVIDER"              "$YASHIGANI_KSM_PROVIDER"
+printf "  %-40s %s\n" "YASHIGANI_KMS_PROVIDER"              "$YASHIGANI_KMS_PROVIDER"
 printf "  %-40s %s\n" "YASHIGANI_INSPECTION_DEFAULT_BACKEND" "$YASHIGANI_INSPECTION_DEFAULT_BACKEND"
 printf "  %-40s %s\n" "YASHIGANI_DEPLOYMENT_STREAM"         "$YASHIGANI_DEPLOYMENT_STREAM"
 printf "  %-40s %s\n" "YASHIGANI_SIEM_MODE"                 "$YASHIGANI_SIEM_MODE"

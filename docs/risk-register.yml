@@ -463,7 +463,7 @@ risks:
   - NIST SP 800-53 SC-28 / IA-5
   - CWE-256 / CWE-312
   compensating_controls:
-  - YSG_KMS_PROVIDER=vault|azure|aws|gcp|keeper fetches credentials at runtime via src/yashigani/kms/ abstractions
+  - YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper fetches credentials at runtime via src/yashigani/kms/ abstractions
   - SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role
   - Dedicated 0640 UID 70 mount
   - Documented at docs/yashigani_install_config.md §6.1

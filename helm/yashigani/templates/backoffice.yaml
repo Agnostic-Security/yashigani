@@ -117,7 +117,7 @@ spec:
               value: "production"
             - name: YASHIGANI_ENVIRONMENT_LABEL
               value: {{ .Values.global.environment | quote }}
-            - name: YASHIGANI_KSM_PROVIDER
+            - name: YASHIGANI_KMS_PROVIDER
               value: "docker"
             - name: YASHIGANI_SERVICE_NAME
               value: "backoffice"

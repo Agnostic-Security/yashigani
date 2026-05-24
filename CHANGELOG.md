@@ -392,7 +392,7 @@ on triage; the cleanup-system architectural class fully closed.
 - **pgbouncer `auth_type=plain` posture documented as non-KMS-only**
   (YSG-RISK-049 ACCEPTED-LOW). The cleartext userlist.txt is the expected
   posture for the non-KMS dev/standalone deployment scenario. Production
-  deployments configure a KMS provider via `YSG_KMS_PROVIDER=vault|azure|
+  deployments configure a KMS provider via `YASHIGANI_KMS_PROVIDER=vault|azure|
   aws|gcp|keeper` which fetches credentials at runtime via the abstractions
   in `src/yashigani/kms/` — the cleartext userlist.txt path is bypassed
   entirely in KMS-configured deployments. Documented at
@@ -510,7 +510,7 @@ on triage; the cleanup-system architectural class fully closed.
 
 - **KMS posture note** at `docs/yashigani_install_config.md` §6.1 — clarifies
   that the cleartext userlist.txt is the non-KMS dev/standalone posture and
-  that production deployments configure `YSG_KMS_PROVIDER=vault|azure|aws|
+  that production deployments configure `YASHIGANI_KMS_PROVIDER=vault|azure|aws|
   gcp|keeper` to bypass the cleartext-on-disk path entirely. Captures the
   YSG-RISK-049 architectural framing.
 
