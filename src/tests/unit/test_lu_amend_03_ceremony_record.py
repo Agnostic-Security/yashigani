@@ -266,9 +266,12 @@ class TestCeremonyEndpointValidation:
         # audit writer was called once with the ceremony event
         mock_writer.write.assert_called_once()
         written_event = mock_writer.write.call_args[0][0]
-        assert written_event["event_type"] == "MANIFEST_CEREMONY_RECORDED"
-        assert written_event["manifest_sha256"] == sha
-        assert written_event["manifest_registration_id"] == 77
+        # writer.write() receives an AuditEvent object (not a dict)
+        from yashigani.audit.schema import ManifestCeremonyEvent as MCE
+        assert isinstance(written_event, MCE)
+        assert written_event.event_type == "MANIFEST_CEREMONY_RECORDED"
+        assert written_event.manifest_sha256 == sha
+        assert written_event.manifest_registration_id == 77
 
     def test_ack_empty_string_pydantic_rejects(self):
         """Pydantic rejects ack_response='' at model construction (min_length=1)."""

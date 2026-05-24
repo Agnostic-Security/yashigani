@@ -328,7 +328,7 @@ async def record_ceremony(
         audit_event_id = event.audit_event_id
         writer = backoffice_state.audit_writer
         if writer is not None:
-            writer.write(event.to_dict())
+            writer.write(event)
         else:
             _log.warning(
                 "audit_writer not initialised — MANIFEST_CEREMONY_RECORDED "
