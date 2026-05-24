@@ -1271,7 +1271,7 @@ risks:
     - SOC 2 CC7.2
   status: mitigated
   closure_evidence:
-    - commit: TBD_WAVE3_COMMIT_SHA
+    - commit: 7f974a0
       rationale: >-
         Migration 0014 adds BIGSERIAL seq column to audit_events.
         AuditChainService.run_daily_checkpoint ORDER BY changed to
