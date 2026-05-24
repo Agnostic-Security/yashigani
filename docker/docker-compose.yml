@@ -140,7 +140,10 @@ services:
       - ./secrets:/run/secrets:ro
       - ./service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      # MUST-4 / v2.24.1: admin TCP :2019 removed; unix socket is the only
+      # admin path. curl --unix-socket targets the socket from inside the
+      # container — no TCP listener exposed to any network.
+      test: ["CMD", "curl", "-fsS", "--unix-socket", "/run/caddy/admin.sock", "http://localhost/config/"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -149,6 +152,9 @@ services:
       # YSG-RISK-008 (v2.23.4): caddy_data + caddy_config are named volumes
       # (writable). /tmp needed for ACME challenge staging + TLS cert staging.
       - /tmp:size=64m,mode=1777
+      # MUST-4 / v2.24.1: /run/caddy holds the admin unix socket.
+      # read_only rootfs requires tmpfs here — caddy creates admin.sock at startup.
+      - /run/caddy:size=1m,mode=0700
     # YSG-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
       - no-new-privileges:true

@@ -653,6 +653,12 @@ data:
   Caddyfile: |
     {
       local_certs
+      # MUST-4 / v2.24.1: admin TCP :2019 removed — unix socket only.
+      # Filesystem permissions are the auth gate. Liveness agent uses exec
+      # probe via caddy CLI or curl --unix-socket; kubelet pod-IP probes use
+      # the :80 /healthz listener below (unchanged). No TCP admin surface
+      # exposed to any pod network or host port.
+      admin unix//run/caddy/admin.sock
       servers {
         timeouts {
           read_body   10s
@@ -664,9 +670,8 @@ data:
     }
     # Retro #3al — explicit :80 listener so kubelet probes (which target
     # pod-IP, not the global tlsDomain) get a deterministic answer. Caddy's
-    # admin endpoint at :2019 is bound to localhost-only and therefore
-    # refuses pod-IP probes; opening it to 0.0.0.0 would expose the entire
-    # admin API. The :80 listener gives kubelet a cheap GET / -> 308 plus a
+    # admin TCP endpoint removed (MUST-4); unix socket is in-container only.
+    # The :80 listener gives kubelet a cheap GET / -> 308 plus a
     # /healthz that returns 204 No Content for a tighter probe.
     :80 {
       handle /healthz {

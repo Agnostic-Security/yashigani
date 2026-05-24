@@ -116,6 +116,11 @@ spec:
               mountPath: /etc/caddy/Caddyfile
               subPath: Caddyfile
               readOnly: true
+            # MUST-4 / v2.24.1: admin unix socket lives here.
+            # readOnlyRootFilesystem requires an explicit writable mount for
+            # the socket directory — Caddy creates admin.sock at startup.
+            - name: caddy-admin-sock
+              mountPath: /run/caddy
             {{- if .Values.mtls.enabled }}
             # Mesh mTLS — Caddy presents caddy_client.{crt,key} to gateway/
             # backoffice/policy upstreams and validates them against ca_root.
@@ -136,6 +141,10 @@ spec:
         - name: caddy-data
           emptyDir: {}
         - name: caddy-config
+          emptyDir: {}
+        # MUST-4 / v2.24.1: writable dir for the admin unix socket.
+        # emptyDir is ephemeral and pod-local — socket is never shared.
+        - name: caddy-admin-sock
           emptyDir: {}
         - name: caddyfile
           configMap:

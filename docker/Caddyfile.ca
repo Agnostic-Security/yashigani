@@ -15,6 +15,12 @@
 # Full WAF requires a custom Caddy build — see docker/caddy/Caddyfile.waf.
 
 {
+    # ── Admin API — unix socket only (MUST-4 / v2.24.1 hardening) ───────────
+    # TCP :2019 removed. Filesystem permissions are the auth gate.
+    # In-container tooling (healthcheck, reload) uses the socket directly.
+    # No other service on any network can reach this surface.
+    admin unix//run/caddy/admin.sock
+
     # ── Connection timeouts (DoS/slow-loris mitigation) ─────────────────────
     servers {
         timeouts {

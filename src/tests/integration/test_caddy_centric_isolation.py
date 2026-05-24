@@ -175,11 +175,11 @@ class TestComposeNetworkIsolation:
         """
         TEST 3: The legitimate path — via Caddy — must still work.
 
-        Checks Caddy's :2019 admin API from the host (Caddy is on `edge` with
-        host port mapping). Then checks the actual healthz through Caddy.
-        The TLS domain may be self-signed in test environments; we check the
-        Caddy admin endpoint first to confirm Caddy is up, then use the
-        YASHIGANI_TLS_DOMAIN env var (or localhost fallback) for the actual check.
+        Checks the actual healthz through Caddy to confirm Caddy is up.
+        The TLS domain may be self-signed in test environments; we use the
+        YASHIGANI_TLS_DOMAIN env var (or localhost fallback) for the check.
+        NOTE: Caddy admin TCP :2019 is REMOVED (MUST-4 / v2.24.1) — admin
+        surface is unix socket /run/caddy/admin.sock, in-container only.
         """
         tls_domain = os.environ.get("YASHIGANI_TLS_DOMAIN", "localhost")
         https_port = int(os.environ.get("YASHIGANI_HTTPS_PORT", "443"))
