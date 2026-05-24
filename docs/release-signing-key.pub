@@ -1,0 +1,19 @@
+# Yashigani release signing key — SSH allowed-signers format
+#
+# Signing method: SSH (git tag -s with gpg.format=ssh)
+# Key type:       ed25519
+# Signer:         Maxine <maxine@agnosticsec.com>
+# Used since:     v2.23.3
+#
+# To verify a signed release tag locally:
+#
+#   git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub
+#   git tag -v v2.23.3
+#
+# The allowed-signers line below follows the OpenSSH allowed_signers(5) format:
+#   <principal> namespaces="git" <keytype> <base64-key>
+#
+# Only "git" namespace tags are covered; SSH authentication use of this key
+# for host access is a separate concern not governed by this file.
+#
+maxine@agnosticsec.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN7sU9TP7sFNq+8NNW33zQyoV3dJksPMGqzvpFe/iK6W

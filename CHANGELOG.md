@@ -1,5 +1,6 @@
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
+<!-- last-updated: 2026-05-25T12:00:00+00:00 (v2.24.1: fix(pgbouncer): restore compose-Helm admin_users + stats_users parity — drift #8 secondary, 859294a follow-up) -->
 <!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.1: YSG-RISK-061 — Caddy egress restrictions via iptables + K8s NetworkPolicy; NET_ADMIN cap added) -->
 <!-- last-updated: 2026-05-24T12:00:00+00:00 (v2.24.1: PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets removed; closes NICO-V241-001 + YSG-RISK-060) -->
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: per-user 100 RPS rate limit + admin alert via Prometheus + audit event USER_RATE_LIMIT_EXCEEDED) -->
@@ -879,7 +880,7 @@ Theme: **Security Hardening + Supply-Chain Controls + ASVS L3 92% + Agentic AI O
 - **All 73 Caddy `reverse_proxy` blocks gated** — `X-Caddy-Verified-Secret` injected on every `reverse_proxy` block across all Caddyfile variants and the Kubernetes ConfigMap. Asserted by contract test in CI.
 - **Backslash open-redirect patch** — `next=` parameter in the admin login flow now rejects backslash-encoded path bypass variants. Regression test suite covers the known bypass patterns.
 - **Safe error envelopes** — All backoffice and gateway error responses go through `safe_error_envelope`; exception class names and stack details are stripped from customer-visible responses.
-- **GPG release tag signing** — Signing infrastructure complete: CI workflow (`tag-sign.yml`), one-time key ceremony procedure, and public key (`docs/release-signing-key.asc`) all landed. `git tag -v v2.23.2` verifies the signature.
+- **Release tag signing** — CI workflow (`tag-sign.yml`) and one-time key ceremony procedure landed. Note: the originally planned GPG path via `tag-sign.yml` was blocked (hardware-backed Yubikey key cannot sign in CI without the physical device). Actual signing uses SSH (`git config gpg.format=ssh`). From v2.23.3 onward, all release tags are SSH-signed by `maxine@agnosticsec.com`; the public key is at `docs/release-signing-key.pub`. v2.23.2 is unsigned. To verify a tag: `git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub && git tag -v v2.23.3`.
 - **SSRF on alert webhook** — Host allowlist enforced on webhook SSRF guard in addition to the v2.23.1 SSRF batch.
 
 ### Supply Chain

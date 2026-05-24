@@ -1,6 +1,6 @@
-# Last updated: 2026-05-24T00:00:00+00:00
+# Last updated: 2026-05-25T00:00:00+00:00
 """
-PgBouncer auth_query compose-Helm parity tests — drift audit finding #8.
+PgBouncer auth_query compose-Helm parity tests — drift audit findings #8 + #8-secondary.
 
 Asserts that:
   1. Both compose pgbouncer.ini files (main + letta) use auth_query — not auth_type=plain
@@ -14,9 +14,16 @@ Asserts that:
      (SECURITY DEFINER role — YSG-RISK-049 close).
   6. auth_dbname = yashigani is present in all four ini files
      (Amendment C6 — both instances auth via the yashigani database).
+  7. admin_users = (empty) is present in all four ini files — pgbouncer admin
+     console explicitly disabled. Guards against edoburu image default
+     admin_users=$DB_USER (Laura F2 / ASVS V14.4.1). Drift #8 secondary finding
+     (859294a follow-up): helm-main was missing this directive.
+  8. stats_users = (empty) is present in all four ini files — statistics console
+     likewise disabled. Same rationale as admin_users. Drift #8 secondary finding.
 
 YSG-RISK-049: SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role.
 Drift audit finding #8: compose pgbouncer.ini had auth_file=; Helm did not.
+Drift audit finding #8-secondary: helm-main pgbouncer.ini missing admin_users + stats_users.
 """
 from __future__ import annotations
 
@@ -204,4 +211,86 @@ def test_auth_type_is_scram(label: str, path: Path) -> None:
         assert value == "scram-sha-256", (
             f"{label} ({path.name}): auth_type = '{value}', expected 'scram-sha-256'. "
             "YSG-RISK-049 mandates scram-sha-256."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 7: admin_users = (empty) in all four ini files (drift #8 secondary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("label,path", ALL_INI_FILES)
+def test_admin_users_disabled(label: str, path: Path) -> None:
+    """All four pgbouncer ini files must have admin_users = (empty string).
+
+    Drift audit finding #8-secondary (859294a follow-up): helm-main was missing
+    admin_users. The edoburu image default sets admin_users=$DB_USER (yashigani_app)
+    when the directive is absent, which would expose the pgbouncer admin console
+    to any connecting client authenticated as yashigani_app.
+
+    Empty string explicitly disables the admin console in pgbouncer 1.21+.
+    Laura F2 / ASVS V14.4.1: no unnecessary services/interfaces exposed.
+    """
+    content = _read_ini(path)
+    # Use raw content lines (including comment lines) to find the directive —
+    # admin_users = has an empty value so _active_lines would still include it
+    # as a non-comment, non-empty line. We validate on raw to keep the check
+    # simple and independent of future stripping logic.
+    raw_lines = content.splitlines()
+    admin_directives = [
+        l.strip() for l in raw_lines
+        if re.match(r"^\s*admin_users\s*=", l)
+        and not l.strip().startswith(";")
+        and not l.strip().startswith("#")
+    ]
+    assert admin_directives, (
+        f"{label} ({path.name}): admin_users directive missing. "
+        "Drift #8-secondary: edoburu default sets admin_users=$DB_USER when absent. "
+        "Explicit 'admin_users =' (empty) is required to disable the admin console. "
+        "Laura F2 / ASVS V14.4.1."
+    )
+    for line in admin_directives:
+        value = line.split("=", 1)[1].strip()
+        assert value == "", (
+            f"{label} ({path.name}): admin_users = '{value}', expected empty string. "
+            "Admin console must be fully disabled (Laura F2 / ASVS V14.4.1). "
+            "Remove any username from admin_users."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 8: stats_users = (empty) in all four ini files (drift #8 secondary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("label,path", ALL_INI_FILES)
+def test_stats_users_disabled(label: str, path: Path) -> None:
+    """All four pgbouncer ini files must have stats_users = (empty string).
+
+    Drift audit finding #8-secondary (859294a follow-up): helm-main was missing
+    stats_users. Without an explicit empty override the edoburu image may inherit
+    a default that grants statistics-console access, leaking pool state (connection
+    counts, query rates, user lists) to any user who can reach the pgbouncer
+    admin TCP listener.
+
+    Empty string explicitly disables stats console access in pgbouncer 1.21+.
+    Laura F2 / ASVS V14.4.1: no unnecessary services/interfaces exposed.
+    """
+    content = _read_ini(path)
+    raw_lines = content.splitlines()
+    stats_directives = [
+        l.strip() for l in raw_lines
+        if re.match(r"^\s*stats_users\s*=", l)
+        and not l.strip().startswith(";")
+        and not l.strip().startswith("#")
+    ]
+    assert stats_directives, (
+        f"{label} ({path.name}): stats_users directive missing. "
+        "Drift #8-secondary: explicit 'stats_users =' (empty) is required to disable "
+        "the statistics console. Laura F2 / ASVS V14.4.1."
+    )
+    for line in stats_directives:
+        value = line.split("=", 1)[1].strip()
+        assert value == "", (
+            f"{label} ({path.name}): stats_users = '{value}', expected empty string. "
+            "Stats console must be fully disabled (Laura F2 / ASVS V14.4.1). "
+            "Remove any username from stats_users."
         )

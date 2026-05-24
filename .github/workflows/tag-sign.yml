@@ -1,19 +1,26 @@
-# Last updated: 2026-05-11T00:00:00+01:00
+# Last updated: 2026-05-25T00:00:00+01:00
 name: Tag — GPG Sign & Verify
 
-# Triggered when a version tag is pushed (e.g. v2.23.2).
-# This workflow:
-#   1. Imports the Agnostic Security GPG release signing key from GitHub Secrets.
-#   2. Deletes the unsigned/annotated-only tag that triggered it.
-#   3. Re-creates the same tag as a GPG-signed annotated tag at the same commit.
-#   4. Force-pushes the signed tag back to origin.
-#   5. Verifies the signature; fails if verification fails.
+# STATUS: GPG CI signing path is BLOCKED — Tiago's release signing key is
+# hardware-backed (Yubikey/smartcard). The private key material cannot be
+# exported to a GitHub Secret; the workflow's "Import GPG key" step always
+# exits non-zero with "private-keys-v1.d/ is empty after import".
 #
-# For new releases: this runs automatically after the tag is pushed.
-# For retroactive signing: dispatch manually via workflow_dispatch with
-#   the tag name and commit SHA inputs.
+# ACTUAL signing method (since v2.23.3): SSH — git is configured locally
+# with gpg.format=ssh and user.signingkey=~/.ssh/id_ed25519.pub.
+# Maxine signs release tags locally; the public key is in docs/release-signing-key.pub.
 #
-# GPG key setup (one-time, per-team):
+# To verify a signed tag:
+#   git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub
+#   git tag -v v2.23.3   # (v2.23.2 is unsigned; v2.23.3+ are SSH-signed)
+#
+# This workflow remains in the repo as a placeholder for when a software
+# GPG key for CI signing is generated. Until then it will fail if triggered.
+# To unblock: generate a software GPG key (RSA 4096, passphrase-protected),
+# store in GitHub Secrets (GPG_PRIVATE_KEY + GPG_PASSPHRASE), and commit
+# the public key to docs/release-signing-key.asc.
+#
+# Original design intent (GPG key setup, one-time):
 #   1. Generate: gpg --full-generate-key (RSA 4096, releases@agnosticsec.com)
 #   2. Export private: gpg --armor --export-secret-keys releases@agnosticsec.com
 #   3. Store in GitHub Secrets: GPG_PRIVATE_KEY (armored), GPG_PASSPHRASE
