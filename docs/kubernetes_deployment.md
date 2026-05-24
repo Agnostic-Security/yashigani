@@ -228,7 +228,7 @@ Agent bundles are opt-in and disabled by default. The current agent lineup is:
 - **Julietta** (Letta) — memory-augmented conversational agent
 - **Scout** (OpenClaw) — messaging-capable agent (exposes port 18789 for webhooks)
 
-Agent chaining is supported: `@Scout` -> `@Julietta` -> `@qwen`. Use the `@Help` agent for a chaining guide.
+Agent chaining is supported: `@Scout` -> `@Julietta` -> `@qwen`. Model strings starting with `@` are resolved as agent names in the registry; chain them by passing the result of one agent as the model parameter of the next call.
 
 > **Note:** Goose (ACP too slow) and LangGraph (replaced by Langflow) have been removed from the agent lineup.
 

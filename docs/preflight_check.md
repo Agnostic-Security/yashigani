@@ -907,7 +907,7 @@ The current agent lineup is: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 [ ] Agent bundles work out of the box with --agent-bundles flag
 [ ] Installer auto-registers agents via backoffice API and writes PSK tokens to docker/secrets/
 [ ] Agent bundles registered with unified identity model (kind: service)
-[ ] Agent chaining reviewed: @Scout -> @Julietta -> @qwen (@Help agent for chaining guide)
+[ ] Agent chaining reviewed: @Scout -> @Julietta -> @qwen (model strings prefixed with @ are resolved as agent names in the registry)
 ```
 
 ### Optional Services

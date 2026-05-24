@@ -2017,7 +2017,7 @@ Three agent bundles are available as opt-in installs. They are **not installed b
 | Julietta | Letta | Apache 2.0 | Memory-augmented agent → Yashigani → tools | `letta` |
 | Scout | OpenClaw (Node.js 24) | MIT | OpenClaw Gateway (:18789) → Yashigani → LLMs | `openclaw` |
 
-**Agent chaining** is supported: `@Scout` -> `@Julietta` -> `@qwen`. Use the `@Help` agent for a chaining guide.
+**Agent chaining** is supported: `@Scout` -> `@Julietta` -> `@qwen`. Model strings prefixed with `@` are resolved as agent names in the identity registry; chain them by passing the result of one agent as the `model` parameter of the next completion call.
 
 ### 17.1 Docker Compose — Opt-In via Profiles
 
@@ -2177,7 +2177,7 @@ Response inspection is configurable per agent via the admin panel (Admin → Age
 ### 18.3 `.env` Settings
 
 ```dotenv
-YASHIGANI_INSPECT_RESPONSES=true        # Enable/disable globally (default: true)
+YASHIGANI_INSPECT_RESPONSES=true        # Enable response inspection (default: false — opt-in for compliance customers; see docs/operator-guide.md §2)
 YASHIGANI_RESPONSE_THRESHOLD=0.85       # Suspicion threshold for response classifier (default: matches request threshold)
 ```
 

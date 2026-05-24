@@ -241,6 +241,15 @@ services:
       YASHIGANI_PII_MODE: ${YASHIGANI_PII_MODE:-log}
       # Cloud bypass OFF by default — admin must explicitly enable to allow PII to cloud LLMs
       YASHIGANI_PII_CLOUD_BYPASS: ${YASHIGANI_PII_CLOUD_BYPASS:-false}
+      # YSG-RISK-057 — response inspection is OFF by default (design-by-pairing).
+      # Compliance customers (CMMC / ISO 27001 / SOC 2) MUST set BOTH:
+      #   YASHIGANI_INSPECT_RESPONSES=true   (activates ResponseInspectionPipeline)
+      #   YASHIGANI_OPA_URL=https://policy:8181  (already set above — OPA must be deployed)
+      # Without inspection OPA never receives a sensitivity label, ceiling check
+      # operates on PUBLIC by default (benign for non-compliance deployments).
+      # Without OPA, inspection produces a classification with nothing to consume it.
+      # See docs/operator-guide.md §2 for the opt-in recipe and YSG-RISK-057 for rationale.
+      YASHIGANI_INSPECT_RESPONSES: ${YASHIGANI_INSPECT_RESPONSES:-false}
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
