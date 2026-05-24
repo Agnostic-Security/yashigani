@@ -1,5 +1,6 @@
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
+<!-- last-updated: 2026-05-24T12:00:00+00:00 (v2.24.1: PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets removed; closes NICO-V241-001 + YSG-RISK-060) -->
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: per-user 100 RPS rate limit + admin alert via Prometheus + audit event USER_RATE_LIMIT_EXCEEDED) -->
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: DDoSProtector wire-up + license-scaled per-IP defaults) -->
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: BUG-V241-LANGFLOW-LETTA-BASE-URL: langflow+letta OPENAI_API_BASE :8080→:8081 in compose+helm) -->
@@ -19,6 +20,51 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ---
 
 ## [Unreleased] — v2.24.1
+
+### Security
+- **security(secrets): per-key Docker named-secrets on openclaw / langflow / letta / letta-pgbouncer**
+  (PROBE-AG1, Tiago directive 2026-05-24; closes NICO-V241-001 + YSG-RISK-060):
+
+  **Attack chain eliminated:** openclaw joins `edge` (internet-facing for Slack/Telegram
+  webhooks) AND previously had `./secrets:/run/secrets:ro` mounted wholesale. An openclaw
+  RCE via a malicious webhook payload could read `caddy_internal_hmac` from
+  `/run/secrets/caddy_internal_hmac`, forge `X-Caddy-Verified-Secret` HMAC tokens, and
+  bypass the entire Caddy auth perimeter at backoffice — full admin access without
+  credentials. Same root cause (wholesale mount) as NICO-V241-001 but escalated to
+  `high` due to the `edge`-network adjacency.
+
+  **Fixes applied:**
+  - **openclaw**: `./secrets:/run/secrets:ro` volume mount **removed entirely**. openclaw
+    reads `yashigani_internal_bearer` from `openclaw.json` (install.sh substitutes
+    `__YASHIGANI_INTERNAL_BEARER__` at install time — no runtime file read needed). No
+    `secrets:` block on the openclaw service at all. `caddy_internal_hmac` and ALL PKI
+    material are inaccessible from within the openclaw container.
+  - **langflow**: wholesale mount replaced with single Docker named-secret
+    (`yashigani_internal_bearer`, mode 0440). Entrypoint shim continues to read from
+    `/run/secrets/yashigani_internal_bearer` — path unchanged. No other secrets visible.
+  - **letta**: wholesale mount replaced with single Docker named-secret
+    (`yashigani_internal_bearer`, mode 0440). Same entrypoint shim pattern.
+  - **letta-pgbouncer**: wholesale mount + redundant extra bind-mount replaced with 4
+    named-secrets: `pgbouncer_authenticator_password` (0440), `ca_root.crt` (0444),
+    `letta-pgbouncer_client.crt` (0444), `letta-pgbouncer_client.key` (0400). These are
+    exactly the 4 files consumed by the wrapper command + pgbouncer-letta.ini.
+  - **Helm parity verified** (Iris BF-1): `agent-bundles.yaml` already uses
+    `valueFrom.secretKeyRef` env-var injection — no volume mount of any kind. No Helm drift.
+
+  **Kill criterion (negative — the fix proof):**
+  - `docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac` → no such file
+    (no `/run/secrets` in openclaw at all)
+  - `docker exec yashigani-langflow ls /run/secrets/` → only `yashigani_internal_bearer`
+  - `docker exec yashigani-letta ls /run/secrets/` → only `yashigani_internal_bearer`
+  - `docker exec yashigani-letta-pgbouncer ls /run/secrets/` → only the 4 named keys
+
+  **Files changed:** `docker/docker-compose.yml` (top-level `secrets:` block added;
+  per-service `secrets:` blocks on langflow/letta/letta-pgbouncer; openclaw volume
+  and comment updated). `docs/risk-register.yml` (NICO-V241-001 → mitigated; new
+  YSG-RISK-060 mitigated).
+
+  **Risk register:** NICO-V241-001 closed (`deferred` → `mitigated`). YSG-RISK-060
+  added + closed (`mitigated`) in same commit.
 
 ### Added
 - **Per-user rate limit — 100 RPS / 200 burst** (YSG-RISK-058, Tiago 2026-05-24):

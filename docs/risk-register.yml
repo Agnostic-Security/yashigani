@@ -600,9 +600,12 @@ risks:
   review_by: 2026-08-22
   closure_evidence: null
   last_threat_model_review: 2026-05-24
-- id: HELD-NICO-V241-001
-  description: caddy_client.key mounted into all agent containers via wholesale ./secrets mount; letta UID 0 can
-    read 0640, forge SPIFFE identity for Caddy.
+- id: NICO-V241-001
+  description: >-
+    caddy_client.key (and caddy_internal_hmac) mounted into all agent containers via
+    wholesale ./secrets:/run/secrets:ro bind-mount; agent container with RCE could
+    read PKI material and forge SPIFFE identity for Caddy. Root cause: wholesale
+    mount instead of per-key named-secrets.
   severity: high
   controls_impacted:
   - ASVS V10.3.5
@@ -614,23 +617,29 @@ risks:
   - Agent containers run cap_drop:ALL
   - SPIFFE identity verified at Caddy edge; forge would need Caddy mTLS termination
   - v2.24.0 customer base single-tenant per install
-  status: deferred
-  accepted_by: Tiago
-  accepted_at: 2026-05-23
-  review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
-  held_reason: Auth-touching; Tiago 2026-05-23 HOLD on agent-auth changes.
-  planned_close:
-    owner: Captain
-    effort: 2h Docker named-secrets remap
-    affected_files:
-    - docker/docker-compose.yml:140
-    - docker/docker-compose.yml:1580
-    - docker/docker-compose.yml:1751
-    - docker/docker-compose.yml:1834
+  status: mitigated
+  mitigated_by: Captain
+  mitigated_at: 2026-05-24
+  review_by: 2026-08-24
+  closure_evidence:
+  - description: >-
+      Per-key Docker named-secrets replace wholesale ./secrets mount on langflow, letta,
+      letta-pgbouncer. openclaw /run/secrets mount removed entirely (bearer is
+      pre-substituted into openclaw.json by install.sh — no runtime secret read).
+      caddy_internal_hmac, caddy_client.{crt,key}, all PKI material NOT listed in the
+      top-level secrets: block — not mounted into any agent container. Fix at the mount
+      layer is independent of KMS mode; the residual the KMS-mode conditional was tracking
+      (cleartext-on-disk of pkbouncer_authenticator_password) is a separate concern from
+      the blast-radius of which container can read which file.
+      Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac
+      → "No such file or directory" (confirmed in evidence dir).
+    commit: pending-this-commit
+    evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_per_key_secrets_PROBE_AG1_fix_20260524/
+  last_threat_model_review: 2026-05-24
+  held_reason: Resolved — HOLD lifted by PROBE-AG1 Tiago directive 2026-05-24.
   source: synthesis-v241-agent-infrastructure-council.md §3.1
   original_lu_status: accepted_pending_revision
+  fix_in_version: v2.24.1
 - id: HELD-MUST-SU-1
   description: Caddy compose healthcheck calls http://127.0.0.1:2019/config/ — adding `admin off` (Laura MUST-4)
     crashes Caddy loop. Must migrate to :80/healthz.
@@ -1096,3 +1105,49 @@ risks:
     letta inherited the pre-BUG-2 port 8080 pattern from the compose template.
   fix_in_version: v2.24.1
   bug_reference: BUG-V241-LANGFLOW-LETTA-BASE-URL
+
+- id: YSG-RISK-060
+  description: >-
+    openclaw + edge network + wholesale ./secrets:/run/secrets:ro mount compound.
+    openclaw joins the `edge` network (internet-facing for Slack/Telegram webhook
+    inbound on :18789). An openclaw RCE (e.g. via malicious webhook payload) combined
+    with the wholesale secrets mount could allow an attacker to read caddy_internal_hmac
+    from /run/secrets/caddy_internal_hmac, forge X-Caddy-Verified-Secret HMAC tokens,
+    and bypass the entire Caddy auth perimeter at backoffice. Same root cause as
+    NICO-V241-001 (wholesale ./secrets mount instead of per-key named-secrets) but
+    ESCALATED severity due to openclaw's edge-network internet-facing adjacency.
+    Attack chain: Slack/Telegram malicious webhook → openclaw RCE → read
+    caddy_internal_hmac → forge X-Caddy-Verified-Secret → bypass Caddy
+    forward_auth at backoffice → full admin access without credentials.
+  severity: high
+  controls_impacted:
+  - ASVS V10.3.5
+  - NIST SP 800-204C §4
+  - CWE-732
+  - CWE-290
+  - CWE-284 (Improper Access Control)
+  - OWASP A01:2021 (Broken Access Control)
+  compensating_controls:
+  - openclaw cap_drop:ALL
+  - openclaw read_only:true rootfs
+  - openclaw joins openclaw_isolated (internal:true) — no data-plane access
+  - caddy_internal_hmac passed via .env (env var), not just file
+  status: mitigated
+  mitigated_by: Captain
+  mitigated_at: 2026-05-24
+  review_by: 2026-08-24
+  closure_evidence:
+  - description: >-
+      ./secrets:/run/secrets:ro mount removed from openclaw entirely.
+      openclaw has NO secrets: block in docker-compose.yml.
+      Bearer token is pre-substituted into openclaw.json by install.sh
+      (__YASHIGANI_INTERNAL_BEARER__ → actual token at install time).
+      caddy_internal_hmac is NOT accessible from within the openclaw container.
+      Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac
+      → exec fails (no /run/secrets dir exists in openclaw container at all).
+    commit: pending-this-commit
+    evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_per_key_secrets_PROBE_AG1_fix_20260524/
+  last_threat_model_review: 2026-05-24
+  source: PROBE-AG1 — code-verified by Tiago directive 2026-05-24
+  related_to: NICO-V241-001
+  fix_in_version: v2.24.1

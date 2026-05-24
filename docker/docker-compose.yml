@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.24.1 — Docker Compose stack
+# Last updated: 2026-05-24T12:00:00+01:00 (security(secrets): PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets mount removed; closes NICO-V241-001 + YSG-RISK-060)
 # Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
 # Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
 # Last updated: 2026-05-20T10:50:00+01:00 (fix(compose): AGENT-RUNTIME-003c drop sslmode=require from LETTA_PG_URI — pg8000 alembic path)
@@ -88,7 +89,9 @@ x-common-env: &common-env
   # os.environ.get("YASHIGANI_INTERNAL_BEARER"). Fail-fast syntax: missing value
   # surfaces at compose-up, not deep inside the container at lifespan startup.
   # Bucket-C shims (open-webui, langflow, letta) read from /run/secrets/yashigani_internal_bearer
-  # file directly — they also benefit from the env var for consistency.
+  # via Docker named-secrets (langflow + letta) or direct bind-mount (open-webui — untouched
+  # per brief). openclaw reads the bearer from openclaw.json (pre-substituted by install.sh) —
+  # it has no /run/secrets mount at all (PROBE-AG1 fix). They also benefit from the env var for consistency.
   YASHIGANI_INTERNAL_BEARER: ${YASHIGANI_INTERNAL_BEARER:?run install.sh to generate yashigani_internal_bearer}
 
 # Reminder for readers: the manifest is mounted into each Python service as
@@ -1603,9 +1606,13 @@ services:
       LANGFLOW_ALEMBIC_LOG_TO_STDOUT: "true"
     volumes:
       - langflow_data:/app/langflow
-      # Captain Bucket-C: mount secrets dir so entrypoint shim can read
-      # yashigani_internal_bearer at startup.
-      - ./secrets:/run/secrets:ro
+    # PROBE-AG1 fix: per-key Docker named-secrets — replaces wholesale ./secrets mount.
+    # langflow only needs yashigani_internal_bearer (entrypoint shim: cat /run/secrets/yashigani_internal_bearer).
+    # caddy_internal_hmac, PKI certs, postgres/redis passwords are NOT exposed to langflow.
+    secrets:
+      - source: yashigani_internal_bearer
+        target: yashigani_internal_bearer
+        mode: 0440
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:7860/health', timeout=5)\""]
       interval: 15s
@@ -1700,9 +1707,28 @@ services:
         export DATABASE_URL="postgresql://pgbouncer_authenticator:$$PASS@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
-      - ./secrets:/run/secrets:ro
       - ./pgbouncer/pgbouncer-letta.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./secrets/pgbouncer_authenticator_password:/run/secrets/pgbouncer_authenticator_password:ro
+    # PROBE-AG1 fix: per-key Docker named-secrets — replaces wholesale ./secrets mount.
+    # letta-pgbouncer needs exactly 4 secrets:
+    #   pgbouncer_authenticator_password — read by wrapper command (cat /run/secrets/...)
+    #   ca_root.crt                      — server_tls_ca_file in pgbouncer-letta.ini
+    #   letta-pgbouncer_client.crt       — server_tls_cert_file in pgbouncer-letta.ini
+    #   letta-pgbouncer_client.key       — server_tls_key_file in pgbouncer-letta.ini
+    # caddy_internal_hmac, yashigani_internal_bearer, gateway/backoffice certs, postgres/redis
+    # passwords are NOT exposed to letta-pgbouncer.
+    secrets:
+      - source: pgbouncer_authenticator_password
+        target: pgbouncer_authenticator_password
+        mode: 0440
+      - source: ca_root_crt
+        target: ca_root.crt
+        mode: 0444
+      - source: letta_pgbouncer_client_crt
+        target: letta-pgbouncer_client.crt
+        mode: 0444
+      - source: letta_pgbouncer_client_key
+        target: letta-pgbouncer_client.key
+        mode: 0400
     healthcheck:
       # edoburu/pgbouncer image is busybox-based — same nc healthcheck as the
       # existing pgbouncer instance. 127.0.0.1 avoids IPv6-first resolution.
@@ -1789,9 +1815,6 @@ services:
       LETTA_PG_URI: postgresql://yashigani_app:${POSTGRES_PASSWORD}@letta-pgbouncer:5432/letta
     volumes:
       - letta_data:/root/.letta
-      # Captain Bucket-C: mount secrets dir so entrypoint shim can read
-      # yashigani_internal_bearer at startup.
-      - ./secrets:/run/secrets:ro
       # letta 0.16.7 write-path fix — keep read_only:true on the rootfs:
       # app.py:162 writes openapi_letta.json via Path("openapi_letta.json").write_text()
       # relative to CWD (/app). Single-file bind mount creates a writable inode at exactly
@@ -1800,6 +1823,15 @@ services:
       # a directory, not a file). The file is regenerated on every startup — host copy
       # is just a placeholder. Installer (Su) creates this file in install.sh.
       - ./letta-runtime/openapi_letta.json:/app/openapi_letta.json:rw
+    # PROBE-AG1 fix: per-key Docker named-secrets — replaces wholesale ./secrets mount.
+    # letta only needs yashigani_internal_bearer (entrypoint shim: cat /run/secrets/yashigani_internal_bearer).
+    # caddy_internal_hmac, PKI certs, postgres/redis passwords are NOT exposed to letta.
+    # letta-pgbouncer certs are mounted on letta-pgbouncer sidecar, not on letta itself
+    # (letta→letta-pgbouncer is plain TCP, pg8000 constraint C1; pgbouncer owns the mTLS leg).
+    secrets:
+      - source: yashigani_internal_bearer
+        target: yashigani_internal_bearer
+        mode: 0440
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8283/v1/health\", timeout=5)'"]
       interval: 15s
@@ -1877,8 +1909,14 @@ services:
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
     volumes:
       - openclaw_data:/home/node/.openclaw
-      - ./secrets:/run/secrets:ro
       - ./openclaw/openclaw.json:/etc/openclaw/openclaw.json:ro
+    # PROBE-AG1 fix: NO /run/secrets mount at all for openclaw.
+    # openclaw reads yashigani_internal_bearer via openclaw.json (install.sh substitutes
+    # __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is baked into the config).
+    # No runtime secret file reads required. caddy_internal_hmac and ALL PKI material
+    # are NOT accessible to openclaw containers.
+    # openclaw also joins `edge` (internet-facing for Slack/Telegram webhooks) — the
+    # absence of /run/secrets mount is the critical blast-radius reduction for PROBE-AG1.
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:18789/healthz 2>/dev/null || wget -qO- http://localhost:18789/healthz 2>/dev/null || exit 1"]
       interval: 15s
@@ -2170,11 +2208,39 @@ volumes:
     driver: local
 
 # ---------------------------------------------------------------------------
-# Docker secrets (populated by backoffice bootstrap)
+# Docker named-secrets (PROBE-AG1 fix, v2.24.1)
 # ---------------------------------------------------------------------------
-# Docker secrets section removed — all services bind-mount ./secrets directly.
+# Per-key Docker named-secrets replace wholesale ./secrets:/run/secrets:ro mounts on
+# agent containers (langflow, letta, letta-pgbouncer). Each secret is exposed ONLY to
+# the service(s) that actually need it. caddy_internal_hmac is NOT listed here because
+# no agent container needs it — it is passed to gateway/backoffice/caddy via .env only.
+#
+# openclaw has NO entry in this block — it needs zero secret file reads at runtime.
+# The bearer token is pre-substituted into openclaw.json by install.sh.
+#
+# Most core services (gateway, backoffice, caddy, redis, postgres, pgbouncer, etc.)
+# continue to use the ./secrets:/run/secrets:ro bind-mount directly — those services
+# are first-party Python/Go workloads with constrained blast radius. The bind-mount
+# pattern is intentionally preserved for them; the named-secrets pattern is applied
+# to third-party agent containers that join the `edge` network (openclaw) or that
+# have broader blast-radius exposure.
+#
 # Secret files are generated by install.sh and stored in docker/secrets/.
 # To upgrade to a paid tier, replace docker/secrets/license_key with your .ysg content.
+secrets:
+  # langflow + letta entrypoint shim: cat /run/secrets/yashigani_internal_bearer
+  yashigani_internal_bearer:
+    file: ./secrets/yashigani_internal_bearer
+
+  # letta-pgbouncer: wrapper command reads password; pgbouncer-letta.ini reads certs
+  pgbouncer_authenticator_password:
+    file: ./secrets/pgbouncer_authenticator_password
+  ca_root_crt:
+    file: ./secrets/ca_root.crt
+  letta_pgbouncer_client_crt:
+    file: ./secrets/letta-pgbouncer_client.crt
+  letta_pgbouncer_client_key:
+    file: ./secrets/letta-pgbouncer_client.key
 
 # ---------------------------------------------------------------------------
 # Networks — Caddy-centric isolation (EX-231-10 fix, 2026-04-29)
