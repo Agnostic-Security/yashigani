@@ -633,7 +633,7 @@ risks:
       the blast-radius of which container can read which file.
       Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac
       → "No such file or directory" (confirmed in evidence dir).
-    commit: pending-this-commit
+    commit: 6fa98dc
     evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_per_key_secrets_PROBE_AG1_fix_20260524/
   last_threat_model_review: 2026-05-24
   held_reason: Resolved — HOLD lifted by PROBE-AG1 Tiago directive 2026-05-24.
@@ -1145,7 +1145,7 @@ risks:
       caddy_internal_hmac is NOT accessible from within the openclaw container.
       Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac
       → exec fails (no /run/secrets dir exists in openclaw container at all).
-    commit: pending-this-commit
+    commit: 6fa98dc
     evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_per_key_secrets_PROBE_AG1_fix_20260524/
   last_threat_model_review: 2026-05-24
   source: PROBE-AG1 — code-verified by Tiago directive 2026-05-24
