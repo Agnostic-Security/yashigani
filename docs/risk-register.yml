@@ -1274,7 +1274,7 @@ risks:
     - Process restart requires attacker access to deployment plane (high bar)
   status: mitigated
   closure_evidence:
-    - commit: TBD_REPLACED_BY_SHA
+    - commit: 0df9774
       rationale: >-
         Redis-backed counter (_totp_incr_failure / _totp_get_count / _totp_reset
         in auth.py). Integration test verifies counter survives module eviction
