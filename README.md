@@ -477,3 +477,5 @@ The following features are included in **all seven tiers** at parity. They are d
 
 Agnostic Security will donate 10% of the Yashigani platform sales profits to the open-source projects that we use, as long as they are registered as non-for-profit organizations.
 We might also decide to sponsor other Open-Source projects that we use in some way.
+
+For the full attribution list of third-party open-source components Yashigani integrates with or ships pinned by the reference compose / Helm artefacts — including each upstream project, pinned version, SPDX license identifier, and any non-standard licensing notes — see [`docs/THIRD-PARTY-LICENSES.md`](docs/THIRD-PARTY-LICENSES.md).
