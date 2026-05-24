@@ -21,13 +21,19 @@ Design rationale:
     A failed Redis connection should not gate legitimate traffic when the
     risk signal is unavailable.
 
-Default threshold rationale (v2.4.1):
-  max_connections_per_ip defaults to 5000/60s — intentionally permissive.
-  Caddy timeouts remain the first-line flood defence. This second-line
-  per-IP throttle fires only on EXTREME volume. Shared-NAT / corporate-proxy
-  / load-test traffic stays under the threshold. Operators wanting stricter
-  controls override via YASHIGANI_DDOS_PER_IP_LIMIT (env).
-  Risk register: YSG-RISK-056.
+Default threshold rationale (v2.4.1 → v2.24.1):
+  max_connections_per_ip scales with the licensed max_end_users count so
+  that large deployments (corporate offices, multi-org Pro+, enterprise)
+  are never blocked by an arbitrary fixed ceiling.
+  Formula: max(5000, max_end_users * 25)
+  Unlimited tiers (enterprise, academic_nonprofit, max_end_users == -1)
+  → 100 000 (very permissive; operator expected to tune or add own DDoS
+  perimeter).  Caddy timeouts remain the first-line flood defence; this
+  second-line per-IP throttle fires only on EXTREME volume.
+  Override via YASHIGANI_DDOS_PER_IP_LIMIT (env) — env wins over computed
+  default.  Risk register: YSG-RISK-056.
+  Tiago 2026-05-24: "tie the threshold to the number of users so you don't
+  block big deployments".
 
 OWASP ASVS Level 3 alignment:
   V4.2.1 — Enforced at application layer (not solely network layer).
@@ -49,9 +55,47 @@ ENV_WINDOW_SECONDS = "YASHIGANI_DDOS_WINDOW_SECONDS"
 ENV_EXEMPT_PATHS = "YASHIGANI_DDOS_EXEMPT_PATHS"
 
 # Default thresholds — permissive by design (see module docstring / YSG-RISK-056).
+# _DEFAULT_MAX_CONNECTIONS_PER_IP is the floor used by _ddos_default_per_ip_limit()
+# and also the fallback when no license is loaded (community / canary / dev).
 # Override via YASHIGANI_DDOS_PER_IP_LIMIT and YASHIGANI_DDOS_WINDOW_SECONDS.
 _DEFAULT_MAX_CONNECTIONS_PER_IP: int = 5000
 _DEFAULT_WINDOW_SECONDS: int = 60
+
+
+def _ddos_default_per_ip_limit(max_end_users: int) -> int:
+    """
+    Compute the default per-IP connection limit scaled to the licensed user count.
+
+    Per-IP connection limit scales with licensed max_end_users so big-NAT
+    deployments (corporate offices, multi-org Pro+, enterprise) aren't blocked
+    by an arbitrary ceiling.
+
+    Formula: max(5000, max_end_users * 25)
+
+    The 25x multiplier assumes a worst case where many users share one NAT
+    (realistic for corporate office networks or multi-team Pro+ installs).
+
+    Unlimited tiers (max_end_users == -1 — enterprise, academic_nonprofit)
+    → 100 000 (very permissive; operator is expected to override via
+    YASHIGANI_DDOS_PER_IP_LIMIT or front with their own DDoS perimeter).
+
+    Resulting per-tier defaults:
+      community        (5)    → 5 000  (floor — 5*25=125 < 5000)
+      canary           (5)    → 5 000  (floor)
+      igniter          (50)   → 5 000  (floor — 50*25=1250 < 5000)
+      starter          (100)  → 5 000  (floor — 100*25=2500 < 5000)
+      professional     (500)  → 12 500
+      professional_plus (4000) → 100 000  (4000*25=100000)
+      enterprise       (-1)   → 100 000  (sentinel)
+      academic_nonprofit (-1) → 100 000  (sentinel)
+
+    Authority: Tiago 2026-05-24 — "tie the threshold to the number of users
+    so you don't block big deployments".
+    Risk register: YSG-RISK-056.
+    """
+    if max_end_users == -1:
+        return 100_000  # enterprise / academic — operator-tuned
+    return max(5_000, max_end_users * 25)
 
 # Paths exempt from DDoS tracking (health/metrics must always respond).
 _EXEMPT_PATHS: frozenset[str] = frozenset({

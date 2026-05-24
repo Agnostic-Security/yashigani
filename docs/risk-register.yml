@@ -574,10 +574,16 @@ risks:
   ua10_accelerated: "Tiago directive 2026-05-24 — accelerated from v2.24.2 to v2.24.1"
 - id: YSG-RISK-056
   description: >-
-    DDoSProtector per-IP throttle defaults to 5000 concurrent connections per IP per 60s
-    — chosen permissive to avoid breaking shared-NAT / corporate-proxy / load-test usage.
-    Caddy timeouts remain the first-line defence. Operators wanting stricter controls
-    must explicitly override via YASHIGANI_DDOS_PER_IP_LIMIT.
+    DDoSProtector per-IP throttle defaults scale with licensed max_end_users
+    to avoid blocking legitimate big-NAT / multi-user deployments.
+    Formula: max(5000, max_end_users * 25); enterprise/academic = 100000.
+    Window 60s. Operator can always override via YASHIGANI_DDOS_PER_IP_LIMIT.
+  rationale: >-
+    Tiago 2026-05-24 — "tie the threshold to the number of users so you
+    don't block big deployments". Floor 5000 protects free/community from
+    demo abuse; multiplier 25x user-count gives headroom for corporate
+    NAT topologies; enterprise sentinel 100000 + operator override for
+    mature SOC setups.
   severity: low
   controls_impacted:
   - ASVS V11.1.4
@@ -586,6 +592,7 @@ risks:
   - Caddy connection timeout + read/write deadlines (first-line)
   - Per-IP env var override available for tighter control (YASHIGANI_DDOS_PER_IP_LIMIT)
   - Rate limiter on /v1/* fires before DDoSProtector for authenticated requests
+  - License-scaled default ensures big-NAT corporate deployments are not blocked
   status: accepted
   accepted_by: Tiago
   accepted_at: 2026-05-24

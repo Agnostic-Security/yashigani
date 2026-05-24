@@ -1,6 +1,6 @@
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
-<!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: DDoSProtector wire-up — permissive defaults, Redis DB 5, env-var overrides) -->
+<!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: DDoSProtector wire-up + license-scaled per-IP defaults) -->
 <!-- last-updated: 2026-05-16T18:30:00+01:00 (v2.23.4: draft [Unreleased] entry covering 62 commits since v2.23.3) -->
 <!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
@@ -26,11 +26,28 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   dead code. That claim is now true.
 
 ### Changed
-- **Permissive DDoS defaults** (YSG-RISK-056): default threshold raised from 50 to
-  **5000 requests/IP/60s**. Caddy timeouts remain the first-line flood defence; this
-  second-line gate fires only on extreme volume. Shared-NAT / corporate-proxy /
-  load-test traffic stays under the threshold. Override via:
-  - `YASHIGANI_DDOS_PER_IP_LIMIT` — integer, requests per window per IP
+- **License-scaled DDoS defaults** (YSG-RISK-056, Tiago 2026-05-24): per-IP
+  connection limit now scales with `LicenseState.max_end_users` so large deployments
+  are not blocked by a fixed ceiling. Formula: `max(5000, max_end_users * 25)`.
+  The 25× multiplier assumes a worst-case corporate-NAT topology where many licensed
+  users share a single egress IP. Enterprise/academic (unlimited, `max_end_users == -1`)
+  → 100 000. Resulting per-tier defaults:
+  | Tier | max_end_users | per-IP limit |
+  |---|---|---|
+  | community / canary | 5 | 5 000 (floor) |
+  | igniter | 50 | 5 000 (floor) |
+  | starter | 100 | 5 000 (floor) |
+  | professional | 500 | 12 500 |
+  | professional_plus | 4 000 | 100 000 |
+  | enterprise / academic | -1 | 100 000 (sentinel) |
+
+  `YASHIGANI_DDOS_PER_IP_LIMIT` env var still overrides the computed default.
+  Startup log now emits:
+  `"DDoSProtector configured: max_end_users=N → per_ip_limit=M (source=license|env), window=60s"`
+- **Permissive DDoS floor** (from previous entry): floor of 5000 still applies.
+  Caddy timeouts remain the first-line flood defence; this second-line gate fires
+  only on extreme volume. Override env vars:
+  - `YASHIGANI_DDOS_PER_IP_LIMIT` — integer, requests per window per IP (wins over license-computed)
   - `YASHIGANI_DDOS_WINDOW_SECONDS` — integer, window length in seconds
   - `YASHIGANI_DDOS_EXEMPT_PATHS` — comma-separated extra paths to exempt
 - **Redis DB 5** dedicated to DDoS counters (DB 2 = rate-limit/anomaly,

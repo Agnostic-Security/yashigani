@@ -374,3 +374,133 @@ class TestPermissiveDefaults:
         for _ in range(5000):
             p.record("203.0.113.2")
         assert p.check("203.0.113.2") is True
+
+
+# ---------------------------------------------------------------------------
+# _ddos_default_per_ip_limit — license-scaled defaults (v2.24.1 / YSG-RISK-056)
+# ---------------------------------------------------------------------------
+
+class TestDdosDefaultPerIpLimit:
+    """
+    Verify _ddos_default_per_ip_limit() produces the correct per-tier value
+    for all 8 defined tiers (Tiago 2026-05-24 formula: max(5000, users*25)).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _load_helper(self):
+        """Ensure _ddos_default_per_ip_limit is importable from the module."""
+        assert hasattr(_ddos_module, "_ddos_default_per_ip_limit"), (
+            "_ddos_default_per_ip_limit missing from ddos module"
+        )
+
+    @pytest.mark.parametrize("max_end_users,expected", [
+        # community / canary: max_end_users=5 → 5*25=125 < 5000 → floor 5000
+        (5,    5_000),
+        # igniter: max_end_users=50 → 50*25=1250 < 5000 → floor 5000
+        (50,   5_000),
+        # starter: max_end_users=100 → 100*25=2500 < 5000 → floor 5000
+        (100,  5_000),
+        # professional: max_end_users=500 → 500*25=12500 > 5000 → 12500
+        (500,  12_500),
+        # professional_plus: max_end_users=4000 → 4000*25=100000 > 5000 → 100000
+        (4000, 100_000),
+        # enterprise / academic_nonprofit: -1 → sentinel 100000
+        (-1,   100_000),
+    ])
+    def test_per_tier_limit(self, max_end_users, expected):
+        fn = _ddos_module._ddos_default_per_ip_limit
+        assert fn(max_end_users) == expected, (
+            f"max_end_users={max_end_users}: expected {expected}, "
+            f"got {fn(max_end_users)}"
+        )
+
+    def test_community_tier_default_matches_floor(self):
+        """community max_end_users=5 must hit the 5000 floor, not 5*25=125."""
+        fn = _ddos_module._ddos_default_per_ip_limit
+        assert fn(5) == 5_000
+
+    def test_enterprise_sentinel_100k(self):
+        """enterprise/academic (-1) must return exactly 100 000."""
+        fn = _ddos_module._ddos_default_per_ip_limit
+        assert fn(-1) == 100_000
+
+    def test_formula_is_max_of_floor_and_product(self):
+        """Cross-check: any positive user count below 200 hits the 5000 floor."""
+        fn = _ddos_module._ddos_default_per_ip_limit
+        for users in [1, 5, 50, 100, 199]:
+            result = fn(users)
+            assert result == 5_000, (
+                f"users={users}: expected 5000 (floor), got {result}"
+            )
+
+    def test_formula_above_floor(self):
+        """Any user count where users*25 > 5000 (i.e. users >= 201) must use product."""
+        fn = _ddos_module._ddos_default_per_ip_limit
+        # 201 * 25 = 5025 > 5000
+        assert fn(201) == 5_025
+        # 1000 * 25 = 25000
+        assert fn(1000) == 25_000
+
+
+class TestDdosEnvVarBeatslicensedDefault:
+    """
+    Env var YASHIGANI_DDOS_PER_IP_LIMIT must win over the license-computed
+    default.  Simulate the entrypoint.py resolution logic.
+    """
+
+    def test_env_var_override_beats_computed_default(self, monkeypatch):
+        """
+        When YASHIGANI_DDOS_PER_IP_LIMIT=999 is set, the entrypoint
+        resolution path must use 999, not the license-computed value.
+        """
+        monkeypatch.setenv(_ddos_module.ENV_PER_IP_LIMIT, "999")
+        env_val = os.environ.get(_ddos_module.ENV_PER_IP_LIMIT)
+        assert env_val is not None
+        resolved = int(env_val)
+        assert resolved == 999
+        # The license-computed value for community (5) would be 5000 — verify
+        # that the env override is distinct and wins.
+        assert resolved != _ddos_module._ddos_default_per_ip_limit(5)
+
+    def test_no_env_var_uses_license_computation(self, monkeypatch):
+        """
+        When env var is absent, the computed default is used.
+        """
+        monkeypatch.delenv(_ddos_module.ENV_PER_IP_LIMIT, raising=False)
+        env_val = os.environ.get(_ddos_module.ENV_PER_IP_LIMIT)
+        assert env_val is None
+        # Falls back to license computation; community tier gives 5000
+        computed = _ddos_module._ddos_default_per_ip_limit(5)
+        assert computed == 5_000
+
+
+class TestDdosMissingLicenseFallback:
+    """
+    If get_license() raises (no license file, broken verifier), the entrypoint
+    falls back to community defaults (max_end_users=5 → 5000).
+    """
+
+    def test_community_fallback_is_5(self):
+        """
+        The community fallback max_end_users=5 passed to _ddos_default_per_ip_limit
+        must yield 5000 (the floor).
+        """
+        fn = _ddos_module._ddos_default_per_ip_limit
+        # entrypoint fallback on exception: max_end_users = 5
+        fallback_users = 5
+        assert fn(fallback_users) == 5_000
+
+    def test_community_max_end_users_value(self):
+        """
+        TIER_DEFAULTS["community"]["max_end_users"] must be 5 so the
+        fallback in the entrypoint DDoS block produces the floor (5000).
+        Uses sys.path insertion to avoid dataclass annotation resolution
+        issues in Python 3.9 with spec_from_file_location.
+        """
+        src_root = Path(__file__).parent.parent.parent
+        src_str = str(src_root)
+        if src_str not in sys.path:
+            sys.path.insert(0, src_str)
+        from yashigani.licensing.model import TIER_DEFAULTS  # noqa: PLC0415
+        assert TIER_DEFAULTS["community"]["max_end_users"] == 5
+        assert TIER_DEFAULTS["canary"]["max_end_users"] == 5

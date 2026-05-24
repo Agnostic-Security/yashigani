@@ -31,7 +31,7 @@ from yashigani.gateway.agent_auth import AgentAuthMiddleware
 from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
-from yashigani.gateway.ddos import DDoSProtector, ENV_PER_IP_LIMIT, ENV_WINDOW_SECONDS, ENV_EXEMPT_PATHS, _EXEMPT_PATHS
+from yashigani.gateway.ddos import DDoSProtector, ENV_PER_IP_LIMIT, ENV_WINDOW_SECONDS, ENV_EXEMPT_PATHS, _EXEMPT_PATHS, _ddos_default_per_ip_limit
 from yashigani.auth.caddy_verified import CaddyVerifiedMiddleware
 from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
@@ -388,15 +388,30 @@ def _build_app(mesh_mode: bool = False):
         logger.warning("Pool Manager unavailable (%s) — pool-managed dispatch disabled", exc)
 
     # DDoS protector — Redis DB 5 (free, separate namespace from rl: and ddos: siblings).
-    # Defaults: 5000 req/IP/60s — permissive so shared-NAT / corporate-proxy / load-test
-    # traffic stays under the threshold (YSG-RISK-056).  Caddy timeouts are the primary
-    # flood defence; this is a second-line per-IP extreme-volume gate only.
+    # Per-IP limit scales with licensed max_end_users — formula: max(5000, max_end_users*25).
+    # Enterprise/unlimited → 100 000.  Caddy timeouts are the primary flood defence;
+    # this is a second-line per-IP extreme-volume gate only (YSG-RISK-056).
+    # Tiago 2026-05-24: "tie the threshold to the number of users so you don't block
+    # big deployments".
     # Override via YASHIGANI_DDOS_PER_IP_LIMIT / YASHIGANI_DDOS_WINDOW_SECONDS /
     # YASHIGANI_DDOS_EXEMPT_PATHS (comma-separated).
     ddos_protector = None
     try:
         import redis as _redis
-        _ddos_per_ip = int(os.getenv(ENV_PER_IP_LIMIT, "5000"))
+        # Resolve per-IP limit: env var wins; otherwise scale from license.
+        _ddos_env_limit = os.getenv(ENV_PER_IP_LIMIT)
+        if _ddos_env_limit is not None:
+            _ddos_per_ip = int(_ddos_env_limit)
+            _ddos_limit_source = "env"
+        else:
+            # Read max_end_users from cryptographically-verified license.
+            try:
+                from yashigani.licensing.enforcer import get_license as _get_ddos_license
+                _ddos_max_end_users = _get_ddos_license().max_end_users
+            except Exception:
+                _ddos_max_end_users = 5  # fallback: community defaults
+            _ddos_per_ip = _ddos_default_per_ip_limit(_ddos_max_end_users)
+            _ddos_limit_source = "license"
         _ddos_window = int(os.getenv(ENV_WINDOW_SECONDS, "60"))
         # Extra exempt paths from env (comma-separated), merged with class defaults.
         _ddos_extra_exempt_raw = os.getenv(ENV_EXEMPT_PATHS, "")
@@ -415,8 +430,10 @@ def _build_app(mesh_mode: bool = False):
             import yashigani.gateway.ddos as _ddos_mod
             _ddos_mod._EXEMPT_PATHS = _EXEMPT_PATHS | _ddos_extra_exempt
         logger.info(
-            "DDoSProtector ready (Redis DB 5, per_ip_limit=%d, window=%ds)",
+            "DDoSProtector configured: max_end_users=%d → per_ip_limit=%d (source=%s), window=%ds",
+            _ddos_max_end_users if _ddos_limit_source == "license" else -1,
             _ddos_per_ip,
+            _ddos_limit_source,
             _ddos_window,
         )
     except Exception as exc:
