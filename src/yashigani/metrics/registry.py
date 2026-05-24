@@ -136,7 +136,7 @@ ratelimit_multiplier = _G(
 ratelimit_effective_rps = _G(
     "yashigani_ratelimit_effective_rps",
     "Effective requests-per-second per dimension after adaptive scaling.",
-    ["dimension"],  # global | ip | agent | session
+    ["dimension"],  # global | ip | agent | session | user
 )
 
 ratelimit_config_last_updated_timestamp = _G(
