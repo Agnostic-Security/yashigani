@@ -169,6 +169,14 @@ class EventType(str, Enum):
     # STREAM_TERMINATED: emitted when a streaming response is terminated
     # early by the StreamingInspector due to sensitive content detection.
     STREAM_TERMINATED = "STREAM_TERMINATED"
+    # v2.24.1 — LU-AMEND-04: operator identity attestation on yashigani onboard
+    # OPERATOR_TOKEN_ISSUED: admin issued a short-lived operator onboard token.
+    # ASVS V7.2.1 + NIST IA-2 + CMMC IA.L2-3.5.1 + SOC 2 CC6.1.
+    OPERATOR_TOKEN_ISSUED = "OPERATOR_TOKEN_ISSUED"
+    # ONBOARD_ATTEMPTED: yashigani onboard was called; records operator identity
+    # or flags as weak-identity when no token was supplied.
+    # ASVS V7.2.1 + NIST AU-3 + CMMC AU.L2-3.3.1.
+    ONBOARD_ATTEMPTED = "ONBOARD_ATTEMPTED"
 
 
 # ---------------------------------------------------------------------------
@@ -1463,3 +1471,68 @@ class StreamTerminatedEvent(AuditEvent):
     session_id: str = ""
     agent_id: str = ""
     accumulated_chars: int = 0
+
+
+# ---------------------------------------------------------------------------
+# v2.24.1 — LU-AMEND-04: operator identity attestation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OperatorTokenIssuedEvent(AuditEvent):
+    """
+    Emitted when an admin issues a short-lived operator onboard token via
+    POST /auth/operator-token.
+
+    Security invariants:
+      - The token value itself is NEVER logged; only the jti (token ID)
+        and expiry are recorded. The jti enables cross-correlation with
+        ONBOARD_ATTEMPTED without exposing the bearer credential.
+      - admin_account is the issuing admin's username (not the target).
+      - token_ttl_seconds records the TTL at issuance time.
+
+    ASVS V7.2.1 + NIST IA-2/AU-3 + CMMC IA.L2-3.5.1/3 + SOC 2 CC6.1
+    + ISO 27001 A.5.16/A.5.17 / LU-AMEND-04.
+    """
+
+    event_type: str = EventType.OPERATOR_TOKEN_ISSUED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""     # issuing admin username
+    token_jti: str = ""         # UUID4 — correlates with ONBOARD_ATTEMPTED
+    token_ttl_seconds: int = 0  # TTL at issuance (typically 900 s / 15 min)
+    issued_for: str = ""        # free-text note — operator intent, e.g. agent name
+
+
+@dataclass
+class OnboardAttemptedEvent(AuditEvent):
+    """
+    Emitted when `yashigani onboard` is called.
+
+    Identity quality:
+      - identity_quality = "attested"  → operator supplied a valid token
+        (jti + expiry verified by backoffice). Audit trail is complete.
+      - identity_quality = "weak"      → operator did NOT supply --token.
+        The onboard was allowed but flagged so auditors can identify
+        un-attested onboards. CMMC CA.L2-3.12.2 / SOC 2 CC3.1 require
+        that all exceptions are documented.
+
+    Security invariants:
+      - The raw token value is NEVER logged.
+      - token_jti is empty string when identity_quality = "weak" (no token).
+      - operator_identity is the value carried in the token's sub claim
+        (typically the admin username who issued it), or "unknown" when weak.
+
+    ASVS V7.2.1 + NIST AU-3/IA-2 + CMMC IA.L2-3.5.1 + AU.L2-3.3.1
+    + SOC 2 CC6.1 + ISO 42001 A.6.1.2 / LU-AMEND-04.
+    """
+
+    event_type: str = EventType.ONBOARD_ATTEMPTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    identity_quality: str = ""   # "attested" | "weak"
+    operator_identity: str = ""  # sub claim from token, or "unknown"
+    token_jti: str = ""          # UUID4 from token, or "" when weak
+    agent_name: str = ""         # agent being onboarded
+    agent_url: str = ""          # upstream URL from CLI arg
+    client_ip: str = ""          # caller's IP (from X-Forwarded-For or direct)

@@ -954,6 +954,284 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
 # ---------------------------------------------------------------------------
 # Admin IP access control — blocklist + allowlist (fail2ban-style)
 # ---------------------------------------------------------------------------
+# LU-AMEND-04: Operator identity attestation token for yashigani onboard
+# ---------------------------------------------------------------------------
+
+# Short-lived operator token TTL: 15 minutes. Enough for a single onboard
+# ceremony; short enough to minimise the value of a leaked token.
+_OPERATOR_TOKEN_TTL_SECONDS: int = int(os.getenv("YASHIGANI_OPERATOR_TOKEN_TTL", "900"))
+
+
+class OperatorTokenRequest(BaseModel):
+    """Request body for POST /auth/operator-token."""
+
+    issued_for: str = Field(
+        default="",
+        max_length=256,
+        description="Optional free-text note describing the onboard ceremony (e.g. agent name).",
+    )
+
+
+@router.post("/operator-token")
+async def issue_operator_token(
+    body: OperatorTokenRequest,
+    session: AdminSession,
+    request: Request,
+):
+    """
+    Issue a short-lived operator identity token for use with `yashigani onboard`.
+
+    Prerequisites:
+      - Active admin session (AdminSession dependency — cookie auth).
+      - Fresh step-up TOTP (assert_fresh_stepup — within YASHIGANI_STEPUP_TTL_SECONDS).
+
+    Returns a signed JWT with:
+      - sub:  admin username (the issuing operator identity)
+      - jti:  UUID4 (enables cross-correlation in the audit log)
+      - iat:  issued-at (Unix timestamp)
+      - exp:  expiry = iat + _OPERATOR_TOKEN_TTL_SECONDS
+      - iss:  "yashigani.backoffice"
+      - purpose: "operator-onboard"
+
+    Security invariants:
+      - Step-up required: prevents a hijacked session from silently issuing tokens.
+      - Token is signed with HS256 using the caddy_internal_hmac (already available
+        at runtime via /run/secrets/caddy_internal_hmac).
+      - The token value is NEVER written to the audit log — only the jti and TTL.
+      - Verify endpoint: GET /auth/operator-token/verify (used by the CLI).
+
+    ASVS V7.2.1 + NIST IA-2/AU-3 + CMMC IA.L2-3.5.1/3 + SOC 2 CC6.1
+    + ISO 27001 A.5.16/A.5.17 / LU-AMEND-04.
+    """
+    from yashigani.auth.stepup import assert_fresh_stepup
+
+    assert_fresh_stepup(session)
+
+    state = backoffice_state
+    assert state.auth_service is not None
+    assert state.audit_writer is not None
+
+    admin_record = await state.auth_service.get_account_by_id(session.account_id)
+    if admin_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    import uuid
+    import time as _time
+
+    import jwt as _pyjwt
+
+    # Signing key: reuse caddy_internal_hmac (already a 32+ byte secret at runtime).
+    # Fail closed if the secret file is not readable.
+    _hmac_path = "/run/secrets/caddy_internal_hmac"
+    try:
+        with open(_hmac_path) as _f:
+            _signing_key = _f.read().strip()
+    except OSError:
+        _log.error("LU-AMEND-04: cannot read %s — operator-token issuance refused", _hmac_path)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "signing_key_unavailable"},
+        )
+
+    _jti = str(uuid.uuid4())
+    _now = int(_time.time())
+    _payload = {
+        "sub": admin_record.username,
+        "jti": _jti,
+        "iat": _now,
+        "exp": _now + _OPERATOR_TOKEN_TTL_SECONDS,
+        "iss": "yashigani.backoffice",
+        "purpose": "operator-onboard",
+        "issued_for": body.issued_for[:256],
+    }
+    _token = _pyjwt.encode(_payload, _signing_key, algorithm="HS256")
+
+    from yashigani.audit.schema import OperatorTokenIssuedEvent
+
+    state.audit_writer.write(
+        OperatorTokenIssuedEvent(
+            admin_account=admin_record.username,
+            token_jti=_jti,
+            token_ttl_seconds=_OPERATOR_TOKEN_TTL_SECONDS,
+            issued_for=body.issued_for[:256],
+        )
+    )
+
+    _log.info(
+        "LU-AMEND-04: operator token issued by %s jti=%s ttl=%ds issued_for=%r",
+        admin_record.username,
+        _jti,
+        _OPERATOR_TOKEN_TTL_SECONDS,
+        body.issued_for[:64],
+    )
+
+    return {
+        "token": _token,
+        "jti": _jti,
+        "expires_in": _OPERATOR_TOKEN_TTL_SECONDS,
+        "token_type": "Bearer",
+        "purpose": "operator-onboard",
+    }
+
+
+@router.get("/operator-token/verify")
+async def verify_operator_token(
+    request: Request,
+):
+    """
+    Verify an operator onboard token presented in the Authorization header.
+
+    Used by `yashigani onboard --token <tok>` to validate the token before
+    proceeding with the onboard ceremony.  The CLI POSTs the agent registration
+    only after this endpoint returns 200.
+
+    Authorization: Bearer <token>
+
+    Returns 200 + {sub, jti, exp, issued_for} on success.
+    Returns 401 on invalid/expired/wrong-purpose token.
+    Returns 400 if the header is absent or malformed.
+
+    Security invariants:
+      - This endpoint does NOT require an admin session cookie — it is the
+        bearer-token validation surface for headless CLI callers.
+      - The endpoint is on the internal backoffice path (:8443) — it is NOT
+        reachable from the public Caddy edge without admin session + mTLS.
+      - No audit event emitted here (verify is low-value; ONBOARD_ATTEMPTED
+        in the CLI captures the full ceremony outcome).
+
+    LU-AMEND-04 / v2.24.1.
+    """
+    import jwt as _pyjwt
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "missing_bearer_token"},
+        )
+    _raw_token = auth_header[len("Bearer "):].strip()
+
+    _hmac_path = "/run/secrets/caddy_internal_hmac"
+    try:
+        with open(_hmac_path) as _f:
+            _signing_key = _f.read().strip()
+    except OSError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "signing_key_unavailable"},
+        )
+
+    try:
+        _payload = _pyjwt.decode(
+            _raw_token,
+            _signing_key,
+            algorithms=["HS256"],
+            options={"require": ["sub", "jti", "exp", "iat", "iss", "purpose"]},
+        )
+    except _pyjwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "token_expired"},
+        )
+    except _pyjwt.InvalidTokenError as _e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "invalid_token", "detail": str(_e)},
+        )
+
+    if _payload.get("purpose") != "operator-onboard":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "wrong_token_purpose"},
+        )
+    if _payload.get("iss") != "yashigani.backoffice":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "wrong_token_issuer"},
+        )
+
+    return {
+        "valid": True,
+        "sub": _payload["sub"],
+        "jti": _payload["jti"],
+        "exp": _payload["exp"],
+        "issued_for": _payload.get("issued_for", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LU-AMEND-04: Internal onboard audit endpoint
+#
+# Called by the yashigani-onboard CLI to emit an ONBOARD_ATTEMPTED event after
+# verifying (or not) the operator token.  Mounted at /auth/onboard-event via
+# the /auth prefix in app.py.  The full path is /auth/onboard-event.
+#
+# Security: requires AdminSession (session cookie from the CLI --session-cookie
+# flag) + X-Caddy-Verified-Secret HMAC (same Layer B gate as all direct backoffice
+# calls).  No step-up required — this is an audit-write path, not a mutation.
+# ---------------------------------------------------------------------------
+
+
+class OnboardEventBody(BaseModel):
+    """Request body for POST /auth/onboard-event."""
+
+    identity_quality: str = Field(
+        ...,
+        pattern="^(attested|weak)$",
+        description="'attested' when a valid token was supplied; 'weak' otherwise.",
+    )
+    operator_identity: str = Field(default="unknown", max_length=256)
+    token_jti: str = Field(default="", max_length=64)
+    agent_name: str = Field(..., max_length=256)
+    agent_url: str = Field(..., max_length=512)
+    client_ip: str = Field(default="", max_length=64)
+
+
+@router.post("/onboard-event")
+async def record_onboard_event(
+    body: OnboardEventBody,
+    session: AdminSession,
+):
+    """
+    Record an ONBOARD_ATTEMPTED audit event emitted by the yashigani-onboard CLI.
+
+    Security invariants:
+      - Requires AdminSession — callers must present a valid admin session cookie.
+      - identity_quality is constrained to "attested" | "weak" by Pydantic validation.
+      - Raw token values are NEVER accepted in this payload.
+      - Only jti (cross-reference ID) and operator_identity (sub claim) are stored.
+
+    LU-AMEND-04 / v2.24.1.
+    """
+    state = backoffice_state
+    assert state.audit_writer is not None
+
+    from yashigani.audit.schema import OnboardAttemptedEvent
+
+    state.audit_writer.write(
+        OnboardAttemptedEvent(
+            identity_quality=body.identity_quality,
+            operator_identity=body.operator_identity,
+            token_jti=body.token_jti,
+            agent_name=body.agent_name,
+            agent_url=body.agent_url,
+            client_ip=body.client_ip,
+        )
+    )
+
+    _log.info(
+        "LU-AMEND-04: ONBOARD_ATTEMPTED audit event recorded "
+        "identity_quality=%s operator=%s agent=%r jti=%s",
+        body.identity_quality,
+        body.operator_identity,
+        body.agent_name,
+        body.token_jti or "(none)",
+    )
+
+    return {"status": "ok", "identity_quality": body.identity_quality}
+
+
+# ---------------------------------------------------------------------------
 
 
 @router.get("/blocked-ips")
