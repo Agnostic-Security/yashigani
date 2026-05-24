@@ -65,7 +65,7 @@ _DEFAULT_BACKOFFICE = "https://localhost:8443"
 _DEFAULT_PROTOCOL = "openai"
 _VERIFY_PATH = "/auth/operator-token/verify"
 _REGISTER_PATH = "/admin/agents"
-_AUDIT_ONBOARD_PATH = "/internal/audit/onboard-event"  # audit write endpoint
+_AUDIT_ONBOARD_PATH = "/auth/onboard-event"  # audit write endpoint (mounted on backoffice /auth router)
 
 # HMAC secret file — present at /run/secrets inside the backoffice container.
 # CLI callers outside the container must supply it via YSG_CADDY_HMAC env var.
@@ -203,7 +203,7 @@ def _emit_onboard_audit(
     POST an ONBOARD_ATTEMPTED audit event via the backoffice internal endpoint.
     Non-fatal: a failure here logs a warning but does not abort the onboard.
 
-    The backoffice /internal/audit/onboard-event endpoint accepts the payload
+    The backoffice /auth/onboard-event endpoint accepts the payload
     without requiring step-up (the session is already authenticated), records
     an OnboardAttemptedEvent, and returns 200.
 
