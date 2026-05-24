@@ -947,24 +947,20 @@ risks:
 
 - id: YSG-RISK-057
   description: >-
-    ResponseInspectionPipeline (buffered LLM response sensitivity classification + PII
-    detection) is default-disabled via YASHIGANI_INSPECT_RESPONSES env var. When off,
-    _opa_response_check still runs but receives no sensitivity data, so the response-leg
-    OPA ceiling check (v1_routing.rego response_decision) effectively passes through.
-    Streaming response inspection is unaffected. Default-off is an accepted tradeoff for
-    usability/performance — classification adds ~50-200ms per response which is unacceptable
-    for the demo/free/community customer experience. Compliance-driven customers (CMMC
-    SC.L2-3.13.10, ISO 27001 A.8.3) must explicitly opt-in via env var.
-  severity: medium
+    DESIGN-BY-PAIRING — ResponseInspectionPipeline and OPA are deliberately paired.
+    Both default OFF (YASHIGANI_INSPECT_RESPONSES=false, OPA not deployed). Compliance
+    customers opt-in to BOTH together. The "default OFF" decision is a product UX
+    decision — facilitates adoption, prevents support-mail flood ("why is X blocked",
+    "why slow"), keeps simple/demo/community deploys frictionless. When OPA is not
+    deployed, the response-leg check is moot anyway: there is no policy engine to
+    consume sensitivity classification, so producing it would be wasted CPU. When
+    customer enables OPA, they enable inspection alongside it; the pairing then
+    enforces sensitivity ceiling on responses (v1_routing.rego response_decision rule).
+  severity: informational
   controls_impacted:
-  - CMMC SC.L2-3.13.10 (sensitivity-marked data handling)
-  - ISO 27001 A.8.3 (information access restriction)
-  - ASVS V8.3 (sensitive private data)
-  compensating_controls:
-  - Prompt-side sensitivity_classifier IS on by default (request-leg classification works)
-  - Streaming response inspection IS on (Iris audit A4 — streaming forced off when OPA active, but where streaming is active it inspects)
-  - _opa_response_check runs even without pipeline (just lacks sensitivity input)
-  - Operator opt-in available via YASHIGANI_INSPECT_RESPONSES=true
+  - Product UX (adoption, support-load management)
+  - Documented design pairing (not a control gap)
+  compensating_controls: []
   status: accepted
   accepted_by: Tiago
   accepted_at: 2026-05-24
@@ -972,7 +968,11 @@ risks:
   closure_evidence: null
   last_threat_model_review: 2026-05-24
   rationale: >-
-    Tradeoff approved by Tiago 2026-05-24 — "if we lock all then it cannot be used".
-    Per-response classification latency unacceptable for demo/free/community tier UX.
-    Compliance customers opt-in explicitly.
+    Tiago 2026-05-24 — "simple user experience first case"; "facilitates adoption and
+    stops flood of support mails"; "if there is no OPA in place what is the point of
+    closing for the sake of closing it?" OPA + inspection are deployed together by
+    compliance customers (CMMC / ISO 27001 / SOC 2 surfaces), and BOTH ship as opt-in
+    via env vars. Documenting here so future auditors see the design choice, not as
+    a risk needing compensating controls.
+  documentation_pointer: docs/operator-guide.md (opt-in pairing recipe)
   source: changelog-vs-reality-drift-audit-20260524.md finding #4
