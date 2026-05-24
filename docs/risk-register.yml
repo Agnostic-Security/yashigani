@@ -1252,6 +1252,44 @@ risks:
       across compose+helm+Mac+Linux + operator-override doc)
 
 
+- id: YSG-RISK-064
+  description: >-
+    Audit chain cross-batch ordering stability under timestamp collision.
+    Pre-wave-3 (before migration 0014), two events at the same microsecond
+    could be reordered between replicas: ORDER BY (created_at, id) is
+    non-deterministic when created_at values collide because UUID v4 sort
+    is random. This weakened hash-chain integrity under high-throughput
+    conditions — checkpoint computation on replica A could disagree with
+    replica B, silently invalidating the audit trail's tamper-evidence
+    guarantee. Closed by migration 0014 (BIGSERIAL seq column) + chain
+    query reorder to use seq as the authoritative ordering key.
+  severity: medium
+  controls_impacted:
+    - ASVS V7.3.3
+    - NIST AU-9
+    - NIST AU-10
+    - SOC 2 CC7.2
+  status: mitigated
+  closure_evidence:
+    - commit: TBD_WAVE3_COMMIT_SHA
+      rationale: >-
+        Migration 0014 adds BIGSERIAL seq column to audit_events.
+        AuditChainService.run_daily_checkpoint ORDER BY changed to
+        ORDER BY seq NULLS LAST. INSERT_AUDIT_EVENT uses RETURNING seq.
+        PostgresSink._flush_batch uses fetchrow to capture RETURNING seq.
+        verify_chain_segment docstring updated to reference seq ordering.
+        78/78 tests PASS (21 new unit + 6 new integration + 46 wave-2 + 5 existing).
+        Integration test: 1000-event chain on live PG, timestamp-collision
+        pair verified distinct seq, chain integrity verified seq-ordered.
+  linked_finding: LU-AMEND-01-wave-3
+  linked_commit_note: >-
+    Flagged in wave-2 commit 4d19647 body:
+    "Cross-batch chain ordering stability deferred: UUID v4 sort under
+    timestamp collision requires a bigserial sequence column
+    (migration 0013 candidate, recorded in commit body for Lu)."
+  fix_in_version: v2.24.1
+
+
 - id: YSG-RISK-063
   description: >-
     TOTP step-up failure counter was a module-level Python dict (Iris SEC-4,

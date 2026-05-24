@@ -79,12 +79,26 @@ class FileSink(AuditSink):
 
 
 class PostgresSink(AuditSink):
-    """Async batch sink — writes audit_events rows via asyncpg."""
+    """Async batch sink — writes audit_events rows via asyncpg.
+
+    LU-AMEND-01 (wave 2): accepts an AuditChainService instance that computes
+    prev_hash + event_hash before each INSERT.  If chain_service is None, the
+    hash columns are written as NULL (legacy / test path with no chain).
+    """
     name = "postgres"
     MAX_QUEUE_DEPTH = 1000
 
-    def __init__(self, pool_getter) -> None:
+    def __init__(self, pool_getter, chain_service=None) -> None:
+        """
+        Args:
+            pool_getter: zero-argument callable returning an asyncpg pool.
+            chain_service: optional AuditChainService instance.  When supplied,
+                every INSERT populates prev_hash and event_hash.  When None, the
+                columns are left NULL (permitted by the nullable migration 0011
+                columns; chain integrity gaps are counted at checkpoint time).
+        """
         self._pool_getter = pool_getter
+        self._chain_service = chain_service
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.MAX_QUEUE_DEPTH)
         self._last_write: Optional[datetime] = None
         self._task: Optional[asyncio.Task] = None
@@ -130,7 +144,29 @@ class PostgresSink(AuditSink):
                         str(tenant_id),
                     )
                     req_id = event.get("request_id")
-                    await conn.execute(
+
+                    # LU-AMEND-01 wave 2: compute hash-chain fields before INSERT.
+                    # The AuditChainService lock serialises these within the process;
+                    # the batch loop serialises them within this flush call.
+                    # LU-AMEND-01 wave 3: INSERTs are sequential within a single
+                    # transaction so the DB-assigned seq values are strictly
+                    # monotonic in insertion order — the same order in which
+                    # compute_hashes_for_event() is called here.
+                    prev_hash: Optional[str] = None
+                    event_hash: Optional[str] = None
+                    if self._chain_service is not None:
+                        try:
+                            prev_hash, event_hash = self._chain_service.compute_hashes_for_event(event)
+                        except Exception as exc:
+                            logger.error(
+                                "PostgresSink: chain hash computation failed — INSERT will have NULL hashes: %s",
+                                exc,
+                            )
+
+                    # RETURNING seq (wave 3): capture the authoritative sequence
+                    # value for logging / verification. The seq column is the
+                    # canonical ordering key; its value is DB-assigned (BIGSERIAL).
+                    row = await conn.fetchrow(
                         INSERT_AUDIT_EVENT,
                         uuid.UUID(str(tenant_id)),
                         event.get("event_type", "UNKNOWN"),
@@ -143,7 +179,15 @@ class PostgresSink(AuditSink):
                         event.get("elapsed_ms"),
                         event.get("confidence_score"),
                         event.get("client_ip_hash"),
+                        prev_hash,
+                        event_hash,
                     )
+                    if row is not None:
+                        logger.debug(
+                            "PostgresSink: inserted audit event seq=%s type=%s",
+                            row["seq"],
+                            event.get("event_type", "UNKNOWN"),
+                        )
         self._last_write = datetime.now(timezone.utc)
 
     async def write(self, event: dict) -> None:

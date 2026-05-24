@@ -12,11 +12,21 @@ Hash scheme (consistent with writer.py F-12):
 Daily merkle-root checkpoint:
   - Computed by AuditChainService.run_daily_checkpoint()
   - Merkle tree: balanced binary tree of SHA-384 hashes of all event_hash values
-    for the day, sorted by (created_at, id) — deterministic ordering.
+    for the day, ordered by seq (authoritative, wave-3) with (created_at, id)
+    fallback for NULL-seq rows (backfilled wave-2 rows).
   - Signed with the service's internal SPIFFE identity (internal PKI leaf key)
     rather than an external Sigstore endpoint (rationale in migration 0011).
 
-Last updated: 2026-05-24T00:00:00+01:00
+Ordering authority (LU-AMEND-01 wave-3):
+  - Migration 0014 adds a BIGSERIAL seq column to audit_events.
+  - seq is the AUTHORITATIVE ordering key for all chain queries (checkpoint,
+    verify_chain_segment). Under timestamp collision (two events at the same
+    microsecond) seq provides strict monotonic order; UUID v4 sort does not.
+  - Backfilled rows (seq IS NOT NULL after migration 0014) use seq throughout.
+  - Queries ORDER BY seq NULLS LAST to handle any rows where seq is temporarily
+    NULL (should not occur in production after migration 0014 completes).
+
+Last updated: 2026-05-25T00:00:00+00:00
 
 Compliance:
     ASVS V7.3.3 — audit log integrity (tamper-evident)
@@ -263,17 +273,23 @@ class AuditChainService:
                     tenant_id,
                 )
 
-                # Fetch event hashes for the target date, ordered deterministically.
-                # NULLs (events inserted before this migration) are excluded.
+                # Fetch event hashes for the target date, ordered by seq
+                # (LU-AMEND-01 wave-3 authoritative ordering key).
+                # seq is BIGSERIAL assigned at INSERT time — strictly monotonic
+                # even when two events share the same created_at microsecond.
+                # Rows with NULL event_hash are excluded (chain not populated).
+                # ORDER BY seq NULLS LAST: all post-migration rows have seq;
+                # any stray NULL-seq rows are sorted to the end so they do not
+                # corrupt the chain ordering of normal rows.
                 rows = await conn.fetch(
                     """
-                    SELECT event_hash, prev_hash
+                    SELECT event_hash, prev_hash, seq
                     FROM audit_events
                     WHERE tenant_id = $1
                       AND created_at >= $2
                       AND created_at < $3
                       AND event_hash IS NOT NULL
-                    ORDER BY created_at, id
+                    ORDER BY seq NULLS LAST
                     """,
                     uuid.UUID(tenant_id),
                     start_ts,
@@ -314,7 +330,7 @@ class AuditChainService:
                     INSERT INTO audit_chain_checkpoints
                         (id, tenant_id, checkpoint_date, event_count, merkle_root,
                          chain_break_count, signing_spiffe_id, signature_hex, computed_at)
-                    VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, now())
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
                     ON CONFLICT (tenant_id, checkpoint_date) DO UPDATE
                         SET event_count       = EXCLUDED.event_count,
                             merkle_root       = EXCLUDED.merkle_root,
@@ -325,7 +341,7 @@ class AuditChainService:
                     """,
                     uuid.UUID(checkpoint_id),
                     uuid.UUID(tenant_id),
-                    date_str,
+                    target_date,  # asyncpg accepts datetime.date directly
                     event_count,
                     root,
                     chain_breaks,
@@ -370,8 +386,10 @@ class AuditChainService:
         """Verify the hash chain for a sequence of events.
 
         Args:
-            events — list of event dicts ordered by (created_at, id), each
-                including prev_hash and event_hash fields as stored in the DB.
+            events — list of event dicts ordered by seq (LU-AMEND-01 wave-3
+                authoritative ordering key), each including prev_hash and
+                event_hash fields as stored in the DB. For backfilled pre-wave-3
+                rows without seq, callers should order by (created_at, id).
             date_str — "YYYY-MM-DD" of the segment (used to compute the expected
                 day anchor for the first event).
 

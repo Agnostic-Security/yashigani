@@ -1,5 +1,6 @@
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
+<!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(audit): LU-AMEND-01 wave-3 — bigserial seq column on audit_events closes cross-batch ordering stability under timestamp collision; YSG-RISK-064) -->
 <!-- last-updated: 2026-05-25T12:00:00+00:00 (v2.24.1: fix(pgbouncer): restore compose-Helm admin_users + stats_users parity — drift #8 secondary, 859294a follow-up) -->
 <!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.1: YSG-RISK-061 — Caddy egress restrictions via iptables + K8s NetworkPolicy; NET_ADMIN cap added) -->
 <!-- last-updated: 2026-05-24T12:00:00+00:00 (v2.24.1: PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets removed; closes NICO-V241-001 + YSG-RISK-060) -->
@@ -24,6 +25,20 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ## [Unreleased] — v2.24.1
 
 ### Security
+- **security(audit): LU-AMEND-01 wave-3 — bigserial sequence column on `audit_events` closes cross-batch ordering stability under timestamp collision** (YSG-RISK-064, Tom standing order 2026-05-25):
+
+  **Problem closed:** Wave-2 (migration 0011) established the hash chain but used `ORDER BY (created_at, id)` for chain-row ordering. Under timestamp collision (two events at the same microsecond), UUID v4 sort is non-deterministic — ordering could differ between replicas, silently weakening the tamper-evidence guarantee (ASVS V7.3.3, NIST AU-10).
+
+  **Fix:** Migration 0014 adds a `BIGSERIAL seq` column to `audit_events`. `seq` is assigned at INSERT time by a global sequence object (`audit_events_seq_seq`), giving strictly monotonic order regardless of timestamp ties. `run_daily_checkpoint` now uses `ORDER BY seq NULLS LAST` as the authoritative ordering key. `INSERT_AUDIT_EVENT` uses `RETURNING seq`; `PostgresSink._flush_batch` captures it via `fetchrow`.
+
+  **Backfill:** Existing rows are backfilled in a single `UPDATE` ordered by `(created_at, id)` — preserving wave-2 ordering so existing chain verification remains valid.
+
+  **Partitioned-table note:** `audit_events` is `PARTITION BY RANGE (created_at)`. PostgreSQL cannot enforce `UNIQUE(seq)` without including the partition key. A plain `NOT NULL` + two B-tree indexes (`idx_audit_events_seq`, `idx_audit_events_tenant_seq`) replace the UNIQUE constraint; uniqueness is guaranteed by the sequence mechanism. Documented in migration 0014.
+
+  **Files:** `src/yashigani/db/migrations/versions/0014_audit_events_bigserial_sequence.py`, `src/yashigani/db/models/__init__.py`, `src/yashigani/audit/chain.py`, `src/yashigani/audit/sinks.py`.
+
+  **Tests:** 21 new unit tests (`test_lu_amend_01_wave3_bigserial.py`) + 6 new integration tests (`test_lu_amend_01_wave3_integration.py`). Integration test covers 1000-event chain on live PG + timestamp-collision pair + chain integrity verification. All 78 tests PASS (new + pre-existing wave-2).
+
 - **security(auth): TOTP failure counter migrated to Redis** (closes SEC-4 / ASVS V6.3.5 — YSG-RISK-063):
   Counter now survives process restart and is consistent across multi-replica deployments. Previously
   a module-level Python dict (`_totp_failures`) reset on every process kill/restart, allowing an
