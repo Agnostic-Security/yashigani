@@ -48,6 +48,8 @@ from yashigani.backoffice.routes.webauthn_v1 import router as webauthn_v1_router
 from yashigani.backoffice.routes.pki_v1 import router as pki_v1_router
 # v2.23.4 — Gap 4: user self-service Bearer issuance (/me/api-key*)
 from yashigani.backoffice.routes.me import router as me_router
+# v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
+from yashigani.backoffice.routes.manifest_history import router as manifest_history_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -83,4 +85,6 @@ __all__ = [
     "pki_v1_router",
     # v2.23.4 — Gap 4: user self-service Bearer issuance
     "me_router",
+    # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
+    "manifest_history_router",
 ]

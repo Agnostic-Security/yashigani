@@ -93,6 +93,8 @@ from yashigani.backoffice.routes import (
     pki_v1_router,
     # v2.23.4 — Gap 4: user self-service Bearer issuance (/me/api-key*)
     me_router,
+    # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
+    manifest_history_router,
 )
 
 
@@ -514,6 +516,11 @@ def create_backoffice_app() -> FastAPI:
         # (prefix, max_bytes)
         ("/admin/audit/search", 64 * 1024),  # JSON search query
         ("/admin/agents", 16 * 1024),  # agent register metadata
+        # LU-AMEND-02/03: manifest YAML may be up to 1 MB (hard limit in service);
+        # give ceremony endpoint 1.1 MB to accommodate the JSON envelope overhead.
+        ("/admin/manifest-registrations/ceremony", 1_100 * 1024),
+        # Manifest list/show are GET-only; cap any accidental POST body at 1 kB.
+        ("/admin/manifest-registrations", 1 * 1024),
         ("/admin/users", 4 * 1024),  # username + opt email
         ("/admin/license", 4 * 1024),  # confirm flag or small LIC
         ("/api/v1/license", 256),  # status GET only, no body
@@ -796,6 +803,10 @@ def create_backoffice_app() -> FastAPI:
     # v2.23.4 — Gap 4: user self-service Bearer issuance (/me/api-key*)
     # Routes carry /me/ prefix defined in the router itself (no extra prefix needed).
     app.include_router(me_router, tags=["me"])
+
+    # v2.24.1 — LU-AMEND-02/03: manifest registration ledger + ceremony record
+    # Routes carry /admin/manifest-registrations/ paths defined in the router itself.
+    app.include_router(manifest_history_router, tags=["manifest-registry"])
 
     # v0.9.0 — Phase 6: WebAuthn/Passkeys
     # webauthn_router carries its own full path segments (no prefix stripping needed)
