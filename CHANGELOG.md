@@ -1,3 +1,4 @@
+<!-- last-updated: 2026-05-25T21:00:00+00:00 (v2.24.3: fix(opa): fail-closed default on undefined OPA result + test parser fix — LAURA-V243-001 + LAURA-V243-002; commit 3d85ba3) -->
 <!-- last-updated: 2026-05-25T20:00:00+00:00 (v2.24.1: feat(pool): Kubernetes API backend for PoolManager — KubernetesBackend + RBAC Role + NetworkPolicy; YSG-RISK-070; closes Tom 7e653b1 option b) -->
 <!-- last-updated: 2026-05-25T19:00:00+00:00 (v2.24.1: fix(openwebui): remove @Help CHAINING_GUIDE half-implementation seed — drift #10; init-openwebui-agents.py) -->
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->

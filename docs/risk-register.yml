@@ -1473,11 +1473,13 @@ risks:
     fail-closed as of v2.23.4. This fix closes the softer degraded-bundle gap.
   status: mitigated
   closure_evidence:
-  - commit: TBD
+  - commit: 3d85ba3
     rationale: >-
-      Default flipped True → False at both call sites in openai_router.py.
-      Three unit tests added to TestOpaUndefinedResultFailClosed in
+      Default flipped True → False at both call sites in openai_router.py
+      (lines 1277 + 1812). Three unit tests added to
+      TestOpaUndefinedResultFailClosed in
       src/tests/unit/test_v2234_opa_fail_closed.py: undefined-result DENY,
       absent-result-key DENY, explicit-allow-True still passes.
+      Full suite 2896 passed / 0 failed.
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
