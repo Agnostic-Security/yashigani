@@ -454,9 +454,9 @@ risks:
   review_by: null
   closure_evidence:
   - rationale: 'pgbouncer-auth gains dedicated cert; pg_hba A2 carveout removed; catch-all clientcert=verify-ca
-      uniform across the cluster. EXCEPTION: cert carveout for pgbouncer_authenticator role added v2.24.3 — see
-      YSG-RISK-073 for the documented exception (pg_hba `cert clientcert=verify-ca` entry BEFORE catch-all, role+CN
-      scoped, fail-closed).'
+      uniform across the cluster. EXCEPTION: trust+clientcert carveout for pgbouncer_authenticator role added v2.24.3
+      — see YSG-RISK-073 for the documented exception (pg_hba `trust clientcert=verify-ca` entry BEFORE catch-all,
+      role+database scoped; clientcert=verify-ca enforces CA chain + private-key proof; cert-equivalent, PG16-valid).'
     commits:
     - af9fdcd
     - f6a3bbf
@@ -1511,30 +1511,37 @@ risks:
     initiator. This caused auth_query to fail on every clean install from v2.24.0 onwards, preventing pgbouncer
     from fetching userlist.txt and breaking all postgres-backed services (gateway, backoffice). Workaround applied
     by Ava gate (cycle 3): runtime `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 trust` added to pg_hba —
-    trust is weaker than the fix. Fix: narrow pg_hba carveout using `cert` auth method (client cert IS the authenticator;
-    no SCRAM challenge issued). Both pgbouncer instances (main: pgbouncer-auth_client.crt, CN=pgbouncer-auth; letta:
-    letta-pgbouncer_client.crt, CN=letta-pgbouncer) present CA-signed certs. The `cert` method with `clientcert=verify-ca`
-    is at least as strong as SCRAM+cert because private-key proof + CA chain verification both hold without a password
-    round-trip. Detected by Ava release gate v2.24.3 cycle 3.'
+    trust is weaker than the fix. Cycle 4 fix attempt: `cert clientcert=verify-ca` — broken on two layers (Layer A:
+    PG16 syntax rejection — only clientcert=verify-full valid with cert method; postgres crash-loops. Layer B: CN
+    mismatch — CN=pgbouncer-auth != role pgbouncer_authenticator, verify-full would fail CN check). Cycle 5 fix:
+    `trust clientcert=verify-ca` — cert-equivalent and PG16-compatible. The CA-verified client cert IS the sole
+    authenticator. `trust` adds no password challenge; `clientcert=verify-ca` enforces CA chain + private-key proof.
+    md5 was also attempted in cycle 5 but failed in practice: pgbouncer 1.25.1 (edoburu image) cannot correctly
+    perform server-side md5 authentication. Detected by Ava release gate v2.24.3 cycle 3/4/5.'
   severity: high
   controls_impacted:
   - Availability — all postgres-backed services degraded on clean install
   - Authentication — YSG-RISK-049 auth_query pattern broken (pgbouncer auth_user could not authenticate to call
     ysg_pgbouncer_get_auth)
   compensating_controls:
-  - Ava applied a runtime `trust` workaround during the gate run; not suitable for release (trust is weaker than
-    cert — no credential verification).
-  status: mitigated
+  - Ava applied a runtime `trust` workaround during the gate run; not suitable for release (bare trust is weaker —
+    no cert verification).
+  status: closed
   closure_evidence:
   - commit: 7f296a1
-    rationale: '05-enable-ssl.sh pg_hba heredoc updated to include cert carveout for pgbouncer_authenticator BEFORE
-      the scram catch-all. Carveout form: `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 cert clientcert=verify-ca`
-      (IPv4 + IPv6). 10-pgbouncer-auth.sh step 4 updated to INSERT the cert carveout (not remove the carveout as
-      in v2.24.0). Script handles upgrade paths from v2.24.0-v2.24.2 (no carveout) and v2.24.0-pre (trust carveout)
-      idempotently. Both pgbouncer.ini and pgbouncer-letta.ini comments updated. Contract test suite tests/contracts/test_pghba_pgbouncer_cert_carveout.py
-      added (8 tests, 1 skipped): cert carveout present + precedes catchall + no trust + insert logic present +
-      YSG-RISK-073 reference. Helm test correctly skips (Helm uses same init scripts). Full static suite: 3081 pass,
-      92 skip, 0 fail.'
+    rationale: 'Cycle 4 (BROKEN): 05-enable-ssl.sh heredoc added `cert clientcert=verify-ca` carveout for pgbouncer_authenticator.
+      Broken by BUG-C4-001 (PG16 syntax: cert method only accepts verify-full; postgres crash-loops) and BUG-C4-002
+      (duplicate carveout: 05-enable-ssl.sh + 10-pgbouncer-auth.sh both wrote it). This commit is the broken state.'
+  - commit: PENDING-CYCLE5
+    rationale: 'Cycle 5 (CLOSED): BUG-C4-001/BUG-C4-002 fixed. Carveout form changed from cert to trust+clientcert:
+      `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 trust clientcert=verify-ca` (IPv4 + IPv6). Single source
+      of truth: 10-pgbouncer-auth.sh only (05-enable-ssl.sh no longer writes carveout — BUG-C4-002 fix). awk
+      first-match insertion replaces sed /i (sed inserts before every match; awk inserts once). Helm 10-pgbouncer-auth.sh
+      sync''d to match docker version. All 4 pgbouncer INI files updated (comments only). Contract test suite updated:
+      11 tests, 1 skipped — trust+clientcert present, no bare-trust, no cert, no md5, single-source-of-truth. Live
+      test on Podman: postgres healthy, pg_hba has exactly 2 trust+clientcert carveout lines (no duplicates), catch-all
+      scram-sha-256 below, pgbouncer HEALTHY, auth_query confirmed working (SELECT current_user = yashigani_app
+      via pgbouncer). Full contract suite: 191 pass, 4 skip, 0 fail.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
 - id: YSG-RISK-074

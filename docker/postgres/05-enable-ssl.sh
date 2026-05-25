@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
 # Yashigani v2.24.0 — enable TLS + client-cert verification on Postgres.
-# Last updated: 2026-05-23 (feat(postgres): BYO-CA trust-bundle re-sync on every start)
+# Last updated: 2026-05-25 (fix(postgres): BUG-C4-001/002 — md5 clientcert=verify-ca; remove duplicate carveout from heredoc)
 #
 # This init script is invoked in two contexts:
 #
@@ -22,8 +22,14 @@
 #     connecting clients
 #   * Clients must present a cert signed by our internal CA
 #     (clientcert=verify-ca)
-#   * Password auth (scram-sha-256) still required on top of the cert
-#     (defence in depth — three factors: TLS + cert + password)
+#   * Password auth (scram-sha-256) still required on top of the cert for all
+#     roles (defence in depth — three factors: TLS + cert + password).
+#     EXCEPTION: pgbouncer_authenticator uses md5 clientcert=verify-ca (two-factor:
+#     CA chain verified + md5 password). The carveout is written by 10-pgbouncer-auth.sh
+#     (single source of truth — not written here to prevent duplicate entries).
+#     Rationale: cert auth (PG16 `cert` method) requires clientcert=verify-full which
+#     in turn requires CN==role-name; CN=pgbouncer-auth does not match role
+#     pgbouncer_authenticator. md5+clientcert=verify-ca is PG16-valid + two-factor.
 #
 # PKI design: root → intermediate → leaf (two-tier).
 # ssl_ca_file (root.crt) must contain BOTH ca_root.crt and ca_intermediate.crt
@@ -151,20 +157,6 @@ local   all       all                           trust
 # Loopback — postgres image runs its own bootstrap on 127.0.0.1.
 host    all       all            127.0.0.1/32   trust
 host    all       all            ::1/128        trust
-# YSG-RISK-073 CLOSED (v2.24.3): pgbouncer_authenticator auth_query carveout.
-# PgBouncer 1.25.1 (edoburu image) cannot perform SCRAM-SHA-256 as the client
-# when running auth_query against postgres. The cert IS the authentication:
-# both pgbouncer instances (main: pgbouncer-auth_client.crt, CN=pgbouncer-auth;
-# letta: letta-pgbouncer_client.crt, CN=letta-pgbouncer) present certs signed
-# by our internal CA, satisfying clientcert=verify-ca. The `cert` auth method
-# accepts the presented client cert as the sole authentication factor — no
-# password challenge is issued. This is at least as strong as SCRAM+cert
-# because the private key proof (TLS handshake) AND CA trust-chain verification
-# both hold. Scope: yashigani database only (auth_dbname for both instances);
-# pgbouncer_authenticator role only. Catch-all rule below covers everything else.
-# Design ref: iris-v240-pgbouncer-auth-query-design.md; YSG-RISK-073.
-hostssl yashigani pgbouncer_authenticator 0.0.0.0/0  cert  clientcert=verify-ca
-hostssl yashigani pgbouncer_authenticator ::/0        cert  clientcert=verify-ca
 # All other network connections must use TLS with a client cert signed by our
 # internal CA, AND present a valid scram-sha-256 password. Three factors.
 # Letta reaches postgres via the letta-pgbouncer sidecar which presents

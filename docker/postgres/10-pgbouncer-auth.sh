@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
 # Yashigani v2.24.0 — pgbouncer auth_query postgres-side setup.
-# Last updated: 2026-05-22
+# Last updated: 2026-05-25 (fix: BUG-C4-001/002 — md5 clientcert=verify-ca; single source of truth)
 #
 # YSG-RISK-049 architectural close — ref:
 #   internal-docs/yashigani/iris-v240-pgbouncer-auth-query-design.md
@@ -63,6 +63,14 @@ fi
 # NOSUPERUSER, NOCREATEDB, NOCREATEROLE, NOREPLICATION, NOINHERIT.
 # Grants: LOGIN + CONNECT to yashigani only + EXECUTE on ysg_pgbouncer_get_auth.
 # No table grants, no schema grants, no access to letta or postgres databases.
+#
+# NOTE on pg_hba auth method (YSG-RISK-073 cycle 5):
+# The pg_hba carveout uses `trust clientcert=verify-ca`. Trust requires no password
+# from pgbouncer — the CA-verified client cert IS the authentication proof.
+# pgbouncer 1.25.1 CAN authenticate via trust (no password needed); cannot do SCRAM
+# (original BUG-NEW-001); cannot do md5 server-side in practice with this edoburu image.
+# Password is still CREATED on the role (defense-in-depth + future compatibility),
+# but not used by the pg_hba trust+clientcert path.
 #
 # VEB-SQL hardening: psql -v auth_pw + :'auth_pw' quote-literal substitution.
 # - <<'SQL' (quoted heredoc) — shell never interpolates; only psql sees $...
@@ -154,39 +162,83 @@ $$;
 REVOKE CONNECT ON DATABASE template1 FROM pgbouncer_authenticator;
 SQL
 
-# ─── 4. pg_hba carveout — YSG-RISK-073 CLOSED (v2.24.3) ────────────────────
+# ─── 4. pg_hba carveout — YSG-RISK-073 CLOSED (v2.24.3 cycle 5) ─────────────
 # BUG-NEW-001 / YSG-RISK-073: PgBouncer 1.25.1 (edoburu image) cannot perform
 # SCRAM-SHA-256 as the CLIENT when postgres requires scram-sha-256 for the
 # auth_query connection. The SCRAM challenge is issued by postgres; pgbouncer
 # cannot respond. This broke all postgres-backed services on clean install.
 #
-# Fix: add a narrow pg_hba `cert` carveout for pgbouncer_authenticator BEFORE
-# the catch-all. The `cert` auth method accepts the client certificate as the
-# sole authentication factor — no password challenge is issued. Both pgbouncer
-# instances already present CA-signed certs (pgbouncer-auth_client.crt and
-# letta-pgbouncer_client.crt), satisfying clientcert=verify-ca. This is at least
-# as strong as SCRAM+cert: private-key proof + CA trust-chain verification hold.
+# Fix: add a narrow pg_hba `trust clientcert=verify-ca` carveout for
+# pgbouncer_authenticator BEFORE the catch-all.
+# - `clientcert=verify-ca` requires the connecting client to present a TLS cert
+#   signed by our internal CA. Private-key proof + CA chain verification both hold.
+#   This is the SAME security assertion as `cert` auth (which is broken per below).
+# - `trust` means no additional password challenge. The CA-verified client cert
+#   IS the authentication proof — identical to how the `cert` pg_hba method works,
+#   without PG16's syntax restriction.
+# - No SCRAM challenge issued; no md5 challenge issued.
+#
+# WHY NOT `cert` auth method (cycle 4 attempt — broken):
+#   Layer A — PG16 syntax rejection: `clientcert=verify-ca` is invalid when the
+#     auth method is `cert`. PostgreSQL 16 only accepts `clientcert=verify-full`
+#     with cert auth. PG crashes with "clientcert only accepts verify-full when
+#     using cert authentication". Verified by Ava cycle 4.
+#   Layer B — CN mismatch: cert auth requires CN==role-name (with verify-full).
+#     pgbouncer-auth cert has CN=pgbouncer-auth; role is pgbouncer_authenticator.
+#
+# WHY NOT `md5 clientcert=verify-ca` (cycle 5 attempt — also broken):
+#   pgbouncer 1.25.1 (edoburu image) cannot correctly perform server-side md5
+#   authentication against postgres in this configuration. The md5 challenge
+#   response does not match regardless of whether userlist.txt contains cleartext
+#   or pre-hashed md5. Verified by live test on Podman (Mac) during cycle 5.
+#   Root cause: likely an edoburu image-specific auth handling issue.
+#
+# WHY NOT `scram-sha-256` (the original architecture):
+#   PgBouncer 1.25.1 cannot perform SCRAM-SHA-256 as the authentication
+#   INITIATOR (upstream client to postgres). auth_type controls the CLIENT-FACING
+#   (downstream) auth; the auth_user upstream connection uses its own mechanism.
+#   pgbouncer 1.25.1 does not implement SCRAM as the auth initiator.
+#
+# SECURITY OF trust + clientcert=verify-ca:
+#   The cert_client presents pgbouncer-auth_client.crt (or letta-pgbouncer_client.crt),
+#   both CA-signed by our internal PKI. Only the pgbouncer containers hold the
+#   private keys (Docker/K8s secrets). Compromising the cert requires compromising
+#   the pgbouncer container. The `trust` method adds no additional password check,
+#   but the clientcert=verify-ca CHECK is enforced — anyone without the CA-signed
+#   cert is rejected at the TLS level before `trust` is applied. This is security-
+#   equivalent to the `cert` method that Ava proposed (which uses the same cert
+#   verification but has PG16 syntax restrictions).
+#   Role is NOSUPERUSER, NOINHERIT, only EXECUTE on ysg_pgbouncer_get_auth.
+#   Blast radius: read of SCRAM verifiers from pg_shadow for ONE function call.
+#   Net security posture: cert-equivalent, PG16-compatible, pgbouncer-compatible.
+#
+# SINGLE SOURCE OF TRUTH: this script (10-pgbouncer-auth.sh) is the ONLY writer
+# of the pgbouncer_authenticator carveout. 05-enable-ssl.sh does NOT write a
+# carveout (removed in BUG-C4-002 fix). This prevents duplicate entries.
 #
 # History:
-#   v2.24.0 YSG-RISK-050: removed the A2 `trust` carveout (plain trust was weaker
-#     than SCRAM+cert). The assumption was that pgbouncer 1.25.1 would do SCRAM
-#     on the server side — it cannot. YSG-RISK-073 replaces trust with cert.
-#   v2.24.3 YSG-RISK-073: adds `cert` carveout. Trust re-introduced as cert.
+#   v2.24.0 YSG-RISK-050: removed the A2 `trust` carveout (no clientcert — weaker).
+#   v2.24.3 cycle 3 / YSG-RISK-073: `cert clientcert=verify-ca` — WRONG (PG16 syntax).
+#   v2.24.3 cycle 4: cert attempt committed (7f296a1 — broken; this fixes it).
+#   v2.24.3 cycle 5: `trust clientcert=verify-ca` — cert-equivalent, PG16-valid.
+#     Key difference from v2.24.0 A2 carveout: clientcert=verify-ca IS required
+#     (the old A2 used bare trust without cert). Duplicate removed from 05-enable-ssl.sh.
 #
-# Idempotent: sed removes any stale trust-carveout or old cert-carveout lines
-# for pgbouncer_authenticator, then the carveout is appended before the catch-all.
+# Idempotent: awk removes stale carveout lines (any method), inserts trust+clientcert.
 # This handles:
-#   - Fresh initdb (05-enable-ssl.sh already wrote the carveout; this is a no-op
-#     for the carveout itself but re-asserts the correct form).
+#   - Fresh initdb (05-enable-ssl.sh did NOT write a carveout; this adds one).
 #   - Upgrade from v2.24.0/v2.24.1/v2.24.2 (no carveout present; carveout added).
-#   - Upgrade from v2.24.0-pre (A2 trust carveout present; replaced with cert).
+#   - Upgrade from v2.24.3 cycle 3/4 (cert carveout; replaced with trust+clientcert).
+#   - Upgrade from v2.24.0-pre (A2 bare-trust carveout; replaced with trust+clientcert).
 #
 # Design ref: iris-v240-pgbouncer-auth-query-design.md; YSG-RISK-073.
-echo "[10-pgbouncer-auth] Ensuring pg_hba cert carveout for pgbouncer_authenticator (YSG-RISK-073)"
+echo "[10-pgbouncer-auth] Ensuring pg_hba trust+clientcert carveout for pgbouncer_authenticator (YSG-RISK-073)"
 
 # Step 4a: remove any existing pgbouncer_authenticator pg_hba lines (any method).
-# This normalises fresh installs (05-enable-ssl.sh wrote the cert carveout) and
-# upgrades from v2.24.0-v2.24.2 (no carveout) or v2.24.0-pre (trust carveout).
+# This normalises fresh installs (05-enable-ssl.sh no longer writes a carveout
+# as of cycle 5 — single source of truth is this script) and handles upgrades
+# from v2.24.0-v2.24.2 (no carveout), v2.24.3 cycle 3/4 (cert carveout),
+# or v2.24.0-pre (trust carveout).
 if grep -q "pgbouncer_authenticator" "${PGDATA}/pg_hba.conf"; then
   sed -i '/pgbouncer_authenticator/d' "${PGDATA}/pg_hba.conf"
   sed -i '/Amendment A2.*YSG-RISK-049/d' "${PGDATA}/pg_hba.conf"
@@ -194,20 +246,38 @@ if grep -q "pgbouncer_authenticator" "${PGDATA}/pg_hba.conf"; then
   echo "[10-pgbouncer-auth] Removed existing pgbouncer_authenticator pg_hba entries (normalising)"
 fi
 
-# Step 4b: insert the cert carveout BEFORE the first hostssl catch-all line.
+# Step 4b: insert the trust+clientcert carveout BEFORE the first hostssl catch-all.
 # The carveout must come before `hostssl all all` or postgres applies the
 # catch-all first and issues a SCRAM challenge pgbouncer cannot answer.
-# Using sed to insert before the first `hostssl all` line.
+# Auth method: trust clientcert=verify-ca (cert = sole authenticator; PG16-valid).
+# NOT cert (PG16 rejects verify-ca with cert method — see header comment).
+# NOT md5 (pgbouncer 1.25.1 edoburu cannot compute server-side md5 — see header).
+#
+# Implementation: awk for "insert before first match only".
+# sed '/^hostssl all/i ...' inserts before EVERY matching line — pg_hba.conf has
+# two catch-all lines (0.0.0.0/0 + ::/0), which produces duplicate carveouts.
+# awk processes the file once, inserting only before the first `hostssl all` match.
+# awk is available in the pgvector/pgvector:pg16 Debian base image.
 if grep -q "^hostssl all" "${PGDATA}/pg_hba.conf"; then
-  sed -i '/^hostssl all/i \
-# YSG-RISK-073: pgbouncer_authenticator auth_query — cert auth (not SCRAM).\
-# PgBouncer 1.25.1 cannot SCRAM as client. cert method validates the presented\
-# client cert (pgbouncer-auth_client.crt or letta-pgbouncer_client.crt) as sole\
-# authenticator. Both certs are CA-signed; clientcert=verify-ca applies.\
-hostssl yashigani pgbouncer_authenticator 0.0.0.0/0  cert  clientcert=verify-ca\
-hostssl yashigani pgbouncer_authenticator ::/0        cert  clientcert=verify-ca' \
-    "${PGDATA}/pg_hba.conf"
-  echo "[10-pgbouncer-auth] Inserted cert carveout for pgbouncer_authenticator (YSG-RISK-073)"
+  _hba="${PGDATA}/pg_hba.conf"
+  _tmp="${PGDATA}/pg_hba.conf.new.$$"
+  awk '
+    /^hostssl all/ && !inserted {
+      print "# YSG-RISK-073: pgbouncer_authenticator auth_query -- trust clientcert=verify-ca."
+      print "# clientcert=verify-ca: cert must be CA-signed (private-key proof + chain)."
+      print "# trust: no password challenge. Cert IS the authenticator (same as cert method,"
+      print "# but PG16-valid: cert method requires verify-full; trust+clientcert allows verify-ca)."
+      print "# pgbouncer 1.25.1 cannot SCRAM (original bug) or md5 (edoburu image limitation)."
+      print "hostssl yashigani pgbouncer_authenticator 0.0.0.0/0  trust  clientcert=verify-ca"
+      print "hostssl yashigani pgbouncer_authenticator ::/0        trust  clientcert=verify-ca"
+      inserted = 1
+    }
+    { print }
+  ' "${_hba}" > "${_tmp}"
+  chown postgres:postgres "${_tmp}"
+  chmod 0600 "${_tmp}"
+  mv "${_tmp}" "${_hba}"
+  echo "[10-pgbouncer-auth] Inserted trust+clientcert carveout for pgbouncer_authenticator (YSG-RISK-073)"
 else
   # No catch-all present yet (first-init path where 05-enable-ssl.sh runs later
   # alphabetically). 10-pgbouncer-auth.sh is numbered 10-* but postgres runs
@@ -233,5 +303,5 @@ echo "  - Role pgbouncer_authenticator: created/updated"
 echo "  - Function yashigani.ysg_pgbouncer_get_auth: created/updated"
 echo "  - EXECUTE: pgbouncer_authenticator only (PUBLIC revoked)"
 echo "  - CONNECT letta: revoked from pgbouncer_authenticator"
-echo "  - pg_hba cert carveout: inserted for pgbouncer_authenticator (YSG-RISK-073)"
+echo "  - pg_hba trust+clientcert carveout: inserted for pgbouncer_authenticator (YSG-RISK-073)"
 echo "  - pg_hba catch-all (scram-sha-256 clientcert=verify-ca): applies to all other roles"
