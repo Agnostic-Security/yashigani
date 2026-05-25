@@ -1,334 +1,43 @@
 # Last updated: 2026-05-25T00:00:00+01:00
-name: Tag — GPG Sign & Verify
-
-# STATUS: GPG CI signing path is BLOCKED — Tiago's release signing key is
-# hardware-backed (Yubikey/smartcard). The private key material cannot be
-# exported to a GitHub Secret; the workflow's "Import GPG key" step always
-# exits non-zero with "private-keys-v1.d/ is empty after import".
+# Yashigani release tags are SSH-signed locally by the maintainer before push.
+# This file documents the verification recipe for CI / auditors.
 #
-# ACTUAL signing method (since v2.23.3): SSH — git is configured locally
-# with gpg.format=ssh and user.signingkey=~/.ssh/id_ed25519.pub.
-# Maxine signs release tags locally; the public key is in docs/release-signing-key.pub.
+# SIGNING SCHEME: SSH-only (hardware-backed Yubikey ed25519)
+# -----------------------------------------------------------------------
+# Release tags are signed by the maintainer (maxine@agnosticsec.com) on
+# their local machine using a hardware-backed ed25519 key held on a Yubikey.
+# CI does NOT participate in signing — the Yubikey is never available to CI.
 #
-# To verify a signed tag:
+# Tags are signed at creation time:
+#   git config gpg.format ssh
+#   git config user.signingkey ~/.ssh/id_ed25519.pub
+#   git tag -s v2.X.Y <commit> -m "message"
+#
+# The public key is committed at docs/release-signing-key.pub in
+# OpenSSH allowed_signers(5) format.
+#
+# WHY NOT GPG:
+#   The maintainer's signing key is hardware-backed (Yubikey). Software GPG
+#   export is not possible. This was confirmed empirically: tag-sign.yml ran
+#   a full GPG import + sign cycle (run 25682146979); private-keys-v1.d/ was
+#   empty after import because GnuPG detected a smartcard stub. Git's native
+#   SSH signing (gpg.format=ssh, available since git 2.34) is the correct
+#   approach for hardware-backed keys and requires no additional infrastructure.
+#   GPG path removed 2026-05-25 per Tiago directive "Declare SSH-only".
+#
+# VERIFICATION RECIPE (for auditors, downstream consumers, CI):
+# -----------------------------------------------------------------------
+#
 #   git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub
-#   git tag -v v2.23.3   # (v2.23.2 is unsigned; v2.23.3+ are SSH-signed)
+#   git tag -v v2.24.2
+#   # Expected output:
+#   # Good "git" signature for maxine@agnosticsec.com with ED25519 key SHA256:y5RP8TQfAFKBECUDgqP300d8CrdY4njSRS8HzxIQdJE
 #
-# This workflow remains in the repo as a placeholder for when a software
-# GPG key for CI signing is generated. Until then it will fail if triggered.
-# To unblock: generate a software GPG key (RSA 4096, passphrase-protected),
-# store in GitHub Secrets (GPG_PRIVATE_KEY + GPG_PASSPHRASE), and commit
-# the public key to docs/release-signing-key.asc.
+# KEY ROTATION:
+#   See docs/security/release-signing.md for the full rotation procedure.
 #
-# Original design intent (GPG key setup, one-time):
-#   1. Generate: gpg --full-generate-key (RSA 4096, releases@agnosticsec.com)
-#   2. Export private: gpg --armor --export-secret-keys releases@agnosticsec.com
-#   3. Store in GitHub Secrets: GPG_PRIVATE_KEY (armored), GPG_PASSPHRASE
-#   4. Export public: gpg --armor --export releases@agnosticsec.com
-#   5. Commit public key to: docs/release-signing-key.asc
-
-on:
-  push:
-    tags:
-      - 'v*.*.*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to sign (e.g. v2.23.1)'
-        required: true
-        type: string
-      commit_sha:
-        description: 'Commit SHA the tag points to (full 40-char)'
-        required: true
-        type: string
-
-concurrency:
-  group: tag-sign-${{ github.ref }}
-  cancel-in-progress: false
-
-permissions:
-  contents: write   # push signed tag back
-
-jobs:
-  sign-tag:
-    name: GPG Sign Release Tag
-    runs-on: ubuntu-latest
-    # Guard: only run on actual tag refs (refs/tags/…), not on branch pushes
-    # where the branch name happens to match the v*.*.* pattern (e.g. v2.23.3).
-    # GitHub workflow triggers with `push: tags:` do NOT filter out branch-push
-    # events when the branch name matches the tag pattern.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      # -----------------------------------------------------------------------
-      # 1. Checkout (full history — needed to resolve tag commits)
-      # -----------------------------------------------------------------------
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      # -----------------------------------------------------------------------
-      # 2. Resolve tag and commit from trigger source
-      # -----------------------------------------------------------------------
-      - name: Resolve tag and commit
-        id: resolve
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
-            COMMIT="${{ inputs.commit_sha }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-            COMMIT="${GITHUB_SHA}"
-          fi
-
-          # Validate tag format
-          if ! echo "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
-            echo "ERROR: Tag '${TAG}' does not match vN.N.N or vN.N.N-rc.N" >&2
-            exit 1
-          fi
-
-          # For push triggers, resolve via git (GITHUB_SHA is the commit, not tag object)
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            # The tag may point to a tag object; dereference to commit
-            COMMIT=$(git rev-parse "${TAG}^{commit}" 2>/dev/null || echo "${COMMIT}")
-          fi
-
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "Resolved: tag=${TAG} commit=${COMMIT}"
-
-      # -----------------------------------------------------------------------
-      # 3. Check if tag is already GPG-signed
-      # -----------------------------------------------------------------------
-      - name: Check existing signature
-        id: sig_check
-        run: |
-          TAG="${{ steps.resolve.outputs.tag }}"
-          # Fetch the tag object and look for PGP header
-          if git cat-file tag "${TAG}" 2>/dev/null | grep -q "BEGIN PGP SIGNATURE"; then
-            echo "already_signed=true" >> "$GITHUB_OUTPUT"
-            echo "[INFO] Tag ${TAG} is already GPG-signed."
-          else
-            echo "already_signed=false" >> "$GITHUB_OUTPUT"
-            echo "[INFO] Tag ${TAG} is unsigned — proceeding to sign."
-          fi
-
-      # -----------------------------------------------------------------------
-      # 4. Skip if already signed (idempotency guard)
-      # -----------------------------------------------------------------------
-      - name: Skip if already signed
-        if: steps.sig_check.outputs.already_signed == 'true'
-        run: |
-          echo "[INFO] Tag is already signed. Nothing to do."
-          echo "To re-sign, first delete the tag on origin and re-run."
-
-      # -----------------------------------------------------------------------
-      # 5. Import GPG release signing key
-      # -----------------------------------------------------------------------
-      - name: Import GPG key
-        if: steps.sig_check.outputs.already_signed == 'false'
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          if [[ -z "${GPG_PRIVATE_KEY}" ]]; then
-            echo "ERROR: GitHub secret GPG_PRIVATE_KEY is not set." >&2
-            exit 1
-          fi
-
-          # Step A: Import the armored private key.
-          # --batch --yes --no-tty: fully non-interactive.
-          # --pinentry-mode loopback + --passphrase-fd 3: supply passphrase at
-          # import time. The key UID is `tr@agnosticsec.com`.
-          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg \
-            --batch --yes --no-tty \
-            --pinentry-mode loopback \
-            --passphrase-fd 3 \
-            --import \
-            3< <(printf '%s' "${GPG_PASSPHRASE}")
-
-          # Step B: Verify the private key material is available.
-          # GnuPG 2.1+ stores private keys in private-keys-v1.d/<keygrip>.key.
-          # If the directory is empty after import, the key is either:
-          #   a) A smartcard stub (private material on hardware token — cannot
-          #      sign in CI without the physical device), OR
-          #   b) Exported with --export instead of --export-secret-keys (the
-          #      armored blob contains only the public key despite the header).
-          # In both cases: signing is impossible and Tiago must create a
-          # software key for CI signing.
-          GNUPGHOME_DIR="${GNUPGHOME:-${HOME}/.gnupg}"
-          KEY_COUNT=$(ls "${GNUPGHOME_DIR}/private-keys-v1.d/" 2>/dev/null | wc -l)
-          if [[ "${KEY_COUNT}" -eq 0 ]]; then
-            echo "ERROR: GPG_PRIVATE_KEY imported but no private key material" \
-              "found in private-keys-v1.d/." >&2
-            echo "" >&2
-            echo "Root cause (run 25682146979 diagnostic):" >&2
-            echo "  private-keys-v1.d/ is empty after import." >&2
-            echo "  The 'To migrate secring.gpg, with each smartcard' message" >&2
-            echo "  from GnuPG indicates the key is backed by a hardware token" >&2
-            echo "  (Yubikey/smartcard). Hardware-backed keys cannot sign in CI." >&2
-            echo "" >&2
-            echo "Required action (Tiago):" >&2
-            echo "  1. Generate a SOFTWARE GPG key for CI signing:" >&2
-            echo "       gpg --full-generate-key  (RSA 4096, no expiry, with passphrase)" >&2
-            echo "  2. Export it: gpg --armor --export-secret-keys <fingerprint>" >&2
-            echo "  3. Update GitHub Secret: GPG_PRIVATE_KEY = output of step 2" >&2
-            echo "  4. Update GitHub Secret: GPG_PASSPHRASE = the passphrase" >&2
-            echo "  5. Update docs/release-signing-key.asc with the public key" >&2
-            exit 1
-          fi
-
-          # Step C: Extract fingerprint from public keyring.
-          KEY_FP=$(gpg --batch --no-tty --list-keys --with-colons \
-            | awk -F: '/^fpr/ { print $10; exit }')
-          if [[ -z "${KEY_FP}" ]]; then
-            echo "ERROR: Could not find public key fingerprint after import." >&2
-            exit 1
-          fi
-          echo "[INFO] Key fingerprint: ${KEY_FP}"
-
-          # Step D: Pre-load passphrase into gpg-agent.
-          # Requires allow-preset-passphrase in gpg-agent.conf.
-          # Belt-and-suspenders alongside the gpg wrapper in the signing step.
-          mkdir -p "${GNUPGHOME_DIR}"
-          echo "allow-preset-passphrase" >> "${GNUPGHOME_DIR}/gpg-agent.conf"
-          gpg-connect-agent reloadagent /bye 2>/dev/null || true
-
-          KEYGRIP=$(gpg --batch --no-tty \
-            --with-keygrip --list-keys --with-colons \
-            | awk -F: '/^grp/ { print $10; exit }')
-          if [[ -n "${KEYGRIP}" ]]; then
-            GPG_PRESET=$(find /usr/lib/gnupg2 /usr/lib/gnupg -name gpg-preset-passphrase 2>/dev/null | head -1 || true)
-            if [[ -n "${GPG_PRESET}" ]]; then
-              printf '%s' "${GPG_PASSPHRASE}" | "${GPG_PRESET}" --preset "${KEYGRIP}" \
-                && echo "[INFO] Passphrase preset in gpg-agent for keygrip: ${KEYGRIP}" \
-                || echo "[WARN] gpg-preset-passphrase failed; gpg wrapper handles passphrase" >&2
-            else
-              echo "[WARN] gpg-preset-passphrase not found; gpg wrapper handles passphrase" >&2
-            fi
-          fi
-
-          echo "KEY_FP=${KEY_FP}" >> "$GITHUB_ENV"
-
-          # Step E: Pre-set ultimate trust so git tag -v passes without
-          # interactive prompting.
-          echo "${KEY_FP}:6:" | gpg --import-ownertrust
-
-      # -----------------------------------------------------------------------
-      # 6. Configure git identity for the signed tag
-      # -----------------------------------------------------------------------
-      - name: Configure git
-        if: steps.sig_check.outputs.already_signed == 'false'
-        run: |
-          git config user.name  "Agnostic Security Releases"
-          git config user.email "tr@agnosticsec.com"
-          git config user.signingkey "${KEY_FP}"
-          git config tag.gpgsign true
-
-      # -----------------------------------------------------------------------
-      # 7. Capture existing tag message (to preserve on re-sign)
-      # -----------------------------------------------------------------------
-      - name: Capture tag message
-        if: steps.sig_check.outputs.already_signed == 'false'
-        id: tag_msg
-        run: |
-          TAG="${{ steps.resolve.outputs.tag }}"
-          COMMIT="${{ steps.resolve.outputs.commit }}"
-
-          # Extract the body of the existing tag object (strip header lines)
-          MSG=$(git cat-file tag "${TAG}" 2>/dev/null | sed '1,/^$/d' || echo "Yashigani ${TAG}")
-          echo "msg<<MSG_EOF" >> "$GITHUB_OUTPUT"
-          echo "${MSG}"      >> "$GITHUB_OUTPUT"
-          echo "MSG_EOF"     >> "$GITHUB_OUTPUT"
-
-      # -----------------------------------------------------------------------
-      # 8. Delete the unsigned tag locally and re-create as signed
-      # -----------------------------------------------------------------------
-      - name: Create signed tag
-        if: steps.sig_check.outputs.already_signed == 'false'
-        env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          TAG="${{ steps.resolve.outputs.tag }}"
-          COMMIT="${{ steps.resolve.outputs.commit }}"
-          MSG="${{ steps.tag_msg.outputs.msg }}"
-
-          # Delete the existing (unsigned) local tag
-          git tag -d "${TAG}" 2>/dev/null || true
-
-          # Write a gpg wrapper that supplies --pinentry-mode loopback and
-          # --passphrase-fd so that passphrase-protected keys work in CI
-          # without an interactive pinentry or a running gpg-agent.
-          # GPG_PASSPHRASE is inherited from the env; the wrapper passes it
-          # to gpg via a process-substitution on fd 9.
-          GPG_WRAPPER="${RUNNER_TEMP}/gpg-sign-wrapper"
-          {
-            echo '#!/bin/bash'
-            echo 'exec gpg --batch --yes --no-tty --pinentry-mode loopback --passphrase-fd 9 "$@" 9< <(printf "%s" "${GPG_PASSPHRASE}")'
-          } > "${GPG_WRAPPER}"
-          chmod +x "${GPG_WRAPPER}"
-
-          # Re-create tag using wrapper as gpg.program so git supplies all
-          # standard git-tag args, and the wrapper injects the passphrase.
-          git -c "gpg.program=${GPG_WRAPPER}" tag -s "${TAG}" "${COMMIT}" \
-            --local-user "${KEY_FP}" \
-            -m "${MSG}"
-
-          echo "[INFO] Signed tag created: ${TAG} -> ${COMMIT}"
-
-      # -----------------------------------------------------------------------
-      # 9. Verify the signature locally before pushing
-      # -----------------------------------------------------------------------
-      - name: Verify signature
-        if: steps.sig_check.outputs.already_signed == 'false'
-        run: |
-          TAG="${{ steps.resolve.outputs.tag }}"
-          VERIFY_OUT=$(git tag -v "${TAG}" 2>&1)
-          echo "${VERIFY_OUT}"
-          if ! echo "${VERIFY_OUT}" | grep -qiE "(good signature|gpg: Signature made)"; then
-            echo "ERROR: Signature verification failed. Tag NOT pushed." >&2
-            exit 1
-          fi
-          echo "[INFO] Signature: GOOD"
-
-      # -----------------------------------------------------------------------
-      # 10. Force-push the signed tag to origin
-      # -----------------------------------------------------------------------
-      - name: Push signed tag
-        if: steps.sig_check.outputs.already_signed == 'false'
-        run: |
-          TAG="${{ steps.resolve.outputs.tag }}"
-          git push origin "refs/tags/${TAG}" --force
-          echo "[INFO] Signed tag ${TAG} pushed to origin."
-
-      # -----------------------------------------------------------------------
-      # 11. Summary
-      # -----------------------------------------------------------------------
-      - name: Summary
-        run: |
-          TAG="${{ steps.resolve.outputs.tag }}"
-          COMMIT="${{ steps.resolve.outputs.commit }}"
-          ALREADY="${{ steps.sig_check.outputs.already_signed }}"
-
-          if [[ "${ALREADY}" == "true" ]]; then
-            echo "## Tag Signing — Skipped (already signed)" >> "$GITHUB_STEP_SUMMARY"
-            echo "Tag \`${TAG}\` was already GPG-signed. No action taken." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "## Tag Signing — Success" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Tag | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Commit | \`${COMMIT}\` |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Signer | tr@agnosticsec.com |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Method | GPG (git tag -s) |" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Verify the signature:**" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`sh" >> "$GITHUB_STEP_SUMMARY"
-            echo "gpg --import docs/release-signing-key.asc" >> "$GITHUB_STEP_SUMMARY"
-            echo "git fetch --tags --force origin" >> "$GITHUB_STEP_SUMMARY"
-            echo "git tag -v ${TAG}" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-          fi
+# This file is kept in .github/workflows/ so that CI workflows and tooling
+# that inspect the workflow directory can discover the verification recipe.
+# It does NOT define an active workflow job (no `on:` trigger).
+#
+# Full documentation: docs/security/release-signing.md

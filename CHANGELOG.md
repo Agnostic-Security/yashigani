@@ -1,7 +1,9 @@
+<!-- last-updated: 2026-05-25T19:00:00+00:00 (v2.24.1: fix(openwebui): remove @Help CHAINING_GUIDE half-implementation seed — drift #10; init-openwebui-agents.py) -->
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
 <!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(audit): LU-AMEND-01 wave-3 — bigserial seq column on audit_events closes cross-batch ordering stability under timestamp collision; YSG-RISK-064) -->
 <!-- last-updated: 2026-05-25T16:00:00+00:00 (v2.24.1: security(opa): close OPA conformance gaps GAP-001 + GAP-002 — /v1/models OPA principal-aware listing + catch-all proxy response-leg OPA; YSG-RISK-066 + YSG-RISK-067) -->
+<!-- last-updated: 2026-05-25T18:00:00+00:00 (v2.24.1: docs(release-signing): formally declare SSH-only signing scheme; GPG path removed from .github/workflows/tag-sign.yml; release-signing.md documents verification recipe + key rotation; closes drift #3 fully; YSG-RISK-069) -->
 <!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(opa): response-content sensitivity classification — GAP-3 + SEC-5 close) -->
 <!-- last-updated: 2026-05-25T12:00:00+00:00 (v2.24.1: fix(pgbouncer): restore compose-Helm admin_users + stats_users parity — drift #8 secondary, 859294a follow-up) -->
 <!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.1: YSG-RISK-061 — Caddy egress restrictions via iptables + K8s NetworkPolicy; NET_ADMIN cap added) -->
@@ -25,6 +27,11 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ---
 
 ## [Unreleased] — v2.24.1
+
+### Documentation
+- **docs(release-signing): formally declare SSH-only signing scheme. GPG path removed from `.github/workflows/tag-sign.yml`; `docs/security/release-signing.md` documents the verification recipe + key rotation process. Closes drift #3 fully (correction landed in `be94e26`; formal declaration lands here). YSG-RISK-069.**
+
+  The originally planned GPG CI path (v2.23.2 CHANGELOG "aspirational") was confirmed non-viable: maintainer's signing key is hardware-backed (Yubikey); software GPG export is not possible. SSH signing via `gpg.format=ssh` (git 2.34+) is the correct approach and has been the actual scheme since v2.23.3. `tag-sign.yml` now contains only the verification recipe comment block; the 300-line GPG workflow is removed. `docs/release-signing-key.pub` is unchanged — it remains the operational artefact for `git tag -v` verification.
 
 ### Security
 - **security(sod): admin/user separation-of-duties enforcement — cross-store collision checks on all auth creation paths + account_tier filter on /auth/verify + daily cross-store conflict audit cron. Closes Iris #96 SoD-001..005 (SoD-004 was live-exploitable). NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2. YSG-RISK-068.**
@@ -271,6 +278,15 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   ASVS V5.1.5 / CWE-601 / OWASP A01:2021.
 
 ### Fixed
+- **fix(openwebui): remove @Help half-implementation seed (drift #10)** — The
+  `CHAINING_GUIDE` model (`id: "@Help"`, name: "Yashigani — How to use agents") was
+  seeded into Open WebUI's model table via `scripts/init-openwebui-agents.py`. The model
+  appeared in the UI @-mention picker but was never registered as a real agent in
+  `/admin/agents`; any user invocation routed to the gateway and received a 404. Removed
+  entirely — the three real agents (Lala/@Langflow, Julietta/@Letta, Scout/@OpenClaw)
+  remain unaffected. Grep confirms zero remaining `@Help` or `CHAINING_GUIDE` references
+  in any user-facing path.
+
 - **fix(agents): langflow + letta OPENAI_API_BASE port corrected :8080→:8081**
   (BUG-V241-LANGFLOW-LETTA-BASE-URL — confirmed broken by Maxine + Iris fresh audits,
   Tiago directive 2026-05-24):

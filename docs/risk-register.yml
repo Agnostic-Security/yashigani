@@ -1524,3 +1524,37 @@ risks:
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (Iris GAP-002 / Tiago 2026-05-25 OPA universal directive)
+
+- id: YSG-RISK-069
+  description: >-
+    Release tag signing scheme formally declared SSH-only. Maintainer's signing
+    key is hardware-backed (Yubikey ed25519); software GPG path historically
+    referenced in CHANGELOG v2.23.2 is removed — the maintainer's key cannot
+    be exported from the hardware token. Signing occurs locally on the
+    maintainer's machine at tag creation time; CI does not participate.
+    Verification recipe and key rotation process documented at
+    docs/security/release-signing.md. GPG CI workflow path removed from
+    .github/workflows/tag-sign.yml (2026-05-25).
+  severity: informational
+  controls_impacted:
+    - NIST SP 800-53 SI-7 (software integrity)
+    - SOC 2 CC8.1 (change management)
+    - SLSA Level 3 (build provenance — release artifact signing)
+  compensating_controls:
+    - Hardware-backed ed25519 key (Yubikey) — private key material never exportable
+    - SSH allowed-signers file committed in-repo (docs/release-signing-key.pub) for offline verification
+    - Key rotation procedure documented at docs/security/release-signing.md
+    - All tags from v2.23.3 onward carry SSH signature verifiable with git tag -v
+  status: accepted
+  accepted_by: Tiago
+  accepted_at: "2026-05-25"
+  review_by: "2026-08-23"
+  closure_evidence:
+    - commit: "<sha-placeholder>"
+      rationale: >-
+        SSH-only signing scheme formally declared. GPG workflow path removed
+        from .github/workflows/tag-sign.yml. docs/security/release-signing.md
+        created as single source of truth. Verification confirmed:
+        git tag -v v2.24.2 emits Good "git" signature for maxine@agnosticsec.com
+        with ED25519 key SHA256:y5RP8TQfAFKBECUDgqP300d8CrdY4njSRS8HzxIQdJE.
+        Closes drift audit entry #3 (changelog-vs-reality-drift-audit-20260524.md).

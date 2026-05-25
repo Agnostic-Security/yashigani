@@ -64,45 +64,6 @@ AGENTS = [
     },
 ]
 
-# Chaining guide — shown as a system agent in Open WebUI
-CHAINING_GUIDE = {
-    "id": "@Help",
-    "name": "Yashigani — How to use agents",
-    "base_model_id": "qwen2.5:3b",
-    "description": (
-        "You can chain agents and models together in a single conversation! "
-        "Mention any agent or model by name to route parts of your request.\n\n"
-        "Chaining examples:\n"
-        "• \"@Scout find all recent articles about AI security from the last 6 months, "
-        "then @Julietta compile and organise them by topic, "
-        "then @qwen2.5:3b summarise the key findings in 5 bullet points\"\n\n"
-        "• \"@Lala build a workflow that checks our API health every hour, "
-        "then @Julietta remember the results and alert me if anything changes\"\n\n"
-        "• \"@Scout search for OWASP Agentic AI latest updates, "
-        "@Julietta cross-reference with what we discussed last week, "
-        "@qwen2.5:3b draft a security advisory email\"\n\n"
-        "More ideas:\n"
-        "• \"@Scout find competitor pricing for AI security gateways, "
-        "@Julietta compare with our pricing from last quarter's analysis, "
-        "@qwen2.5:3b write a competitive positioning summary\"\n\n"
-        "• \"@qwen2.5:3b explain the OWASP ASVS v5 session management requirements, "
-        "@Lala create a checklist workflow I can run weekly to verify compliance\"\n\n"
-        "• \"@Scout get the latest CVEs for Python 3.12, "
-        "@qwen2.5:3b assess which ones affect our dependencies, "
-        "@Julietta add the findings to our vulnerability tracking\"\n\n"
-        "Available agents:\n"
-        "  Lala — Workflow Builder (multi-step pipelines, API chains, automation)\n"
-        "  Julietta — Memory Agent (remembers context, personal assistant, research)\n"
-        "  Scout — Connected Agent (web search, code execution, messaging)\n"
-        "  qwen2.5:3b — Local LLM (fast, private, on-premises inference)\n\n"
-        "Tip: You can use any combination — the gateway routes each @mention "
-        "to the right agent automatically, with full security enforcement on every hop."
-    ),
-}
-
-# Add chaining guide to the agent list
-AGENTS.append(CHAINING_GUIDE)
-
 
 def main():
     db = sqlite3.connect(DB_PATH)
