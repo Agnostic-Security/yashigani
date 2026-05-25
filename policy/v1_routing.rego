@@ -186,3 +186,136 @@ reason := "sensitivity_ceiling_exceeded" if {
     routing_safe
     not sensitivity_allowed
 }
+
+# ── GET /v1/models — principal-aware model listing (GAP-001) ──────────────
+#
+# Controls whether a caller may enumerate the model list and what subset
+# they receive.  Human principals with non-anonymous identity get the full
+# list.  Service-account principals (internal_bearer, SPIFFE workloads) see
+# only models they are authorised to call — the full topology must not be
+# enumerable by compromised internal-mesh containers.
+#
+# Input schema:
+#   input.identity.status         — active | suspended | anonymous
+#   input.identity.kind           — human | service | admin | unknown
+#   input.identity.sensitivity_ceiling — PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
+#
+# Decision document:
+#   models_list_allowed           — bool: may the caller see any model list at all?
+#   models_list_filter            — "full" | "restricted" | "denied"
+#
+# Operator override: push a data bundle with
+#   data.yashigani.v1.models_list_policy.service_account_filter = "full"
+# to grant service accounts the full list (opt-in, explicit, auditable).
+
+default models_list_allowed := false
+
+# Human principals with an active identity always get a model listing.
+models_list_allowed if {
+    input.identity.status == "active"
+    input.identity.kind in {"human", "admin"}
+}
+
+# Service-account principals get RESTRICTED listing by default.
+# Operator can grant full listing via data bundle override (see above).
+models_list_allowed if {
+    input.identity.status == "active"
+    input.identity.kind in {"service", "unknown"}
+}
+
+# Filter level:
+#   human / admin → full list
+#   service / unknown → restricted (their allowed_models only, or all if allowed_models is empty and operator grants)
+#   denied → should not reach this branch (models_list_allowed = false guards above)
+default models_list_filter := "denied"
+
+models_list_filter := "full" if {
+    models_list_allowed
+    input.identity.kind in {"human", "admin"}
+}
+
+models_list_filter := "restricted" if {
+    models_list_allowed
+    input.identity.kind in {"service", "unknown"}
+    not _service_full_override
+}
+
+models_list_filter := "full" if {
+    models_list_allowed
+    input.identity.kind in {"service", "unknown"}
+    _service_full_override
+}
+
+# Operator override gate — requires explicit data bundle entry.
+_service_full_override if {
+    data.yashigani.v1.models_list_policy.service_account_filter == "full"
+}
+
+models_list_decision := {
+    "allow": models_list_allowed,
+    "filter": models_list_filter,
+    "reason": _models_list_reason,
+}
+
+_models_list_reason := "ok" if models_list_allowed
+_models_list_reason := "identity_not_active_or_anonymous" if not models_list_allowed
+
+# ── Catch-all proxy response-leg OPA (GAP-002) ───────────────────────────
+#
+# Evaluates whether the caller may receive the upstream MCP response.
+# Mirrors the /v1/* response_decision shape.
+#
+# Input schema:
+#   input.principal.status              — active | suspended | anonymous
+#   input.principal.kind                — human | service | admin | unknown
+#   input.principal.sensitivity_ceiling — PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
+#   input.response_sensitivity          — PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
+#   input.response_pii_detected         — boolean
+#   input.request_path                  — the MCP tool path that was proxied
+#
+# When response_sensitivity is absent (pipeline off), the check runs with
+# PUBLIC sensitivity — conservative but not blocking (pipeline-off default).
+# Operators who enable the pipeline get full sensitivity enforcement.
+#
+# Fail-closed: unknown sensitivity strings map to rank 4 via sensitivity_rank.
+
+default proxy_response_allowed := true
+
+proxy_response_allowed := false if {
+    _proxy_effective_sensitivity_rank > sensitivity_rank(input.principal.sensitivity_ceiling)
+}
+
+proxy_response_allowed := false if {
+    input.response_pii_detected == true
+    input.principal.kind != "admin"
+    input.principal.kind != "human"
+}
+
+_proxy_effective_sensitivity_rank := r if {
+    r := sensitivity_rank(input.response_sensitivity)
+}
+
+_proxy_effective_sensitivity_rank := 0 if {
+    not input.response_sensitivity
+}
+
+default proxy_response_reason := "ok"
+
+proxy_response_reason := "ok" if proxy_response_allowed
+
+proxy_response_reason := "response_sensitivity_exceeds_ceiling" if {
+    not proxy_response_allowed
+    _proxy_effective_sensitivity_rank > sensitivity_rank(input.principal.sensitivity_ceiling)
+}
+
+proxy_response_reason := "response_pii_blocked_for_service_account" if {
+    not proxy_response_allowed
+    input.response_pii_detected == true
+    input.principal.kind != "admin"
+    input.principal.kind != "human"
+}
+
+proxy_response_decision := {
+    "allow": proxy_response_allowed,
+    "reason": proxy_response_reason,
+}

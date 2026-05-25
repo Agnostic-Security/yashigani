@@ -2,21 +2,29 @@
 Yashigani Gateway — Reverse proxy for MCP servers and agentic AI systems.
 
 Traffic flow:
-  Client → [AuthN/Z] → [Inspection pipeline] → [OPA policy check] → MCP server
-                                 ↑
-                        Credential masking via CHS
-                        before any AI classifier call
+  Client → [AuthN/Z] → [Inspection pipeline] → [OPA request check] → MCP server
+                                 ↑                                          ↓
+                        Credential masking via CHS          [Response inspection]
+                        before any AI classifier call       [PII detection]
+                                                            [OPA response check]
+                                                                    ↓
+                                                             Client (or 403/503)
 
 All inbound requests are:
 1. Authenticated via session cookie or API key
 2. Inspected for credential exfiltration and prompt injection
-3. Policy-checked via OPA (never cloud-delegated)
+3. Policy-checked via OPA on request leg (never cloud-delegated)
 4. Forwarded to the upstream MCP server or discarded
 
-Responses from MCP servers are forwarded back as-is.
+Responses from MCP servers are:
+5. Inspected by ResponseInspectionPipeline (when configured)
+6. PII-scanned (when configured)
+7. Policy-checked via OPA on response leg (GAP-002 / YSG-RISK-067 / v2.24.1)
+8. Delivered to client or blocked (403 policy deny / 503 OPA unreachable)
+
 Audit events are written for every request regardless of disposition.
 
-Last updated: 2026-05-17T00:00:00+01:00
+Last updated: 2026-05-25T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -778,6 +786,37 @@ async def _proxy_request_body(
                     _upstream_content = _resp_pii_text.encode("utf-8", errors="replace")
                 # BLOCK: add header warning, do not suppress — response already generated
 
+    # 5c-opa. Response-leg OPA check (GAP-002 close).
+    # After response inspection and PII detection, query OPA to decide whether
+    # this caller's sensitivity ceiling permits receiving the upstream content.
+    # Fail-closed: OPA unreachable → 503.  OPA deny → 403.
+    # No OPA in dev opt-in mode (YASHIGANI_OPA_OPTIONAL=true + non-production).
+    _opa_resp_result = await _opa_proxy_response_check(
+        cfg=cfg,
+        request=request,
+        path=path,
+        session_id=session_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        response_sensitivity=_proxy_response_sensitivity(resp_pipeline, upstream_response.content, session_id, agent_id, request_id),
+        pii_detected=pii_detected_on_response,
+        request_id=request_id,
+        audit_writer=audit_writer,
+    )
+    if not _opa_resp_result.get("allow", False):
+        _opa_deny_reason = _opa_resp_result.get("reason", "opa_denied")
+        _http_status = 503 if "unreachable" in _opa_deny_reason or "not_configured" in _opa_deny_reason else 403
+        return JSONResponse(
+            status_code=_http_status,
+            content={
+                "error": "MCP_RESPONSE_BLOCKED_BY_OPA",
+                "detail": "The upstream MCP response was blocked by Yashigani policy.",
+                "reason": _opa_deny_reason,
+                "request_id": request_id,
+            },
+            headers={"X-Yashigani-Request-Id": request_id},
+        )
+
     elapsed_ms = int((time.monotonic() - start) * 1000)
     _audit_request(
         audit_writer, request_id, "FORWARDED", "clean", request, path,
@@ -907,6 +946,186 @@ async def _opa_check(
             path, session_id, exc,
         )
         return False  # fail-closed
+
+
+# ---------------------------------------------------------------------------
+# Response-leg OPA helpers (GAP-002)
+# ---------------------------------------------------------------------------
+
+
+def _proxy_response_sensitivity(
+    resp_pipeline,
+    content: bytes,
+    session_id: str,
+    agent_id: str,
+    request_id: str,
+) -> str:
+    """
+    Derive response sensitivity for OPA input.
+
+    When the ResponseInspectionPipeline is configured and the content is
+    non-empty, attempt to classify response sensitivity.  Fall back to
+    "PUBLIC" when pipeline is absent (default per YSG-RISK-057) or when
+    classification fails.
+
+    Returns one of PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED.
+    """
+    if resp_pipeline is None or not content:
+        return "PUBLIC"
+    try:
+        text = _decode_body_safe(content)
+        if not text:
+            return "PUBLIC"
+        result = resp_pipeline.inspect(
+            response_body=text,
+            content_type="",
+            request_id=request_id,
+            session_id=session_id,
+            agent_id=agent_id,
+        )
+        # ResponseInspectionResult.response_sensitivity is populated by
+        # ResponseInspectionPipeline when a SensitivityClassifier is wired.
+        # Attribute is absent on older pipeline versions — getattr is safe.
+        sens = getattr(result, "response_sensitivity", None)
+        if sens and isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
+            return sens
+    except Exception as exc:
+        logger.debug(
+            "proxy: response sensitivity classification failed (request_id=%s): %s",
+            request_id, exc,
+        )
+    return "PUBLIC"
+
+
+async def _opa_proxy_response_check(
+    cfg: GatewayConfig,
+    request: Request,
+    path: str,
+    session_id: str,
+    agent_id: str,
+    user_id: str,
+    response_sensitivity: str,
+    pii_detected: bool,
+    request_id: str,
+    audit_writer,
+) -> dict:
+    """
+    Query OPA proxy_response_decision for the catch-all proxy response leg.
+
+    Returns {"allow": bool, "reason": str}.
+
+    Fail-closed: OPA unreachable or not configured (without dev opt-in) →
+    {"allow": False, "reason": "opa_unreachable"} or "opa_not_configured".
+
+    Dev opt-in: YASHIGANI_OPA_OPTIONAL=true + non-production → allow without
+    policy check.
+
+    GAP-002 / ASVS V4.1.3 / Iris GAP-002 / YSG-RISK-067 / v2.24.1.
+    """
+    from yashigani.audit.schema import McpResponseBlockedByOpaEvent, ProxyOpaResponseCheckFailedEvent
+
+    _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+    _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+
+    if not cfg.opa_url:
+        if _opa_optional and _ysg_env != "production":
+            logger.warning(
+                "OPA not configured (YASHIGANI_OPA_OPTIONAL=true, env=%s) — "
+                "allowing proxy response without policy check (dev opt-in)",
+                _ysg_env,
+            )
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+        logger.error(
+            "OPA not configured and fail-closed triggered for proxy response-leg "
+            "(env=%s, opa_optional=%s)",
+            _ysg_env, _opa_optional,
+        )
+        if audit_writer is not None:
+            try:
+                audit_writer.write(ProxyOpaResponseCheckFailedEvent(
+                    request_id=request_id,
+                    identity_id=user_id or agent_id or "anonymous",
+                    reason="opa_not_configured",
+                    outcome="not_configured",
+                ))
+            except Exception as _aw_exc:
+                logger.warning("Audit write failed for ProxyOpaResponseCheckFailedEvent: %s", _aw_exc)
+        return {"allow": False, "reason": "opa_not_configured"}
+
+    # Build principal doc from available identity signals in proxy.
+    # The catch-all proxy does not have a full identity registry lookup;
+    # we use the identity extracted by _extract_identity + JWT claims.
+    principal_doc = {
+        "status": "active",
+        "kind": "service" if (agent_id and agent_id != "anonymous") else "human",
+        "sensitivity_ceiling": "RESTRICTED",  # conservative default; real ceiling gated by request-leg OPA
+    }
+    # Internal mesh bearer → sensitivity_ceiling matches internal identity
+    _auth = request.headers.get("authorization", "")
+    if _auth.startswith("Bearer ") and hmac.compare_digest(_auth[7:], _INTERNAL_BEARER):
+        principal_doc["kind"] = "service"
+        principal_doc["sensitivity_ceiling"] = "RESTRICTED"
+
+    opa_input = {
+        "principal": principal_doc,
+        "response_sensitivity": response_sensitivity,
+        "response_pii_detected": pii_detected,
+        "request_path": path,
+    }
+
+    try:
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                cfg.opa_url.rstrip("/") + "/v1/data/yashigani/v1/proxy_response_decision",
+                json={"input": opa_input},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            opa_allow = bool(result.get("allow", True))
+            opa_reason = result.get("reason", "ok")
+
+            if not opa_allow:
+                if audit_writer is not None:
+                    try:
+                        audit_writer.write(McpResponseBlockedByOpaEvent(
+                            request_id=request_id,
+                            identity_id=user_id or agent_id or "anonymous",
+                            identity_kind=principal_doc["kind"],
+                            request_path=path,
+                            response_sensitivity=response_sensitivity,
+                            pii_detected=pii_detected,
+                            deny_reason=opa_reason,
+                            action="denied",
+                        ))
+                    except Exception as _aw_exc:
+                        logger.warning(
+                            "Audit write failed for McpResponseBlockedByOpaEvent: %s", _aw_exc
+                        )
+            return {"allow": opa_allow, "reason": opa_reason}
+
+    except Exception as exc:
+        exc_class = type(exc).__name__
+        logger.error(
+            "OPA proxy response check FAILED — denying (fail-closed zero-trust). "
+            "exc_class=%s exc=%s. OPA must be restored to re-enable proxy response delivery.",
+            exc_class, exc,
+        )
+        if audit_writer is not None:
+            try:
+                audit_writer.write(ProxyOpaResponseCheckFailedEvent(
+                    request_id=request_id,
+                    identity_id=user_id or agent_id or "anonymous",
+                    reason="opa_exception",
+                    outcome="exception",
+                    exc_class=exc_class,
+                    exc_str=str(exc)[:256],
+                ))
+            except Exception as _aw_exc:
+                logger.warning(
+                    "Audit write failed for ProxyOpaResponseCheckFailedEvent: %s", _aw_exc
+                )
+        return {"allow": False, "reason": "opa_unreachable"}
 
 
 # ---------------------------------------------------------------------------

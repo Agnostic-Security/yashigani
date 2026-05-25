@@ -1375,3 +1375,92 @@ risks:
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (Ava GAP-3 / Iris SEC-5 / Tiago 2026-05-25 directive)
+
+- id: YSG-RISK-066
+  description: >-
+    GET /v1/models OPA evaluation absent (Iris GAP-001).
+    Any authenticated principal (human, service-account, SPIFFE workload)
+    could enumerate the full agent topology, service-identity slugs, and
+    Ollama model list without OPA policy evaluation. An authenticated
+    compromised internal-bearer container (langflow, letta, openclaw) could
+    use this endpoint to map the full Yashigani agent topology without any
+    OPA gate firing. Severity: MEDIUM (authenticated required; topology
+    enumeration, not content access).
+  severity: medium
+  controls_impacted:
+    - ASVS V4.1.1
+    - OWASP API9 (Improper Inventory Management)
+    - CMMC IA.L2-3.5.1
+    - ISO 27001 A.8.2
+  compensating_controls:
+    - Authentication required (FINDING-59-01 fix — unauthenticated callers get 401)
+    - Network isolation limits internal-bearer exposure to mesh-internal bridge
+  status: mitigated
+  closure_evidence:
+    - commit: TBD-gap001-002-commit
+      rationale: >-
+        1. _opa_models_check() coroutine added to openai_router.py: queries
+           OPA /v1/data/yashigani/v1/models_list_decision after identity
+           resolution. Fail-closed on OPA error or unconfigured (dev opt-in only).
+        2. list_models() handler wired: OPA deny → 403 (or 503 on unreachable).
+           OPA allow with filter=restricted → service-account gets only
+           allowed_models content; agent/service-identity topology withheld.
+           OPA allow with filter=full → human/admin gets complete list.
+        3. v1_routing.rego: models_list_allowed + models_list_filter + models_list_decision
+           rules added. Service accounts get restricted by default; operator can
+           grant full via data bundle override (explicit, auditable opt-in).
+        4. audit/schema.py: MODELS_LIST_REQUESTED EventType + ModelsListRequestedEvent
+           dataclass. Event records identity, filter level, model count (not names).
+        5. Tests: 15 unit + 5 integration (GAP-001 suite). All PASS.
+        Negative regression: compromised internal-bearer cannot enumerate agent
+        topology (test H in integration suite).
+  fix_in_version: v2.24.1
+  closed_at: 2026-05-25
+  closed_by: Tom (Iris GAP-001 / Tiago 2026-05-25 OPA universal directive)
+
+- id: YSG-RISK-067
+  description: >-
+    Catch-all proxy (/{path:path}) response-leg OPA absent (Iris GAP-002).
+    After forwarding a request to an upstream MCP server and receiving the
+    response, the catch-all proxy delivered the response to the caller WITHOUT
+    querying OPA. The caller's sensitivity ceiling was enforced only on the
+    request leg (inbound OPA check); the response content was never gated.
+    Symmetric to the pre-v2.24.1 /agents/* gap (SEC-5) that was treated as a
+    release-blocker. Severity: HIGH (MCP responses can contain CONFIDENTIAL
+    or RESTRICTED content; caller ceiling violation possible).
+  severity: high
+  controls_impacted:
+    - ASVS V4.1.3
+    - CMMC SC.L2-3.13.10
+    - ISO 27001 A.8.3
+    - NIST AC-4 (information flow enforcement)
+  compensating_controls:
+    - Request-leg OPA check already enforces path-level policy
+    - ResponseInspectionPipeline injection/credential-exfil check (when configured)
+    - PII detector on response path (when configured)
+  status: mitigated
+  closure_evidence:
+    - commit: TBD-gap001-002-commit
+      rationale: >-
+        1. _opa_proxy_response_check() coroutine added to proxy.py: queries
+           OPA /v1/data/yashigani/v1/proxy_response_decision after response
+           inspection and PII detection. Fail-closed on OPA error or
+           unconfigured (dev opt-in only).
+        2. _proxy_response_sensitivity() helper: derives response sensitivity
+           from ResponseInspectionPipeline (when configured) or returns PUBLIC
+           (pipeline-off safe default per YSG-RISK-057).
+        3. Proxy handler wired: OPA deny → 403 MCP_RESPONSE_BLOCKED_BY_OPA
+           (or 503 on unreachable). FORWARDED audit event only on OPA allow.
+        4. v1_routing.rego: proxy_response_allowed + proxy_response_reason +
+           proxy_response_decision rules added. Evaluates sensitivity ceiling
+           against response_sensitivity from pipeline or PUBLIC fallback.
+        5. audit/schema.py: MCP_RESPONSE_BLOCKED_BY_OPA + PROXY_OPA_RESPONSE_CHECK_FAILED
+           EventTypes + McpResponseBlockedByOpaEvent + ProxyOpaResponseCheckFailedEvent
+           dataclasses.
+        6. proxy.py streaming: _forward() uses httpx.AsyncClient.request() (buffered,
+           not streamed); upstream_response.content is available synchronously.
+           No force-buffer needed — proxy already buffers all responses.
+        7. Tests: 13 unit + 3 integration (GAP-002 suite). All PASS.
+  fix_in_version: v2.24.1
+  closed_at: 2026-05-25
+  closed_by: Tom (Iris GAP-002 / Tiago 2026-05-25 OPA universal directive)

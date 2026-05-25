@@ -1,6 +1,7 @@
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
 <!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(audit): LU-AMEND-01 wave-3 — bigserial seq column on audit_events closes cross-batch ordering stability under timestamp collision; YSG-RISK-064) -->
+<!-- last-updated: 2026-05-25T16:00:00+00:00 (v2.24.1: security(opa): close OPA conformance gaps GAP-001 + GAP-002 — /v1/models OPA principal-aware listing + catch-all proxy response-leg OPA; YSG-RISK-066 + YSG-RISK-067) -->
 <!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(opa): response-content sensitivity classification — GAP-3 + SEC-5 close) -->
 <!-- last-updated: 2026-05-25T12:00:00+00:00 (v2.24.1: fix(pgbouncer): restore compose-Helm admin_users + stats_users parity — drift #8 secondary, 859294a follow-up) -->
 <!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.1: YSG-RISK-061 — Caddy egress restrictions via iptables + K8s NetworkPolicy; NET_ADMIN cap added) -->
@@ -26,6 +27,31 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ## [Unreleased] — v2.24.1
 
 ### Security
+- **security(opa): close OPA conformance gaps GAP-001 + GAP-002 — /v1/models OPA-evaluated for principal-aware listing; /v1/proxy catch-all gets response-leg OPA mirroring /v1/chat/completions pattern** (YSG-RISK-066 + YSG-RISK-067, Iris conformance audit Iris #94, Tiago 2026-05-25 universal OPA directive):
+
+  Per `docs/opa_manual.md:44` OPA-everywhere mandate. Both gaps were code-vs-docs drift — the manual mandated OPA on all traffic both legs; the code did not comply on these two surfaces.
+
+  **GAP-001 — GET /v1/models (MEDIUM, release-blocker):**
+  - Previous state: authenticated but not OPA-evaluated. Any authenticated principal (internal-bearer, API-key, SPIFFE workload) could enumerate the full agent topology + service-identity slugs + Ollama model list without OPA policy check.
+  - Fix: `_opa_models_check()` added to `openai_router.py`. Queries OPA `/v1/data/yashigani/v1/models_list_decision` after identity resolution. Fail-closed on OPA error. Human/admin principals receive full list; service-account principals receive RESTRICTED list (allowed_models only — agent and service-identity topology withheld). Operator can grant full listing via data bundle override (explicit opt-in).
+  - `v1_routing.rego`: `models_list_allowed` + `models_list_filter` + `models_list_decision` rules added.
+  - `audit/schema.py`: `MODELS_LIST_REQUESTED` EventType + `ModelsListRequestedEvent` (identity, filter, model count — no names logged).
+  - Open WebUI model dropdown: human admin (cookie-auth) still gets full list via filter=full — no regression.
+
+  **GAP-002 — /{path:path} catch-all proxy response leg (HIGH, release-blocker):**
+  - Previous state: request-leg OPA (`_opa_check`) present; response-leg OPA absent. After `_forward()` returns upstream MCP content, the response was delivered to caller without OPA evaluating whether the caller's sensitivity ceiling permits receiving the upstream content.
+  - Fix: `_opa_proxy_response_check()` added to `proxy.py`. Queries OPA `/v1/data/yashigani/v1/proxy_response_decision` after response inspection pipeline and PII detection. Fail-closed on OPA error (→ 503). OPA deny → 403 `MCP_RESPONSE_BLOCKED_BY_OPA`.
+  - `_proxy_response_sensitivity()` helper: derives response sensitivity from `ResponseInspectionPipeline.response_sensitivity` when pipeline is configured; falls back to `"PUBLIC"` (pipeline-off safe default per YSG-RISK-057).
+  - Streaming concern addressed: `_forward()` uses `httpx.AsyncClient.request()` (buffered) — `upstream_response.content` is available synchronously. No force-buffer needed.
+  - `v1_routing.rego`: `proxy_response_allowed` + `proxy_response_reason` + `proxy_response_decision` rules added.
+  - `audit/schema.py`: `MCP_RESPONSE_BLOCKED_BY_OPA` + `PROXY_OPA_RESPONSE_CHECK_FAILED` EventTypes + corresponding dataclasses.
+
+  **Tests:** 15 unit (GAP-001) + 13 unit (GAP-002) + 8 integration (combined suite). All PASS verified locally.
+
+  **Negative regression:** compromised internal-bearer cannot enumerate full agent topology (integration test H).
+
+  ASVS V4.1.1 / V4.1.3 / OWASP API9 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.2 / A.8.3 / YSG-RISK-066 / YSG-RISK-067.
+
 - **security(opa): response-content sensitivity classification — closes Ava GAP-3 + Iris SEC-5 asymmetry between /v1/* and /agents/* response checks** (YSG-RISK-065, Tiago directive 2026-05-25):
 
   **Problem closed:**

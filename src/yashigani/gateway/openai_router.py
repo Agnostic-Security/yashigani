@@ -1363,7 +1363,16 @@ async def list_models(request: Request):
     the same Caddy auth) so the picker still populates after login. MCP
     clients that hit `/v1/models` directly must present a valid Bearer
     token or X-Forwarded-User header to enumerate.
+
+    v2.24.1 — GAP-001 (Iris audit): OPA evaluation added after identity
+    resolution.  Human/admin principals receive full list; service-account
+    principals receive RESTRICTED list (their allowed_models only, or all
+    if allowed_models is empty).  OPA unreachable → 503 fail-closed.
+    OPA deny → 403.  Audit event MODELS_LIST_REQUESTED on every call.
+    ASVS V4.1.1 / OWASP API9 / Iris GAP-001 / YSG-RISK-066.
     """
+    from yashigani.audit.schema import ModelsListRequestedEvent
+
     identity = _resolve_identity(request)
     if not identity:
         raise HTTPException(
@@ -1378,25 +1387,78 @@ async def list_models(request: Request):
             },
         )
 
+    # GAP-001: OPA evaluation — is this principal allowed to enumerate models?
+    opa_result = await _opa_models_check(identity)
+    identity_id = identity.get("identity_id", "unknown") if identity else "anonymous"
+    identity_kind = identity.get("kind", "unknown") if identity else "unknown"
+
+    if not opa_result.get("allow", False):
+        # Fail-closed: OPA deny or OPA unreachable
+        opa_reason = opa_result.get("reason", "opa_denied")
+        http_status = 503 if "unreachable" in opa_reason or "not_configured" in opa_reason else 403
+        if _state.audit_writer:
+            try:
+                _state.audit_writer.write(ModelsListRequestedEvent(
+                    identity_id=identity_id,
+                    identity_kind=identity_kind,
+                    opa_filter="denied",
+                    model_count=0,
+                    action="denied",
+                ))
+            except Exception as _aw_exc:
+                logger.warning("Audit write failed for ModelsListRequestedEvent deny: %s", _aw_exc)
+        raise HTTPException(
+            status_code=http_status,
+            detail={
+                "error": "MODELS_LIST_DENIED",
+                "detail": (
+                    "OPA policy denied model enumeration for this principal. "
+                    f"Reason: {opa_reason}"
+                ),
+            },
+        )
+
+    opa_filter = opa_result.get("filter", "restricted")
+    # Identify allowed_models for service-account RESTRICTED filter.
+    # Three states:
+    #   opa_filter == "full"         → no restriction (None sentinel OK)
+    #   opa_filter == "restricted"   → service account
+    #     allowed_models non-empty   → allow only those models
+    #     allowed_models empty       → block all models (empty set → no match)
+    #
+    # NOTE: None means "full access allowed" (set below only when filter=full).
+    # An empty frozenset means "explicitly no models allowed" (service account
+    # with empty allowed_models list).  This is intentionally fail-secure:
+    # service accounts with no explicit model allowlist see an empty response.
+    allowed_models_set: Optional[frozenset] = None
+    if opa_filter == "restricted":
+        am = (identity.get("allowed_models", []) if identity else [])
+        # Use frozenset whether empty or not — empty frozenset = no models allowed.
+        allowed_models_set = frozenset(am)
+
     models = []
 
-    # Add local Ollama models
+    # Add local Ollama models — exposed on full filter; for restricted filter,
+    # only models in allowed_models_set (if set is non-empty).
     try:
         import httpx
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{_state.ollama_url}/api/tags")
             if resp.status_code == 200:
                 for m in resp.json().get("models", []):
-                    models.append(ModelInfo(
-                        id=m.get("name", ""),
-                        created=0,
-                        owned_by="ollama (local)",
-                    ))
+                    model_name = m.get("name", "")
+                    if opa_filter == "full" or (allowed_models_set is not None and model_name in allowed_models_set):
+                        models.append(ModelInfo(
+                            id=model_name,
+                            created=0,
+                            owned_by="ollama (local)",
+                        ))
     except Exception as exc:
         logger.warning("Failed to fetch Ollama models: %s", exc)
 
     # Add configured service identities as "models" (for @mention invocation)
-    if _state.identity_registry:
+    # Only exposed on full filter — topology not visible to service accounts.
+    if opa_filter == "full" and _state.identity_registry:
         from yashigani.identity import IdentityKind
         for svc in _state.identity_registry.list_active(kind=IdentityKind.SERVICE):
             models.append(ModelInfo(
@@ -1406,7 +1468,8 @@ async def list_models(request: Request):
             ))
 
     # Add registered agents as selectable models (for @agent invocation in Open WebUI)
-    if _state.agent_registry:
+    # Only exposed on full filter — agent topology not visible to service accounts.
+    if opa_filter == "full" and _state.agent_registry:
         try:
             for agent in _state.agent_registry.list_all():
                 if agent.get("status") == "active":
@@ -1421,11 +1484,27 @@ async def list_models(request: Request):
 
     # Add any statically configured models
     for m in _state.available_models:
-        models.append(ModelInfo(
-            id=m.get("id", ""),
-            created=0,
-            owned_by=m.get("provider", "yashigani"),
-        ))
+        model_id = m.get("id", "")
+        if opa_filter == "full" or (allowed_models_set is not None and model_id in allowed_models_set):
+            models.append(ModelInfo(
+                id=model_id,
+                created=0,
+                owned_by=m.get("provider", "yashigani"),
+            ))
+
+    # Audit: MODELS_LIST_REQUESTED with count of models returned.
+    # Count only — no model names stored (prevents log-based topology disclosure).
+    if _state.audit_writer:
+        try:
+            _state.audit_writer.write(ModelsListRequestedEvent(
+                identity_id=identity_id,
+                identity_kind=identity_kind,
+                opa_filter=opa_filter,
+                model_count=len(models),
+                action="allowed",
+            ))
+        except Exception as _aw_exc:
+            logger.warning("Audit write failed for ModelsListRequestedEvent allow: %s", _aw_exc)
 
     return ModelListResponse(data=models)
 
@@ -1756,3 +1835,69 @@ async def _opa_response_check(
             except Exception as _aw_exc:
                 logger.warning("Audit write failed for OPA exception event: %s", _aw_exc)
         return {"allow": False, "reason": "opa_response_check_failed"}
+
+
+async def _opa_models_check(identity: dict | None) -> dict:
+    """
+    Query OPA models_list_decision for GET /v1/models.
+
+    Returns {"allow": bool, "filter": str, "reason": str}.
+    "filter" is one of "full" | "restricted" | "denied".
+
+    Fail-closed: OPA unreachable or not configured → deny (no topology
+    enumeration without policy).
+
+    Dev opt-in: YASHIGANI_OPA_OPTIONAL=true + non-production env →
+    allow with filter="full" (mirrors _opa_v1_check dev mode).
+
+    GAP-001 / ASVS V4.1.1 / OWASP API9 / Iris GAP-001 / YSG-RISK-066.
+    """
+    if not _state.opa_url:
+        _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+        _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+        if _opa_optional and _ysg_env != "production":
+            logger.warning(
+                "OPA not configured (YASHIGANI_OPA_OPTIONAL=true, env=%s) — "
+                "allowing /v1/models without policy check (dev opt-in)",
+                _ysg_env,
+            )
+            return {"allow": True, "filter": "full", "reason": "opa_not_configured_dev_opt_in"}
+        logger.error(
+            "OPA not configured and fail-closed triggered for /v1/models (env=%s, opa_optional=%s)",
+            _ysg_env, _opa_optional,
+        )
+        opa_response_check_failures_total.labels(
+            outcome="not_configured", reason="opa_not_configured"
+        ).inc()
+        return {"allow": False, "filter": "denied", "reason": "opa_not_configured"}
+
+    identity_doc = {
+        "status": identity.get("status", "active") if identity else "anonymous",
+        "kind": identity.get("kind", "unknown") if identity else "unknown",
+        "sensitivity_ceiling": (
+            identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC"
+        ),
+    }
+
+    opa_input = {"identity": identity_doc}
+
+    try:
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                _state.opa_url.rstrip("/") + "/v1/data/yashigani/v1/models_list_decision",
+                json={"input": opa_input},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            return {
+                "allow": bool(result.get("allow", False)),
+                "filter": result.get("filter", "denied"),
+                "reason": result.get("reason", "unknown"),
+            }
+    except Exception as exc:
+        logger.error("OPA models check failed: %s — denying (fail-closed)", exc)
+        opa_response_check_failures_total.labels(
+            outcome="exception", reason=type(exc).__name__
+        ).inc()
+        return {"allow": False, "filter": "denied", "reason": "opa_unreachable"}

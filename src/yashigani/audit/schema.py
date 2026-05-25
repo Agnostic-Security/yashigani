@@ -208,6 +208,44 @@ class EventType(str, Enum):
     # exceeds caller ceiling, or PII detected).
     # ASVS V4.1.3 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3 / Iris SEC-5 / Ava GAP-3.
     AGENT_RESPONSE_BLOCKED_BY_OPA = "AGENT_RESPONSE_BLOCKED_BY_OPA"
+    # v2.24.1 — GAP-001: GET /v1/models principal-aware OPA listing.
+    # MODELS_LIST_REQUESTED: emitted on every GET /v1/models call, recording
+    # the principal, OPA filter level, and count of models returned.
+    # ASVS V4.1.1 / OWASP API9 / Iris GAP-001 / YSG-RISK-066.
+    MODELS_LIST_REQUESTED = "MODELS_LIST_REQUESTED"
+    # v2.24.1 — GAP-002: catch-all proxy response-leg OPA.
+    # MCP_RESPONSE_BLOCKED_BY_OPA: emitted when the proxy response-leg OPA check
+    # denies delivery of the upstream MCP response to the caller.
+    # Mirrors AGENT_RESPONSE_BLOCKED_BY_OPA for the MCP proxy path.
+    # ASVS V4.1.3 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3 / Iris GAP-002 / YSG-RISK-067.
+    MCP_RESPONSE_BLOCKED_BY_OPA = "MCP_RESPONSE_BLOCKED_BY_OPA"
+    # v2.24.1 — GAP-002: OPA error on proxy response leg (fail-closed).
+    # PROXY_OPA_RESPONSE_CHECK_FAILED: emitted when the OPA call on the proxy
+    # response leg errors or is unreachable; gateway returns HTTP 503.
+    # Alert on sustained rate — mirrors OPA_RESPONSE_CHECK_FAILED for /v1/*.
+    PROXY_OPA_RESPONSE_CHECK_FAILED = "PROXY_OPA_RESPONSE_CHECK_FAILED"
+    # v2.24.1 — Iris #96: Admin/User Separation-of-Duties (SoD-001..005)
+    # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2
+    # ADMIN_CREATE_REJECTED_USER_EXISTS: admin creation blocked because a user-tier
+    # identity already exists with the same username/email.
+    ADMIN_CREATE_REJECTED_USER_EXISTS = "ADMIN_CREATE_REJECTED_USER_EXISTS"
+    # USER_CREATE_REJECTED_ADMIN_EXISTS: user creation blocked because an admin
+    # account already exists with the same username/email (SoD-002a/b/c).
+    USER_CREATE_REJECTED_ADMIN_EXISTS = "USER_CREATE_REJECTED_ADMIN_EXISTS"
+    # SCIM_PROVISION_REJECTED_ADMIN_EXISTS: SCIM provision blocked because an admin
+    # account exists with the given email (SoD-002b).
+    SCIM_PROVISION_REJECTED_ADMIN_EXISTS = "SCIM_PROVISION_REJECTED_ADMIN_EXISTS"
+    # SSO_PROVISION_REJECTED_ADMIN_EXISTS: SSO identity auto-provision blocked
+    # because an admin account exists with the given email (SoD-002c / SoD-004).
+    SSO_PROVISION_REJECTED_ADMIN_EXISTS = "SSO_PROVISION_REJECTED_ADMIN_EXISTS"
+    # AUTH_VERIFY_REJECTED_ADMIN_SESSION: /auth/verify (Caddy forward_auth) blocked
+    # because the session belongs to an admin — admins cannot bridge to data plane
+    # (SoD-003). NIST AC-5 / OWASP ASVS V4.1.2.
+    AUTH_VERIFY_REJECTED_ADMIN_SESSION = "AUTH_VERIFY_REJECTED_ADMIN_SESSION"
+    # IDENTITY_STORE_CONFLICT: cross-store conflict detected by daily cron audit
+    # (SoD-005). Same username/email exists in both admin_accounts and
+    # identity_registry. Operator must remediate manually.
+    IDENTITY_STORE_CONFLICT = "IDENTITY_STORE_CONFLICT"
 
 
 # ---------------------------------------------------------------------------
@@ -1768,3 +1806,236 @@ class RuntimeSettingChangedEvent(AuditEvent):
     new_value: str = ""                   # JSON string of the new value
     changed_by: str = ""                  # admin account_id
     source: str = ""                      # 'ui' | 'api'
+
+
+# ---------------------------------------------------------------------------
+# v2.24.1 — GAP-001: GET /v1/models principal-aware OPA listing
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ModelsListRequestedEvent(AuditEvent):
+    """Written on every GET /v1/models call.
+
+    Records the caller's identity, the OPA filter level applied, and the
+    count of models returned to the caller.  When OPA is not configured or
+    unreachable (fail-closed), action is "denied" and model_count is 0.
+
+    Security invariants:
+      - No model names are stored — only the count (prevents log-based
+        topology disclosure to a log-read attacker).
+      - identity_id is the resolved identity slug, never the raw API key.
+      - masking_applied is always True.
+
+    ASVS V4.1.1 / OWASP API9 (Improper Inventory Management) /
+    Iris GAP-001 / YSG-RISK-066 / v2.24.1.
+    """
+
+    event_type: str = EventType.MODELS_LIST_REQUESTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    identity_id: str = ""            # resolved identity slug or "anonymous"
+    identity_kind: str = ""          # human | service | admin | unknown
+    opa_filter: str = ""             # full | restricted | denied
+    model_count: int = 0             # count of models returned (0 on deny)
+    action: str = ""                 # allowed | denied | fail_closed
+
+
+# ---------------------------------------------------------------------------
+# v2.24.1 — GAP-002: catch-all proxy response-leg OPA
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class McpResponseBlockedByOpaEvent(AuditEvent):
+    """Written when the proxy response-leg OPA check denies delivery of the
+    upstream MCP response to the caller.
+
+    Mirrors AgentResponseBlockedByOpaEvent for the catch-all MCP proxy path.
+
+    Security invariants:
+      - No response body or user content is stored here.
+      - identity_id is the resolved identity slug.
+      - response_sensitivity comes from the ResponseInspectionPipeline (when
+        enabled) or "PUBLIC" (pipeline off — see proxy.py).
+      - masking_applied is always True.
+
+    ASVS V4.1.3 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3 /
+    Iris GAP-002 / YSG-RISK-067 / v2.24.1.
+    """
+
+    event_type: str = EventType.MCP_RESPONSE_BLOCKED_BY_OPA
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""            # resolved identity slug
+    identity_kind: str = ""          # human | service | admin | unknown
+    request_path: str = ""           # the MCP tool path that was proxied
+    response_sensitivity: str = ""   # PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
+    pii_detected: bool = False
+    deny_reason: str = ""            # from OPA proxy_response_reason
+    action: str = "denied"
+
+
+@dataclass
+class ProxyOpaResponseCheckFailedEvent(AuditEvent):
+    """Written when the OPA response-leg check on the catch-all proxy errors
+    or is unreachable.  Gateway returns HTTP 503 (fail-closed).
+
+    Alert on sustained rate — an OPA outage causes proxy response-delivery
+    failures.  Mirrors OPA_RESPONSE_CHECK_FAILED for the /v1/* path.
+
+    Security invariants:
+      - No response body or user content is stored.
+      - exc_str is truncated to 256 chars.
+      - masking_applied is always True.
+
+    ASVS V8.* + V14.5.* / Iris GAP-002 / YSG-RISK-067 / v2.24.1.
+    """
+
+    event_type: str = EventType.PROXY_OPA_RESPONSE_CHECK_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    reason: str = ""           # "opa_not_configured" | "opa_exception"
+    outcome: str = ""          # "not_configured" | "exception"
+    exc_class: str = ""
+    exc_str: str = ""          # str(exc)[:256]
+    action: str = "denied_fail_closed"
+
+
+# ---------------------------------------------------------------------------
+# v2.24.1 — Iris #96: Admin/User Separation-of-Duties events (SoD-001..005)
+# NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AdminCreateRejectedUserExistsEvent(AuditEvent):
+    """Emitted when admin creation is blocked because a user-tier identity
+    already exists with the same username or email (SoD-001).
+
+    Cross-store collision: the username/email maps to an existing user account
+    in admin_accounts (account_tier=user) or the identity_registry. Creating
+    an admin with the same identity would collapse the separation boundary.
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.ADMIN_CREATE_REJECTED_USER_EXISTS
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    acting_admin_account_id: str = ""   # admin performing the creation
+    rejected_username: str = ""         # the username that collided
+    collision_store: str = ""           # "user_accounts" | "identity_registry"
+
+
+@dataclass
+class UserCreateRejectedAdminExistsEvent(AuditEvent):
+    """Emitted when user creation is blocked because an admin account
+    already exists with the same username or email (SoD-002a/b/c).
+
+    Applies to: POST /admin/users (SoD-002a), SCIM /Users (SoD-002b),
+    SSO callback (SoD-002c / SoD-004 combined fix).
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.USER_CREATE_REJECTED_ADMIN_EXISTS
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    acting_admin_account_id: str = ""   # admin or system performing the creation
+    rejected_username_or_email: str = ""  # NEVER the real email — use hash or redacted
+    creation_path: str = ""             # "direct" | "scim" | "sso"
+
+
+@dataclass
+class ScimProvisionRejectedAdminExistsEvent(AuditEvent):
+    """Emitted when SCIM provisioning is blocked because an admin account
+    exists with the given email address (SoD-002b).
+
+    The email is hashed (HMAC-SHA256) before logging — same as SSO audit events.
+    The identity provider receives a SCIM error response.
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.SCIM_PROVISION_REJECTED_ADMIN_EXISTS
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    acting_admin_account_id: str = ""   # admin session that called SCIM
+    email_hash: str = ""                # HMAC-SHA256 of the email, never raw
+
+
+@dataclass
+class SsoProvisionRejectedAdminExistsEvent(AuditEvent):
+    """Emitted when SSO identity auto-provision is blocked because an admin
+    account exists with the given email (SoD-002c + SoD-004 combined fix).
+
+    The same admin email completing an SSO flow would otherwise silently create
+    a HUMAN identity and bridge the admin to the data plane via /auth/verify.
+    Both the identity creation AND the session are blocked at this point.
+
+    The email is hashed (HMAC-SHA256) before logging — same as all SSO events.
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.SSO_PROVISION_REJECTED_ADMIN_EXISTS
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    idp_id: str = ""
+    idp_name: str = ""
+    email_hash: str = ""                # HMAC-SHA256 of the email, never raw
+    client_ip_prefix: str = ""          # last-octet masked
+
+
+@dataclass
+class AuthVerifyRejectedAdminSessionEvent(AuditEvent):
+    """Emitted when /auth/verify (Caddy forward_auth) rejects an admin session.
+
+    Admins are permitted to authenticate to the backoffice (port 8443) but MUST
+    NOT traverse the data plane (/v1/*, /agents/*, etc.) via Caddy forward_auth.
+    An admin session presented to /auth/verify is always rejected with HTTP 403
+    and this event is written for forensic and alerting purposes.
+
+    Combined with SoD-002c, this closes the SoD-004 exploit chain:
+      admin SSO → HUMAN identity created → admin session → /auth/verify → data plane.
+    Layer 1 (SoD-002c): blocks identity creation.
+    Layer 2 (SoD-003 here): blocks the /auth/verify bridge even if identity existed.
+
+    NIST AC-5 / SOC 2 CC6.3 / OWASP ASVS V4.1.2 / v2.24.1.
+    """
+
+    event_type: str = EventType.AUTH_VERIFY_REJECTED_ADMIN_SESSION
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    account_id: str = ""                # the admin account_id from the session
+    client_ip_prefix: str = ""          # last-octet masked
+
+
+@dataclass
+class IdentityStoreConflictEvent(AuditEvent):
+    """Emitted by the daily SoD conflict audit cron (SoD-005) when the same
+    username or email is found in both admin_accounts and the identity_registry.
+
+    This indicates either:
+    - A race condition in creation (cross-store collision checks failed atomically)
+    - A pre-fix record that existed before SoD enforcement was added
+    - Manual DB modification bypassing the API layer
+
+    Operator must remediate: rename the user identity or delete the admin account.
+    Surfaced in /admin/dashboard/sod-conflicts.
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / v2.24.1.
+    """
+
+    event_type: str = EventType.IDENTITY_STORE_CONFLICT
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    admin_account_id: str = ""          # UUID from admin_accounts
+    admin_username: str = ""            # admin username (for operator display)
+    identity_id: str = ""               # identity_registry identity_id
+    conflict_field: str = ""            # "username" | "email"
+    conflict_value_hash: str = ""       # HMAC-SHA256 of the conflicting value
