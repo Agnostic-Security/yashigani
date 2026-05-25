@@ -84,15 +84,47 @@ sensitivity_rank(level) := 4 if {
 # Evaluates whether a response can be delivered to the caller.
 # Input schema (response path):
 #   input.identity              — caller's identity record
-#   input.response_sensitivity  — detected sensitivity of the response content
+#   input.prompt_sensitivity    — sensitivity of the REQUEST (prompt), from request-leg scan
+#   input.response_sensitivity  — sensitivity of the RESPONSE CONTENT (from ResponseInspectionPipeline)
+#                                  When pipeline is off, gateway sets this equal to prompt_sensitivity
+#                                  (backward-compatible: old callers that only send response_sensitivity
+#                                  still work because the MAX rule reads only response_sensitivity).
 #   input.response_verdict      — inspection verdict (clean/suspicious/blocked)
 #   input.pii_detected          — boolean, PII found in response
+#
+# v2.24.1 — GAP-3 / SEC-5:
+#   The ceiling check evaluates MAX(prompt_sensitivity, response_sensitivity).
+#   This means a CONFIDENTIAL response to a PUBLIC prompt is blocked for a
+#   INTERNAL-ceiling identity — the most restrictive signal wins.
+#   Backward compat: if prompt_sensitivity is absent (old callers), the rule
+#   falls back to response_sensitivity-only (pre-v2.24.1 behaviour).
+
+# effective_sensitivity — the stricter of prompt and response sensitivity ranks.
+# When prompt_sensitivity is absent (old caller), effective = response_sensitivity.
+# When response_sensitivity is absent, effective = prompt_sensitivity.
+# GAP-1 catch-all: unknown strings map to rank 4 (above RESTRICTED) via the
+# sensitivity_rank helper.
+_effective_sensitivity_rank := r if {
+    ps := sensitivity_rank(input.prompt_sensitivity)
+    rs := sensitivity_rank(input.response_sensitivity)
+    r := max([ps, rs])
+}
+
+_effective_sensitivity_rank := r if {
+    not input.prompt_sensitivity
+    r := sensitivity_rank(input.response_sensitivity)
+}
+
+_effective_sensitivity_rank := r if {
+    not input.response_sensitivity
+    r := sensitivity_rank(input.prompt_sensitivity)
+}
 
 default response_allowed := true
 
-# Block response if its sensitivity exceeds the caller's ceiling
+# Block response if effective sensitivity exceeds the caller's ceiling
 response_allowed := false if {
-    sensitivity_rank(input.response_sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
+    _effective_sensitivity_rank > sensitivity_rank(input.identity.sensitivity_ceiling)
 }
 
 # Block response if inspection verdict is BLOCKED and identity is not admin
@@ -110,7 +142,7 @@ response_reason := "ok" if response_allowed
 
 response_reason := "response_sensitivity_exceeds_ceiling" if {
     not response_allowed
-    sensitivity_rank(input.response_sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
+    _effective_sensitivity_rank > sensitivity_rank(input.identity.sensitivity_ceiling)
 }
 
 response_reason := "response_blocked_by_inspection" if {

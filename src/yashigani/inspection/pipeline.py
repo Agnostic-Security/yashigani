@@ -386,6 +386,11 @@ class ResponseInspectionResult:
     skipped: bool                   # True when inspection was bypassed (disabled/exempt)
     skip_reason: Optional[str]      # "disabled" | "exempt_content_type" | None
     audit_fields: dict
+    # v2.24.1 — GAP-3 / SEC-5: response-content sensitivity classification.
+    # When pipeline is enabled and runs, this is the SensitivityLevel of the
+    # response body (not the prompt).  Defaults to PUBLIC (most permissive)
+    # so callers that do not inspect responses see conservative-safe behaviour.
+    response_sensitivity: str = "PUBLIC"  # PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
 
 
 class ResponseInspectionPipeline:
@@ -409,6 +414,15 @@ class ResponseInspectionPipeline:
 
     The raw response body is never stored in the audit log. A SHA-256 hash
     is recorded instead (ASVS V7.1 — audit log integrity).
+
+    v2.24.1 — GAP-3 / SEC-5:
+        Pass a `sensitivity_classifier` (SensitivityClassifier instance) to
+        have the pipeline classify response-*content* sensitivity in addition to
+        the injection-verdict check.  When provided, `ResponseInspectionResult`
+        carries a `response_sensitivity` field (PUBLIC…RESTRICTED) derived from
+        the response body, independent of the prompt's sensitivity level.
+        When absent the field defaults to "PUBLIC" (safe fallback — OPA will
+        fall back to prompt sensitivity per the updated v1_routing.rego rule).
     """
 
     def __init__(
@@ -417,11 +431,14 @@ class ResponseInspectionPipeline:
         config: Optional[ResponseInspectionConfig] = None,
         on_audit: Optional[Callable[[str, dict], None]] = None,
         backend_registry=None,  # Optional[BackendRegistry]
+        sensitivity_classifier=None,  # Optional[SensitivityClassifier]
     ) -> None:
         self._classifier = classifier
         self._backend_registry = backend_registry
         self._config = config or ResponseInspectionConfig()
         self._on_audit = on_audit or (lambda name, data: None)
+        # v2.24.1 — GAP-3: optional second classifier for response-content sensitivity
+        self._sensitivity_classifier = sensitivity_classifier
 
     def inspect(
         self,
@@ -455,6 +472,7 @@ class ResponseInspectionPipeline:
                 skipped=True,
                 skip_reason="disabled",
                 audit_fields={},
+                response_sensitivity="PUBLIC",
             )
 
         # Fast path — exempt content type
@@ -468,6 +486,24 @@ class ResponseInspectionPipeline:
                     skipped=True,
                     skip_reason="exempt_content_type",
                     audit_fields={},
+                    response_sensitivity="PUBLIC",
+                )
+
+        # v2.24.1 — GAP-3 / SEC-5: classify response-content sensitivity.
+        # Runs here (before injection check) so sensitivity is always populated
+        # even when the verdict is CLEAN.  Fail-safe: any exception defaults to
+        # PUBLIC so callers still get a usable result; OPA falls back to prompt
+        # sensitivity via the MAX() rule in v1_routing.rego.
+        response_sensitivity_value = "PUBLIC"
+        if self._sensitivity_classifier is not None:
+            try:
+                sens_result = self._sensitivity_classifier.classify(response_body)
+                response_sensitivity_value = sens_result.level.value
+            except Exception as exc:
+                logger.warning(
+                    "ResponseInspectionPipeline: sensitivity_classifier failed "
+                    "(request_id=%s): %s — defaulting to PUBLIC",
+                    request_id, exc,
                 )
 
         # Classify — backend_registry takes precedence over legacy classifier
@@ -492,6 +528,7 @@ class ResponseInspectionPipeline:
                 skipped=False,
                 skip_reason=None,
                 audit_fields={},
+                response_sensitivity=response_sensitivity_value,
             )
 
         # Any non-CLEAN label is a potential injection attempt
@@ -516,6 +553,7 @@ class ResponseInspectionPipeline:
             "content_type": content_type,
             "response_content_hash": content_hash,
             "fasttext_only_mode": cfg.fasttext_only,
+            "response_sensitivity": response_sensitivity_value,
         }
         self._on_audit("RESPONSE_INJECTION_DETECTED", audit)
 
@@ -526,6 +564,7 @@ class ResponseInspectionPipeline:
             skipped=False,
             skip_reason=None,
             audit_fields=audit,
+            response_sensitivity=response_sensitivity_value,
         )
 
     def update_config(self, config: ResponseInspectionConfig) -> None:

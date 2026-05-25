@@ -7,14 +7,18 @@ to its configured upstream_url.
 
 Path format: /agents/{target_agent_id}/{remainder_path}
 
-Writes AGENT_CALL_ALLOWED, AGENT_CALL_DENIED_RBAC, or AGENT_NOT_FOUND
-audit events. Updates Prometheus agent metrics.
+Writes AGENT_CALL_ALLOWED, AGENT_CALL_DENIED_RBAC, AGENT_NOT_FOUND, or
+AGENT_RESPONSE_BLOCKED_BY_OPA audit events. Updates Prometheus agent metrics.
 
 OPA enforcement (ASVS V4.2 — local policy only, fail-closed):
-  - Builds an agent-to-agent input document.
-  - Queries OPA at /v1/data/yashigani/agent_call_allowed.
-  - On deny or OPA unreachable: returns HTTP 403 and writes
-    AgentCallDeniedRBACEvent.
+  - Request leg: queries OPA at /v1/data/yashigani/agent_call_allowed.
+    On deny or OPA unreachable: returns HTTP 403 + AgentCallDeniedRBACEvent.
+  - Response leg (v2.24.1 — GAP-3 / SEC-5): after receiving the upstream
+    response, classifies response-content sensitivity and queries OPA at
+    /v1/data/yashigani/agent_response_decision.
+    On deny: returns HTTP 403 + AgentResponseBlockedByOpaEvent (fail-closed).
+    Closes the asymmetry between /v1/* (had response-OPA-check) and /agents/*
+    (did not).  Symmetric to openai_router._opa_response_check.
 """
 from __future__ import annotations
 
@@ -35,6 +39,8 @@ _HOP_BY_HOP = frozenset({
 })
 
 _OPA_AGENT_ALLOWED_PATH = "/v1/data/yashigani/agent_call_allowed"
+# v2.24.1 — GAP-3 / SEC-5: response-leg OPA check
+_OPA_AGENT_RESPONSE_PATH = "/v1/data/yashigani/agent_response_decision"
 
 
 async def route_agent_call(request: Request, path: str, state: dict) -> Response:
@@ -203,6 +209,89 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
     except Exception:
         logger.debug("agent_router: metric increment failed for agent_calls_total/agent_call_duration_seconds (allowed)", exc_info=True)
 
+    # ── Response-leg OPA check (v2.24.1 — GAP-3 / SEC-5) ─────────────────────
+    # Classify response-content sensitivity and query OPA.  Fail-closed on
+    # any OPA error.  Symmetric to openai_router._opa_response_check.
+    # Only runs when OPA URL is configured (same guard as /v1/* path).
+    opa_url = config.opa_url if config is not None else "https://policy:8181"
+    response_sensitivity_value = "PUBLIC"
+    response_pii_detected = False
+
+    # Attempt sensitivity classification of the response body
+    response_inspection_pipeline = state.get("response_inspection_pipeline")
+    if response_inspection_pipeline is not None and upstream_resp.content:
+        try:
+            resp_ct = upstream_resp.headers.get("content-type", "application/octet-stream")
+            resp_body_text = upstream_resp.text
+            resp_insp = response_inspection_pipeline.inspect(
+                response_body=resp_body_text,
+                content_type=resp_ct,
+                request_id=getattr(request.state, "request_id", caller_agent_id),
+                session_id=caller_agent_id,
+                agent_id=caller_agent_id,
+            )
+            if not resp_insp.skipped:
+                response_sensitivity_value = resp_insp.response_sensitivity
+        except Exception as exc:
+            logger.warning(
+                "route_agent_call: response inspection failed "
+                "(caller=%s → target=%s): %s",
+                caller_agent_id, target_agent_id, exc,
+            )
+
+    # OPA response-leg check — fail-closed
+    if opa_url:
+        caller_sensitivity_ceiling = caller_agent.get("sensitivity_ceiling", "RESTRICTED")
+        resp_opa_input = {
+            "caller": {
+                "agent_id": caller_agent_id,
+                "groups": caller_groups,
+                "sensitivity_ceiling": caller_sensitivity_ceiling,
+            },
+            "target_agent": {
+                "agent_id": target_agent_id,
+            },
+            "response_sensitivity": response_sensitivity_value,
+            "response_pii_detected": response_pii_detected,
+        }
+        resp_opa_allowed, resp_opa_reason = await _opa_agent_response_check(
+            opa_url, resp_opa_input
+        )
+        if not resp_opa_allowed:
+            logger.warning(
+                "route_agent_call: OPA BLOCKED response delivery "
+                "(caller=%s → target=%s) response_sensitivity=%s reason=%s",
+                caller_agent_id, target_agent_id,
+                response_sensitivity_value, resp_opa_reason,
+            )
+            if audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import AgentResponseBlockedByOpaEvent
+                    audit_writer.write(AgentResponseBlockedByOpaEvent(
+                        caller_agent_id=caller_agent_id,
+                        target_agent_id=target_agent_id,
+                        response_sensitivity=response_sensitivity_value,
+                        deny_reason=resp_opa_reason,
+                        request_id=getattr(request.state, "request_id", ""),
+                        pii_detected=response_pii_detected,
+                    ))
+                except Exception as exc:
+                    logger.error(
+                        "route_agent_call: failed to write AgentResponseBlockedByOpaEvent: %s",
+                        exc,
+                    )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "AGENT_RESPONSE_BLOCKED",
+                    "reason": resp_opa_reason,
+                    "target_agent_id": target_agent_id,
+                },
+                headers={
+                    "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
+                },
+            )
+
     # Audit event
     if audit_writer is not None:
         try:
@@ -230,6 +319,43 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
         headers=resp_headers,
         media_type=upstream_resp.headers.get("content-type"),
     )
+
+
+# ---------------------------------------------------------------------------
+# OPA agent response-leg check (v2.24.1 — GAP-3 / SEC-5)
+# ---------------------------------------------------------------------------
+
+async def _opa_agent_response_check(opa_url: str, opa_input: dict) -> tuple[bool, str]:
+    """
+    Query OPA agent_response_decision for allow/deny on response delivery.
+
+    Fail-closed: any OPA error → (False, "opa_unreachable").
+    Mirrors openai_router._opa_response_check for /v1/*.
+
+    Returns (allowed: bool, reason: str).
+    """
+    try:
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                opa_url.rstrip("/") + _OPA_AGENT_RESPONSE_PATH,
+                json={"input": opa_input},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("result", {})
+            allowed = bool(result.get("allow", False))
+            reason = result.get("reason", "opa_denied")
+            return allowed, reason
+    except Exception as exc:
+        logger.error(
+            "route_agent_call: OPA response check FAILED — denying (fail-closed). "
+            "caller=%s → target=%s exc=%s",
+            opa_input.get("caller", {}).get("agent_id", "unknown"),
+            opa_input.get("target_agent", {}).get("agent_id", "unknown"),
+            exc,
+        )
+        return False, "opa_unreachable"
 
 
 # ---------------------------------------------------------------------------

@@ -1322,3 +1322,56 @@ risks:
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (SEC-4 / Iris architectural audit)
+
+
+- id: YSG-RISK-065
+  description: >-
+    Response-content sensitivity asymmetry between /v1/* and /agents/* paths.
+    Two related gaps: (1) Ava GAP-3 — the OPA response ceiling check for
+    /v1/* received the prompt's sensitivity label (from the request-leg scan),
+    not the response body's sensitivity. A model could return CONFIDENTIAL
+    content in response to a PUBLIC prompt and OPA would allow delivery because
+    response_sensitivity=PUBLIC. (2) Iris SEC-5 — the /agents/* path had NO
+    response-leg OPA check at all; agent-to-agent calls were evaluated for the
+    request leg only, leaving the response body un-gated. Both gaps share the
+    same root fix: extend ResponseInspectionPipeline to classify response-content
+    sensitivity, wire it into both /v1/* and /agents/* OPA response checks.
+  severity: medium
+  controls_impacted:
+    - ASVS V4.1.3
+    - ASVS V14.7.2
+    - CMMC SC.L2-3.13.10
+    - ISO 27001 A.8.3
+  compensating_controls:
+    - Request-leg sensitivity ceiling check still fires on prompt sensitivity
+    - ResponseInspectionPipeline injection/credential-exfil check still active
+    - PII detector on response path (when configured)
+  status: mitigated
+  closure_evidence:
+    - commit: TBD-this-commit
+      rationale: >-
+        1. ResponseInspectionPipeline.inspect() now produces response_sensitivity
+           (SensitivityLevel string) by running the SensitivityClassifier on the
+           response body. Field added to ResponseInspectionResult dataclass.
+        2. openai_router._opa_response_check updated: accepts both
+           response_sensitivity (content) and prompt_sensitivity; passes both
+           to OPA. Pipeline off → response_sensitivity falls back to
+           prompt_sensitivity (backward-compatible).
+        3. policy/v1_routing.rego updated: response_decision evaluates
+           MAX(prompt_sensitivity, response_sensitivity) via
+           _effective_sensitivity_rank helper. Backward compat: missing
+           prompt_sensitivity field → falls back to response_sensitivity only.
+        4. agent_router.route_agent_call() gains response-leg OPA check:
+           classifies response-content sensitivity, queries OPA at
+           /v1/data/yashigani/agent_response_decision. Fail-closed on OPA error.
+           Returns HTTP 403 + AGENT_RESPONSE_BLOCKED_BY_OPA audit event on deny.
+        5. policy/agents.rego gains agent_response_allowed rule with
+           sensitivity_rank helper (duplicated from v1_routing.rego — packages
+           are scoped in OPA). Default deny. Compound agent_response_decision
+           object mirrors v1_routing.rego response_decision shape.
+        6. audit/schema.py: AGENT_RESPONSE_BLOCKED_BY_OPA EventType +
+           AgentResponseBlockedByOpaEvent dataclass added.
+        Tests: 20 unit + 4 integration. All PASS verified locally.
+  fix_in_version: v2.24.1
+  closed_at: 2026-05-25
+  closed_by: Tom (Ava GAP-3 / Iris SEC-5 / Tiago 2026-05-25 directive)

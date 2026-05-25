@@ -200,6 +200,14 @@ class EventType(str, Enum):
     # RUNTIME_SETTING_CHANGED: emitted on every PUT /admin/runtime-settings/{key}.
     # CMMC AU.L2-3.3.1 / SOC 2 CC6.2 / ISO 27001 A.5.15.
     RUNTIME_SETTING_CHANGED = "RUNTIME_SETTING_CHANGED"
+    # v2.24.1 — GAP-3 / SEC-5: agent response blocked by OPA.
+    # AGENT_RESPONSE_BLOCKED_BY_OPA: emitted when the response-leg OPA check on
+    # /agents/* denies delivery of the upstream agent's response to the caller.
+    # Mirrors OPA_RESPONSE_CHECK_FAILED for /v1/* (which covers OPA errors);
+    # this event covers a deliberate OPA policy deny (response sensitivity
+    # exceeds caller ceiling, or PII detected).
+    # ASVS V4.1.3 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3 / Iris SEC-5 / Ava GAP-3.
+    AGENT_RESPONSE_BLOCKED_BY_OPA = "AGENT_RESPONSE_BLOCKED_BY_OPA"
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +803,34 @@ class AgentNotFoundEvent(AuditEvent):
     caller_agent_id: str = ""
     target_agent_id_requested: str = ""
     path: str = ""
+
+
+@dataclass
+class AgentResponseBlockedByOpaEvent(AuditEvent):
+    """
+    Emitted when the response-leg OPA check for /agents/* denies delivery
+    of the upstream agent's response to the calling agent.
+
+    v2.24.1 — GAP-3 / SEC-5: closes asymmetry between /v1/* (which had a
+    response-OPA check) and /agents/* (which did not).
+
+    Security invariants:
+    - response body is never stored; response_sensitivity is the label only.
+    - masking_applied is always True.
+    - deny_reason identifies which guard fired (ceiling / pii / identity).
+
+    ASVS V4.1.3 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3.
+    """
+
+    event_type: str = EventType.AGENT_RESPONSE_BLOCKED_BY_OPA
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_agent_id: str = ""
+    target_agent_id: str = ""
+    response_sensitivity: str = ""        # PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
+    deny_reason: str = ""                 # response_sensitivity_exceeds_caller_ceiling | pii_detected_in_response | missing_agent_identity | opa_unreachable
+    request_id: str = ""
+    pii_detected: bool = False
 
 
 # ---------------------------------------------------------------------------

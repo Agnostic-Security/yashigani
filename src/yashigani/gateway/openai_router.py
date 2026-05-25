@@ -1118,6 +1118,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # F-T10-001: default to 1.0 (no inspection = clean pass, full confidence).
     # When inspection runs this is overwritten with the actual pipeline score.
     response_inspection_confidence: float = 1.0
+    # v2.24.1 — GAP-3 / SEC-5: response-CONTENT sensitivity.
+    # When pipeline is enabled and not skipped, this is set from the pipeline's
+    # sensitivity classification of the response body.  When pipeline is off
+    # (default, YSG-RISK-057) it stays None so _opa_response_check falls back
+    # to prompt sensitivity (explicitly documented fallback per the updated
+    # v1_routing.rego MAX(prompt_sensitivity, response_sensitivity) rule).
+    response_content_sensitivity: Optional[str] = None
     if _state.response_inspection_pipeline is not None and assistant_content:
         try:
             # session_id and agent_id are best-effort from identity; fall back
@@ -1134,6 +1141,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             )
             if not resp_result.skipped:
                 response_verdict = resp_result.verdict.lower()
+                # v2.24.1 — GAP-3: capture response-content sensitivity from pipeline
+                response_content_sensitivity = resp_result.response_sensitivity
                 # F-T10-001: capture inspection confidence for operator UI badge.
                 # Clamp to [0.0, 1.0] with explicit isfinite guard.  Python's
                 # min/max do not propagate NaN reliably (max(0.0, min(1.0, NaN))
@@ -1251,9 +1260,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # this point.  The `and identity` guard is removed; `_opa_response_check`
     # handles None identity defensively regardless.
     if _state.opa_url:
+        # v2.24.1 — GAP-3 / SEC-5: when response inspection pipeline ran and
+        # classified response content, use that as response_sensitivity.
+        # When pipeline is off (default), pass None so OPA falls back to
+        # prompt sensitivity via the MAX() rule in v1_routing.rego.
         resp_opa = await _opa_response_check(
             identity=identity,
-            response_sensitivity=sensitivity_level,
+            response_sensitivity=response_content_sensitivity,
+            prompt_sensitivity=sensitivity_level,
             response_verdict=response_verdict,
             pii_detected=pii_detected_on_response,
         )
@@ -1601,15 +1615,27 @@ async def _opa_v1_check(
 
 async def _opa_response_check(
     identity: dict | None,
-    response_sensitivity: str,
+    response_sensitivity: Optional[str],
     response_verdict: str,
     pii_detected: bool,
+    prompt_sensitivity: Optional[str] = None,
 ) -> dict:
     """
     Query OPA v1_routing response_decision for allow/deny on response delivery.
 
     Checks whether the caller's sensitivity ceiling permits receiving
     content at the detected sensitivity level.
+
+    v2.24.1 — GAP-3 / SEC-5:
+        `response_sensitivity` is the response-CONTENT sensitivity (from the
+        ResponseInspectionPipeline).  It may be None when the pipeline is
+        disabled (default per YSG-RISK-057).
+        `prompt_sensitivity` is the REQUEST (prompt) sensitivity from step 3.
+        OPA receives both; v1_routing.rego evaluates MAX(prompt, response)
+        — the stricter of the two.
+        When response_sensitivity is None (pipeline off), it is omitted from
+        the OPA input document, and the Rego rule falls back to prompt-only
+        check (backward-compatible with pre-v2.24.1 callers).
 
     Zero-trust fail-closed behaviour (ASVS V8.* + V14.5.*):
 
@@ -1670,12 +1696,21 @@ async def _opa_response_check(
         "sensitivity_ceiling": identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC",
     }
 
-    opa_input = {
+    # v2.24.1 — GAP-3 / SEC-5: include both prompt and response sensitivity.
+    # When response_sensitivity is None (pipeline off), OPA receives
+    # prompt_sensitivity as the effective value — explicitly set for clarity.
+    # When prompt_sensitivity is None (legacy callers), it is omitted from
+    # the OPA input doc; v1_routing.rego falls back to response_sensitivity only
+    # (backward-compatible with pre-v2.24.1 callers).
+    _effective_response_sensitivity = response_sensitivity if response_sensitivity is not None else prompt_sensitivity
+    opa_input: dict = {
         "identity": identity_doc,
-        "response_sensitivity": response_sensitivity,
+        "response_sensitivity": _effective_response_sensitivity,
         "response_verdict": response_verdict,
         "pii_detected": pii_detected,
     }
+    if prompt_sensitivity is not None:
+        opa_input["prompt_sensitivity"] = prompt_sensitivity
 
     try:
         async with internal_httpx_client(timeout=5.0) as client:

@@ -1,6 +1,7 @@
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
 <!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(audit): LU-AMEND-01 wave-3 — bigserial seq column on audit_events closes cross-batch ordering stability under timestamp collision; YSG-RISK-064) -->
+<!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(opa): response-content sensitivity classification — GAP-3 + SEC-5 close) -->
 <!-- last-updated: 2026-05-25T12:00:00+00:00 (v2.24.1: fix(pgbouncer): restore compose-Helm admin_users + stats_users parity — drift #8 secondary, 859294a follow-up) -->
 <!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.1: YSG-RISK-061 — Caddy egress restrictions via iptables + K8s NetworkPolicy; NET_ADMIN cap added) -->
 <!-- last-updated: 2026-05-24T12:00:00+00:00 (v2.24.1: PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets removed; closes NICO-V241-001 + YSG-RISK-060) -->
@@ -25,6 +26,28 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ## [Unreleased] — v2.24.1
 
 ### Security
+- **security(opa): response-content sensitivity classification — closes Ava GAP-3 + Iris SEC-5 asymmetry between /v1/* and /agents/* response checks** (YSG-RISK-065, Tiago directive 2026-05-25):
+
+  **Problem closed:**
+  - Ava GAP-3: `response_sensitivity` passed to the OPA response ceiling check for `/v1/*` was the prompt's sensitivity (request-leg scan), not the response body's. A model returning CONFIDENTIAL content to a PUBLIC prompt would not be blocked for a INTERNAL-ceiling identity.
+  - Iris SEC-5: `/agents/*` had no response-leg OPA check at all — agent-to-agent calls were evaluated for the request leg only; the response body was never gated.
+
+  **Fix — four coordinated changes:**
+  1. `src/yashigani/inspection/pipeline.py` — `ResponseInspectionPipeline` now accepts a `sensitivity_classifier` kwarg. When provided, `inspect()` classifies the response body and populates `ResponseInspectionResult.response_sensitivity` (PUBLIC|INTERNAL|CONFIDENTIAL|RESTRICTED). Existing verdict behaviour (CLEAN/FLAGGED/BLOCKED) is unchanged — additive only.
+  2. `src/yashigani/gateway/openai_router.py` — `_opa_response_check` accepts both `response_sensitivity` (content) and `prompt_sensitivity` (prompt). Passes both to OPA. Pipeline off (default, per YSG-RISK-057) → `response_sensitivity` falls back to `prompt_sensitivity` (backward-compatible explicit fallback, not silent).
+  3. `policy/v1_routing.rego` — `response_decision` evaluates `MAX(prompt_sensitivity, response_sensitivity)` via new `_effective_sensitivity_rank` helper. GAP-1 unknown-level catch-all (rank 4) applies to both inputs. Backward compat: old callers that only send `response_sensitivity` still work (prompt absent → effective = response only).
+  4. `src/yashigani/gateway/agent_router.py` — `route_agent_call()` gains a response-leg OPA check: classifies response sensitivity via pipeline (when configured), queries OPA at `/v1/data/yashigani/agent_response_decision`. Fail-closed on OPA error. Returns HTTP 403 + `AGENT_RESPONSE_BLOCKED_BY_OPA` audit event on deny.
+  5. `policy/agents.rego` — new `agent_response_allowed` + `agent_response_decision` rules with `sensitivity_rank` helper (duplicated from v1_routing.rego — OPA packages are scoped). Default deny. Symmetric to `/v1/*` response_decision shape.
+  6. `src/yashigani/audit/schema.py` — `AGENT_RESPONSE_BLOCKED_BY_OPA` EventType + `AgentResponseBlockedByOpaEvent` dataclass added (captures caller/target agent IDs, response_sensitivity, deny_reason, pii_detected).
+
+  **Default unchanged:** `YASHIGANI_INSPECT_RESPONSES=false` (per YSG-RISK-057 UX rationale). Sensitivity classification is part of the opt-in pipeline. `/agents/*` response OPA check runs regardless, defaulting to PUBLIC sensitivity when pipeline is off.
+
+  **Tests:** 20 unit tests (`test_v241_gap3_sec5_response_sensitivity.py`) + 4 integration tests (`test_v241_gap3_sec5_agent_response_opa.py`). All PASS.
+
+  **Pending:** Ava E2E + Laura adversarial gate required before release (per `feedback_ava_laura_both_on_final_test`).
+
+  ASVS V4.1.3 / ASVS V14.7.2 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3 / YSG-RISK-065.
+
 - **security(audit): LU-AMEND-01 wave-3 — bigserial sequence column on `audit_events` closes cross-batch ordering stability under timestamp collision** (YSG-RISK-064, Tom standing order 2026-05-25):
 
   **Problem closed:** Wave-2 (migration 0011) established the hash chain but used `ORDER BY (created_at, id)` for chain-row ordering. Under timestamp collision (two events at the same microsecond), UUID v4 sort is non-deterministic — ordering could differ between replicas, silently weakening the tamper-evidence guarantee (ASVS V7.3.3, NIST AU-10).

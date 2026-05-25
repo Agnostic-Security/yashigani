@@ -20,6 +20,8 @@ from yashigani.audit.chain import (
     compute_prev_hash,
     day_anchor,
 )
+# v2.24.1 LU-AMEND-01 wave 2 — daily checkpoint scheduler
+from yashigani.audit.checkpoint_job import AuditCheckpointScheduler
 
 __all__ = [
     "AuditEvent",
@@ -44,4 +46,6 @@ __all__ = [
     "compute_event_hash",
     "compute_prev_hash",
     "day_anchor",
+    # v2.24.1 LU-AMEND-01 wave 2
+    "AuditCheckpointScheduler",
 ]
