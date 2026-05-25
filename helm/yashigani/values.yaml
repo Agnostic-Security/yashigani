@@ -1389,3 +1389,31 @@ modelAliases:
   #     provider: "local"
   #     modelName: "qwen2.5:3b"
   #     forceLocal: true
+
+# ---------------------------------------------------------------------------
+# PoolManager — per-identity container spawning (YSG-RISK-070)
+# ---------------------------------------------------------------------------
+# The PoolManager provides container-per-identity isolation for agents registered
+# with upstream_url="pool://<image>". In K8s deployments, the KubernetesBackend
+# spawns pods via the API server instead of requiring a Docker/Podman socket.
+#
+# k8sBackend.enabled: set to true in Kubernetes deployments only.
+#   - Creates rbac-pool-manager.yaml Role + RoleBinding granting the gateway
+#     ServiceAccount pods CRUD in this namespace.
+#   - Creates NetworkPolicy rules allowing gateway → pool-pod dispatch and
+#     enforcing inter-pod isolation (UA-10, YSG-RISK-055).
+#   - Does NOT apply in Docker/Podman deployments (auto-detected in pool/backend.py).
+#
+# agentPort: the port pool-managed pods listen on. Must match the port declared
+#   in the agent image (e.g. 8080 for most Python-based agents). Used in the
+#   NetworkPolicy ingress/egress rules.
+#
+# podReadyTimeoutSeconds: how long the gateway waits for a pool-managed pod to
+#   reach Running phase before returning 503 Retry-After. K8s pod startup
+#   (image pull + scheduler) can take 10-60s for cached images, longer for cold
+#   pulls. Increase if operators see spurious 503s on first dispatch.
+poolManager:
+  k8sBackend:
+    enabled: false
+    agentPort: 8080
+    podReadyTimeoutSeconds: 120

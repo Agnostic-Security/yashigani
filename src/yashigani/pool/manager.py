@@ -288,17 +288,31 @@ class PoolManager:
 
         if self._backend:
             try:
-                handle = self._backend.run(
-                    image=image,
-                    name=container_name,
-                    environment=env,
-                    network=self._network,
-                    labels={
-                        "yashigani.managed": "true",
-                        "yashigani.identity": identity_id,
-                        "yashigani.service": service_slug,
-                    },
-                )
+                _labels = {
+                    "yashigani.managed": "true",
+                    "yashigani.identity": identity_id,
+                    "yashigani.service": service_slug,
+                }
+                if self._backend.name == "kubernetes":
+                    # KubernetesBackend.run() has no `network` param — pods use
+                    # K8s in-namespace networking. The `port` param sets the
+                    # container port declaration and the wait-for-Running path
+                    # resolves the pod IP directly.
+                    handle = self._backend.run(
+                        image=image,
+                        name=container_name,
+                        environment=env,
+                        labels=_labels,
+                        port=port,
+                    )
+                else:
+                    handle = self._backend.run(
+                        image=image,
+                        name=container_name,
+                        environment=env,
+                        network=self._network,
+                        labels=_labels,
+                    )
                 container_id = handle.id
                 ip = handle.get_network_ip(self._network)
                 endpoint = f"{ip}:{port}"

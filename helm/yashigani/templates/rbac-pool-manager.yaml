@@ -1,0 +1,70 @@
+{{- if .Values.poolManager.k8sBackend.enabled }}
+{{- /*
+  PoolManager K8s backend RBAC — YSG-RISK-070 (2026-05-25)
+
+  The gateway pod spawns per-identity pods via the Kubernetes API when
+  running in-cluster (KubernetesBackend in pool/backend.py). This requires
+  the gateway ServiceAccount to have CRUD on the `pods` resource in its
+  own namespace ONLY.
+
+  LEAST PRIVILEGE design:
+    - Resource: pods ONLY (no services, no secrets, no deployments)
+    - Namespace-scoped Role (NOT ClusterRole) — cannot touch other namespaces
+    - Verbs: create, get, list, delete (no update/patch — pods are immutable
+      once created; we kill-and-replace rather than mutate)
+    - Subject: the existing `yashigani` ServiceAccount (gateway pod)
+
+  Trade-off documented in YSG-RISK-070:
+    - Gateway SA gains pods CRUD → compromise of the gateway pod allows
+      arbitrary pod creation in the namespace.
+    - Mitigation: Kyverno admission policies (admission-policies.yaml) enforce
+      non-root + no-new-privileges + seccomp/apparmor on ALL pods in the
+      namespace, including pool-managed pods. A compromised gateway cannot
+      spawn privileged pods.
+
+  This template is guarded by poolManager.k8sBackend.enabled (default false).
+  It should be enabled ONLY in Kubernetes deployments, not Docker/Podman.
+*/ -}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "yashigani.fullname" . }}-pool-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pool-manager
+  annotations:
+    # YSG-RISK-070: gateway SA gains pods CRUD in namespace for per-identity pod spawning.
+    # Kyverno admission policies enforce security context on all spawned pods.
+    yashigani.io/risk-id: "YSG-RISK-070"
+rules:
+  # ONLY pods. No services, secrets, configmaps, or other resources.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["create", "get", "list", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "yashigani.fullname" . }}-pool-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pool-manager
+  annotations:
+    yashigani.io/risk-id: "YSG-RISK-070"
+subjects:
+  - kind: ServiceAccount
+    # Reuse the existing `yashigani` ServiceAccount (serviceaccount.yaml).
+    # The gateway Deployment references this SA; adding a Role to it grants
+    # the gateway pod the pod-spawn permission without a separate SA.
+    name: yashigani
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "yashigani.fullname" . }}-pool-manager
+  apiGroup: rbac.authorization.k8s.io
+
+{{- end }}{{- /* poolManager.k8sBackend.enabled */ -}}

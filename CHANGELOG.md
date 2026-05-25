@@ -1,3 +1,4 @@
+<!-- last-updated: 2026-05-25T20:00:00+00:00 (v2.24.1: feat(pool): Kubernetes API backend for PoolManager — KubernetesBackend + RBAC Role + NetworkPolicy; YSG-RISK-070; closes Tom 7e653b1 option b) -->
 <!-- last-updated: 2026-05-25T19:00:00+00:00 (v2.24.1: fix(openwebui): remove @Help CHAINING_GUIDE half-implementation seed — drift #10; init-openwebui-agents.py) -->
 <!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
 <!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
@@ -234,6 +235,29 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
   added + closed (`mitigated`) in same commit.
 
 ### Added
+- **feat(pool): Kubernetes API backend — PoolManager now supports in-cluster per-identity pod spawning via the K8s API** (YSG-RISK-070, Tiago directive 2026-05-25, Tom #56 option b from `7e653b1`).
+  Previously, `create_backend()` returned `None` in K8s deployments without a Docker/Podman socket projection, causing pool-managed agent dispatch to return 502. The new `KubernetesBackend` closes this gap.
+
+  **What changed:**
+  - `KubernetesBackend` class added to `src/yashigani/pool/backend.py`: uses `kubernetes.client.CoreV1Api.create_namespaced_pod()` with labels `yashigani.managed=true`, `yashigani.identity=<id>`, `yashigani.service=<slug>`. Pod naming follows the Docker/Podman pattern (`ysg-<service>-<short_id>-<random>`).
+  - Detection: `create_backend()` checks for `KUBERNETES_SERVICE_HOST` env + `/var/run/secrets/kubernetes.io/serviceaccount/token` file before trying Docker/Podman. In-cluster config loaded via `kubernetes.config.load_incluster_config()`.
+  - Pod startup grace: K8s pods take seconds to start. Backend polls up to `YASHIGANI_POOL_K8S_POD_READY_TIMEOUT` (default 120s) at 2s intervals. Pods stuck in Pending raise `PodStartupTimeout` — callers should emit 503 Retry-After rather than 502.
+  - `PoolManager._create_container()` detects `backend.name == "kubernetes"` and omits the `network` parameter (irrelevant in K8s — pod IP is resolved directly from pod status).
+  - `kubernetes>=30.1` added to core dependencies in `pyproject.toml`.
+  - `YASHIGANI_POOL_K8S_POD_READY_TIMEOUT` env var controls the pod startup grace period.
+
+  **Helm:**
+  - `helm/yashigani/templates/rbac-pool-manager.yaml` (NEW): namespace-scoped `Role` granting `pods` + `pods/log` create/get/list/delete to the `yashigani` ServiceAccount. Bound via `RoleBinding`. Guarded by `poolManager.k8sBackend.enabled` (default `false`).
+  - `helm/yashigani/templates/networkpolicy.yaml`: three new policies (within `poolManager.k8sBackend.enabled` guard):
+    - `allow-pool-managed-pod-ingress`: gateway ONLY may reach pool pods on `poolManager.k8sBackend.agentPort`.
+    - `allow-pool-managed-pod-egress`: pool pods may only reach gateway:8080 (all LLM calls through gateway — OPA inspects both legs, UA-10 isolation preserved).
+    - `allow-gateway-to-pool-pods-egress`: gateway egress to pool pods on `agentPort`.
+  - `helm/yashigani/values.yaml`: `poolManager.k8sBackend.{enabled, agentPort, podReadyTimeoutSeconds}` values added with defaults (`false`, `8080`, `120`).
+
+  **Tests:** 20 unit tests in `src/tests/unit/test_pool_k8s_backend.py` (all PASS). Existing 29 pool tests unaffected.
+
+  **Risk:** YSG-RISK-070 accepted — gateway SA gains `pods` CRUD in namespace. Mitigated by Kyverno admission policies (non-root + no-new-privileges + seccomp enforced on all spawned pods).
+
 - **Per-user rate limit — 100 RPS / 200 burst** (YSG-RISK-058, Tiago 2026-05-24):
   new `user` dimension added to `RateLimiter.check()`. When an authenticated user
   (identified via `x-yashigani-user-id` header set by Caddy `forward_auth`) exceeds

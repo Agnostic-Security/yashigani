@@ -1558,3 +1558,58 @@ risks:
         git tag -v v2.24.2 emits Good "git" signature for maxine@agnosticsec.com
         with ED25519 key SHA256:y5RP8TQfAFKBECUDgqP300d8CrdY4njSRS8HzxIQdJE.
         Closes drift audit entry #3 (changelog-vs-reality-drift-audit-20260524.md).
+
+- id: YSG-RISK-070
+  description: >-
+    PoolManager K8s backend: gateway ServiceAccount gains namespace-scoped
+    pods CRUD permission to enable per-identity pod spawning via the
+    Kubernetes API (KubernetesBackend in pool/backend.py). This closes the
+    in-cluster gap identified in Tom #56 commit 7e653b1 (option b deferred).
+    Trade-off: a compromised gateway pod could create arbitrary pods in its
+    namespace. Mitigated by Kyverno admission policies (admission-policies.yaml)
+    which enforce non-root, no-new-privileges, and seccomp/AppArmor on ALL
+    pods in the namespace — a compromised gateway cannot spawn privileged pods.
+    Per-identity pod isolation now works on K8s (was previously Docker/Podman only).
+    NetworkPolicy enforces UA-10: pool-managed pods cannot reach each other
+    (default-deny-egress + no inter-pod ingress rule), and can only reach
+    the gateway on port 8080 for LLM dispatch (OPA inspects all traffic).
+  severity: medium
+  controls_impacted:
+    - ASVS V4.1.1 (access control — principle of least privilege)
+    - NIST AC-6 (least privilege)
+    - CMMC AC.L2-3.1.2 (limit system access)
+    - SOC 2 CC6.3 (logical access controls)
+    - ISO 27001 A.9.4.1 (restriction of access to programs and data)
+  compensating_controls:
+    - Kyverno ClusterPolicies in admission-policies.yaml enforce non-root +
+      no-new-privileges + seccomp + AppArmor on all namespace pods including
+      pool-managed pods spawned by the gateway SA. Privileged pod creation
+      is blocked at admission time regardless of SA permissions.
+    - NetworkPolicy default-deny-ingress + default-deny-egress — pool pods
+      can only communicate via the explicitly whitelisted gateway path.
+    - Pool pod labels (yashigani.managed=true, yashigani.identity=<id>,
+      yashigani.service=<slug>) are auditable — any unexpected pod in the
+      namespace is visible via `kubectl get pods -l yashigani.managed=true`.
+    - RBAC is namespace-scoped (Role, not ClusterRole) — no cross-namespace
+      or cluster-admin escalation possible.
+    - poolManager.k8sBackend.enabled defaults to false — operators opt in
+      explicitly; Docker/Podman deployments are unaffected.
+  status: accepted
+  accepted_by: Tiago
+  accepted_at: "2026-05-25"
+  review_by: "2026-11-25"
+  closure_evidence:
+    - commit: "TBD"
+      rationale: >-
+        KubernetesBackend implemented in src/yashigani/pool/backend.py.
+        RBAC: helm/yashigani/templates/rbac-pool-manager.yaml (Role + RoleBinding,
+        pods CRUD only, namespace-scoped, guarded by poolManager.k8sBackend.enabled).
+        NetworkPolicy: three new rules in networkpolicy.yaml within the
+        poolManager.k8sBackend.enabled guard: allow-pool-managed-pod-ingress
+        (gateway-only source), allow-pool-managed-pod-egress (gateway:8080 only),
+        allow-gateway-to-pool-pods-egress (gateway → pool pods on agentPort).
+        20 unit tests PASS (test_pool_k8s_backend.py). Helm lint 0 failures.
+        Helm template renders Role, RoleBinding, and 3 NetworkPolicies when enabled.
+        Existing pool tests (29) PASS — no regression.
+  fix_in_version: v2.24.1
+  last_threat_model_review: "2026-05-25"

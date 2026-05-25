@@ -226,4 +226,136 @@ Pre-fix records (created before v2.24.1 when enforcement was not in place) will 
 
 If your SSO IdP (OIDC or SAML) uses the same email address for both admin and user identities, the SSO user login **will be blocked**. This is intentional. Configure your IdP to use separate email addresses, or instruct the human to use a different email for their user-tier account.
 
+---
+
+## 6. PoolManager — Per-Identity Pod Spawning in Kubernetes
+
+> **Authority:** YSG-RISK-070 (risk-register.yml, accepted 2026-05-25, Tiago).
+> **Closes:** Tom #56 commit `7e653b1` option (b) — K8s API backend.
+
+### 6.1 What the K8s backend does
+
+PoolManager provides container-per-identity isolation for agents registered with an upstream URL in the form `pool://<image>`. Each identity gets a dedicated container for each agent service it invokes; no two identities share a container.
+
+In Docker and Podman deployments, PoolManager spawns containers via the Docker/Podman SDK (socket required). In Kubernetes, it uses the K8s API (`CoreV1Api.create_namespaced_pod()`) — no socket projection needed.
+
+Detection is automatic: `create_backend()` checks for `KUBERNETES_SERVICE_HOST` environment variable + `/var/run/secrets/kubernetes.io/serviceaccount/token`. When both are present (in-cluster), the K8s backend is selected first; Docker/Podman are tried only if K8s initialisation fails.
+
+### 6.2 RBAC requirements
+
+The K8s backend requires the gateway ServiceAccount (`yashigani`) to have namespace-scoped `pods` CRUD. The Helm chart installs this automatically when `poolManager.k8sBackend.enabled=true`:
+
+```yaml
+# Role: yashigani-pool-manager (namespace-scoped)
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["create", "get", "list", "delete"]
+```
+
+This is a **namespace-scoped Role** (not ClusterRole). The gateway cannot affect pods in other namespaces. To verify the Role is installed:
+
+```bash
+kubectl get role yashigani-pool-manager -n <namespace> -o yaml
+kubectl get rolebinding yashigani-pool-manager -n <namespace> -o yaml
+```
+
+### 6.3 Enabling the K8s backend (Helm)
+
+Add to your `values-override.yaml`:
+
+```yaml
+poolManager:
+  k8sBackend:
+    enabled: true
+    agentPort: 8080          # port pool-managed pods listen on
+    podReadyTimeoutSeconds: 120  # how long to wait for a pod to reach Running
+```
+
+The `poolManager.k8sBackend.enabled` flag gates the Role, RoleBinding, and three NetworkPolicies. It defaults to `false` — Docker/Podman deployments are unaffected.
+
+### 6.4 Tier mapping
+
+Pool-managed pod counts are governed by the same `TierLimits` as Docker/Podman backends:
+
+| Tier | Max pods per identity | Max total concurrent |
+|------|-----------------------|----------------------|
+| community / academic | 1 | 3 |
+| starter | 1 | 5 |
+| professional | 3 | 15 |
+| professional_plus | 5 | 50 |
+| enterprise | unlimited | unlimited |
+
+Exceeding the limit returns HTTP 402 `pool_limit_exceeded`. The limit is per-Yashigani-instance (not per K8s node).
+
+### 6.5 Pod startup grace period
+
+K8s pods take 5–60+ seconds to reach Running (scheduler + image pull). The backend polls until `YASHIGANI_POOL_K8S_POD_READY_TIMEOUT` (default `120` seconds, overridden by env var or `podReadyTimeoutSeconds` Helm value). If the pod is still Pending after the timeout, the gateway returns HTTP 503 with `Retry-After: 5` — the client should retry.
+
+Increase the timeout if you see spurious 503s on first dispatch (cold image pull on a node that doesn't have the agent image cached):
+
+```yaml
+poolManager:
+  k8sBackend:
+    podReadyTimeoutSeconds: 240  # 4 minutes for large agent images
+```
+
+Or set the env var on the gateway Deployment:
+
+```yaml
+gateway:
+  env:
+    YASHIGANI_POOL_K8S_POD_READY_TIMEOUT: "240"
+```
+
+### 6.6 Network isolation (UA-10)
+
+Three NetworkPolicies enforce UA-10 agent isolation for pool-managed pods:
+
+1. **Ingress**: pool pods accept connections ONLY from the gateway. No peer pool pod may reach another pool pod.
+2. **Egress from pool pods**: pool pods may only reach gateway:8080. All LLM calls route through the gateway; OPA inspects both legs.
+3. **Egress from gateway**: gateway may reach pool pods on `agentPort`.
+
+Pool pods carry `yashigani.managed: "true"` labels — verify isolation with:
+
+```bash
+kubectl get pods -l yashigani.managed=true -n <namespace>
+kubectl get networkpolicies -l app.kubernetes.io/component=pool-manager -n <namespace>
+```
+
+### 6.7 Troubleshooting
+
+**Pod stuck in Pending (namespace quota):**
+```bash
+kubectl describe pod <ysg-*> -n <namespace>
+# Look for: "FailedScheduling" events — resource quota, node affinity, image pull
+kubectl get resourcequota -n <namespace>
+```
+
+**Image pull failure (ImagePullBackOff):**
+Pool-managed pods inherit the namespace's default `imagePullSecrets`. Configure image pull secrets at install time and ensure the agent image (`pool://ghcr.io/...`) is accessible from within the cluster:
+```bash
+kubectl create secret docker-registry regcred \
+  --docker-server=ghcr.io \
+  --docker-username=<user> \
+  --docker-password=<token> \
+  -n <namespace>
+# Then reference in values-override.yaml:
+# gateway: imagePullSecrets: [{name: regcred}]
+# (pool-managed pods use the namespace default; patch the default SA if needed)
+```
+
+**RBAC permission denied:**
+```bash
+kubectl auth can-i create pods --as=system:serviceaccount:<namespace>:yashigani -n <namespace>
+# Expected: yes
+# If "no": poolManager.k8sBackend.enabled is false or Helm upgrade not run
+```
+
+**Gateway stuck waiting (PodStartupTimeout in logs):**
+The gateway logs `"K8s backend: pod <name> phase=Pending, waiting..."` every 2 seconds. If `PodStartupTimeout` is raised, the client gets 503. Check:
+1. Node capacity: `kubectl top nodes`
+2. Pod events: `kubectl describe pod <ysg-*> -n <namespace>`
+3. Increase `podReadyTimeoutSeconds` if image pull is consistently slow
+
 *Operator guide — Yashigani. Maintained by Agnostic Security.*

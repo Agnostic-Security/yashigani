@@ -56,6 +56,10 @@ dependencies = [
     "opentelemetry-propagator-b3>=1.24",
     # Container backends for Pool Manager (per-identity isolation)
     "podman>=5.0",  # Podman SDK — primary backend on Podman deployments
+    # kubernetes-client is a soft dep: only imported when running in-cluster.
+    # Listed in core deps so the gateway image includes it without an extra;
+    # the K8s backend gracefully falls back to Docker/Podman if import fails.
+    "kubernetes>=30.1",  # K8s API backend — YSG-RISK-070
 ]
 
 [project.optional-dependencies]

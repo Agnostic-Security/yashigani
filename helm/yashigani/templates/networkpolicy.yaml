@@ -1371,4 +1371,114 @@ spec:
           port: 80
 {{- end }}
 
+
+{{- if .Values.poolManager.k8sBackend.enabled }}
+---
+# PoolManager K8s backend — gateway → pool-managed pod ingress (YSG-RISK-070).
+#
+# Pool-managed pods carry label yashigani.managed=true (set by KubernetesBackend.run()).
+# The gateway must be able to reach them on the agent service port for the
+# dispatch path. This rule permits ONLY gateway as the ingress source.
+#
+# UA-10 isolation (YSG-RISK-055): pool-managed pods cannot reach each other —
+# the default-deny-ingress policy (top of this file) blocks all ingress unless
+# explicitly allowed, and NO rule allows pod-to-pod traffic within the
+# yashigani.managed=true set. Pool pods also have no egress rule for
+# reaching each other (default-deny-egress catches any attempt).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-pool-managed-pod-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pool-manager
+  annotations:
+    yashigani.io/risk-id: "YSG-RISK-070"
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.managed: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    # Gateway ONLY — no peer pool-managed pod may initiate a connection (UA-10).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: {{ .Values.poolManager.k8sBackend.agentPort }}
+
+---
+# PoolManager K8s backend — pool-managed pod egress (YSG-RISK-070).
+#
+# Pool-managed pods are user-plane agent containers. Their ONLY permitted
+# egress is to the gateway (all LLM calls route through gateway, same as
+# registered agent bundles). They explicitly CANNOT reach each other
+# (no rule grants egress to yashigani.managed=true pods) — UA-10 isolation.
+#
+# Pool pods also need DNS for internal service name resolution.
+# DNS is already covered by allow-dns-egress for all pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-pool-managed-pod-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pool-manager
+  annotations:
+    yashigani.io/risk-id: "YSG-RISK-070"
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.managed: "true"
+  policyTypes:
+    - Egress
+  egress:
+    # LLM dispatch — gateway:8080 only (all agent calls route through gateway).
+    # OPA inspects this traffic on both legs (YSG-RISK-055 OPA constraint).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# Gateway → pool-managed pod egress extension (YSG-RISK-070).
+#
+# The gateway must be able to reach pool-managed pods (yashigani.managed=true)
+# on the agent port for the dispatch path. This extends allow-gateway-egress
+# without modifying the base rule (which handles the registered-upstream path).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-pool-pods-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pool-manager
+  annotations:
+    yashigani.io/risk-id: "YSG-RISK-070"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-gateway
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              yashigani.managed: "true"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.poolManager.k8sBackend.agentPort }}
+
+{{- end }}{{- /* poolManager.k8sBackend.enabled */ -}}
+
 {{- end }}{{- /* networkPolicies.enabled */ -}}
