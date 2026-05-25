@@ -300,13 +300,22 @@ class TestAuditChainServiceVerifyEvent:
 # ---------------------------------------------------------------------------
 
 class TestAuditChainServiceVerifyChainSegment:
-    def _build_chain(self, n: int, date_str: str) -> list[dict]:
-        """Build a valid chain of n events for the given date."""
-        svc = AuditChainService()
-        # Force the chain to start fresh for this date
-        svc._current_day = date_str
-        svc._last_hash = None
+    @staticmethod
+    def _today() -> str:
+        """Return today's UTC date as YYYY-MM-DD — matches compute_hashes_for_event's clock."""
+        return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
+    def _build_chain(self, n: int) -> tuple[list[dict], str]:
+        """Build a valid chain of n events anchored to today's UTC date.
+
+        Returns (events, date_str) so callers can pass the same date_str to
+        verify_chain_segment.  Previously the date was hardcoded to a past day
+        ("2026-05-24"), but compute_hashes_for_event always anchors to *today*
+        internally (it reads the live clock), causing a mismatch once that date
+        passed.  Fix: build and verify against today's date.
+        """
+        date_str = self._today()
+        svc = AuditChainService()
         events = []
         for i in range(n):
             ev = {"event_type": f"EV_{i}", "seq": i, "day": date_str}
@@ -314,50 +323,51 @@ class TestAuditChainServiceVerifyChainSegment:
             ev["prev_hash"] = prev
             ev["event_hash"] = ev_hash
             events.append(ev)
-        return events
+        return events, date_str
 
     def test_intact_chain_no_breaks(self):
-        events = self._build_chain(5, "2026-05-24")
+        events, date_str = self._build_chain(5)
         svc = AuditChainService()
-        ok, breaks = svc.verify_chain_segment(events, "2026-05-24")
+        ok, breaks = svc.verify_chain_segment(events, date_str)
         assert ok is True
         assert breaks == []
 
     def test_empty_chain_ok(self):
+        date_str = self._today()
         svc = AuditChainService()
-        ok, breaks = svc.verify_chain_segment([], "2026-05-24")
+        ok, breaks = svc.verify_chain_segment([], date_str)
         assert ok is True
         assert breaks == []
 
     def test_single_event_intact(self):
-        events = self._build_chain(1, "2026-05-24")
+        events, date_str = self._build_chain(1)
         svc = AuditChainService()
-        ok, breaks = svc.verify_chain_segment(events, "2026-05-24")
+        ok, breaks = svc.verify_chain_segment(events, date_str)
         assert ok is True
 
     def test_tampered_first_event_prev_hash(self):
-        events = self._build_chain(3, "2026-05-24")
+        events, date_str = self._build_chain(3)
         # Tamper the first event's prev_hash
         events[0]["prev_hash"] = "wrong-anchor"
         svc = AuditChainService()
-        ok, breaks = svc.verify_chain_segment(events, "2026-05-24")
+        ok, breaks = svc.verify_chain_segment(events, date_str)
         assert ok is False
         assert 0 in breaks
 
     def test_tampered_second_event_prev_hash(self):
-        events = self._build_chain(4, "2026-05-24")
+        events, date_str = self._build_chain(4)
         events[2]["prev_hash"] = "corrupted"
         svc = AuditChainService()
-        ok, breaks = svc.verify_chain_segment(events, "2026-05-24")
+        ok, breaks = svc.verify_chain_segment(events, date_str)
         assert ok is False
         assert 2 in breaks
 
     def test_multiple_breaks_detected(self):
-        events = self._build_chain(5, "2026-05-24")
+        events, date_str = self._build_chain(5)
         events[1]["prev_hash"] = "bad"
         events[3]["prev_hash"] = "also-bad"
         svc = AuditChainService()
-        ok, breaks = svc.verify_chain_segment(events, "2026-05-24")
+        ok, breaks = svc.verify_chain_segment(events, date_str)
         assert ok is False
         assert 1 in breaks
         assert 3 in breaks

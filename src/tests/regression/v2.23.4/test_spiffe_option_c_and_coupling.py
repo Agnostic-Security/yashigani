@@ -34,10 +34,6 @@ Last updated: 2026-05-19T00:00:00+01:00
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
-import types
-from pathlib import Path
 import pytest
 from unittest.mock import patch
 
@@ -47,33 +43,17 @@ from unittest.mock import patch
 # ---------------------------------------------------------------------------
 
 def _load_spiffe_middleware_module():
-    """Load yashigani.gateway.spiffe_middleware without triggering gateway/__init__.py.
+    """Load yashigani.gateway.spiffe_middleware.
 
-    gateway/__init__.py imports proxy.py which calls _load_internal_bearer() at
-    module-load time and raises RuntimeError when YASHIGANI_INTERNAL_BEARER is
-    absent.  We load the .py file directly to avoid that.
+    YASHIGANI_INTERNAL_BEARER is guaranteed by conftest.py (setdefault), so the
+    gateway package barrel import (proxy.py -> _load_internal_bearer()) no
+    longer raises RuntimeError.  We do a normal package import here so that the
+    real yashigani.gateway package is registered correctly in sys.modules AND as
+    an attribute on the parent yashigani module — avoiding the cross-test
+    contamination that the old stub-insertion approach caused.
     """
-    repo_root = Path(__file__).resolve().parents[4]
-    module_path = repo_root / "src" / "yashigani" / "gateway" / "spiffe_middleware.py"
-    module_name = "yashigani.gateway.spiffe_middleware"
-
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-
-    # Ensure parent package stubs exist so relative imports don't fail
-    if "yashigani" not in sys.modules:
-        sys.modules["yashigani"] = types.ModuleType("yashigani")
-    if "yashigani.gateway" not in sys.modules:
-        pkg = types.ModuleType("yashigani.gateway")
-        pkg.__path__ = [str(module_path.parent)]
-        pkg.__package__ = "yashigani.gateway"
-        sys.modules["yashigani.gateway"] = pkg
-
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    import yashigani.gateway.spiffe_middleware as _sm
+    return _sm
 
 
 # ---------------------------------------------------------------------------

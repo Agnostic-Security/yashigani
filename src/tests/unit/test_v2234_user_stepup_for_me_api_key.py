@@ -129,13 +129,23 @@ async def _call_stepup(session, account_record, totp_ok=True, totp_code="123456"
     return result, mock_store
 
 
-async def _call_stepup_full(session, account_record, totp_ok=True, totp_code="123456"):
+async def _call_stepup_full(
+    session,
+    account_record,
+    totp_ok=True,
+    totp_code="123456",
+    failure_count_override: int = 0,
+):
     """
     Call stepup_verify() directly with mocked dependencies.
     Returns (result_dict, mock_store, mock_audit) or raises HTTPException.
     Exposes mock_audit so callers can inspect write() call args.
+
+    Redis helpers (_totp_get_count, _totp_incr_failure, _totp_reset) are patched
+    to avoid requiring a live Redis connection in unit tests.  The failure counter
+    starts at `failure_count_override` (default 0 = below limit).
     """
-    from yashigani.backoffice.routes.auth import StepUpRequest, _totp_failures
+    from yashigani.backoffice.routes.auth import StepUpRequest
     from yashigani.backoffice import state as _state_mod
 
     body = StepUpRequest(totp_code=totp_code)
@@ -162,7 +172,10 @@ async def _call_stepup_full(session, account_record, totp_ok=True, totp_code="12
         async def _fake_pg():
             yield MagicMock()
 
-        with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()):
+        with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()), \
+             patch("yashigani.backoffice.routes.auth._totp_get_count", return_value=failure_count_override), \
+             patch("yashigani.backoffice.routes.auth._totp_incr_failure", return_value=failure_count_override + 1), \
+             patch("yashigani.backoffice.routes.auth._totp_reset", return_value=None):
             from yashigani.backoffice.routes.auth import stepup_verify
             result = await stepup_verify(body=body, session=session, store=mock_store)
             return result, mock_store, mock_audit
@@ -216,7 +229,7 @@ class TestT1AnonymousRejected:
                 await require_any_session(request=req, store=mock_store)
             return exc_info.value
 
-        exc = asyncio.get_event_loop().run_until_complete(_run())
+        exc = asyncio.run(_run())
         assert exc.status_code == 401
         assert exc.detail["error"] == "authentication_required"
 
@@ -241,7 +254,7 @@ class TestT2AdminSessionRegression:
             result, store = await _call_stepup(session, record, totp_ok=True)
             return result, store
 
-        result, store = asyncio.get_event_loop().run_until_complete(_run())
+        result, store = asyncio.run(_run())
         assert result["stepup_verified"] is True
         assert result["status"] == "ok"
         assert "ttl_seconds" in result
@@ -268,7 +281,7 @@ class TestT3UserSessionValidTotp:
             result, store = await _call_stepup(session, record, totp_ok=True)
             return result, store
 
-        result, store = asyncio.get_event_loop().run_until_complete(_run())
+        result, store = asyncio.run(_run())
         assert result["stepup_verified"] is True
         assert result["status"] == "ok"
         assert "ttl_seconds" in result
@@ -280,29 +293,71 @@ class TestT3UserSessionValidTotp:
 # ---------------------------------------------------------------------------
 
 class TestT4UserSessionWrongTotp:
-    """T4: Wrong TOTP code → 401 invalid_totp_code + _totp_failures incremented."""
+    """T4: Wrong TOTP code → 401 invalid_totp_code + failure counter incremented.
+
+    The failure counter was migrated from in-memory _totp_failures dict to Redis
+    (_totp_incr_failure / _totp_get_count / _totp_reset).  This test verifies
+    that _totp_incr_failure is called exactly once on a wrong-TOTP path.
+
+    We call stepup_verify directly (not through _call_stepup_full) so we can
+    capture _totp_incr_failure without it being pre-patched by the helper.
+    """
 
     def test_user_session_wrong_totp_increments_counter(self):
         from fastapi import HTTPException
-        from yashigani.backoffice.routes.auth import _totp_failures
+        from yashigani.backoffice import state as _state_mod
+        from yashigani.backoffice.routes import auth as auth_mod
 
         session = _make_session(token="c" * 64, account_tier="user", account_id="acc-user-002")
         record = _make_account_record(account_id="acc-user-002", username="bob")
 
-        prefix = session.token[:8]
-        _totp_failures.pop(prefix, None)  # clean state
-        before = _totp_failures.get(prefix, 0)
+        incr_calls: list[str] = []
 
-        async def _run():
-            with pytest.raises(HTTPException) as exc_info:
-                await _call_stepup(session, record, totp_ok=False)
-            return exc_info.value
+        def _fake_incr(prefix: str) -> int:
+            incr_calls.append(prefix)
+            return 1  # first failure; below lock-out limit of 3
 
-        exc = asyncio.get_event_loop().run_until_complete(_run())
+        mock_store = MagicMock()
+        mock_auth_service = MagicMock()
+        mock_auth_service.get_account_by_id = AsyncMock(return_value=record)
+        mock_auth_service._verify_totp_with_replay = AsyncMock(return_value=False)
+        mock_audit = MagicMock()
+
+        orig_auth = _state_mod.backoffice_state.auth_service
+        orig_audit = _state_mod.backoffice_state.audit_writer
+        try:
+            _state_mod.backoffice_state.auth_service = mock_auth_service
+            _state_mod.backoffice_state.audit_writer = mock_audit
+
+            from yashigani.backoffice.routes.auth import StepUpRequest, stepup_verify
+
+            @asynccontextmanager
+            async def _fake_pg():
+                yield MagicMock()
+
+            async def _run():
+                body = StepUpRequest(totp_code="000000")
+                with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()), \
+                     patch("yashigani.backoffice.routes.auth._totp_get_count", return_value=0), \
+                     patch("yashigani.backoffice.routes.auth._totp_incr_failure", side_effect=_fake_incr), \
+                     patch("yashigani.backoffice.routes.auth._totp_reset", return_value=None):
+                    with pytest.raises(HTTPException) as exc_info:
+                        await stepup_verify(body=body, session=session, store=mock_store)
+                return exc_info.value
+
+            exc = asyncio.run(_run())
+        finally:
+            _state_mod.backoffice_state.auth_service = orig_auth
+            _state_mod.backoffice_state.audit_writer = orig_audit
+
         assert exc.status_code == 401
         assert exc.detail["error"] == "invalid_totp_code"
-        after = _totp_failures.get(prefix, 0)
-        assert after == before + 1, f"failure counter not incremented: before={before}, after={after}"
+        assert len(incr_calls) == 1, (
+            f"_totp_incr_failure must be called exactly once on wrong TOTP; got {incr_calls}"
+        )
+        assert incr_calls[0] == session.token[:8], (
+            f"incr called with wrong prefix: {incr_calls[0]!r} != {session.token[:8]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +381,7 @@ class TestT5UserSessionReplay:
                 await _call_stepup(session, record, totp_ok=False, totp_code="654321")
             return exc_info.value
 
-        exc = asyncio.get_event_loop().run_until_complete(_run())
+        exc = asyncio.run(_run())
         assert exc.status_code == 401
         assert exc.detail["error"] == "invalid_totp_code"
 
@@ -343,6 +398,12 @@ class TestT6WrongTenantUser:
         If session.account_id does not exist in the platform DB
         (e.g., fabricated token or wrong-org session), get_account_by_id
         returns None → stepup_verify raises 403 totp_not_configured.
+
+        Note: the 403 is returned BEFORE the TOTP failure counter is checked,
+        so no Redis patching is needed for the core assertion.  We patch Redis
+        helpers anyway for consistency (the function reaches _totp_get_count
+        after the account lookup on None path, but it is guarded by an early
+        return on None account_record).
         """
         from fastapi import HTTPException
         from yashigani.backoffice import state as _state_mod
@@ -371,12 +432,15 @@ class TestT6WrongTenantUser:
 
             async def _run():
                 body = StepUpRequest(totp_code="000000")
-                with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()):
+                with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()), \
+                     patch("yashigani.backoffice.routes.auth._totp_get_count", return_value=0), \
+                     patch("yashigani.backoffice.routes.auth._totp_incr_failure", return_value=1), \
+                     patch("yashigani.backoffice.routes.auth._totp_reset", return_value=None):
                     with pytest.raises(HTTPException) as exc_info:
                         await stepup_verify(body=body, session=session, store=mock_store)
                 return exc_info.value
 
-            exc = asyncio.get_event_loop().run_until_complete(_run())
+            exc = asyncio.run(_run())
             assert exc.status_code == 403
             assert exc.detail["error"] == "totp_not_configured"
         finally:
@@ -389,24 +453,25 @@ class TestT6WrongTenantUser:
 # ---------------------------------------------------------------------------
 
 class TestT7FailureLimitExceeded:
-    """T7: _TOTP_FAILURE_LIMIT (3) exceeded → 429 stepup_attempts_exceeded."""
+    """T7: _TOTP_FAILURE_LIMIT (3) exceeded → 429 stepup_attempts_exceeded.
+
+    The failure counter is Redis-backed (_totp_get_count).  Simulate the limit
+    being exceeded by patching _totp_get_count to return _TOTP_FAILURE_LIMIT.
+    """
 
     def test_fifth_attempt_returns_429(self):
         """
-        After 4 consecutive wrong codes the failure counter is 4 (> limit of 3),
-        so the 5th attempt receives 429 immediately without calling verify.
+        When the failure counter is already at or above _TOTP_FAILURE_LIMIT,
+        the next attempt receives 429 immediately without calling TOTP verify.
         """
         from fastapi import HTTPException
-        from yashigani.backoffice.routes.auth import _totp_failures, _TOTP_FAILURE_LIMIT
+        from unittest.mock import patch as _patch
+        from yashigani.backoffice.routes.auth import _TOTP_FAILURE_LIMIT
         from yashigani.backoffice import state as _state_mod
         from yashigani.backoffice.routes import auth as auth_mod
 
         session = _make_session(token="f" * 64, account_tier="user", account_id="acc-user-007")
         record = _make_account_record(account_id="acc-user-007", username="dave")
-        prefix = session.token[:8]
-
-        # Seed failure counter at the limit
-        _totp_failures[prefix] = _TOTP_FAILURE_LIMIT
 
         mock_store = MagicMock()
         mock_auth_service = MagicMock()
@@ -425,18 +490,20 @@ class TestT7FailureLimitExceeded:
             async def _fake_pg():
                 yield MagicMock()
 
-            async def _run():
-                body = StepUpRequest(totp_code="111111")
-                with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()):
-                    with pytest.raises(HTTPException) as exc_info:
-                        await stepup_verify(body=body, session=session, store=mock_store)
-                return exc_info.value
+            # Patch _totp_get_count to return the limit (counter already at threshold)
+            with _patch("yashigani.backoffice.routes.auth._totp_get_count", return_value=_TOTP_FAILURE_LIMIT):
+                async def _run():
+                    body = StepUpRequest(totp_code="111111")
+                    with patch.object(auth_mod, "_pg_tenant_transaction", return_value=_fake_pg()):
+                        with pytest.raises(HTTPException) as exc_info:
+                            await stepup_verify(body=body, session=session, store=mock_store)
+                    return exc_info.value
 
-            exc = asyncio.get_event_loop().run_until_complete(_run())
+                exc = asyncio.run(_run())
+
             assert exc.status_code == 429
             assert exc.detail["error"] == "stepup_attempts_exceeded"
         finally:
-            _totp_failures.pop(prefix, None)
             _state_mod.backoffice_state.auth_service = orig_auth
             _state_mod.backoffice_state.audit_writer = orig_audit
 
@@ -471,7 +538,7 @@ class TestT8AssertFreshStepupPassesAfterUserStepup:
             store.record_totp_stepup.assert_called_once_with(session.token)
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        result = asyncio.run(_run())
         assert result["stepup_verified"] is True
 
         # Simulate what SessionStore.get() returns after record_totp_stepup:
@@ -506,7 +573,7 @@ class TestT9UserTierAuditEvent:
             result, store, audit = await _call_stepup_full(session, record, totp_ok=True)
             return audit
 
-        mock_audit = asyncio.get_event_loop().run_until_complete(_run())
+        mock_audit = asyncio.run(_run())
         mock_audit.write.assert_called_once()
         event = mock_audit.write.call_args[0][0]
         assert event.account_tier == "user", (
@@ -537,7 +604,7 @@ class TestT10AdminTierAuditEvent:
             result, store, audit = await _call_stepup_full(session, record, totp_ok=True)
             return audit
 
-        mock_audit = asyncio.get_event_loop().run_until_complete(_run())
+        mock_audit = asyncio.run(_run())
         mock_audit.write.assert_called_once()
         event = mock_audit.write.call_args[0][0]
         assert event.account_tier == "admin", (
@@ -554,8 +621,14 @@ class TestStructuralGuard:
 
     def test_stepup_verify_uses_any_session_not_admin_session(self):
         """
-        AST / text check: the stepup_verify function signature must NOT contain
-        'AdminSession' and MUST contain 'AnySession' as the session dependency.
+        AST check: the stepup_verify function's parameter annotations must use
+        AnySession (not AdminSession) for the session dependency.
+
+        Note: we check the function *signature* (arguments) only, not the entire
+        function body.  The body legitimately imports AdminSessionTotpLockoutEvent
+        (an audit event class), which contains the substring "AdminSession" but is
+        NOT a session dependency — using ast.unparse(fn.args) avoids the false
+        positive from that event class import.
         """
         import ast
         from pathlib import Path
@@ -574,13 +647,19 @@ class TestStructuralGuard:
                 break
 
         assert stepup_fn is not None, "stepup_verify not found in auth.py"
-        fn_src = ast.unparse(stepup_fn)
 
-        assert "AnySession" in fn_src, (
-            "stepup_verify must use AnySession — Gap B fix not applied"
+        # Check only the function signature (arguments + annotations) — not the body.
+        # This avoids false positives from event-class imports inside the body that
+        # contain "AdminSession" as a substring (e.g. AdminSessionTotpLockoutEvent).
+        sig_src = ast.unparse(stepup_fn.args)
+
+        assert "AnySession" in sig_src, (
+            f"stepup_verify signature must use AnySession — Gap B fix not applied.\n"
+            f"Signature: {sig_src}"
         )
-        assert "AdminSession" not in fn_src, (
-            "stepup_verify must NOT use AdminSession — it would reject user-tier sessions"
+        assert "AdminSession" not in sig_src, (
+            f"stepup_verify signature must NOT use AdminSession — it would reject user-tier sessions.\n"
+            f"Signature: {sig_src}"
         )
 
 

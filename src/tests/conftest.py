@@ -19,6 +19,20 @@ from __future__ import annotations
 import os
 os.environ.setdefault("YASHIGANI_ENV", "dev")
 
+# YSG-TEST-BEARER: set YASHIGANI_INTERNAL_BEARER before any gateway module import.
+# gateway/proxy.py and gateway/openai_router.py execute _load_internal_bearer() at
+# module load time (fail-closed production behaviour). Without a value, the first
+# import raises RuntimeError and pollutes sys.modules, causing cascading failures
+# across ALL unit tests that import any gateway module even indirectly.
+# setdefault() preserves an explicit override (e.g. CI with a real rotated secret).
+os.environ.setdefault("YASHIGANI_INTERNAL_BEARER", "test-internal-bearer-token-for-unit-tests")
+
+# YSG-TEST-OPA-OPTIONAL: allow tests to run without a live OPA instance.
+# Tests that need OPA enforcement use MockOPATransport or patch opa_url directly.
+# Without this flag the router's _opa_v1_check is fail-closed (correct for
+# production) but causes all unit tests without a real OPA to 403 on every call.
+os.environ.setdefault("YASHIGANI_OPA_OPTIONAL", "true")
+
 import json
 import pytest
 from unittest.mock import MagicMock, AsyncMock

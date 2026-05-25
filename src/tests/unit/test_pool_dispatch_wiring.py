@@ -80,8 +80,18 @@ def _make_container_info(identity_id: str, agent_name: str, image: str) -> _Cont
 
 
 def _make_request() -> MagicMock:
-    """Minimal ASGI request stub authenticated via the internal bearer."""
-    bearer = os.environ.get("YASHIGANI_INTERNAL_BEARER", "test-token")
+    """Minimal ASGI request stub authenticated via the internal bearer.
+
+    Reads _INTERNAL_BEARER from the already-imported openai_router module so the
+    Authorization header always matches the module's cached value, regardless of
+    what YASHIGANI_INTERNAL_BEARER was set to when the module was first imported.
+    This avoids suite-order sensitivity: if conftest.py set a different value
+    than the test fixture's "test-token", the bearer comparison in _resolve_identity
+    would fail with 401 (which looks identical to an identity resolution failure
+    but is really a bearer mismatch).
+    """
+    from yashigani.gateway.openai_router import _INTERNAL_BEARER
+    bearer = _INTERNAL_BEARER
     req = MagicMock(spec=Request)
     # Use a MagicMock for headers that supports case-insensitive get
     headers_mock = MagicMock()

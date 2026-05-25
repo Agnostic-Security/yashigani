@@ -289,9 +289,22 @@ class TestStepupOrdering:
 
     def test_stepup_failure_is_warn_and_continue(self):
         """
-        BUG-INSTALLER-AUTO-AGENT-REG-401: stepup failure must produce a WARNING
-        log, not a hard sys.exit(). The installer pattern is warn-and-continue
-        so a TOTP replay or timing edge case does not abort the entire install.
+        BUG-INSTALLER-AUTO-AGENT-REG-401: stepup failure handling in install.sh.
+
+        Original test expected warn-and-continue (WARNING:stepup_failed).
+        The installer was subsequently updated to HARD-FAIL on stepup failure
+        (ERROR:stepup_failed + sys.exit(1)) — this is the deliberate security
+        stance: agent registration MUST NOT proceed if the stepup TOTP check
+        failed, as the subsequent POST /admin/agents calls require a valid stepup.
+
+        This test now verifies the CURRENT behaviour (hard-fail) rather than the
+        original warn-and-continue expectation.
+
+        Drift rationale: install.sh comment at the relevant line reads:
+        "Hard-fail on stepup failure. A successful stepup is required before any
+         POST /admin/agents call."
+
+        Updated: 2026-05-25T00:00:00+00:00
         """
         body = _get_register_body()
 
@@ -299,18 +312,18 @@ class TestStepupOrdering:
         stepup_pos = body.find("/auth/stepup")
         assert stepup_pos != -1, "register_agent_bundles(): /auth/stepup not found"
 
-        # After the stepup request, there must be a WARNING print, not sys.exit
+        # After the stepup request, there must be an ERROR print + sys.exit (hard-fail)
         after_stepup = body[stepup_pos:]
-        # Must contain WARNING
-        assert "WARNING:stepup_failed" in after_stepup, (
+        assert "ERROR:stepup_failed" in after_stepup, (
             "BUG-INSTALLER-AUTO-AGENT-REG-401: stepup failure must print "
-            "WARNING:stepup_failed (warn-and-continue pattern)"
+            "ERROR:stepup_failed (hard-fail pattern since v2.23.4)"
         )
-        # Must NOT call sys.exit in the stepup except block (before # Register agents)
-        register_agents_pos = after_stepup.find("# Register agents")
+        # Hard-fail: sys.exit must appear in the stepup except block
+        register_agents_pos = after_stepup.find("# YSG-AGENT-REG-001")
         if register_agents_pos != -1:
             stepup_except_region = after_stepup[:register_agents_pos]
-            assert "sys.exit" not in stepup_except_region, (
-                "BUG-INSTALLER-AUTO-AGENT-REG-401: stepup failure must NOT call "
-                "sys.exit() — installer must warn-and-continue to match existing pattern"
+            assert "sys.exit" in stepup_except_region, (
+                "BUG-INSTALLER-AUTO-AGENT-REG-401: stepup failure MUST call "
+                "sys.exit() — installer must hard-fail to prevent agent registration "
+                "without a valid TOTP step-up"
             )

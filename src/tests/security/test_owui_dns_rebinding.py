@@ -141,11 +141,17 @@ class TestOwuiDnsRebindingDefence:
             pinned_resolver_calls.append({"hostname": hostname, "allowlist": allowlist})
             yield fake_client
 
-        # agents.py now does `from yashigani.net.pinned_resolver import pinned_resolver`
-        # inside the function body (direct submodule import — required so mypy resolves
-        # the callable type; lazy because it's function-scoped).  Patch at the source
-        # so the in-function import picks up the fake.
-        with patch("yashigani.net.pinned_resolver.pinned_resolver", _fake_pinned_resolver):
+        # agents.py does `from yashigani.net.pinned_resolver import pinned_resolver`
+        # inside the function body.  `yashigani.net` is a _NetModule that intercepts
+        # attribute access and returns the pinned_resolver *function* when you access
+        # `yashigani.net.pinned_resolver` — so patch("yashigani.net.pinned_resolver.pinned_resolver")
+        # fails because mock resolves yashigani.net.pinned_resolver to the function,
+        # not the submodule.  Patch the attribute on the real submodule object from
+        # sys.modules instead, so the in-function `from <submodule> import pinned_resolver`
+        # picks up the fake.
+        import sys
+        _pr_submod = sys.modules["yashigani.net.pinned_resolver"]
+        with patch.object(_pr_submod, "pinned_resolver", _fake_pinned_resolver):
             from yashigani.backoffice.routes.agents import _push_openwebui_model
 
             await _push_openwebui_model("test-agent", "http://open-webui:8080")
@@ -343,10 +349,13 @@ class TestOwuiPinnedResolverAllowlistPropagation:
             captured_allowlist.append(list(allowlist or []))
             yield fake_client
 
-        # agents.py now does `from yashigani.net.pinned_resolver import pinned_resolver`
-        # inside the function body — patch at the source submodule so the in-function
-        # import picks up the fake.
-        with patch("yashigani.net.pinned_resolver.pinned_resolver", _capture_pinned_resolver):
+        # agents.py does `from yashigani.net.pinned_resolver import pinned_resolver`
+        # inside the function body.  _NetModule intercepts yashigani.net.pinned_resolver
+        # and returns the function, not the submodule — so the dotted patch path fails.
+        # Patch on the real submodule object from sys.modules instead.
+        import sys
+        _pr_submod = sys.modules["yashigani.net.pinned_resolver"]
+        with patch.object(_pr_submod, "pinned_resolver", _capture_pinned_resolver):
             from yashigani.backoffice.routes.agents import _push_openwebui_model
 
             await _push_openwebui_model("custom-agent", "http://custom-owui:8080")

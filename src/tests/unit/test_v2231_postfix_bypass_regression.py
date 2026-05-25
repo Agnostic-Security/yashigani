@@ -564,24 +564,23 @@ class TestXssResidualSinks:
 
 class TestSpiffeForgeV232002:
     """
-    LAURA-V232-002 / ISSUE-019 regression suite for SpiffePeerCertMiddleware.
+    LAURA-V232-002 / ISSUE-019 / Option-C regression suite for SpiffePeerCertMiddleware.
 
-    ISSUE-019 correction (2026-05-19): Su's LAURA-V232-002 fix stripped
-    x-spiffe-id from all requests, which broke the Caddy→backoffice path:
-    Caddy injects x-spiffe-id in the request it sends to backoffice, and
-    that header IS present in the ASGI scope this middleware processes.
-    Stripping it caused 401 no_spiffe_id for every SPIFFE-gated mutation
-    route (POST /admin/agents, PUT /admin/agents/{id}, etc.).
+    ISSUE-019 was originally corrected (2026-05-19) to preserve x-spiffe-id on
+    all requests.  Option C (AND-couple with X-Caddy-Verified-Secret) was subsequently
+    applied to tighten the forge surface.  The current contract is:
 
-    Corrected contract:
-    - x-spiffe-id-peer-cert is ALWAYS overwritten (server-controlled).
-    - x-spiffe-id is PRESERVED (Caddy-injected on Caddy→upstream path, or
-      install.sh-injected on the direct-backoffice path).
+    Option C contract (supersedes ISSUE-019 "preserve always"):
+    - x-spiffe-id-peer-cert is ALWAYS overwritten (server-controlled from ASGI TLS ext).
+    - x-spiffe-id is PRESERVED only when X-Caddy-Verified-Secret is present AND valid.
+    - x-spiffe-id is STRIPPED when X-Caddy-Verified-Secret is absent or invalid.
     - Primary forge-prevention is CaddyVerifiedMiddleware Layer B (HMAC).
     - Residual risk: a direct-mesh attacker holding a CA cert + HMAC secret
       can forge x-spiffe-id.  Accepted for v2.23.4; tracked in YSG-RISK-012b.
       Long-term fix: Option A from LAURA-V232-002 (all access via Caddy only).
     """
+
+    _VALID_SECRET = "a" * 64  # 64-char HMAC secret used in all positive-path tests
 
     def _import_middleware(self):
         from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
@@ -589,10 +588,13 @@ class TestSpiffeForgeV232002:
 
     def test_x_spiffe_id_peer_cert_overwritten_by_middleware(self):
         """
-        LAURA-V232-002 / ISSUE-019: x-spiffe-id-peer-cert supplied by the
-        client must be overwritten (not passed through).  When the ASGI TLS
-        extension is absent, it becomes "" (empty = no peer cert extracted).
+        LAURA-V232-002 / Option-C: x-spiffe-id-peer-cert supplied by the client must
+        be overwritten.  When the ASGI TLS extension is absent, it becomes "" (empty).
+        x-spiffe-id is stripped when X-Caddy-Verified-Secret is absent (no HMAC).
         """
+        import asyncio
+        from unittest.mock import patch
+
         MW = self._import_middleware()
 
         received_headers = {}
@@ -605,8 +607,8 @@ class TestSpiffeForgeV232002:
 
         middleware = MW(fake_app)
 
-        # Simulate a request with a forged x-spiffe-id-peer-cert and a
-        # legitimate x-spiffe-id (Caddy-injected or install.sh-injected).
+        # Simulate a request WITHOUT X-Caddy-Verified-Secret (forge attempt with no HMAC).
+        # Option C: x-spiffe-id must be STRIPPED (not preserved without valid HMAC).
         scope = {
             "type": "http",
             "method": "POST",
@@ -619,12 +621,12 @@ class TestSpiffeForgeV232002:
             "extensions": {},  # No TLS extension — peer_cert absent
         }
 
-        import asyncio
-        asyncio.run(middleware(scope, None, None))
+        with patch("yashigani.auth.caddy_verified._caddy_secret", self._VALID_SECRET):
+            asyncio.run(middleware(scope, None, None))
 
-        # x-spiffe-id must be preserved (Caddy/install.sh injected).
-        assert received_headers["x_spiffe_id"] == "spiffe://yashigani.internal/backoffice", (
-            "ISSUE-019: x-spiffe-id must be preserved by middleware — "
+        # x-spiffe-id must be STRIPPED (Option C: no valid HMAC → strip).
+        assert received_headers["x_spiffe_id"] is None, (
+            "Option-C: x-spiffe-id must be stripped when X-Caddy-Verified-Secret is absent — "
             f"got x-spiffe-id={received_headers['x_spiffe_id']!r}"
         )
         # x-spiffe-id-peer-cert must be overwritten to "" (TLS ext absent).
@@ -635,10 +637,12 @@ class TestSpiffeForgeV232002:
 
     def test_x_spiffe_id_preserved_caddy_path(self):
         """
-        ISSUE-019: x-spiffe-id injected by Caddy on the Caddy→backoffice path
-        must reach the downstream app unchanged.  This is the fix for the
-        regression introduced by LAURA-V232-002 Su fix (commit 4a7a5a8).
+        ISSUE-019 / Option-C: x-spiffe-id injected by Caddy on the Caddy→backoffice
+        path must reach downstream when X-Caddy-Verified-Secret is valid (HMAC).
         """
+        import asyncio
+        from unittest.mock import patch
+
         MW = self._import_middleware()
 
         downstream_scope = {}
@@ -654,19 +658,21 @@ class TestSpiffeForgeV232002:
             "path": "/admin/agents",
             "headers": [
                 (b"x-spiffe-id", b"spiffe://yashigani.internal/caddy"),
+                (b"x-caddy-verified-secret", self._VALID_SECRET.encode()),
                 (b"host", b"backoffice"),
             ],
             "extensions": {},
         }
 
-        import asyncio
-        asyncio.run(middleware(scope, None, None))
+        with patch("yashigani.auth.caddy_verified._caddy_secret", self._VALID_SECRET):
+            asyncio.run(middleware(scope, None, None))
 
         header_names_and_values = {
             k.lower(): v for k, v in downstream_scope.get("headers", [])
         }
         assert b"x-spiffe-id" in header_names_and_values, (
-            "ISSUE-019: x-spiffe-id must be preserved on Caddy→backoffice path"
+            "ISSUE-019/Option-C: x-spiffe-id must be preserved on Caddy→backoffice path "
+            "when X-Caddy-Verified-Secret is valid"
         )
         assert header_names_and_values[b"x-spiffe-id"] == b"spiffe://yashigani.internal/caddy", (
             "ISSUE-019: x-spiffe-id value must be Caddy's SPIFFE identity"
@@ -674,10 +680,13 @@ class TestSpiffeForgeV232002:
 
     def test_middleware_overwrites_peer_cert_header_preserves_spiffe_id(self):
         """
-        ISSUE-019 / LAURA-V232-002: when ASGI TLS extension is absent,
+        ISSUE-019 / LAURA-V232-002 / Option-C: when ASGI TLS extension is absent,
         x-spiffe-id-peer-cert supplied by the client is overwritten to "".
-        x-spiffe-id (Caddy/install.sh injected) is preserved.
+        x-spiffe-id is preserved when X-Caddy-Verified-Secret is valid (HMAC).
         """
+        import asyncio
+        from unittest.mock import patch
+
         MW = self._import_middleware()
 
         downstream_scope = {}
@@ -694,12 +703,13 @@ class TestSpiffeForgeV232002:
             "headers": [
                 (b"x-spiffe-id", b"spiffe://yashigani.internal/backoffice"),
                 (b"x-spiffe-id-peer-cert", b"spiffe://yashigani.internal/fake"),
+                (b"x-caddy-verified-secret", self._VALID_SECRET.encode()),
             ],
             "extensions": {},
         }
 
-        import asyncio
-        asyncio.run(middleware(scope, None, None))
+        with patch("yashigani.auth.caddy_verified._caddy_secret", self._VALID_SECRET):
+            asyncio.run(middleware(scope, None, None))
 
         headers_dict = {k.lower(): v for k, v in downstream_scope.get("headers", [])}
 
@@ -708,7 +718,7 @@ class TestSpiffeForgeV232002:
         assert headers_dict.get(b"x-spiffe-id-peer-cert") == b"", (
             "LAURA-V232-002: x-spiffe-id-peer-cert must be empty when TLS ext absent"
         )
-        # x-spiffe-id must be preserved (install.sh / Caddy injected).
+        # x-spiffe-id must be preserved (valid HMAC = legitimate Caddy/install.sh path).
         assert headers_dict.get(b"x-spiffe-id") == b"spiffe://yashigani.internal/backoffice", (
-            "ISSUE-019: x-spiffe-id must be preserved — Caddy/install.sh injected value"
+            "ISSUE-019/Option-C: x-spiffe-id must be preserved when X-Caddy-Verified-Secret valid"
         )

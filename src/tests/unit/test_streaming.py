@@ -450,8 +450,15 @@ class TestStreamingRouterFallback:
             }
             return resp
 
+        # Authenticate as the internal service account so _resolve_identity does not
+        # return None (which would raise 401 before streaming logic is reached).
+        # The internal bearer must match the module's cached _INTERNAL_BEARER.
+        # Use a MagicMock for headers so .get() works case-insensitively.
+        _headers_data = {"authorization": f"Bearer {mod._INTERNAL_BEARER}"}
+        _headers_mock = MagicMock()
+        _headers_mock.get = lambda key, default="": _headers_data.get(key.lower(), default)
         mock_request = MagicMock()
-        mock_request.headers = {}
+        mock_request.headers = _headers_mock
         mock_request.client = MagicMock()
         mock_request.client.host = "127.0.0.1"
 
@@ -490,8 +497,13 @@ class TestStreamingRouterFallback:
         """
         mod = _import_router_fresh(streaming_enabled=True)
 
+        # Authenticate as the internal service account — same pattern as the
+        # buffered test above. _resolve_identity checks Authorization header.
+        _headers_data_2 = {"authorization": f"Bearer {mod._INTERNAL_BEARER}"}
+        _headers_mock_2 = MagicMock()
+        _headers_mock_2.get = lambda key, default="": _headers_data_2.get(key.lower(), default)
         mock_request = MagicMock()
-        mock_request.headers = {}
+        mock_request.headers = _headers_mock_2
         mock_request.client = MagicMock()
         mock_request.client.host = "127.0.0.1"
 
