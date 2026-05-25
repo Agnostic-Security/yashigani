@@ -1533,7 +1533,7 @@ risks:
     rationale: 'Cycle 5 (INTERMEDIATE — single-factor security gap): BUG-C4-001/BUG-C4-002 fixed. Carveout changed
       to trust+clientcert. Laura cycle 5 adversarial probe confirmed this was a security regression (YSG-RISK-075).
       Cycle 5 is NOT the closed state — superseded by cycle 6.'
-  - commit: TBD-CYCLE6
+  - commit: 4729d8d
     rationale: 'Cycle 6 (CLOSED): Carveout changed from `trust clientcert=verify-ca` to `scram-sha-256 clientcert=verify-ca`.
       Two-factor authentication restored: cert (CA chain + private-key proof via clientcert=verify-ca) + password
       (SCRAM challenge for pgbouncer_authenticator). pgbouncer 1.25.1 (edoburu) CONFIRMED SCRAM-capable as auth
@@ -1604,7 +1604,7 @@ risks:
     become usable credentials — adds cost but does not block a motivated attacker.
   status: mitigated
   closure_evidence:
-  - commit: TBD-CYCLE6
+  - commit: 4729d8d
     rationale: 'Cycle 6: pg_hba carveout changed from `trust clientcert=verify-ca` to `scram-sha-256 clientcert=verify-ca`
       in docker/postgres/10-pgbouncer-auth.sh and helm/yashigani/files/10-pgbouncer-auth.sh. Two-factor authentication
       (cert + password) means a stolen CA-signed cert is no longer sufficient — attacker also needs the
