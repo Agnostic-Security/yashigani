@@ -1649,7 +1649,8 @@ risks:
     rationale: 'Cycle 6 (INTERMEDIATE): pg_hba carveout changed to `scram-sha-256 clientcert=verify-ca`. Two-factor
       auth (cert + password) breaks the lateral-pivot for cert-only attackers. However, cycle 6 broke on ARM64/Mac
       Podman due to YSG-RISK-077 SCRAM computation bug — superseded by cycle 7.'
-  - rationale: 'Cycle 7 (STRONGER CLOSE — BUG-C7-001 fix): cert method + pg_ident CN map. Attack chain analysis:
+  - commit: 542e800
+    rationale: 'Cycle 7/8 (STRONGER CLOSE — BUG-C7-001 fix): cert method + pg_ident CN map. Attack chain analysis:
       cert method implies verify-full — CN must match pg_ident map exactly. pg_ident map restricts to ONLY CN=pgbouncer-auth
       (main pgbouncer) and CN=letta-pgbouncer (letta sidecar). All 11 other data-network cert holders (gateway,
       backoffice, open-webui, otel-collector, etc.) have DIFFERENT CNs — none can impersonate pgbouncer_authenticator.
@@ -1678,7 +1679,8 @@ risks:
   - cert method (PG16 verify-full + pg_ident CN map) is architecturally stronger than SCRAM+clientcert
   status: closed
   closure_evidence:
-  - rationale: 'BUG-C7-001 fix (cycle 7): changed auth_user auth method from scram-sha-256+clientcert to cert+pg_ident.
+  - commit: 542e800
+    rationale: 'BUG-C7-001 fix (cycle 7/8): changed auth_user auth method from scram-sha-256+clientcert to cert+pg_ident.
       cert method requires pgbouncer to present its TLS client cert (pgbouncer-auth_client.crt, CN=pgbouncer-auth)
       during the TLS handshake — no SCRAM computation required. postgres verifies chain via ca_root.crt + maps CN
       to pgbouncer_authenticator via pg_ident pgb-auth-map. Platform-independent: TLS handshake is handled by OpenSSL
