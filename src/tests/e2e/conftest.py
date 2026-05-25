@@ -43,7 +43,8 @@ def _resolve_ca_cert() -> Optional[str]:
         return explicit
     candidates = [
         # macOS local deploy: docker/secrets relative to repo root
-        Path(__file__).parents[4] / "docker" / "secrets" / "ca_root.crt",
+        # parents[0]=e2e/ parents[1]=tests/ parents[2]=src/ parents[3]=repo-root/
+        Path(__file__).parents[3] / "docker" / "secrets" / "ca_root.crt",
         # Linux container or VM deploy
         Path("/run/secrets/ca_root.crt"),
     ]

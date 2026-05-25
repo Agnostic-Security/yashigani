@@ -156,8 +156,8 @@ class TestAgentDispatchLive:
         gw = self._gateway_name()
         code = (
             "import json, urllib.request, urllib.error\n"
-            f"body = json.dumps({{'model': {json.dumps(model)!r},"
-            f" 'messages': [{{'role': 'user', 'content': {json.dumps(prompt)!r}}}],"
+            f"body = json.dumps({{'model': {json.dumps(model)},"
+            f" 'messages': [{{'role': 'user', 'content': {json.dumps(prompt)}}}],"
             f" 'stream': False}}).encode()\n"
             "bearer = open('/run/secrets/yashigani_internal_bearer').read().strip()\n"
             "req = urllib.request.Request(\n"
