@@ -1397,7 +1397,7 @@ risks:
     - Network isolation limits internal-bearer exposure to mesh-internal bridge
   status: mitigated
   closure_evidence:
-    - commit: TBD-gap001-002-commit
+    - commit: cec7585
       rationale: >-
         1. _opa_models_check() coroutine added to openai_router.py: queries
            OPA /v1/data/yashigani/v1/models_list_decision after identity
@@ -1440,7 +1440,7 @@ risks:
     - PII detector on response path (when configured)
   status: mitigated
   closure_evidence:
-    - commit: TBD-gap001-002-commit
+    - commit: cec7585
       rationale: >-
         1. _opa_proxy_response_check() coroutine added to proxy.py: queries
            OPA /v1/data/yashigani/v1/proxy_response_decision after response
