@@ -1550,7 +1550,7 @@ risks:
   accepted_at: "2026-05-25"
   review_by: "2026-08-23"
   closure_evidence:
-    - commit: "<sha-placeholder>"
+    - commit: "80450ee"
       rationale: >-
         SSH-only signing scheme formally declared. GPG workflow path removed
         from .github/workflows/tag-sign.yml. docs/security/release-signing.md
