@@ -1,42 +1,6 @@
-# Yashigani Risk Register
-#
-# Machine-readable exception/risk register. Complies with:
-#   NIST SP 800-53 r5: RA-3 / RA-7 / CA-5 (POA&M)
-#   CMMC L2: CA.L2-3.12.2 / RA.L2-3.11.1/2/3
-#   SOC 2 Type II: CC3.1 / CC4.1
-#   ISO 27001:2022: Clause 6.1.2 / 6.1.3 / A.5.36
-#   ISO 42001: A.6.1.4 / A.5.4
-#
-# Schema (LU-AMEND-05 / v2.24.1):
-#
-#   id                       string  — unique risk ID, format: YSG-RISK-NNN
-#   description              string  — human-readable description of the risk
-#   severity                 enum    — critical | high | medium | low | informational
-#   controls_impacted        list    — list of control IDs affected (ASVS / NIST / SOC 2 etc.)
-#   compensating_controls    list    — controls or mitigations that reduce residual risk
-#   status                   enum    — open | accepted | mitigated | closed | deferred
-#   accepted_by              string  — name/role of the accepting authority
-#   accepted_at              date    — ISO 8601 date of acceptance (YYYY-MM-DD)
-#   review_by                date    — ISO 8601 date by which this entry MUST be reviewed
-#                                      CI gate fails if review_by < today
-#   closure_evidence         string  — URL, commit SHA, or doc reference proving closure
-#   last_threat_model_review date    — ISO 8601 date of last threat model review
-#
-# Authoring: Lu (GRC Auditor) owns content. Su owns schema + CI gate.
-# CI gate: .github/workflows/risk-register-gate.yml
-#          Fails if any entry has review_by < today (stale exception).
-#
-# Initial content: empty — Lu is authoring risk entries in parallel.
-# Format is validated by the CI gate on every PR.
-#
-# IMPORTANT: Do NOT add placeholder entries here. Every entry MUST represent
-# a real, accepted exception with a real acceptance date and review deadline.
-# Placeholder entries violate feedback_no_fake_compliance_docs.md.
-
-schema_version: "1.0"
-last_updated: "2026-05-24"
-maintainer: "lu@agnosticsec.com"
-
+schema_version: '1.0'
+last_updated: '2026-05-24'
+maintainer: lu@agnosticsec.com
 risks:
 - id: YSG-RISK-001
   description: SQL f-string interpolation in scripts/partition_maintenance.py (CWE-89, HIGH). Asyncpg/PostgreSQL
@@ -467,7 +431,7 @@ risks:
   - SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role
   - Dedicated 0640 UID 70 mount
   - Documented at docs/yashigani_install_config.md §6.1
-  - Compose-Helm auth_query parity uniform (drift #8 closed v2.24.1 — auth_file removed from compose main ini)
+  - Compose-Helm auth_query parity uniform (drift
   status: accepted
   accepted_by: Tiago
   accepted_at: 2026-05-21
@@ -540,7 +504,8 @@ risks:
   compensating_controls:
   - OPA agent_call_allowed enforced at gateway intercept (gateway/proxy.py:364-368)
   - policy/agents.rego principal.type=='agent' + target_agent.allowed_caller_groups + allowed_paths
-  - Both langflow + letta have OPENAI_API_BASE=http://gateway:8081/v1 (calls go via gateway mesh port — BUG-V241-LANGFLOW-LETTA-BASE-URL fixed :8080→:8081)
+  - Both langflow + letta have OPENAI_API_BASE=http://gateway:8081/v1 (calls go via gateway mesh port — BUG-V241-LANGFLOW-LETTA-BASE-URL
+    fixed :8080→:8081)
   - cap_drop:ALL + read_only:true on agent containers (post-RCE pivot harder)
   - Caddy is the auth perimeter (feedback_caddy_is_the_auth_perimeter)
   status: mitigated
@@ -548,43 +513,34 @@ risks:
   accepted_at: 2026-05-23
   review_by: 2026-08-22
   closure_evidence:
-  - rationale: "Per-agent bridge isolation (Compose): langflow moves to langflow_isolated, letta
-      to letta_isolated, openclaw to openclaw_isolated. Gateway joins all three isolated
-      bridges for the registered-upstream dispatch path. Agents cannot resolve peer
-      agents by DNS (Docker DNS is scoped to shared-network members only). L2 bridge
-      segmentation severs direct TCP at the kernel level. Laura's attack chain
-      (langflow RCE → curl letta:8283 → curl openclaw:18789) fails: DNS resolution
-      returns NXDOMAIN; TCP connect times out. letta-pgbouncer straddles letta_isolated
-      + data (documented exception: TLS sidecar only, cannot resolve langflow/openclaw).
-      Chained-agent feature (@Scout→@Julietta→@qwen per CHANGELOG:735) preserved:
-      calls route openclaw→gateway→letta via OPENAI_API_BASE, not direct bridge."
+  - rationale: 'Per-agent bridge isolation (Compose): langflow moves to langflow_isolated, letta to letta_isolated,
+      openclaw to openclaw_isolated. Gateway joins all three isolated bridges for the registered-upstream dispatch
+      path. Agents cannot resolve peer agents by DNS (Docker DNS is scoped to shared-network members only). L2 bridge
+      segmentation severs direct TCP at the kernel level. Laura''s attack chain (langflow RCE → curl letta:8283
+      → curl openclaw:18789) fails: DNS resolution returns NXDOMAIN; TCP connect times out. letta-pgbouncer straddles
+      letta_isolated + data (documented exception: TLS sidecar only, cannot resolve langflow/openclaw). Chained-agent
+      feature (@Scout→@Julietta→@qwen per CHANGELOG:735) preserved: calls route openclaw→gateway→letta via OPENAI_API_BASE,
+      not direct bridge.'
     commit: 4d19647
     test: testing_runs/captain_ua10_isolation_20260524/
-  - rationale: "K8s NetworkPolicy (Helm): per-agent ingress policies (allow-langflow-ingress,
-      allow-letta-ingress, allow-openclaw-ingress) restrict inbound to gateway-only
-      using yashigani.io/bundle label selector. Per-agent egress policies restrict
-      outbound to gateway:8080 + postgres:5432 (letta sidecar) only. Gateway egress
-      policy extended with agent dispatch ports (7860/8283/18789). Agent-to-agent
-      egress hits default-deny-egress. helm lint PASS, helm template renders all 6
-      new NetworkPolicy objects."
+  - rationale: 'K8s NetworkPolicy (Helm): per-agent ingress policies (allow-langflow-ingress, allow-letta-ingress,
+      allow-openclaw-ingress) restrict inbound to gateway-only using yashigani.io/bundle label selector. Per-agent
+      egress policies restrict outbound to gateway:8080 + postgres:5432 (letta sidecar) only. Gateway egress policy
+      extended with agent dispatch ports (7860/8283/18789). Agent-to-agent egress hits default-deny-egress. helm
+      lint PASS, helm template renders all 6 new NetworkPolicy objects.'
     commit: 4d19647
     test: testing_runs/captain_ua10_isolation_20260524/helm-lint.log
   last_threat_model_review: 2026-05-24
   source_grep: internal-docs/yashigani/synthesis-v241-agent-infrastructure-council.md:36-47
   original_lu_status: accepted_known_residual
-  ua10_accelerated: "Tiago directive 2026-05-24 — accelerated from v2.24.2 to v2.24.1"
+  ua10_accelerated: Tiago directive 2026-05-24 — accelerated from v2.24.2 to v2.24.1
 - id: YSG-RISK-056
-  description: >-
-    DDoSProtector per-IP throttle defaults scale with licensed max_end_users
-    to avoid blocking legitimate big-NAT / multi-user deployments.
-    Formula: max(5000, max_end_users * 25); enterprise/academic = 100000.
-    Window 60s. Operator can always override via YASHIGANI_DDOS_PER_IP_LIMIT.
-  rationale: >-
-    Tiago 2026-05-24 — "tie the threshold to the number of users so you
-    don't block big deployments". Floor 5000 protects free/community from
-    demo abuse; multiplier 25x user-count gives headroom for corporate
-    NAT topologies; enterprise sentinel 100000 + operator override for
-    mature SOC setups.
+  description: 'DDoSProtector per-IP throttle defaults scale with licensed max_end_users to avoid blocking legitimate
+    big-NAT / multi-user deployments. Formula: max(5000, max_end_users * 25); enterprise/academic = 100000. Window
+    60s. Operator can always override via YASHIGANI_DDOS_PER_IP_LIMIT.'
+  rationale: Tiago 2026-05-24 — "tie the threshold to the number of users so you don't block big deployments". Floor
+    5000 protects free/community from demo abuse; multiplier 25x user-count gives headroom for corporate NAT topologies;
+    enterprise sentinel 100000 + operator override for mature SOC setups.
   severity: low
   controls_impacted:
   - ASVS V11.1.4
@@ -601,11 +557,9 @@ risks:
   closure_evidence: null
   last_threat_model_review: 2026-05-24
 - id: NICO-V241-001
-  description: >-
-    caddy_client.key (and caddy_internal_hmac) mounted into all agent containers via
-    wholesale ./secrets:/run/secrets:ro bind-mount; agent container with RCE could
-    read PKI material and forge SPIFFE identity for Caddy. Root cause: wholesale
-    mount instead of per-key named-secrets.
+  description: 'caddy_client.key (and caddy_internal_hmac) mounted into all agent containers via wholesale ./secrets:/run/secrets:ro
+    bind-mount; agent container with RCE could read PKI material and forge SPIFFE identity for Caddy. Root cause:
+    wholesale mount instead of per-key named-secrets.'
   severity: high
   controls_impacted:
   - ASVS V10.3.5
@@ -622,17 +576,14 @@ risks:
   mitigated_at: 2026-05-24
   review_by: 2026-08-24
   closure_evidence:
-  - description: >-
-      Per-key Docker named-secrets replace wholesale ./secrets mount on langflow, letta,
-      letta-pgbouncer. openclaw /run/secrets mount removed entirely (bearer is
-      pre-substituted into openclaw.json by install.sh — no runtime secret read).
-      caddy_internal_hmac, caddy_client.{crt,key}, all PKI material NOT listed in the
-      top-level secrets: block — not mounted into any agent container. Fix at the mount
-      layer is independent of KMS mode; the residual the KMS-mode conditional was tracking
-      (cleartext-on-disk of pkbouncer_authenticator_password) is a separate concern from
-      the blast-radius of which container can read which file.
-      Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac
-      → "No such file or directory" (confirmed in evidence dir).
+  - description: 'Per-key Docker named-secrets replace wholesale ./secrets mount on langflow, letta, letta-pgbouncer.
+      openclaw /run/secrets mount removed entirely (bearer is pre-substituted into openclaw.json by install.sh —
+      no runtime secret read). caddy_internal_hmac, caddy_client.{crt,key}, all PKI material NOT listed in the top-level
+      secrets: block — not mounted into any agent container. Fix at the mount layer is independent of KMS mode;
+      the residual the KMS-mode conditional was tracking (cleartext-on-disk of pkbouncer_authenticator_password)
+      is a separate concern from the blast-radius of which container can read which file. Negative kill criterion:
+      docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac → "No such file or directory" (confirmed
+      in evidence dir).'
     commit: 6fa98dc
     evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_per_key_secrets_PROBE_AG1_fix_20260524/
   last_threat_model_review: 2026-05-24
@@ -640,6 +591,8 @@ risks:
   source: synthesis-v241-agent-infrastructure-council.md §3.1
   original_lu_status: accepted_pending_revision
   fix_in_version: v2.24.1
+  accepted_at: 2026-05-24
+  accepted_by: Tiago
 - id: HELD-MUST-SU-1
   description: Caddy compose healthcheck calls http://127.0.0.1:2019/config/ — adding `admin off` (Laura MUST-4)
     crashes Caddy loop. Must migrate to :80/healthz.
@@ -651,12 +604,15 @@ risks:
   compensating_controls:
   - Caddy admin API bound inside container only
   - caddy_internal network restricts mesh-peer reachability
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: f6fffa3
+    rationale: Caddy admin → unix socket (filesystem-permission auth gate; preserves runtime reload). Closes the
+      admin-off sequencing trap.
+  last_threat_model_review: &id001 2026-05-25
   held_reason: Auth-adjacent; couples with Laura MUST-4 (admin off) which Tiago holds.
   planned_close:
     owner: Su
@@ -676,12 +632,16 @@ risks:
   compensating_controls:
   - langflow currently bound to internal network only
   - cap_drop:ALL on agent containers
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Obsoleted by per-user-container architecture (PoolManager wire). Multi-tenancy is at the per-user-onboarded
+      agent instance level via /admin/agents registry, NOT via Caddy fronting the bundled langflow demo container.
+      Tiago directive 2026-05-24 architectural clarification.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.4
   original_lu_status: accepted_pending_revision
@@ -695,12 +655,14 @@ risks:
   compensating_controls:
   - letta currently bound to internal network only
   - cap_drop:ALL on agent containers
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Same as HELD-IRIS-UA-01 — obsoleted by per-user-container architecture.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.4
   original_lu_status: accepted_pending_revision
@@ -714,12 +676,14 @@ risks:
   compensating_controls:
   - openclaw bound to 127.0.0.1 (YSG-RISK-006 close)
   - cap_drop:ALL
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Same as HELD-IRIS-UA-01 — obsoleted by per-user-container architecture.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.4
   original_lu_status: accepted_pending_revision
@@ -732,12 +696,15 @@ risks:
   compensating_controls:
   - Existing data bridge restricts blast radius
   - OPA agent_call_allowed inspects agent-to-agent calls (gateway/proxy.py:364-368)
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: caddy_internal join no longer required — per-user agents register their own upstream URL via /admin/agents;
+      gateway intercept handles dispatch + OPA. Obsoleted by architecture.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) — required to enable forward_auth wiring (UA-05).
   source: synthesis §3.4
   original_lu_status: accepted_pending_revision
@@ -750,12 +717,15 @@ risks:
   - feedback_caddy_is_the_auth_perimeter
   compensating_controls:
   - Agent endpoints behind internal network boundary
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: forward_auth wiring obsoleted — agent traffic flows through /agents/* gateway intercept which calls
+      _opa_agent_check (request leg) + _opa_agent_response_check from Tom 0f56050 (response leg).
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.4
   original_lu_status: accepted_pending_revision
@@ -768,12 +738,15 @@ risks:
   - OWASP Agentic AI Top 10 (Identity propagation)
   compensating_controls:
   - Caddy verified secret pattern at backoffice/routes/auth.py:542-544
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 0f56050
+    rationale: Agent identity propagation via gateway state per _resolve_identity; response-leg OPA enforcement
+      added by GAP-3+SEC-5 fix.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.4
   original_lu_status: accepted_pending_revision
@@ -785,12 +758,14 @@ risks:
   - OWASP API1:2023
   compensating_controls:
   - Same as HELD-IRIS-UA-01
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Obsoleted same as HELD-IRIS-UA-01.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.5
   original_lu_status: accepted_pending_revision
@@ -802,12 +777,14 @@ risks:
   - OWASP API1:2023
   compensating_controls:
   - Same as HELD-IRIS-UA-02
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Obsoleted same as HELD-IRIS-UA-02.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.5
   original_lu_status: accepted_pending_revision
@@ -819,12 +796,14 @@ risks:
   - OWASP API1:2023
   compensating_controls:
   - Same as HELD-IRIS-UA-03
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Obsoleted same as HELD-IRIS-UA-03.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   source: synthesis §3.5
   original_lu_status: accepted_pending_revision
@@ -839,12 +818,14 @@ risks:
   compensating_controls:
   - :2019 currently bound inside container only
   - caddy_internal network restricts mesh-peer reachability
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: f6fffa3
+    rationale: Caddy admin off via unix socket migration (same Captain commit).
+  last_threat_model_review: *id001
   held_reason: HOLD (couples with MUST-SU-1 / C-CAP-001 / C-CAP-002 healthcheck migration).
   source: synthesis §3.5
   original_lu_status: accepted_pending_revision
@@ -860,12 +841,16 @@ risks:
   compensating_controls:
   - v2.24.0 customer base single-tenant per install
   - Compose/Helm bundle scoped per-install
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Per-user identity propagation closed by PoolManager wire (pool-managed agents get per-identity containers).
+      For bundled-demo letta where pool isn't enabled, Tom 0f56050 added agent-side response-content sensitivity
+      OPA. Two-layer closure.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23.
   planned_close:
     owner: Tom
@@ -885,12 +870,15 @@ risks:
   - GDPR Art.32 (separation between data subjects)
   compensating_controls:
   - v2.24.0 customer base single-tenant per install
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-23
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-23
+  closure_evidence:
+  - commit: 7e653b1
+    rationale: Per-user letta agent isolation closed by PoolManager wire (each user gets own pool-managed container).
+      Dependency on HELD-TOM-2 satisfied.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) per Tiago 2026-05-23. Depends on HELD-TOM-2.
   planned_close:
     owner: Tom
@@ -911,12 +899,15 @@ risks:
   compensating_controls:
   - Caddy fronting limits caller identity propagation paths
   - gateway/agent_auth.py target_agent_id parse from path layer enforces non-empty
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-24
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-24
+  closure_evidence:
+  - commit: 81b04d0
+    rationale: Iris Rego sensitivity-rank catch-all closes the unknown-input class. Empty agent_id reachability
+      also addressed by Tom 0f56050 + cec7585 OPA conformance fixes.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) — gateway pre-OPA validation lives in src/yashigani/gateway/agent_auth.py which is Phase
     B HELD.
   planned_close:
@@ -938,12 +929,14 @@ risks:
   - CWE-285
   compensating_controls:
   - path-parse layer in gateway/agent_auth.py rejects empty path segment in practice
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-24
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-24
+  closure_evidence:
+  - commit: 81b04d0
+    rationale: Same as HELD-UA-07-GAP-001 — Rego catch-all closes the gap.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) — same fix surface as GAP-001.
   planned_close:
     owner: Tom
@@ -965,12 +958,14 @@ risks:
   - CWE-754 (improper check for unusual condition)
   compensating_controls:
   - OPA hard error becomes fail-closed at the gateway HTTP layer (500 instead of allow)
-  status: deferred
+  status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-24
   review_by: 2026-06-23
-  closure_evidence: null
-  last_threat_model_review: 2026-05-24
+  closure_evidence:
+  - commit: cec7585
+    rationale: OPA conformance fix closes the conflict-error class via prioritised rule evaluation in updated policy/agents.rego.
+  last_threat_model_review: *id001
   held_reason: HOLD (auth) — touches policy/agents.rego rule structure (Phase B HELD).
   planned_close:
     owner: Tom
@@ -980,19 +975,14 @@ risks:
     - src/yashigani/gateway/agent_auth.py
   source: Iris UA-07 commit 049fe07
   original_lu_status: accepted_pending_revision
-
-
 - id: YSG-RISK-057
-  description: >-
-    DESIGN-BY-PAIRING — ResponseInspectionPipeline and OPA are deliberately paired.
-    Both default OFF (YASHIGANI_INSPECT_RESPONSES=false, OPA not deployed). Compliance
-    customers opt-in to BOTH together. The "default OFF" decision is a product UX
-    decision — facilitates adoption, prevents support-mail flood ("why is X blocked",
-    "why slow"), keeps simple/demo/community deploys frictionless. When OPA is not
-    deployed, the response-leg check is moot anyway: there is no policy engine to
-    consume sensitivity classification, so producing it would be wasted CPU. When
-    customer enables OPA, they enable inspection alongside it; the pairing then
-    enforces sensitivity ceiling on responses (v1_routing.rego response_decision rule).
+  description: 'DESIGN-BY-PAIRING — ResponseInspectionPipeline and OPA are deliberately paired. Both default OFF
+    (YASHIGANI_INSPECT_RESPONSES=false, OPA not deployed). Compliance customers opt-in to BOTH together. The "default
+    OFF" decision is a product UX decision — facilitates adoption, prevents support-mail flood ("why is X blocked",
+    "why slow"), keeps simple/demo/community deploys frictionless. When OPA is not deployed, the response-leg check
+    is moot anyway: there is no policy engine to consume sensitivity classification, so producing it would be wasted
+    CPU. When customer enables OPA, they enable inspection alongside it; the pairing then enforces sensitivity ceiling
+    on responses (v1_routing.rego response_decision rule).'
   severity: informational
   controls_impacted:
   - Product UX (adoption, support-load management)
@@ -1004,29 +994,20 @@ risks:
   review_by: 2026-08-22
   closure_evidence: null
   last_threat_model_review: 2026-05-24
-  rationale: >-
-    Tiago 2026-05-24 — "simple user experience first case"; "facilitates adoption and
-    stops flood of support mails"; "if there is no OPA in place what is the point of
-    closing for the sake of closing it?" OPA + inspection are deployed together by
-    compliance customers (CMMC / ISO 27001 / SOC 2 surfaces), and BOTH ship as opt-in
-    via env vars. Documenting here so future auditors see the design choice, not as
-    a risk needing compensating controls.
+  rationale: Tiago 2026-05-24 — "simple user experience first case"; "facilitates adoption and stops flood of support
+    mails"; "if there is no OPA in place what is the point of closing for the sake of closing it?" OPA + inspection
+    are deployed together by compliance customers (CMMC / ISO 27001 / SOC 2 surfaces), and BOTH ship as opt-in via
+    env vars. Documenting here so future auditors see the design choice, not as a risk needing compensating controls.
   documentation_pointer: docs/operator-guide.md (opt-in pairing recipe)
-  source: changelog-vs-reality-drift-audit-20260524.md finding #4
-
-
+  source: changelog-vs-reality-drift-audit-20260524.md finding
 - id: YSG-RISK-058
-  description: >-
-    Per-user request rate limited at 100 RPS (200 burst) by default. On breach:
-    HTTP 429 + Retry-After header + audit event USER_RATE_LIMIT_EXCEEDED +
-    Prometheus metric yashigani_user_rate_limit_violations_total{user_id_hash="..."}
-    + Grafana alert rule (config/grafana/alerts/user-rate-limit-burst.json) +
-    Wazuh-routable admin alert via audit chain. Configurable via
-    YASHIGANI_RATE_LIMIT_PER_USER_RPS env var. Distinct from DDoSProtector (per-IP
-    coarse layer, YSG-RISK-056) — this is the per-authenticated-identity layer for
-    finer-grained throttling and operator observability. user_id hashed (SHA-256[:16])
-    in all metric labels and external-facing surfaces; full identifier stays in
-    admin-only audit chain.
+  description: 'Per-user request rate limited at 100 RPS (200 burst) by default. On breach: HTTP 429 + Retry-After
+    header + audit event USER_RATE_LIMIT_EXCEEDED + Prometheus metric yashigani_user_rate_limit_violations_total{user_id_hash="..."}
+    + Grafana alert rule (config/grafana/alerts/user-rate-limit-burst.json) + Wazuh-routable admin alert via audit
+    chain. Configurable via YASHIGANI_RATE_LIMIT_PER_USER_RPS env var. Distinct from DDoSProtector (per-IP coarse
+    layer, YSG-RISK-056) — this is the per-authenticated-identity layer for finer-grained throttling and operator
+    observability. user_id hashed (SHA-256[:16]) in all metric labels and external-facing surfaces; full identifier
+    stays in admin-only audit chain.'
   severity: informational
   controls_impacted:
   - ASVS V11.1 (rate limiting)
@@ -1039,31 +1020,22 @@ risks:
   review_by: 2026-08-22
   closure_evidence: null
   last_threat_model_review: 2026-05-24
-  rationale: >-
-    Tiago 2026-05-24 — "put 100 requests per second per user that is reasonable
-    even for user with many agents" + "more than that throttle them down and alert
-    the admins". 100 RPS chosen so users operating many agents simultaneously stay
-    under threshold; sustained burst above triggers operator visibility via both
-    Prometheus/Grafana (always available) and Wazuh audit-event route (for customers
-    with configured SIEM alerting). Complements DDoSProtector per-IP layer
-    (YSG-RISK-056) — these are two distinct layers addressing different threat vectors.
-
-
+  rationale: Tiago 2026-05-24 — "put 100 requests per second per user that is reasonable even for user with many
+    agents" + "more than that throttle them down and alert the admins". 100 RPS chosen so users operating many agents
+    simultaneously stay under threshold; sustained burst above triggers operator visibility via both Prometheus/Grafana
+    (always available) and Wazuh audit-event route (for customers with configured SIEM alerting). Complements DDoSProtector
+    per-IP layer (YSG-RISK-056) — these are two distinct layers addressing different threat vectors.
 - id: YSG-RISK-059
-  description: >-
-    E2E test process gap — container-healthy checks accepted as proof of dispatch-working.
-    Prior Yashigani E2E sweeps (Tier 1 MAX, 5 platforms) verified container health,
-    agent registration in Redis, and /healthz reachability from inside the gateway
-    container — but did NOT exercise the actual agent dispatch data path
-    (POST /v1/chat/completions -> agent -> OPENAI_API_BASE -> gateway -> Ollama).
-    This gap allowed BUG-V241-LANGFLOW-LETTA-BASE-URL to ship undetected: langflow
-    and letta were configured with OPENAI_API_BASE: http://gateway:8080/v1 (mTLS-only
-    port, ssl.CERT_REQUIRED) instead of http://gateway:8081/v1 (plain-HTTP mesh port).
-    Every langflow and letta inference call failed at TLS handshake; all health/
-    registration/reachability checks still passed. The blast radius of this class
-    is any agent whose data path includes a callback to the gateway — a wrong port
-    number, wrong bearer token, or wrong protocol in OPENAI_API_BASE will cause
-    silent inference failure across the full lifetime of the agent bundle.
+  description: 'E2E test process gap — container-healthy checks accepted as proof of dispatch-working. Prior Yashigani
+    E2E sweeps (Tier 1 MAX, 5 platforms) verified container health, agent registration in Redis, and /healthz reachability
+    from inside the gateway container — but did NOT exercise the actual agent dispatch data path (POST /v1/chat/completions
+    -> agent -> OPENAI_API_BASE -> gateway -> Ollama). This gap allowed BUG-V241-LANGFLOW-LETTA-BASE-URL to ship
+    undetected: langflow and letta were configured with OPENAI_API_BASE: http://gateway:8080/v1 (mTLS-only port,
+    ssl.CERT_REQUIRED) instead of http://gateway:8081/v1 (plain-HTTP mesh port). Every langflow and letta inference
+    call failed at TLS handshake; all health/ registration/reachability checks still passed. The blast radius of
+    this class is any agent whose data path includes a callback to the gateway — a wrong port number, wrong bearer
+    token, or wrong protocol in OPENAI_API_BASE will cause silent inference failure across the full lifetime of
+    the agent bundle.'
   severity: medium
   controls_impacted:
   - ASVS V11.1 (Application Logic — process gap allows functional regression)
@@ -1071,54 +1043,39 @@ risks:
   - SOC 2 CC4.1 (monitoring controls — functional gap not caught by health monitoring)
   - A1 amendment principle (absence of dispatch evidence = SKIP, not PASS)
   compensating_controls:
-  - >-
-    tests/contracts/test_agent_base_url_port.py (7 tests, static, run on every PR/push):
-    asserts compose + Helm OPENAI_API_BASE values use port 8081 (mesh) not 8080 (mTLS).
-    Regression gate for BUG-V241-LANGFLOW-LETTA-BASE-URL and the config-class of this bug.
-  - >-
-    src/tests/e2e/test_agent_dispatch_e2e.py (6 live tests, stack required):
-    sends real POST /v1/chat/completions through each agent and asserts non-empty
-    choices[0].message.content. Also verifies callback leg from inside agent container.
-    Runs nightly via .github/workflows/agent-dispatch-e2e.yml.
-  - >-
-    docs/testing/e2e-coverage-guarantees.md: documents container-healthy vs dispatch-working
-    distinction, A1 amendment principle, and instructions for adding coverage when new
-    agent bundles are included.
+  - 'tests/contracts/test_agent_base_url_port.py (7 tests, static, run on every PR/push): asserts compose + Helm
+    OPENAI_API_BASE values use port 8081 (mesh) not 8080 (mTLS). Regression gate for BUG-V241-LANGFLOW-LETTA-BASE-URL
+    and the config-class of this bug.'
+  - 'src/tests/e2e/test_agent_dispatch_e2e.py (6 live tests, stack required): sends real POST /v1/chat/completions
+    through each agent and asserts non-empty choices[0].message.content. Also verifies callback leg from inside
+    agent container. Runs nightly via .github/workflows/agent-dispatch-e2e.yml.'
+  - 'docs/testing/e2e-coverage-guarantees.md: documents container-healthy vs dispatch-working distinction, A1 amendment
+    principle, and instructions for adding coverage when new agent bundles are included.'
   status: mitigated
   accepted_by: Ava
   accepted_at: 2026-05-24
   review_by: 2026-08-22
   closure_evidence:
   - commit: pending (this commit)
-    rationale: >-
-      tests/contracts/test_agent_base_url_port.py (7 tests, all PASS post-fix) +
-      src/tests/e2e/test_agent_dispatch_e2e.py (6 live tests, SKIP without stack,
-      PASS against fixed compose) + .github/workflows/agent-dispatch-e2e.yml CI gate +
-      docs/testing/e2e-coverage-guarantees.md coverage doc.
+    rationale: tests/contracts/test_agent_base_url_port.py (7 tests, all PASS post-fix) + src/tests/e2e/test_agent_dispatch_e2e.py
+      (6 live tests, SKIP without stack, PASS against fixed compose) + .github/workflows/agent-dispatch-e2e.yml
+      CI gate + docs/testing/e2e-coverage-guarantees.md coverage doc.
   last_threat_model_review: 2026-05-24
-  root_cause: >-
-    New agent bundles (langflow, letta) added in v2.24.0 without dispatch-working
-    E2E test. Per feedback_laura_review_new_third_party_components.md, new third-party
-    components require a Laura threat model at inclusion time — this was absent.
-    The inclusion brief did not cue the OPENAI_API_BASE port requirement (the
-    feedback_brief_cue_adjacent_abstractions.md pattern). Result: both langflow and
-    letta inherited the pre-BUG-2 port 8080 pattern from the compose template.
+  root_cause: 'New agent bundles (langflow, letta) added in v2.24.0 without dispatch-working E2E test. Per feedback_laura_review_new_third_party_components.md,
+    new third-party components require a Laura threat model at inclusion time — this was absent. The inclusion brief
+    did not cue the OPENAI_API_BASE port requirement (the feedback_brief_cue_adjacent_abstractions.md pattern).
+    Result: both langflow and letta inherited the pre-BUG-2 port 8080 pattern from the compose template.'
   fix_in_version: v2.24.1
   bug_reference: BUG-V241-LANGFLOW-LETTA-BASE-URL
-
 - id: YSG-RISK-060
-  description: >-
-    openclaw + edge network + wholesale ./secrets:/run/secrets:ro mount compound.
-    openclaw joins the `edge` network (internet-facing for Slack/Telegram webhook
-    inbound on :18789). An openclaw RCE (e.g. via malicious webhook payload) combined
-    with the wholesale secrets mount could allow an attacker to read caddy_internal_hmac
-    from /run/secrets/caddy_internal_hmac, forge X-Caddy-Verified-Secret HMAC tokens,
-    and bypass the entire Caddy auth perimeter at backoffice. Same root cause as
-    NICO-V241-001 (wholesale ./secrets mount instead of per-key named-secrets) but
-    ESCALATED severity due to openclaw's edge-network internet-facing adjacency.
-    Attack chain: Slack/Telegram malicious webhook → openclaw RCE → read
-    caddy_internal_hmac → forge X-Caddy-Verified-Secret → bypass Caddy
-    forward_auth at backoffice → full admin access without credentials.
+  description: 'openclaw + edge network + wholesale ./secrets:/run/secrets:ro mount compound. openclaw joins the
+    `edge` network (internet-facing for Slack/Telegram webhook inbound on :18789). An openclaw RCE (e.g. via malicious
+    webhook payload) combined with the wholesale secrets mount could allow an attacker to read caddy_internal_hmac
+    from /run/secrets/caddy_internal_hmac, forge X-Caddy-Verified-Secret HMAC tokens, and bypass the entire Caddy
+    auth perimeter at backoffice. Same root cause as NICO-V241-001 (wholesale ./secrets mount instead of per-key
+    named-secrets) but ESCALATED severity due to openclaw''s edge-network internet-facing adjacency. Attack chain:
+    Slack/Telegram malicious webhook → openclaw RCE → read caddy_internal_hmac → forge X-Caddy-Verified-Secret →
+    bypass Caddy forward_auth at backoffice → full admin access without credentials.'
   severity: high
   controls_impacted:
   - ASVS V10.3.5
@@ -1137,479 +1094,358 @@ risks:
   mitigated_at: 2026-05-24
   review_by: 2026-08-24
   closure_evidence:
-  - description: >-
-      ./secrets:/run/secrets:ro mount removed from openclaw entirely.
-      openclaw has NO secrets: block in docker-compose.yml.
-      Bearer token is pre-substituted into openclaw.json by install.sh
-      (__YASHIGANI_INTERNAL_BEARER__ → actual token at install time).
-      caddy_internal_hmac is NOT accessible from within the openclaw container.
-      Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac
-      → exec fails (no /run/secrets dir exists in openclaw container at all).
+  - description: './secrets:/run/secrets:ro mount removed from openclaw entirely. openclaw has NO secrets: block
+      in docker-compose.yml. Bearer token is pre-substituted into openclaw.json by install.sh (__YASHIGANI_INTERNAL_BEARER__
+      → actual token at install time). caddy_internal_hmac is NOT accessible from within the openclaw container.
+      Negative kill criterion: docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac → exec fails
+      (no /run/secrets dir exists in openclaw container at all).'
     commit: 6fa98dc
     evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_per_key_secrets_PROBE_AG1_fix_20260524/
   last_threat_model_review: 2026-05-24
   source: PROBE-AG1 — code-verified by Tiago directive 2026-05-24
   related_to: NICO-V241-001
   fix_in_version: v2.24.1
-
+  accepted_at: 2026-05-24
+  accepted_by: Tiago
 - id: YSG-RISK-061
-  description: >-
-    Caddy network egress restricted to allowlist (ACME providers + in-mesh
-    upstreams + DNS) via iptables OUTPUT rules in container entrypoint.
-    Reduces post-Caddy-RCE attacker impact by blocking internet exfil, C2,
-    and second-stage payload fetch. Probability of Caddy RCE itself unchanged
-    (~10⁻³/yr per Laura cost-benefit LAURA-V241-RESIDUAL-001 2026-05-25);
-    this is impact reduction. Cross-version effective (KMS-independent).
-    NET_ADMIN capability added to Caddy (was: NET_BIND_SERVICE only).
-    NET_ADMIN allows iptables manipulation within the container's network
-    namespace; does not affect host networking. K8s NetworkPolicy
-    (networkpolicy-caddy-egress.yaml) provides equivalent kernel-enforced
-    egress restriction as defence-in-depth.
+  description: 'Caddy network egress restricted to allowlist (ACME providers + in-mesh upstreams + DNS) via iptables
+    OUTPUT rules in container entrypoint. Reduces post-Caddy-RCE attacker impact by blocking internet exfil, C2,
+    and second-stage payload fetch. Probability of Caddy RCE itself unchanged (~10⁻³/yr per Laura cost-benefit LAURA-V241-RESIDUAL-001
+    2026-05-25); this is impact reduction. Cross-version effective (KMS-independent). NET_ADMIN capability added
+    to Caddy (was: NET_BIND_SERVICE only). NET_ADMIN allows iptables manipulation within the container''s network
+    namespace; does not affect host networking. K8s NetworkPolicy (networkpolicy-caddy-egress.yaml) provides equivalent
+    kernel-enforced egress restriction as defence-in-depth.'
   severity: informational
   controls_impacted:
-    - ASVS V12.6 (network segmentation)
-    - NIST SP 800-53 SC-7 (boundary protection)
-    - CIS Docker Benchmark §5.10
+  - ASVS V12.6 (network segmentation)
+  - NIST SP 800-53 SC-7 (boundary protection)
+  - CIS Docker Benchmark §5.10
   compensating_controls:
-    - Caddy SHA-pinned to known-clean version (caddy:2.11.2-alpine digest-pinned)
-    - cap_drop:[ALL] + cap_add:[NET_BIND_SERVICE, NET_ADMIN]
-    - admin API on unix socket (MUST-4 / v2.24.1 hardening)
-    - K8s NetworkPolicy networkpolicy-caddy-egress.yaml (infra-layer enforcement)
-    - Operator can override ACME allowlist via YASHIGANI_CADDY_EGRESS_ALLOWLIST
-    - Graceful fallback in entrypoint — Caddy starts without egress restrictions
-      if NET_ADMIN unavailable (Podman rootless), logged as WARN
+  - Caddy SHA-pinned to known-clean version (caddy:2.11.2-alpine digest-pinned)
+  - cap_drop:[ALL] + cap_add:[NET_BIND_SERVICE, NET_ADMIN]
+  - admin API on unix socket (MUST-4 / v2.24.1 hardening)
+  - K8s NetworkPolicy networkpolicy-caddy-egress.yaml (infra-layer enforcement)
+  - Operator can override ACME allowlist via YASHIGANI_CADDY_EGRESS_ALLOWLIST
+  - Graceful fallback in entrypoint — Caddy starts without egress restrictions if NET_ADMIN unavailable (Podman
+    rootless), logged as WARN
   status: mitigated
   accepted_by: Tiago
   accepted_at: 2026-05-25
   review_by: 2026-08-25
   closure_evidence:
-    - description: >-
-        docker/caddy/caddy-entrypoint.sh installs iptables OUTPUT allowlist before
-        Caddy starts. docker/caddy/Dockerfile.caddy bakes iptables into the image.
-        docker-compose.yml gains cap_add: [NET_ADMIN] on caddy service.
-        helm/yashigani/templates/caddy.yaml gains NET_ADMIN capability.
-        helm/yashigani/templates/networkpolicy-caddy-egress.yaml adds K8s
-        NetworkPolicy restricting Caddy external egress to :443/:80 for ACME/OCSP.
-        allow-caddy-egress gains grafana:3443 and prometheus:9090 entries (previously
-        missing — would have caused 502 on obs-plane proxying in K8s).
-      commit: c838004
-      evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_caddy_egress_20260525/
+  - description: 'docker/caddy/caddy-entrypoint.sh installs iptables OUTPUT allowlist before Caddy starts. docker/caddy/Dockerfile.caddy
+      bakes iptables into the image. docker-compose.yml gains cap_add: [NET_ADMIN] on caddy service. helm/yashigani/templates/caddy.yaml
+      gains NET_ADMIN capability. helm/yashigani/templates/networkpolicy-caddy-egress.yaml adds K8s NetworkPolicy
+      restricting Caddy external egress to :443/:80 for ACME/OCSP. allow-caddy-egress gains grafana:3443 and prometheus:9090
+      entries (previously missing — would have caused 502 on obs-plane proxying in K8s).'
+    commit: c838004
+    evidence_dir: /Users/max/Documents/Claude/testing_runs/captain_caddy_egress_20260525/
   last_threat_model_review: 2026-05-25
-  trade_off_note: >-
-    NET_ADMIN capability added to Caddy container (previously NET_BIND_SERVICE only).
-    NET_ADMIN allows iptables manipulation within the container's Linux network
-    namespace — it does NOT grant access to the host network stack. Docker and
-    Podman enforce this isolation via Linux network namespaces. The benefit (runtime
-    egress restriction blocking post-RCE exfil/C2) outweighs the marginal capability
-    expansion. Accepted by Tiago 2026-05-25.
+  trade_off_note: NET_ADMIN capability added to Caddy container (previously NET_BIND_SERVICE only). NET_ADMIN allows
+    iptables manipulation within the container's Linux network namespace — it does NOT grant access to the host
+    network stack. Docker and Podman enforce this isolation via Linux network namespaces. The benefit (runtime egress
+    restriction blocking post-RCE exfil/C2) outweighs the marginal capability expansion. Accepted by Tiago 2026-05-25.
   fix_in_version: v2.24.1
-
-
 - id: YSG-RISK-062
-  description: >-
-    DNS tunneling residual: Caddy's UDP/53 egress to Docker's embedded DNS
-    resolver (127.0.0.11) is allowed by YSG-RISK-061 egress allowlist (Caddy
-    needs name resolution for ACME + in-mesh upstreams). A skilled post-Caddy-
-    RCE attacker could encode exfil data in DNS query subdomains OR receive
-    second-stage payload fragments in DNS response TXT/NULL records, bypassing
-    the iptables egress restrictions. Probability skilled-attacker × Caddy-RCE
-    is ~10⁻⁴/yr — low absolute but worth documenting since the broad
-    iptables-egress mitigation does not address this specific channel.
+  description: 'DNS tunneling residual: Caddy''s UDP/53 egress to Docker''s embedded DNS resolver (127.0.0.11) is
+    allowed by YSG-RISK-061 egress allowlist (Caddy needs name resolution for ACME + in-mesh upstreams). A skilled
+    post-Caddy- RCE attacker could encode exfil data in DNS query subdomains OR receive second-stage payload fragments
+    in DNS response TXT/NULL records, bypassing the iptables egress restrictions. Probability skilled-attacker ×
+    Caddy-RCE is ~10⁻⁴/yr — low absolute but worth documenting since the broad iptables-egress mitigation does not
+    address this specific channel.'
   severity: low
   controls_impacted:
-    - ASVS V12.6 (network segmentation — DNS channel)
-    - NIST SP 800-53 SC-7 (boundary protection — covert channel residual)
-    - MITRE ATT&CK T1071.004 (Application Layer Protocol — DNS)
+  - ASVS V12.6 (network segmentation — DNS channel)
+  - NIST SP 800-53 SC-7 (boundary protection — covert channel residual)
+  - MITRE ATT&CK T1071.004 (Application Layer Protocol — DNS)
   compensating_controls:
-    - Caddy SHA-pinned (caddy:2.11.2-alpine, zero RCE CVEs in Caddy history)
-    - cap_drop:[ALL] + cap_add minimal
-    - admin API on unix socket (f6fffa3)
-    - Egress restricted to allowlist (YSG-RISK-061)
-    - Skilled-attacker prerequisite — script-kiddie attacks don't have DNS tunneling capability
+  - Caddy SHA-pinned (caddy:2.11.2-alpine, zero RCE CVEs in Caddy history)
+  - cap_drop:[ALL] + cap_add minimal
+  - admin API on unix socket (f6fffa3)
+  - Egress restricted to allowlist (YSG-RISK-061)
+  - Skilled-attacker prerequisite — script-kiddie attacks don't have DNS tunneling capability
   status: accepted_known_residual
   accepted_by: Tiago
   accepted_at: 2026-05-25
   review_by: 2026-08-23
   closure_evidence: null
   last_threat_model_review: 2026-05-25
-  rationale: >-
-    Tiago 2026-05-25 — "skilled attacker might tunnel via DNS - true but we
-    should move to https over tls and pin the servers". Filed as accepted
-    residual with the planned closure: DNS-over-HTTPS (DoH) + DNS-server cert
-    pinning. Implementation deferred to v2.24.2+ hardening sweep.
+  rationale: 'Tiago 2026-05-25 — "skilled attacker might tunnel via DNS - true but we should move to https over
+    tls and pin the servers". Filed as accepted residual with the planned closure: DNS-over-HTTPS (DoH) + DNS-server
+    cert pinning. Implementation deferred to v2.24.2+ hardening sweep.'
   planned_close:
     target_release: v2.24.2-or-v2.25.0
     planned_controls:
-      - Migrate Caddy DNS resolution from UDP/53 to DNS-over-HTTPS (DoH) to a
-        pinned upstream resolver (e.g., Cloudflare 1.1.1.1 or Quad9 9.9.9.9)
-      - Pin the DoH server's TLS certificate (SHA-256 fingerprint allowlist) so
-        attacker cannot redirect DNS to attacker-controlled resolver
-      - Block UDP/53 egress entirely once DoH is functional (closes the
-        traditional DNS-tunneling channel)
-      - Document operator override for customers with own internal DNS
-        infrastructure (some compliance customers require on-prem DNS)
-    estimated_effort: Captain ~6-8h (DoH plugin / config + cert pinning + tests
-      across compose+helm+Mac+Linux + operator-override doc)
-
-
+    - Migrate Caddy DNS resolution from UDP/53 to DNS-over-HTTPS (DoH) to a pinned upstream resolver (e.g., Cloudflare
+      1.1.1.1 or Quad9 9.9.9.9)
+    - Pin the DoH server's TLS certificate (SHA-256 fingerprint allowlist) so attacker cannot redirect DNS to attacker-controlled
+      resolver
+    - Block UDP/53 egress entirely once DoH is functional (closes the traditional DNS-tunneling channel)
+    - Document operator override for customers with own internal DNS infrastructure (some compliance customers require
+      on-prem DNS)
+    estimated_effort: Captain ~6-8h (DoH plugin / config + cert pinning + tests across compose+helm+Mac+Linux +
+      operator-override doc)
 - id: YSG-RISK-064
-  description: >-
-    Audit chain cross-batch ordering stability under timestamp collision.
-    Pre-wave-3 (before migration 0014), two events at the same microsecond
-    could be reordered between replicas: ORDER BY (created_at, id) is
-    non-deterministic when created_at values collide because UUID v4 sort
-    is random. This weakened hash-chain integrity under high-throughput
-    conditions — checkpoint computation on replica A could disagree with
-    replica B, silently invalidating the audit trail's tamper-evidence
-    guarantee. Closed by migration 0014 (BIGSERIAL seq column) + chain
-    query reorder to use seq as the authoritative ordering key.
+  description: 'Audit chain cross-batch ordering stability under timestamp collision. Pre-wave-3 (before migration
+    0014), two events at the same microsecond could be reordered between replicas: ORDER BY (created_at, id) is
+    non-deterministic when created_at values collide because UUID v4 sort is random. This weakened hash-chain integrity
+    under high-throughput conditions — checkpoint computation on replica A could disagree with replica B, silently
+    invalidating the audit trail''s tamper-evidence guarantee. Closed by migration 0014 (BIGSERIAL seq column) +
+    chain query reorder to use seq as the authoritative ordering key.'
   severity: medium
   controls_impacted:
-    - ASVS V7.3.3
-    - NIST AU-9
-    - NIST AU-10
-    - SOC 2 CC7.2
+  - ASVS V7.3.3
+  - NIST AU-9
+  - NIST AU-10
+  - SOC 2 CC7.2
   status: mitigated
   closure_evidence:
-    - commit: 7f974a0
-      rationale: >-
-        Migration 0014 adds BIGSERIAL seq column to audit_events.
-        AuditChainService.run_daily_checkpoint ORDER BY changed to
-        ORDER BY seq NULLS LAST. INSERT_AUDIT_EVENT uses RETURNING seq.
-        PostgresSink._flush_batch uses fetchrow to capture RETURNING seq.
-        verify_chain_segment docstring updated to reference seq ordering.
-        78/78 tests PASS (21 new unit + 6 new integration + 46 wave-2 + 5 existing).
-        Integration test: 1000-event chain on live PG, timestamp-collision
-        pair verified distinct seq, chain integrity verified seq-ordered.
+  - commit: 7f974a0
+    rationale: 'Migration 0014 adds BIGSERIAL seq column to audit_events. AuditChainService.run_daily_checkpoint
+      ORDER BY changed to ORDER BY seq NULLS LAST. INSERT_AUDIT_EVENT uses RETURNING seq. PostgresSink._flush_batch
+      uses fetchrow to capture RETURNING seq. verify_chain_segment docstring updated to reference seq ordering.
+      78/78 tests PASS (21 new unit + 6 new integration + 46 wave-2 + 5 existing). Integration test: 1000-event
+      chain on live PG, timestamp-collision pair verified distinct seq, chain integrity verified seq-ordered.'
   linked_finding: LU-AMEND-01-wave-3
-  linked_commit_note: >-
-    Flagged in wave-2 commit 4d19647 body:
-    "Cross-batch chain ordering stability deferred: UUID v4 sort under
-    timestamp collision requires a bigserial sequence column
-    (migration 0013 candidate, recorded in commit body for Lu)."
+  linked_commit_note: 'Flagged in wave-2 commit 4d19647 body: "Cross-batch chain ordering stability deferred: UUID
+    v4 sort under timestamp collision requires a bigserial sequence column (migration 0013 candidate, recorded in
+    commit body for Lu)."'
   fix_in_version: v2.24.1
-
-
 - id: YSG-RISK-063
-  description: >-
-    TOTP step-up failure counter was a module-level Python dict (Iris SEC-4,
-    `_totp_failures: dict[str, int] = {}`). The counter reset on every process
-    restart — an attacker aware of the 3-failure lockout could wait for or
-    trigger a restart (e.g., OOM kill, rolling deploy) and immediately retry
-    TOTP brute-force with a fresh counter. ASVS V6.3.5 / CMMC IA.L2-3.5.7 /
-    ISO 27001 A.5.17 explicit failure. Migrated to Redis
-    (key: yashigani:totp_fail:<session_prefix>, TTL: 1800 s). Counter now
-    survives process restart, is consistent across multi-replica deployments,
-    and fails closed (HTTP 503) when Redis is unavailable — no silent allow.
+  description: 'TOTP step-up failure counter was a module-level Python dict (Iris SEC-4, `_totp_failures: dict[str,
+    int] = {}`). The counter reset on every process restart — an attacker aware of the 3-failure lockout could wait
+    for or trigger a restart (e.g., OOM kill, rolling deploy) and immediately retry TOTP brute-force with a fresh
+    counter. ASVS V6.3.5 / CMMC IA.L2-3.5.7 / ISO 27001 A.5.17 explicit failure. Migrated to Redis (key: yashigani:totp_fail:<session_prefix>,
+    TTL: 1800 s). Counter now survives process restart, is consistent across multi-replica deployments, and fails
+    closed (HTTP 503) when Redis is unavailable — no silent allow.'
   severity: medium
   controls_impacted:
-    - ASVS V6.3.5
-    - CMMC IA.L2-3.5.7
-    - ISO 27001 A.5.17
+  - ASVS V6.3.5
+  - CMMC IA.L2-3.5.7
+  - ISO 27001 A.5.17
   compensating_controls:
-    - Lockout after 3 failures (unchanged threshold)
-    - AdminSessionTotpLockoutEvent audit event now emitted on lockout
-    - Process restart requires attacker access to deployment plane (high bar)
+  - Lockout after 3 failures (unchanged threshold)
+  - AdminSessionTotpLockoutEvent audit event now emitted on lockout
+  - Process restart requires attacker access to deployment plane (high bar)
   status: mitigated
   closure_evidence:
-    - commit: 0df9774
-      rationale: >-
-        Redis-backed counter (_totp_incr_failure / _totp_get_count / _totp_reset
-        in auth.py). Integration test verifies counter survives module eviction
-        (simulated restart). Fail-closed: HTTP 503 when Redis unavailable.
-        Lockout audit event (AdminSessionTotpLockoutEvent) now emitted with
-        consecutive_failures + endpoint fields.
+  - commit: 0df9774
+    rationale: 'Redis-backed counter (_totp_incr_failure / _totp_get_count / _totp_reset in auth.py). Integration
+      test verifies counter survives module eviction (simulated restart). Fail-closed: HTTP 503 when Redis unavailable.
+      Lockout audit event (AdminSessionTotpLockoutEvent) now emitted with consecutive_failures + endpoint fields.'
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (SEC-4 / Iris architectural audit)
-
-
 - id: YSG-RISK-065
-  description: >-
-    Response-content sensitivity asymmetry between /v1/* and /agents/* paths.
-    Two related gaps: (1) Ava GAP-3 — the OPA response ceiling check for
-    /v1/* received the prompt's sensitivity label (from the request-leg scan),
-    not the response body's sensitivity. A model could return CONFIDENTIAL
-    content in response to a PUBLIC prompt and OPA would allow delivery because
-    response_sensitivity=PUBLIC. (2) Iris SEC-5 — the /agents/* path had NO
-    response-leg OPA check at all; agent-to-agent calls were evaluated for the
-    request leg only, leaving the response body un-gated. Both gaps share the
-    same root fix: extend ResponseInspectionPipeline to classify response-content
-    sensitivity, wire it into both /v1/* and /agents/* OPA response checks.
+  description: 'Response-content sensitivity asymmetry between /v1/* and /agents/* paths. Two related gaps: (1)
+    Ava GAP-3 — the OPA response ceiling check for /v1/* received the prompt''s sensitivity label (from the request-leg
+    scan), not the response body''s sensitivity. A model could return CONFIDENTIAL content in response to a PUBLIC
+    prompt and OPA would allow delivery because response_sensitivity=PUBLIC. (2) Iris SEC-5 — the /agents/* path
+    had NO response-leg OPA check at all; agent-to-agent calls were evaluated for the request leg only, leaving
+    the response body un-gated. Both gaps share the same root fix: extend ResponseInspectionPipeline to classify
+    response-content sensitivity, wire it into both /v1/* and /agents/* OPA response checks.'
   severity: medium
   controls_impacted:
-    - ASVS V4.1.3
-    - ASVS V14.7.2
-    - CMMC SC.L2-3.13.10
-    - ISO 27001 A.8.3
+  - ASVS V4.1.3
+  - ASVS V14.7.2
+  - CMMC SC.L2-3.13.10
+  - ISO 27001 A.8.3
   compensating_controls:
-    - Request-leg sensitivity ceiling check still fires on prompt sensitivity
-    - ResponseInspectionPipeline injection/credential-exfil check still active
-    - PII detector on response path (when configured)
+  - Request-leg sensitivity ceiling check still fires on prompt sensitivity
+  - ResponseInspectionPipeline injection/credential-exfil check still active
+  - PII detector on response path (when configured)
   status: mitigated
   closure_evidence:
-    - commit: TBD-this-commit
-      rationale: >-
-        1. ResponseInspectionPipeline.inspect() now produces response_sensitivity
-           (SensitivityLevel string) by running the SensitivityClassifier on the
-           response body. Field added to ResponseInspectionResult dataclass.
-        2. openai_router._opa_response_check updated: accepts both
-           response_sensitivity (content) and prompt_sensitivity; passes both
-           to OPA. Pipeline off → response_sensitivity falls back to
-           prompt_sensitivity (backward-compatible).
-        3. policy/v1_routing.rego updated: response_decision evaluates
-           MAX(prompt_sensitivity, response_sensitivity) via
-           _effective_sensitivity_rank helper. Backward compat: missing
-           prompt_sensitivity field → falls back to response_sensitivity only.
-        4. agent_router.route_agent_call() gains response-leg OPA check:
-           classifies response-content sensitivity, queries OPA at
-           /v1/data/yashigani/agent_response_decision. Fail-closed on OPA error.
-           Returns HTTP 403 + AGENT_RESPONSE_BLOCKED_BY_OPA audit event on deny.
-        5. policy/agents.rego gains agent_response_allowed rule with
-           sensitivity_rank helper (duplicated from v1_routing.rego — packages
-           are scoped in OPA). Default deny. Compound agent_response_decision
-           object mirrors v1_routing.rego response_decision shape.
-        6. audit/schema.py: AGENT_RESPONSE_BLOCKED_BY_OPA EventType +
-           AgentResponseBlockedByOpaEvent dataclass added.
-        Tests: 20 unit + 4 integration. All PASS verified locally.
+  - commit: TBD-this-commit
+    rationale: "1. ResponseInspectionPipeline.inspect() now produces response_sensitivity\n   (SensitivityLevel\
+      \ string) by running the SensitivityClassifier on the\n   response body. Field added to ResponseInspectionResult\
+      \ dataclass.\n2. openai_router._opa_response_check updated: accepts both\n   response_sensitivity (content)\
+      \ and prompt_sensitivity; passes both\n   to OPA. Pipeline off → response_sensitivity falls back to\n   prompt_sensitivity\
+      \ (backward-compatible).\n3. policy/v1_routing.rego updated: response_decision evaluates\n   MAX(prompt_sensitivity,\
+      \ response_sensitivity) via\n   _effective_sensitivity_rank helper. Backward compat: missing\n   prompt_sensitivity\
+      \ field → falls back to response_sensitivity only.\n4. agent_router.route_agent_call() gains response-leg\
+      \ OPA check:\n   classifies response-content sensitivity, queries OPA at\n   /v1/data/yashigani/agent_response_decision.\
+      \ Fail-closed on OPA error.\n   Returns HTTP 403 + AGENT_RESPONSE_BLOCKED_BY_OPA audit event on deny.\n5.\
+      \ policy/agents.rego gains agent_response_allowed rule with\n   sensitivity_rank helper (duplicated from v1_routing.rego\
+      \ — packages\n   are scoped in OPA). Default deny. Compound agent_response_decision\n   object mirrors v1_routing.rego\
+      \ response_decision shape.\n6. audit/schema.py: AGENT_RESPONSE_BLOCKED_BY_OPA EventType +\n   AgentResponseBlockedByOpaEvent\
+      \ dataclass added.\nTests: 20 unit + 4 integration. All PASS verified locally."
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (Ava GAP-3 / Iris SEC-5 / Tiago 2026-05-25 directive)
-
 - id: YSG-RISK-066
-  description: >-
-    GET /v1/models OPA evaluation absent (Iris GAP-001).
-    Any authenticated principal (human, service-account, SPIFFE workload)
-    could enumerate the full agent topology, service-identity slugs, and
-    Ollama model list without OPA policy evaluation. An authenticated
-    compromised internal-bearer container (langflow, letta, openclaw) could
-    use this endpoint to map the full Yashigani agent topology without any
-    OPA gate firing. Severity: MEDIUM (authenticated required; topology
-    enumeration, not content access).
+  description: 'GET /v1/models OPA evaluation absent (Iris GAP-001). Any authenticated principal (human, service-account,
+    SPIFFE workload) could enumerate the full agent topology, service-identity slugs, and Ollama model list without
+    OPA policy evaluation. An authenticated compromised internal-bearer container (langflow, letta, openclaw) could
+    use this endpoint to map the full Yashigani agent topology without any OPA gate firing. Severity: MEDIUM (authenticated
+    required; topology enumeration, not content access).'
   severity: medium
   controls_impacted:
-    - ASVS V4.1.1
-    - OWASP API9 (Improper Inventory Management)
-    - CMMC IA.L2-3.5.1
-    - ISO 27001 A.8.2
+  - ASVS V4.1.1
+  - OWASP API9 (Improper Inventory Management)
+  - CMMC IA.L2-3.5.1
+  - ISO 27001 A.8.2
   compensating_controls:
-    - Authentication required (FINDING-59-01 fix — unauthenticated callers get 401)
-    - Network isolation limits internal-bearer exposure to mesh-internal bridge
+  - Authentication required (FINDING-59-01 fix — unauthenticated callers get 401)
+  - Network isolation limits internal-bearer exposure to mesh-internal bridge
   status: mitigated
   closure_evidence:
-    - commit: cec7585
-      rationale: >-
-        1. _opa_models_check() coroutine added to openai_router.py: queries
-           OPA /v1/data/yashigani/v1/models_list_decision after identity
-           resolution. Fail-closed on OPA error or unconfigured (dev opt-in only).
-        2. list_models() handler wired: OPA deny → 403 (or 503 on unreachable).
-           OPA allow with filter=restricted → service-account gets only
-           allowed_models content; agent/service-identity topology withheld.
-           OPA allow with filter=full → human/admin gets complete list.
-        3. v1_routing.rego: models_list_allowed + models_list_filter + models_list_decision
-           rules added. Service accounts get restricted by default; operator can
-           grant full via data bundle override (explicit, auditable opt-in).
-        4. audit/schema.py: MODELS_LIST_REQUESTED EventType + ModelsListRequestedEvent
-           dataclass. Event records identity, filter level, model count (not names).
-        5. Tests: 15 unit + 5 integration (GAP-001 suite). All PASS.
-        Negative regression: compromised internal-bearer cannot enumerate agent
-        topology (test H in integration suite).
+  - commit: cec7585
+    rationale: "1. _opa_models_check() coroutine added to openai_router.py: queries\n   OPA /v1/data/yashigani/v1/models_list_decision\
+      \ after identity\n   resolution. Fail-closed on OPA error or unconfigured (dev opt-in only).\n2. list_models()\
+      \ handler wired: OPA deny → 403 (or 503 on unreachable).\n   OPA allow with filter=restricted → service-account\
+      \ gets only\n   allowed_models content; agent/service-identity topology withheld.\n   OPA allow with filter=full\
+      \ → human/admin gets complete list.\n3. v1_routing.rego: models_list_allowed + models_list_filter + models_list_decision\n\
+      \   rules added. Service accounts get restricted by default; operator can\n   grant full via data bundle override\
+      \ (explicit, auditable opt-in).\n4. audit/schema.py: MODELS_LIST_REQUESTED EventType + ModelsListRequestedEvent\n\
+      \   dataclass. Event records identity, filter level, model count (not names).\n5. Tests: 15 unit + 5 integration\
+      \ (GAP-001 suite). All PASS. Negative regression: compromised internal-bearer cannot enumerate agent topology\
+      \ (test H in integration suite)."
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (Iris GAP-001 / Tiago 2026-05-25 OPA universal directive)
-
 - id: YSG-RISK-068
-  description: >-
-    Admin/user separation-of-duties enforcement gaps (Iris #96 SoD-001..005).
-    Pre-fix: (1) admin creation did not check for an existing user-tier account with
-    the same username/email; (2) user creation via direct API, SCIM, and SSO/SAML
-    callbacks did not check for an existing admin account; (3) the Caddy forward_auth
-    endpoint /auth/verify accepted admin sessions, allowing an admin to traverse the
-    data plane (/v1/chat/completions, /agents/*, etc.); (4) an admin completing SSO
-    flow had a HUMAN identity silently created in the registry, then could bridge to
-    the data plane via /auth/verify — LIVE EXPLOITABLE (SoD-004, HIGH severity);
-    (5) no cross-store conflict detection cron existed to catch residual collisions.
-    The compound effect: a single admin account could administer AND use the platform
-    simultaneously, violating Tiago's strict separation principle and NIST AC-5.
+  description: 'Admin/user separation-of-duties enforcement gaps (Iris #96 SoD-001..005). Pre-fix: (1) admin creation
+    did not check for an existing user-tier account with the same username/email; (2) user creation via direct API,
+    SCIM, and SSO/SAML callbacks did not check for an existing admin account; (3) the Caddy forward_auth endpoint
+    /auth/verify accepted admin sessions, allowing an admin to traverse the data plane (/v1/chat/completions, /agents/*,
+    etc.); (4) an admin completing SSO flow had a HUMAN identity silently created in the registry, then could bridge
+    to the data plane via /auth/verify — LIVE EXPLOITABLE (SoD-004, HIGH severity); (5) no cross-store conflict
+    detection cron existed to catch residual collisions. The compound effect: a single admin account could administer
+    AND use the platform simultaneously, violating Tiago''s strict separation principle and NIST AC-5.'
   severity: high
   controls_impacted:
-    - NIST SP 800-53 AC-5 (Separation of Duties)
-    - SOC 2 CC6.3 (logical access controls)
-    - SOC 2 CC6.7 (system access restriction)
-    - ISO 27001 A.5.16 (identity management)
-    - ISO 27001 A.5.17 (authentication information)
-    - CMMC L2 AC.L2-3.1.4 (separation of duties)
-    - OWASP ASVS V4.1.2 (admin interface least privilege)
+  - NIST SP 800-53 AC-5 (Separation of Duties)
+  - SOC 2 CC6.3 (logical access controls)
+  - SOC 2 CC6.7 (system access restriction)
+  - ISO 27001 A.5.16 (identity management)
+  - ISO 27001 A.5.17 (authentication information)
+  - CMMC L2 AC.L2-3.1.4 (separation of duties)
+  - OWASP ASVS V4.1.2 (admin interface least privilege)
   compensating_controls:
-    - Admin login port (8443) and user data plane (8080/443) are separately routed
-    - TOTP required on all admin logins
-    - Audit trail emits all auth events
+  - Admin login port (8443) and user data plane (8080/443) are separately routed
+  - TOTP required on all admin logins
+  - Audit trail emits all auth events
   status: mitigated
   closure_evidence:
-    - commit: e9758d1
-      rationale: >-
-        SoD-001: accounts.py create_admin checks identity_registry + user_accounts
-        for existing user-tier record before creating admin. Emits
-        ADMIN_CREATE_REJECTED_USER_EXISTS + HTTP 409 admin_user_collision on collision.
-        SoD-002a: users.py create_user checks admin_accounts by username and email
-        before creating user. Emits USER_CREATE_REJECTED_ADMIN_EXISTS + HTTP 409
-        admin_user_collision on collision.
-        SoD-002b: scim.py scim_provision_user checks admin_accounts by email before
-        provisioning. Emits SCIM_PROVISION_REJECTED_ADMIN_EXISTS + SCIM 409
-        uniqueness error to the identity provider.
-        SoD-002c + SoD-004: sso.py oidc_callback and saml_acs pre-check admin
-        collision via _check_sod_admin_collision() before calling
-        _resolve_or_create_identity(). Emits SSO_PROVISION_REJECTED_ADMIN_EXISTS +
-        redirects to /login?error=admin_cannot_use_platform. Closes SoD-004
-        (layer 1 of 2).
-        SoD-003: auth.py verify_session rejects account_tier==admin sessions with
-        HTTP 403 admin_session_not_allowed_data_plane + emits
-        AUTH_VERIFY_REJECTED_ADMIN_SESSION. Closes SoD-004 (layer 2 of 2).
-        SoD-005: sod_conflict_audit_task.py cron runs daily at 00:30 UTC, compares
-        admin_accounts against identity_registry HUMAN entries, emits
-        IDENTITY_STORE_CONFLICT on collision. Dashboard at
-        GET /admin/dashboard/sod-conflicts. Scheduled in app.py lifespan.
-        pg_auth.py: get_account_by_email() method added for case-insensitive
-        email-based admin lookup (SoD-001/002a/002b/002c).
-        audit/schema.py: 6 new EventTypes + 6 new dataclasses added.
-        Tests: unit (8 per gap = 40 total) + integration (SSO exploit replay,
-        /auth/verify admin session, end-to-end SoD-004 attack chain). All PASS.
+  - commit: e9758d1
+    rationale: 'SoD-001: accounts.py create_admin checks identity_registry + user_accounts for existing user-tier
+      record before creating admin. Emits ADMIN_CREATE_REJECTED_USER_EXISTS + HTTP 409 admin_user_collision on collision.
+      SoD-002a: users.py create_user checks admin_accounts by username and email before creating user. Emits USER_CREATE_REJECTED_ADMIN_EXISTS
+      + HTTP 409 admin_user_collision on collision. SoD-002b: scim.py scim_provision_user checks admin_accounts
+      by email before provisioning. Emits SCIM_PROVISION_REJECTED_ADMIN_EXISTS + SCIM 409 uniqueness error to the
+      identity provider. SoD-002c + SoD-004: sso.py oidc_callback and saml_acs pre-check admin collision via _check_sod_admin_collision()
+      before calling _resolve_or_create_identity(). Emits SSO_PROVISION_REJECTED_ADMIN_EXISTS + redirects to /login?error=admin_cannot_use_platform.
+      Closes SoD-004 (layer 1 of 2). SoD-003: auth.py verify_session rejects account_tier==admin sessions with HTTP
+      403 admin_session_not_allowed_data_plane + emits AUTH_VERIFY_REJECTED_ADMIN_SESSION. Closes SoD-004 (layer
+      2 of 2). SoD-005: sod_conflict_audit_task.py cron runs daily at 00:30 UTC, compares admin_accounts against
+      identity_registry HUMAN entries, emits IDENTITY_STORE_CONFLICT on collision. Dashboard at GET /admin/dashboard/sod-conflicts.
+      Scheduled in app.py lifespan. pg_auth.py: get_account_by_email() method added for case-insensitive email-based
+      admin lookup (SoD-001/002a/002b/002c). audit/schema.py: 6 new EventTypes + 6 new dataclasses added. Tests:
+      unit (8 per gap = 40 total) + integration (SSO exploit replay, /auth/verify admin session, end-to-end SoD-004
+      attack chain). All PASS.'
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
-  closed_by: Tom (Iris #96 SoD-001..005 / Tiago 2026-05-25 strict admin/user separation)
-
+  closed_by: Tom (Iris
 - id: YSG-RISK-067
-  description: >-
-    Catch-all proxy (/{path:path}) response-leg OPA absent (Iris GAP-002).
-    After forwarding a request to an upstream MCP server and receiving the
-    response, the catch-all proxy delivered the response to the caller WITHOUT
-    querying OPA. The caller's sensitivity ceiling was enforced only on the
-    request leg (inbound OPA check); the response content was never gated.
-    Symmetric to the pre-v2.24.1 /agents/* gap (SEC-5) that was treated as a
-    release-blocker. Severity: HIGH (MCP responses can contain CONFIDENTIAL
-    or RESTRICTED content; caller ceiling violation possible).
+  description: 'Catch-all proxy (/{path:path}) response-leg OPA absent (Iris GAP-002). After forwarding a request
+    to an upstream MCP server and receiving the response, the catch-all proxy delivered the response to the caller
+    WITHOUT querying OPA. The caller''s sensitivity ceiling was enforced only on the request leg (inbound OPA check);
+    the response content was never gated. Symmetric to the pre-v2.24.1 /agents/* gap (SEC-5) that was treated as
+    a release-blocker. Severity: HIGH (MCP responses can contain CONFIDENTIAL or RESTRICTED content; caller ceiling
+    violation possible).'
   severity: high
   controls_impacted:
-    - ASVS V4.1.3
-    - CMMC SC.L2-3.13.10
-    - ISO 27001 A.8.3
-    - NIST AC-4 (information flow enforcement)
+  - ASVS V4.1.3
+  - CMMC SC.L2-3.13.10
+  - ISO 27001 A.8.3
+  - NIST AC-4 (information flow enforcement)
   compensating_controls:
-    - Request-leg OPA check already enforces path-level policy
-    - ResponseInspectionPipeline injection/credential-exfil check (when configured)
-    - PII detector on response path (when configured)
+  - Request-leg OPA check already enforces path-level policy
+  - ResponseInspectionPipeline injection/credential-exfil check (when configured)
+  - PII detector on response path (when configured)
   status: mitigated
   closure_evidence:
-    - commit: cec7585
-      rationale: >-
-        1. _opa_proxy_response_check() coroutine added to proxy.py: queries
-           OPA /v1/data/yashigani/v1/proxy_response_decision after response
-           inspection and PII detection. Fail-closed on OPA error or
-           unconfigured (dev opt-in only).
-        2. _proxy_response_sensitivity() helper: derives response sensitivity
-           from ResponseInspectionPipeline (when configured) or returns PUBLIC
-           (pipeline-off safe default per YSG-RISK-057).
-        3. Proxy handler wired: OPA deny → 403 MCP_RESPONSE_BLOCKED_BY_OPA
-           (or 503 on unreachable). FORWARDED audit event only on OPA allow.
-        4. v1_routing.rego: proxy_response_allowed + proxy_response_reason +
-           proxy_response_decision rules added. Evaluates sensitivity ceiling
-           against response_sensitivity from pipeline or PUBLIC fallback.
-        5. audit/schema.py: MCP_RESPONSE_BLOCKED_BY_OPA + PROXY_OPA_RESPONSE_CHECK_FAILED
-           EventTypes + McpResponseBlockedByOpaEvent + ProxyOpaResponseCheckFailedEvent
-           dataclasses.
-        6. proxy.py streaming: _forward() uses httpx.AsyncClient.request() (buffered,
-           not streamed); upstream_response.content is available synchronously.
-           No force-buffer needed — proxy already buffers all responses.
-        7. Tests: 13 unit + 3 integration (GAP-002 suite). All PASS.
+  - commit: cec7585
+    rationale: "1. _opa_proxy_response_check() coroutine added to proxy.py: queries\n   OPA /v1/data/yashigani/v1/proxy_response_decision\
+      \ after response\n   inspection and PII detection. Fail-closed on OPA error or\n   unconfigured (dev opt-in\
+      \ only).\n2. _proxy_response_sensitivity() helper: derives response sensitivity\n   from ResponseInspectionPipeline\
+      \ (when configured) or returns PUBLIC\n   (pipeline-off safe default per YSG-RISK-057).\n3. Proxy handler\
+      \ wired: OPA deny → 403 MCP_RESPONSE_BLOCKED_BY_OPA\n   (or 503 on unreachable). FORWARDED audit event only\
+      \ on OPA allow.\n4. v1_routing.rego: proxy_response_allowed + proxy_response_reason +\n   proxy_response_decision\
+      \ rules added. Evaluates sensitivity ceiling\n   against response_sensitivity from pipeline or PUBLIC fallback.\n\
+      5. audit/schema.py: MCP_RESPONSE_BLOCKED_BY_OPA + PROXY_OPA_RESPONSE_CHECK_FAILED\n   EventTypes + McpResponseBlockedByOpaEvent\
+      \ + ProxyOpaResponseCheckFailedEvent\n   dataclasses.\n6. proxy.py streaming: _forward() uses httpx.AsyncClient.request()\
+      \ (buffered,\n   not streamed); upstream_response.content is available synchronously.\n   No force-buffer\
+      \ needed — proxy already buffers all responses.\n7. Tests: 13 unit + 3 integration (GAP-002 suite). All PASS."
   fix_in_version: v2.24.1
   closed_at: 2026-05-25
   closed_by: Tom (Iris GAP-002 / Tiago 2026-05-25 OPA universal directive)
-
 - id: YSG-RISK-069
-  description: >-
-    Release tag signing scheme formally declared SSH-only. Maintainer's signing
-    key is hardware-backed (Yubikey ed25519); software GPG path historically
-    referenced in CHANGELOG v2.23.2 is removed — the maintainer's key cannot
-    be exported from the hardware token. Signing occurs locally on the
-    maintainer's machine at tag creation time; CI does not participate.
-    Verification recipe and key rotation process documented at
-    docs/security/release-signing.md. GPG CI workflow path removed from
-    .github/workflows/tag-sign.yml (2026-05-25).
+  description: Release tag signing scheme formally declared SSH-only. Maintainer's signing key is hardware-backed
+    (Yubikey ed25519); software GPG path historically referenced in CHANGELOG v2.23.2 is removed — the maintainer's
+    key cannot be exported from the hardware token. Signing occurs locally on the maintainer's machine at tag creation
+    time; CI does not participate. Verification recipe and key rotation process documented at docs/security/release-signing.md.
+    GPG CI workflow path removed from .github/workflows/tag-sign.yml (2026-05-25).
   severity: informational
   controls_impacted:
-    - NIST SP 800-53 SI-7 (software integrity)
-    - SOC 2 CC8.1 (change management)
-    - SLSA Level 3 (build provenance — release artifact signing)
+  - NIST SP 800-53 SI-7 (software integrity)
+  - SOC 2 CC8.1 (change management)
+  - SLSA Level 3 (build provenance — release artifact signing)
   compensating_controls:
-    - Hardware-backed ed25519 key (Yubikey) — private key material never exportable
-    - SSH allowed-signers file committed in-repo (docs/release-signing-key.pub) for offline verification
-    - Key rotation procedure documented at docs/security/release-signing.md
-    - All tags from v2.23.3 onward carry SSH signature verifiable with git tag -v
+  - Hardware-backed ed25519 key (Yubikey) — private key material never exportable
+  - SSH allowed-signers file committed in-repo (docs/release-signing-key.pub) for offline verification
+  - Key rotation procedure documented at docs/security/release-signing.md
+  - All tags from v2.23.3 onward carry SSH signature verifiable with git tag -v
   status: accepted
   accepted_by: Tiago
-  accepted_at: "2026-05-25"
-  review_by: "2026-08-23"
+  accepted_at: '2026-05-25'
+  review_by: '2026-08-23'
   closure_evidence:
-    - commit: "80450ee"
-      rationale: >-
-        SSH-only signing scheme formally declared. GPG workflow path removed
-        from .github/workflows/tag-sign.yml. docs/security/release-signing.md
-        created as single source of truth. Verification confirmed:
-        git tag -v v2.24.2 emits Good "git" signature for maxine@agnosticsec.com
-        with ED25519 key SHA256:y5RP8TQfAFKBECUDgqP300d8CrdY4njSRS8HzxIQdJE.
-        Closes drift audit entry #3 (changelog-vs-reality-drift-audit-20260524.md).
-
+  - commit: 80450ee
+    rationale: 'SSH-only signing scheme formally declared. GPG workflow path removed from .github/workflows/tag-sign.yml.
+      docs/security/release-signing.md created as single source of truth. Verification confirmed: git tag -v v2.24.2
+      emits Good "git" signature for maxine@agnosticsec.com with ED25519 key SHA256:y5RP8TQfAFKBECUDgqP300d8CrdY4njSRS8HzxIQdJE.
+      Closes drift audit entry #3 (changelog-vs-reality-drift-audit-20260524.md).'
 - id: YSG-RISK-070
-  description: >-
-    PoolManager K8s backend: gateway ServiceAccount gains namespace-scoped
-    pods CRUD permission to enable per-identity pod spawning via the
-    Kubernetes API (KubernetesBackend in pool/backend.py). This closes the
-    in-cluster gap identified in Tom #56 commit 7e653b1 (option b deferred).
-    Trade-off: a compromised gateway pod could create arbitrary pods in its
-    namespace. Mitigated by Kyverno admission policies (admission-policies.yaml)
-    which enforce non-root, no-new-privileges, and seccomp/AppArmor on ALL
-    pods in the namespace — a compromised gateway cannot spawn privileged pods.
-    Per-identity pod isolation now works on K8s (was previously Docker/Podman only).
-    NetworkPolicy enforces UA-10: pool-managed pods cannot reach each other
-    (default-deny-egress + no inter-pod ingress rule), and can only reach
-    the gateway on port 8080 for LLM dispatch (OPA inspects all traffic).
+  description: 'PoolManager K8s backend: gateway ServiceAccount gains namespace-scoped pods CRUD permission to enable
+    per-identity pod spawning via the Kubernetes API (KubernetesBackend in pool/backend.py). This closes the in-cluster
+    gap identified in Tom #56 commit 7e653b1 (option b deferred). Trade-off: a compromised gateway pod could create
+    arbitrary pods in its namespace. Mitigated by Kyverno admission policies (admission-policies.yaml) which enforce
+    non-root, no-new-privileges, and seccomp/AppArmor on ALL pods in the namespace — a compromised gateway cannot
+    spawn privileged pods. Per-identity pod isolation now works on K8s (was previously Docker/Podman only). NetworkPolicy
+    enforces UA-10: pool-managed pods cannot reach each other (default-deny-egress + no inter-pod ingress rule),
+    and can only reach the gateway on port 8080 for LLM dispatch (OPA inspects all traffic).'
   severity: medium
   controls_impacted:
-    - ASVS V4.1.1 (access control — principle of least privilege)
-    - NIST AC-6 (least privilege)
-    - CMMC AC.L2-3.1.2 (limit system access)
-    - SOC 2 CC6.3 (logical access controls)
-    - ISO 27001 A.9.4.1 (restriction of access to programs and data)
+  - ASVS V4.1.1 (access control — principle of least privilege)
+  - NIST AC-6 (least privilege)
+  - CMMC AC.L2-3.1.2 (limit system access)
+  - SOC 2 CC6.3 (logical access controls)
+  - ISO 27001 A.9.4.1 (restriction of access to programs and data)
   compensating_controls:
-    - Kyverno ClusterPolicies in admission-policies.yaml enforce non-root +
-      no-new-privileges + seccomp + AppArmor on all namespace pods including
-      pool-managed pods spawned by the gateway SA. Privileged pod creation
-      is blocked at admission time regardless of SA permissions.
-    - NetworkPolicy default-deny-ingress + default-deny-egress — pool pods
-      can only communicate via the explicitly whitelisted gateway path.
-    - Pool pod labels (yashigani.managed=true, yashigani.identity=<id>,
-      yashigani.service=<slug>) are auditable — any unexpected pod in the
-      namespace is visible via `kubectl get pods -l yashigani.managed=true`.
-    - RBAC is namespace-scoped (Role, not ClusterRole) — no cross-namespace
-      or cluster-admin escalation possible.
-    - poolManager.k8sBackend.enabled defaults to false — operators opt in
-      explicitly; Docker/Podman deployments are unaffected.
+  - Kyverno ClusterPolicies in admission-policies.yaml enforce non-root + no-new-privileges + seccomp + AppArmor
+    on all namespace pods including pool-managed pods spawned by the gateway SA. Privileged pod creation is blocked
+    at admission time regardless of SA permissions.
+  - NetworkPolicy default-deny-ingress + default-deny-egress — pool pods can only communicate via the explicitly
+    whitelisted gateway path.
+  - Pool pod labels (yashigani.managed=true, yashigani.identity=<id>, yashigani.service=<slug>) are auditable —
+    any unexpected pod in the namespace is visible via `kubectl get pods -l yashigani.managed=true`.
+  - RBAC is namespace-scoped (Role, not ClusterRole) — no cross-namespace or cluster-admin escalation possible.
+  - poolManager.k8sBackend.enabled defaults to false — operators opt in explicitly; Docker/Podman deployments are
+    unaffected.
   status: accepted
   accepted_by: Tiago
-  accepted_at: "2026-05-25"
-  review_by: "2026-11-25"
+  accepted_at: '2026-05-25'
+  review_by: '2026-11-25'
   closure_evidence:
-    - commit: "TBD"
-      rationale: >-
-        KubernetesBackend implemented in src/yashigani/pool/backend.py.
-        RBAC: helm/yashigani/templates/rbac-pool-manager.yaml (Role + RoleBinding,
-        pods CRUD only, namespace-scoped, guarded by poolManager.k8sBackend.enabled).
-        NetworkPolicy: three new rules in networkpolicy.yaml within the
-        poolManager.k8sBackend.enabled guard: allow-pool-managed-pod-ingress
-        (gateway-only source), allow-pool-managed-pod-egress (gateway:8080 only),
-        allow-gateway-to-pool-pods-egress (gateway → pool pods on agentPort).
-        20 unit tests PASS (test_pool_k8s_backend.py). Helm lint 0 failures.
-        Helm template renders Role, RoleBinding, and 3 NetworkPolicies when enabled.
-        Existing pool tests (29) PASS — no regression.
+  - commit: TBD
+    rationale: 'KubernetesBackend implemented in src/yashigani/pool/backend.py. RBAC: helm/yashigani/templates/rbac-pool-manager.yaml
+      (Role + RoleBinding, pods CRUD only, namespace-scoped, guarded by poolManager.k8sBackend.enabled). NetworkPolicy:
+      three new rules in networkpolicy.yaml within the poolManager.k8sBackend.enabled guard: allow-pool-managed-pod-ingress
+      (gateway-only source), allow-pool-managed-pod-egress (gateway:8080 only), allow-gateway-to-pool-pods-egress
+      (gateway → pool pods on agentPort). 20 unit tests PASS (test_pool_k8s_backend.py). Helm lint 0 failures. Helm
+      template renders Role, RoleBinding, and 3 NetworkPolicies when enabled. Existing pool tests (29) PASS — no
+      regression.'
   fix_in_version: v2.24.1
-  last_threat_model_review: "2026-05-25"
+  last_threat_model_review: '2026-05-25'
