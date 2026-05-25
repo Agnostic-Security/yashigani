@@ -293,6 +293,52 @@ def _resolve_or_create_identity(
     return identity_id
 
 
+def _write_audit_safe(event) -> None:
+    """Write an audit event, swallowing exceptions to avoid masking primary errors."""
+    try:
+        if backoffice_state.audit_writer is not None:
+            backoffice_state.audit_writer.write(event)
+    except Exception as exc:
+        logger.error("SSO audit write failed: %s", exc)
+
+
+async def _check_sod_admin_collision(email: str) -> bool:
+    """
+    SoD-002c + SoD-004: async pre-check before SSO identity creation.
+
+    Returns True if an admin account already exists with this email (collision;
+    provisioning must be blocked). Returns False if the path is clear.
+
+    Fail-open on auth service unavailability (SoD-005 cron catches residual
+    conflicts). Admin account uses email as username, so we check both the
+    username lookup (fast — indexed) and the email column lookup.
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    """
+    auth_svc = getattr(backoffice_state, "auth_service", None)
+    if auth_svc is None:
+        return False
+
+    # Check 1: admin usernames are emails — direct username lookup
+    try:
+        record = await auth_svc.get_account(email.strip().lower())
+        if record is not None and record.account_tier == "admin":
+            return True
+    except Exception as exc:
+        logger.warning("SoD-002c: username-based admin collision check failed: %s", exc)
+
+    # Check 2: email column lookup (handles case-insensitive variations)
+    if hasattr(auth_svc, "get_account_by_email"):
+        try:
+            record = await auth_svc.get_account_by_email(email)
+            if record is not None and record.account_tier == "admin":
+                return True
+        except Exception as exc:
+            logger.warning("SoD-002c: email-based admin collision check failed: %s", exc)
+
+    return False
+
+
 def _write_sso_success_audit(
     idp_id: str,
     idp_name: str,
@@ -688,6 +734,30 @@ async def oidc_callback(
         _claim_auth_time,
         idp_id,
     )
+
+    # SoD-002c + SoD-004 (combined): block SSO identity creation for admin emails.
+    # An admin completing SSO would otherwise create a HUMAN identity and bridge
+    # to the data plane via /auth/verify (layer 2 / SoD-003). Blocking here is
+    # layer 1 of the defence-in-depth closure.
+    # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    if await _check_sod_admin_collision(sso_result.email):
+        from yashigani.audit.schema import SsoProvisionRejectedAdminExistsEvent
+        _sod_email_hash = _email_hash(sso_result.email, org_id=_idp_cfg.org_id if _idp_cfg else "")
+        _write_audit_safe(SsoProvisionRejectedAdminExistsEvent(
+            idp_id=idp_id,
+            idp_name=sso_result.idp_name or idp_id,
+            email_hash=_sod_email_hash,
+            client_ip_prefix=_mask_ip(client_ip),
+        ))
+        logger.warning(
+            "SoD-002c/SoD-004: SSO provision rejected — admin account exists (email_hash=%s idp=%s)",
+            _sod_email_hash,
+            idp_id,
+        )
+        return RedirectResponse(
+            url="/login?error=admin_cannot_use_platform&reason=separate_account_required",
+            status_code=status.HTTP_302_FOUND,
+        )
 
     # Resolve or provision the Yashigani identity.
     # Re-use _idp_cfg already fetched during the acr/amr check above.
@@ -1093,6 +1163,27 @@ async def saml_acs(idp_id: str, request: Request):
         _saml_authn_instant or "(none)",
         idp_id,
     )
+
+    # SoD-002c + SoD-004 (combined): block SAML SSO identity creation for admin emails.
+    # Mirrors the OIDC callback SoD check — same exploit chain applies via SAML.
+    if await _check_sod_admin_collision(sso_result.email):
+        from yashigani.audit.schema import SsoProvisionRejectedAdminExistsEvent
+        _sod_saml_email_hash = _email_hash(sso_result.email, org_id=idp.org_id if idp else "")
+        _write_audit_safe(SsoProvisionRejectedAdminExistsEvent(
+            idp_id=idp_id,
+            idp_name=sso_result.idp_name or idp_id,
+            email_hash=_sod_saml_email_hash,
+            client_ip_prefix=_mask_ip(client_ip),
+        ))
+        logger.warning(
+            "SoD-002c/SoD-004 (SAML): SSO provision rejected — admin account exists (email_hash=%s idp=%s)",
+            _sod_saml_email_hash,
+            idp_id,
+        )
+        return RedirectResponse(
+            url="/login?error=admin_cannot_use_platform&reason=separate_account_required",
+            status_code=status.HTTP_302_FOUND,
+        )
 
     # Resolve or create the identity
     try:

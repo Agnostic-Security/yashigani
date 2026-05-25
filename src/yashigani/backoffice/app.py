@@ -379,7 +379,8 @@ async def lifespan(app: FastAPI):
 
     # Startup — schedule daily licence expiry check (v0.7.1),
     # grace-period audit emitter (v2.23.3),
-    # and inactive-account disable (v2.23.3, FedRAMP AC-2(F2) / LU-YSG-002).
+    # inactive-account disable (v2.23.3, FedRAMP AC-2(F2) / LU-YSG-002),
+    # and SoD cross-store conflict audit (v2.24.1, Iris #96, NIST AC-5).
     scheduler = None
     try:
         import asyncio
@@ -388,6 +389,7 @@ async def lifespan(app: FastAPI):
         from yashigani.licensing.expiry_monitor import check_and_alert_licence_expiry
         from yashigani.licensing.grace_period import emit_grace_period_audit
         from yashigani.backoffice.inactive_account_task import run_inactive_account_disable
+        from yashigani.backoffice.sod_conflict_audit_task import run_sod_conflict_audit
 
         _inactive_interval_hours: int = 24
         try:
@@ -422,11 +424,24 @@ async def lifespan(app: FastAPI):
             id="inactive_account_disable",
             replace_existing=True,
         )
+        # SoD cross-store conflict audit — daily at 00:30 UTC (Iris #96 / v2.24.1)
+        # Runs after midnight audit checkpoint (00:05). Emits IDENTITY_STORE_CONFLICT
+        # events for any admin/user username or email collision found across stores.
+        # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4.
+        scheduler.add_job(
+            run_sod_conflict_audit,
+            trigger="cron",
+            hour=0,
+            minute=30,
+            id="sod_conflict_audit",
+            replace_existing=True,
+        )
         scheduler.start()
         # Fire all immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
         asyncio.ensure_future(emit_grace_period_audit())
         asyncio.ensure_future(run_inactive_account_disable())
+        asyncio.ensure_future(run_sod_conflict_audit())
     except ImportError:
         pass  # apscheduler not installed — expiry alerts + inactive-disable disabled
     except Exception as exc:

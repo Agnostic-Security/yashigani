@@ -206,6 +206,44 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
             detail={"error": "username_taken"},
         )
 
+    # SoD-002a: reject user creation if an admin account already exists with
+    # the same username OR same email. Admins and users MUST be strictly separate.
+    # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    _sod002a_admin_record = None
+    try:
+        _sod002a_by_username = await state.auth_service.get_account(effective_username)
+        if _sod002a_by_username is not None and _sod002a_by_username.account_tier == "admin":
+            _sod002a_admin_record = _sod002a_by_username
+    except Exception:
+        pass  # already checked above; belt-and-suspenders
+
+    if _sod002a_admin_record is None:
+        try:
+            _sod002a_by_email = await state.auth_service.get_account_by_email(effective_email)
+            if _sod002a_by_email is not None and _sod002a_by_email.account_tier == "admin":
+                _sod002a_admin_record = _sod002a_by_email
+        except Exception:
+            pass  # get_account_by_email may not exist on all auth backends — SoD-005 cron catches residual
+
+    if _sod002a_admin_record is not None:
+        from yashigani.audit.schema import UserCreateRejectedAdminExistsEvent
+        state.audit_writer.write(UserCreateRejectedAdminExistsEvent(
+            acting_admin_account_id=session.account_id,
+            rejected_username_or_email="<redacted>",  # never log raw email
+            creation_path="direct",
+        ))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "admin_user_collision",
+                "message": (
+                    "An admin account already exists with this username/email. "
+                    "Admin and user identities must be strictly separate. "
+                    "The user must use a different username and email."
+                ),
+            },
+        )
+
     from yashigani.auth.password import generate_password
 
     temp_password = generate_password(36)

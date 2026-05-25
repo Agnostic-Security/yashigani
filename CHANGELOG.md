@@ -27,6 +27,43 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 ## [Unreleased] — v2.24.1
 
 ### Security
+- **security(sod): admin/user separation-of-duties enforcement — cross-store collision checks on all auth creation paths + account_tier filter on /auth/verify + daily cross-store conflict audit cron. Closes Iris #96 SoD-001..005 (SoD-004 was live-exploitable). NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2. YSG-RISK-068.**
+
+  **Background:** Iris audit #96 surfaced 5 separation-of-duties gaps. The most critical (SoD-004) was live-exploitable: an admin completing an SSO flow silently created a HUMAN identity in the identity registry, and the admin's session then bridged to the data plane via `/auth/verify` (Caddy forward_auth). Tiago directive 2026-05-25: "admins cannot use the platform only administrate it; they need a second account as normal user with different username."
+
+  **SoD-001 — admin creation collision check** (`accounts.py`):
+  - `create_admin` now checks both `auth_service.get_account()` (username) and `auth_service.get_account_by_email()` (email) for any existing user-tier account before creating the admin.
+  - Collision → HTTP 409 `admin_user_collision` + `ADMIN_CREATE_REJECTED_USER_EXISTS` audit event.
+
+  **SoD-002a — direct user creation collision check** (`users.py`):
+  - `create_user` now checks for admin accounts with the same username AND email before creating.
+  - Collision → HTTP 409 `admin_user_collision` + `USER_CREATE_REJECTED_ADMIN_EXISTS` audit event.
+
+  **SoD-002b — SCIM provision collision check** (`scim.py`):
+  - `scim_provision_user` now checks for admin account by email before provisioning.
+  - Collision → SCIM 409 `uniqueness` error to the identity provider + `SCIM_PROVISION_REJECTED_ADMIN_EXISTS` audit event.
+
+  **SoD-002c + SoD-004 — SSO/SAML identity creation collision check** (`sso.py`):
+  - `oidc_callback` and `saml_acs` now call `_check_sod_admin_collision(email)` before `_resolve_or_create_identity()`.
+  - Collision → redirect `/login?error=admin_cannot_use_platform` + `SSO_PROVISION_REJECTED_ADMIN_EXISTS` audit event.
+  - This is layer 1 of the SoD-004 exploit chain closure.
+
+  **SoD-003 — `/auth/verify` admin session filter** (`auth.py`):
+  - `verify_session` (Caddy forward_auth target) now inspects `session.account_tier`.
+  - `tier == "admin"` → HTTP 403 `admin_session_not_allowed_data_plane` + `AUTH_VERIFY_REJECTED_ADMIN_SESSION` audit event.
+  - This is layer 2 of the SoD-004 exploit chain closure (defence in depth with SoD-002c).
+
+  **SoD-005 — cross-store conflict audit cron** (`sod_conflict_audit_task.py`):
+  - Daily cron (00:30 UTC) compares `admin_accounts` emails against `identity_registry` HUMAN slugs.
+  - Collisions emit `IDENTITY_STORE_CONFLICT` audit event + populate `GET /admin/dashboard/sod-conflicts`.
+  - Wired into `app.py` lifespan APScheduler alongside existing crons.
+
+  **Supporting changes:**
+  - `pg_auth.py`: `get_account_by_email()` method added — case-insensitive email lookup on `admin_accounts`.
+  - `audit/schema.py`: 6 new `EventType` values + 6 new dataclasses (`AdminCreateRejectedUserExistsEvent`, `UserCreateRejectedAdminExistsEvent`, `ScimProvisionRejectedAdminExistsEvent`, `SsoProvisionRejectedAdminExistsEvent`, `AuthVerifyRejectedAdminSessionEvent`, `IdentityStoreConflictEvent`).
+
+  **Tests:** 8 unit tests per gap (40 total) covering collision-reject + legitimate-pass paths. Integration: SSO exploit replay chain blocked end-to-end. Evidence: `/Users/max/Documents/Claude/testing_runs/tom_sod_admin_user_separation_20260525/`.
+
 - **security(opa): close OPA conformance gaps GAP-001 + GAP-002 — /v1/models OPA-evaluated for principal-aware listing; /v1/proxy catch-all gets response-leg OPA mirroring /v1/chat/completions pattern** (YSG-RISK-066 + YSG-RISK-067, Iris conformance audit Iris #94, Tiago 2026-05-25 universal OPA directive):
 
   Per `docs/opa_manual.md:44` OPA-everywhere mandate. Both gaps were code-vs-docs drift — the manual mandated OPA on all traffic both legs; the code did not comply on these two surfaces.

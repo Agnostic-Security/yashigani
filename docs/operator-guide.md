@@ -167,4 +167,63 @@ Setting `YASHIGANI_PASSWORD_MAX_AGE_DAYS=pci` raises `ValueError: invalid litera
 
 ---
 
+---
+
+## 5. Admin / User Account Separation
+
+**MANDATORY — Tiago directive 2026-05-25 / Iris #96 / NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4.**
+
+### 5.1 Core principle
+
+Yashigani enforces strict separation between admin accounts and user accounts. These are two distinct identity stores:
+
+| Store | Purpose | Authenticate at |
+|-------|---------|-----------------|
+| `admin_accounts` (Postgres) | Administer Yashigani only | Port 8443 (backoffice) |
+| `identity_registry` (Redis) | Use the platform (agents, MCPs, models) | Port 443/8080 via Caddy |
+
+**Admins cannot use the platform.** Admins cannot call agents, MCPs, or AI models. This is enforced at the API layer, not just at the UI layer.
+
+### 5.2 If a person needs both roles
+
+Create two separate accounts with **different usernames AND different email addresses**:
+
+1. Admin account: `admin@yourco.com` — for administrating Yashigani
+2. User account: `user@yourco.com` (or a personal mailbox) — for using agents/MCPs
+
+Using the same email across both stores is **blocked** by the system (HTTP 409 / SCIM 409 / SSO redirect).
+
+### 5.3 Enforced boundaries
+
+The following actions are blocked at the API layer:
+
+| Action | Error | Reason |
+|--------|-------|--------|
+| Create admin with same username/email as existing user | HTTP 409 `admin_user_collision` | SoD-001 |
+| Create user with same username/email as existing admin | HTTP 409 `admin_user_collision` | SoD-002a |
+| SCIM provision user whose email matches an admin | SCIM 409 `uniqueness` | SoD-002b |
+| SSO login with an admin email | Redirect `/login?error=admin_cannot_use_platform` | SoD-002c / SoD-004 |
+| Admin session presented to `/auth/verify` (Caddy forward_auth) | HTTP 403 `admin_session_not_allowed_data_plane` | SoD-003 |
+
+### 5.4 Daily conflict audit
+
+A cron job runs daily at **00:30 UTC** and compares the two identity stores. Any collision (same username or email in both) is surfaced at:
+
+```
+GET /admin/dashboard/sod-conflicts
+```
+
+Response includes `conflicts` (list of collision records), `last_run_at`, and counts scanned.
+
+Each collision emits an `IDENTITY_STORE_CONFLICT` audit event and requires **manual operator remediation**:
+
+1. Rename the user identity slug, OR
+2. Delete the admin account and re-create with a different email
+
+Pre-fix records (created before v2.24.1 when enforcement was not in place) will surface here. Remediate all conflicts within 30 days of upgrade.
+
+### 5.5 SSO configuration note
+
+If your SSO IdP (OIDC or SAML) uses the same email address for both admin and user identities, the SSO user login **will be blocked**. This is intentional. Configure your IdP to use separate email addresses, or instruct the human to use a different email for their user-tier account.
+
 *Operator guide — Yashigani. Maintained by Agnostic Security.*

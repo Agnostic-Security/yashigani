@@ -91,11 +91,68 @@ async def create_admin(body: CreateAdminRequest, session: AdminSession):
             detail={"error": "admin_seat_limit_exceeded", "limit": exc.max_val, "current": exc.current},
         )
 
-    if await state.auth_service.get_account(body.username) is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"error": "username_taken"},
-        )
+    # SoD-001: reject admin creation if a user-tier account or user identity
+    # already exists with the same username/email. Admins and users MUST remain
+    # in strictly separate identity stores. Same username = collapsed boundary.
+    # This replaces the simple "username_taken" check with tier-aware logic:
+    #   - existing record, account_tier == "user"  → SoD-001 collision (HTTP 409 admin_user_collision)
+    #   - existing record, account_tier == "admin" → username taken (HTTP 409 username_taken)
+    #   - no record by username, but email collision in user store → SoD-001 collision
+    # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    _sod001_existing = await state.auth_service.get_account(body.username)
+    if _sod001_existing is not None:
+        if _sod001_existing.account_tier == "user":
+            # SoD-001: existing user-tier account with same username/email
+            state.audit_writer.write(_sod001_collision_event(
+                acting_admin_account_id=session.account_id,
+                rejected_username=body.username,
+                collision_store="user_accounts",
+            ))
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "admin_user_collision",
+                    "message": (
+                        "A user-tier account already exists with this username/email. "
+                        "Admin and user identities must be strictly separate. "
+                        "The admin must use a different username."
+                    ),
+                },
+            )
+        else:
+            # Existing admin account — username taken
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "username_taken"},
+            )
+
+    # Also check by email column (admin usernames are emails but the email column
+    # may contain a different-format record in the user store).
+    # get_account_by_email may not exist on all auth backends (fail open; SoD-005 cron catches it).
+    try:
+        _sod001_by_email = await state.auth_service.get_account_by_email(body.username)
+        if _sod001_by_email is not None and _sod001_by_email.account_tier == "user":
+            state.audit_writer.write(_sod001_collision_event(
+                acting_admin_account_id=session.account_id,
+                rejected_username=body.username,
+                collision_store="user_accounts",
+            ))
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "admin_user_collision",
+                    "message": (
+                        "A user-tier account already exists with this email address. "
+                        "Admin and user identities must be strictly separate. "
+                        "The admin must use a different email."
+                    ),
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # fail open — SoD-005 cron catches residual collisions
+
     record, temp_password = await state.auth_service.create_admin(
         username=body.username,
         auto_generate=True,
@@ -280,4 +337,15 @@ def _config_event(admin_id: str, setting: str, prev: str, new: str, account_tier
         setting=setting,
         previous_value=prev,
         new_value=new,
+    )
+
+
+def _sod001_collision_event(acting_admin_account_id: str, rejected_username: str, collision_store: str):
+    """SoD-001: audit event for admin creation rejection due to user collision."""
+    from yashigani.audit.schema import AdminCreateRejectedUserExistsEvent
+
+    return AdminCreateRejectedUserExistsEvent(
+        acting_admin_account_id=acting_admin_account_id,
+        rejected_username=rejected_username,
+        collision_store=collision_store,
     )

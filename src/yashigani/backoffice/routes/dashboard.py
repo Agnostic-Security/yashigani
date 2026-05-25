@@ -213,6 +213,21 @@ async def resource_pressure(session: AdminSession):
     }
 
 
+@router.get("/sod-conflicts")
+async def sod_conflict_report(session: AdminSession):
+    """
+    Return the result of the most recent SoD cross-store conflict audit run.
+
+    Reports any admin/user identity collisions detected by the daily cron job
+    (SoD-005 / Iris #96). Conflicts indicate a username or email exists in both
+    admin_accounts and the identity_registry — operator must remediate manually.
+
+    NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / v2.24.1.
+    """
+    from yashigani.backoffice.sod_conflict_audit_task import get_last_run_result
+    return get_last_run_result()
+
+
 @router.get("/alerts")
 async def recent_alerts(session: AdminSession, limit: int = 50):
     """Return the most recent admin alerts from the in-memory ring buffer."""

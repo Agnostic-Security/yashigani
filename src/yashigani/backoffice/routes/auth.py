@@ -581,6 +581,35 @@ async def verify_session(request: Request):
     if session is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
+    # SoD-003: admin sessions MUST NOT traverse the data plane.
+    # Admins authenticate to port 8443 (backoffice) only. Any admin session
+    # presented to /auth/verify (Caddy forward_auth) is categorically rejected.
+    # This is layer 2 of the SoD-004 defence (layer 1 = SoD-002c in sso.py).
+    # NIST AC-5 / OWASP ASVS V4.1.2 / ISO 27001 A.5.16 / v2.24.1 Iris #96.
+    if session.account_tier == "admin":
+        from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
+        _client_ip = request.client.host if request.client else "unknown"
+        from yashigani.auth.session import _mask_ip as _verify_mask_ip
+        if state.audit_writer is not None:
+            state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
+                account_id=session.account_id,
+                client_ip_prefix=_verify_mask_ip(_client_ip),
+            ))
+        _log.warning(
+            "SoD-003: /auth/verify rejected admin session account_id=%s — admins cannot use the data plane",
+            session.account_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_session_not_allowed_data_plane",
+                "message": (
+                    "Admin accounts cannot access the data plane. "
+                    "If you need user-tier access, create a separate user account with a different username."
+                ),
+            },
+        )
+
     # Resolve account from account_id
     record = await state.auth_service.get_account_by_id(session.account_id)
 

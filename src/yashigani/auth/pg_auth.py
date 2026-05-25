@@ -531,6 +531,21 @@ class PostgresLocalAuthService:
             )
             return _row_to_record(row) if row else None
 
+    async def get_account_by_email(self, email: str) -> Optional[AccountRecord]:
+        """
+        SoD-001..SoD-004: cross-store collision check.
+        Returns the admin_accounts record whose email column matches the given
+        email (case-insensitive), or None if not found.
+        Used by SCIM and SSO paths to verify no admin account exists with the
+        same email before provisioning a user identity.
+        """
+        async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM admin_accounts WHERE lower(email) = lower($1)",
+                email.strip(),
+            )
+            return _row_to_record(row) if row else None
+
     async def delete_account(self, username: str) -> bool:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             res = await conn.execute(

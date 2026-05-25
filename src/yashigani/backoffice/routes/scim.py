@@ -255,6 +255,53 @@ async def scim_provision_user(
 
     existing_groups = store.get_user_groups(email)
 
+    # SoD-002b: reject SCIM provision if an admin account already exists with
+    # this email. Admins and users must be strictly separate identity stores.
+    # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / ASVS V4.1.2.
+    _sod002b_admin_record = None
+    try:
+        _auth_svc = getattr(backoffice_state, "auth_service", None)
+        if _auth_svc is not None and hasattr(_auth_svc, "get_account_by_email"):
+            _sod002b_admin_record = await _auth_svc.get_account_by_email(email)
+            if _sod002b_admin_record is not None and _sod002b_admin_record.account_tier != "admin":
+                _sod002b_admin_record = None  # only block on admin collision
+        elif _auth_svc is not None:
+            # Fallback: try username lookup (admin usernames are emails)
+            _sod002b_admin_record = await _auth_svc.get_account(email)
+            if _sod002b_admin_record is not None and _sod002b_admin_record.account_tier != "admin":
+                _sod002b_admin_record = None
+    except Exception as _exc:
+        logger.warning("SoD-002b: admin collision check failed: %s", _exc)
+
+    if _sod002b_admin_record is not None:
+        import hashlib as _hashlib
+        _email_hash = _hashlib.sha256(email.strip().lower().encode()).hexdigest()
+        from yashigani.audit.schema import ScimProvisionRejectedAdminExistsEvent
+        _writer = getattr(backoffice_state, "audit_writer", None)
+        if _writer is not None:
+            _writer.write(ScimProvisionRejectedAdminExistsEvent(
+                acting_admin_account_id=session.account_id,
+                email_hash=_email_hash,
+            ))
+        logger.warning(
+            "SoD-002b: SCIM provision rejected — admin account exists for email_hash=%s",
+            _email_hash,
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=409,
+            content={
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                "detail": (
+                    "An admin account already exists with this email address. "
+                    "Admin and user identities must be strictly separate. "
+                    "The user must register with a different email."
+                ),
+                "status": "409",
+                "scimType": "uniqueness",
+            },
+        )
+
     # LAURA-LICENSE-03 / GROUP-2-5: enforce end-user seat limit for new SCIM
     # provisions. A user with no existing groups is being provisioned for the
     # first time — check the limit before creating. Existing members are an

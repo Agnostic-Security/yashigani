@@ -1418,6 +1418,66 @@ risks:
   closed_at: 2026-05-25
   closed_by: Tom (Iris GAP-001 / Tiago 2026-05-25 OPA universal directive)
 
+- id: YSG-RISK-068
+  description: >-
+    Admin/user separation-of-duties enforcement gaps (Iris #96 SoD-001..005).
+    Pre-fix: (1) admin creation did not check for an existing user-tier account with
+    the same username/email; (2) user creation via direct API, SCIM, and SSO/SAML
+    callbacks did not check for an existing admin account; (3) the Caddy forward_auth
+    endpoint /auth/verify accepted admin sessions, allowing an admin to traverse the
+    data plane (/v1/chat/completions, /agents/*, etc.); (4) an admin completing SSO
+    flow had a HUMAN identity silently created in the registry, then could bridge to
+    the data plane via /auth/verify — LIVE EXPLOITABLE (SoD-004, HIGH severity);
+    (5) no cross-store conflict detection cron existed to catch residual collisions.
+    The compound effect: a single admin account could administer AND use the platform
+    simultaneously, violating Tiago's strict separation principle and NIST AC-5.
+  severity: high
+  controls_impacted:
+    - NIST SP 800-53 AC-5 (Separation of Duties)
+    - SOC 2 CC6.3 (logical access controls)
+    - SOC 2 CC6.7 (system access restriction)
+    - ISO 27001 A.5.16 (identity management)
+    - ISO 27001 A.5.17 (authentication information)
+    - CMMC L2 AC.L2-3.1.4 (separation of duties)
+    - OWASP ASVS V4.1.2 (admin interface least privilege)
+  compensating_controls:
+    - Admin login port (8443) and user data plane (8080/443) are separately routed
+    - TOTP required on all admin logins
+    - Audit trail emits all auth events
+  status: mitigated
+  closure_evidence:
+    - commit: TBD-sod-commit
+      rationale: >-
+        SoD-001: accounts.py create_admin checks identity_registry + user_accounts
+        for existing user-tier record before creating admin. Emits
+        ADMIN_CREATE_REJECTED_USER_EXISTS + HTTP 409 admin_user_collision on collision.
+        SoD-002a: users.py create_user checks admin_accounts by username and email
+        before creating user. Emits USER_CREATE_REJECTED_ADMIN_EXISTS + HTTP 409
+        admin_user_collision on collision.
+        SoD-002b: scim.py scim_provision_user checks admin_accounts by email before
+        provisioning. Emits SCIM_PROVISION_REJECTED_ADMIN_EXISTS + SCIM 409
+        uniqueness error to the identity provider.
+        SoD-002c + SoD-004: sso.py oidc_callback and saml_acs pre-check admin
+        collision via _check_sod_admin_collision() before calling
+        _resolve_or_create_identity(). Emits SSO_PROVISION_REJECTED_ADMIN_EXISTS +
+        redirects to /login?error=admin_cannot_use_platform. Closes SoD-004
+        (layer 1 of 2).
+        SoD-003: auth.py verify_session rejects account_tier==admin sessions with
+        HTTP 403 admin_session_not_allowed_data_plane + emits
+        AUTH_VERIFY_REJECTED_ADMIN_SESSION. Closes SoD-004 (layer 2 of 2).
+        SoD-005: sod_conflict_audit_task.py cron runs daily at 00:30 UTC, compares
+        admin_accounts against identity_registry HUMAN entries, emits
+        IDENTITY_STORE_CONFLICT on collision. Dashboard at
+        GET /admin/dashboard/sod-conflicts. Scheduled in app.py lifespan.
+        pg_auth.py: get_account_by_email() method added for case-insensitive
+        email-based admin lookup (SoD-001/002a/002b/002c).
+        audit/schema.py: 6 new EventTypes + 6 new dataclasses added.
+        Tests: unit (8 per gap = 40 total) + integration (SSO exploit replay,
+        /auth/verify admin session, end-to-end SoD-004 attack chain). All PASS.
+  fix_in_version: v2.24.1
+  closed_at: 2026-05-25
+  closed_by: Tom (Iris #96 SoD-001..005 / Tiago 2026-05-25 strict admin/user separation)
+
 - id: YSG-RISK-067
   description: >-
     Catch-all proxy (/{path:path}) response-leg OPA absent (Iris GAP-002).
