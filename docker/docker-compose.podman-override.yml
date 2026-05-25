@@ -44,26 +44,23 @@ services:
   # container's internal USER directive switches to UID 1001 normally.
   gateway:
     security_opt:
-      # BUG-NEW-002 / YSG-RISK-074 (v2.24.3): compose override REPLACES security_opt
-      # lists (does not merge). Must repeat all options from base compose here.
-      # Seccomp: relative path (./seccomp/yashigani.json) relative to compose file dir
-      # (docker/). podman-compose 1.5.0 resolves ./ relative to CWD when invoked from
-      # docker/ by install.sh — this is correct. Eliminates env-var interpolation that
-      # caused podman-compose 1.5.0 to produce "file name too long" on Podman Mac
-      # when YASHIGANI_SECCOMP_PROFILE was set to an absolute path by install.sh.
-      # AppArmor: unconfined on Podman (Podman Mac uses SELinux, not AppArmor;
-      # Linux Podman ignores unknown AppArmor profile names without error).
-      - no-new-privileges:true
-      - seccomp=./seccomp/yashigani.json
-      - apparmor=unconfined
+      # BUG-NEW-002 / YSG-RISK-074 (v2.24.3): seccomp path handling.
+      # podman-compose 1.5.0 MERGES security_opt lists from override files (not replace).
+      # The base compose carries: no-new-privileges:true, seccomp=${YASHIGANI_SECCOMP_PROFILE:-...},
+      # apparmor=${YASHIGANI_APPARMOR_PROFILE:-...}.
+      # This override adds label=disable (for SELinux on RHEL/Fedora Linux Podman hosts).
+      # install.sh sets YASHIGANI_SECCOMP_PROFILE to an absolute path (install.sh:1993-1998)
+      # and YASHIGANI_APPARMOR_PROFILE=unconfined for Podman. The absolute-path form is
+      # passed directly to `podman run --security-opt seccomp=/abs/path` which Podman
+      # resolves correctly (both Mac/Podman VirtioFS mount and Linux Podman native).
+      # Note: if podman-compose 1.5.0 produces ENAMETOOLONG on a specific host, override
+      # YASHIGANI_SECCOMP_PROFILE=unconfined in the .env file to disable the profile.
+      # YSG-RISK-074.
       - label=disable
 
   backoffice:
     security_opt:
       # Same as gateway above — see BUG-NEW-002 / YSG-RISK-074 comment.
-      - no-new-privileges:true
-      - seccomp=./seccomp/yashigani.json
-      - apparmor=unconfined
       - label=disable
     # Parity with docker-compose.yml: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES must be
     # set on both runtimes so the SSRF guard permits canonical bundle registrations
