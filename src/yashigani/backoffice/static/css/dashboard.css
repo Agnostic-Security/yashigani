@@ -227,3 +227,22 @@ tr:hover { background: #f8fafc; }
 .stepup-input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1.5px solid #cbd5e1; border-radius: 6px; font-size: 1.1rem; letter-spacing: 0.15em; text-align: center; outline: none; margin-bottom: 8px; }
 .stepup-error { color: #dc2626; font-size: 0.8rem; min-height: 1.2em; margin: 0 0 16px; }
 .stepup-buttons { display: flex; gap: 10px; }
+
+/* ── Runtime Settings page ───────────────────────────────────── */
+.rs-key { font-family: monospace; font-size: 0.8rem; }
+.rs-val { font-family: monospace; font-size: 0.85rem; color: #1e293b; }
+.rs-meta { font-size: 0.78rem; color: #64748b; }
+.rs-actions { white-space: nowrap; }
+.rs-btn-edit { margin-right: 4px; }
+/* Inline edit form (inserted between rows by JS) */
+.rs-edit-form { display: none; padding: 10px 16px; background: #f8fafc; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
+.rs-edit-inner { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.rs-edit-label { font-size: 0.85rem; color: #334155; }
+.rs-edit-type { font-size: 0.75rem; color: #94a3b8; margin-right: 4px; }
+.rs-edit-result { font-size: 0.8rem; }
+.rs-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 6px; margin-bottom: 0; }
+/* Toast */
+.rs-toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 18px; border-radius: 6px; font-size: 0.85rem; font-weight: 500; opacity: 0; transition: opacity 0.3s; z-index: 9998; pointer-events: none; }
+.rs-toast-visible { opacity: 1; }
+.rs-toast-ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+.rs-toast-err { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }

@@ -12,6 +12,7 @@
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: per-user 100 RPS rate limit + admin alert via Prometheus + audit event USER_RATE_LIMIT_EXCEEDED) -->
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: DDoSProtector wire-up + license-scaled per-IP defaults) -->
 <!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: BUG-V241-LANGFLOW-LETTA-BASE-URL: langflow+letta OPENAI_API_BASE :8080→:8081 in compose+helm) -->
+<!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.3: feat(runtime-settings): Phase 2 web UI — admin panel for live gateway tunables) -->
 <!-- last-updated: 2026-05-16T18:30:00+01:00 (v2.23.4: draft [Unreleased] entry covering 62 commits since v2.23.3) -->
 <!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
 <!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
@@ -27,7 +28,46 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [Unreleased] — v2.24.1
+## [Unreleased] — v2.24.3
+
+(Entries accrue here as in-flight work lands post-v2.24.2.)
+
+---
+
+## [v2.24.2] — 2026-05-25 — Security fix batch (post-v2.24.1)
+
+Captures session work between v2.24.1 (commit `a46ed5d`) and HEAD (`10e03d4`). Mustui-only release per [[feedback_yashigani_v240_repo_route]] §4; not published to public origin.
+
+**Headline closures:** BUG-V241-LANGFLOW-LETTA-BASE-URL (bundled-agent dispatch silently broken since added) · PROBE-AG1 openclaw HMAC perimeter bypass · SoD-001..005 admin/user separation (SoD-004 was live-exploitable) · SEC-4 TOTP counter → Redis (ASVS V6.3.5) · GAP-3 + SEC-5 response-content sensitivity (asymmetry between /v1/* and /agents/*) · GAP-001 + GAP-002 OPA conformance (/v1/models + proxy.py response-leg) · GAP-1 Rego sensitivity catch-all · MUST-4 Caddy admin off (unix socket migration) · NICO-V241-001 per-key Docker secrets · UA-10 per-agent compose bridge + Helm NetworkPolicy (YSG-RISK-055 closed).
+
+**Audit-chain hardening:** LU-AMEND-01 wave-1/2/3 (schema + service + bigserial seq column for cross-batch ordering stability) · LU-AMEND-02 multi-tenant manifest_registrations ledger + CLI · LU-AMEND-03 manifest signing ceremony record · LU-AMEND-04 operator identity attestation on `yashigani onboard` · LU-AMEND-05 risk-register.yml schema + CI release-gate.
+
+**Perimeter / supply chain:** Caddy egress restrictions via iptables OUTPUT allowlist (YSG-RISK-061; ~60-70% post-RCE impact reduction) · C-CAP-004 trivy-agent-images CI gate · N1 light-touch agent-image built-in component scan (bandit + opengrep) · N2 SHA-256 verification via OpenSSL FIPS Provider when `FIPS_MODE=1` (CMVP #4985) · drift #6 server-side `next=` redirect validator · drift #8 compose-Helm pgbouncer.ini auth_query parity · drift #1 KSM→KMS env-var rename (+ backward-compat shim) · drift #3 SSH-only signing scheme formally declared (release-signing.md + YSG-RISK-069) · drift #10 @Help half-implementation removed.
+
+**Throttling:** DDoSProtector instantiated with license-tier-scaled per-IP defaults (formula `max(5000, max_end_users * 25)`; 100000 for enterprise/academic; YSG-RISK-056) · per-user 100 RPS rate limit with admin alert via Prometheus + audit event + Grafana template (YSG-RISK-058).
+
+**Runtime admin layer:** API-first `runtime_settings` (Phase 1) — DB persistence + service + admin API + audit + Redis pub/sub live-reload · 3 settings retrofitted (per-user RPS, DDoS per-IP, DDoS window) · Phase 2 UI follow-up tracked.
+
+**Documentation:** `docs/operator-guide.md` created (OPA+inspection pairing recipe + XFF clarification + PASSWORD_MAX_AGE_DAYS fix + admin/user separation §5) · `docs/security/xff-trust-boundary.md` created · `docs/security/release-signing.md` created · `docs/release-signing-key.pub` (SSH allowed-signers, `namespaces=git`).
+
+**Memory rules (binding architectural principles, persistent across sessions, captured this session):** admin-surfaces-all-runtime-settings · ground-audit-in-docs-and-ops-before-flagging · ava-laura-both-on-final-test · security-boundary-probed-from-both-directions · security-severity-standing-orders · disk-secret-risks-are-kms-conditional · opa-inspects-all-traffic-both-legs (with admin-plane carve-out + product-promise reframe) · admin-user-account-separation.
+
+**Per [[feedback_ava_laura_both_on_final_test]]:** comprehensive Ava (functional E2E exercising real user flows) + Laura (adversarial re-probe + audit-gap reflection) release-gate RECOMMENDED against `v2.24.2` before broad customer rollout.
+
+### Previous in-flight entries (now formally part of v2.24.2)
+
+### Added
+- **feat(runtime-settings): Phase 2 web UI — admin panel for live gateway tunables (admin-surfaces-all-runtime-settings rule / v2.24.3).**
+
+  Phase 1 (`1d2f31e`) shipped the DB + service + admin API for runtime settings. Phase 2 (this commit) ships the thin web UI consumer:
+
+  - `src/yashigani/backoffice/templates/dashboard.html` — "Runtime Settings" nav button + `#page-runtime-settings` SPA page div with settings table (Key / Value / Source / Last Changed By / Last Changed At / Actions) and inline edit form.
+  - `src/yashigani/backoffice/static/js/runtime-settings.js` — standalone defer-loaded module. `loadRuntimeSettings()` calls `GET /admin/runtime-settings` (read-only, `api()`). Edit → `PUT /admin/runtime-settings/{key}` via `apiMutate()` (triggers StepUp modal on 401). Reset → `POST /admin/runtime-settings/{key}/reset` via `apiMutate()`. Client-side type coercion for int/float/bool before the round-trip. Toast feedback on success/error. CSP-compliant: no inline JS, no CDN, event delegation via `data-action=`.
+  - `src/yashigani/backoffice/static/js/dashboard.js` — `showPage()` dispatches `loadRuntimeSettings()` with `typeof` guard (defer-safe). Event delegation handles `rsEditRow` and `rsResetRow` actions.
+  - `src/yashigani/backoffice/static/css/dashboard.css` — `.rs-*` CSS classes for table layout, inline edit form, and toast notification.
+  - `src/tests/unit/test_runtime_settings_ui_phase2.py` — 37 static-artefact tests (no server): HTML structure, JS contract, dashboard.js wiring, CSS classes. 37/37 PASS.
+
+  No new API endpoints. No StepUp bypass. Mustui only per [[feedback_yashigani_v240_repo_route]].
 
 ### Documentation
 - **docs(release-signing): formally declare SSH-only signing scheme. GPG path removed from `.github/workflows/tag-sign.yml`; `docs/security/release-signing.md` documents the verification recipe + key rotation process. Closes drift #3 fully (correction landed in `be94e26`; formal declaration lands here). YSG-RISK-069.**

@@ -26,6 +26,8 @@ function showPage(name, triggerEl) {
     // window.loadPkiStatus guard prevents ReferenceError if pki.js not yet parsed.
     // Bug fix: v2.23.3 — showPage('pki') was missing the loadPkiStatus() call.
     if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
+    // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
+    if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
 }
 
 async function api(path) {
@@ -1154,6 +1156,22 @@ document.addEventListener('click', function(e) {
         // Backup
         case 'verifyBackup':
             verifyBackup();
+            break;
+
+        // Runtime Settings — row-level actions (defined in runtime-settings.js)
+        case 'rsEditRow':
+            if (typeof rsEditRow === 'function') {
+                rsEditRow(
+                    actionEl.getAttribute('data-rs-key'),
+                    actionEl.getAttribute('data-rs-value'),
+                    actionEl.getAttribute('data-rs-type')
+                );
+            }
+            break;
+        case 'rsResetRow':
+            if (typeof rsResetRow === 'function') {
+                rsResetRow(actionEl.getAttribute('data-rs-key'));
+            }
             break;
     }
 });

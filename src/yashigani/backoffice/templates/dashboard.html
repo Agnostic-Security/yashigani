@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-13T00:00:00+01:00 — v2.23.4 CSP-INLINE-STYLE-SPA -->
+<!-- last-updated: 2026-05-25T00:00:00+00:00 — v2.24.3 runtime-settings Phase 2 nav + page div + edit form + toast -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24,6 +24,7 @@
                 <button data-action="showPage" data-param="backup">Backup</button>
                 <button data-action="showPage" data-param="pki">PKI</button>
                 <button data-action="showPage" data-param="settings">Settings</button>
+                <button data-action="showPage" data-param="runtime-settings">Runtime Settings</button>
             </div>
         </div>
         <div class="nav-right">
@@ -660,6 +661,51 @@
                 </div>
             </div>
         </div>
+        <!-- Runtime Settings Page — v2.24.3 (admin-surfaces-all-runtime-settings Phase 2) -->
+        <div class="page" id="page-runtime-settings">
+            <h2>Runtime Settings</h2>
+            <div class="panel">
+                <div class="panel-header">Gateway &amp; Security Tunables</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Live-reloadable configuration values. Changes take effect on the next request
+                        (or after gateway pub/sub propagation). All writes require TOTP step-up
+                        and are recorded in the audit log.
+                    </p>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Setting Key</th>
+                            <th>Current Value</th>
+                            <th>Source</th>
+                            <th>Last Changed By</th>
+                            <th>Last Changed At</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rs-tbody">
+                        <tr><td colspan="6" class="empty">Loading…</td></tr>
+                    </tbody>
+                </table>
+                <!-- Inline edit form — moved between rows via JS -->
+                <div id="rs-edit-form" class="rs-edit-form">
+                    <div class="rs-edit-inner">
+                        <span class="rs-edit-label">Edit: <code id="rs-edit-key"></code></span>
+                        <span class="rs-edit-type">(<span id="rs-edit-type-hint"></span>)</span>
+                        <input type="hidden" id="rs-edit-key-hidden">
+                        <input id="rs-edit-value" type="text" class="fi w-250" placeholder="New value">
+                        <button id="rs-btn-save" class="btn-sm-save">Save</button>
+                        <button id="rs-btn-cancel" class="btn-sm-secondary">Cancel</button>
+                        <span id="rs-edit-result" class="rs-edit-result"></span>
+                    </div>
+                    <p class="rs-totp-note">Save and Reset require TOTP step-up re-verification (ASVS V6.8.4). Changes are written to the audit log.</p>
+                </div>
+            </div>
+
+            <!-- Toast notification -->
+            <div id="rs-toast" class="rs-toast"></div>
+        </div>
     </main>
 
     <!-- V6.8.4 Step-up TOTP modal — shown when a high-value action requires fresh TOTP -->
@@ -690,5 +736,6 @@
     <script src="/static/js/dashboard.js"></script>
     <script src="/static/js/hibp.js" defer></script>
     <script src="/static/js/pki.js" defer></script>
+    <script src="/static/js/runtime-settings.js" defer></script>
 </body>
 </html>
