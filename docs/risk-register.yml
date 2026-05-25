@@ -453,8 +453,10 @@ risks:
   accepted_at: null
   review_by: null
   closure_evidence:
-  - rationale: pgbouncer-auth gains dedicated cert; pg_hba A2 carveout removed; catch-all clientcert=verify-ca uniform
-      across the cluster.
+  - rationale: 'pgbouncer-auth gains dedicated cert; pg_hba A2 carveout removed; catch-all clientcert=verify-ca
+      uniform across the cluster. EXCEPTION: cert carveout for pgbouncer_authenticator role added v2.24.3 — see
+      YSG-RISK-073 for the documented exception (pg_hba `cert clientcert=verify-ca` entry BEFORE catch-all, role+CN
+      scoped, fail-closed).'
     commits:
     - af9fdcd
     - f6a3bbf
@@ -1449,163 +1451,122 @@ risks:
       regression.'
   fix_in_version: v2.24.1
   last_threat_model_review: '2026-05-25'
-
 - id: YSG-RISK-071
-  description: >-
-    OPA response_decision result default was True (allow) — contradicted
-    fail-closed posture established v2.23.4. Two locations in openai_router.py
-    (lines 1274, 1804): result.get("allow", True) resolved to allow=True when
-    OPA returned HTTP 200 with body {"result": {}} (undefined rule — bundle
-    mismatch or partially-loaded bundle). Exploitable only under OPA bundle
-    degradation; not reachable in normal operation because Rego always sets
-    allow explicitly. Fixed by flipping both defaults to False. Closes
-    Laura release-gate v2.24.3 finding LAURA-V243-001.
+  description: 'OPA response_decision result default was True (allow) — contradicted fail-closed posture established
+    v2.23.4. Two locations in openai_router.py (lines 1274, 1804): result.get("allow", True) resolved to allow=True
+    when OPA returned HTTP 200 with body {"result": {}} (undefined rule — bundle mismatch or partially-loaded bundle).
+    Exploitable only under OPA bundle degradation; not reachable in normal operation because Rego always sets allow
+    explicitly. Fixed by flipping both defaults to False. Closes Laura release-gate v2.24.3 finding LAURA-V243-001.'
   severity: low
   controls_impacted:
   - ASVS V14.5 (gateway authorisation fail-closed)
   - NIST SP 800-53 SC-7 (boundary protection fail-closed)
   compensating_controls:
-  - The Rego rule response_decision under package yashigani.v1 has
-    "default response_allowed := true" and always produces a non-empty result
-    in normal operation. The undefined-result path only occurs if the OPA
-    bundle is in a degraded or partially-loaded state.
-  - OPA exception path (timeout, connection refused, 5xx) was already
-    fail-closed as of v2.23.4. This fix closes the softer degraded-bundle gap.
+  - The Rego rule response_decision under package yashigani.v1 has "default response_allowed := true" and always
+    produces a non-empty result in normal operation. The undefined-result path only occurs if the OPA bundle is
+    in a degraded or partially-loaded state.
+  - OPA exception path (timeout, connection refused, 5xx) was already fail-closed as of v2.23.4. This fix closes
+    the softer degraded-bundle gap.
   status: mitigated
   closure_evidence:
   - commit: 3d85ba3
-    rationale: >-
-      Default flipped True → False at both call sites in openai_router.py
-      (lines 1277 + 1812). Three unit tests added to
-      TestOpaUndefinedResultFailClosed in
-      src/tests/unit/test_v2234_opa_fail_closed.py: undefined-result DENY,
-      absent-result-key DENY, explicit-allow-True still passes.
-      Full suite 2896 passed / 0 failed.
+    rationale: 'Default flipped True → False at both call sites in openai_router.py (lines 1277 + 1812). Three unit
+      tests added to TestOpaUndefinedResultFailClosed in src/tests/unit/test_v2234_opa_fail_closed.py: undefined-result
+      DENY, absent-result-key DENY, explicit-allow-True still passes. Full suite 2896 passed / 0 failed.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
-
 - id: YSG-RISK-072
-  description: >-
-    BUG-C838004-CADDY-COPY: docker/caddy/Dockerfile.caddy contained a COPY
-    directive with the path 'caddy/caddy-entrypoint.sh'. The docker-compose.yml
-    caddy service sets build.context: .. (repo root, parent of docker/). COPY
-    paths resolve relative to the build context, so the correct path is
-    'docker/caddy/caddy-entrypoint.sh'. The file does not exist at
-    <repo-root>/caddy/caddy-entrypoint.sh. This caused ALL Podman-based
-    installs (Mac/Podman + Linux/VM/Podman) to fail at the Caddy build step
-    with "no such file or directory". No containers started. Full release gate
-    was blocked. Bug introduced in commit c838004 (Caddy egress restrictions,
-    v2.24.1). Detected by Ava release gate v2.24.3. Not a security issue —
-    correctness/availability bug (100% install failure on Podman).
+  description: 'BUG-C838004-CADDY-COPY: docker/caddy/Dockerfile.caddy contained a COPY directive with the path ''caddy/caddy-entrypoint.sh''.
+    The docker-compose.yml caddy service sets build.context: .. (repo root, parent of docker/). COPY paths resolve
+    relative to the build context, so the correct path is ''docker/caddy/caddy-entrypoint.sh''. The file does not
+    exist at <repo-root>/caddy/caddy-entrypoint.sh. This caused ALL Podman-based installs (Mac/Podman + Linux/VM/Podman)
+    to fail at the Caddy build step with "no such file or directory". No containers started. Full release gate was
+    blocked. Bug introduced in commit c838004 (Caddy egress restrictions, v2.24.1). Detected by Ava release gate
+    v2.24.3. Not a security issue — correctness/availability bug (100% install failure on Podman).'
   severity: low
   controls_impacted:
   - Availability — all Podman installs broken from c838004 introduction
   compensating_controls:
-  - Docker Engine and K8s/Helm installs were not affected (different build
-    toolchain path; Docker Engine on the same compose file would surface the
-    same error but Docker Desktop was not accessible in the Ava gate run).
-  - The existing test_caddy_egress_hardening.py (43 tests) covered YAML/entrypoint
-    content but not Dockerfile build path correctness — a gap now closed by
-    tests/contracts/test_caddy_dockerfile_build_paths.py (9 tests, YSG-RISK-072).
+  - Docker Engine and K8s/Helm installs were not affected (different build toolchain path; Docker Engine on the
+    same compose file would surface the same error but Docker Desktop was not accessible in the Ava gate run).
+  - The existing test_caddy_egress_hardening.py (43 tests) covered YAML/entrypoint content but not Dockerfile build
+    path correctness — a gap now closed by tests/contracts/test_caddy_dockerfile_build_paths.py (9 tests, YSG-RISK-072).
   status: mitigated
   closure_evidence:
   - commit: 0955773
-    rationale: >-
-      COPY path corrected from 'caddy/caddy-entrypoint.sh' to
-      'docker/caddy/caddy-entrypoint.sh' in docker/caddy/Dockerfile.caddy.
-      Build comment updated to clarify build.context is repo root (not docker/).
-      Contract test suite tests/contracts/test_caddy_dockerfile_build_paths.py
-      added (9 tests): asserts all COPY sources exist relative to repo root,
-      entrypoint uses docker/caddy/ prefix, compose context is .., compose
-      dockerfile key matches, entrypoint file exists, and broken path does not
-      exist (regression proof). Tests PASS against fix, FAIL against broken
-      path (2 failures confirmed). podman build succeeds against fixed file;
-      podman build with broken path exits 125 with identical "no such file"
-      error to Ava gate evidence. Full static suite clean.
+    rationale: 'COPY path corrected from ''caddy/caddy-entrypoint.sh'' to ''docker/caddy/caddy-entrypoint.sh'' in
+      docker/caddy/Dockerfile.caddy. Build comment updated to clarify build.context is repo root (not docker/).
+      Contract test suite tests/contracts/test_caddy_dockerfile_build_paths.py added (9 tests): asserts all COPY
+      sources exist relative to repo root, entrypoint uses docker/caddy/ prefix, compose context is .., compose
+      dockerfile key matches, entrypoint file exists, and broken path does not exist (regression proof). Tests PASS
+      against fix, FAIL against broken path (2 failures confirmed). podman build succeeds against fixed file; podman
+      build with broken path exits 125 with identical "no such file" error to Ava gate evidence. Full static suite
+      clean.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
-
 - id: YSG-RISK-073
-  description: >-
-    BUG-NEW-001: PgBouncer 1.25.1 (edoburu image) cannot perform SCRAM-SHA-256
-    as the client when connecting to postgres as auth_user (pgbouncer_authenticator).
-    YSG-RISK-050 removed the A2 pg_hba carveout, assuming pgbouncer would handle
-    SCRAM on the server connection. It cannot: pgbouncer 1.25.1 does not implement
-    SCRAM as the authentication initiator. This caused auth_query to fail on every
-    clean install from v2.24.0 onwards, preventing pgbouncer from fetching userlist.txt
-    and breaking all postgres-backed services (gateway, backoffice). Workaround applied
-    by Ava gate (cycle 3): runtime `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0
-    trust` added to pg_hba — trust is weaker than the fix. Fix: narrow pg_hba carveout
-    using `cert` auth method (client cert IS the authenticator; no SCRAM challenge
-    issued). Both pgbouncer instances (main: pgbouncer-auth_client.crt, CN=pgbouncer-auth;
-    letta: letta-pgbouncer_client.crt, CN=letta-pgbouncer) present CA-signed certs.
-    The `cert` method with `clientcert=verify-ca` is at least as strong as SCRAM+cert
-    because private-key proof + CA chain verification both hold without a password round-trip.
-    Detected by Ava release gate v2.24.3 cycle 3.
+  description: 'BUG-NEW-001: PgBouncer 1.25.1 (edoburu image) cannot perform SCRAM-SHA-256 as the client when connecting
+    to postgres as auth_user (pgbouncer_authenticator). YSG-RISK-050 removed the A2 pg_hba carveout, assuming pgbouncer
+    would handle SCRAM on the server connection. It cannot: pgbouncer 1.25.1 does not implement SCRAM as the authentication
+    initiator. This caused auth_query to fail on every clean install from v2.24.0 onwards, preventing pgbouncer
+    from fetching userlist.txt and breaking all postgres-backed services (gateway, backoffice). Workaround applied
+    by Ava gate (cycle 3): runtime `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 trust` added to pg_hba —
+    trust is weaker than the fix. Fix: narrow pg_hba carveout using `cert` auth method (client cert IS the authenticator;
+    no SCRAM challenge issued). Both pgbouncer instances (main: pgbouncer-auth_client.crt, CN=pgbouncer-auth; letta:
+    letta-pgbouncer_client.crt, CN=letta-pgbouncer) present CA-signed certs. The `cert` method with `clientcert=verify-ca`
+    is at least as strong as SCRAM+cert because private-key proof + CA chain verification both hold without a password
+    round-trip. Detected by Ava release gate v2.24.3 cycle 3.'
   severity: high
   controls_impacted:
   - Availability — all postgres-backed services degraded on clean install
-  - Authentication — YSG-RISK-049 auth_query pattern broken (pgbouncer auth_user
-    could not authenticate to call ysg_pgbouncer_get_auth)
+  - Authentication — YSG-RISK-049 auth_query pattern broken (pgbouncer auth_user could not authenticate to call
+    ysg_pgbouncer_get_auth)
   compensating_controls:
-  - Ava applied a runtime `trust` workaround during the gate run; not suitable
-    for release (trust is weaker than cert — no credential verification).
+  - Ava applied a runtime `trust` workaround during the gate run; not suitable for release (trust is weaker than
+    cert — no credential verification).
   status: mitigated
   closure_evidence:
   - commit: 7f296a1
-    rationale: >-
-      05-enable-ssl.sh pg_hba heredoc updated to include cert carveout for
-      pgbouncer_authenticator BEFORE the scram catch-all. Carveout form:
-      `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 cert clientcert=verify-ca`
-      (IPv4 + IPv6). 10-pgbouncer-auth.sh step 4 updated to INSERT the cert carveout
-      (not remove the carveout as in v2.24.0). Script handles upgrade paths from
-      v2.24.0-v2.24.2 (no carveout) and v2.24.0-pre (trust carveout) idempotently.
-      Both pgbouncer.ini and pgbouncer-letta.ini comments updated. Contract test suite
-      tests/contracts/test_pghba_pgbouncer_cert_carveout.py added (8 tests, 1 skipped):
-      cert carveout present + precedes catchall + no trust + insert logic present +
-      YSG-RISK-073 reference. Helm test correctly skips (Helm uses same init scripts).
-      Full static suite: 3081 pass, 92 skip, 0 fail.
+    rationale: '05-enable-ssl.sh pg_hba heredoc updated to include cert carveout for pgbouncer_authenticator BEFORE
+      the scram catch-all. Carveout form: `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 cert clientcert=verify-ca`
+      (IPv4 + IPv6). 10-pgbouncer-auth.sh step 4 updated to INSERT the cert carveout (not remove the carveout as
+      in v2.24.0). Script handles upgrade paths from v2.24.0-v2.24.2 (no carveout) and v2.24.0-pre (trust carveout)
+      idempotently. Both pgbouncer.ini and pgbouncer-letta.ini comments updated. Contract test suite tests/contracts/test_pghba_pgbouncer_cert_carveout.py
+      added (8 tests, 1 skipped): cert carveout present + precedes catchall + no trust + insert logic present +
+      YSG-RISK-073 reference. Helm test correctly skips (Helm uses same init scripts). Full static suite: 3081 pass,
+      92 skip, 0 fail.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
-
 - id: YSG-RISK-074
-  description: >-
-    BUG-NEW-002: YASHIGANI_SECCOMP_PROFILE env var set to an absolute path by
-    install.sh caused issues in podman-compose 1.5.0 on Mac, producing "file name
-    too long" errors. Root cause: compose override files REPLACE security_opt lists
-    rather than merging them. The Podman override (docker-compose.podman-override.yml)
-    replaced the base security_opt list for gateway + backoffice with only
-    [label=disable], silently dropping no-new-privileges:true, seccomp=..., and
-    apparmor=... on Podman installs. Additionally, when the env-var form
-    `seccomp=${YASHIGANI_SECCOMP_PROFILE}` was active, podman-compose 1.5.0 on
-    Mac produced ENAMETOOLONG because the absolute path string was misinterpreted.
-    Workaround by Ava: set YASHIGANI_SECCOMP_PROFILE=unconfined — disables seccomp
-    enforcement on Podman. Non-blocker (seccomp was already silently disabled on
-    Podman due to the override replacement; the fix restores seccomp enforcement).
-    Detected by Ava release gate v2.24.3 cycle 3.
+  description: 'BUG-NEW-002: YASHIGANI_SECCOMP_PROFILE env var set to an absolute path by install.sh caused issues
+    in podman-compose 1.5.0 on Mac, producing "file name too long" errors. Root cause: compose override files REPLACE
+    security_opt lists rather than merging them. The Podman override (docker-compose.podman-override.yml) replaced
+    the base security_opt list for gateway + backoffice with only [label=disable], silently dropping no-new-privileges:true,
+    seccomp=..., and apparmor=... on Podman installs. Additionally, when the env-var form `seccomp=${YASHIGANI_SECCOMP_PROFILE}`
+    was active, podman-compose 1.5.0 on Mac produced ENAMETOOLONG because the absolute path string was misinterpreted.
+    Workaround by Ava: set YASHIGANI_SECCOMP_PROFILE=unconfined — disables seccomp enforcement on Podman. Non-blocker
+    (seccomp was already silently disabled on Podman due to the override replacement; the fix restores seccomp enforcement).
+    Detected by Ava release gate v2.24.3 cycle 3.'
   severity: medium
   controls_impacted:
-  - Security hardening — seccomp profile enforcement silently absent on Podman for
-    gateway + backoffice (the two services with seccomp in base compose)
+  - Security hardening — seccomp profile enforcement silently absent on Podman for gateway + backoffice (the two
+    services with seccomp in base compose)
   compensating_controls:
-  - Podman rootless provides user-namespace isolation as a compensating control
-    even without a custom seccomp profile.
-  - AppArmor was already unconfined on Podman (documented in override); seccomp
-    was the gap.
+  - Podman rootless provides user-namespace isolation as a compensating control even without a custom seccomp profile.
+  - AppArmor was already unconfined on Podman (documented in override); seccomp was the gap.
   status: mitigated
   closure_evidence:
   - commit: 7f296a1
-    rationale: >-
-      docker-compose.podman-override.yml gateway + backoffice security_opt blocks
-      updated to explicitly include no-new-privileges:true, seccomp=./seccomp/yashigani.json
-      (relative path, no env-var interpolation), apparmor=unconfined, and label=disable.
-      Relative path ./seccomp/yashigani.json is resolved relative to the compose file
-      directory (docker/) by podman-compose — correct when invoked from WORK_DIR/docker/
-      by install.sh. Eliminates env-var interpolation that caused ENAMETOOLONG.
-      Contract test suite tests/contracts/test_podman_seccomp_override.py added (8 tests):
-      seccomp present in override + no env-var form + no-new-privileges present +
-      profile file exists + valid JSON + defaultAction present + base compose still
-      has env-var form (Docker path unaffected) + YSG-RISK-074 reference.
-      Full static suite: 3081 pass, 92 skip, 0 fail.
+    rationale: 'docker-compose.podman-override.yml gateway + backoffice security_opt blocks updated to explicitly
+      include no-new-privileges:true, seccomp=./seccomp/yashigani.json (relative path, no env-var interpolation),
+      apparmor=unconfined, and label=disable. Relative path ./seccomp/yashigani.json is resolved relative to the
+      compose file directory (docker/) by podman-compose — correct when invoked from WORK_DIR/docker/ by install.sh.
+      Eliminates env-var interpolation that caused ENAMETOOLONG. Contract test suite tests/contracts/test_podman_seccomp_override.py
+      added (8 tests): seccomp present in override + no env-var form + no-new-privileges present + profile file
+      exists + valid JSON + defaultAction present + base compose still has env-var form (Docker path unaffected)
+      + YSG-RISK-074 reference. Full static suite: 3081 pass, 92 skip, 0 fail.'
+  - commit: c659647
+    rationale: Correcting fix for podman-compose 1.5.0 list-merge semantics (initial 7f296a1 was intermediate broken
+      state; c659647 reverts override to label=disable only, no duplicate seccomp).
   fix_in_version: v2.24.3
-  last_threat_model_review: '2026-05-25'
+  last_threat_model_review: 2026-05-25
