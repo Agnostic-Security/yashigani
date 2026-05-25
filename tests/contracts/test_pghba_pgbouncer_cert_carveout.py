@@ -1,46 +1,49 @@
-# Last updated: 2026-05-25T00:00:00+00:00
+# Last updated: 2026-05-25T00:00:00+00:00 (cycle 6: scram-sha-256+clientcert; two-factor restored; YSG-RISK-073/075)
 """
-pg_hba.conf trust+clientcert carveout tests — BUG-NEW-001 / YSG-RISK-073 / BUG-C4-001 / BUG-C4-002.
+pg_hba.conf scram-sha-256+clientcert carveout tests — BUG-NEW-001 / YSG-RISK-073 / BUG-C4-001 / BUG-C4-002.
 
-PgBouncer 1.25.1 (edoburu image) cannot perform SCRAM-SHA-256 as the client when
-connecting to postgres as auth_user. YSG-RISK-050 removed the A2 trust carveout,
-assuming pgbouncer would SCRAM — it cannot. YSG-RISK-073 attempted to fix this:
+YSG-RISK-073 history:
 
-  Cycle 3 (commit 7f296a1 predecessor): `cert clientcert=verify-ca` — WRONG on two layers:
+  Cycle 3: `cert clientcert=verify-ca` — WRONG on two layers:
     BUG-C4-001 Layer A: PG16 rejects `clientcert=verify-ca` with `cert` auth method.
       Only `clientcert=verify-full` is valid with cert; postgres crash-loops.
     BUG-C4-001 Layer B: CN mismatch — CN=pgbouncer-auth != role pgbouncer_authenticator.
-      verify-full would also have failed on CN match.
     BUG-C4-002: 05-enable-ssl.sh heredoc AND 10-pgbouncer-auth.sh step 4b both wrote
       the carveout — duplicate entries in pg_hba.conf, both triggering PG16 syntax error.
 
-  Cycle 5 (this commit): `trust clientcert=verify-ca` — PG16-valid + cert-equivalent:
-    CA chain verified (clientcert=verify-ca). No CN constraint. No password challenge.
-    The CA-verified cert IS the sole authenticator (same security as `cert` method).
-    md5 was also attempted in cycle 5 but failed in practice: pgbouncer 1.25.1 (edoburu
-    image) cannot correctly perform server-side md5 authentication. Observed live.
-    Single source of truth: 10-pgbouncer-auth.sh only. 05-enable-ssl.sh does NOT
-    write a pgbouncer_authenticator carveout (BUG-C4-002 fix).
+  Cycle 5: `trust clientcert=verify-ca` — PG16-valid but SINGLE-FACTOR:
+    Laura cycle 5 adversarial probe confirmed a REAL attack chain: any container on
+    the `data` network holding a CA-signed cert can impersonate pgbouncer_authenticator
+    and call ysg_pgbouncer_get_auth — no password needed with trust auth.
+    The blast radius is full postgres DB compromise via SCRAM verifier retrieval.
+    YSG-RISK-075 documents this class. Cycle 5 carveout is REPLACED here (cycle 6).
+
+  Cycle 6 (this commit): `scram-sha-256 clientcert=verify-ca` — TWO-FACTOR RESTORED:
+    Factor 1: clientcert=verify-ca (CA chain + private-key proof).
+    Factor 2: scram-sha-256 (pgbouncer_authenticator password).
+    pgbouncer 1.25.1 (edoburu) DOES support SCRAM as the auth initiator — confirmed by
+    cycle 6 live test: postgres log shows "connection authenticated: identity=pgbouncer_authenticator
+    method=scram-sha-256". Lateral-pivot attack chain closed.
 
 This test suite asserts the correct form in the two pg_hba-producing scripts:
   05-enable-ssl.sh — writes pg_hba.conf on first-init (NO pgbouncer_authenticator carveout)
-  10-pgbouncer-auth.sh — is the SOLE writer of the trust+clientcert carveout on init + upgrade paths
+  10-pgbouncer-auth.sh — is the SOLE writer of the scram+clientcert carveout on init + upgrade paths
 
 Tests also assert:
   - The catch-all (scram-sha-256 clientcert=verify-ca) is still present in 05-enable-ssl.sh
-  - The trust+clientcert carveout precedes the catch-all in 10-pgbouncer-auth.sh insertion logic
-  - The old bare-trust A2 carveout form (trust WITHOUT clientcert) is NOT present in either script
+  - The scram+clientcert carveout precedes the catch-all in 10-pgbouncer-auth.sh insertion logic
+  - `trust` without `map=` is NOT the auth method for pgbouncer_authenticator (YSG-RISK-075 guard)
   - `cert` is NOT the auth method for pgbouncer_authenticator in either script (BUG-C4-001 guard)
-  - `md5` is NOT the auth method for pgbouncer_authenticator in either script (cycle 5 md5 attempt guard)
+  - `md5` is NOT the auth method for pgbouncer_authenticator in either script (cycle 5 md5 guard)
   - 05-enable-ssl.sh does NOT write the pgbouncer_authenticator carveout (BUG-C4-002 guard)
-  - Helm pg_hba ConfigMap contains the matching trust+clientcert carveout
+  - Helm pg_hba ConfigMap contains the matching scram+clientcert carveout
 
 YSG-RISK-049: SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role.
 YSG-RISK-050: dedicated pgbouncer-auth_client.crt for postgres-facing identity.
-YSG-RISK-073: trust clientcert=verify-ca carveout replaces SCRAM for pgbouncer_authenticator
-              auth_query connection (BUG-NEW-001 from Ava v2.24.3 cycle 3 gate;
-              corrected from cert (cycle 4) to trust+clientcert (cycle 5) after
-              BUG-C4-001/002 Ava findings and live md5 failure confirmation).
+YSG-RISK-073: scram-sha-256+clientcert carveout for pgbouncer_authenticator auth_query
+              (cycle 6 — restores two-factor; trust carveout from cycle 5 was single-factor).
+YSG-RISK-075: trust-auth-without-CN-binding is insufficient when multiple containers
+              hold CA-signed certs — paired with pg_ident map, or use scram (this fix).
 """
 from __future__ import annotations
 
@@ -63,13 +66,22 @@ HELM_PG_HBA_SOURCES = [
     REPO_ROOT / "helm" / "yashigani" / "files" / "pg_hba.conf",
 ]
 
-# The expected trust+clientcert carveout lines (canonical form — cycle 5 fix)
-_TRUST_CLIENTCERT_CARVEOUT_RE = re.compile(
-    r"hostssl\s+yashigani\s+pgbouncer_authenticator\s+[\d.:a-fA-F/]+\s+trust\s+clientcert=verify-ca"
+# The expected scram-sha-256+clientcert carveout lines (canonical form — cycle 6 fix)
+_SCRAM_CLIENTCERT_CARVEOUT_RE = re.compile(
+    r"hostssl\s+yashigani\s+pgbouncer_authenticator\s+[\d.:a-fA-F/]+\s+scram-sha-256\s+clientcert=verify-ca"
 )
+# Legacy alias — tests that previously used _TRUST_CLIENTCERT_CARVEOUT_RE now use _SCRAM_CLIENTCERT_CARVEOUT_RE
+_TRUST_CLIENTCERT_CARVEOUT_RE = _SCRAM_CLIENTCERT_CARVEOUT_RE  # cycle 6: trust replaced by scram
+
 # The forbidden bare-trust form (trust WITHOUT clientcert= — the old v2.24.0 A2 carveout)
 _BARE_TRUST_CARVEOUT_RE = re.compile(
     r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+trust(?!\s+clientcert=)"
+)
+# The forbidden trust+clientcert form (cycle 5 — one-factor; YSG-RISK-075)
+# Trust without a pg_ident map= is insufficient when multiple containers hold CA certs.
+# Any trust carveout for pgbouncer_authenticator is forbidden; scram-sha-256 is required.
+_TRUST_CLIENTCERT_FOR_PGBOUNCER_RE = re.compile(
+    r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+trust\s+clientcert="
 )
 # The forbidden md5 form (cycle 5 first attempt — failed in practice with edoburu 1.25.1)
 _MD5_CARVEOUT_RE = re.compile(
@@ -182,32 +194,67 @@ def test_enable_ssl_no_cert_auth_method_for_pgbouncer_authenticator() -> None:
 # Test 2: 10-pgbouncer-auth.sh manages the md5 carveout correctly
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_pgbouncer_auth_script_inserts_trust_clientcert_carveout() -> None:
-    """10-pgbouncer-auth.sh must insert a trust+clientcert carveout — YSG-RISK-073 cycle 5.
+def test_pgbouncer_auth_script_inserts_scram_clientcert_carveout() -> None:
+    """10-pgbouncer-auth.sh must insert a scram-sha-256+clientcert carveout — YSG-RISK-073 cycle 6.
 
     v2.24.0 step 4 REMOVED the carveout. v2.24.3 cycle 3 INSERTED cert carveout (wrong).
     v2.24.3 cycle 4 committed cert (7f296a1 — broken; PG16 syntax + CN mismatch).
-    v2.24.3 cycle 5 INSERTS trust clientcert=verify-ca carveout (cert-equivalent, PG16-valid).
-    Verify the script contains the trust+clientcert carveout insertion logic.
+    v2.24.3 cycle 5 INSERTED trust clientcert=verify-ca — SINGLE-FACTOR SECURITY GAP (YSG-RISK-075).
+    v2.24.3 cycle 6 INSERTS scram-sha-256 clientcert=verify-ca — TWO-FACTOR RESTORED.
+    Verify the script contains the scram+clientcert carveout insertion logic.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
-    # Must contain trust+clientcert carveout insertion
-    assert "trust  clientcert=verify-ca" in content, (
-        "10-pgbouncer-auth.sh: trust+clientcert carveout insertion text not found. "
-        "Step 4 must insert 'hostssl yashigani pgbouncer_authenticator ... trust  clientcert=verify-ca' "
-        "before the catch-all. YSG-RISK-073 cycle 5 (trust+clientcert, not cert or md5)."
+    # Must contain scram-sha-256+clientcert carveout insertion
+    assert "scram-sha-256  clientcert=verify-ca" in content, (
+        "10-pgbouncer-auth.sh: scram-sha-256+clientcert carveout insertion text not found. "
+        "Step 4 must insert 'hostssl yashigani pgbouncer_authenticator ... scram-sha-256  clientcert=verify-ca' "
+        "before the catch-all. YSG-RISK-073 cycle 6 (scram+clientcert, not trust or cert or md5). "
+        "Laura cycle 5 confirmed trust+clientcert is a one-factor security gap (YSG-RISK-075)."
     )
+
+
+def test_pgbouncer_auth_script_no_trust_clientcert_for_pgbouncer_authenticator() -> None:
+    """10-pgbouncer-auth.sh must NOT insert trust+clientcert for pgbouncer_authenticator.
+
+    YSG-RISK-075: `trust clientcert=verify-ca` for pgbouncer_authenticator is a confirmed
+    security gap. Any container on the `data` network holding a CA-signed cert can connect
+    to postgres claiming role pgbouncer_authenticator and call ysg_pgbouncer_get_auth without
+    a password. Laura cycle 5 release gate confirmed the full attack chain.
+
+    The fix is `scram-sha-256 clientcert=verify-ca` (two-factor: cert + password).
+    This test catches regression to the cycle 5 trust+clientcert form.
+    """
+    content = _read(PGBOUNCER_AUTH_SCRIPT)
+    lines = content.splitlines()
+    in_awk_block = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if "awk '" in stripped or 'awk "' in stripped:
+            in_awk_block = True
+        if in_awk_block and "' \"${_hba}\"" in line:
+            in_awk_block = False
+        if in_awk_block and stripped.startswith("print ") and "pgbouncer_authenticator" in stripped:
+            # Trust+clientcert: trust appears AND clientcert= appears on same line
+            if re.search(r"\btrust\b", stripped) and "clientcert=" in stripped:
+                pytest.fail(
+                    f"10-pgbouncer-auth.sh line {i+1}: trust+clientcert form found in awk insertion "
+                    f"block for pgbouncer_authenticator: '{stripped}'. "
+                    "YSG-RISK-075: trust+clientcert is a one-factor security gap — any CA-cert "
+                    "holder can impersonate pgbouncer_authenticator. "
+                    "Use `scram-sha-256 clientcert=verify-ca` (two-factor). "
+                    "Laura cycle 5 confirmed the attack chain."
+                )
 
 
 def test_pgbouncer_auth_script_no_remove_only() -> None:
     """10-pgbouncer-auth.sh must not only remove the carveout without re-inserting it.
 
-    v2.24.0 bug: the script removed the A2 carveout but did not add a cert/md5 carveout.
-    v2.24.3 cycle 5 fix: the script removes stale entries then inserts the md5 carveout.
+    v2.24.0 bug: the script removed the A2 carveout but did not add a new carveout.
+    v2.24.3 cycle 6 fix: the script removes stale entries then inserts the scram carveout.
     Verify the insert step is present (awk first-match insertion or hostssl carveout literal).
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
-    # Must have awk or sed insertion before catch-all (awk used in cycle 5 to handle
+    # Must have awk or sed insertion before catch-all (awk used in cycle 5/6 to handle
     # first-match-only; sed /i inserts before every match, creating duplicates)
     assert (
         "hostssl yashigani pgbouncer_authenticator" in content
@@ -215,21 +262,19 @@ def test_pgbouncer_auth_script_no_remove_only() -> None:
         or "awk" in content
     ), (
         "10-pgbouncer-auth.sh: carveout insertion logic not found. "
-        "Step 4 must insert the md5 carveout before the catch-all (first match only). "
-        "YSG-RISK-073 cycle 5."
+        "Step 4 must insert the scram+clientcert carveout before the catch-all (first match only). "
+        "YSG-RISK-073 cycle 6."
     )
 
 
 def test_pgbouncer_auth_script_no_bare_trust_carveout_inserted() -> None:
     """10-pgbouncer-auth.sh must not insert a BARE trust carveout (trust without clientcert=).
 
-    The v2.24.0 A2 carveout was `trust` with no clientcert requirement — weaker because
-    any client could connect without presenting a cert. YSG-RISK-073 cycle 5 uses
-    `trust clientcert=verify-ca` — the clientcert= requirement is mandatory.
+    The v2.24.0 A2 carveout was `trust` with no clientcert requirement — weakest because
+    any client could connect without presenting a cert. YSG-RISK-073 cycle 6 uses
+    `scram-sha-256 clientcert=verify-ca` — the correct two-factor form.
     This test guards against bare `trust` (without clientcert=) being inserted,
-    which would be a security regression to the old v2.24.0 A2 posture.
-    The correct form (`trust  clientcert=verify-ca`) is allowed — tested by
-    test_pgbouncer_auth_script_inserts_trust_clientcert_carveout.
+    which would be a regression to the old v2.24.0 A2 posture (or worse).
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
     # Check for bare trust insertion — trust without clientcert=verify-ca immediately following
@@ -313,14 +358,19 @@ def test_pgbouncer_auth_script_no_md5_auth_method_inserted() -> None:
 
 
 def test_pgbouncer_auth_script_references_ysg_risk_073() -> None:
-    """10-pgbouncer-auth.sh must reference YSG-RISK-073 in its comments.
+    """10-pgbouncer-auth.sh must reference YSG-RISK-073 and YSG-RISK-075 in its comments.
 
-    Ensures the script is correctly updated for v2.24.3 and not a stale v2.24.0 version.
+    Ensures the script is correctly updated for v2.24.3 cycle 6 and not a stale version.
+    YSG-RISK-075 is the lateral-pivot class documented by Laura cycle 5 and closed by cycle 6.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
     assert "YSG-RISK-073" in content, (
         "10-pgbouncer-auth.sh: YSG-RISK-073 reference not found. "
-        "The script must be updated to v2.24.3 trust+clientcert carveout logic (cycle 5)."
+        "The script must be updated to v2.24.3 scram+clientcert carveout logic (cycle 6)."
+    )
+    assert "YSG-RISK-075" in content, (
+        "10-pgbouncer-auth.sh: YSG-RISK-075 reference not found. "
+        "The script must document the lateral-pivot class (Laura cycle 5) that cycle 6 closes."
     )
 
 
@@ -328,13 +378,13 @@ def test_pgbouncer_auth_script_references_ysg_risk_073() -> None:
 # Test 3: Helm pg_hba contains md5 carveout (Compose-Helm parity)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_helm_pghba_has_trust_clientcert_carveout() -> None:
-    """Helm chart must also include the trust+clientcert carveout for pgbouncer_authenticator.
+def test_helm_pghba_has_scram_clientcert_carveout() -> None:
+    """Helm chart 10-pgbouncer-auth.sh must contain the scram-sha-256+clientcert carveout.
 
-    Compose-Helm parity: the trust+clientcert carveout added to compose 10-pgbouncer-auth.sh
-    must also appear in the Helm chart's pg_hba.conf ConfigMap/values.
+    Compose-Helm parity: the scram+clientcert carveout in docker/postgres/10-pgbouncer-auth.sh
+    must also appear in helm/yashigani/files/10-pgbouncer-auth.sh (the Helm copy).
     If no Helm pg_hba file exists, this test is skipped with a clear reason.
-    YSG-RISK-073 cycle 5.
+    YSG-RISK-073 cycle 6.
     """
     helm_content = None
     for path in HELM_PG_HBA_SOURCES:
@@ -350,9 +400,9 @@ def test_helm_pghba_has_trust_clientcert_carveout() -> None:
             "when the Helm chart embeds pg_hba.conf as a ConfigMap. YSG-RISK-073."
         )
 
-    matches = _TRUST_CLIENTCERT_CARVEOUT_RE.findall(helm_content)
+    matches = _SCRAM_CLIENTCERT_CARVEOUT_RE.findall(helm_content)
     assert len(matches) >= 1, (
-        f"Helm pg_hba source: trust+clientcert carveout for pgbouncer_authenticator not found. "
-        "Compose-Helm parity requires the trust clientcert=verify-ca carveout in Helm too. "
-        "YSG-RISK-073 cycle 5."
+        f"Helm pg_hba source: scram-sha-256+clientcert carveout for pgbouncer_authenticator not found. "
+        "Compose-Helm parity requires the scram-sha-256 clientcert=verify-ca carveout in Helm too. "
+        "YSG-RISK-073 cycle 6."
     )
