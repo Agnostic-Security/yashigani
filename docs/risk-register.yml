@@ -1509,7 +1509,7 @@ risks:
     tests/contracts/test_caddy_dockerfile_build_paths.py (9 tests, YSG-RISK-072).
   status: mitigated
   closure_evidence:
-  - commit: TBD_BUG_C838004_FIX
+  - commit: 0955773
     rationale: >-
       COPY path corrected from 'caddy/caddy-entrypoint.sh' to
       'docker/caddy/caddy-entrypoint.sh' in docker/caddy/Dockerfile.caddy.
