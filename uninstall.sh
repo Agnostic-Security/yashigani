@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # uninstall.sh — Tear down the Yashigani stack.
 # Usage: ./uninstall.sh [--remove-volumes] [--runtime=docker|podman] [--yes|-y]
+# Last updated: 2026-05-26T00:00:00+00:00 (feat(uninstall): runtime-aware refactor — separate paths per runtime + user-context guard — BUG-UNINSTALL-SUDO-ROOTLESS / Tiago directive 2026-05-26)
+# Last updated: 2026-05-26T00:00:00+00:00 (fix(uninstall): depend-first removal + retry pass + final assertion — BUG-UNINSTALL-DEPEND-ORDER-2026-05-26)
 # Last updated: 2026-05-17T17:00:00+00:00 (fix(uninstall): document yashigani_internal_bearer in secrets-wipe comment — Bucket-C)
 # Last updated: 2026-05-17T10:00:00+00:00 (fix(uninstall): add wazuh-compose volumes to canonical list + prune dangling anon volumes — ANON-VOL-LEAK)
 # Last updated: 2026-05-15T14:00:00+00:00 (fix(uninstall): wipe docker/secrets/ on --remove-volumes + final straggler pass — BUG-3-MULTI-USER-INSTALL-PKI + BUG-1-REDIS-STRAGGLER)
@@ -10,6 +12,10 @@
 # Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
 
 set -euo pipefail
+
+# Hardened PATH — never trust inherited PATH for privileged scripts.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 # Minimal logging helper — mirrors the install.sh format exactly.
 # log_info is called in the state-file runtime-detection block (57ea226);
@@ -162,6 +168,436 @@ _remove_auto_start() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# _list_project_containers — enumerate ALL project containers (running OR
+# exited) using two complementary strategies:
+#
+#   1. Label filter: compose-label variants for both Podman and Docker.
+#   2. Name-prefix fallback: docker_* or docker-* naming conventions.
+#
+# Outputs deduplicated container IDs, one per line, to stdout.
+# Returns 0 regardless of whether any were found.
+#
+# Args: $1 = runtime binary (podman or docker)
+#       $2 = project prefix (default: "docker")
+# ---------------------------------------------------------------------------
+_list_project_containers() {
+  local _rt="${1:?_list_project_containers: runtime required}"
+  local _pfx="${2:-docker}"
+  local _ids=""
+
+  for _label_key in "io.podman.compose.project" "com.docker.compose.project"; do
+    local _l
+    _l="$("$_rt" ps -a -q --filter "label=${_label_key}=${_pfx}" 2>/dev/null || true)"
+    if [ -n "$_l" ]; then
+      _ids="${_ids}${_l}
+"
+    fi
+  done
+
+  local _by_name
+  _by_name="$("$_rt" ps -a -q --filter "name=^${_pfx}[_-]" 2>/dev/null || true)"
+  if [ -n "$_by_name" ]; then
+    _ids="${_ids}${_by_name}
+"
+  fi
+
+  printf '%s' "$_ids" | sort -u | grep -v '^$' || true
+}
+
+# ---------------------------------------------------------------------------
+# _remove_containers — stop then force-remove a newline-separated list of
+# container IDs. Uses --depend first (Podman >=4.x), falls back to plain
+# rm -f (Docker / older Podman).
+#
+# BUG-UNINSTALL-DEPEND-ORDER-2026-05-26: --depend FIRST is mandatory.
+# See Maxine's commit 82f356c for root-cause analysis.
+#
+# Args: $1 = runtime binary
+#       $2 = newline-separated container IDs
+# Side-effects: prints per-container result to stdout/stderr.
+# Returns 0 always (callers check residuals separately).
+# ---------------------------------------------------------------------------
+_remove_containers() {
+  local _rt="${1:?_remove_containers: runtime required}"
+  local _ids="${2:-}"
+  [ -z "$_ids" ] && return 0
+
+  local _count
+  _count="$(printf '%s\n' "$_ids" | grep -c '.' || echo 0)"
+  echo "  [stop] Stopping ${_count} container(s)..."
+  while IFS= read -r _cid; do
+    [ -z "$_cid" ] && continue
+    "$_rt" stop --time 0 "$_cid" >/dev/null 2>&1 || true
+  done <<< "$_ids"
+
+  echo "  [rm] Force-removing ${_count} container(s) (--depend first)..."
+  while IFS= read -r _cid; do
+    [ -z "$_cid" ] && continue
+    local _cname
+    _cname="$("$_rt" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
+    if "$_rt" rm -f --depend "$_cid" >/dev/null 2>&1; then
+      echo "  [removed] ${_cname} (${_cid})"
+    elif "$_rt" rm -f "$_cid" >/dev/null 2>&1; then
+      # --depend unsupported (Docker / older Podman) — plain rm -f fallback
+      echo "  [removed] ${_cname} (${_cid})"
+    else
+      echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
+    fi
+  done <<< "$_ids"
+}
+
+# ---------------------------------------------------------------------------
+# _assert_no_containers_remain — final assertion gate.
+#
+# Re-enumerates project containers after all removal passes. If ANY remain,
+# prints a detailed error with manual remediation and exits 1.
+# This is the contract that closes the "silent exit-0" hole.
+#
+# BUG-UNINSTALL-SILENT-SUCCESS-2026-05-26 / BUG-UNINSTALL-SUDO-ROOTLESS
+#
+# Args: $1 = runtime binary
+#       $2 = project prefix
+#       $3 = human-readable runtime label (for error messages)
+# ---------------------------------------------------------------------------
+_assert_no_containers_remain() {
+  local _rt="${1:?}"
+  local _pfx="${2:-docker}"
+  local _label="${3:-${_rt}}"
+  local _residual
+  _residual="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_residual" ]; then
+    local _cnt
+    _cnt="$(printf '%s\n' "$_residual" | grep -c '.' || echo 0)"
+    printf '\n' >&2
+    printf 'ERROR: uninstall.sh FAILED — %d project container(s) remain after all removal passes.\n' "$_cnt" >&2
+    printf 'Runtime: %s\n' "$_label" >&2
+    while IFS= read -r _cid; do
+      [ -z "$_cid" ] && continue
+      local _detail
+      _detail="$("$_rt" inspect --format '{{.Name}} state={{.State.Status}} restarts={{.RestartCount}}' "$_cid" 2>/dev/null \
+                 | sed 's|^/||' || echo "${_cid} (inspect failed)")"
+      printf '  - %s (%s)\n' "$_detail" "$_cid" >&2
+    done <<< "$_residual"
+    printf '\n' >&2
+    printf 'Manual remediation:\n' >&2
+    # shellcheck disable=SC2016
+    # SC2016: literal $() in single quotes is intentional -- copy-paste remediation for operator
+    printf '  %s rm -f --depend $(%s ps -a -q --filter '"'"'name=^%s[_-]'"'"')\n' \
+           "$_rt" "$_rt" "$_pfx" >&2
+    printf '  %s system prune -af --volumes\n' "$_rt" >&2
+    printf '\n' >&2
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# _assert_no_volumes_remain — final volume assertion gate.
+#
+# After volume removal, re-checks every canonical volume. If ANY still exist,
+# prints a detailed error and exits 1.
+#
+# This closes the volume-parallel of the container silent-exit-0 hole.
+# Previously the script logged [WARN] on individual volume rm failures and
+# continued to exit 0 — operators assumed clean state but volumes remained.
+#
+# Args: $1 = runtime binary
+#       $2 = project prefix
+# ---------------------------------------------------------------------------
+_assert_no_volumes_remain() {
+  local _rt="${1:?}"
+  local _pfx="${2:-docker}"
+  local _leftover=()
+  for _vol in "${_CANONICAL_VOLUMES[@]}"; do
+    local _full="${_pfx}_${_vol}"
+    if "$_rt" volume inspect "$_full" >/dev/null 2>&1; then
+      _leftover+=("$_full")
+    fi
+  done
+  if [ "${#_leftover[@]}" -gt 0 ]; then
+    printf '\n' >&2
+    printf 'ERROR: uninstall.sh FAILED — %d named volume(s) remain after removal pass:\n' \
+           "${#_leftover[@]}" >&2
+    for _v in "${_leftover[@]}"; do
+      printf '  - %s\n' "$_v" >&2
+    done
+    printf '\n' >&2
+    printf 'Manual remediation:\n' >&2
+    for _v in "${_leftover[@]}"; do
+      printf '  %s volume rm %s\n' "$_rt" "$_v" >&2
+    done
+    printf '\n' >&2
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# _teardown_podman_rootless — container teardown for Podman rootless.
+#
+# Key properties of this path:
+# - Containers live in the CALLING USER's user namespace.
+# - "sudo podman" sees root's namespace which has ZERO containers — it MUST
+#   NOT be used (BUG-UNINSTALL-SUDO-ROOTLESS).
+# - compose down signals graceful shutdown; belt-and-braces rm loop is the
+#   reliable fallback for podman-compose ≤1.3.x parity gaps.
+# - Retry pass handles restart-policy=always respawn between stop and rm.
+# ---------------------------------------------------------------------------
+_teardown_podman_rootless() {
+  local _rt="podman"
+  local _pfx="${_PROJECT_PREFIX}"
+  local _label
+  _label="podman-rootless (UID=$(id -u))"
+
+  echo "=== Podman rootless teardown ==="
+
+  # Step 1: compose down (graceful).
+  echo "  [compose] Stopping services via compose down..."
+  # shellcheck disable=SC2086
+  $COMPOSE -f "$COMPOSE_FILE" ${_COMPOSE_ENV_ARGS} down $DOWN_ARGS 2>&1 || true
+
+  # Step 2: belt-and-braces — first pass.
+  echo "  [cleanup] Belt-and-braces first pass..."
+  local _ids
+  _ids="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_ids" ]; then
+    _remove_containers "$_rt" "$_ids"
+  else
+    echo "  [ok] No remaining containers after compose down."
+  fi
+
+  # Step 3: retry pass (handles restart-policy=always respawn race).
+  local _residual
+  _residual="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_residual" ]; then
+    echo "  [retry] Residual containers detected — retry pass..."
+    _remove_containers "$_rt" "$_residual"
+  fi
+
+  # Step 4: final assertion — MUST be zero or we exit 1.
+  _assert_no_containers_remain "$_rt" "$_pfx" "$_label"
+  echo "  [ok] All project containers removed."
+}
+
+# ---------------------------------------------------------------------------
+# _teardown_podman_rootful — container teardown for Podman rootful.
+#
+# Rootful Podman (called as root or via sudo) can see and manage all
+# containers in the system namespace. The teardown logic mirrors rootless
+# but does not gate on SUDO_USER since the caller intentionally has root.
+# ---------------------------------------------------------------------------
+_teardown_podman_rootful() {
+  local _rt="podman"
+  local _pfx="${_PROJECT_PREFIX}"
+  local _label="podman-rootful (UID=0)"
+
+  echo "=== Podman rootful teardown ==="
+
+  # Step 1: compose down (graceful).
+  echo "  [compose] Stopping services via compose down..."
+  # shellcheck disable=SC2086
+  $COMPOSE -f "$COMPOSE_FILE" ${_COMPOSE_ENV_ARGS} down $DOWN_ARGS 2>&1 || true
+
+  # Step 2: belt-and-braces — first pass.
+  local _ids
+  _ids="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_ids" ]; then
+    _remove_containers "$_rt" "$_ids"
+  else
+    echo "  [ok] No remaining containers after compose down."
+  fi
+
+  # Step 3: retry pass.
+  local _residual
+  _residual="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_residual" ]; then
+    echo "  [retry] Residual containers detected — retry pass..."
+    _remove_containers "$_rt" "$_residual"
+  fi
+
+  # Step 4: final assertion.
+  _assert_no_containers_remain "$_rt" "$_pfx" "$_label"
+  echo "  [ok] All project containers removed."
+}
+
+# ---------------------------------------------------------------------------
+# _teardown_docker_desktop — container teardown for Docker Desktop (macOS).
+#
+# Docker Desktop runs a Linux VM managed by the Desktop application.
+# The daemon is accessible via the standard socket but the namespacing is
+# different from Linux native Docker Engine: containers are always "rootful"
+# from Docker's perspective regardless of the host user's UID.
+#
+# Key differences vs docker-engine:
+# - `docker info` shows ServerVersion and Name: desktop-linux.
+# - There is no rootless path — Docker Desktop manages everything internally.
+# - "sudo docker" and "docker" are equivalent (both talk to the Desktop daemon).
+# ---------------------------------------------------------------------------
+_teardown_docker_desktop() {
+  local _rt="docker"
+  local _pfx="${_PROJECT_PREFIX}"
+  local _label="docker-desktop (macOS)"
+
+  echo "=== Docker Desktop teardown ==="
+
+  # Step 1: compose down (graceful).
+  echo "  [compose] Stopping services via compose down..."
+  # shellcheck disable=SC2086
+  $COMPOSE -f "$COMPOSE_FILE" ${_COMPOSE_ENV_ARGS} down $DOWN_ARGS 2>&1 || true
+
+  # Step 2: belt-and-braces — first pass.
+  local _ids
+  _ids="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_ids" ]; then
+    _remove_containers "$_rt" "$_ids"
+  else
+    echo "  [ok] No remaining containers after compose down."
+  fi
+
+  # Step 3: retry pass.
+  local _residual
+  _residual="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_residual" ]; then
+    echo "  [retry] Residual containers detected — retry pass..."
+    _remove_containers "$_rt" "$_residual"
+  fi
+
+  # Step 4: final assertion.
+  _assert_no_containers_remain "$_rt" "$_pfx" "$_label"
+  echo "  [ok] All project containers removed."
+}
+
+# ---------------------------------------------------------------------------
+# _teardown_docker_engine — container teardown for Linux native Docker Engine.
+#
+# Docker Engine on Linux can run rootful (standard daemon) or rootless
+# (docker rootless mode, separate user-level daemon). In the rootless case
+# the daemon is owned by the calling user and "sudo docker" would reach a
+# different daemon — same namespace mismatch as Podman rootless.
+#
+# Rootless Docker Engine detection: XDG_RUNTIME_DIR-based socket path is
+# present when docker rootless is active. We check this at detection time
+# and store in RUNTIME_SUBTYPE=docker-engine-rootless vs docker-engine.
+# ---------------------------------------------------------------------------
+_teardown_docker_engine() {
+  local _rt="docker"
+  local _pfx="${_PROJECT_PREFIX}"
+  local _label="${RUNTIME_SUBTYPE:-docker-engine}"
+
+  echo "=== Docker Engine teardown (${_label}) ==="
+
+  # Step 1: compose down (graceful).
+  echo "  [compose] Stopping services via compose down..."
+  # shellcheck disable=SC2086
+  $COMPOSE -f "$COMPOSE_FILE" ${_COMPOSE_ENV_ARGS} down $DOWN_ARGS 2>&1 || true
+
+  # Step 2: belt-and-braces — first pass.
+  local _ids
+  _ids="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_ids" ]; then
+    _remove_containers "$_rt" "$_ids"
+  else
+    echo "  [ok] No remaining containers after compose down."
+  fi
+
+  # Step 3: retry pass.
+  local _residual
+  _residual="$(_list_project_containers "$_rt" "$_pfx")"
+  if [ -n "$_residual" ]; then
+    echo "  [retry] Residual containers detected — retry pass..."
+    _remove_containers "$_rt" "$_residual"
+  fi
+
+  # Step 4: final assertion.
+  _assert_no_containers_remain "$_rt" "$_pfx" "$_label"
+  echo "  [ok] All project containers removed."
+}
+
+# ---------------------------------------------------------------------------
+# _teardown_k8s — helm/kubectl teardown for Kubernetes.
+#
+# K8s path: helm uninstall + namespace drain. Container-level rm is replaced
+# by kubectl delete pod --all --force in the namespace. Volume cleanup uses
+# kubectl delete pvc --all in the namespace.
+#
+# This path is entered when RUNTIME=k8s in the install state file OR when
+# --runtime=k8s is passed explicitly.
+#
+# IMPORTANT: Kubernetes volumes are PersistentVolumeClaims — named volumes
+# in the compose sense do not exist. The --remove-volumes flag triggers PVC
+# deletion here instead of the compose volume rm loop.
+# ---------------------------------------------------------------------------
+_teardown_k8s() {
+  local _ns="${YASHIGANI_NAMESPACE:-yashigani}"
+  local _release="${YASHIGANI_HELM_RELEASE:-yashigani}"
+
+  echo "=== Kubernetes (Helm) teardown ==="
+  echo "  Namespace: ${_ns}"
+  echo "  Helm release: ${_release}"
+
+  # Step 1: helm uninstall (removes Deployment, Service, ConfigMap, Secrets, etc.)
+  if command -v helm >/dev/null 2>&1; then
+    if helm status "$_release" -n "$_ns" >/dev/null 2>&1; then
+      echo "  [helm] Uninstalling release ${_release}..."
+      helm uninstall "$_release" -n "$_ns" --wait --timeout 120s 2>&1 || true
+    else
+      echo "  [skip] Helm release ${_release} not found in namespace ${_ns}"
+    fi
+  else
+    echo "  [WARN] helm not found — skipping helm uninstall" >&2
+  fi
+
+  # Step 2: drain any residual pods via kubectl.
+  if command -v kubectl >/dev/null 2>&1; then
+    local _pod_count
+    _pod_count="$(kubectl get pods -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
+    if [ "$_pod_count" -gt 0 ]; then
+      echo "  [kubectl] Force-deleting ${_pod_count} residual pod(s)..."
+      kubectl delete pods --all -n "$_ns" --force --grace-period=0 2>&1 || true
+    else
+      echo "  [ok] No residual pods in namespace ${_ns}."
+    fi
+
+    # Step 3: remove PVCs when --remove-volumes is set.
+    if [ "$REMOVE_VOLUMES" = "true" ]; then
+      local _pvc_count
+      _pvc_count="$(kubectl get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
+      if [ "$_pvc_count" -gt 0 ]; then
+        echo "  [kubectl] Deleting ${_pvc_count} PersistentVolumeClaim(s)..."
+        kubectl delete pvc --all -n "$_ns" --wait=true --timeout=60s 2>&1 || true
+      else
+        echo "  [ok] No PVCs found in namespace ${_ns}."
+      fi
+
+      # Step 4: delete the namespace itself.
+      if kubectl get namespace "$_ns" >/dev/null 2>&1; then
+        echo "  [kubectl] Deleting namespace ${_ns}..."
+        kubectl delete namespace "$_ns" --wait=true --timeout=60s 2>&1 || true
+      fi
+    fi
+
+    # Step 5: final assertion — no pods should remain.
+    local _remaining_pods
+    _remaining_pods="$(kubectl get pods -n "$_ns" --no-headers 2>/dev/null | grep -v Terminating | grep -c . || echo 0)"
+    if [ "$_remaining_pods" -gt 0 ]; then
+      printf '\n' >&2
+      printf 'ERROR: uninstall.sh FAILED — %d pod(s) remain in namespace %s\n' \
+             "$_remaining_pods" "$_ns" >&2
+      kubectl get pods -n "$_ns" >&2 || true
+      printf '\nManual remediation:\n' >&2
+      printf '  kubectl delete pods --all -n %s --force --grace-period=0\n' "$_ns" >&2
+      printf '  kubectl delete namespace %s\n' "$_ns" >&2
+      printf '\n' >&2
+      exit 1
+    fi
+    echo "  [ok] All pods removed."
+  else
+    echo "  [WARN] kubectl not found — cannot verify pod drain" >&2
+  fi
+}
+
+# ===========================================================================
+# Argument parsing
+# ===========================================================================
 for arg in "$@"; do
     case "$arg" in
         --remove-volumes) REMOVE_VOLUMES="true" ;;
@@ -176,7 +612,8 @@ Stops the Yashigani stack and optionally removes all data.
 Options:
   --remove-volumes    Also permanently delete all data volumes
                       (Redis, audit logs, Ollama models, metrics history)
-  --runtime=RUNTIME   Force a specific container runtime (docker|podman)
+  --runtime=RUNTIME   Force a specific container runtime
+                      (docker|podman|k8s — normally auto-detected)
   --yes, -y           Skip confirmation prompts (for unattended/CI use).
                       Safety note: when combined with --remove-volumes this
                       will DELETE ALL DATA without prompting. Pass both flags
@@ -189,24 +626,40 @@ EOF
     esac
 done
 
-# State-file runtime detection (Iris IRIS-ARCH-001 / Laura LAURA-TM-CLEANUP-001).
-# install.sh writes docker/.yashigani-install-state at successful install completion.
-# Reading it here avoids heuristic auto-detect on dual-runtime hosts (V240-004).
-# Falls through to auto-detect when state file is absent (pre-v2.23.4 installs).
+# ===========================================================================
+# Runtime detection — four sources, in precedence order:
+#
+#   1. --runtime= flag (already parsed above into RUNTIME)
+#   2. State file: docker/.yashigani-install-state written by install.sh
+#   3. Auto-detect: podman preferred over docker (mirrors install.sh order)
+#   4. Hard error if nothing found
+#
+# RUNTIME_SUBTYPE is derived AFTER the base runtime is known:
+#   podman-rootless   — podman + caller UID != 0
+#   podman-rootful    — podman + caller UID == 0
+#   docker-desktop    — docker + macOS OR docker info Name: desktop-linux
+#   docker-engine     — docker + Linux native daemon
+#   docker-engine-rootless — docker + rootless mode (XDG_RUNTIME_DIR socket)
+#   k8s               — Kubernetes (helm/kubectl)
+# ===========================================================================
+
+# Source 2: state-file runtime detection (Iris IRIS-ARCH-001 / Laura LAURA-TM-CLEANUP-001).
 _STATE_FILE="${SCRIPT_DIR}/docker/.yashigani-install-state"
-if [ -z "$RUNTIME" ] && [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
+_INSTALL_UID=""
+_INSTALL_USER=""
+
+if [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
     _state_runtime="$(grep -E '^RUNTIME=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
-    if [ "$_state_runtime" = "docker" ] || [ "$_state_runtime" = "podman" ]; then
+    _INSTALL_UID="$(grep -E '^INSTALL_UID=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
+    _INSTALL_USER="$(grep -E '^INSTALL_USER=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
+    if [ -z "$RUNTIME" ] && { [ "$_state_runtime" = "docker" ] || [ "$_state_runtime" = "podman" ] || [ "$_state_runtime" = "k8s" ]; }; then
         RUNTIME="$_state_runtime"
         log_info "Using runtime from install state file: $RUNTIME"
+        [ -n "$_INSTALL_USER" ] && log_info "Install was performed by user: ${_INSTALL_USER} (UID: ${_INSTALL_UID:-unknown})"
     fi
 fi
 
-# Detect runtime — prefer Podman (mirrors install.sh auto-detect order).
-# Rationale: on dual-runtime hosts where the install was done via Podman, Docker
-# may also answer `docker info`, causing volume rm to target the wrong store.
-# The --runtime=docker|podman override (parsed above) wins because this block is
-# guarded by [ -z "$RUNTIME" ].
+# Source 3: auto-detect (only when RUNTIME is still empty after state-file check).
 if [ -z "$RUNTIME" ]; then
     if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
         RUNTIME="podman"
@@ -214,13 +667,129 @@ if [ -z "$RUNTIME" ]; then
         RUNTIME="docker"
     else
         echo "ERROR: No container runtime found (tried podman, docker)." >&2
+        echo "Install podman or docker and ensure the daemon/service is running." >&2
         exit 1
     fi
 fi
+
+# Source 4: validate the runtime value is one of the known strings.
+case "$RUNTIME" in
+  docker|podman|k8s) ;;
+  *)
+    printf 'ERROR: Unknown runtime %q — expected docker, podman, or k8s.\n' "$RUNTIME" >&2
+    exit 1
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# RUNTIME_SUBTYPE detection
+# ---------------------------------------------------------------------------
+RUNTIME_SUBTYPE=""
+_CALLER_UID="$(id -u)"
+
+if [ "$RUNTIME" = "podman" ]; then
+  if [ "$_CALLER_UID" = "0" ]; then
+    RUNTIME_SUBTYPE="podman-rootful"
+  else
+    RUNTIME_SUBTYPE="podman-rootless"
+  fi
+elif [ "$RUNTIME" = "docker" ]; then
+  # Docker Desktop detection: present on macOS or when docker info reports
+  # the server name "docker-desktop" or context name "desktop-linux".
+  _docker_os="$(uname -s)"
+  _docker_context_name="$(docker context inspect --format '{{.Name}}' 2>/dev/null || echo '')"
+  _docker_server_name="$(docker info --format '{{.Name}}' 2>/dev/null || echo '')"
+  if [ "$_docker_os" = "Darwin" ] \
+     || [ "$_docker_context_name" = "desktop-linux" ] \
+     || [ "$_docker_server_name" = "docker-desktop" ]; then
+    RUNTIME_SUBTYPE="docker-desktop"
+  else
+    # Check for rootless Docker Engine: rootless daemon uses a user-level socket.
+    _xdg_socket="${XDG_RUNTIME_DIR:-}/docker.sock"
+    if [ -S "$_xdg_socket" ]; then
+      RUNTIME_SUBTYPE="docker-engine-rootless"
+    else
+      RUNTIME_SUBTYPE="docker-engine"
+    fi
+  fi
+elif [ "$RUNTIME" = "k8s" ]; then
+  RUNTIME_SUBTYPE="k8s"
+fi
+
 COMPOSE="$RUNTIME compose"
 
+# ===========================================================================
+# BUG-UNINSTALL-SUDO-ROOTLESS guard
+#
+# When uninstall.sh is invoked via `sudo` AND the target runtime is rootless
+# Podman, the script runs as root (UID 0) but the Podman containers live in
+# the non-root user's namespace. Root's Podman sees ZERO containers — the
+# script would report "nothing to clean" and exit 0 falsely, leaving the
+# entire stack running.
+#
+# Detection:
+#   - SUDO_USER is set (we were invoked via sudo)
+#   - RUNTIME = podman
+#   - Effective UID = 0 (we are root now)
+#   - Install state file records the install was done by a non-root user
+#     (or state file absent — we conservatively refuse on any rootless podman + sudo)
+#
+# Action: REFUSE with a clear error. Do NOT silently re-exec as SUDO_USER
+# because that could re-invoke with wrong env (PATH, HOME, XDG_RUNTIME_DIR).
+# The safe path is to tell the operator to re-run without sudo.
+#
+# Tiago directive 2026-05-26: separate paths for podman, docker, k8s.
+# Maxine session 2026-05-26: root namespace saw ZERO containers during cycle 8 VM test.
+# ===========================================================================
+if [ "${SUDO_USER:-}" != "" ] && [ "$RUNTIME" = "podman" ] && [ "$_CALLER_UID" = "0" ]; then
+  _install_owner="${_INSTALL_USER:-${SUDO_USER}}"
+  printf '\n' >&2
+  printf 'ERROR: uninstall.sh invoked via sudo against rootless Podman.\n' >&2
+  printf '\n' >&2
+  printf 'Rootless Podman containers live in user '"'"'%s'"'"''"'"'s namespace,\n' \
+         "$_install_owner" >&2
+  printf 'not root'"'"'s. Root'"'"'s Podman sees ZERO containers and uninstall would exit 0 falsely.\n' >&2
+  printf '\n' >&2
+  printf 'Re-run WITHOUT sudo as the install-owning user:\n' >&2
+  printf '    bash uninstall.sh\n' >&2
+  if [ "${_install_owner}" != "${SUDO_USER}" ]; then
+    printf '\n' >&2
+    printf 'If you need to run as that user:\n' >&2
+    printf '    su - %s -c "bash %s"\n' "$_install_owner" "$0" >&2
+  fi
+  printf '\n' >&2
+  exit 1
+fi
+
+# ===========================================================================
+# Docker Engine rootless — same namespace-mismatch risk.
+#
+# When running rootless Docker Engine and invoked via sudo, the root user
+# talks to the system Docker socket (/var/run/docker.sock) which is a
+# different daemon from the user's rootless socket. Refuse with same class
+# of error.
+# ===========================================================================
+if [ "${SUDO_USER:-}" != "" ] && [ "$RUNTIME_SUBTYPE" = "docker-engine-rootless" ] && [ "$_CALLER_UID" = "0" ]; then
+  _install_owner="${_INSTALL_USER:-${SUDO_USER}}"
+  printf '\n' >&2
+  printf 'ERROR: uninstall.sh invoked via sudo against rootless Docker Engine.\n' >&2
+  printf '\n' >&2
+  printf 'Rootless Docker containers live in user '"'"'%s'"'"''"'"'s namespace.\n' \
+         "$_install_owner" >&2
+  printf 'Re-run WITHOUT sudo as the install-owning user:\n' >&2
+  printf '    bash uninstall.sh\n' >&2
+  printf '\n' >&2
+  exit 1
+fi
+
+# ===========================================================================
+# Banner
+# ===========================================================================
 echo "=== Yashigani Uninstaller ==="
-echo "Runtime: $RUNTIME"
+echo "Runtime:     $RUNTIME"
+echo "Subtype:     ${RUNTIME_SUBTYPE}"
+echo "Caller UID:  ${_CALLER_UID} ($(id -un))"
+[ -n "$_INSTALL_USER" ] && echo "Install user: ${_INSTALL_USER} (UID: ${_INSTALL_UID:-unknown})"
 echo ""
 
 if [ "$REMOVE_VOLUMES" = "true" ]; then
@@ -251,57 +820,32 @@ fi
 # BUG-REBOOT-NO-AUTO-START / YSG-RISK-046
 _remove_auto_start
 
-# Step 2: Stop the compose stack
+# ===========================================================================
+# Step 2: Environment stub setup for compose down
 #
-# BUG-UNINSTALL-NO-ENV: docker-compose.yml uses ${VAR:?} fail-closed declarations
-# for required variables. Without a populated docker/.env, compose refuses to
-# parse the file and exits non-zero before sending any down/stop signals to
-# containers. This breaks the canonical DR "clean Step 0" path (fresh clone,
-# no prior install.sh run in this checkout).
+# BUG-UNINSTALL-NO-ENV + BUG-UNINSTALL-PARTIAL-ENV:
+# docker-compose.yml uses ${VAR:?} declarations. Without a populated .env,
+# compose refuses to parse the file and exits non-zero. Fix: stub missing
+# vars for the duration of this shell only.
 #
-# BUG-UNINSTALL-PARTIAL-ENV: a .env that EXISTS but is INCOMPLETE (written by
-# install.sh before it hit a failure) causes the same compose parse error. The
-# original guard [ ! -f "$_ENV_FILE" ] does not fire when the file exists.
-#
-# Fix (covers BOTH bugs):
-#   Phase A — absent .env: write a stub file, register for cleanup on EXIT.
-#             _STUB_ENV_CREATED="true" ensures we NEVER delete a real .env.
-#   Phase B — partial .env: dynamically detect which :? vars are unset in the
-#             current process env AND absent from docker/.env, then export a stub
-#             value for each. Process-env takes precedence over .env file for
-#             compose (documented compose env-var precedence). No file is mutated —
-#             the exports live only for the duration of this shell.
-#
-# The :? declarations in docker-compose.yml are kept intact — they are the
-# correct fail-closed posture for install-time. This fix is local to uninstall.sh.
-#
-# Regression guard: tests/integration/uninstall_sh_missing_env_test.sh covers
-# the absent-env case; tests/integration/uninstall_sh_partial_env_test.sh covers
-# the partial-env case.
-# ---------------------------------------------------------------------------
-
+# This setup is shared across all runtime subtypes that use compose.
+# K8s path does not use compose and skips this block.
+# ===========================================================================
 _ENV_FILE="${SCRIPT_DIR}/docker/.env"
 _STUB_ENV_CREATED="false"
 _ENV_READABLE="true"
+_COMPOSE_ENV_ARGS=""
 
-# Cross-UID guard (cleanup-system arch — extends 57ea226 + d4e2337 class):
-# If docker/.env exists but is owned by a different UID (e.g. prior agent
-# installed as root), host-side read fails with EACCES. Compose down does NOT
-# need host-side .env read — process-env exports from Phase B are sufficient.
-if [ -f "$_ENV_FILE" ] && [ ! -r "$_ENV_FILE" ]; then
-    _ENV_READABLE="false"
-    echo "  [warn] docker/.env present but unreadable (cross-UID ownership) — skipping partial-env parse; compose down will use process-env stubs (BUG-UNINSTALL-PARTIAL-ENV cross-UID)"
-fi
+if [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
+  # Cross-UID guard: if .env exists but is owned by a different UID, skip parsing.
+  if [ -f "$_ENV_FILE" ] && [ ! -r "$_ENV_FILE" ]; then
+      _ENV_READABLE="false"
+      echo "  [warn] docker/.env present but unreadable (cross-UID ownership) — skipping partial-env parse (BUG-UNINSTALL-PARTIAL-ENV cross-UID)"
+  fi
 
-if [ ! -f "$_ENV_FILE" ]; then
-    echo "  [info] docker/.env not found — writing uninstall stub to allow compose parse (BUG-UNINSTALL-NO-ENV)"
-    # ---------------------------------------------------------------------------
-    # Stub values for ALL ${VAR:?} required variables in docker/docker-compose.yml.
-    # These are placeholder-only — no real secrets, no install-time validation.
-    # grep 'docker/docker-compose.yml' for '\$\{[A-Z_]+:\?' to enumerate if new
-    # vars are added.  Keep this list in sync with that grep.
-    # ---------------------------------------------------------------------------
-    cat > "$_ENV_FILE" <<'UNINSTALL_STUB_EOF'
+  if [ ! -f "$_ENV_FILE" ]; then
+      echo "  [info] docker/.env not found — writing uninstall stub (BUG-UNINSTALL-NO-ENV)"
+      cat > "$_ENV_FILE" <<'UNINSTALL_STUB_EOF'
 # !! UNINSTALL STUB — DO NOT USE FOR INSTALL !!
 # Written by uninstall.sh when docker/.env was absent (BUG-UNINSTALL-NO-ENV).
 # Removed automatically after compose down completes.
@@ -314,274 +858,143 @@ UPSTREAM_MCP_URL=http://uninstall-stub-upstream:9999
 OWUI_SECRET_KEY=uninstall-stub-owui-key
 YASHIGANI_DB_AES_KEY=uninstall-stub-aes-key
 UNINSTALL_STUB_EOF
-    _STUB_ENV_CREATED="true"
+      _STUB_ENV_CREATED="true"
+  fi
+
+  # Ensure stub is removed on exit (success, failure, or signal).
+  _cleanup_stub() {
+      if [ "$_STUB_ENV_CREATED" = "true" ] && [ -f "$_ENV_FILE" ]; then
+          rm -f "$_ENV_FILE"
+          echo "  [info] uninstall stub docker/.env removed (BUG-UNINSTALL-NO-ENV)"
+      fi
+  }
+  trap _cleanup_stub EXIT
+
+  # Phase B: export stub values for any :? var absent from process env + .env.
+  _PARTIAL_ENV_STUBBED=""
+  if [ -f "$COMPOSE_FILE" ]; then
+      _required_vars="$(grep -oE '\$\{[A-Z_]+:\?' "$COMPOSE_FILE" 2>/dev/null \
+          | sed 's/^\${//;s/:?$//' \
+          | sort -u || true)"
+      while IFS= read -r _var; do
+          [ -z "$_var" ] && continue
+          if [ -n "${!_var+x}" ] && [ -n "${!_var}" ]; then
+              continue
+          fi
+          if [ "$_ENV_READABLE" = "true" ] && [ -f "$_ENV_FILE" ] && grep -qE "^${_var}=.+" "$_ENV_FILE" 2>/dev/null; then
+              continue
+          fi
+          export "${_var}=__yashigani_uninstall_stub__"
+          _PARTIAL_ENV_STUBBED="${_PARTIAL_ENV_STUBBED} ${_var}"
+      done <<< "$_required_vars"
+  fi
+  if [ -n "$_PARTIAL_ENV_STUBBED" ]; then
+      echo "  [info] Partial docker/.env — stubbed missing vars for compose parse:${_PARTIAL_ENV_STUBBED}"
+      echo "  [info] docker/.env on disk is unchanged."
+  fi
+
+  # Override compose .env load when file is cross-UID unreadable.
+  if [ "$_ENV_READABLE" = "false" ]; then
+      _COMPOSE_ENV_ARGS="--env-file /dev/null"
+  fi
 fi
 
-# Ensure stub is removed on exit (success, failure, or signal).
-# We only remove if WE created it — never touch a real .env.
-_cleanup_stub() {
-    if [ "$_STUB_ENV_CREATED" = "true" ] && [ -f "$_ENV_FILE" ]; then
-        rm -f "$_ENV_FILE"
-        echo "  [info] uninstall stub docker/.env removed (BUG-UNINSTALL-NO-ENV)"
-    fi
-}
-trap _cleanup_stub EXIT
-
-# ---------------------------------------------------------------------------
-# BUG-UNINSTALL-PARTIAL-ENV: Phase B — export stub values for any :? var
-# that is not already set in process env AND not present in docker/.env.
-#
-# Detection: grep the active compose file at uninstall-time for ${VAR:?}
-# patterns — this is zero-maintenance (catches new vars automatically) and
-# costs one grep per uninstall run.
-#
-# Precedence: compose reads env vars (process environment) BEFORE it reads
-# .env files. Exporting a var here overrides any absent or empty value in
-# docker/.env without touching the file on disk.
-#
-# _PARTIAL_ENV_STUBBED is set to a space-separated list of vars we export,
-# for logging only.
-# ---------------------------------------------------------------------------
-_PARTIAL_ENV_STUBBED=""
-
-if [ -f "$COMPOSE_FILE" ]; then
-    # Extract all :? var names from compose file, one per line, deduplicated.
-    _required_vars="$(grep -oE '\$\{[A-Z_]+:\?' "$COMPOSE_FILE" 2>/dev/null \
-        | sed 's/^\${//;s/:?$//' \
-        | sort -u || true)"
-
-    while IFS= read -r _var; do
-        [ -z "$_var" ] && continue
-
-        # Check 1: already set in process environment?
-        if [ -n "${!_var+x}" ] && [ -n "${!_var}" ]; then
-            continue
-        fi
-
-        # Check 2: present (non-empty) in docker/.env?
-        # Skip grep when .env is unreadable (cross-UID) — will stub unconditionally.
-        if [ "$_ENV_READABLE" = "true" ] && [ -f "$_ENV_FILE" ] && grep -qE "^${_var}=.+" "$_ENV_FILE" 2>/dev/null; then
-            continue
-        fi
-
-        # Missing — export a stub value for compose parse.
-        export "${_var}=__yashigani_uninstall_stub__"
-        _PARTIAL_ENV_STUBBED="${_PARTIAL_ENV_STUBBED} ${_var}"
-    done <<< "$_required_vars"
-fi
-
-if [ -n "$_PARTIAL_ENV_STUBBED" ]; then
-    echo "  [info] Partial docker/.env detected — stubbed missing required vars for compose parse (BUG-UNINSTALL-PARTIAL-ENV):${_PARTIAL_ENV_STUBBED}"
-    echo "  [info] docker/.env on disk is unchanged."
-fi
-
-# ---------------------------------------------------------------------------
-# When docker/.env is cross-UID unreadable, override compose's auto-load of
-# .env by pointing --env-file at /dev/null (empty, always readable). All
-# required vars are already present in the process environment via Phase B
-# exports above, so compose parse succeeds via process-env precedence.
-_COMPOSE_ENV_ARGS=""
-if [ "$_ENV_READABLE" = "false" ]; then
-    _COMPOSE_ENV_ARGS="--env-file /dev/null"
-fi
-
-# shellcheck disable=SC2086
-$COMPOSE -f "$COMPOSE_FILE" ${_COMPOSE_ENV_ARGS} down $DOWN_ARGS
-
-# ---------------------------------------------------------------------------
-# BUG-UNINSTALL-DEPGRAPH-LEAK: belt-and-braces container force-removal.
-#
-# podman-compose ≤1.3.x has known parity issues with depends_on ordering on
-# teardown: containers that were in Exited state (not running) may not be
-# removed by `compose down` when they originated from a different checkout or
-# were stopped externally. Any Exited container that still references a named
-# volume keeps that volume locked — `volume rm` then fails with "still in use".
-#
-# Fix: after compose down, enumerate ALL project containers (running OR exited)
-# and force-remove any that remain. The enumeration uses two complementary
-# strategies so it works on both Docker Engine and Podman:
-#
-#   1. Label filter: `--filter label=io.podman.compose.project=docker` (Podman)
-#      or `--filter label=com.docker.compose.project=docker` (Docker Engine).
-#      The project name is derived from the compose file's parent dir: "docker".
-#
-#   2. Name-prefix fallback: containers whose name starts with "docker_" or
-#      "docker-" (podman-compose vs docker compose naming conventions).
-#
-# The loop is idempotent: if compose-down already removed all containers,
-# `$RUNTIME ps -a -q ...` returns nothing and no rm is attempted.
-#
-# Both rootful (sudo $RUNTIME) and rootless ($RUNTIME without sudo) paths are
-# covered by using the same $RUNTIME variable resolved above.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Project prefix for container/volume enumeration
+# ===========================================================================
 _PROJECT_PREFIX="docker"
-echo "=== Belt-and-braces: removing any remaining project containers (BUG-UNINSTALL-DEPGRAPH-LEAK) ==="
-_remaining_ids=""
 
-# Strategy 1: label filter — try both compose-label variants
-# podman-compose sets io.podman.compose.project; docker compose sets com.docker.compose.project
-for _label_key in "io.podman.compose.project" "com.docker.compose.project"; do
-    _ids="$("$RUNTIME" ps -a -q --filter "label=${_label_key}=${_PROJECT_PREFIX}" 2>/dev/null || true)"
-    if [ -n "$_ids" ]; then
-        _remaining_ids="${_remaining_ids}${_ids}
-"
-    fi
-done
-
-# Strategy 2: name-prefix filter — catches containers named docker_* or docker-*
-# podman-compose names: docker_<service>_<n>; docker compose: docker-<service>-<n>
-_ids_by_name="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null || true)"
-if [ -n "$_ids_by_name" ]; then
-    _remaining_ids="${_remaining_ids}${_ids_by_name}
-"
-fi
-
-# Deduplicate and remove blank lines
-_remaining_ids="$(printf '%s' "$_remaining_ids" | sort -u | grep -v '^$' || true)"
-
-if [ -n "$_remaining_ids" ]; then
-    _container_count="$(printf '%s\n' "$_remaining_ids" | grep -c '.'  || echo 0)"
-    echo "  Found ${_container_count} remaining container(s) — stopping then force-removing..."
-    _rm_ok=0
-    _rm_fail=0
-    # Pass 1: stop all containers in parallel (graceful shutdown signal).
-    # --time 0 sends SIGKILL immediately — avoids waiting 10s per container
-    # on containers that ignore SIGTERM (e.g. postgres in crash-loop).
-    while IFS= read -r _cid; do
-        [ -z "$_cid" ] && continue
-        "$RUNTIME" stop --time 0 "$_cid" >/dev/null 2>&1 || true
-    done <<< "$_remaining_ids"
-    # Pass 2: force-remove with --depend FIRST (Podman >=4.x tears down
-    # dependent containers before removing this one — order-independent).
-    # Plain rm -f is only used as fallback for runtimes that don't support --depend
-    # (Docker, older Podman). BUG-UNINSTALL-DEPEND-ORDER-2026-05-26: the previous
-    # ordering (plain rm -f first, --depend fallback) hit "has dependent containers"
-    # errors in compose stacks where the loop iteration order doesn't match the
-    # dependency graph, causing some containers to remain and uninstall.sh to
-    # falsely claim success.
-    while IFS= read -r _cid; do
-        [ -z "$_cid" ] && continue
-        _cname="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
-        if "$RUNTIME" rm -f --depend "$_cid" >/dev/null 2>&1; then
-            echo "  [removed] container: ${_cname} (${_cid})"
-            _rm_ok=$(( _rm_ok + 1 ))
-        elif "$RUNTIME" rm -f "$_cid" >/dev/null 2>&1; then
-            # --depend unsupported (older Podman / Docker) — plain rm -f
-            echo "  [removed] container: ${_cname} (${_cid})"
-            _rm_ok=$(( _rm_ok + 1 ))
-        else
-            echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
-            _rm_fail=$(( _rm_fail + 1 ))
-        fi
-    done <<< "$_remaining_ids"
-    echo "Container cleanup: ${_rm_ok} removed, ${_rm_fail} failed (first pass)."
-
-    # BUG-UNINSTALL-DEPEND-ORDER-2026-05-26 retry pass: re-enumerate any
-    # stragglers and force-rm with --depend. A second pass picks up containers
-    # whose dependents were recreated by restart-policy=always between the
-    # stop and rm of the first pass (e.g. Caddy with restart: always).
-    _residual="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null | sort -u | grep -v '^$' || true)"
-    if [ -n "$_residual" ]; then
-        echo "  [retry] residual containers detected after pass 1 — retrying with stop+rm-f --depend"
-        # Disable any restart policy first by stop --time 0, then rm -f --depend
-        while IFS= read -r _cid; do
-            [ -z "$_cid" ] && continue
-            "$RUNTIME" stop --time 0 "$_cid" >/dev/null 2>&1 || true
-            "$RUNTIME" rm -f --depend "$_cid" >/dev/null 2>&1 \
-              || "$RUNTIME" rm -f "$_cid" >/dev/null 2>&1 \
-              || true
-        done <<< "$_residual"
-    fi
-else
-    echo "  [ok]    No remaining project containers found."
-fi
-
-# ---------------------------------------------------------------------------
-# Final assertion — uninstall.sh MUST NOT claim success unless ZERO project
-# containers remain. Previously the script printed "Yashigani stopped" even
-# when [WARN] container(s) could not be removed — masking real failures.
-# Tiago directive 2026-05-26: "make sure that uninstall.sh nukes the dawn thing".
-# ---------------------------------------------------------------------------
-_final_residual="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null | sort -u | grep -v '^$' || true)"
-if [ -n "$_final_residual" ]; then
-    _residual_count="$(printf '%s\n' "$_final_residual" | grep -c '.' || echo 0)"
-    echo "" >&2
-    echo "ERROR: uninstall.sh FAILED — ${_residual_count} project container(s) remain after force-remove pass:" >&2
-    while IFS= read -r _cid; do
-        [ -z "$_cid" ] && continue
-        _cname="$("$RUNTIME" inspect --format '{{.Name}} state={{.State.Status}} restarts={{.RestartCount}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid (inspect failed)")"
-        echo "  - ${_cname} (${_cid})" >&2
-    done <<< "$_final_residual"
-    echo "" >&2
-    echo "Manual remediation:" >&2
-    echo "  ${RUNTIME} rm -f --depend \$(${RUNTIME} ps -a -q --filter 'name=^${_PROJECT_PREFIX}[_-]')" >&2
-    echo "  ${RUNTIME} system prune -af --volumes" >&2
-    echo "" >&2
+# ===========================================================================
+# Step 3: Runtime-specific teardown
+# ===========================================================================
+case "$RUNTIME_SUBTYPE" in
+  podman-rootless)
+    _teardown_podman_rootless
+    ;;
+  podman-rootful)
+    _teardown_podman_rootful
+    ;;
+  docker-desktop)
+    _teardown_docker_desktop
+    ;;
+  docker-engine|docker-engine-rootless)
+    _teardown_docker_engine
+    ;;
+  k8s)
+    _teardown_k8s
+    ;;
+  *)
+    # Fallback: should not be reached given validation above, but be safe.
+    printf 'ERROR: Unhandled runtime subtype %q\n' "$RUNTIME_SUBTYPE" >&2
     exit 1
-fi
+    ;;
+esac
 
-# ---------------------------------------------------------------------------
-# Explicit per-volume cleanup — UNINSTALL-LEAVES-VOLUMES (#8)
-#
-# podman-compose ≤1.3.x ignores --volumes for named volumes.
-# docker compose ≥2.x honours it, but the explicit loop is idempotent and
-# safe on both runtimes: `volume rm` exits 0 when the volume doesn't exist
-# (--force / ignore-not-found).  We log each removal so it is auditable.
-#
-# The project prefix is the compose file's parent directory name: "docker".
-# ---------------------------------------------------------------------------
-if [ "$REMOVE_VOLUMES" = "true" ]; then
-    _PROJECT_PREFIX="docker"
-    echo "Removing named volumes (UNINSTALL-LEAVES-VOLUMES #8 explicit loop):"
+# ===========================================================================
+# Step 4: Named volume cleanup (compose-runtime paths only; k8s uses PVCs)
+# ===========================================================================
+if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
+    # ---------------------------------------------------------------------------
+    # Explicit per-volume rm — UNINSTALL-LEAVES-VOLUMES (#8)
+    #
+    # podman-compose ≤1.3.x ignores --volumes for named volumes.
+    # docker compose ≥2.x honours it, but the explicit loop is idempotent and
+    # safe on both runtimes: `volume rm` exits 0 when the volume doesn't exist.
+    # ---------------------------------------------------------------------------
+    echo "=== Removing named volumes (UNINSTALL-LEAVES-VOLUMES #8 explicit loop) ==="
     _removed=0
     _skipped=0
-    _failed=0
     for _vol in "${_CANONICAL_VOLUMES[@]}"; do
         _full="${_PROJECT_PREFIX}_${_vol}"
         if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
-            # `volume rm -f` removes the volume even when stopped/dead containers
-            # reference it. BUG-UNINSTALL-VOLUME-SILENT-FAIL-2026-05-26: prior
-            # plain `volume rm` failed silently when a mid-restart-loop container
-            # held the volume, leaving stale postgres_data → next install hit
-            # contamination check → cascading retry storm. Laura LAURA-V243-003.
-            if "$RUNTIME" volume rm -f "$_full" >/dev/null 2>&1; then
+            if "$RUNTIME" volume rm "$_full" >/dev/null 2>&1; then
                 echo "  [removed] $_full"
                 _removed=$(( _removed + 1 ))
             else
-                echo "  [WARN] first-pass volume rm failed: $_full (in use?)" >&2
-                _failed=$(( _failed + 1 ))
+                echo "  [WARN] failed to remove $_full (in use?)" >&2
             fi
         else
             echo "  [skip]    $_full (not present)"
             _skipped=$(( _skipped + 1 ))
         fi
     done
+    echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present."
 
-    # Retry pass: re-enumerate any survivors and try again after first-pass kill.
-    # A running-but-mid-respawn container with a volume mount can win the race
-    # against `volume rm -f`; the retry catches it after the container has died.
-    if [ "$_failed" -gt 0 ]; then
-        echo "  [retry] ${_failed} volume(s) failed first pass — retrying after settle"
-        sleep 1
-        # Kill any container that might still reference a volume; then retry rm -f.
-        "$RUNTIME" ps -aq --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null \
-          | xargs -r "$RUNTIME" rm -f --depend 2>/dev/null || true
-        _failed=0
-        for _vol in "${_CANONICAL_VOLUMES[@]}"; do
-            _full="${_PROJECT_PREFIX}_${_vol}"
-            if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
-                if "$RUNTIME" volume rm -f "$_full" >/dev/null 2>&1; then
-                    echo "  [retry-removed] $_full"
-                    _removed=$(( _removed + 1 ))
-                else
-                    echo "  [WARN] retry volume rm STILL failed: $_full" >&2
-                    _failed=$(( _failed + 1 ))
-                fi
+    # ---------------------------------------------------------------------------
+    # Straggler volume retry pass.
+    #
+    # After the container teardown and initial volume rm, re-check all canonical
+    # volumes. A container that was respawned by restart-policy=always between the
+    # belt-and-braces loop and the volume rm may have held the volume reference.
+    # Now that all containers are confirmed gone (per _assert_no_containers_remain),
+    # any still-present volumes can be freed.
+    # ---------------------------------------------------------------------------
+    echo "=== Volume retry pass (straggler volumes) ==="
+    _retry_removed=0
+    for _vol in "${_CANONICAL_VOLUMES[@]}"; do
+        _full="${_PROJECT_PREFIX}_${_vol}"
+        if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
+            if "$RUNTIME" volume rm "$_full" >/dev/null 2>&1; then
+                echo "  [removed] (retry) ${_full}"
+                _retry_removed=$(( _retry_removed + 1 ))
+            else
+                echo "  [WARN] (retry) failed to remove ${_full}" >&2
             fi
-        done
+        fi
+    done
+    if [ "$_retry_removed" -gt 0 ]; then
+        echo "  Volume retry: ${_retry_removed} additional volume(s) removed."
+    else
+        echo "  [ok] No straggler volumes found."
     fi
 
-    echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present, ${_failed} failed."
+    # ---------------------------------------------------------------------------
+    # Final volume assertion — closes the volume-parallel of the container
+    # silent-exit-0 hole. Any canonical volume that still exists after two
+    # removal passes is a failure. Exit 1 with remediation instructions.
+    # ---------------------------------------------------------------------------
+    _assert_no_volumes_remain "$RUNTIME" "$_PROJECT_PREFIX"
+    echo "=== Volume assertion passed — all canonical volumes removed. ==="
 fi
 
 # ---------------------------------------------------------------------------
@@ -601,22 +1014,6 @@ fi
 #      pull fallback for airgap/post-prune paths.
 #   HARD WARN if all fail — operator told exactly what to do; never silent.
 #
-# Wiped files include (non-exhaustive):
-#   - PKI keys + certs (ca_root.key, ca_intermediate.key, *_client.key, etc.)
-#   - admin1_password, admin2_password, admin_initial_password
-#   - postgres_password, redis_password, grafana_admin_password
-#   - caddy_internal_hmac
-#   - yashigani_internal_bearer  (Bucket-C: per-install internal Bearer token;
-#       rotated on fresh install after --remove-volumes — Captain gitleaks 2026-05-17)
-#   - bootstrap tokens + all other docker/secrets/* files
-#
-# Safety guards:
-#   1. Only runs when --remove-volumes is set.
-#   2. Path-validates: _secrets_dir must equal SCRIPT_DIR/docker/secrets.
-#      Prevents accidental rm if SCRIPT_DIR is mis-resolved.
-#   3. Preserves the directory itself (only contents are removed).
-#   4. If docker/secrets/ does not exist, skips silently.
-#
 # _ALPINE_IMAGE: hoisted here so it is available to BOTH the secrets-wipe
 # block (BACKLOG-V240-006) and the bind-mount cleanup block (BACKLOG-V240-003)
 # below. MUST match install.sh _alpine_image — co-rotate on any digest update.
@@ -625,7 +1022,7 @@ fi
 # Alpine digest: MUST match install.sh _alpine_image (SIB-2D-02 co-rotation).
 _ALPINE_IMAGE="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
 
-if [ "$REMOVE_VOLUMES" = "true" ]; then
+if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     _secrets_dir="${SCRIPT_DIR}/docker/secrets"
     # Path-validation guard: only proceed if the resolved path is exactly canonical.
     if [ "${_secrets_dir}" != "${SCRIPT_DIR}/docker/secrets" ]; then
@@ -634,15 +1031,10 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
         echo "  [skip] docker/secrets/ does not exist — nothing to wipe"
     else
         echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
-        # Tier 1: direct rm (same-user caller — no overhead for common case).
-        # Glob covers regular files (*), dotfiles (.[!.]*), and edge-case dotdot
-        # files (..?*) — e.g. .pki-status written by _pki_run_issuer (Laura LAURA-TM-CLEANUP-001).
         if rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
             echo "  [removed] docker/secrets/* — direct rm succeeded"
         else
-            # Cross-UID ownership (Iris BACKLOG-V240-006 / Laura 2D GO 2026-05-21).
             _secrets_wiped=false
-            # Tier 2: Podman unshare (lighter; no container overhead on Podman paths).
             if [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
                 if podman unshare rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
                     echo "  [removed] docker/secrets/* — podman unshare rm succeeded"
@@ -650,11 +1042,6 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
                 fi
             fi
             if [ "$_secrets_wiped" = "false" ]; then
-                # Tier 3: ephemeral container as UID 0 — can unlink any UID's files.
-                # Volume scope: docker/secrets:/t only (path-validated above).
-                # No --privileged, no extra caps. Same surface as Laura-GO'd 2D pattern.
-                # --pull=never first (image in cache after compose down); pull fallback
-                # for airgap / post-manual-prune paths.
                 if "$RUNTIME" run --rm --pull=never \
                         --volume "${_secrets_dir}:/t:rw" \
                         "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
@@ -667,7 +1054,6 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
                     _secrets_wiped=true
                 fi
             fi
-            # Tier 4: hard WARN — never silent swallow.
             if [ "$_secrets_wiped" = "false" ]; then
                 printf '[ERROR] secrets/ cleanup failed — manual remediation required:\n' >&2
                 printf '[ERROR]   rm -rf '"'"'%s'"'"'  (as root or file owner)\n' "${_secrets_dir}" >&2
@@ -675,10 +1061,6 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
                 printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
             fi
         fi
-        # Remove the now-empty secrets/ directory so install.sh can recreate it
-        # with the correct owner on fresh install (Iris IRIS-ARCH-001 §3.4).
-        # rmdir is safe: succeeds on an empty dir regardless of caller UID;
-        # fails silently (|| true) if contents remain (Tier 4 error path above).
         rmdir "${_secrets_dir}" 2>/dev/null || true
     fi
 fi
@@ -702,8 +1084,7 @@ fi
 # update _ALPINE_IMAGE here in the same commit.
 # Search: grep -n "_ALPINE_IMAGE\|_alpine_image" uninstall.sh install.sh
 # ---------------------------------------------------------------------------
-if [ "$REMOVE_VOLUMES" = "true" ]; then
-    # _ALPINE_IMAGE is hoisted above (BACKLOG-V240-006 hoist — co-rotation comment there).
+if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     echo "=== Bind-mount directory cleanup (BACKLOG-V240-003) ==="
     for _bm_dir in \
             "${SCRIPT_DIR}/docker/data" \
@@ -715,12 +1096,9 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
         else
             echo "  [info]   $_bm_dir: host rm failed (likely chowned to UID 1001) — using container fallback"
             if [ "$RUNTIME" = "podman" ]; then
-                # Podman rootless: unshare remaps UID into the user namespace so rm
-                # runs as the effective owner of the chowned files.
                 if podman unshare rm -rf "$_bm_dir" 2>/dev/null; then
                     echo "  [removed] $_bm_dir (podman unshare)"
                 else
-                    # podman unshare also failed — fall back to ephemeral container.
                     if podman run --rm \
                            -v "${_bm_dir}:/t:rw" \
                            "$_ALPINE_IMAGE" rm -rf /t 2>/dev/null \
@@ -732,8 +1110,6 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
                     fi
                 fi
             else
-                # Docker: run an ephemeral container as UID 1001 to rm contents,
-                # then host rm -rf drops the now-empty dir.
                 if "$RUNTIME" run --rm \
                        -v "${_bm_dir}:/t" \
                        --user 1001:1001 \
@@ -751,83 +1127,6 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Redis-straggler final pass — BUG-1 incomplete edge case.
-#
-# Podman can recreate a container during network teardown if `restart: always`
-# is set and the container exits non-zero. The compose `down` + belt-and-braces
-# loop above remove containers that exist at that point; but a container that
-# exits AFTER the loop runs (race window: network teardown respawn) will survive.
-#
-# Fix: run one additional ps+rm pass AFTER volume cleanup. This is intentionally
-# a best-effort second sweep rather than an infinite loop — if a container still
-# survives two sweeps, it is not a compose-managed straggler and must be
-# investigated separately (see docs/yashigani_install_config.md §troubleshooting).
-#
-# `restart: always` on redis and budget-redis (see docker-compose.yml) is the
-# known trigger. The post-volume pass runs after volume rm, so any volume-locked
-# containers are already unlocked, and the respawn cannot re-attach to the now-
-# deleted volume — it will exit(1) immediately and stay in Exited state, where
-# the rm -f below can reach it.
-# ---------------------------------------------------------------------------
-echo "=== Final straggler pass (redis-straggler edge case — BUG-1 incomplete) ==="
-_final_remaining=""
-
-for _label_key in "io.podman.compose.project" "com.docker.compose.project"; do
-    _ids="$("$RUNTIME" ps -a -q --filter "label=${_label_key}=${_PROJECT_PREFIX}" 2>/dev/null || true)"
-    if [ -n "$_ids" ]; then
-        _final_remaining="${_final_remaining}${_ids}
-"
-    fi
-done
-_ids_by_name="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null || true)"
-if [ -n "$_ids_by_name" ]; then
-    _final_remaining="${_final_remaining}${_ids_by_name}
-"
-fi
-_final_remaining="$(printf '%s' "$_final_remaining" | sort -u | grep -v '^$' || true)"
-
-if [ -n "$_final_remaining" ]; then
-    _straggler_count="$(printf '%s\n' "$_final_remaining" | grep -c '.' || echo 0)"
-    echo "  Found ${_straggler_count} straggler container(s) after volume rm — force-removing..."
-    _final_ok=0
-    _final_fail=0
-    while IFS= read -r _cid; do
-        [ -z "$_cid" ] && continue
-        _cname="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
-        if "$RUNTIME" rm -f --time 0 "$_cid" >/dev/null 2>&1; then
-            echo "  [removed] straggler: ${_cname} (${_cid})"
-            _final_ok=$(( _final_ok + 1 ))
-        else
-            echo "  [WARN] could not remove straggler: ${_cname} (${_cid})" >&2
-            _final_fail=$(( _final_fail + 1 ))
-        fi
-    done <<< "$_final_remaining"
-    echo "Straggler cleanup: ${_final_ok} removed, ${_final_fail} failed."
-
-    # After removing straggler containers, retry any volumes that failed the first
-    # pass due to "Resource is still in use". Now that the holding containers are
-    # gone, the volume rm should succeed. Only retry when --remove-volumes is set.
-    if [ "$REMOVE_VOLUMES" = "true" ] && [ "$_final_ok" -gt 0 ]; then
-        echo "  Retrying volumes that were in-use during first pass..."
-        _retry_removed=0
-        for _vol in "${_CANONICAL_VOLUMES[@]}"; do
-            _full="${_PROJECT_PREFIX}_${_vol}"
-            if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
-                if "$RUNTIME" volume rm "$_full" >/dev/null 2>&1; then
-                    echo "  [removed] (retry) ${_full}"
-                    _retry_removed=$(( _retry_removed + 1 ))
-                else
-                    echo "  [WARN] (retry) failed to remove ${_full}" >&2
-                fi
-            fi
-        done
-        echo "  Volume retry: ${_retry_removed} additional volume(s) removed."
-    fi
-else
-    echo "  [ok]    No straggler containers after volume rm."
-fi
-
-# ---------------------------------------------------------------------------
 # Dangling / anonymous volume prune — ANON-VOL-LEAK
 #
 # Compose may create anonymous volumes for tmpfs-backed service paths or
@@ -835,32 +1134,15 @@ fi
 # declared in an opt-in compose override like docker-compose.wazuh.yml that
 # were not started via the primary compose file). These have SHA-like names
 # and are NOT cleaned up by the named-volume loop above.
-#
-# Prune strategy:
-#   For docker: `docker volume prune --filter label=... -f` is too broad.
-#   For podman: `podman volume prune --filter dangling=true -f` is safe —
-#   Podman marks a volume as dangling only when no container references it.
-#
-# We only prune volumes that both:
-#   (a) Have no running or stopped container referencing them (dangling=true).
-#   (b) Were created with label `io.podman.compose.project=docker` (Podman)
-#       or `com.docker.compose.project=docker` (Docker Engine) — limiting the
-#       prune to this project's volumes.
-#
-# Fallback: when label filtering is unavailable (older runtimes), we skip
-# silently and log a manual remediation hint.
 # ---------------------------------------------------------------------------
-if [ "$REMOVE_VOLUMES" = "true" ]; then
+if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     echo "=== Dangling volume prune (ANON-VOL-LEAK) ==="
     _dangling_pruned=0
 
     if [ "$RUNTIME" = "podman" ]; then
-        # Podman: prune dangling volumes belonging to this project
-        # Try label-filtered prune first (Podman >=4.x supports --filter label=)
         _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true \
             --filter "label=io.podman.compose.project=${_PROJECT_PREFIX}" 2>/dev/null || true)"
         if [ -z "$_dangling_ids" ]; then
-            # Fall back: any dangling volume whose Name or Label matches project
             _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
                 | grep -E "^[0-9a-f]{64}$" || true)"
         fi
@@ -876,13 +1158,11 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
             done <<< "$_dangling_ids"
         fi
     elif [ "$RUNTIME" = "docker" ]; then
-        # Docker: prune dangling volumes filtered to project label
-        # `docker volume prune` exits 0 even if nothing was pruned
         _docker_prune_out="$("$RUNTIME" volume prune \
             --filter "label=com.docker.compose.project=${_PROJECT_PREFIX}" \
             -f 2>/dev/null || true)"
         if echo "$_docker_prune_out" | grep -q "Total reclaimed space"; then
-            _dangling_pruned=1   # at least one pruned
+            _dangling_pruned=1
             echo "  [pruned] docker dangling volumes: ${_docker_prune_out}"
         fi
     fi
@@ -895,98 +1175,5 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
 fi
 
 echo ""
-
-# ---------------------------------------------------------------------------
-# FINAL TRUTHFUL ASSERTION — uninstall.sh MUST NOT lie about what was nuked.
-# BUG-UNINSTALL-LIES-2026-05-26 (Tiago "fuck off and create a proper nuke"):
-# Enumerate every project resource that should be gone; if ANY remain, exit 1
-# with the full list. No more "All volumes deleted" while volumes survive.
-# Covers: containers, named volumes, canonical networks. (Build cache pruning
-# is operator-discretionary via `podman system prune -af`; we don't auto-prune
-# because it nukes non-yashigani caches too.)
-# ---------------------------------------------------------------------------
-_NUKE_FAIL=0
-_NUKE_REPORT=""
-
-# 1. Containers — any with project prefix.
-_residual_containers="$("$RUNTIME" ps -aq --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null | grep -v '^$' || true)"
-if [ -n "$_residual_containers" ]; then
-    _count=$(printf '%s\n' "$_residual_containers" | wc -l | tr -d ' ')
-    _NUKE_FAIL=1
-    _NUKE_REPORT="${_NUKE_REPORT}  - ${_count} container(s) remain:
-$(printf '%s\n' "$_residual_containers" | while read -r _cid; do
-    _name="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||')"
-    printf '      %s (%s)\n' "${_name:-unknown}" "$_cid"
-done)
-"
-fi
-
-# 2. Named volumes — canonical list + any project-prefixed volume (catches anon).
-if [ "$REMOVE_VOLUMES" = "true" ]; then
-    _residual_volumes=""
-    for _vol in "${_CANONICAL_VOLUMES[@]}"; do
-        _full="${_PROJECT_PREFIX}_${_vol}"
-        if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
-            _residual_volumes="${_residual_volumes}${_full}\n"
-        fi
-    done
-    # Also: any other project-prefixed volume not on the canonical list.
-    _other_prefixed="$("$RUNTIME" volume ls -q 2>/dev/null | grep "^${_PROJECT_PREFIX}_" || true)"
-    if [ -n "$_other_prefixed" ]; then
-        while IFS= read -r _v; do
-            [ -z "$_v" ] && continue
-            case "$_residual_volumes" in
-                *"${_v}"*) ;;
-                *) _residual_volumes="${_residual_volumes}${_v} (non-canonical)\n" ;;
-            esac
-        done <<< "$_other_prefixed"
-    fi
-    if [ -n "$_residual_volumes" ]; then
-        _NUKE_FAIL=1
-        _NUKE_REPORT="${_NUKE_REPORT}  - volume(s) remain:
-$(printf '%b' "$_residual_volumes" | sed 's/^/      /')
-"
-    fi
-fi
-
-# 3. Networks — canonical compose project networks.
-_canonical_networks="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated"
-_residual_networks=""
-for _net in $_canonical_networks; do
-    _full="${_PROJECT_PREFIX}_${_net}"
-    if "$RUNTIME" network inspect "$_full" >/dev/null 2>&1; then
-        # Try to remove; if successful, no residual.
-        if "$RUNTIME" network rm "$_full" >/dev/null 2>&1; then
-            :
-        else
-            _residual_networks="${_residual_networks}${_full}\n"
-        fi
-    fi
-done
-if [ -n "$_residual_networks" ]; then
-    _NUKE_FAIL=1
-    _NUKE_REPORT="${_NUKE_REPORT}  - network(s) remain (in-use by non-project container?):
-$(printf '%b' "$_residual_networks" | sed 's/^/      /')
-"
-fi
-
-if [ "$_NUKE_FAIL" -ne 0 ]; then
-    echo "" >&2
-    echo "ERROR: uninstall.sh did NOT fully nuke. Residual resources:" >&2
-    printf '%s' "$_NUKE_REPORT" >&2
-    echo "" >&2
-    echo "Manual remediation:" >&2
-    echo "  ${RUNTIME} ps -aq --filter 'name=^${_PROJECT_PREFIX}[_-]' | xargs -r ${RUNTIME} rm -f --depend" >&2
-    if [ "$REMOVE_VOLUMES" = "true" ]; then
-        echo "  ${RUNTIME} volume ls -q | grep '^${_PROJECT_PREFIX}_' | xargs -r ${RUNTIME} volume rm -f" >&2
-    fi
-    echo "  for n in ${_canonical_networks}; do ${RUNTIME} network rm ${_PROJECT_PREFIX}_\$n; done" >&2
-    echo "  rm -rf ~/yashigani ~/yashigani-v243  # remove install trees" >&2
-    echo "  ${RUNTIME} system prune -af --volumes  # nuclear option (also wipes non-yashigani)" >&2
-    echo "" >&2
-    echo "Yashigani uninstall INCOMPLETE — exit 1." >&2
-    exit 1
-fi
-
 echo "Yashigani stopped."
-[ "$REMOVE_VOLUMES" = "true" ] && echo "All volumes verified-deleted (final assertion passed)." || echo "Data volumes preserved."
+[ "$REMOVE_VOLUMES" = "true" ] && echo "All volumes deleted." || echo "Data volumes preserved."
