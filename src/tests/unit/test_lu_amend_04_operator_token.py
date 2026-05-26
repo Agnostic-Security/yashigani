@@ -166,7 +166,7 @@ def test_cli_argparse_requires_name_and_url():
         [sys.executable, "scripts/yashigani-onboard.py", "--help"],
         capture_output=True,
         text=True,
-        cwd="/Users/max/Documents/Claude/yashigani",
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[3]),
     )
     assert result.returncode == 0
     assert "--name" in result.stdout
@@ -190,7 +190,7 @@ def test_cli_exits_3_without_token_and_no_allow_weak():
         ],
         capture_output=True,
         text=True,
-        cwd="/Users/max/Documents/Claude/yashigani",
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[3]),
         timeout=10,
         env={
             **__import__("os").environ,
@@ -219,7 +219,7 @@ def test_cli_exits_3_on_invalid_url_scheme():
         ],
         capture_output=True,
         text=True,
-        cwd="/Users/max/Documents/Claude/yashigani",
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[3]),
         timeout=10,
     )
     assert result.returncode == 3, (

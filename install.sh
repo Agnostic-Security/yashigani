@@ -7846,14 +7846,29 @@ _pki_run_issuer() {
     log_error "_pki_run_issuer: no local yashigani/gateway image found — compose build must run first"
     return 1
   fi
-  local manifest_in="${WORK_DIR}/docker/service_identities.yaml"
+  # Canonical manifest: docker/service_identities.yaml (git-tracked, schema-only,
+  # all bootstrap_token_sha256 fields are empty placeholders).
+  local _canonical_manifest="${WORK_DIR}/docker/service_identities.yaml"
+
+  # Runtime manifest: docker/var/runtime/service_identities.yaml (gitignored).
+  # The PKI issuer writes per-install bootstrap_token_sha256 hashes here, not
+  # into the tracked canonical file. Compose bind-mounts this runtime copy into
+  # each Python service at /etc/yashigani/service_identities.yaml.
+  local manifest_in="${WORK_DIR}/docker/var/runtime/service_identities.yaml"
   local secrets_in="${WORK_DIR}/docker/secrets"
 
   mkdir -p "$secrets_in"
-  if [[ ! -f "$manifest_in" ]]; then
-    log_error "service_identities.yaml missing at $manifest_in — re-clone the repo."
+  if [[ ! -f "$_canonical_manifest" ]]; then
+    log_error "service_identities.yaml missing at ${_canonical_manifest} — re-clone the repo."
     return 1
   fi
+
+  # Create the runtime directory and seed the runtime manifest from the canonical.
+  # mkdir -p is idempotent — safe to re-run on upgrade.
+  mkdir -p "${WORK_DIR}/docker/var/runtime"
+  cp -f "$_canonical_manifest" "$manifest_in" \
+    || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+  log_info "_pki_run_issuer: seeded runtime manifest at ${manifest_in} (hash-back will populate bootstrap_token_sha256 values)"
 
   case "$runtime" in
     docker)

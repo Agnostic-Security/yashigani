@@ -372,7 +372,11 @@ def _load_cli_module():
     """
     import importlib.util
     import sys
-    cli_path = "/Users/max/Documents/Claude/yashigani/scripts/yashigani-manifest.py"
+    # Repo-relative path — avoid hardcoded developer-machine absolutes
+    # (BUG-TEST-HARDCODED-PATH-2026-05-26: prior absolute broke when repo moved).
+    import pathlib
+    _repo_root = pathlib.Path(__file__).resolve().parents[3]
+    cli_path = str(_repo_root / "scripts" / "yashigani-manifest.py")
     spec = importlib.util.spec_from_file_location("yashigani_manifest_cli", cli_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -425,11 +429,12 @@ class TestCeremonyAbort:
         import tempfile, os
         cli = _load_cli_module()
 
-        # Write a temp manifest file
+        # Write a temp manifest file in the system temp dir (was hardcoded
+        # to a developer-machine-specific path that breaks on other hosts +
+        # when repo moves — BUG-TEST-HARDCODED-PATH-2026-05-26).
         manifest_content = "name: abort-test"
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml",
-            dir="/Users/max/Documents/Claude/testing_runs/tom_lu_amend_02_03_20260524",
             delete=False,
         ) as f:
             f.write(manifest_content)

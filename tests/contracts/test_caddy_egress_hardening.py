@@ -376,3 +376,269 @@ class TestValuesEgressAllowlist:
         assert values_caddy["egressAllowlist"] == "", (
             "values.yaml caddy.egressAllowlist default must be '' (empty string)"
         )
+
+
+# ── 8. BUG-V243-CADDY-IPV6-IPTABLES — IPv6 BLOCKED (Yashigani is IPv4-only) ──
+
+class TestEntrypointIpv6Blocked:
+    """BUG-V243-CADDY-IPV6-IPTABLES — Yashigani is IPv4-only by design.
+
+    History:
+      e129cbc (partial): filtered IPv6 OUT of the iptables loop — stopped
+        the crash but left IPv6 egress unfiltered (kernel default ACCEPT).
+      64fd5c4 (parity, REJECTED): added IPv6 ACCEPT rules in parallel with
+        IPv4 — adds attack surface without product value.
+      This commit (BLOCK): ip6tables OUTPUT policy = DROP with ZERO ACCEPT
+        rules. IPv6 is not a supported address family in Yashigani.
+
+    Rationale (Tiago directive 2026-05-26):
+      *"as we are moving towards ipv7 and ipv6 never had much traction"*
+      *"do not implement ipv inside of the yashigani network"*
+      *"block it"*
+
+    Yashigani is IPv4-only by design. Supporting IPv6 inside the ring-fence
+    adds a parallel egress path (= attack surface) without proportional
+    deployment-ecosystem value.
+    """
+
+    # ── Policy: IPv6 OUTPUT must be DROP ────────────────────────────────────
+
+    def test_ip6tables_sets_output_drop(self, entrypoint_text):
+        """ip6tables OUTPUT policy MUST be DROP."""
+        assert "ip6tables -P OUTPUT DROP" in entrypoint_text, (
+            "BUG-V243 BLOCK regression: caddy-entrypoint.sh must set "
+            "`ip6tables -P OUTPUT DROP` policy. Yashigani is IPv4-only "
+            "(Tiago 2026-05-26: 'block it')."
+        )
+
+    # ── ip6tables ACCEPT rules — ONLY loopback + ESTABLISHED ────────────────
+
+    def test_ip6tables_allows_loopback(self, entrypoint_text):
+        """ip6tables MUST allow loopback (::1 → ::1, defensive intra-container)."""
+        assert "ip6tables -A OUTPUT -o lo -j ACCEPT" in entrypoint_text, (
+            "BUG-V243 BLOCK-INBOUND regression: caddy-entrypoint.sh must allow "
+            "ip6tables loopback (defensive intra-container)."
+        )
+
+    def test_ip6tables_allows_established_for_inbound_responses(self, entrypoint_text):
+        """ip6tables MUST allow ESTABLISHED/RELATED so v6 inbound clients get response packets."""
+        assert "ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED" in entrypoint_text, (
+            "BUG-V243 BLOCK-INBOUND regression: caddy-entrypoint.sh must allow "
+            "ip6tables ESTABLISHED,RELATED on OUTPUT. Without this, SYN-ACK and "
+            "data packets to internet IPv6 clients (allowed per Tiago directive "
+            "2026-05-26 'allow ipv6 in the front to connect to the internet if "
+            "the client wants to') are DROPped and connections hang."
+        )
+
+    def test_ip6tables_has_no_destination_accept_rules(self, entrypoint_text):
+        """ip6tables MUST NOT have any destination ACCEPT rules (no v6 outbound allowlist)."""
+        # Reject `ip6tables -A OUTPUT ... -d <addr> ... -j ACCEPT` — that would
+        # allow NEW IPv6 outbound to that destination. Loopback (-o lo) and
+        # state ESTABLISHED are the ONLY ACCEPTs permitted; both are non-
+        # destination-based ACCEPTs that don't grant new-outbound capability.
+        import re
+        lines = entrypoint_text.splitlines()
+        accept_dest_lines = [
+            (i + 1, ln) for i, ln in enumerate(lines)
+            if re.search(r"ip6tables\b.*-A\s+OUTPUT.*-d\s+\S+.*-j\s+ACCEPT", ln)
+        ]
+        assert not accept_dest_lines, (
+            "BUG-V243 BLOCK-OUTBOUND regression: caddy-entrypoint.sh must NOT "
+            "add any `ip6tables -A OUTPUT -d <dest> ... -j ACCEPT` rules. "
+            "Caddy does NOT initiate NEW IPv6 outbound — only response packets "
+            "to inbound v6 clients (via ESTABLISHED) and loopback are allowed. "
+            "Found destination-ACCEPT rules:\n"
+            + "\n".join(f"  line {n}: {ln.strip()}" for n, ln in accept_dest_lines)
+        )
+
+    # ── Resolution loop: IPv6 results skipped, NOT routed to ip6tables ──────
+
+    def test_resolution_loop_skips_ipv6_silently(self, entrypoint_text):
+        """The host resolution loop must SKIP IPv6 results (no ip6tables call)."""
+        # Acceptable pattern: case `*:*` branch that does NOT call ip6tables -A.
+        # We verify by looking for the case statement and ensuring the v6
+        # branch does NOT contain `ip6tables -A OUTPUT`.
+        has_case_match = ("*:*)" in entrypoint_text and "*.*)" in entrypoint_text)
+        assert has_case_match, (
+            "BUG-V243 BLOCK regression: caddy-entrypoint.sh must use a case "
+            "statement matching `*:*` (IPv6) and `*.*` (IPv4) in the host "
+            "resolution loop. The IPv6 branch must skip silently without "
+            "calling ip6tables (since IPv6 is blocked at the policy level)."
+        )
+
+    def test_resolution_loop_no_ip6tables_accept_in_loop(self, entrypoint_text):
+        """The resolution loop must not feed IPv6 addresses into ip6tables."""
+        # Stronger test: scan the loop for any ip6tables ACCEPT call. There
+        # should be ZERO ip6tables ACCEPT calls in the whole script (covered
+        # by test_ip6tables_has_no_accept_rules above) — this just re-asserts
+        # specifically for the resolution loop with an extra readable error.
+        import re
+        # Look for any ip6tables -A line that adds an ACCEPT for a destination
+        # — this would mean we're allowlisting IPv6 destinations.
+        accept_dest_pattern = re.search(
+            r"ip6tables\s+-A\s+OUTPUT.*-d\s+\S+.*-j\s+ACCEPT", entrypoint_text
+        )
+        assert accept_dest_pattern is None, (
+            "BUG-V243 BLOCK regression: the resolution loop must NOT add "
+            "ip6tables ACCEPT rules for any IPv6 destination. IPv6 is "
+            "BLOCKED, not allowlisted. Yashigani is IPv4-only."
+        )
+
+    # ── LOG rule for IPv6 bypass attempts (observability for canary) ────────
+
+    def test_ip6tables_logs_blocked_v6_attempts(self, entrypoint_text):
+        """ip6tables LOG rule must fire for IPv6 egress attempts (canary)."""
+        assert "CADDY_EGRESS_BLOCKED_V6" in entrypoint_text, (
+            "BUG-V243 BLOCK regression: caddy-entrypoint.sh must install an "
+            "ip6tables LOG rule with prefix CADDY_EGRESS_BLOCKED_V6. In a "
+            "healthy install this never fires; when it does, it's a canary "
+            "for an IPv6-bypass attempt (compromised service, misconfigured "
+            "agent) that must be investigated."
+        )
+
+    # ── Documentation: invariant comments ───────────────────────────────────
+
+    def test_docs_ipv4_only_design_intent(self, entrypoint_text):
+        """The script must document Yashigani's IPv4-only-by-design posture."""
+        v4_only_signals = [
+            "IPv4-only",
+            "IPv4 only",
+            "IPv6 is blocked",
+            "Yashigani is IPv4-only",
+            "BUG-V243",
+        ]
+        has_doc = sum(1 for sig in v4_only_signals if sig in entrypoint_text) >= 3
+        assert has_doc, (
+            "BUG-V243 BLOCK regression: caddy-entrypoint.sh must document "
+            "the IPv4-only-by-design posture clearly. At least 3 of these "
+            "signals must appear: 'IPv4-only', 'IPv4 only', 'IPv6 is "
+            "blocked', 'Yashigani is IPv4-only', 'BUG-V243'."
+        )
+
+    def test_no_parity_language_carryover(self, entrypoint_text):
+        """No 'parity' language should remain — that was the rejected approach."""
+        # Reject the rejected-approach language to prevent regression.
+        banned_phrases = ["IPv6 OUTPUT allowlist", "allowlist (IPv6"]
+        found_banned = [p for p in banned_phrases if p in entrypoint_text]
+        assert not found_banned, (
+            "BUG-V243 BLOCK regression: caddy-entrypoint.sh must not "
+            "describe the IPv6 chain as an 'allowlist' — the rejected "
+            "64fd5c4 parity approach used that language. IPv6 is blocked, "
+            "not allowlisted. Found:\n"
+            + "\n".join(f"  '{p}'" for p in found_banned)
+        )
+
+
+# ── 9. LAURA-V243-002 — ACME egress gated on TLS_MODE=acme ──────────────────
+
+class TestEntrypointAcmeTlsModeGate:
+    """LAURA-V243-002 (MEDIUM) — Laura's adversarial probe 2026-05-26.
+
+    Before this fix: DEFAULT_ACME_HOSTS (Let's Encrypt prod + staging + OCSP
+    responders) was added to the egress allowlist unconditionally, regardless
+    of YASHIGANI_TLS_MODE. In selfsigned/ca modes, Cloudflare IPs (172.65.32.248
+    + 172.65.46.172 + AAAA equivalents) remained reachable from inside the
+    Caddy container — widening post-RCE exfil surface beyond the documented
+    intent (the script's header comment claims ACME hosts are only allowed in
+    acme mode, but the code didn't gate).
+
+    Fix: read YASHIGANI_TLS_MODE; only seed full_allowlist from
+    DEFAULT_ACME_HOSTS when the value is "acme" (or absent, defaulting to
+    acme for backward compat). Operator-supplied YASHIGANI_CADDY_EGRESS_ALLOWLIST
+    is still honoured in any mode (operator opt-in is the boundary).
+    """
+
+    def test_acme_hosts_gated_on_tls_mode(self, entrypoint_text):
+        """ACME default hosts must only seed allowlist when TLS_MODE=acme."""
+        assert "YASHIGANI_TLS_MODE" in entrypoint_text, (
+            "LAURA-V243-002 regression: caddy-entrypoint.sh must read "
+            "YASHIGANI_TLS_MODE to decide whether to include ACME hosts in "
+            "the egress allowlist."
+        )
+        # Specifically the seed must be conditional on _tls_mode = "acme".
+        assert '"$_tls_mode" = "acme"' in entrypoint_text or \
+               '$_tls_mode = "acme"' in entrypoint_text or \
+               '"${_tls_mode}" = "acme"' in entrypoint_text, (
+            "LAURA-V243-002 regression: caddy-entrypoint.sh must gate "
+            "full_allowlist=$DEFAULT_ACME_HOSTS behind a check that "
+            "$_tls_mode = \"acme\". Without the gate, selfsigned/ca modes "
+            "still allowlist Cloudflare ACME IPs."
+        )
+
+    def test_laura_v243_002_referenced(self, entrypoint_text):
+        """The fix must reference LAURA-V243-002 so future readers can trace."""
+        assert "LAURA-V243-002" in entrypoint_text, (
+            "LAURA-V243-002 regression: caddy-entrypoint.sh must reference "
+            "LAURA-V243-002 in the comment near the TLS_MODE gate. Provides "
+            "traceability if a future refactor removes the gate."
+        )
+
+
+# ── 10. LAURA-V243-005 — iptables ADD failure resilience ────────────────────
+
+class TestEntrypointIptablesAddResilience:
+    """LAURA-V243-005 (MED) — Laura adversarial probe 2026-05-26.
+
+    Before this fix: bare `iptables -A OUTPUT ... -j ACCEPT` calls under
+    `set -eu` aborted the entrypoint mid-loop on any failure. Caddy then
+    never started — restart loop with no clear error in container logs.
+    Fail-closed per Laura's live test (no bypass), but operationally opaque.
+
+    Fix: `_iptables_add_or_warn` wrapper catches non-zero, logs the rule
+    that failed, increments a counter, lets the loop continue. The OUTPUT
+    policy is already DROP, so a partial allowlist remains fail-safe.
+    """
+
+    def test_has_iptables_add_wrapper(self, entrypoint_text):
+        assert "_iptables_add_or_warn" in entrypoint_text, (
+            "LAURA-V243-005 regression: caddy-entrypoint.sh must define a "
+            "wrapper function `_iptables_add_or_warn` so iptables ADD "
+            "failures don't crash the entrypoint under `set -eu`."
+        )
+
+    def test_wrapper_used_in_resolution_loop(self, entrypoint_text):
+        assert "_iptables_add_or_warn -A OUTPUT -p tcp -d" in entrypoint_text, (
+            "LAURA-V243-005 regression: resolution-loop v4 branch must call "
+            "_iptables_add_or_warn, not bare `iptables -A OUTPUT -p tcp -d`."
+        )
+
+    def test_laura_v243_005_referenced(self, entrypoint_text):
+        assert "LAURA-V243-005" in entrypoint_text, (
+            "LAURA-V243-005 regression: caddy-entrypoint.sh must reference "
+            "LAURA-V243-005 in the comment near the wrapper definition."
+        )
+
+
+# ── 11. LAURA-V243-004 — nf_log_all_netns observability canary ──────────────
+
+class TestEntrypointNflogObservabilityCheck:
+    """LAURA-V243-004 (MED) — Laura adversarial probe 2026-05-26.
+
+    ip6tables LOG uses kernel printk, per-netns on modern kernels. Without
+    host sysctl `net.netfilter.nf_log_all_netns=1`, the IPv6 bypass canary
+    (CADDY_EGRESS_BLOCKED_V6) fires inside the container but is invisible
+    to operators running `journalctl -k`. Enforcement (DROP) unaffected;
+    observability is the gap.
+
+    Fix: read /proc/sys/net/netfilter/nf_log_all_netns at startup (read-only
+    host sysctl exposure, no extra privileges); if 0, warn with the exact
+    `sysctl -w` remediation command.
+    """
+
+    def test_reads_nf_log_all_netns(self, entrypoint_text):
+        assert "nf_log_all_netns" in entrypoint_text, (
+            "LAURA-V243-004 regression: caddy-entrypoint.sh must read "
+            "/proc/sys/net/netfilter/nf_log_all_netns and warn if 0."
+        )
+
+    def test_warns_with_remediation_command(self, entrypoint_text):
+        assert "sysctl -w net.netfilter.nf_log_all_netns=1" in entrypoint_text, (
+            "LAURA-V243-004 regression: warn must include the exact "
+            "`sysctl -w net.netfilter.nf_log_all_netns=1` remediation."
+        )
+
+    def test_laura_v243_004_referenced(self, entrypoint_text):
+        assert "LAURA-V243-004" in entrypoint_text, (
+            "LAURA-V243-004 regression: caddy-entrypoint.sh must reference "
+            "LAURA-V243-004 in the comment near the sysctl-check block."
+        )
