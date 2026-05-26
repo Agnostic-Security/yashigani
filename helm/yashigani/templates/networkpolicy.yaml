@@ -480,6 +480,13 @@ spec:
 # SECURITY NOTE: Ollama requires external internet access for model pulls.
 # Restrict to the ollama registry CIDR in production if possible, or use
 # an OCI mirror to avoid this egress rule entirely.
+#
+# LAURA-V243-003 / Gap 2: the prior port-only rule (no `to:` ipBlock) allowed
+# egress to ANY destination including IPv6 addresses on dual-stack clusters.
+# Tiago directive 2026-05-26: "anything else internally is ipv4 ... block it."
+# Fix: explicit IPv4-public-internet ipBlock (RFC1918 ranges excepted).
+# K8s semantics: an egress rule with an IPv4 ipBlock implicitly denies IPv6
+# because ::/0 is not matched — no explicit IPv6 deny needed.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -494,7 +501,16 @@ spec:
   policyTypes:
     - Egress
   egress:
-    - ports:
+    # IPv4 public internet only — RFC1918 private ranges excluded.
+    # This implicitly blocks IPv6 egress (no ::/0 entry = IPv6 denied).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
         - protocol: TCP
           port: 443
         - protocol: TCP
@@ -1005,6 +1021,12 @@ spec:
 # OpenClaw — additional external egress for messaging channel webhooks.
 # SECURITY NOTE: This rule allows all outbound HTTPS from openclaw pods.
 # Tighten to known webhook IPs in production if your network permits.
+#
+# LAURA-V243-003 / Gap 3: the prior port-only rule (no `to:` ipBlock) allowed
+# egress to ANY destination including IPv6 addresses on dual-stack clusters.
+# Tiago directive 2026-05-26: "anything else internally is ipv4 ... block it."
+# Fix: explicit IPv4-public-internet ipBlock (RFC1918 ranges excepted).
+# K8s semantics: an egress rule with an IPv4 ipBlock implicitly denies IPv6.
 {{- if .Values.agentBundles.openclaw.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1020,7 +1042,16 @@ spec:
   policyTypes:
     - Egress
   egress:
-    - ports:
+    # IPv4 public internet only — RFC1918 private ranges excluded.
+    # This implicitly blocks IPv6 egress (no ::/0 entry = IPv6 denied).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
         - protocol: TCP
           port: 443
         - protocol: TCP
@@ -1047,10 +1078,22 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # External client traffic
+    # External client traffic — IPv4 internet clients (FIND-C9-001 / Gap 1)
     - from:
         - ipBlock:
             cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    # IPv6 internet clients — Tiago directive 2026-05-26: "allow ipv6 in the
+    # front to connect to the internet if the client wants to." Dual-stack K8s
+    # clusters require an explicit ::/0 ipBlock for IPv6 LoadBalancer traffic.
+    # Internal traffic remains IPv4-only (no ::/0 egress anywhere else).
+    - from:
+        - ipBlock:
+            cidr: "::/0"
       ports:
         - protocol: TCP
           port: 443
