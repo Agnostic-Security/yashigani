@@ -19,6 +19,11 @@ htmlcov/
 # Yashigani runtime data
 docker/secrets/
 docker/.yashigani-install-state
+# docker/var/ — per-install runtime state (service_identities populated with
+# bootstrap_token_sha256 hashes, and future runtime artefacts).
+# install.sh creates docker/var/runtime/service_identities.yaml on each run.
+# This file must never be committed — it contains per-install token hashes.
+docker/var/
 data/*
 !data/fasttext
 docker/data/

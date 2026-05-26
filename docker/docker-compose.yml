@@ -94,11 +94,16 @@ x-common-env: &common-env
   # it has no /run/secrets mount at all (PROBE-AG1 fix). They also benefit from the env var for consistency.
   YASHIGANI_INTERNAL_BEARER: ${YASHIGANI_INTERNAL_BEARER:?run install.sh to generate yashigani_internal_bearer}
 
-# Reminder for readers: the manifest is mounted into each Python service as
-#   ./service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+# Reminder for readers: the runtime manifest (with per-install bootstrap_token_sha256
+# values populated) is mounted into each Python service as:
+#   ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+# The canonical schema source is docker/service_identities.yaml (git-tracked, all
+# bootstrap_token_sha256 placeholders empty). install.sh copies it to
+# docker/var/runtime/service_identities.yaml and populates the hashes there.
+# docker/var/ is gitignored — post-install git status stays clean.
 # Adding a service? Add it to docker/service_identities.yaml AND bind-mount
 # the file here. install.sh bootstrap_internal_pki() will issue its cert on
-# the next rotate-certs run.
+# the next run.
 
 services:
 
@@ -152,10 +157,11 @@ services:
       - caddy_config:/config
       - ./tls:/etc/caddy/tls:ro    # only used in ca mode
       # Internal mesh CA — Caddy calls backoffice /auth/verify via forward_auth
-      # (mTLS client). Its own client cert lives in ./secrets; the manifest
-      # is mounted read-only.
+      # (mTLS client). Its own client cert lives in ./secrets; the runtime manifest
+      # (with per-install bootstrap_token_sha256 values) is mounted read-only.
+      # Source is docker/var/runtime/ (gitignored, populated by install.sh).
       - ./secrets:/run/secrets:ro
-      - ./service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+      - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
     healthcheck:
       # MUST-4 / v2.24.1: admin TCP :2019 removed; unix socket is the only
       # admin path. curl --unix-socket targets the socket from inside the
@@ -277,8 +283,9 @@ services:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
       - ./secrets:/run/secrets:ro
-      # Internal mTLS — service identity manifest (read-only).
-      - ./service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+      # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
+      # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
+      - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
       # Container socket for Pool Manager (per-identity isolation)
       # SECURITY: read-only mount, gateway runs as non-root (UID 1001).
       # Pool Manager uses only: containers.run(), .get(), .kill(), .remove().
@@ -474,8 +481,9 @@ services:
       # for v2.24.0. K8s is already protected: backoffice.yaml initContainer runs
       # chmod 0400 on all /secrets-rw/* files including license_key.
       - ./secrets:/run/secrets
-      # Internal mTLS — manifest mounted read-only.
-      - ./service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+      # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
+      # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
+      - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
     read_only: true
     tmpfs:
       - /tmp:size=100M

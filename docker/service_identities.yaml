@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Yashigani — Service Identity Manifest (IaC-declared ecosystem allowlist)
-# Last updated: 2026-05-16T00:00:00+01:00 (YSG-RISK-012b: add /admin/agents endpoint_acls — ASVS V10.3.5)
+# Last updated: 2026-05-26T00:00:00+01:00 (fix: move runtime bootstrap_token_sha256 to var/runtime/ — stop tracked-file drift)
 #
 # Every container that speaks inside the Yashigani mesh MUST have an entry
 # here. Services not in this file cannot obtain an internal-CA-signed client
@@ -23,17 +23,23 @@
 #                           bridge-network isolation + bearer token).
 #   bootstrap_token_sha256 — SHA-256 of the per-install bootstrap token that
 #                            lives at ./secrets/<name>_bootstrap_token.
-#                            Populated by install.sh on first deploy;
-#                            refuses to start if the on-disk token does not
-#                            hash to this value (tamper detection).
+#                            SCHEMA PLACEHOLDER ONLY in this file ("").
+#                            install.sh populates real values into
+#                            docker/var/runtime/service_identities.yaml
+#                            (git-ignored), which is what compose and the PKI
+#                            issuer use at runtime. This file never changes on
+#                            install — git status stays clean.
 #   revoked               — operator kill switch. revoked: true => the next
 #                            install.sh rotate-certs run skips this service
 #                            and the current cert is allowed to expire. Used
 #                            for incident response. A future canary hook can
 #                            flip this programmatically (see docs/incident.md).
 #
-# The manifest is under git — any addition, revocation, or SAN change is a
-# visible commit, never a runtime push. That is the point.
+# This file is IaC — service shape (name, dns_sans, spiffe_id, purpose,
+# mtls_capable, revoked) is committed and version-controlled. The per-install
+# bootstrap_token_sha256 values are NOT committed; they live in the runtime
+# manifest at docker/var/runtime/service_identities.yaml (gitignored).
+# install.sh copies this file to the runtime path and populates the hashes.
 #
 # Cert lifetime: chosen at install time (YASHIGANI_CERT_LIFETIME_DAYS,
 # range 30–365, default 90). Admins can change it later from
@@ -50,7 +56,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/caddy
     purpose: "TLS edge + internal CA root"
     mtls_capable: true
-    bootstrap_token_sha256: "8233da468b42eb1b31763a936b1ecd1c799d04bc7df5bed866ea758a0c21cf6c"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: gateway
@@ -58,7 +64,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/gateway
     purpose: "MCP reverse proxy (data plane)"
     mtls_capable: true
-    bootstrap_token_sha256: "753ef663891fe4d8fdf46c592d22ec6d2fb8146d45bb6739d4a48a7f0d5cb377"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: backoffice
@@ -66,7 +72,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/backoffice
     purpose: "Admin control plane (SSO, RBAC, audit, billing)"
     mtls_capable: true
-    bootstrap_token_sha256: "e5470833a685c29ac40f9035fcc5a8127221be56d7de8e9c288fb5073d057ba9"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: policy
@@ -79,7 +85,7 @@ services:
     # updated to use internal_httpx_client / internal_httpx_sync_client
     # (EX-231-01 closure, task #54).
     mtls_capable: true
-    bootstrap_token_sha256: "9396417ef97ed27a3bcefd613c7d53f928d887ebf294c6348ea3fef9f3ff3b6b"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   # ── Data stores ───────────────────────────────────────────────────────────
@@ -88,7 +94,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/postgres
     purpose: "PostgreSQL 16 (tenants, audit, RBAC, inference)"
     mtls_capable: true
-    bootstrap_token_sha256: "d9ad48e5474a4ccc04c4349ef93de1b90a54d6229bd43b54ac1816ad3dc2de6c"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: pgbouncer
@@ -96,7 +102,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/pgbouncer
     purpose: "Transaction-mode PostgreSQL pooler"
     mtls_capable: true
-    bootstrap_token_sha256: "357daecd7ec4ee80bfa05f9c076f0a0e79861ab1d5b72e9355f0be633f61d82a"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: redis
@@ -104,7 +110,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/redis
     purpose: "Session store, TOTP provisioning, rate-limit counters"
     mtls_capable: true
-    bootstrap_token_sha256: "122bc5c5f0a48c66743d21d104d8ba3f4afc4dd52e7291955192a9d40d2b867e"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: budget-redis
@@ -112,7 +118,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/budget-redis
     purpose: "Budget counter store (noeviction)"
     mtls_capable: true
-    bootstrap_token_sha256: "7c439ac8504fc762d4d850d2150d8a9433011620e0777587af96cc35b0a3b583"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   # ── Observability ─────────────────────────────────────────────────────────
@@ -121,7 +127,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/prometheus
     purpose: "Metrics collection + federation"
     mtls_capable: true
-    bootstrap_token_sha256: "446629e8391bf7644d6b1ffbb3a9753e04306f18a5773066ea74652daeac2719"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: grafana
@@ -129,7 +135,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/grafana
     purpose: "Dashboards + alerting"
     mtls_capable: true
-    bootstrap_token_sha256: "0bd9a8715b813b07e4d52301cd6537883a15cc222913ae22ae33cb895b938575"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: alertmanager
@@ -137,7 +143,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/alertmanager
     purpose: "Alert routing"
     mtls_capable: true
-    bootstrap_token_sha256: "03f34755e531116e919b91ef79ab3bf73f67142db32cda0e27c4d008a130148c"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: loki
@@ -145,7 +151,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/loki
     purpose: "Log aggregation backend"
     mtls_capable: true
-    bootstrap_token_sha256: "5e5a4a402415807c8c82ca2c6559540d705b4fe3f238456e552708bbca0accb8"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: promtail
@@ -157,7 +163,7 @@ services:
     # remains plain HTTP for the local healthcheck). mtls_capable:true here means
     # only that the issuer must produce a client cert for this service.
     mtls_capable: true
-    bootstrap_token_sha256: "17fd50515fd428196a59bde20eca2563441e1504ea147a231932e236ecbac9f4"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: otel-collector
@@ -165,7 +171,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/otel-collector
     purpose: "OTLP receiver (mTLS); Jaeger exporter (mTLS, EX-231-09 closed v2.23.2)"
     mtls_capable: true
-    bootstrap_token_sha256: "c4663f5b4e19b83e88d3577a24a0458bc1fbb512bba22dbaa7763fcbffb945da"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: jaeger
@@ -173,7 +179,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/jaeger
     purpose: "Distributed trace UI + OTLP gRPC collector (mTLS, EX-231-09 closed v2.23.2)"
     mtls_capable: true
-    bootstrap_token_sha256: "e83ecaeb794ef1e518971fc395ab671b2cb0d9f858e0301ae01dcd0c25ca2d20"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   # ── AI / inference ────────────────────────────────────────────────────────
@@ -184,7 +190,7 @@ services:
     # Ollama does not support server TLS. Protection = internal bridge-only +
     # bearer token. This is an honest gap, not a pretend control.
     mtls_capable: false
-    bootstrap_token_sha256: "41a20f61dd3b633da3e9e3e92d43501ff35b121e7417a21e50037532316980fa"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   # ── Optional / profile-gated services ─────────────────────────────────────
@@ -193,7 +199,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/open-webui
     purpose: "User-facing chat UI (profile: openwebui)"
     mtls_capable: true
-    bootstrap_token_sha256: "3b6d02180904655375ccad83b868396f42c960d76422484d4b29265f38749ead"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: langflow
@@ -201,7 +207,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/langflow
     purpose: "Visual agent workflow builder (profile: langflow)"
     mtls_capable: false       # upstream image, no TLS. Uses CA as client.
-    bootstrap_token_sha256: "f33a4a92d0f29a04a29b1aa87a9328d711b1862c811c5c7c0e2ced16c09bd93d"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: letta
@@ -209,7 +215,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/letta
     purpose: "Stateful agent with persistent memory (profile: letta)"
     mtls_capable: false       # upstream image, no TLS. Uses CA as client.
-    bootstrap_token_sha256: "6286076bbe4c6ff3d145f927c673b7923dc44fca380efc8811489c71160950c4"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: pgbouncer-auth
@@ -224,7 +230,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/pgbouncer-auth
     purpose: "Dedicated outbound cert for pgbouncer→postgres connections (YSG-RISK-050 close)"
     mtls_capable: true
-    bootstrap_token_sha256: ""  # populated by install.sh on first deploy
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: letta-pgbouncer
@@ -240,7 +246,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/letta-pgbouncer
     purpose: "pgbouncer session-mode sidecar — proxies letta→postgres over mTLS (profile: letta)"
     mtls_capable: true        # pgbouncer presents letta-pgbouncer_client.crt to postgres.
-    bootstrap_token_sha256: ""  # populated by install.sh on first deploy
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: openclaw
@@ -248,7 +254,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/openclaw
     purpose: "Personal AI w/ messaging channel integrations (profile: openclaw)"
     mtls_capable: false       # upstream image. Uses CA as client.
-    bootstrap_token_sha256: "4aee4c24ca983690ee4069132a78e46c2f0a13fc91de28838ca68496d11d4b1a"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: keycloak
@@ -256,7 +262,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/keycloak
     purpose: "Upstream test IdP for OIDC/SAML federation (profile: test-idp)"
     mtls_capable: true
-    bootstrap_token_sha256: "24e73780b67282df6ff2842b17de79d475930b07feef3f7409f06168d3c6b6b4"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: vault
@@ -264,7 +270,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/vault
     purpose: "HashiCorp Vault dev-mode KMS (profile: vault)"
     mtls_capable: true
-    bootstrap_token_sha256: "4eb96cbc1dc23bd6b4bebf71111c1da08701923fec46d74c97e6e934bde0acdf"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: step-ca
@@ -272,7 +278,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/step-ca
     purpose: "Smallstep CA — legacy, kept for --with-internal-ca profile only"
     mtls_capable: true
-    bootstrap_token_sha256: "da671daac8b57f030b54cce03178ea488234c20f94a6db31b83e34484a3a8faa"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: wazuh-manager
@@ -280,7 +286,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/wazuh-manager
     purpose: "Wazuh SIEM event ingest (profile: wazuh)"
     mtls_capable: true
-    bootstrap_token_sha256: "f2f9ab637a95fb52bfefc9ffcb883bfd4460bf9459f794312ddfc5978d1695f3"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: wazuh-indexer
@@ -288,7 +294,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/wazuh-indexer
     purpose: "Wazuh SIEM OpenSearch backend (profile: wazuh)"
     mtls_capable: true
-    bootstrap_token_sha256: "368520e9b0a332a75278b78f909ec522cbef02f76b13e5b7199799d75cfa7d77"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
   - name: wazuh-dashboard
@@ -296,7 +302,7 @@ services:
     spiffe_id: spiffe://yashigani.internal/wazuh-dashboard
     purpose: "Wazuh SIEM UI (profile: wazuh)"
     mtls_capable: true
-    bootstrap_token_sha256: "41e264bc6ccc94ff16108a32fffb1e51bbe48f827bd9da0fef4673cfdb0b6115"
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
 # ─────────────────────────────────────────────────────────────────────────────
