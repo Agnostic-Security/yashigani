@@ -147,8 +147,14 @@ apply_egress_rules() {
     for host_port in $full_allowlist; do
         host="${host_port%:*}"
         port="${host_port##*:}"
-        # Resolve via Docker DNS (already allowed above via subnet rule)
-        ips=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+        # Resolve via Docker DNS (already allowed above via subnet rule).
+        # IPv4 only — this allowlist uses `iptables` (IPv4); AAAA records
+        # (containing ':') would fail with "host/network <addr> not found"
+        # under `set -e` and crash-loop the container. BUG-V243-CADDY-IPV6-
+        # IPTABLES verified on fresh VM/Podman install 2026-05-26 (Caddy
+        # restart count 393 in 3 min before fix). IPv6 egress is currently
+        # not filtered separately — tracked for follow-up via ip6tables.
+        ips=$(getent ahosts "$host" 2>/dev/null | awk '$1 !~ /:/ {print $1}' | sort -u)
         if [ -z "$ips" ]; then
             warn "Could not resolve $host — skipping iptables rule for $host:$port"
             continue

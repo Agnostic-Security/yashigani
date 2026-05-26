@@ -376,3 +376,53 @@ class TestValuesEgressAllowlist:
         assert values_caddy["egressAllowlist"] == "", (
             "values.yaml caddy.egressAllowlist default must be '' (empty string)"
         )
+
+
+# ── 8. BUG-V243-CADDY-IPV6-IPTABLES regression guard ─────────────────────────
+
+class TestEntrypointIpv6Filter:
+    """BUG-V243-CADDY-IPV6-IPTABLES — verified fresh-install 2026-05-26.
+
+    The egress allowlist loop resolves operator/ACME hosts via `getent ahosts`
+    and feeds each address to `iptables`. `getent ahosts` returns BOTH A
+    (IPv4) and AAAA (IPv6) records. `iptables` (the IPv4 binary) rejects IPv6
+    addresses with `host/network <addr> not found` and exits non-zero. Under
+    `set -e` (line 55) this crashes the entrypoint → container exits → Podman
+    restart-policy=always re-runs → restart loop (393 restarts in 3 minutes
+    measured on UTM VM, fresh tarball install).
+
+    Fix: filter IPv6 results out before iterating to iptables. Either
+    `getent ahostsv4` (explicit IPv4-only) or awk filter (reject any
+    address containing ':').
+    """
+
+    def test_getent_ahosts_filters_ipv6(self, entrypoint_text):
+        """Resolution must not feed IPv6 addresses into the iptables loop."""
+        # Acceptable patterns:
+        # 1. getent ahostsv4 (musl + glibc — explicit IPv4-only)
+        # 2. getent ahosts ... awk '!~ /:/' (filter colons)
+        # 3. getent ahosts ... awk '!/:/'   (same, regex shorthand)
+        has_v4_only_getent = "getent ahostsv4" in entrypoint_text
+        has_colon_filter = "!~ /:/" in entrypoint_text or "!/:/" in entrypoint_text
+
+        assert has_v4_only_getent or has_colon_filter, (
+            "BUG-V243-CADDY-IPV6-IPTABLES regression: caddy-entrypoint.sh "
+            "must filter IPv6 addresses from `getent ahosts` output before "
+            "passing to `iptables` (IPv4-only). Either use `getent ahostsv4` "
+            "or filter via awk pattern `$1 !~ /:/`. Without the filter, AAAA "
+            "records crash the entrypoint under `set -e` and Caddy restart-"
+            "loops indefinitely."
+        )
+
+    def test_iptables_loop_documents_ipv4_only(self, entrypoint_text):
+        """The egress loop must document the IPv4-only invariant for future maintainers."""
+        # Find the resolution block and verify there's a comment about IPv4/IPv6.
+        v6_comment_signals = ["IPv4 only", "AAAA", "IPv6", "BUG-V243"]
+        has_doc = any(signal in entrypoint_text for signal in v6_comment_signals)
+        assert has_doc, (
+            "caddy-entrypoint.sh must document the IPv4-only invariant of "
+            "the iptables egress allowlist near the getent loop (any of: "
+            "'IPv4 only', 'AAAA', 'IPv6', 'BUG-V243'). The filter alone is "
+            "fragile — comment ensures future maintainers don't 'simplify' "
+            "it back to bare `getent ahosts`."
+        )
