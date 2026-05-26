@@ -535,21 +535,53 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
     echo "Removing named volumes (UNINSTALL-LEAVES-VOLUMES #8 explicit loop):"
     _removed=0
     _skipped=0
+    _failed=0
     for _vol in "${_CANONICAL_VOLUMES[@]}"; do
         _full="${_PROJECT_PREFIX}_${_vol}"
         if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
-            if "$RUNTIME" volume rm "$_full" >/dev/null 2>&1; then
+            # `volume rm -f` removes the volume even when stopped/dead containers
+            # reference it. BUG-UNINSTALL-VOLUME-SILENT-FAIL-2026-05-26: prior
+            # plain `volume rm` failed silently when a mid-restart-loop container
+            # held the volume, leaving stale postgres_data → next install hit
+            # contamination check → cascading retry storm. Laura LAURA-V243-003.
+            if "$RUNTIME" volume rm -f "$_full" >/dev/null 2>&1; then
                 echo "  [removed] $_full"
                 _removed=$(( _removed + 1 ))
             else
-                echo "  [WARN] failed to remove $_full (in use?)" >&2
+                echo "  [WARN] first-pass volume rm failed: $_full (in use?)" >&2
+                _failed=$(( _failed + 1 ))
             fi
         else
             echo "  [skip]    $_full (not present)"
             _skipped=$(( _skipped + 1 ))
         fi
     done
-    echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present."
+
+    # Retry pass: re-enumerate any survivors and try again after first-pass kill.
+    # A running-but-mid-respawn container with a volume mount can win the race
+    # against `volume rm -f`; the retry catches it after the container has died.
+    if [ "$_failed" -gt 0 ]; then
+        echo "  [retry] ${_failed} volume(s) failed first pass — retrying after settle"
+        sleep 1
+        # Kill any container that might still reference a volume; then retry rm -f.
+        "$RUNTIME" ps -aq --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null \
+          | xargs -r "$RUNTIME" rm -f --depend 2>/dev/null || true
+        _failed=0
+        for _vol in "${_CANONICAL_VOLUMES[@]}"; do
+            _full="${_PROJECT_PREFIX}_${_vol}"
+            if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
+                if "$RUNTIME" volume rm -f "$_full" >/dev/null 2>&1; then
+                    echo "  [retry-removed] $_full"
+                    _removed=$(( _removed + 1 ))
+                else
+                    echo "  [WARN] retry volume rm STILL failed: $_full" >&2
+                    _failed=$(( _failed + 1 ))
+                fi
+            fi
+        done
+    fi
+
+    echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present, ${_failed} failed."
 fi
 
 # ---------------------------------------------------------------------------
@@ -863,5 +895,98 @@ if [ "$REMOVE_VOLUMES" = "true" ]; then
 fi
 
 echo ""
+
+# ---------------------------------------------------------------------------
+# FINAL TRUTHFUL ASSERTION — uninstall.sh MUST NOT lie about what was nuked.
+# BUG-UNINSTALL-LIES-2026-05-26 (Tiago "fuck off and create a proper nuke"):
+# Enumerate every project resource that should be gone; if ANY remain, exit 1
+# with the full list. No more "All volumes deleted" while volumes survive.
+# Covers: containers, named volumes, canonical networks. (Build cache pruning
+# is operator-discretionary via `podman system prune -af`; we don't auto-prune
+# because it nukes non-yashigani caches too.)
+# ---------------------------------------------------------------------------
+_NUKE_FAIL=0
+_NUKE_REPORT=""
+
+# 1. Containers — any with project prefix.
+_residual_containers="$("$RUNTIME" ps -aq --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null | grep -v '^$' || true)"
+if [ -n "$_residual_containers" ]; then
+    _count=$(printf '%s\n' "$_residual_containers" | wc -l | tr -d ' ')
+    _NUKE_FAIL=1
+    _NUKE_REPORT="${_NUKE_REPORT}  - ${_count} container(s) remain:
+$(printf '%s\n' "$_residual_containers" | while read -r _cid; do
+    _name="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||')"
+    printf '      %s (%s)\n' "${_name:-unknown}" "$_cid"
+done)
+"
+fi
+
+# 2. Named volumes — canonical list + any project-prefixed volume (catches anon).
+if [ "$REMOVE_VOLUMES" = "true" ]; then
+    _residual_volumes=""
+    for _vol in "${_CANONICAL_VOLUMES[@]}"; do
+        _full="${_PROJECT_PREFIX}_${_vol}"
+        if "$RUNTIME" volume inspect "$_full" >/dev/null 2>&1; then
+            _residual_volumes="${_residual_volumes}${_full}\n"
+        fi
+    done
+    # Also: any other project-prefixed volume not on the canonical list.
+    _other_prefixed="$("$RUNTIME" volume ls -q 2>/dev/null | grep "^${_PROJECT_PREFIX}_" || true)"
+    if [ -n "$_other_prefixed" ]; then
+        while IFS= read -r _v; do
+            [ -z "$_v" ] && continue
+            case "$_residual_volumes" in
+                *"${_v}"*) ;;
+                *) _residual_volumes="${_residual_volumes}${_v} (non-canonical)\n" ;;
+            esac
+        done <<< "$_other_prefixed"
+    fi
+    if [ -n "$_residual_volumes" ]; then
+        _NUKE_FAIL=1
+        _NUKE_REPORT="${_NUKE_REPORT}  - volume(s) remain:
+$(printf '%b' "$_residual_volumes" | sed 's/^/      /')
+"
+    fi
+fi
+
+# 3. Networks — canonical compose project networks.
+_canonical_networks="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated"
+_residual_networks=""
+for _net in $_canonical_networks; do
+    _full="${_PROJECT_PREFIX}_${_net}"
+    if "$RUNTIME" network inspect "$_full" >/dev/null 2>&1; then
+        # Try to remove; if successful, no residual.
+        if "$RUNTIME" network rm "$_full" >/dev/null 2>&1; then
+            :
+        else
+            _residual_networks="${_residual_networks}${_full}\n"
+        fi
+    fi
+done
+if [ -n "$_residual_networks" ]; then
+    _NUKE_FAIL=1
+    _NUKE_REPORT="${_NUKE_REPORT}  - network(s) remain (in-use by non-project container?):
+$(printf '%b' "$_residual_networks" | sed 's/^/      /')
+"
+fi
+
+if [ "$_NUKE_FAIL" -ne 0 ]; then
+    echo "" >&2
+    echo "ERROR: uninstall.sh did NOT fully nuke. Residual resources:" >&2
+    printf '%s' "$_NUKE_REPORT" >&2
+    echo "" >&2
+    echo "Manual remediation:" >&2
+    echo "  ${RUNTIME} ps -aq --filter 'name=^${_PROJECT_PREFIX}[_-]' | xargs -r ${RUNTIME} rm -f --depend" >&2
+    if [ "$REMOVE_VOLUMES" = "true" ]; then
+        echo "  ${RUNTIME} volume ls -q | grep '^${_PROJECT_PREFIX}_' | xargs -r ${RUNTIME} volume rm -f" >&2
+    fi
+    echo "  for n in ${_canonical_networks}; do ${RUNTIME} network rm ${_PROJECT_PREFIX}_\$n; done" >&2
+    echo "  rm -rf ~/yashigani ~/yashigani-v243  # remove install trees" >&2
+    echo "  ${RUNTIME} system prune -af --volumes  # nuclear option (also wipes non-yashigani)" >&2
+    echo "" >&2
+    echo "Yashigani uninstall INCOMPLETE — exit 1." >&2
+    exit 1
+fi
+
 echo "Yashigani stopped."
-[ "$REMOVE_VOLUMES" = "true" ] && echo "All volumes deleted." || echo "Data volumes preserved."
+[ "$REMOVE_VOLUMES" = "true" ] && echo "All volumes verified-deleted (final assertion passed)." || echo "Data volumes preserved."
