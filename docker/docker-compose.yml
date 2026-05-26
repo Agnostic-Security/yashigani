@@ -151,6 +151,15 @@ services:
       # iptables OUTPUT ACCEPT rule per IP+port pair. Unresolvable hostnames are
       # logged as WARN and skipped (Caddy still starts).
       YASHIGANI_CADDY_EGRESS_ALLOWLIST: ${YASHIGANI_CADDY_EGRESS_ALLOWLIST:-}
+      # LAURA-V243-002 (env-propagation closure): TLS mode must be visible to
+      # caddy-entrypoint.sh INSIDE the container, not just at compose-parse
+      # time for the Caddyfile volume mount path below. Without this env
+      # passthrough, the entrypoint's TLS_MODE gate (which prevents ACME-host
+      # egress fallback in selfsigned/ca mode) reads an empty var and defaults
+      # to "acme" in any mode, defeating the LAURA-V243-002 fix. The Caddy
+      # container would still allowlist Cloudflare ACME IPs even though Caddy
+      # never invokes ACME — exactly the gap Laura found.
+      YASHIGANI_TLS_MODE: ${YASHIGANI_TLS_MODE:-acme}
     volumes:
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
