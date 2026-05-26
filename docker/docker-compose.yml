@@ -2315,21 +2315,26 @@ secrets:
 #   NetworkPolicy enforces this at the kernel level (no residual).
 #
 networks:
-  # ── Address-family posture ────────────────────────────────────────────────
-  # Yashigani is IPv4-only by design (Tiago directive 2026-05-26 in response
-  # to BUG-V243-CADDY-IPV6-IPTABLES — "do not implement ipv inside of the
-  # yashigani network ... block it"). Every bridge below sets
-  # `enable_ipv6: false` explicitly to prevent Docker / Podman from creating
-  # dual-stack bridges that would route IPv6 traffic around the Caddy
-  # iptables OUTPUT allowlist (the iptables allowlist is IPv4-only by
-  # definition; IPv6 traffic would bypass it).
-  # ip6tables OUTPUT policy = DROP is set inside the Caddy container by
-  # docker/caddy/caddy-entrypoint.sh as a second layer; this network-level
-  # enable_ipv6: false is the first layer.
+  # ── Address-family posture (Tiago directives 2026-05-26) ─────────────────
+  # Internal mesh: IPv4-only. Every internal bridge (caddy_internal, data,
+  # obs, *_isolated) sets `enable_ipv6: false` to prevent Docker/Podman
+  # from creating dual-stack bridges that would route IPv6 traffic around
+  # the IPv4 iptables allowlist enforced in Caddy + the in-mesh service
+  # network policies. ("do not implement ipv inside of the yashigani
+  # network ... block it")
+  #
+  # Edge bridge: keeps IPv6 ENABLED (no `enable_ipv6: false`) so internet
+  # clients connecting INBOUND to Caddy over IPv6 are accepted. ("allow
+  # ipv6 in the front to connect to the internet if the client wants to")
+  # Caddy's ip6tables OUTPUT chain still DROPs new outbound IPv6 — only
+  # ESTABLISHED,RELATED response packets are allowed back out to v6
+  # clients (see docker/caddy/caddy-entrypoint.sh Step 1b).
   # ─────────────────────────────────────────────────────────────────────────
   edge:
     driver: bridge
-    enable_ipv6: false
+    # IPv6 left at Docker default (true) — Caddy accepts inbound IPv6 clients
+    # from internet per Tiago 2026-05-26. New IPv6 outbound is DROPped by
+    # caddy-entrypoint.sh ip6tables OUTPUT policy.
     # external: true — Caddy needs internet access for ACME challenges (IPv4)
   caddy_internal:
     driver: bridge

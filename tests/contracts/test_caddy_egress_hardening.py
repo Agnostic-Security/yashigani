@@ -411,25 +411,44 @@ class TestEntrypointIpv6Blocked:
             "(Tiago 2026-05-26: 'block it')."
         )
 
-    # ── NO IPv6 ACCEPT rules anywhere (BLOCK posture, not allowlist) ────────
+    # ── ip6tables ACCEPT rules — ONLY loopback + ESTABLISHED ────────────────
 
-    def test_ip6tables_has_no_accept_rules(self, entrypoint_text):
-        """No ip6tables -A ACCEPT rules allowed — block posture, no allowlist."""
-        # Reject any `ip6tables -A OUTPUT ... -j ACCEPT` pattern. The shell
-        # script can still call ip6tables for non-ACCEPT verbs (P, F, L) and
-        # the LOG target is OK.
+    def test_ip6tables_allows_loopback(self, entrypoint_text):
+        """ip6tables MUST allow loopback (::1 → ::1, defensive intra-container)."""
+        assert "ip6tables -A OUTPUT -o lo -j ACCEPT" in entrypoint_text, (
+            "BUG-V243 BLOCK-INBOUND regression: caddy-entrypoint.sh must allow "
+            "ip6tables loopback (defensive intra-container)."
+        )
+
+    def test_ip6tables_allows_established_for_inbound_responses(self, entrypoint_text):
+        """ip6tables MUST allow ESTABLISHED/RELATED so v6 inbound clients get response packets."""
+        assert "ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED" in entrypoint_text, (
+            "BUG-V243 BLOCK-INBOUND regression: caddy-entrypoint.sh must allow "
+            "ip6tables ESTABLISHED,RELATED on OUTPUT. Without this, SYN-ACK and "
+            "data packets to internet IPv6 clients (allowed per Tiago directive "
+            "2026-05-26 'allow ipv6 in the front to connect to the internet if "
+            "the client wants to') are DROPped and connections hang."
+        )
+
+    def test_ip6tables_has_no_destination_accept_rules(self, entrypoint_text):
+        """ip6tables MUST NOT have any destination ACCEPT rules (no v6 outbound allowlist)."""
+        # Reject `ip6tables -A OUTPUT ... -d <addr> ... -j ACCEPT` — that would
+        # allow NEW IPv6 outbound to that destination. Loopback (-o lo) and
+        # state ESTABLISHED are the ONLY ACCEPTs permitted; both are non-
+        # destination-based ACCEPTs that don't grant new-outbound capability.
         import re
         lines = entrypoint_text.splitlines()
-        accept_lines = [
+        accept_dest_lines = [
             (i + 1, ln) for i, ln in enumerate(lines)
-            if re.search(r"ip6tables\b.*-A\s+OUTPUT.*-j\s+ACCEPT", ln)
+            if re.search(r"ip6tables\b.*-A\s+OUTPUT.*-d\s+\S+.*-j\s+ACCEPT", ln)
         ]
-        assert not accept_lines, (
-            "BUG-V243 BLOCK regression: caddy-entrypoint.sh must NOT add "
-            "any `ip6tables -A OUTPUT ... -j ACCEPT` rules. IPv6 is blocked "
-            "at the policy level (DROP) — no per-host allowlist, no loopback "
-            "exception, no ESTABLISHED exception, no ACME path. Found:\n"
-            + "\n".join(f"  line {n}: {ln.strip()}" for n, ln in accept_lines)
+        assert not accept_dest_lines, (
+            "BUG-V243 BLOCK-OUTBOUND regression: caddy-entrypoint.sh must NOT "
+            "add any `ip6tables -A OUTPUT -d <dest> ... -j ACCEPT` rules. "
+            "Caddy does NOT initiate NEW IPv6 outbound — only response packets "
+            "to inbound v6 clients (via ESTABLISHED) and loopback are allowed. "
+            "Found destination-ACCEPT rules:\n"
+            + "\n".join(f"  line {n}: {ln.strip()}" for n, ln in accept_dest_lines)
         )
 
     # ── Resolution loop: IPv6 results skipped, NOT routed to ip6tables ──────

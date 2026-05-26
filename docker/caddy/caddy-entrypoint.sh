@@ -8,17 +8,34 @@
 #   the Caddy process. Blocks all outbound TCP/UDP except to explicitly
 #   permitted destinations.
 #
-# ADDRESS FAMILY POSTURE — Tiago directive 2026-05-26
-#   Yashigani is IPv4-only by design. IPv6 is BLOCKED (DROP policy with no
-#   allowlist rules), not supported. Rationale: IPv6 never gained meaningful
-#   deployment traction in the ecosystems Yashigani targets, and the industry
-#   is moving toward IPv7. Supporting IPv6 inside the ring-fence adds attack
-#   surface (parallel egress path) without proportional value. All IPv6 OUTPUT
-#   from the Caddy container is dropped at the ip6tables policy level —
-#   there is no per-host AAAA allowlist, no ACME-over-IPv6 path, no operator
-#   override for IPv6 destinations. If an operator NEEDS IPv6 connectivity,
-#   they MUST disable Yashigani's ring-fence (out of supported scope) or
-#   front Yashigani with an IPv6 → IPv4 NAT64 gateway (also out of scope).
+# ADDRESS FAMILY POSTURE — Tiago directives 2026-05-26
+#   Yashigani's internal mesh is IPv4-only by design ("anything else internally
+#   is ipv4"). However, Caddy at the EDGE accepts IPv6 inbound from internet
+#   clients ("allow ipv6 in the front to connect to the internet if the client
+#   wants to"). Rationale: IPv6 never gained meaningful deployment traction
+#   in the ecosystems Yashigani targets (industry moving toward IPv7); but
+#   refusing IPv6 inbound from clients would needlessly drop legitimate
+#   connections from dual-stack ISPs that may have routed the client's
+#   request over v6.
+#
+#   What this means for the OUTPUT chain:
+#     - iptables (IPv4): full allowlist (loopback, ESTABLISHED, DNS, bridge
+#       subnets, ACME, operator extras) — Caddy's IPv4 operational path.
+#     - ip6tables (IPv6): MINIMAL — only loopback + ESTABLISHED,RELATED.
+#       Loopback is defensive (intra-container). ESTABLISHED,RELATED is the
+#       essential allow: when an IPv6 client connects INBOUND to Caddy,
+#       response packets must be able to go OUT — without this, the TCP
+#       handshake completes but SYN-ACK is dropped and the connection hangs.
+#       NO new IPv6 outbound allowed (no DNS, no ACME, no bridge subnets,
+#       no operator extras) — Caddy does not initiate IPv6 connections.
+#     - LOG rule on CADDY_EGRESS_BLOCKED_V6 catches any NEW IPv6 outbound
+#       attempt (canary: in a healthy install this never fires; if it does,
+#       investigate as a possible bypass attempt or upstream misconfiguration).
+#
+#   Internal mesh networks have `enable_ipv6: false` in docker-compose.yml —
+#   that's the kernel-level guarantee that in-mesh IPv6 routing is impossible.
+#   The `edge` network keeps IPv6 enabled (or default) so Caddy can receive
+#   IPv6 inbound from internet clients.
 #
 # LEGITIMATE CADDY EGRESS DESTINATIONS
 #   1. Loopback (lo) — admin unix socket healthchecks
@@ -86,25 +103,40 @@ apply_egress_rules() {
     fi
     log "NET_ADMIN available — applying iptables OUTPUT allowlist (IPv4)."
 
-    # ── Step 1b: BLOCK IPv6 entirely ────────────────────────────────────────
-    # Tiago directive 2026-05-26: Yashigani is IPv4-only by design. IPv6 is
-    # blocked at the ip6tables policy level — no per-host allowlist, no AAAA
-    # ACME path, no operator override for IPv6. If ip6tables itself is
-    # unavailable in this namespace (kernel CONFIG_IP6_NF_IPTABLES absent,
-    # IPv6 disabled via sysctl, NET_ADMIN missing for v6) that's actually
-    # the SAFER state because IPv6 has no functional stack — log as INFO,
-    # not WARN. If ip6tables IS available, we apply a hard DROP policy with
-    # NO ACCEPT rules (not even loopback — Caddy and its in-container
-    # callers use IPv4 only).
+    # ── Step 1b: IPv6 OUTPUT — DROP all NEW outbound; allow only ESTABLISHED ─
+    # Tiago directives 2026-05-26:
+    #   "do not implement ipv inside of the yashigani network ... block it"
+    #   "allow ipv6 in the front to connect to the internet if the client wants to"
+    #
+    # Combined posture: ip6tables OUTPUT policy = DROP (so no NEW outbound
+    # IPv6 connection from Caddy can succeed — no ACME-over-AAAA, no operator
+    # outbound, no internal mesh routing). BUT we MUST allow loopback and
+    # ESTABLISHED,RELATED so that when an internet client connects INBOUND
+    # to Caddy over IPv6 (legitimate, per directive), Caddy can send response
+    # packets back. Without ESTABLISHED ACCEPT on ip6tables OUTPUT, the
+    # SYN-ACK and data packets to the v6 client are dropped — the inbound
+    # connection appears to hang from the client's perspective.
+    #
+    # If ip6tables itself is unavailable in this namespace (kernel
+    # CONFIG_IP6_NF_IPTABLES absent, IPv6 disabled via sysctl, NET_ADMIN
+    # missing for v6) that's the SAFER state because IPv6 has no functional
+    # stack — log as INFO, not WARN.
     IPV6_TABLE=0
     if ip6tables -P OUTPUT DROP 2>/dev/null; then
         IPV6_TABLE=1
         # Flush any rules that might have been inherited from another run
         # (defensive — the OUTPUT chain is the one we control).
         ip6tables -F OUTPUT 2>/dev/null || true
-        log "ip6tables available — IPv6 OUTPUT policy = DROP (Yashigani is IPv4-only by design)."
+        # Loopback — defensive intra-container (::1 → ::1).
+        ip6tables -A OUTPUT -o lo -j ACCEPT
+        # ESTABLISHED,RELATED — response packets for IPv6 inbound clients.
+        # This is the ONLY non-loopback ACCEPT; new outbound IPv6 is DROPped.
+        ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        log "ip6tables OUTPUT: DROP policy + loopback + ESTABLISHED only."
+        log "  (Internet IPv6 inbound clients receive response packets;"
+        log "   Caddy cannot initiate NEW IPv6 outbound — no ACME/DNS/mesh over v6.)"
     else
-        log "ip6tables not applicable — kernel/namespace has no usable IPv6 stack (this is the intended state)."
+        log "ip6tables not applicable — kernel/namespace has no usable IPv6 stack (intended state)."
     fi
 
     # ── Step 2: Allow loopback (IPv4 only) ─────────────────────────────────
