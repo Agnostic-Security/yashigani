@@ -451,33 +451,73 @@ if [ -n "$_remaining_ids" ]; then
         [ -z "$_cid" ] && continue
         "$RUNTIME" stop --time 0 "$_cid" >/dev/null 2>&1 || true
     done <<< "$_remaining_ids"
-    # Pass 2: force-remove (rm -f on an already-stopped container is idempotent).
-    # podman rm -f removes even containers that ignore stop; --depend also removes
-    # any dependent containers (available in Podman >=4.x; no-op on Docker/older).
+    # Pass 2: force-remove with --depend FIRST (Podman >=4.x tears down
+    # dependent containers before removing this one — order-independent).
+    # Plain rm -f is only used as fallback for runtimes that don't support --depend
+    # (Docker, older Podman). BUG-UNINSTALL-DEPEND-ORDER-2026-05-26: the previous
+    # ordering (plain rm -f first, --depend fallback) hit "has dependent containers"
+    # errors in compose stacks where the loop iteration order doesn't match the
+    # dependency graph, causing some containers to remain and uninstall.sh to
+    # falsely claim success.
     while IFS= read -r _cid; do
         [ -z "$_cid" ] && continue
         _cname="$("$RUNTIME" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
-        if "$RUNTIME" rm -f "$_cid" >/dev/null 2>&1; then
+        if "$RUNTIME" rm -f --depend "$_cid" >/dev/null 2>&1; then
+            echo "  [removed] container: ${_cname} (${_cid})"
+            _rm_ok=$(( _rm_ok + 1 ))
+        elif "$RUNTIME" rm -f "$_cid" >/dev/null 2>&1; then
+            # --depend unsupported (older Podman / Docker) — plain rm -f
             echo "  [removed] container: ${_cname} (${_cid})"
             _rm_ok=$(( _rm_ok + 1 ))
         else
-            # Last resort: try with --depend flag (Podman >=4.x tears down
-            # dependent containers before removing this one)
-            if "$RUNTIME" rm -f --depend "$_cid" >/dev/null 2>&1; then
-                echo "  [removed+dep] container: ${_cname} (${_cid})"
-                _rm_ok=$(( _rm_ok + 1 ))
-            else
-                echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
-                _rm_fail=$(( _rm_fail + 1 ))
-            fi
+            echo "  [WARN] could not remove container: ${_cname} (${_cid})" >&2
+            _rm_fail=$(( _rm_fail + 1 ))
         fi
     done <<< "$_remaining_ids"
-    echo "Container cleanup: ${_rm_ok} removed, ${_rm_fail} failed."
-    if [ "$_rm_fail" -gt 0 ]; then
-        echo "  [WARN] ${_rm_fail} container(s) could not be removed. Volume rm may still fail." >&2
+    echo "Container cleanup: ${_rm_ok} removed, ${_rm_fail} failed (first pass)."
+
+    # BUG-UNINSTALL-DEPEND-ORDER-2026-05-26 retry pass: re-enumerate any
+    # stragglers and force-rm with --depend. A second pass picks up containers
+    # whose dependents were recreated by restart-policy=always between the
+    # stop and rm of the first pass (e.g. Caddy with restart: always).
+    _residual="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null | sort -u | grep -v '^$' || true)"
+    if [ -n "$_residual" ]; then
+        echo "  [retry] residual containers detected after pass 1 — retrying with stop+rm-f --depend"
+        # Disable any restart policy first by stop --time 0, then rm -f --depend
+        while IFS= read -r _cid; do
+            [ -z "$_cid" ] && continue
+            "$RUNTIME" stop --time 0 "$_cid" >/dev/null 2>&1 || true
+            "$RUNTIME" rm -f --depend "$_cid" >/dev/null 2>&1 \
+              || "$RUNTIME" rm -f "$_cid" >/dev/null 2>&1 \
+              || true
+        done <<< "$_residual"
     fi
 else
     echo "  [ok]    No remaining project containers found."
+fi
+
+# ---------------------------------------------------------------------------
+# Final assertion — uninstall.sh MUST NOT claim success unless ZERO project
+# containers remain. Previously the script printed "Yashigani stopped" even
+# when [WARN] container(s) could not be removed — masking real failures.
+# Tiago directive 2026-05-26: "make sure that uninstall.sh nukes the dawn thing".
+# ---------------------------------------------------------------------------
+_final_residual="$("$RUNTIME" ps -a -q --filter "name=^${_PROJECT_PREFIX}[_-]" 2>/dev/null | sort -u | grep -v '^$' || true)"
+if [ -n "$_final_residual" ]; then
+    _residual_count="$(printf '%s\n' "$_final_residual" | grep -c '.' || echo 0)"
+    echo "" >&2
+    echo "ERROR: uninstall.sh FAILED — ${_residual_count} project container(s) remain after force-remove pass:" >&2
+    while IFS= read -r _cid; do
+        [ -z "$_cid" ] && continue
+        _cname="$("$RUNTIME" inspect --format '{{.Name}} state={{.State.Status}} restarts={{.RestartCount}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid (inspect failed)")"
+        echo "  - ${_cname} (${_cid})" >&2
+    done <<< "$_final_residual"
+    echo "" >&2
+    echo "Manual remediation:" >&2
+    echo "  ${RUNTIME} rm -f --depend \$(${RUNTIME} ps -a -q --filter 'name=^${_PROJECT_PREFIX}[_-]')" >&2
+    echo "  ${RUNTIME} system prune -af --volumes" >&2
+    echo "" >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
