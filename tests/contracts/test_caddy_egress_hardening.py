@@ -378,51 +378,103 @@ class TestValuesEgressAllowlist:
         )
 
 
-# ── 8. BUG-V243-CADDY-IPV6-IPTABLES regression guard ─────────────────────────
+# ── 8. BUG-V243-CADDY-IPV6-IPTABLES — IPv4/IPv6 egress parity ────────────────
 
-class TestEntrypointIpv6Filter:
+class TestEntrypointIpv6Parity:
     """BUG-V243-CADDY-IPV6-IPTABLES — verified fresh-install 2026-05-26.
 
-    The egress allowlist loop resolves operator/ACME hosts via `getent ahosts`
-    and feeds each address to `iptables`. `getent ahosts` returns BOTH A
-    (IPv4) and AAAA (IPv6) records. `iptables` (the IPv4 binary) rejects IPv6
-    addresses with `host/network <addr> not found` and exits non-zero. Under
-    `set -e` (line 55) this crashes the entrypoint → container exits → Podman
-    restart-policy=always re-runs → restart loop (393 restarts in 3 minutes
-    measured on UTM VM, fresh tarball install).
+    Original bug: the egress allowlist loop resolved hosts via `getent ahosts`
+    (returns A + AAAA) and fed every result to `iptables` (IPv4-only).
+    iptables rejected IPv6 with `host/network not found`; under `set -e` this
+    crashed the entrypoint → restart loop (393 restarts/3min on UTM VM).
 
-    Fix: filter IPv6 results out before iterating to iptables. Either
-    `getent ahostsv4` (explicit IPv4-only) or awk filter (reject any
-    address containing ':').
+    Fix (Tiago directive 2026-05-26 *"both need to work out of the box"*):
+    apply parity OUTPUT allowlists on BOTH iptables (IPv4) and ip6tables
+    (IPv6). Resolution returns all families; loop routes each address to its
+    correct table by detecting `:` (IPv6) vs `.` (IPv4). Graceful degradation
+    if ip6tables is unavailable (kernel CONFIG_IP6_NF_IPTABLES absent, etc.).
     """
 
-    def test_getent_ahosts_filters_ipv6(self, entrypoint_text):
-        """Resolution must not feed IPv6 addresses into the iptables loop."""
-        # Acceptable patterns:
-        # 1. getent ahostsv4 (musl + glibc — explicit IPv4-only)
-        # 2. getent ahosts ... awk '!~ /:/' (filter colons)
-        # 3. getent ahosts ... awk '!/:/'   (same, regex shorthand)
-        has_v4_only_getent = "getent ahostsv4" in entrypoint_text
-        has_colon_filter = "!~ /:/" in entrypoint_text or "!/:/" in entrypoint_text
+    # ── Parity: ip6tables must be invoked the same as iptables ──────────────
 
-        assert has_v4_only_getent or has_colon_filter, (
-            "BUG-V243-CADDY-IPV6-IPTABLES regression: caddy-entrypoint.sh "
-            "must filter IPv6 addresses from `getent ahosts` output before "
-            "passing to `iptables` (IPv4-only). Either use `getent ahostsv4` "
-            "or filter via awk pattern `$1 !~ /:/`. Without the filter, AAAA "
-            "records crash the entrypoint under `set -e` and Caddy restart-"
-            "loops indefinitely."
+    def test_ip6tables_sets_output_drop(self, entrypoint_text):
+        """ip6tables OUTPUT policy must be DROP (parity with iptables IPv4)."""
+        assert "ip6tables -P OUTPUT DROP" in entrypoint_text, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must call "
+            "`ip6tables -P OUTPUT DROP` (parallel to the existing iptables "
+            "call) — Tiago 2026-05-26 directive: 'both need to work out "
+            "of the box'."
         )
 
-    def test_iptables_loop_documents_ipv4_only(self, entrypoint_text):
-        """The egress loop must document the IPv4-only invariant for future maintainers."""
-        # Find the resolution block and verify there's a comment about IPv4/IPv6.
-        v6_comment_signals = ["IPv4 only", "AAAA", "IPv6", "BUG-V243"]
-        has_doc = any(signal in entrypoint_text for signal in v6_comment_signals)
+    def test_ip6tables_allows_loopback(self, entrypoint_text):
+        """ip6tables must accept loopback (parity with iptables IPv4)."""
+        assert "ip6tables -A OUTPUT -o lo -j ACCEPT" in entrypoint_text, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must allow "
+            "loopback via ip6tables (parallel to the existing iptables call)."
+        )
+
+    def test_ip6tables_allows_established_related(self, entrypoint_text):
+        """ip6tables must accept ESTABLISHED/RELATED (response packets)."""
+        assert "ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED" in entrypoint_text, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must allow "
+            "ESTABLISHED,RELATED via ip6tables — without this, inbound "
+            "IPv6 connections cannot receive response packets."
+        )
+
+    def test_ip6tables_has_final_drop(self, entrypoint_text):
+        """ip6tables OUTPUT must end with DROP (after allowlist + LOG)."""
+        assert "ip6tables -A OUTPUT -j DROP" in entrypoint_text, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must terminate "
+            "the ip6tables OUTPUT chain with -j DROP (parallel to iptables)."
+        )
+
+    def test_ip6tables_logs_blocked_v6(self, entrypoint_text):
+        """ip6tables LOG rule for blocked IPv6 egress (debug aid)."""
+        assert "CADDY_EGRESS_BLOCKED_V6" in entrypoint_text, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must install "
+            "an ip6tables LOG rule with prefix CADDY_EGRESS_BLOCKED_V6 "
+            "(parallel to CADDY_EGRESS_BLOCKED_V4 for IPv4 debugging)."
+        )
+
+    # ── Resolution loop: dual-family routing ────────────────────────────────
+
+    def test_resolution_loop_routes_by_family(self, entrypoint_text):
+        """The host resolution loop must split addresses by family."""
+        # Acceptable patterns:
+        # 1. case statement matching `*:*` for IPv6 + `*.*` for IPv4
+        # 2. awk filter splitting into two lists (less idiomatic)
+        has_case_match = ("*:*)" in entrypoint_text and "*.*)" in entrypoint_text)
+        has_dual_lists = (
+            "getent ahostsv4" in entrypoint_text and "getent ahostsv6" in entrypoint_text
+        )
+        assert has_case_match or has_dual_lists, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must route "
+            "resolved addresses to the correct iptables/ip6tables binary "
+            "by address family. Either via a case statement matching `*:*` "
+            "(IPv6) and `*.*` (IPv4), or via dual getent calls "
+            "(ahostsv4 + ahostsv6)."
+        )
+
+    def test_graceful_v6_degradation(self, entrypoint_text):
+        """If ip6tables fails at probe, IPv4 still applies; warn but continue."""
+        # The script must guard ip6tables invocations behind IPV6_ENABLED.
+        assert "IPV6_ENABLED" in entrypoint_text, (
+            "BUG-V243 parity regression: caddy-entrypoint.sh must guard "
+            "ip6tables calls behind an IPV6_ENABLED flag (set by probing "
+            "`ip6tables -P OUTPUT DROP` at script start) so the IPv4 path "
+            "still works when ip6tables is unavailable (kernel lacks "
+            "CONFIG_IP6_NF_IPTABLES, IPv6 disabled, etc)."
+        )
+
+    # ── Documentation: invariant comments ───────────────────────────────────
+
+    def test_docs_ipv4_ipv6_parity_intent(self, entrypoint_text):
+        """The script header must document the IPv4+IPv6 parity intent."""
+        v6_doc_signals = ["IPv4 + IPv6", "parity", "BUG-V243", "ip6tables"]
+        has_doc = sum(1 for sig in v6_doc_signals if sig in entrypoint_text) >= 2
         assert has_doc, (
-            "caddy-entrypoint.sh must document the IPv4-only invariant of "
-            "the iptables egress allowlist near the getent loop (any of: "
-            "'IPv4 only', 'AAAA', 'IPv6', 'BUG-V243'). The filter alone is "
-            "fragile — comment ensures future maintainers don't 'simplify' "
-            "it back to bare `getent ahosts`."
+            "BUG-V243 parity regression: caddy-entrypoint.sh must document "
+            "the IPv4+IPv6 parity posture in the header or near the chain "
+            "setup. At least 2 of these signals must appear: 'IPv4 + IPv6', "
+            "'parity', 'BUG-V243', 'ip6tables'."
         )

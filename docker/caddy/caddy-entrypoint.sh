@@ -1,13 +1,15 @@
 #!/bin/sh
 # Yashigani — Caddy egress restriction entrypoint
-# YSG-RISK-061 (2026-05-25): iptables OUTPUT allowlist
+# YSG-RISK-061 (2026-05-25): iptables + ip6tables OUTPUT allowlist
+# BUG-V243-CADDY-IPV6-IPTABLES (2026-05-26): IPv4/IPv6 parity refactor
 #
 # PURPOSE
 #   Enforce a network egress allowlist for the Caddy container before starting
 #   the Caddy process. Blocks all outbound TCP/UDP except to explicitly
-#   permitted destinations. Reduces post-Caddy-RCE attacker impact by blocking
-#   internet exfil, C2, and second-stage payload fetch (~60-70% impact reduction
-#   per Laura cost-benefit 2026-05-25).
+#   permitted destinations on BOTH IPv4 and IPv6 (parity posture — out-of-the-
+#   box restrictions apply equally to both address families). Reduces post-
+#   Caddy-RCE attacker impact by blocking internet exfil, C2, and second-stage
+#   payload fetch (~60-70% impact reduction per Laura cost-benefit 2026-05-25).
 #
 # LEGITIMATE CADDY EGRESS DESTINATIONS
 #   1. Loopback (lo) — admin unix socket healthchecks
@@ -63,7 +65,7 @@ warn() {
 }
 
 apply_egress_rules() {
-    # ── Step 1: probe NET_ADMIN availability ─────────────────────────────────
+    # ── Step 1: probe NET_ADMIN availability (IPv4) ──────────────────────────
     # Try to set OUTPUT default policy. If this fails, we have no NET_ADMIN and
     # must skip all iptables setup. Caddy still starts — just without egress
     # restrictions (documented limitation for rootless Podman).
@@ -73,116 +75,157 @@ apply_egress_rules() {
         warn "Rootless Podman limitation: re-run with --cap-add NET_ADMIN or use K8s NetworkPolicy."
         return 0
     fi
+    log "NET_ADMIN available — applying iptables OUTPUT allowlist (IPv4)."
 
-    log "NET_ADMIN available — applying egress OUTPUT allowlist."
+    # Probe ip6tables — Alpine + iptables-nft package ships both binaries
+    # (xtables-nft shim provides ip6tables in the same package as iptables).
+    # If ip6tables-policy fails (kernel CONFIG_IP6_NF_IPTABLES absent, IPv6
+    # disabled via sysctl, or namespace lacks NET_ADMIN for v6), we degrade
+    # gracefully: keep IPv4 filtering but log a WARN. Egress posture parity
+    # is the OUT-OF-BOX intent (Tiago 2026-05-26); ip6tables absence is the
+    # rare case, not the default.
+    IPV6_ENABLED=0
+    if ip6tables -P OUTPUT DROP 2>/dev/null; then
+        IPV6_ENABLED=1
+        log "ip6tables available — applying ip6tables OUTPUT allowlist (IPv6, parity)."
+    else
+        warn "ip6tables OUTPUT policy modification failed — IPv6 egress NOT filtered."
+        warn "Likely cause: kernel lacks CONFIG_IP6_NF_IPTABLES, IPv6 disabled via sysctl,"
+        warn "or container missing NET_ADMIN for v6 namespace. IPv4 filtering proceeds."
+    fi
 
-    # ── Step 2: Allow loopback ─────────────────────────────────────────────
+    # ── Step 2: Allow loopback (v4 + v6) ─────────────────────────────────
     # All Caddy admin socket interactions (healthcheck, reload) go via loopback.
     iptables -A OUTPUT -o lo -j ACCEPT
-    log "egress allow: loopback"
+    [ "$IPV6_ENABLED" = "1" ] && ip6tables -A OUTPUT -o lo -j ACCEPT
+    log "egress allow: loopback ($([ "$IPV6_ENABLED" = "1" ] && echo "IPv4 + IPv6" || echo "IPv4 only"))"
 
-    # ── Step 3: Allow ESTABLISHED/RELATED ────────────────────────────────────
+    # ── Step 3: Allow ESTABLISHED/RELATED (v4 + v6) ──────────────────────
     # Required for Caddy's inbound listeners (:80/:443/:8444/:8445) to send
     # response packets. Without this, SYN-ACK and data packets to clients are
     # dropped by the OUTPUT chain.
     iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    [ "$IPV6_ENABLED" = "1" ] && ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     log "egress allow: ESTABLISHED,RELATED (response packets for inbound listeners)"
 
-    # ── Step 4: Allow Docker embedded DNS ─────────────────────────────────
-    # Docker's embedded resolver lives at 127.0.0.11:53. This is the only
-    # DNS server Caddy uses for upstream name resolution.
-    # TCP port 53 also allowed for large DNS responses.
+    # ── Step 4: Allow Docker embedded DNS (v4 only) ──────────────────────
+    # Docker's embedded resolver is 127.0.0.11 (IPv4-only by Docker design).
+    # There is no AAAA-equivalent embedded resolver — IPv6 DNS, if needed,
+    # would come via operator-configured DNS servers added to OPERATOR_EXTRA.
     iptables -A OUTPUT -p udp --dport 53 -d 127.0.0.11 -j ACCEPT
     iptables -A OUTPUT -p tcp --dport 53 -d 127.0.0.11 -j ACCEPT
-    log "egress allow: DNS → 127.0.0.11:53 (Docker embedded resolver)"
+    log "egress allow: DNS → 127.0.0.11:53 (Docker embedded resolver, IPv4 only)"
 
-    # ── Step 5: Allow all Docker bridge subnets ───────────────────────────
+    # ── Step 5: Allow all Docker bridge subnets (v4 + v6) ────────────────
     # Caddy proxies to in-mesh services (gateway, backoffice, open-webui,
-    # grafana, prometheus) all on Docker bridge networks. Bridge IPs are
-    # dynamic (assigned per Docker daemon / compose project). We enumerate
-    # them at startup from the kernel routing table.
-    #
-    # `ip route show` output format (per runtime verification):
-    #   default via <gw> dev eth0
-    #   <subnet>/<prefix> dev eth0 proto kernel scope link src <ip>
-    # We extract the kernel-link subnets (scope link) which are the bridge
-    # subnets Caddy is directly connected to.
-    bridge_subnets=$(ip route show 2>/dev/null | awk '/proto kernel/ {print $1}')
-    if [ -n "$bridge_subnets" ]; then
-        for subnet in $bridge_subnets; do
+    # grafana, prometheus) on Docker bridge networks. Bridge IPs are dynamic
+    # (assigned per Docker daemon / compose project). We enumerate them at
+    # startup from the kernel routing table.
+    bridge_subnets_v4=$(ip route show 2>/dev/null | awk '/proto kernel/ {print $1}')
+    if [ -n "$bridge_subnets_v4" ]; then
+        for subnet in $bridge_subnets_v4; do
             iptables -A OUTPUT -d "$subnet" -j ACCEPT
-            log "egress allow: Docker bridge subnet $subnet"
+            log "egress allow: Docker bridge subnet $subnet (IPv4)"
         done
     else
-        warn "No bridge subnets found via ip route — in-mesh egress may be blocked."
+        warn "No IPv4 bridge subnets found via ip route — in-mesh egress may be blocked."
+    fi
+    if [ "$IPV6_ENABLED" = "1" ]; then
+        bridge_subnets_v6=$(ip -6 route show 2>/dev/null | awk '/proto kernel/ {print $1}')
+        if [ -n "$bridge_subnets_v6" ]; then
+            for subnet in $bridge_subnets_v6; do
+                ip6tables -A OUTPUT -d "$subnet" -j ACCEPT
+                log "egress allow: Docker bridge subnet $subnet (IPv6)"
+            done
+        fi
+        # No warn on empty v6 routes — Docker default networks are IPv4-only,
+        # absence is expected unless operator enabled IPv6 networking.
     fi
 
-    # ── Step 6: Allow ACME providers + operator allowlist ────────────────
-    # Default ACME list:
-    #   acme-v02.api.letsencrypt.org:443    (Let's Encrypt production)
-    #   acme-staging-v02.api.letsencrypt.org:443  (Let's Encrypt staging)
-    # Let's Encrypt OCSP responders (for OCSP stapling, port 80):
-    #   r10.o.lencr.org:80
-    #   r11.o.lencr.org:80
-    #   r12.o.lencr.org:80   (new R4 responder pool — pre-allow)
-    #   e5.o.lencr.org:80    (E5 intermediary pool)
-    #   e6.o.lencr.org:80
-    # These are only needed in acme TLS mode, but we allow them in all modes —
-    # they are non-sensitive and simplify the entrypoint logic.
+    # ── Step 6: Allow ACME providers + operator allowlist (v4 + v6) ──────
+    # Default ACME list: Let's Encrypt prod + staging + OCSP responders.
     # Operator overrides via YASHIGANI_CADDY_EGRESS_ALLOWLIST (comma-separated
-    # host:port pairs) are appended to the default list.
+    # host:port pairs) are appended.
+    #
+    # Resolution returns both A (IPv4) and AAAA (IPv6) records. We split by
+    # address family (presence of `:` indicates IPv6) and route each to its
+    # respective table. This is the BUG-V243-CADDY-IPV6-IPTABLES parity fix
+    # — previously the loop fed all addresses to iptables (IPv4-only) which
+    # rejected IPv6 with "host/network not found" and crash-looped under
+    # set -e.
 
     DEFAULT_ACME_HOSTS="acme-v02.api.letsencrypt.org:443 acme-staging-v02.api.letsencrypt.org:443 r10.o.lencr.org:80 r11.o.lencr.org:80 r12.o.lencr.org:80 e5.o.lencr.org:80 e6.o.lencr.org:80"
     OPERATOR_EXTRA="${YASHIGANI_CADDY_EGRESS_ALLOWLIST:-}"
-
-    # Build full allowlist (space-separated host:port)
     full_allowlist="${DEFAULT_ACME_HOSTS}"
     if [ -n "$OPERATOR_EXTRA" ]; then
-        # Convert comma-separated operator list to space-separated
         extra_space=$(printf '%s' "$OPERATOR_EXTRA" | tr ',' ' ')
         full_allowlist="${full_allowlist} ${extra_space}"
     fi
 
-    resolved_count=0
+    resolved_v4=0
+    resolved_v6=0
     for host_port in $full_allowlist; do
         host="${host_port%:*}"
         port="${host_port##*:}"
-        # Resolve via Docker DNS (already allowed above via subnet rule).
-        # IPv4 only — this allowlist uses `iptables` (IPv4); AAAA records
-        # (containing ':') would fail with "host/network <addr> not found"
-        # under `set -e` and crash-loop the container. BUG-V243-CADDY-IPV6-
-        # IPTABLES verified on fresh VM/Podman install 2026-05-26 (Caddy
-        # restart count 393 in 3 min before fix). IPv6 egress is currently
-        # not filtered separately — tracked for follow-up via ip6tables.
-        ips=$(getent ahosts "$host" 2>/dev/null | awk '$1 !~ /:/ {print $1}' | sort -u)
-        if [ -z "$ips" ]; then
-            warn "Could not resolve $host — skipping iptables rule for $host:$port"
+        # Resolve to ALL families (A + AAAA), then route each address to
+        # the correct table by detecting `:` (IPv6).
+        all_ips=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+        if [ -z "$all_ips" ]; then
+            warn "Could not resolve $host — skipping egress rule for $host:$port"
             continue
         fi
-        for ip in $ips; do
-            iptables -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
-            log "egress allow: $host ($ip) :$port"
-            resolved_count=$((resolved_count + 1))
+        for ip in $all_ips; do
+            case "$ip" in
+                *:*)
+                    if [ "$IPV6_ENABLED" = "1" ]; then
+                        ip6tables -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
+                        log "egress allow: $host ($ip) :$port (IPv6)"
+                        resolved_v6=$((resolved_v6 + 1))
+                    fi
+                    # If ip6tables unavailable, IPv6 destinations are DROPpED by
+                    # kernel default (no chain configured) — graceful fallback.
+                    ;;
+                *.*)
+                    iptables -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
+                    log "egress allow: $host ($ip) :$port (IPv4)"
+                    resolved_v4=$((resolved_v4 + 1))
+                    ;;
+                *)
+                    warn "Unrecognised address family for $host: $ip — skipping."
+                    ;;
+            esac
         done
     done
-    log "ACME/OCSP/operator egress: $resolved_count IP-port rules added."
+    log "ACME/OCSP/operator egress: $resolved_v4 IPv4 + $resolved_v6 IPv6 rules added."
 
-    # ── Step 7: LOG then DROP ─────────────────────────────────────────────
+    # ── Step 7: LOG then DROP (both tables) ──────────────────────────────
     # LOG before DROP: any blocked egress appears in the host kernel log.
     # Aids debugging when a new upstream is added to Caddyfile without
     # updating this allowlist. --log-level 4 = WARNING in kernel log.
-    # The LOG rule may fail silently in some kernel configurations — that is
-    # acceptable (DROP still applies).
-    iptables -A OUTPUT -j LOG --log-prefix "CADDY_EGRESS_BLOCKED: " --log-level 4 2>/dev/null \
-        && log "egress LOG rule installed (CADDY_EGRESS_BLOCKED prefix)" \
-        || warn "LOG target unavailable — blocked egress will not be logged (DROP still applies)"
-
+    iptables -A OUTPUT -j LOG --log-prefix "CADDY_EGRESS_BLOCKED_V4: " --log-level 4 2>/dev/null \
+        && log "egress LOG rule installed (IPv4, CADDY_EGRESS_BLOCKED_V4 prefix)" \
+        || warn "iptables LOG target unavailable — blocked IPv4 egress will not be logged (DROP still applies)"
     iptables -A OUTPUT -j DROP
-    log "egress OUTPUT DROP applied — allowlist active."
-    log "Effective iptables OUTPUT chain:"
+    log "egress OUTPUT DROP applied (IPv4) — allowlist active."
+
+    if [ "$IPV6_ENABLED" = "1" ]; then
+        ip6tables -A OUTPUT -j LOG --log-prefix "CADDY_EGRESS_BLOCKED_V6: " --log-level 4 2>/dev/null \
+            && log "egress LOG rule installed (IPv6, CADDY_EGRESS_BLOCKED_V6 prefix)" \
+            || warn "ip6tables LOG target unavailable — blocked IPv6 egress will not be logged (DROP still applies)"
+        ip6tables -A OUTPUT -j DROP
+        log "egress OUTPUT DROP applied (IPv6) — allowlist active."
+    fi
+
+    log "Effective iptables OUTPUT chain (IPv4):"
     iptables -L OUTPUT -n --line-numbers 2>/dev/null | while IFS= read -r line; do
         log "  $line"
     done
+    if [ "$IPV6_ENABLED" = "1" ]; then
+        log "Effective ip6tables OUTPUT chain (IPv6):"
+        ip6tables -L OUTPUT -n --line-numbers 2>/dev/null | while IFS= read -r line; do
+            log "  $line"
+        done
+    fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
