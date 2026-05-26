@@ -998,6 +998,63 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Canonical network cleanup — BUG-UNINSTALL-LEAVES-NETWORKS-2026-05-26.
+# Su's refactor (23755da) treated network teardown as compose-down territory;
+# but `podman-compose down` does NOT always remove user-defined networks
+# (varies by version + restart-policy state). Result: post-uninstall enumeration
+# shows containers=0 volumes=0 BUT networks=7 — operator sees stale networks
+# in `podman network ls`, gets confused on re-install (false "already exists").
+# Fix: explicit network removal of every canonical compose project network,
+# regardless of REMOVE_VOLUMES flag (networks hold no data; safe to remove).
+# Final assertion exits 1 if any survive.
+# ---------------------------------------------------------------------------
+_PROJECT_PREFIX="${_PROJECT_PREFIX:-docker}"
+_CANONICAL_NETWORKS="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated"
+
+echo "=== Canonical network cleanup ==="
+_net_removed=0
+_net_skipped=0
+_net_failed=0
+for _net in $_CANONICAL_NETWORKS; do
+    _full="${_PROJECT_PREFIX}_${_net}"
+    if "$RUNTIME" network inspect "$_full" >/dev/null 2>&1; then
+        if "$RUNTIME" network rm "$_full" >/dev/null 2>&1; then
+            echo "  [removed] $_full"
+            _net_removed=$(( _net_removed + 1 ))
+        else
+            echo "  [WARN] network rm failed: $_full (in-use by foreign container?)" >&2
+            _net_failed=$(( _net_failed + 1 ))
+        fi
+    else
+        _net_skipped=$(( _net_skipped + 1 ))
+    fi
+done
+echo "Network cleanup: ${_net_removed} removed, ${_net_skipped} not present, ${_net_failed} failed."
+
+# Final network assertion.
+_residual_networks=""
+for _net in $_CANONICAL_NETWORKS; do
+    _full="${_PROJECT_PREFIX}_${_net}"
+    if "$RUNTIME" network inspect "$_full" >/dev/null 2>&1; then
+        _residual_networks="${_residual_networks}${_full}\n"
+    fi
+done
+if [ -n "$_residual_networks" ]; then
+    echo "" >&2
+    echo "ERROR: ${_net_failed} canonical network(s) survived removal:" >&2
+    printf '%b' "$_residual_networks" | sed 's/^/      /' >&2
+    echo "" >&2
+    echo "Likely cause: a non-yashigani container is attached to one of these networks." >&2
+    echo "Manual remediation:" >&2
+    echo "  ${RUNTIME} network inspect <name>  # find what's attached" >&2
+    echo "  ${RUNTIME} network rm <name>       # after detaching foreign containers" >&2
+    echo "" >&2
+    echo "Yashigani uninstall INCOMPLETE — network residual. Exit 1." >&2
+    exit 1
+fi
+echo "=== Network assertion passed — all canonical networks removed. ==="
+
+# ---------------------------------------------------------------------------
 # BUG-3-MULTI-USER-INSTALL-PKI / BACKLOG-V240-006: wipe docker/secrets/ on
 # --remove-volumes (sudo-free, container-fallback — Iris+Laura 2026-05-21).
 #
