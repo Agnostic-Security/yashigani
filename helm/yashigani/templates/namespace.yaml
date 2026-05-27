@@ -1,2 +1,39 @@
-{{/* Namespace is created by helm install --create-namespace.
-     This template is intentionally empty to avoid conflicts. */}}
+{{- /*
+  B13 fix (Laura F-002): Pod Security Admission baseline enforcement labels.
+  PSA is a Kubernetes built-in admission controller (GA since K8s v1.25) that
+  enforces Pod Security Standards at the namespace level — independent of Kyverno.
+  Labelling the namespace `baseline` is defence-in-depth:
+    - Blocks the most dangerous privilege escalations (privileged pods, hostPID,
+      hostNetwork, hostPath, allowPrivilegeEscalation=true, root UID) at the
+      k8s API server layer, before the pod spec reaches any webhook.
+    - Provides a security floor even when admissionPolicies.enabled=false (Kyverno
+      not installed), which is the default.
+  warn + audit modes emit events without blocking; enforce mode hard-rejects.
+  Using warn+audit on baseline AND enforce on baseline for belt-and-suspenders:
+    - enforce baseline: hard-reject pods that fail the standard.
+    - warn baseline: surface violations in dry-run / kubectl output.
+    - audit baseline: emit audit events for detection.
+  Our workloads already meet the baseline standard (runAsNonRoot, no privileged
+  flag, no hostPath, seccompProfile set), so enforce baseline causes zero regressions.
+  Restricted standard would require additional seccompProfile constraints that
+  some upstream images (open-webui initContainer) don't yet meet — baseline is
+  the correct tier for this chart's current workload posture.
+  Reference: https://kubernetes.io/docs/concepts/security/pod-security-standards/
+  YSG-RISK-008: B13 / Laura F-002.
+*/ -}}
+{{- if .Release.IsInstall }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    # B13: PSA baseline enforcement — defence-in-depth regardless of Kyverno posture.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/audit-version: latest
+{{- end }}

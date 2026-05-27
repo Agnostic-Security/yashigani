@@ -78,16 +78,17 @@ spec:
               value: "docker"
             - name: YASHIGANI_SERVICE_NAME
               value: "gateway"
+            {{- $gwEnv := .Values.gateway.env | default dict }}
             - name: YASHIGANI_UPSTREAM_URL
-              value: {{ .Values.gateway.env.upstreamUrl | quote }}
+              value: {{ $gwEnv.upstreamUrl | quote }}
             - name: YASHIGANI_OPA_URL
-              value: {{ .Values.gateway.env.opaUrl | quote }}
+              value: {{ $gwEnv.opaUrl | quote }}
             - name: OLLAMA_BASE_URL
-              value: {{ .Values.gateway.env.ollamaUrl | quote }}
+              value: {{ $gwEnv.ollamaUrl | quote }}
             - name: REDIS_HOST
-              value: {{ .Values.gateway.env.redisHost | quote }}
+              value: {{ $gwEnv.redisHost | quote }}
             - name: REDIS_PORT
-              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}{{ .Values.gateway.env.redisPort | quote }}{{ end }}
+              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}{{ $gwEnv.redisPort | quote }}{{ end }}
             # Budget Redis — separate instance, code default "budget-redis"
             # wouldn't resolve in-cluster. K8s service is yashigani-budget-redis.
             - name: BUDGET_REDIS_HOST
@@ -103,13 +104,13 @@ spec:
               value: "/run/secrets"
             {{- end }}
             - name: YASHIGANI_AGENT_ROUTING_ENABLED
-              value: {{ .Values.gateway.env.agentRoutingEnabled | quote }}
+              value: {{ $gwEnv.agentRoutingEnabled | quote }}
             - name: YASHIGANI_AGENT_PATH_PREFIX
-              value: {{ .Values.gateway.env.agentPathPrefix | quote }}
+              value: {{ $gwEnv.agentPathPrefix | quote }}
             - name: YASHIGANI_AGENT_TOKEN_MIN_LENGTH
-              value: {{ .Values.gateway.env.agentTokenMinLength | quote }}
+              value: {{ $gwEnv.agentTokenMinLength | quote }}
             - name: YASHIGANI_DEPLOYMENT_STREAM
-              value: {{ .Values.gateway.env.deploymentStream | quote }}
+              value: {{ $gwEnv.deploymentStream | quote }}
             {{- if .Values.mtls.enabled }}
             # M-01 fix: mTLS OTLP endpoint (grpcs://). Gateway presents its
             # leaf cert. Python OTEL exporter goes through Python ssl —
@@ -124,10 +125,10 @@ spec:
               value: "/run/secrets/gateway_client.key"
             {{- else }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ .Values.gateway.env.otelEndpoint | quote }}
+              value: {{ $gwEnv.otelEndpoint | quote }}
             {{- end }}
             - name: SKLEARN_MODEL_PATH
-              value: {{ .Values.gateway.env.sklearnModelPath | quote }}
+              value: {{ $gwEnv.sklearnModelPath | quote }}
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: POSTGRES_PASSWORD
