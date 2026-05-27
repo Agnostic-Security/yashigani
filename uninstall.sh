@@ -14,7 +14,15 @@
 set -euo pipefail
 
 # Hardened PATH — never trust inherited PATH for privileged scripts.
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# BUG-UNINSTALL-PATH-MISSING-PODMAN-MAC-2026-05-27: prior PATH excluded
+# /opt/homebrew/bin (Apple Silicon Homebrew) and /opt/homebrew/sbin where
+# Podman Desktop installs `podman` on macOS — uninstall.sh hit
+# "podman: command not found", _list_project_containers silently returned
+# empty (|| true), _assert_no_containers_remain said "all clear" while 15
+# containers were still running. Live verify on Mac/Podman Desktop 2026-05-27.
+# Adding the standard macOS Homebrew + Podman Desktop locations preserves
+# the hardening intent while making the script actually work on Mac.
+PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/opt/podman/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 # Minimal logging helper — mirrors the install.sh format exactly.
@@ -1229,6 +1237,46 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     else
         echo "  Dangling volumes pruned: ${_dangling_pruned}."
     fi
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# Install-time state file cleanup — BUG-UNINSTALL-LEAVES-STATEFILES-2026-05-27
+#
+# install.sh creates two state files in the WORK_DIR's docker/ subdirectory:
+#   - docker/.env                          (compose env file with per-install secrets/config)
+#   - docker/.yashigani-install-state      (runtime mode + admin/license metadata)
+#
+# Both were surfaced by live-verify on Mac and VM 2026-05-27 — prior to this
+# fix, uninstall.sh left them behind even on --remove-volumes. Result:
+#   1. Next install reads stale .env values (DB_AES_KEY, OWUI_SECRET_KEY,
+#      FIPS_MODE, YASHIGANI_TLS_MODE, etc.) instead of regenerating.
+#   2. .yashigani-install-state misleads runtime-detection on a fresh install
+#      (especially the k8s mode flag — Su's refactor reads RUNTIME from here).
+#   3. Operator running uninstall expects "all install artefacts gone";
+#      finding .env still on disk with secrets is a real-world security
+#      surprise.
+#
+# Wipe both files always (not gated on --remove-volumes). They are install-
+# time artefacts; uninstall = inverse of install.
+# ---------------------------------------------------------------------------
+echo "=== Install-time state file cleanup ==="
+_statefile_removed=0
+for _statefile in \
+        "${SCRIPT_DIR}/docker/.env" \
+        "${SCRIPT_DIR}/docker/.yashigani-install-state"; do
+    if [ -e "$_statefile" ]; then
+        if rm -f "$_statefile" 2>/dev/null; then
+            echo "  [removed] $_statefile"
+            _statefile_removed=$(( _statefile_removed + 1 ))
+        else
+            echo "  [WARN] could not remove $_statefile (permission?)" >&2
+        fi
+    fi
+done
+if [ "$_statefile_removed" -eq 0 ]; then
+    echo "  [ok]    No install-time state files present."
 fi
 
 echo ""

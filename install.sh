@@ -134,6 +134,15 @@ MODE_EXPLICIT=0
 DEPLOY_MODE=""                # demo|production|enterprise — set interactively or via --deploy
 DOMAIN=""
 TLS_MODE="acme"
+# FIPS_MODE — operator opt-in to FIPS-mode crypto (CMVP #4985 when a FIPS-
+# configured base image is in use). Default 0 = standard OpenSSL. Set to 1
+# via --fips-mode flag or YSG_FIPS_MODE env var. Captain v2.24.4 B8 closure:
+# Captain's commit 7d5b6c0 added the YAML side (FIPS_MODE: ${YSG_FIPS_MODE:-0}
+# in x-common-env); this closes the install.sh side per Captain's original
+# brief — _env_set writes FIPS_MODE to docker/.env so compose reads it
+# runtime-agnostically rather than relying on env-var propagation through
+# subshells (which works on Linux Podman but not Mac Podman Desktop).
+FIPS_MODE="${YSG_FIPS_MODE:-0}"
 ADMIN_EMAIL=""
 UPSTREAM_URL=""
 LICENSE_KEY_PATH=""
@@ -208,6 +217,16 @@ OPTIONS
   --mode           compose|k8s|vm         Legacy deployment mode (prefer --deploy)
   --domain         DOMAIN                 TLS domain, e.g. yashigani.example.com
   --tls-mode       acme|ca|selfsigned     TLS provisioning mode (default: acme)
+  --fips-mode      [0|1]                  Enable FIPS-mode crypto routing (default: 0).
+                                          Pass --fips-mode 1 OR --fips-mode (no arg → 1)
+                                          OR set YSG_FIPS_MODE=1 in the env. Writes
+                                          FIPS_MODE to docker/.env so gateway, backoffice,
+                                          and caddy containers read it. NOTE: FIPS_MODE=1
+                                          activates the CMVP-validated path only if the
+                                          container base image contains the FIPS Provider
+                                          (default python:3.14.0-slim does NOT — operators
+                                          requiring CMVP #4985 must swap to a FIPS-configured
+                                          base image. See docs/yashigani_install_config.md §30.)
   --admin-email    EMAIL                  Admin account email / username
   --upstream-url   URL                    Upstream MCP URL
   --license-key    PATH                   Path to .ysg license file
@@ -340,6 +359,20 @@ parse_args() {
         TLS_MODE="${2:?'--tls-mode requires a value: acme|ca|selfsigned'}"
         TLS_MODE_EXPLICITLY_SET="true"
         shift 2
+        ;;
+      --fips-mode)
+        # Captain v2.24.4 B8 closure (install.sh side). Flag-or-env-var path.
+        # Accepts 0/1 explicitly OR `--fips-mode` alone (= 1).
+        case "${2:-}" in
+          0|1)
+            FIPS_MODE="$2"
+            shift 2
+            ;;
+          *)
+            FIPS_MODE="1"
+            shift 1
+            ;;
+        esac
         ;;
       --admin-email)
         ADMIN_EMAIL="${2:?'--admin-email requires a value'}"
@@ -2038,6 +2071,17 @@ _write_aes_key_to_env() {
 
   # --- TLS mode ---
   _env_set "YASHIGANI_TLS_MODE" "${TLS_MODE}"
+  # Captain v2.24.4 B8 closure (install.sh side per Nico N-001):
+  # Compose YAML at docker/docker-compose.yml `x-common-env` reads
+  # `FIPS_MODE: ${YSG_FIPS_MODE:-0}`. Writing FIPS_MODE here to docker/.env
+  # makes the value runtime-agnostic — env-var propagation through subshells
+  # is fragile (works on Linux Podman, fails on Mac Podman Desktop because
+  # YAML interpolation happens client-side and the Podman socket doesn't
+  # propagate process env into the compose CLI invocation reliably). docker/.env
+  # is read by compose directly, so the operator's --fips-mode / YSG_FIPS_MODE
+  # opt-in reaches gateway/backoffice/caddy regardless of runtime.
+  _env_set "FIPS_MODE" "${FIPS_MODE:-0}"
+  _env_set "YSG_FIPS_MODE" "${FIPS_MODE:-0}"
 
   # --- Admin email ---
   if [[ -n "$ADMIN_EMAIL" ]]; then
