@@ -41,6 +41,14 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Runtime FIPS attestation — read once at module load (Nico N-002)
 # ---------------------------------------------------------------------------
+# NOTE (Iris drift gate, v2.25.0 P2): both _FIPS_MODE_ACTIVE and the
+# Prometheus gauge are set at module-load time and reflect the FIPS state at
+# pod startup, NOT a live value. If an operator changes fips.mode via helm
+# upgrade (or YSG_FIPS_MODE in compose) WITHOUT restarting the backoffice
+# pod/container, the attestation reports the old value until the process
+# recycles. This matches how every other module-level metric in this codebase
+# behaves and is the intended trade-off — FIPS mode is a startup property of
+# the OpenSSL provider chain, not a per-request switch.
 
 _FIPS_MODE_ACTIVE: bool = os.environ.get("FIPS_MODE", "0") == "1"
 _CMVP_CERT: str | None = os.environ.get("YASHIGANI_CMVP_CERT") or None

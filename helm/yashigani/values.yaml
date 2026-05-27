@@ -1484,9 +1484,16 @@ poolManager:
 #
 # Set to true ONLY if you have deployed a FIPS-configured base image.
 # Default false: FIPS_MODE env is not injected; containers use standard OpenSSL.
+#
+# cmvpCert: operator-supplied CMVP certificate number for the FIPS-validated
+# OpenSSL provider in the base image (e.g. "#4985" for the CMVP-validated
+# OpenSSL FIPS Provider, ACTIVE FIPS 140-3, sunset 2030-03-10). Surfaced by
+# /admin/crypto/inventory as runtime attestation evidence for auditors.
+# Leave empty if no CMVP certificate applies — the attestation field reports null.
 # ---------------------------------------------------------------------------
 fips:
   mode: false
+  cmvpCert: ""
 
 # ---------------------------------------------------------------------------
 # Licensing — Petra P0-1 (v2.24.4)

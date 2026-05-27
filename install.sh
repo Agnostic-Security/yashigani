@@ -143,6 +143,12 @@ TLS_MODE="acme"
 # runtime-agnostically rather than relying on env-var propagation through
 # subshells (which works on Linux Podman but not Mac Podman Desktop).
 FIPS_MODE="${YSG_FIPS_MODE:-0}"
+# CMVP_CERT — operator-supplied CMVP certificate number for the FIPS-validated
+# OpenSSL provider in the chosen base image (e.g. "#4985"). Surfaced by
+# /admin/crypto/inventory as runtime FIPS attestation evidence for auditors
+# (Nico N-002 / v2.25.0 P2 B9). Default empty = attestation reports null.
+# Set via --cmvp-cert flag or YSG_CMVP_CERT env var.
+CMVP_CERT="${YSG_CMVP_CERT:-}"
 ADMIN_EMAIL=""
 UPSTREAM_URL=""
 LICENSE_KEY_PATH=""
@@ -227,6 +233,11 @@ OPTIONS
                                           (default python:3.14.0-slim does NOT — operators
                                           requiring CMVP #4985 must swap to a FIPS-configured
                                           base image. See docs/yashigani_install_config.md §30.)
+  --cmvp-cert      CERT                   CMVP certificate number for runtime FIPS
+                                          attestation, e.g. "#4985". Surfaced by
+                                          /admin/crypto/inventory as evidence for auditors.
+                                          OR set YSG_CMVP_CERT in the env. Default empty
+                                          = attestation reports cmvp_cert: null.
   --admin-email    EMAIL                  Admin account email / username
   --upstream-url   URL                    Upstream MCP URL
   --license-key    PATH                   Path to .ysg license file
@@ -373,6 +384,10 @@ parse_args() {
             shift 1
             ;;
         esac
+        ;;
+      --cmvp-cert)
+        CMVP_CERT="${2:?'--cmvp-cert requires a value, e.g. \"#4985\"'}"
+        shift 2
         ;;
       --admin-email)
         ADMIN_EMAIL="${2:?'--admin-email requires a value'}"
@@ -2082,6 +2097,11 @@ _write_aes_key_to_env() {
   # opt-in reaches gateway/backoffice/caddy regardless of runtime.
   _env_set "FIPS_MODE" "${FIPS_MODE:-0}"
   _env_set "YSG_FIPS_MODE" "${FIPS_MODE:-0}"
+  # Nico N-002 (v2.25.0 P2 B9): CMVP certificate number for runtime FIPS
+  # attestation. Compose YAML at docker/docker-compose.yml x-common-env reads
+  # YASHIGANI_CMVP_CERT: ${YSG_CMVP_CERT:-}. Surfaced by /admin/crypto/inventory
+  # as auditor evidence. Empty default = attestation reports cmvp_cert: null.
+  _env_set "YSG_CMVP_CERT" "${CMVP_CERT:-}"
 
   # --- Admin email ---
   if [[ -n "$ADMIN_EMAIL" ]]; then
@@ -7294,6 +7314,13 @@ _write_helm_values() {
     else
       printf '  mode: false\n'
     fi
+    # Nico N-002 (v2.25.0 P2 B9): persist cmvpCert too. Operator-supplied;
+    # may be empty (omit field if so to preserve chart default).
+    # YAML-single-quoted to safely carry "#" (would be a YAML comment unquoted).
+    # Replace any single quotes in the value with the YAML-escaped form ''.
+    if [[ -n "${CMVP_CERT:-}" ]]; then
+      printf "  cmvpCert: '%s'\n" "${CMVP_CERT//\'/\'\'}"
+    fi
 
     # License key: read from file if operator passed --license-key.
     # Written last — it may be multi-line (YAML literal block scalar).
@@ -7446,6 +7473,13 @@ k8s_helm_install() {
   if [[ "${FIPS_MODE:-0}" == "1" ]]; then
     helm_args+=(--set fips.mode=true)
     log_info "FIPS_MODE=1 — passing --set fips.mode=true to helm"
+  fi
+  # Nico N-002 (v2.25.0 P2 B9): translate --cmvp-cert to fips.cmvpCert helm value.
+  # Without this, --mode k8s --cmvp-cert "#4985" silently drops the cert number
+  # (k8s path doesn't read docker/.env). Mirrors the FIPS_MODE Q1 pattern above.
+  if [[ -n "${CMVP_CERT:-}" ]]; then
+    helm_args+=(--set "fips.cmvpCert=${CMVP_CERT}")
+    log_info "CMVP_CERT=${CMVP_CERT} — passing --set fips.cmvpCert to helm"
   fi
 
   helm "${helm_args[@]}"

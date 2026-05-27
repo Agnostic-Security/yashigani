@@ -251,6 +251,10 @@ spec:
             - name: FIPS_MODE
               value: "1"
             {{- end }}
+            {{- if .Values.fips.cmvpCert }}
+            - name: YASHIGANI_CMVP_CERT
+              value: {{ .Values.fips.cmvpCert | quote }}
+            {{- end }}
             {{- if .Values.auditLog.enabled }}
             # B7 fix (v2.25.0 P2): audit env vars injected for PVC-backed audit log.
             # SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 / CMMC AU.L2-3.3.4/8/9 /

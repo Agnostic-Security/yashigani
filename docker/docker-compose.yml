@@ -106,6 +106,11 @@ x-common-env: &common-env
   # include the FIPS Provider. Operators requiring FIPS-validated crypto MUST
   # use a FIPS-configured base image (e.g. UBI + openssl-fips or AWS BoringCrypto).
   FIPS_MODE: ${YSG_FIPS_MODE:-0}
+  # Nico N-002 (v2.25.0 P2 B9): CMVP cert number for runtime FIPS attestation.
+  # Surfaced by /admin/crypto/inventory as evidence for auditors. Operator opt-in
+  # via YSG_CMVP_CERT env (e.g. "#4985" for the CMVP-validated OpenSSL FIPS Provider).
+  # Empty default = attestation field reports null.
+  YASHIGANI_CMVP_CERT: ${YSG_CMVP_CERT:-}
 
 # Reminder for readers: the runtime manifest (with per-install bootstrap_token_sha256
 # values populated) is mounted into each Python service as:
