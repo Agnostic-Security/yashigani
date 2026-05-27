@@ -308,3 +308,79 @@ class TestOpenclawExternalEgressIPv4Only:
             f"allow-openclaw-external-egress: ::/0 found in egress ipBlocks — "
             f"violates IPv4-internal-only directive. Found: {cidrs}"
         )
+
+
+class TestOpenclawWebhookEgressIPv4Only:
+    """
+    A3 HIGH / LAURA-V243-003 residual — allow-openclaw-egress webhook rule
+    must be IPv4-only (not port-only).
+
+    allow-openclaw-external-egress (PR #155 v2.24.3) closed the broad external
+    HTTPS egress gap. But allow-openclaw-egress (the webhook section of the
+    per-agent policy) still carried a port-only rule with no `to:` ipBlock —
+    on dual-stack K8s that implicitly permits egress to ANY destination
+    including IPv6, regenerating the LAURA-V243-003 gap.
+
+    Fix: the webhook egress rule now uses the same explicit IPv4-public-internet
+    ipBlock pattern as allow-ollama-egress and allow-openclaw-external-egress.
+    """
+
+    def test_policy_exists(self, rendered_policies: dict[str, Any]) -> None:
+        assert "allow-openclaw-egress" in rendered_policies, (
+            "allow-openclaw-egress NetworkPolicy not found in helm render. "
+            "Ensure agentBundles.openclaw.enabled=true is set."
+        )
+
+    def test_no_port_only_egress_rule(self, rendered_policies: dict[str, Any]) -> None:
+        """
+        No egress rule in allow-openclaw-egress should have `ports` without
+        a `to:` block. Port-only egress permits egress to any IPv6 destination
+        on dual-stack clusters (LAURA-V243-003 residual A3 HIGH).
+        """
+        has_port_only = _egress_has_port_only_rule(
+            rendered_policies["allow-openclaw-egress"]
+        )
+        assert not has_port_only, (
+            "allow-openclaw-egress: found port-only egress rule (no 'to:' block). "
+            "This implicitly permits IPv6 egress on dual-stack clusters "
+            "(LAURA-V243-003 residual). Add an explicit ipBlock with cidr: "
+            "0.0.0.0/0 and RFC1918 except entries."
+        )
+
+    def test_webhook_rule_has_explicit_ipv4_ipblock(
+        self, rendered_policies: dict[str, Any]
+    ) -> None:
+        """Webhook egress must carry an explicit 0.0.0.0/0 ipBlock."""
+        blocks = _egress_ip_blocks(rendered_policies["allow-openclaw-egress"])
+        cidrs = {b["cidr"] for b in blocks}
+        assert "0.0.0.0/0" in cidrs, (
+            f"allow-openclaw-egress: no 0.0.0.0/0 ipBlock in egress. "
+            f"Found: {cidrs}"
+        )
+
+    def test_webhook_rule_rfc1918_excluded(
+        self, rendered_policies: dict[str, Any]
+    ) -> None:
+        """RFC1918 private ranges must appear in except: on the webhook ipBlock."""
+        blocks = _egress_ip_blocks(rendered_policies["allow-openclaw-egress"])
+        ipv4_block = next(
+            (b for b in blocks if b.get("cidr") == "0.0.0.0/0"), None
+        )
+        assert ipv4_block is not None, (
+            "allow-openclaw-egress: 0.0.0.0/0 ipBlock not found"
+        )
+        except_ranges = set(ipv4_block.get("except", []))
+        missing = RFC1918_RANGES - except_ranges
+        assert not missing, (
+            f"allow-openclaw-egress: RFC1918 ranges missing from ipBlock "
+            f"except: {missing}. Found: {except_ranges}"
+        )
+
+    def test_no_ipv6_cidr_in_egress(self, rendered_policies: dict[str, Any]) -> None:
+        """::/0 must NOT appear in allow-openclaw-egress egress blocks."""
+        blocks = _egress_ip_blocks(rendered_policies["allow-openclaw-egress"])
+        cidrs = {b["cidr"] for b in blocks}
+        assert "::/0" not in cidrs, (
+            f"allow-openclaw-egress: ::/0 found in egress ipBlocks — violates "
+            f"IPv4-internal-only directive. Found: {cidrs}"
+        )
