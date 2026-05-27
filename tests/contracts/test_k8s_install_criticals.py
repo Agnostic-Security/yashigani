@@ -405,12 +405,14 @@ class TestB2WriteHelmValues:
             "_write_helm_values does not handle DRY_RUN mode"
         )
 
-    def test_function_preseeds_aes_key_into_k8s_secret(self):
-        """_write_helm_values must pre-seed DB_AES_KEY into K8s Secret before helm install.
+    def test_function_writes_dbAesKey_to_helm_values(self):
+        """_write_helm_values must write DB_AES_KEY as backoffice.dbAesKey into .env.helm.
 
-        This is the workaround for the Captain schema change (backoffice.dbAesKey
-        not yet in values.yaml). Pre-seeding ensures Helm's lookup() preserves
-        the operator-generated key rather than generating randAlphaNum.
+        Iris coord #1 (v2.25.0 P2 wave 2): the kubectl pre-seeding workaround is
+        retired. DB_AES_KEY is now written as backoffice.dbAesKey into the Helm
+        values override file. secrets.yaml uses .Values.backoffice.dbAesKey when
+        non-empty, so Helm generates the Secret with the operator key on first install.
+        Helm's lookup() preserves it on upgrade regardless of this value.
         """
         script = _read_install()
         fn_start = script.find('_write_helm_values()')
@@ -420,8 +422,14 @@ class TestB2WriteHelmValues:
         assert 'DB_AES_KEY' in fn_body, (
             "_write_helm_values does not handle DB_AES_KEY"
         )
-        assert 'kubectl create secret' in fn_body or 'kubectl apply' in fn_body, (
-            "_write_helm_values does not pre-seed K8s Secret with AES key"
+        assert 'dbAesKey' in fn_body, (
+            "_write_helm_values does not write backoffice.dbAesKey to .env.helm "
+            "(Iris coord #1 — kubectl pre-seeding replaced by helm values injection)"
+        )
+        # Confirm the OLD workaround is removed
+        assert 'kubectl create secret' not in fn_body, (
+            "_write_helm_values still contains the old kubectl create secret workaround "
+            "(should be replaced by backoffice.dbAesKey — Iris coord #1)"
         )
 
     def test_function_called_before_helm_dep_update(self):
