@@ -3247,4 +3247,74 @@ Removal of a BYO CA (reverting to a Yashigani-generated PKI) is **not supported 
 
 ---
 
+## 30. FIPS mode (v2.24.4, Nico N-001)
+
+### 30.1 What FIPS mode does
+
+Yashigani includes a FIPS-aware SHA-256 helper (`lib/yashigani-fips.sh`) that routes `openssl dgst` calls through the OpenSSL FIPS Provider when `FIPS_MODE=1`. This affects:
+
+- Host-side backup `MANIFEST.sha256` generation (`install.sh` step 8).
+- Air-gap bundle integrity verification (`install.sh --airgap` path).
+
+Prior to v2.24.4, `FIPS_MODE` was **only active in the host shell** — no container (gateway, backoffice, caddy) ever received this variable. The CHANGELOG N2 entry implied in-container FIPS coverage; the actual scope was host-shell-only. v2.24.4 closes this gap by propagating `FIPS_MODE` to all three services.
+
+### 30.2 Enabling FIPS mode
+
+**Docker/Podman compose:**
+
+Set `YSG_FIPS_MODE=1` in your environment before running `install.sh` or `docker compose up`:
+
+```bash
+export YSG_FIPS_MODE=1
+./install.sh --domain example.com
+```
+
+The `x-common-env` anchor in `docker-compose.yml` maps `YSG_FIPS_MODE` to `FIPS_MODE` inside every container.
+
+**Kubernetes / Helm:**
+
+```bash
+helm upgrade yashigani ./helm/yashigani -n yashigani \
+  --set fips.mode=true
+```
+
+This injects `FIPS_MODE=1` into the gateway, backoffice, and caddy container env blocks.
+
+### 30.3 FIPS-capable vs FIPS-validated — critical distinction
+
+Setting `FIPS_MODE=1` activates code paths that call `openssl dgst` and `openssl dgst -sha256` via subprocess. Those calls run through the OpenSSL FIPS Provider **only if the OpenSSL installation inside the container includes the CMVP-validated FIPS Provider**.
+
+**The default Yashigani base images do NOT include the FIPS Provider:**
+
+| Image | FIPS Provider included |
+|-------|------------------------|
+| `python:3.14.0-slim` (gateway, backoffice) | No |
+| `caddy:2.11.2-alpine` (caddy) | No |
+
+Setting `fips.mode=true` or `YSG_FIPS_MODE=1` with the default images makes Yashigani **FIPS-capable** (the code path is active) but does **not** make it **FIPS-validated** (CMVP module not loaded; crypto operations use the default non-validated OpenSSL).
+
+### 30.4 Achieving FIPS-validated crypto in-container
+
+Operators who require FIPS-validated cryptography inside containers MUST:
+
+1. Replace the default base images with a FIPS-configured alternative, for example:
+   - **RHEL/UBI-based image** with the `openssl-fips` package installed.
+   - **AWS BoringCrypto-based image** (ships a CMVP-validated crypto module).
+2. Build custom `Dockerfile.gateway` and `Dockerfile.backoffice` variants on top of the FIPS-configured base.
+3. Set `fips.mode=true` (Helm) or `YSG_FIPS_MODE=1` (compose) to activate the code path.
+
+Relevant CMVP certificate: **#4985** (OpenSSL 3.x FIPS Provider, ACTIVE, FIPS 140-3, sunset 2030-03-10). Verify at [https://csrc.nist.gov/projects/cryptographic-module-validation-program](https://csrc.nist.gov/projects/cryptographic-module-validation-program).
+
+### 30.5 Scope of FIPS mode
+
+`FIPS_MODE=1` affects **only** `openssl dgst` subprocess calls (hash verification). It does **not** change:
+
+- Python TLS (uses `ssl` module / OpenSSL binding — governed by the installed OpenSSL, not by this env var).
+- PostgreSQL TLS (governed by the postgres image's OpenSSL build).
+- Redis TLS (governed by the redis image's build).
+
+A complete FIPS-validated deployment requires FIPS-configured base images for **all** services, not just gateway/backoffice/caddy.
+
+---
+
 *Yashigani v2.24.0 — Installation and Configuration Guide — 2026-05-23T00:00:00+00:00*

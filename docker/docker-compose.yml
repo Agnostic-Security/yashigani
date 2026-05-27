@@ -93,6 +93,19 @@ x-common-env: &common-env
   # per brief). openclaw reads the bearer from openclaw.json (pre-substituted by install.sh) —
   # it has no /run/secrets mount at all (PROBE-AG1 fix). They also benefit from the env var for consistency.
   YASHIGANI_INTERNAL_BEARER: ${YASHIGANI_INTERNAL_BEARER:?run install.sh to generate yashigani_internal_bearer}
+  # Nico N-001 (v2.24.4): FIPS_MODE propagation to containers.
+  # lib/yashigani-fips.sh defines FIPS_MODE and routes openssl dgst calls through
+  # the OpenSSL FIPS Provider when FIPS_MODE=1. Previously host-shell only — no
+  # container ever received this var. Now injected via x-common-env anchor.
+  # Default 0 (unset) = standard OpenSSL; set to 1 via YSG_FIPS_MODE env var
+  # or --fips-mode flag in install.sh.
+  #
+  # IMPORTANT: FIPS_MODE=1 activates the FIPS code path only if the container's
+  # OpenSSL installation includes the CMVP #4985-validated FIPS Provider.
+  # The default python:3.14.0-slim and caddy:2.11.2-alpine images do NOT
+  # include the FIPS Provider. Operators requiring FIPS-validated crypto MUST
+  # use a FIPS-configured base image (e.g. UBI + openssl-fips or AWS BoringCrypto).
+  FIPS_MODE: ${YSG_FIPS_MODE:-0}
 
 # Reminder for readers: the runtime manifest (with per-install bootstrap_token_sha256
 # values populated) is mounted into each Python service as:
@@ -160,6 +173,9 @@ services:
       # container would still allowlist Cloudflare ACME IPs even though Caddy
       # never invokes ACME — exactly the gap Laura found.
       YASHIGANI_TLS_MODE: ${YASHIGANI_TLS_MODE:-acme}
+      # Nico N-001 (v2.24.4): FIPS_MODE for caddy. Caddy does not use x-common-env
+      # (caddy has its own env block). Add separately to ensure parity.
+      FIPS_MODE: ${YSG_FIPS_MODE:-0}
     volumes:
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

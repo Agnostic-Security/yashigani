@@ -1419,3 +1419,69 @@ poolManager:
     enabled: false
     agentPort: 8080
     podReadyTimeoutSeconds: 120
+
+# ---------------------------------------------------------------------------
+# FIPS mode — Nico N-001 (v2.24.4)
+# ---------------------------------------------------------------------------
+# lib/yashigani-fips.sh defines FIPS_MODE and routes openssl dgst calls through
+# the OpenSSL FIPS Provider when FIPS_MODE=1. install.sh sources it for
+# host-side backup MANIFEST hashing + air-gap bundle integrity. Prior to v2.24.4
+# NO container env block passed FIPS_MODE to gateway / backoffice / caddy —
+# the in-container FIPS code path existed but never activated.
+#
+# CRITICAL HONESTY NOTE (Nico N-001):
+#   Setting fips.mode: true injects FIPS_MODE=1 into gateway, backoffice, and
+#   caddy containers so that openssl dgst calls (hash verification) run in
+#   FIPS mode IF a FIPS-configured base image is present.
+#
+#   The DEFAULT base images (python:3.14.0-slim, caddy:2.11.2-alpine) DO NOT
+#   contain the CMVP #4985-validated OpenSSL FIPS Provider. Setting fips.mode=true
+#   without swapping to a FIPS-configured base image does NOT produce FIPS-validated
+#   cryptography — it only activates code paths that call openssl via subprocess.
+#
+#   To achieve FIPS-validated crypto operators MUST:
+#     1. Use a base image that ships the CMVP #4985-validated OpenSSL FIPS Provider,
+#        e.g. a RHEL/UBI-based image with openssl-fips, or an AWS BoringCrypto image.
+#     2. Set fips.mode: true in this chart.
+#
+#   "FIPS-capable" (code path exists) vs "FIPS-validated" (CMVP module loaded) are
+#   NOT the same. Do not claim FIPS compliance without a FIPS-configured base image.
+#   Ref: CMVP certificate #4985 (ACTIVE, FIPS 140-3, sunset 2030-03-10).
+#
+# Set to true ONLY if you have deployed a FIPS-configured base image.
+# Default false: FIPS_MODE env is not injected; containers use standard OpenSSL.
+# ---------------------------------------------------------------------------
+fips:
+  mode: false
+
+# ---------------------------------------------------------------------------
+# Licensing — Petra P0-1 (v2.24.4)
+# ---------------------------------------------------------------------------
+# The license loader (src/yashigani/licensing/loader.py) resolves /run/secrets/
+# license_key as its second candidate after YASHIGANI_LICENSE_FILE. In compose
+# deployments, install.sh writes the operator's .ysg file to docker/secrets/
+# license_key and Docker/Podman mounts it at /run/secrets/license_key
+# automatically. Helm had NO equivalent — every K8s install silently fell back
+# to COMMUNITY tier regardless of what the customer paid.
+#
+# This block provides the K8s parity:
+#   1. Set licenseKey to the raw content of your .ysg file, e.g.:
+#        --set licensing.licenseKey="$(cat my.ysg)"
+#      or supply it via a values override file.
+#   2. The chart renders a Secret named yashigani-license and mounts it at
+#      /run/secrets/license_key on gateway and backoffice.
+#   3. When licenseKey is empty (default), no Secret is rendered and no mount
+#      is added — the loader falls back to COMMUNITY tier as designed.
+#
+# OPERATOR NOTE: if licenseKey is empty after install the gateway and backoffice
+# run in COMMUNITY tier. A prominent warning is emitted by install.sh when
+# MODE=k8s and this field is empty (Petra P0-1).
+#
+# LIC-002 reminder: YASHIGANI_LICENSE_TIER MUST NOT be set via env or values —
+# that bypasses the signed-license enforcement path. Use this licenseKey field.
+# ---------------------------------------------------------------------------
+licensing:
+  # Raw content of your .ysg license file (K8s handles base64 internally via stringData).
+  # Leave empty to run in COMMUNITY tier.
+  # Example: licenseKey: "$(cat /path/to/my.ysg)"
+  licenseKey: ""
