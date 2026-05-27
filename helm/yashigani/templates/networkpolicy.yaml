@@ -68,11 +68,14 @@ spec:
           port: 53
 
 ---
-# Gateway — ingress rules (EX-231-10 + BUG-2 v2.23.4):
+# Gateway — ingress rules (EX-231-10 + BUG-2 v2.23.4 + A4 v2.25.0-P2):
 #   Port 8080 (mTLS): Caddy ONLY — Caddy is the sole external ingress.
-#   Port 8081 (mesh): open-webui ONLY — internal mesh port, plain HTTP.
-#     open-webui cannot reach port 8080 (mTLS+CaddyVerified blocks it).
+#   Port 8081 (mesh): open-webui + agent bundle pods — internal mesh port, plain HTTP.
+#     open-webui and agent bundles cannot reach port 8080 (mTLS+CaddyVerified blocks it).
 #     Port 8081 never serves Caddy-proxied traffic; it has no CaddyVerified gate.
+# A4 fix: agent bundle pods (langflow/letta/openclaw) connect to gateway:8081 for
+# LLM dispatch (values.yaml configures them with OPENAI_API_BASE=http://gateway:8081/v1).
+# Without this rule, default-deny-ingress drops all agent LLM calls silently in K8s.
 # nginx-ingress retained for installations using tlsMode=nginx (Caddy bypassed).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -101,11 +104,28 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # Internal mesh port — open-webui only (BUG-2 fix, v2.23.4)
+    # Internal mesh port — open-webui + agent bundle pods (BUG-2 fix v2.23.4; A4 v2.25.0-P2)
+    # A4: agent bundles route LLM calls to gateway:8081 (OPENAI_API_BASE in values.yaml).
+    # Council finding A4: Laura F-001 + Iris DRIFT-009 + Tom indirect.
     - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: open-webui
+        {{- if .Values.agentBundles.langflow.enabled }}
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "langflow"
+        {{- end }}
+        {{- if .Values.agentBundles.letta.enabled }}
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "letta"
+        {{- end }}
+        {{- if .Values.agentBundles.openclaw.enabled }}
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "openclaw"
+        {{- end }}
       ports:
         - protocol: TCP
           port: 8081
@@ -245,7 +265,11 @@ spec:
           port: 8443
 
 ---
-# Backoffice egress — policy, redis, budget-redis, ollama, pgbouncer
+# Backoffice egress — policy, redis, budget-redis, ollama, pgbouncer, otel-collector
+# A5 fix (v2.25.0 P2): added otel-collector egress (DRIFT-003). Backoffice exports
+# OTLP traces to otel-collector:4317 (grpcs:// when mTLS enabled). Without this
+# egress rule, backoffice OTEL export is silently dropped under default-deny-egress.
+# Council finding A5: Captain HIGH #5 + Iris DRIFT-003.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -267,6 +291,16 @@ spec:
       ports:
         - protocol: TCP
           port: 8181
+    {{- if .Values.otelCollector.enabled }}
+    # A5: backoffice OTEL export to otel-collector (DRIFT-003)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+    {{- end }}
     - to:
         - podSelector:
             matchLabels:
@@ -814,6 +848,12 @@ spec:
 
 ---
 # Grafana — accept ingress from caddy / nginx-ingress only
+# A2 fix (v2.25.0 P2): port updated to 3443 for mTLS mode (retro #83).
+# Since retro #83 Grafana serves HTTPS on 3443 (GF_SERVER_HTTP_PORT=3443).
+# The prior port: 3000 blocked all Caddy→Grafana proxy traffic under
+# default-deny-ingress when mtls.enabled=true, causing HTTP 502 on
+# /admin/grafana/* routes. Port 3000 retained for the non-mTLS fallback.
+# Council finding: Captain CRITICAL #3 / Iris DRIFT-008/019 / Lu seconded.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -837,7 +877,7 @@ spec:
               kubernetes.io/metadata.name: ingress-nginx
       ports:
         - protocol: TCP
-          port: 3000
+          port: {{ if .Values.mtls.enabled }}3443{{ else }}3000{{ end }}
 
 ---
 # Grafana egress — prometheus and loki only
@@ -871,6 +911,241 @@ spec:
           port: 3100
 
 ---
+# A5 fix (v2.25.0 P2): obs-plane service NetworkPolicies.
+# otel-collector, jaeger, alertmanager, and loki all lacked ingress NetworkPolicies.
+# Under default-deny-ingress, all inbound connections were silently dropped:
+#   - gateway/backoffice OTLP traces never reached otel-collector
+#   - otel-collector never forwarded traces to jaeger
+#   - Jaeger UI was unreachable from Caddy
+#   - Alertmanager couldn't receive alerts from Prometheus or send notifications
+#   - Loki couldn't receive logs (otel-collector HTTP export) or answer Grafana queries
+# Council finding A5: Captain HIGH #5 + Iris DRIFT-004/005/006/007.
+
+{{- if .Values.otelCollector.enabled }}
+---
+# otel-collector ingress — gateway + backoffice OTLP push + health_check
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otel-collector-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  policyTypes:
+    - Ingress
+  ingress:
+    # OTLP gRPC (4317) + HTTP (4318) — gateway and backoffice push traces here
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-backoffice
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    # Health check port — Caddy or internal liveness probe
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 13133
+
+---
+# otel-collector egress — forward traces to jaeger, logs to loki
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otel-collector-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  policyTypes:
+    - Egress
+  egress:
+    # Forward traces to Jaeger via OTLP gRPC
+    {{- if .Values.jaeger.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-jaeger
+      ports:
+        - protocol: TCP
+          port: 4317
+    {{- end }}
+    # Forward logs to Loki via OTLP HTTP
+    {{- if .Values.loki.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-loki
+      ports:
+        - protocol: TCP
+          port: 3100
+    {{- end }}
+{{- end }}
+
+{{- if .Values.jaeger.enabled }}
+---
+# Jaeger ingress — otel-collector OTLP push + Caddy proxy for UI
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-jaeger-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-jaeger
+  policyTypes:
+    - Ingress
+  ingress:
+    # OTLP gRPC from otel-collector
+    {{- if .Values.otelCollector.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+    {{- end }}
+    # Jaeger UI + health check from Caddy proxy (/admin/jaeger/* routes)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: 16686
+        - protocol: TCP
+          port: 13133
+{{- end }}
+
+{{- if .Values.alertmanager.enabled }}
+---
+# Alertmanager ingress — Prometheus alert push + Caddy proxy for UI
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-alertmanager-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-alertmanager
+  policyTypes:
+    - Ingress
+  ingress:
+    # Prometheus pushes alerts to alertmanager:9093
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-prometheus
+      ports:
+        - protocol: TCP
+          port: 9093
+    # Caddy proxy for alertmanager UI
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: 9093
+
+---
+# Alertmanager egress — external notification channels (email/PagerDuty/Slack relay)
+# Under default-deny-egress alertmanager cannot send notifications. Allow
+# HTTPS/SMTP to external receivers. IPv4 public internet only (IPv6 blocked).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-alertmanager-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-alertmanager
+  policyTypes:
+    - Egress
+  egress:
+    # External notification channels: HTTPS (webhooks, PagerDuty, Slack)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        # SMTP relay (email notifications)
+        - protocol: TCP
+          port: 587
+        - protocol: TCP
+          port: 25
+{{- end }}
+
+{{- if .Values.loki.enabled }}
+---
+# Loki ingress — otel-collector OTLP HTTP log push + Grafana queries
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-loki-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-loki
+  policyTypes:
+    - Ingress
+  ingress:
+    # OTLP HTTP from otel-collector (log pipeline)
+    {{- if .Values.otelCollector.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 3100
+    {{- end }}
+    # Grafana queries (LogQL) + Prometheus self-scrape piggyback (port 3100)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-grafana
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-prometheus
+      ports:
+        - protocol: TCP
+          port: 3100
+{{- end }}
+
+---
 # Agent bundles — accept ingress from gateway only
 # Applies to all enabled agent bundle Deployments via the bundle label.
 apiVersion: networking.k8s.io/v1
@@ -902,7 +1177,12 @@ spec:
           port: 18789   # openclaw
 
 ---
-# Agent bundles — egress to gateway only (all LLM calls route through gateway)
+# Agent bundles — egress to gateway (all LLM calls route through gateway)
+# A4 fix (v2.25.0 P2): added port 8081 (mesh port) alongside 8080 (mTLS port).
+# Agent bundles configure OPENAI_API_BASE=http://yashigani-gateway:8081/v1 so all
+# LLM calls go to the plain-HTTP mesh port. The prior rule only permitted 8080 —
+# under default-deny-egress, all agent LLM calls were silently dropped in K8s.
+# Council finding A4: Laura F-001 + Iris DRIFT-009.
 # openclaw also needs external internet for messaging webhooks — its egress is
 # handled by a separate rule below.
 apiVersion: networking.k8s.io/v1
@@ -926,6 +1206,9 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+        # A4: mesh port for LLM dispatch (OPENAI_API_BASE configured as :8081 in values.yaml)
+        - protocol: TCP
+          port: 8081
     - to:
         - podSelector:
             matchLabels:
@@ -1266,7 +1549,10 @@ spec:
           port: 7860
 
 ---
-# Langflow egress — gateway:8080 only + DNS.
+# Langflow egress — gateway:8080 (mTLS) + gateway:8081 (mesh) + DNS.
+# A4 fix: langflow LLM calls use OPENAI_API_BASE=http://yashigani-gateway:8081/v1
+# so :8081 is required. Without it, all langflow LLM calls are dropped under
+# default-deny-egress. Council finding A4.
 # Langflow has no direct DB access; all LLM calls route through gateway.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1289,6 +1575,9 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+        # A4: mesh port for LLM dispatch
+        - protocol: TCP
+          port: 8081
 {{- end }}
 
 {{- if .Values.agentBundles.letta.enabled }}
@@ -1318,7 +1607,10 @@ spec:
           port: 8283
 
 ---
-# Letta egress — gateway:8080 + postgres:5432 (for letta-pgbouncer sidecar) + DNS.
+# Letta egress — gateway:8080 (mTLS) + gateway:8081 (mesh) + postgres:5432 + DNS.
+# A4 fix: letta LLM calls use OPENAI_API_BASE=http://yashigani-gateway:8081/v1
+# so :8081 is required. Without it, all letta LLM calls are dropped under
+# default-deny-egress. Council finding A4.
 # In K8s, the letta-pgbouncer sidecar shares the pod network namespace and
 # its egress to postgres is governed by the letta pod's NetworkPolicy.
 # The letta application container itself connects only to 127.0.0.1:5432 (sidecar
@@ -1344,6 +1636,9 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+        # A4: mesh port for LLM dispatch
+        - protocol: TCP
+          port: 8081
     # letta-pgbouncer sidecar egress to postgres (sidecar runs in pod netns)
     - to:
         - podSelector:
@@ -1381,7 +1676,10 @@ spec:
           port: 18789
 
 ---
-# OpenClaw egress — gateway:8080 + external HTTPS (webhook channels) + DNS.
+# OpenClaw egress — gateway:8080 (mTLS) + gateway:8081 (mesh) + external HTTPS + DNS.
+# A4 fix: openclaw LLM calls use OPENCLAW_UPSTREAM_URL=http://yashigani-gateway:8081
+# so :8081 is required. Without it, all openclaw LLM calls are dropped under
+# default-deny-egress. Council finding A4.
 # External egress is necessary for openclaw's messaging channel integrations
 # (Slack, Telegram outbound webhooks). allow-openclaw-external-egress (above)
 # covers the broad HTTPS egress; this rule covers the gateway dispatch path.
@@ -1415,6 +1713,9 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+        # A4: mesh port for LLM dispatch
+        - protocol: TCP
+          port: 8081
     # External messaging channel webhooks (Slack, Telegram, etc.)
     # IPv4 public internet only — RFC1918 private ranges excluded.
     # This implicitly blocks IPv6 egress (no ::/0 entry = IPv6 denied).

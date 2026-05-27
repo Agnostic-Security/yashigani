@@ -364,6 +364,40 @@ backoffice:
   backupsHostPath: ""
 
 # ---------------------------------------------------------------------------
+# Audit log persistence — B7 fix (v2.25.0 P2, Lu P0-#3)
+# SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 / CMMC AU.L2-3.3.4/8/9 /
+# EU AI Act Art.12: operator-visible audit log persistence in K8s.
+#
+# Prior state: varlog volume was emptyDir{sizeLimit:50Mi} on gateway + backoffice.
+# Pod restart wiped the file sink; audit env vars were absent from helm entirely.
+#
+# When enabled: gateway + backoffice replace the emptyDir with a PVC-backed
+# audit-data volume at /var/log/yashigani. The audit env vars are injected on
+# both containers so the application writes to the configured path + rotation.
+#
+# storageClass: "" uses the cluster default StorageClass (standard / gp2 / etc.)
+# Set to a specific class for NFS, Longhorn, etc. that supports ReadWriteMany
+# if replicaCount > 1 (each replica writes its own audit log shard).
+# ---------------------------------------------------------------------------
+auditLog:
+  # Set to true to enable PVC-backed audit log persistence on gateway + backoffice.
+  # false = prior behaviour (emptyDir 50Mi, no persistence).
+  enabled: false
+  persistence:
+    size: "5Gi"
+    storageClass: ""
+    # AccessMode: ReadWriteOnce works for single-replica; ReadWriteMany needed
+    # when replicaCount > 1 and the StorageClass supports it (e.g. NFS, EFS).
+    accessMode: "ReadWriteOnce"
+  # Audit log configuration injected as env vars (mirrors compose .env defaults).
+  # YASHIGANI_AUDIT_LOG_PATH: path inside the container (must be under /var/log/yashigani)
+  logPath: "/var/log/yashigani/audit.log"
+  # YASHIGANI_AUDIT_MAX_FILE_SIZE_MB: rotate after this many MB (0 = disabled)
+  maxFileSizeMB: "100"
+  # YASHIGANI_AUDIT_RETENTION_DAYS: prune rotated files older than N days (0 = disabled)
+  retentionDays: "90"
+
+# ---------------------------------------------------------------------------
 # Backup — age-encrypted CronJob (MP.L2-3.8.9 / CMMC L2)
 # Last updated: 2026-05-09T00:00:00+01:00
 # ---------------------------------------------------------------------------

@@ -251,6 +251,17 @@ spec:
             - name: FIPS_MODE
               value: "1"
             {{- end }}
+            {{- if .Values.auditLog.enabled }}
+            # B7 fix (v2.25.0 P2): audit env vars injected for PVC-backed audit log.
+            # SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 / CMMC AU.L2-3.3.4/8/9 /
+            # EU AI Act Art.12. Council finding B7: Lu P0-#3.
+            - name: YASHIGANI_AUDIT_LOG_PATH
+              value: {{ .Values.auditLog.logPath | quote }}
+            - name: YASHIGANI_AUDIT_MAX_FILE_SIZE_MB
+              value: {{ .Values.auditLog.maxFileSizeMB | quote }}
+            - name: YASHIGANI_AUDIT_RETENTION_DAYS
+              value: {{ .Values.auditLog.retentionDays | quote }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ .Values.backoffice.existingSecretName | default "yashigani-backoffice-secrets" }}
@@ -339,9 +350,18 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
+        # B7 fix (v2.25.0 P2): replace emptyDir with PVC when auditLog.enabled.
+        # emptyDir is wiped on pod restart — operator-visible audit log file sink
+        # is lost. PVC persists across restarts for SOC 2 / ISO 27001 / NIST AU-9.
+        # Council finding B7: Lu P0-#3.
         - name: varlog
+          {{- if .Values.auditLog.enabled }}
+          persistentVolumeClaim:
+            claimName: yashigani-backoffice-audit-log
+          {{- else }}
           emptyDir:
             sizeLimit: 50Mi
+          {{- end }}
         {{- if .Values.mtls.enabled }}
         # Writable /run/secrets seeded by initContainer.
         - name: secrets
