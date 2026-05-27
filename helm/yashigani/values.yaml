@@ -1,6 +1,6 @@
-# Yashigani v2.24.0 — Umbrella Chart Top-Level Values
+# Yashigani v2.25.0 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-17 (feat: internalBearer per-install secret — Captain Bucket-C; remove hardcoded yashigani-internal)
+# Last updated: 2026-05-27 (v2.25.0 P2 wave 2 — B10/B11/B12/B13/B14-captain/A6 + Iris coord)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -98,6 +98,24 @@ networkPolicies:
 # active; document any disablement in the risk register with maintainer
 # sign-off, referencing YSG-RISK-008.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Image policy (A6 — Captain MEDIUM + Nico N-003)
+# ---------------------------------------------------------------------------
+# Yashigani-owned images (gateway, backoffice, caddy) are tag-only by default.
+# Production deployments SHOULD pin to @sha256: digests for supply-chain
+# attestation. The attestation workflow:
+#   1. Build images: install.sh builds yashigani-gateway + yashigani-backoffice
+#      from source and tags them with the release version.
+#   2. Inspect digest: `docker inspect --format='{{index .RepoDigests 0}}' <image>`
+#      or `docker images --digests <image>`.
+#   3. Set in values: gateway.image.tag="2.25.0@sha256:<digest>" etc.
+#
+# requireImageDigests: when true, helm template/install/upgrade fails if any
+# Yashigani-owned image tag does not contain @sha256:. Enforce post-build.
+# Default: false — operators must opt in after running their own image build.
+imagePolicy:
+  requireImageDigests: false
+
 # ---------------------------------------------------------------------------
 # LIC-002 SECURITY NOTICE — YASHIGANI_LICENSE_TIER is NOT an operator-settable
 # value and MUST NOT appear anywhere in this values file, in extraEnv blocks,
@@ -340,6 +358,22 @@ backoffice:
     port: 8443
     type: ClusterIP
   existingSecretName: ""
+  # Iris coord #1 (v2.25.0 P2 wave 2): backoffice.dbAesKey — operator-supplied
+  # AES key for pgcrypto pgp_sym_encrypt on the auth_settings table.
+  # When non-empty, secrets.yaml writes this value into yashigani-backoffice-secrets
+  # under the db_aes_key key instead of auto-generating via randAlphaNum.
+  # This retires the install.sh _write_helm_values `kubectl create secret --dry-run`
+  # workaround which pre-seeded the Secret before helm install.
+  #
+  # Key format: 64-char hex (32 bytes) — generate with: openssl rand -hex 32
+  # On upgrade: re-supply the SAME key or the db_aes_key value in the existing
+  # Secret will be preserved by Helm's lookup() regardless of this field.
+  # Missing key → RuntimeError at backoffice startup (fail-closed per SOP 1).
+  #
+  # Helm-only deployments: set via --set backoffice.dbAesKey="$(openssl rand -hex 32)"
+  # install.sh path: install.sh generates DB_AES_KEY and sets this value
+  # in _write_helm_values (removing the pre-seeding workaround).
+  dbAesKey: ""
   # v2.23.3 (#59): the backoffice K8s Secret (existingSecretName / default
   # "yashigani-backoffice-secrets") must contain the following keys:
   #   db_aes_key  — 64-char hex (32 bytes) or 44-char base64; used by
@@ -1185,6 +1219,10 @@ agentBundles:
 # ---------------------------------------------------------------------------
 openWebui:
   enabled: false
+  # B12 fix (TOM-K8S-001): existingSecretName for OWUI_SECRET_KEY injection
+  # into backoffice. Leave empty to use the chart-managed yashigani-open-webui-secrets.
+  # Set to a pre-created Secret name if managing the secret out-of-band.
+  existingSecretName: ""
   image:
     # Pinned to v0.9.1 to match docker-compose.yml (was floating :main — fixed
     # in v2.23.2 image-pin sweep 2026-05-02).
@@ -1261,6 +1299,29 @@ budgetRedis:
     enabled: true
     size: 1Gi
     storageClass: ""
+
+# ---------------------------------------------------------------------------
+# Wazuh SIEM integration (B11 fix — DRIFT-001 / Lu A.8.15/A.8.16)
+# ---------------------------------------------------------------------------
+# Compose ships a 3-container Wazuh stack (manager, indexer, dashboard).
+# Kubernetes does NOT support Wazuh in this chart version — no Helm templates
+# exist for Wazuh resources. Setting wazuh.enabled=true has NO effect; it is
+# retained as an explicit operator-visible declaration so that:
+#   1. The operator knows Wazuh is NOT running (vs. silently absent).
+#   2. The backoffice UI "Wazuh: active" status can be gated on this value in
+#      a future release to prevent misleading the operator.
+#   3. Auditors reviewing chart values find an explicit NOT-SUPPORTED declaration
+#      rather than inference-by-absence (ISO 27001 A.8.15/A.8.16 audit trail).
+#
+# If you need SIEM on Kubernetes, use an external Wazuh deployment and
+# configure the agents to forward logs externally. This is tracked as a
+# future K8s integration item.
+#
+# AUDIT NOTE: Any compliance control that lists "Wazuh SIEM" as implemented
+# MUST reference a running external Wazuh cluster, NOT this chart value.
+# The compose-side Wazuh stack is a Docker/Podman deployment concern only.
+wazuh:
+  enabled: false  # NOT SUPPORTED on Kubernetes in this chart version.
 
 # ---------------------------------------------------------------------------
 # PostgreSQL 16 — primary durable store

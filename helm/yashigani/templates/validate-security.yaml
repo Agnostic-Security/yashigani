@@ -88,7 +88,54 @@
   Or use the bundled OPA deployment (the default chart configuration).
 */ -}}
 {{- if or (eq .Values.global.environment "production") (eq .Values.global.environment "staging") -}}
-  {{- if not .Values.gateway.env.opaUrl -}}
+  {{- if not ((.Values.gateway).env).opaUrl -}}
     {{- fail "OPA-URL-001 SECURITY VIOLATION: gateway.env.opaUrl is empty in production/staging. When YASHIGANI_OPA_URL is unset, the gateway OPA policy check returns allow:True for every request — all policy enforcement is bypassed. Set gateway.env.opaUrl to the OPA decision endpoint, e.g. --set gateway.env.opaUrl=\"https://yashigani-policy:8181\" or use the bundled OPA deployment (default chart configuration). Do not override to an empty value in production or staging environments." -}}
+  {{- end -}}
+{{- end -}}
+
+{{- /*
+  B11 (DRIFT-001 / Lu A.8.15/A.8.16): warn when wazuh.enabled=true in K8s.
+  The compose stack ships a 3-container Wazuh SIEM. The Helm chart has NO
+  Wazuh templates — wazuh.enabled=true has no operational effect in K8s.
+  An operator who sets this to true has a dangerously false compliance belief:
+  they think SIEM is running when it is not. Fail at template time to prevent
+  that scenario. K8s SIEM requires an external Wazuh deployment.
+*/ -}}
+{{- if (.Values.wazuh).enabled -}}
+  {{- fail "B11 CONFIGURATION ERROR: wazuh.enabled=true has no effect in Kubernetes — this chart ships no Wazuh templates. The Wazuh SIEM stack is only available on the Docker/Podman Compose path. Setting wazuh.enabled=true creates a false compliance posture (ISO 27001 A.8.15/A.8.16): auditors see 'Wazuh active' but no SIEM is running. For K8s SIEM, deploy an external Wazuh cluster and forward container logs to it. Remove wazuh.enabled=true from your values override." -}}
+{{- end -}}
+
+{{- /*
+  B13 (Laura F-002): warn when admissionPolicies.enabled=false in production.
+  Kyverno policies default to off (Kyverno must be pre-installed). In production,
+  a cluster without Kyverno admission control can spawn privileged pods that
+  violate YSG-RISK-008. This guard surfaces a warning so operators are aware of
+  the posture delta — it is a warn (not fail) because Kyverno installation is a
+  cluster-admin prerequisite step, not a chart error.
+  PSA baseline labels on the namespace are rendered unconditionally as a
+  defence-in-depth layer regardless of admissionPolicies.enabled (see namespace.yaml).
+*/ -}}
+{{- if and (eq .Values.global.environment "production") (not .Values.admissionPolicies.enabled) -}}
+  {{- $_ := (printf "B13 SECURITY NOTICE: admissionPolicies.enabled=false in production. Kyverno admission policies (YSG-RISK-008) are not enforcing — privileged pods can be spawned. To enable: install Kyverno cluster-wide, then set admissionPolicies.enabled=true. PSA baseline enforcement labels are applied to the namespace as a defence-in-depth layer regardless of this setting. Document the gap in your risk register with a remediation deadline." | nindent 0) -}}
+{{- end -}}
+
+{{- /*
+  A6 (image version drift): when requireImageDigests=true, enforce that
+  all Yashigani-owned images carry a @sha256: digest pin.
+  Default: false (operators must opt in after running their own image build).
+  This is a template-time assertion only — the chart cannot verify
+  third-party images (OPA, Redis, Grafana etc.) without manifest inspect.
+*/ -}}
+{{- if (.Values.imagePolicy).requireImageDigests -}}
+  {{- if not (contains "@sha256:" .Values.gateway.image.tag) -}}
+    {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but gateway.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' yashigani-gateway:<tag>` and set gateway.image.tag=\"<tag>@sha256:<digest>\"." -}}
+  {{- end -}}
+  {{- if not (contains "@sha256:" .Values.backoffice.image.tag) -}}
+    {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but backoffice.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' yashigani-backoffice:<tag>` and set backoffice.image.tag=\"<tag>@sha256:<digest>\"." -}}
+  {{- end -}}
+  {{- if .Values.caddy.enabled -}}
+    {{- if not (contains "@sha256:" .Values.caddy.image.tag) -}}
+      {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but caddy.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' caddy:<tag>` and set caddy.image.tag=\"<tag>@sha256:<digest>\"." -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}

@@ -49,3 +49,44 @@ AGENT BUNDLES — notes for operators:
   Then deploy Yashigani with --set admissionPolicies.enabled=true.
   The chart will fail-loud with remediation steps if Kyverno CRDs are absent.
   Finding: ccc7abf/adf6fda (2026-05-15).
+
+AUDIT LOG — DURABILITY NOTICE (Iris coord #3 / Lu A.8.15):
+
+  auditLog.enabled defaults to FALSE. In this state the gateway and backoffice
+  write audit events to an emptyDir volume (50 MiB, NOT persistent). Pod restarts
+  wipe the audit trail. This is a durability gap vs the Docker/Podman compose
+  deployment where audit logging is always-on to a bind-mounted host directory.
+
+  To enable persistent audit logging on Kubernetes:
+    --set auditLog.enabled=true
+    --set auditLog.persistence.size=5Gi          # adjust to retention needs
+    --set auditLog.persistence.storageClass=...  # set for your cluster StorageClass
+
+  ROLLBACK WARNING: if you previously ran with auditLog.enabled=true and
+  switch back to enabled=false, the audit PVC becomes orphaned (Helm does not
+  delete PVCs on upgrade). Manually delete it after archiving the audit data:
+    kubectl delete pvc -n {{ .Release.Namespace }} -l app.kubernetes.io/component=audit-log
+
+  COMPLIANCE NOTE: SOC 2 CC7.2, ISO 27001 A.8.15, NIST AU-9/AU-11, CMMC
+  AU.L2-3.3.4/8/9, EU AI Act Art.12 all require durable audit records.
+  auditLog.enabled=false does NOT satisfy these controls — document the gap
+  in your risk register if running without persistent audit.
+
+KUBERNETES vs DOCKER/PODMAN FOOTPRINT DIFFERENCES (B11 — DRIFT-001):
+
+  The following components are present in the Docker/Podman Compose deployment
+  but are NOT available in this Helm chart. Compliance controls that reference
+  these components MUST note this Kubernetes limitation:
+
+  | Component           | Compose | Helm/K8s | Notes                               |
+  |---------------------|---------|----------|-------------------------------------|
+  | Wazuh SIEM          | YES     | NO       | Deploy external Wazuh + forward logs|
+  | Keycloak IdP        | NO      | NO       | Future roadmap item                 |
+  | HashiCorp Vault     | NO      | NO       | Use external-secrets-operator       |
+  | step-ca (ACME CA)   | NO      | NO       | Use cert-manager instead            |
+  | Promtail log agent  | NO      | NO       | Use Loki's native K8s log discovery |
+  | OpenClaw UI (full)  | Partial | Partial  | API mode only on both paths         |
+
+  wazuh.enabled=true is explicitly blocked by this chart — it has no effect and
+  will fail helm install/upgrade with a configuration error to prevent false
+  compliance posture. See values.yaml wazuh section for migration notes.
