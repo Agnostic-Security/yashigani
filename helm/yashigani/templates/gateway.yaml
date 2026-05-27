@@ -247,6 +247,16 @@ spec:
               mountPath: /etc/yashigani
               readOnly: true
             {{- end }}
+            {{- if .Values.licensing.licenseKey }}
+            # Petra P0-1 (v2.24.4): mount the licence key alongside the PKI material
+            # so loader.py candidate 2 (/run/secrets/license_key) resolves correctly.
+            # subPath keeps the mount scoped to a single file; does not collide with
+            # the PKI Secret already mounted at /run/secrets.
+            - name: license
+              mountPath: /run/secrets/license_key
+              subPath: license_key
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -268,6 +278,14 @@ spec:
         - name: service-manifest
           configMap:
             name: yashigani-pki-manifest
+        {{- end }}
+        {{- if .Values.licensing.licenseKey }}
+        # Petra P0-1 (v2.24.4): licence Secret volume.
+        # Mounted via subPath at /run/secrets/license_key (readOnly).
+        - name: license
+          secret:
+            secretName: yashigani-license
+            defaultMode: 0440
         {{- end }}
 ---
 apiVersion: v1

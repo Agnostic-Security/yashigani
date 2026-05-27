@@ -7258,6 +7258,22 @@ k8s_helm_install() {
 
   helm "${helm_args[@]}"
   log_success "Helm release deployed"
+
+  # Petra P0-1 (v2.24.4): warn if licensing.licenseKey was not supplied.
+  # When the key is absent the gateway and backoffice fall back to COMMUNITY
+  # tier — every paid-tier K8s install silently regressed to COMMUNITY before
+  # this fix. Emit a visible WARNING so the operator knows to re-run with:
+  #   helm upgrade yashigani ... --set licensing.licenseKey="$(base64 < my.ysg)"
+  local _lic_secret
+  _lic_secret=$(kubectl get secret yashigani-license --namespace "$NAMESPACE" \
+    --ignore-not-found 2>/dev/null)
+  if [[ -z "$_lic_secret" ]]; then
+    log_warn "COMMUNITY TIER ACTIVE: yashigani-license Secret not found."
+    log_warn "Gateway and backoffice are running in COMMUNITY tier."
+    log_warn "To enroll a paid licence re-run with:"
+    log_warn "  helm upgrade yashigani ./helm/yashigani -n ${NAMESPACE} \\"
+    log_warn "    --set licensing.licenseKey=\"\$(base64 < /path/to/your.ysg)\""
+  fi
 }
 
 # STEP 9 (k8s): kubectl rollout status

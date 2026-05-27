@@ -1419,3 +1419,35 @@ poolManager:
     enabled: false
     agentPort: 8080
     podReadyTimeoutSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Licensing — Petra P0-1 (v2.24.4)
+# ---------------------------------------------------------------------------
+# The license loader (src/yashigani/licensing/loader.py) resolves /run/secrets/
+# license_key as its second candidate after YASHIGANI_LICENSE_FILE. In compose
+# deployments, install.sh writes the operator's .ysg file to docker/secrets/
+# license_key and Docker/Podman mounts it at /run/secrets/license_key
+# automatically. Helm had NO equivalent — every K8s install silently fell back
+# to COMMUNITY tier regardless of what the customer paid.
+#
+# This block provides the K8s parity:
+#   1. Set licenseKey to the base64-encoded content of your .ysg file, e.g.:
+#        --set licensing.licenseKey="$(base64 < my.ysg)"
+#      or supply it via a values override file.
+#   2. The chart renders a Secret named yashigani-license and mounts it at
+#      /run/secrets/license_key on gateway and backoffice.
+#   3. When licenseKey is empty (default), no Secret is rendered and no mount
+#      is added — the loader falls back to COMMUNITY tier as designed.
+#
+# OPERATOR NOTE: if licenseKey is empty after install the gateway and backoffice
+# run in COMMUNITY tier. A prominent warning is emitted by install.sh when
+# MODE=k8s and this field is empty (Petra P0-1).
+#
+# LIC-002 reminder: YASHIGANI_LICENSE_TIER MUST NOT be set via env or values —
+# that bypasses the signed-license enforcement path. Use this licenseKey field.
+# ---------------------------------------------------------------------------
+licensing:
+  # base64-encoded content of your .ysg license file.
+  # Leave empty to run in COMMUNITY tier.
+  # Example: licenseKey: "$(base64 < /path/to/my.ysg)"
+  licenseKey: ""
