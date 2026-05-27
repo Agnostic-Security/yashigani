@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 # scripts/backup.sh — Yashigani encrypted backup
-# Last updated: 2026-05-09T00:00:00+01:00 (feat: MP.L2-3.8.9 age-encrypted backups — CMMC L2 product gap)
+# Last updated: 2026-05-27T00:00:00+01:00 (fix(backup): B5 — include agent bundle state dirs in tarball)
 #
 # Produces an age-encrypted tarball at:
 #   /var/lib/yashigani/backups/<timestamp>.tar.gz.age
 #
+# The primary source directory (--source-dir / YASHIGANI_BACKUP_SOURCE_DIR) is
+# always included.  Agent bundle state directories (langflow flows, letta
+# memories, openclaw policies) live in separate volumes and are included via
+# --extra-dirs.  Without --extra-dirs, agent state is silently excluded from
+# the backup (B5 data-loss path — closes v2.25.0 P2 B5).
+#
 # Usage:
 #   backup.sh [--output-dir DIR] [--recipient-key FILE] [--dry-run]
+#             [--extra-dirs DIR1:DIR2:...]
 #
 # Environment variables:
-#   YASHIGANI_BACKUP_OUTPUT_DIR   Override output directory (default: /var/lib/yashigani/backups)
-#   YASHIGANI_BACKUP_RECIPIENT    Override recipient public key file (default: /etc/yashigani/backup-recipient.age.pub)
-#   YASHIGANI_BACKUP_SOURCE_DIR   Override source directory (default: /var/lib/yashigani)
+#   YASHIGANI_BACKUP_OUTPUT_DIR    Override output directory (default: /var/lib/yashigani/backups)
+#   YASHIGANI_BACKUP_RECIPIENT     Override recipient public key file (default: /etc/yashigani/backup-recipient.age.pub)
+#   YASHIGANI_BACKUP_SOURCE_DIR    Override source directory (default: /var/lib/yashigani)
+#   YASHIGANI_BACKUP_EXTRA_DIRS    Colon-separated list of extra dirs to archive (default: empty)
+#                                  Example: /var/lib/yashigani/agents/langflow:/var/lib/yashigani/agents/letta
 #
 # Operator pre-requisites (see docs/operations/backup.md):
 #   1. Generate key pair: age-keygen -o /etc/yashigani/backup-identity.age
@@ -22,6 +31,7 @@
 #
 # Finding: MP.L2-3.8.9 — backup encryption at rest
 # CWE: CWE-312 (cleartext storage of sensitive information)
+# B5: agent bundle state excluded from backup — silent data loss on restore
 # ============================================================================
 
 set -euo pipefail
@@ -33,6 +43,12 @@ umask 077
 RECIPIENT_KEY_FILE="${YASHIGANI_BACKUP_RECIPIENT:-/etc/yashigani/backup-recipient.age.pub}"
 OUTPUT_DIR="${YASHIGANI_BACKUP_OUTPUT_DIR:-/var/lib/yashigani/backups}"
 SOURCE_DIR="${YASHIGANI_BACKUP_SOURCE_DIR:-/var/lib/yashigani}"
+# B5: colon-separated list of additional directories to include in the tarball.
+# Populated by the K8s CronJob via YASHIGANI_BACKUP_EXTRA_DIRS or --extra-dirs.
+# Each directory that exists is added as a separate top-level entry in the archive.
+# Missing directories are logged as warnings (not errors) — they may be absent if
+# the corresponding agent bundle is not enabled.
+EXTRA_DIRS="${YASHIGANI_BACKUP_EXTRA_DIRS:-}"
 DRY_RUN=false
 
 # ---------------------------------------------------------------------------
@@ -67,16 +83,19 @@ Usage: backup.sh [OPTIONS]
 Produce an age-encrypted tarball of Yashigani backup data.
 
 Options:
-  --output-dir DIR      Directory to write <timestamp>.tar.gz.age (default: /var/lib/yashigani/backups)
-  --recipient-key FILE  Path to age recipient public key (default: /etc/yashigani/backup-recipient.age.pub)
-  --source-dir DIR      Directory to archive (default: /var/lib/yashigani)
-  --dry-run             Validate configuration without writing output
-  --help, -h            Print this help and exit
+  --output-dir DIR        Directory to write <timestamp>.tar.gz.age (default: /var/lib/yashigani/backups)
+  --recipient-key FILE    Path to age recipient public key (default: /etc/yashigani/backup-recipient.age.pub)
+  --source-dir DIR        Directory to archive (default: /var/lib/yashigani)
+  --extra-dirs DIR1:DIR2  Colon-separated list of additional directories to include
+                          (B5: use for agent bundle state — langflow, letta, openclaw)
+  --dry-run               Validate configuration without writing output
+  --help, -h              Print this help and exit
 
 Environment variables:
   YASHIGANI_BACKUP_OUTPUT_DIR    Override --output-dir
   YASHIGANI_BACKUP_RECIPIENT     Override --recipient-key
   YASHIGANI_BACKUP_SOURCE_DIR    Override --source-dir
+  YASHIGANI_BACKUP_EXTRA_DIRS    Override --extra-dirs (colon-separated)
 
 The recipient public key file MUST start with 'age1' (native age format).
 Armored PEM-wrapped keys are NOT accepted.
@@ -93,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --output-dir)    OUTPUT_DIR="$2";         shift 2 ;;
     --recipient-key) RECIPIENT_KEY_FILE="$2"; shift 2 ;;
     --source-dir)    SOURCE_DIR="$2";         shift 2 ;;
+    --extra-dirs)    EXTRA_DIRS="$2";         shift 2 ;;
     --dry-run)       DRY_RUN=true;            shift   ;;
     --help|-h)       usage; exit 0                    ;;
     *) log_error "Unknown option: $1"; usage; exit 1  ;;
@@ -163,6 +183,31 @@ if [[ ! -d "${SOURCE_DIR}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# B5: validate extra dirs (warn-only — absent agent dirs are non-fatal)
+# Split EXTRA_DIRS on colon into array; verify each entry is a non-empty string.
+# ---------------------------------------------------------------------------
+EXTRA_DIRS_ARRAY=()
+if [[ -n "${EXTRA_DIRS}" ]]; then
+  # Read colon-separated dirs into array (IFS split — no glob expansion risk;
+  # each element is a path token, not a glob).
+  IFS=':' read -ra _raw_dirs <<< "${EXTRA_DIRS}"
+  for _d in "${_raw_dirs[@]}"; do
+    # Strip leading/trailing whitespace
+    _d="${_d#"${_d%%[![:space:]]*}"}"
+    _d="${_d%"${_d##*[![:space:]]}"}"
+    [[ -z "${_d}" ]] && continue
+    if [[ -d "${_d}" ]]; then
+      EXTRA_DIRS_ARRAY+=("${_d}")
+      log_info "  Extra dir:  ${_d} (found)"
+    else
+      # B5: warn rather than fail — if langflow is disabled the PVC mount
+      # path won't exist; we should still back up the core source dir.
+      log_warn "  Extra dir:  ${_d} (NOT FOUND — skipping; agent bundle may be disabled)"
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
 # Dry-run exit
 # ---------------------------------------------------------------------------
 if [[ "${DRY_RUN}" == "true" ]]; then
@@ -170,6 +215,15 @@ if [[ "${DRY_RUN}" == "true" ]]; then
   log_info "  Recipient key:  ${RECIPIENT_KEY_FILE}"
   log_info "  Output dir:     ${OUTPUT_DIR}"
   log_info "  Source dir:     ${SOURCE_DIR}"
+  if [[ ${#EXTRA_DIRS_ARRAY[@]} -gt 0 ]]; then
+    for _d in "${EXTRA_DIRS_ARRAY[@]}"; do
+      log_info "  Extra dir:      ${_d}"
+    done
+  else
+    log_info "  Extra dirs:     (none — agent bundle state not included in backup)"
+    log_warn "  B5: no extra dirs configured. To include agent bundle state, set"
+    log_warn "      YASHIGANI_BACKUP_EXTRA_DIRS or pass --extra-dirs DIR1:DIR2"
+  fi
   exit 0
 fi
 
@@ -194,11 +248,23 @@ log_info "Starting encrypted backup..."
 log_info "  Source:   ${SOURCE_DIR}"
 log_info "  Output:   ${OUTPUT_FILE}"
 log_info "  Recipient: ${RECIPIENT_KEY:0:16}..."
+if [[ ${#EXTRA_DIRS_ARRAY[@]} -gt 0 ]]; then
+  for _d in "${EXTRA_DIRS_ARRAY[@]}"; do
+    log_info "  Extra:    ${_d}"
+  done
+else
+  log_warn "  No extra dirs configured — agent bundle state excluded from backup (B5)."
+  log_warn "  Set YASHIGANI_BACKUP_EXTRA_DIRS to include langflow/letta/openclaw state."
+fi
 
 # ---------------------------------------------------------------------------
 # Produce tarball and pipe through age encryption.
 #
-# Pipeline: tar -cz SOURCE_DIR | age --encrypt --recipient KEY > OUTPUT_FILE
+# Pipeline: tar -cz SOURCE_DIR [extra_dirs...] | age --encrypt --recipient KEY > OUTPUT_FILE
+#
+# B5: extra dirs are appended as --directory parent basename pairs so each dir
+# appears as a top-level entry in the archive (restore unpacks cleanly into the
+# original paths without path-collision with the primary SOURCE_DIR tree).
 #
 # Failure modes:
 #   - tar non-zero:   archive creation failed (permissions, I/O) — output deleted
@@ -214,6 +280,17 @@ TMP_OUTPUT="${OUTPUT_DIR}/.tmp-${TIMESTAMP}-$$.tar.gz.age"
 # write tar's exit code to a temp status file that survives the subshell.
 TAR_STATUS_FILE="${OUTPUT_DIR}/.tmp-tar-status-${TIMESTAMP}-$$"
 
+# Build the tar argument list for extra dirs.
+# Each extra dir becomes: --directory <parent> <basename>
+# This preserves the canonical path structure inside the archive:
+#   SOURCE_DIR=/var/lib/yashigani        → yashigani/ at archive root
+#   extra_dir=/var/lib/agents/langflow   → langflow/  at archive root
+# On restore, the operator extracts each tree to its original parent.
+TAR_EXTRA_ARGS=()
+for _extra in "${EXTRA_DIRS_ARRAY[@]}"; do
+  TAR_EXTRA_ARGS+=( "--directory" "$(dirname "${_extra}")" "$(basename "${_extra}")" )
+done
+
 # Ensure temp files are cleaned up on any exit (including SIGINT/SIGTERM)
 # shellcheck disable=SC2064
 trap 'rm -f "${TMP_OUTPUT}" "${TAR_STATUS_FILE}" 2>/dev/null; exit 1' INT TERM
@@ -226,6 +303,7 @@ trap 'rm -f "${TMP_OUTPUT}" "${TAR_STATUS_FILE}" 2>/dev/null; exit 1' INT TERM
   tar --create --gzip \
       --directory "$(dirname "${SOURCE_DIR}")" \
       "$(basename "${SOURCE_DIR}")" \
+      "${TAR_EXTRA_ARGS[@]}" \
       2>/dev/null
   printf '%d' $? > "${TAR_STATUS_FILE}"
 ) | age --encrypt --recipient "${RECIPIENT_KEY}" --output "${TMP_OUTPUT}" 2>/dev/null
@@ -241,7 +319,7 @@ if [[ "${TAR_STATUS}" -ne 0 ]]; then
   rm -f "${TMP_OUTPUT}" 2>/dev/null || true
   trap - INT TERM
   log_error "tar failed (exit ${TAR_STATUS}) — no backup written to disk."
-  log_error "  Check: read access to ${SOURCE_DIR}"
+  log_error "  Check: read access to ${SOURCE_DIR} and extra dirs"
   exit 1
 fi
 

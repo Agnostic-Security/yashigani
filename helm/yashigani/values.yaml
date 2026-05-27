@@ -494,6 +494,28 @@ backup:
   # History limits
   failedJobsHistoryLimit: 3
   successfulJobsHistoryLimit: 3
+  # B5 fix (v2.25.0 P2): agent bundle state directories.
+  # Each entry mounts the named PVC into the backup CronJob pod and includes
+  # the mountPath in the YASHIGANI_BACKUP_EXTRA_DIRS list passed to backup.sh.
+  # Without this, agent bundle state (langflow flows, letta memories, openclaw
+  # policies) is silently excluded from every encrypted backup.
+  #
+  # Disable an entry by setting pvcName: "" — the mount is skipped entirely.
+  # If an agent bundle PVC does not exist, the CronJob pod will fail to start.
+  # Only enable entries for agent bundles that are actually deployed.
+  #
+  # Example — enable langflow backup when agentBundles.langflow.enabled=true:
+  #   backup:
+  #     agentBundlePaths:
+  #       - pvcName: "yashigani-langflow-data"
+  #         mountPath: "/var/lib/yashigani-agents/langflow"
+  #       - pvcName: "yashigani-letta-data"
+  #         mountPath: "/var/lib/yashigani-agents/letta"
+  #
+  # Default: empty list — no agent bundle state included in backup.
+  # Set explicitly when agent bundles are enabled and you want their state
+  # included in the encrypted backup tarball.
+  agentBundlePaths: []
 
 # ---------------------------------------------------------------------------
 # Policy — Open Policy Agent
