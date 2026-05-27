@@ -626,6 +626,22 @@ yashigani_pool_limit_exceeded_total = Counter(
 )
 
 
+# ---------------------------------------------------------------------------
+# FIPS attestation metric — Nico N-002 (v2.25.0 P2 B9)
+# ---------------------------------------------------------------------------
+# yashigani_fips_mode_active is a static gauge (0 or 1) reflecting whether
+# FIPS_MODE=1 is active in this container.  Set once at startup from the env.
+# Operators queried by auditors ("was FIPS mode active in production?") can
+# cite this metric from the Prometheus time-series as a runtime artefact.
+# ---------------------------------------------------------------------------
+
+fips_mode_active = _G(
+    "yashigani_fips_mode_active",
+    "1 if FIPS_MODE=1 is active in this container, 0 otherwise. "
+    "Set once at startup from the FIPS_MODE environment variable.",
+)
+
+
 def get_metrics() -> dict:
     """Return a flat dict of all metric objects — useful for testing."""
     return {k: v for k, v in globals().items() if not k.startswith("_") and k not in (

@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-02T02:32:22+01:00 */ -}}
+{{- /* Last updated: 2026-05-27T00:00:00+00:00 */ -}}
 {{- if .Values.gateway.enabled }}
 ---
 apiVersion: apps/v1
@@ -32,8 +32,13 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
-      # /run/secrets mount collision — see redis.yaml note.
-      automountServiceAccountToken: false
+      # B14 (v2.25.0 P2 TOM-K8S-002): automountServiceAccountToken is conditional.
+      # When poolManager.k8sBackend.enabled=true the gateway ServiceAccount token
+      # must be mounted so pool/backend.py can call load_incluster_config() and
+      # reach the K8s API server (CoreV1Api.create_namespaced_pod). When the k8s
+      # backend is disabled the token is never consumed and mounting it is an
+      # unnecessary attack surface — Checkov CKV_K8S_43 / ASVS V14.3.2.
+      automountServiceAccountToken: {{ if .Values.poolManager.k8sBackend.enabled }}true{{ else }}false{{ end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001
