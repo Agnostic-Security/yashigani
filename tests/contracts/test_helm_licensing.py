@@ -36,7 +36,7 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent.parent
 HELM_CHART = REPO_ROOT / "helm" / "yashigani"
 
-_TEST_LICENSE_B64 = "dGVzdC1saWNlbnNlLWtleS1mb3ItY29udHJhY3QtdGVzdA=="  # test artefact
+_TEST_LICENSE_RAW = "test-license-key-for-contract-test"  # raw .ysg content (not base64)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -118,8 +118,8 @@ def _get_volume(deployment: dict[str, Any], vol_name: str) -> dict[str, Any] | N
 
 @pytest.fixture(scope="module")
 def docs_with_license() -> list[dict[str, Any]]:
-    """Render with licensing.licenseKey set."""
-    rendered = _helm_template([f"licensing.licenseKey={_TEST_LICENSE_B64}"])
+    """Render with licensing.licenseKey set (raw .ysg content, not base64)."""
+    rendered = _helm_template([f"licensing.licenseKey={_TEST_LICENSE_RAW}"])
     return _parse_all_docs(rendered)
 
 
@@ -144,13 +144,32 @@ class TestLicenseSecretRendered:
             "licensing.licenseKey set (Petra P0-1)"
         )
 
+    def test_secret_uses_stringdata_not_data(
+        self, docs_with_license: list[dict[str, Any]]
+    ) -> None:
+        """B3-D1 (Iris drift gate): Secret must use stringData, not data.
+        K8s data: requires pre-encoded base64; stringData: accepts raw strings and
+        K8s base64-encodes internally. Using data: with | quote (but no | b64enc)
+        forces operators to pre-encode, causing silent garbage mounts on raw input.
+        """
+        secret = _find_by_kind_name(docs_with_license, "Secret", "yashigani-license")
+        assert secret is not None
+        assert secret.get("data") is None, (
+            "yashigani-license Secret uses 'data:' — must use 'stringData:' instead "
+            "(B3-D1 Iris drift gate). 'data:' requires pre-base64-encoded values; "
+            "'stringData:' accepts raw content and K8s encodes internally."
+        )
+        assert secret.get("stringData") is not None, (
+            "yashigani-license Secret is missing 'stringData:' block (B3-D1)."
+        )
+
     def test_secret_has_license_key_field(
         self, docs_with_license: list[dict[str, Any]]
     ) -> None:
         secret = _find_by_kind_name(docs_with_license, "Secret", "yashigani-license")
         assert secret is not None
-        assert "license_key" in (secret.get("data") or {}), (
-            "yashigani-license Secret is missing the 'license_key' data field. "
+        assert "license_key" in (secret.get("stringData") or {}), (
+            "yashigani-license Secret is missing the 'license_key' stringData field. "
             "loader.py resolves /run/secrets/license_key as candidate 2."
         )
 
@@ -159,10 +178,10 @@ class TestLicenseSecretRendered:
     ) -> None:
         secret = _find_by_kind_name(docs_with_license, "Secret", "yashigani-license")
         assert secret is not None
-        actual = (secret.get("data") or {}).get("license_key")
-        assert actual == _TEST_LICENSE_B64, (
-            f"yashigani-license.data.license_key mismatch. "
-            f"Expected: {_TEST_LICENSE_B64!r}, Got: {actual!r}"
+        actual = (secret.get("stringData") or {}).get("license_key")
+        assert actual == _TEST_LICENSE_RAW, (
+            f"yashigani-license.stringData.license_key mismatch. "
+            f"Expected: {_TEST_LICENSE_RAW!r}, Got: {actual!r}"
         )
 
 

@@ -1465,8 +1465,8 @@ fips:
 # to COMMUNITY tier regardless of what the customer paid.
 #
 # This block provides the K8s parity:
-#   1. Set licenseKey to the base64-encoded content of your .ysg file, e.g.:
-#        --set licensing.licenseKey="$(base64 < my.ysg)"
+#   1. Set licenseKey to the raw content of your .ysg file, e.g.:
+#        --set licensing.licenseKey="$(cat my.ysg)"
 #      or supply it via a values override file.
 #   2. The chart renders a Secret named yashigani-license and mounts it at
 #      /run/secrets/license_key on gateway and backoffice.
@@ -1481,7 +1481,7 @@ fips:
 # that bypasses the signed-license enforcement path. Use this licenseKey field.
 # ---------------------------------------------------------------------------
 licensing:
-  # base64-encoded content of your .ysg license file.
+  # Raw content of your .ysg license file (K8s handles base64 internally via stringData).
   # Leave empty to run in COMMUNITY tier.
-  # Example: licenseKey: "$(base64 < /path/to/my.ysg)"
+  # Example: licenseKey: "$(cat /path/to/my.ysg)"
   licenseKey: ""
