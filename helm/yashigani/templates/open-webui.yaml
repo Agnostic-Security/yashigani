@@ -35,6 +35,12 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
+      # B14 fix (Laura F-003 / TOM-K8S-002 — Captain side): open-webui was the
+      # only Deployment missing automountServiceAccountToken: false. Every other
+      # pod in the chart disables this. With poolManager.k8sBackend.enabled=true
+      # the shared `yashigani` SA has pods CRUD rights; a compromised open-webui
+      # pod inherits those rights via the auto-mounted token. Disabled here.
+      automountServiceAccountToken: false
       # Retro #3ak — runAsNonRoot:true alone causes CrashLoopBackOff because
       # the upstream open-webui image's USER directive is root. The image
       # supports running as a non-root uid when WEBUI_USER_UID is honoured,
@@ -193,7 +199,7 @@ spec:
             - name: RAG_EMBEDDING_ENGINE
               value: "ollama"
             - name: RAG_OLLAMA_BASE_URL
-              value: {{ .Values.gateway.env.ollamaUrl | quote }}
+              value: {{ (.Values.gateway.env | default dict).ollamaUrl | quote }}
           # Retro #3ag (v2.23.1 task #94) — startupProbe gates liveness/readiness
           # so cold-boot of the upstream open-webui image (SvelteKit + Python +
           # LangChain stack, regularly 90-180s on Docker Desktop) does not get
