@@ -1385,6 +1385,15 @@ spec:
 # External egress is necessary for openclaw's messaging channel integrations
 # (Slack, Telegram outbound webhooks). allow-openclaw-external-egress (above)
 # covers the broad HTTPS egress; this rule covers the gateway dispatch path.
+#
+# LAURA-V243-003 residual (A3 HIGH): the prior webhook rule was port-only
+# (no `to:` ipBlock). On dual-stack K8s clusters a port-only egress rule
+# implicitly permits egress to ANY destination including IPv6 addresses,
+# regenerating the gap that allow-openclaw-external-egress was meant to close.
+# Fix: explicit IPv4-public-internet ipBlock (RFC1918 ranges excepted) mirrors
+# the pattern already applied to allow-ollama-egress and
+# allow-openclaw-external-egress in v2.24.3 PR #155.
+# K8s semantics: an IPv4 ipBlock implicitly denies IPv6 (no ::/0 = denied).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -1407,7 +1416,16 @@ spec:
         - protocol: TCP
           port: 8080
     # External messaging channel webhooks (Slack, Telegram, etc.)
-    - ports:
+    # IPv4 public internet only — RFC1918 private ranges excluded.
+    # This implicitly blocks IPv6 egress (no ::/0 entry = IPv6 denied).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
         - protocol: TCP
           port: 443
         - protocol: TCP

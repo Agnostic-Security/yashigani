@@ -98,6 +98,15 @@ spec:
                   name: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
                   key: caddy_internal_hmac
             {{- end }}
+            {{- if .Values.fips.mode }}
+            # Nico N-001 (v2.24.4): FIPS_MODE propagation.
+            # Routes openssl dgst calls through the OpenSSL FIPS Provider.
+            # REQUIRES a FIPS-configured base image (CMVP #4985) — default
+            # caddy:2.11.2-alpine does NOT contain the FIPS Provider. Do NOT
+            # set fips.mode=true without swapping to a FIPS-configured image.
+            - name: FIPS_MODE
+              value: "1"
+            {{- end }}
           # Retro #3al — probe the public :80 listener instead of the admin
           # endpoint at :2019. Caddy's admin API is bound to localhost only;
           # exposing it on 0.0.0.0 to satisfy the kubelet would expose the

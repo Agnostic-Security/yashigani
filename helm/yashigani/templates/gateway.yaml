@@ -179,6 +179,15 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.internalBearer.existingSecretName | default "yashigani-agent-bearer" }}
                   key: yashigani_internal_bearer
+            {{- if .Values.fips.mode }}
+            # Nico N-001 (v2.24.4): FIPS_MODE propagation.
+            # Routes openssl dgst calls through the OpenSSL FIPS Provider.
+            # REQUIRES a FIPS-configured base image (CMVP #4985) — default
+            # python:3.14.0-slim does NOT contain the FIPS Provider. Do NOT
+            # set fips.mode=true without swapping to a FIPS-configured image.
+            - name: FIPS_MODE
+              value: "1"
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ .Values.gateway.existingSecretName | default "yashigani-gateway-secrets" }}
@@ -247,6 +256,16 @@ spec:
               mountPath: /etc/yashigani
               readOnly: true
             {{- end }}
+            {{- if .Values.licensing.licenseKey }}
+            # Petra P0-1 (v2.24.4): mount the licence key alongside the PKI material
+            # so loader.py candidate 2 (/run/secrets/license_key) resolves correctly.
+            # subPath keeps the mount scoped to a single file; does not collide with
+            # the PKI Secret already mounted at /run/secrets.
+            - name: license
+              mountPath: /run/secrets/license_key
+              subPath: license_key
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -268,6 +287,14 @@ spec:
         - name: service-manifest
           configMap:
             name: yashigani-pki-manifest
+        {{- end }}
+        {{- if .Values.licensing.licenseKey }}
+        # Petra P0-1 (v2.24.4): licence Secret volume.
+        # Mounted via subPath at /run/secrets/license_key (readOnly).
+        - name: license
+          secret:
+            secretName: yashigani-license
+            defaultMode: 0440
         {{- end }}
 ---
 apiVersion: v1
