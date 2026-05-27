@@ -96,11 +96,18 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: yashigani-caddy
-        # nginx-ingress controller pods (namespace may differ per cluster).
+        # nginx-ingress controller pods — AND semantics (B10 fix M-LIOR-001):
+        # namespaceSelector alone admits ANY pod in ingress-nginx namespace.
+        # Adding podSelector restricts to the nginx-controller pod specifically.
+        # In multi-tenant clusters a compromised pod in ingress-nginx would
+        # otherwise reach this service — lateral movement path closed.
         # Only active when global.tlsMode=nginx — Caddy is bypassed in that mode.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
       ports:
         - protocol: TCP
           port: 8080
@@ -257,9 +264,13 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: yashigani-caddy
+        # B10 fix (M-LIOR-001): AND semantics — namespace + pod selector combined.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
       ports:
         - protocol: TCP
           port: 8443
@@ -705,9 +716,13 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: yashigani-caddy
+        # B10 fix (M-LIOR-001): AND semantics — namespace + pod selector combined.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
       ports:
         - protocol: TCP
           port: 8080
@@ -768,9 +783,13 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: yashigani-caddy
+        # B10 fix (M-LIOR-001): AND semantics — namespace + pod selector combined.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
       ports:
         - protocol: TCP
           port: 9090
@@ -872,9 +891,13 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: yashigani-caddy
+        # B10 fix (M-LIOR-001): AND semantics — namespace + pod selector combined.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
       ports:
         - protocol: TCP
           port: {{ if .Values.mtls.enabled }}3443{{ else }}3000{{ end }}
