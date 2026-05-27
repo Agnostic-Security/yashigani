@@ -181,6 +181,25 @@ async def lifespan(app: FastAPI):
 
     _load_caddy_secret()
 
+    # Iris FIX-1 (v2.25.0 P2 wave 2 B12 follow-up): operator-visibility gap.
+    # When openWebui.existingSecretName is a BYO Secret that lacks the
+    # 'secret_key' key, the env var resolves to empty string and agent
+    # provisioning to Open WebUI silently fails at runtime.  The chart cannot
+    # detect this at template time, so we warn here at startup.
+    # Threat-model: OWUI_API_URL is operator-supplied; use %s parameterised
+    # logging (not f-string) to prevent log-injection.
+    _owui_api_url = os.environ.get("OWUI_API_URL", "").strip()
+    _owui_secret_key = os.environ.get("OWUI_SECRET_KEY", "").strip()
+    if _owui_api_url and not _owui_secret_key:
+        _log.warning(
+            "OWUI_API_URL is set (%s) but OWUI_SECRET_KEY is empty or absent. "
+            "Open WebUI agent provisioning will fail silently at runtime. "
+            "Either unset OWUI_API_URL to disable Open WebUI integration, or set "
+            "OWUI_SECRET_KEY (via Helm openWebui.existingSecretName containing key "
+            "'secret_key', or via docker/.env OWUI_SECRET_KEY for compose).",
+            _owui_api_url,
+        )
+
     db_dsn = os.getenv("YASHIGANI_DB_DSN", "")
     if db_dsn and "${POSTGRES_PASSWORD}" not in db_dsn:
         try:
