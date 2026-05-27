@@ -144,6 +144,51 @@ spec:
                     [ -f "$f" ] || continue
                     cp -- "$f" /tmp/leaves/
                   done
+                  # A1 fix (v2.25.0 P2): bootstrap_token_sha256 + caddy_internal_hmac
+                  # preservation.  The bootstrap Job already writes these extensionless
+                  # files into the leaves Secret (see mtls-bootstrap-job.yaml applier).
+                  # The prior rotation applier only globbed *.crt + *_client.key — so on
+                  # the FIRST rotation run the kubectl-create/apply would overwrite the
+                  # leaves Secret WITHOUT these two file classes, silently deleting them.
+                  # Impact: Caddy HMAC verification fails immediately (HTTP 401 on every
+                  # request) and _verify_bootstrap_token() fails for all services.
+                  # Fix: read the current Secret values from K8s and carry them forward,
+                  # exactly as the bootstrap Job does for caddy_internal_hmac on upgrade.
+                  #
+                  # caddy_internal_hmac — idempotent: reuse existing value.
+                  existing_hmac=""
+                  existing_hmac=$(kubectl get secret {{ .Values.mtls.secretName }} \
+                    --namespace {{ .Release.Namespace }} \
+                    -o jsonpath='{.data.caddy_internal_hmac}' 2>/dev/null \
+                    | base64 -d 2>/dev/null || true)
+                  if [ -n "$existing_hmac" ]; then
+                    printf "%s" "$existing_hmac" > /tmp/leaves/caddy_internal_hmac
+                    echo "[rotate] Carried forward caddy_internal_hmac from existing Secret."
+                  else
+                    echo "[rotate] WARNING: caddy_internal_hmac absent from existing Secret — rotation will leave it absent." >&2
+                  fi
+                  # *_bootstrap_token files — carry all of them forward from the existing Secret.
+                  # Use kubectl to list keys then fetch each one by name.
+                  existing_keys=$(kubectl get secret {{ .Values.mtls.secretName }} \
+                    --namespace {{ .Release.Namespace }} \
+                    -o jsonpath='{.data}' 2>/dev/null \
+                    | tr ',' '\n' | grep -o '"[^"]*_bootstrap_token[^"]*"' | tr -d '"' || true)
+                  for token_key in $existing_keys; do
+                    token_val=$(kubectl get secret {{ .Values.mtls.secretName }} \
+                      --namespace {{ .Release.Namespace }} \
+                      -o "jsonpath={.data.${token_key}}" 2>/dev/null \
+                      | base64 -d 2>/dev/null || true)
+                    if [ -n "$token_val" ]; then
+                      printf "%s" "$token_val" > "/tmp/leaves/${token_key}"
+                      echo "[rotate] Carried forward ${token_key} from existing Secret."
+                    fi
+                  done
+                  # ca_bundle.crt — regenerate from leaves ca_root.crt + ca_intermediate.crt
+                  # (same as bootstrap Job). Required by libpq/psycopg2 consumers.
+                  if [ -f /tmp/leaves/ca_root.crt ] && [ -f /tmp/leaves/ca_intermediate.crt ]; then
+                    cat /tmp/leaves/ca_root.crt /tmp/leaves/ca_intermediate.crt > /tmp/leaves/ca_bundle.crt
+                    echo "[rotate] ca_bundle.crt regenerated."
+                  fi
                   for f in ca_root.key ca_intermediate.key; do
                     [ -f "$f" ] || continue
                     cp -- "$f" /tmp/cakeys/
@@ -155,7 +200,7 @@ spec:
                   cd /tmp/leaves
                   kubectl create secret generic {{ .Values.mtls.secretName }} \
                     --namespace {{ .Release.Namespace }} \
-                    $(for f in *.crt *.key; do [ -f "$f" ] && echo "--from-file=$f=$f"; done) \
+                    $(for f in *.crt *.key caddy_internal_hmac *_bootstrap_token; do [ -f "$f" ] && echo "--from-file=$f=$f"; done) \
                     --dry-run=client -o yaml \
                   | kubectl apply -n {{ .Release.Namespace }} -f -
                   cd /tmp/cakeys
