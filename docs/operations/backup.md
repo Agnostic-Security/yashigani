@@ -250,12 +250,31 @@ EITHER wrap can recover the DEK.
 
 ### Wrap#2 — recovery path (license/local-key)
 
-- **Licensed tier:** IKM2 = raw bytes of the `.ysg` license file. The DEK can be recovered via
-  the portal — download your `.ysg` file and pass it to `restore.sh --recovery-license <file>`.
-  The portal retains prior `.ysg` files keyed by `license_id` (contact support if needed).
+- **Licensed tier:** IKM2 = raw bytes of the `.ysg` license file. To recover, restore the
+  **same `.ysg` file that was current when the backup was taken** and pass it to
+  `restore.sh --recovery-license <file>`. The backup's `backup-meta.json` records the
+  `license_key_id` so you can identify which `.ysg` version a given backup was encrypted under.
 - **Community tier:** IKM2 = `YASHIGANI_DB_AES_KEY` from `docker/.env`. This key is LOCAL —
   **there is NO portal recovery**. If you lose both the backup and your `.env`, the backup is
   unrecoverable. **Safeguard and offsite your `.env` before taking backups.**
+
+### License rotation and backup compatibility (READ BEFORE ROTATING A LICENSE)
+
+Wrap#2 (licensed tier) is derived from the exact bytes of the `.ysg` file. **When you renew or
+rotate your license, the new `.ysg` produces a different key — backups encrypted under the OLD
+license can no longer be decrypted with the NEW one** via the recovery path. Wrap#1 (admin
+password) is unaffected by license rotation, but it is itself broken by an admin-password change
+and is absent under `FIPS_MODE=1`, so do not rely on it as the sole recovery path.
+
+> **INTERIM LIMITATION (v2.25.0):** portal-side retention of prior `.ysg` versions is **not yet
+> available**. Until it ships you MUST, before renewing/rotating a license, EITHER:
+> 1. **Archive the old `.ysg`** offsite/secure (label it with its `license_id` / date), so you can
+>    later restore prior backups via `restore.sh --recovery-license <old.ysg>`; OR
+> 2. **Re-encrypt** the backups you need to keep by restoring them under the old license and
+>    taking a fresh backup under the new one.
+>
+> Do not rotate a license while you still depend on backups taken under the old one without doing
+> one of the above first — those backups would otherwise become unrecoverable via wrap#2.
 
 ### FIPS_MODE=1
 
