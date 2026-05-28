@@ -182,6 +182,23 @@ def reset_codegen_registry() -> None:
 # C10 — Caddy snippet validator
 # ---------------------------------------------------------------------------
 
+def _c10_require_caddy_validate() -> bool:
+    """
+    LAURA-005: return True if an absent caddy binary is a hard failure.
+
+    Controlled by two env vars (mirrors M7 enforcement-level pattern):
+      YSG_REQUIRE_CADDY_VALIDATE=true/1/yes/fail  — explicit opt-in
+      YASHIGANI_ENV=production or YASHIGANI_ENV=staging               — implicit production gate
+
+    Dev environments (unset, "dev", "development", "test") keep skip-with-warning.
+    """
+    explicit = os.environ.get("YSG_REQUIRE_CADDY_VALIDATE", "").lower()
+    if explicit in ("true", "1", "yes", "fail"):
+        return True
+    env = os.environ.get("YASHIGANI_ENV", "").lower()
+    return env in ("production", "staging", "prod")
+
+
 def _validate_caddy_snippet(
     snippet: str,
     *,
@@ -193,9 +210,16 @@ def _validate_caddy_snippet(
     The snippet is wrapped in a minimal Caddyfile shell and validated.
 
     If ``_validator`` is not provided, this function searches for the ``caddy``
-    binary.  If caddy is absent, emits a WARNING and returns (skip-with-warning
-    semantics, matching C10 spec).  If caddy IS present (or a validator callable
-    is injected), any validation failure aborts codegen.
+    binary.
+
+    LAURA-005 enforcement-level gate:
+      - If caddy is absent AND _c10_require_caddy_validate() is True
+        (YSG_REQUIRE_CADDY_VALIDATE=true or YASHIGANI_ENV=production/staging):
+        HARD FAIL — codegen aborted.  caddy must be on PATH during onboard
+        in production environments.
+      - Otherwise (dev / unset): skip with WARNING (original behaviour).
+    If caddy IS present (or a validator callable is injected), any validation
+    failure aborts codegen regardless of mode.
 
     Args:
         snippet: Caddy configuration snippet to validate.
@@ -217,9 +241,18 @@ def _validate_caddy_snippet(
     # Real path: locate caddy binary
     caddy_bin = shutil.which("caddy")
     if caddy_bin is None:
+        if _c10_require_caddy_validate():
+            raise CodegenError(
+                "C10_caddy_binary_absent",
+                "caddy binary not found and YSG_REQUIRE_CADDY_VALIDATE / YASHIGANI_ENV "
+                "mandates validation. Install caddy on PATH before running "
+                "`yashigani onboard` in production/staging (LAURA-005 / C10).",
+            )
         _log.warning(
             "C10: caddy binary not found — Caddy snippet validation SKIPPED. "
-            "Install caddy and re-run `yashigani onboard` to enforce C10."
+            "Install caddy and re-run `yashigani onboard` to enforce C10. "
+            "Set YSG_REQUIRE_CADDY_VALIDATE=true or YASHIGANI_ENV=production "
+            "to make absent caddy a hard failure (LAURA-005)."
         )
         return
 
@@ -257,8 +290,16 @@ def _safe_write(dest: Path, content: str, allowed_root: Path) -> None:
     M9 (MEDIUM): write ``content`` to ``dest`` with:
       - realpath + allowed-roots prefix check (refuse to write outside output_root)
       - symlink guard (refuse to write through a symlinked dest)
-      - atomic rename via tempfile-then-os.rename (O_NOFOLLOW semantics via
-        the realpath check above — we resolve before writing, not during)
+      - atomic rename via tempfile-then-os.rename
+
+    LAURA-004 comment accuracy: this is a check-then-atomic-rename pattern.
+    It is NOT true O_NOFOLLOW semantics (which would require per-component
+    openat(O_NOFOLLOW) at each path element).  A TOCTOU residual exists: if
+    the output directory is attacker-writable, a symlink planted between the
+    realpath check and the os.rename call will not be caught.  In the intended
+    deployment model (operator-owned output root, single-user process) this
+    risk is negligible.  Operator runbook must document: output_root must be
+    owned by and writable only by the yashigani process user.
 
     Raises:
         CodegenError: M9_path_traversal, M9_symlink_write
@@ -471,6 +512,13 @@ def _gen_compose_override(
     # L7: depends_on — ringfence-init must complete before agent starts
     init_svc = "ringfence-init-%s" % agent_name
 
+    # W3-F1: emit BOTH the isolated ringfence bridge and caddy_internal.
+    # Replicates the existing <agent>_isolated pattern at docker-compose.yml:2405-2413
+    # (langflow_isolated, letta_isolated, openclaw_isolated — internal:true,
+    # enable_ipv6:false).  The ringfence bridge provides L2 default-deny
+    # containment; caddy_internal is the only bridge that reaches Caddy egress.
+    ringfence_bridge = "ringfence_%s" % agent_name
+
     lines = [
         _header_comment(manifest_hash, runtime),
         "# Shape A compose override for agent: %s (tenant: %s)" % (agent_name, tenant_id),
@@ -478,6 +526,7 @@ def _gen_compose_override(
         "  %s:" % agent_name,
         "    image: %s:%s@%s" % (repo, tag, digest),
         "    networks:",
+        "      - %s" % ringfence_bridge,
         "      - caddy_internal",
         "    # L9 — hardened security defaults",
         "    security_opt:",
@@ -496,6 +545,13 @@ def _gen_compose_override(
         "      %s:" % init_svc,
         "        condition: service_completed_successfully",
         rootless_note.rstrip("\n") if rootless_note else "",
+        "",
+        "# W3-F1: isolated ringfence bridge — L2 default-deny containment (YSG-RISK-055)",
+        "networks:",
+        "  %s:" % ringfence_bridge,
+        "    driver: bridge",
+        "    enable_ipv6: false",
+        "    internal: true",
     ]
 
     # Remove empty lines (optional disabled features)
@@ -596,6 +652,47 @@ def _gen_networkpolicy_overlay(
     egress_allow = network.get("egress_allow") or []
 
     egress_rules = []
+
+    # W3-F2: always allow egress to Caddy pod on port 443.
+    # Replicates allow-agent-bundle-egress + allow-agent-bundle-ingress pattern
+    # from networkpolicy.yaml:1177-1247.  Without this, under default-deny egress,
+    # all LLM calls to Caddy are silently dropped.
+    # 8-space indent: matches the {egress_section} placeholder inside the
+    # textwrap.dedent template below (the template dedents everything 8 spaces,
+    # but since textwrap.dedent removes the COMMON leading whitespace from the
+    # template string, the {egress_section} placeholder is at 8-space indent
+    # relative to the YAML root).  We emit our rules at 8-space indent so they
+    # nest correctly under egress:.
+    egress_rules.append(
+        "        # W3-F2: allow egress to Caddy (ring-fence egress gateway) — port 443\n"
+        "        - to:\n"
+        "            - podSelector:\n"
+        "                matchLabels:\n"
+        "                  app.kubernetes.io/name: caddy\n"
+        "          ports:\n"
+        "            - protocol: TCP\n"
+        "              port: 443"
+    )
+
+    # W3-F2: always allow egress to kube-dns (UDP+TCP 53).
+    # Without this, service-name resolution inside the agent pod fails under
+    # default-deny egress (the agent cannot resolve "caddy" or any other svc name).
+    egress_rules.append(
+        "        # W3-F2: allow egress to kube-dns — UDP+TCP 53\n"
+        "        - to:\n"
+        "            - namespaceSelector:\n"
+        "                matchLabels:\n"
+        "                  kubernetes.io/metadata.name: kube-system\n"
+        "              podSelector:\n"
+        "                matchLabels:\n"
+        "                  k8s-app: kube-dns\n"
+        "          ports:\n"
+        "            - protocol: UDP\n"
+        "              port: 53\n"
+        "            - protocol: TCP\n"
+        "              port: 53"
+    )
+
     for entry in egress_allow:
         if not isinstance(entry, dict):
             continue
@@ -605,12 +702,15 @@ def _gen_networkpolicy_overlay(
         ports = entry.get("ports") or []
         port_block = ""
         if ports:
-            port_lines = "\n".join("          - port: %d" % p for p in ports)
-            port_block = "\n        ports:\n%s" % port_lines
-        egress_rules.append("      - to:\n          - ipBlock:\n              cidr: 0.0.0.0/0%s  # %s" % (
-            port_block, host))
+            port_lines = "\n".join("            - port: %d" % p for p in ports)
+            port_block = "\n          ports:\n%s" % port_lines
+        egress_rules.append(
+            "        - to:\n"
+            "            - ipBlock:\n"
+            "                cidr: 0.0.0.0/0%s  # %s" % (port_block, host)
+        )
 
-    egress_section = "\n".join(egress_rules) if egress_rules else "      []  # no egress configured"
+    egress_section = "\n".join(egress_rules)
 
     content = textwrap.dedent("""\
         {header}
@@ -747,9 +847,15 @@ def _gen_caddy_snippet(
     if not deduped_upstreams:
         # No upstream configured — emit a placeholder route that returns 502
         upstream_block = "        respond \"no upstream configured\" 502"
+    elif len(deduped_upstreams) == 1:
+        # W3-F3: Caddy requires `reverse_proxy <upstream>` (inline) for a single
+        # upstream, NOT bare hostnames as sub-lines inside a block.
+        # Single upstream: `reverse_proxy <upstream>` (inline form).
+        upstream_block = "        reverse_proxy %s" % deduped_upstreams[0]
     else:
-        upstream_lines = "\n".join("        %s" % u for u in deduped_upstreams)
-        upstream_block = "        reverse_proxy {\n%s\n        }" % upstream_lines
+        # W3-F3: multiple upstreams use `reverse_proxy { to <upstream> }` block form.
+        to_lines = "\n".join("            to %s" % u for u in deduped_upstreams)
+        upstream_block = "        reverse_proxy {\n%s\n        }" % to_lines
 
     rootless_note = ""
     if runtime == "podman-rootless":
@@ -802,10 +908,10 @@ def _gen_service_identity_entry(
     agent_name = meta.get("name", "")
     tenant_id = meta.get("tenant_id", "")
 
-    try:
-        spiffe_id = resolve_spiffe_uri(parsed)
-    except ValueError:
-        spiffe_id = "spiffe://yashigani.internal/agents/%s/%s" % (tenant_id, agent_name)
+    # W3-F4: let ValueError propagate so a future validation addition cannot
+    # be silently bypassed.  The linter must reject manifests with missing
+    # name/tenant_id before codegen is invoked.
+    spiffe_id = resolve_spiffe_uri(parsed)
 
     content = textwrap.dedent("""\
         {header}

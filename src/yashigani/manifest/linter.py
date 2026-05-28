@@ -14,9 +14,14 @@ Rules implemented here:
   C1  — egress_allow host must not resolve to RFC1918/loopback/link-local
          (static parse-time check on literal values; full DNS is codegen).
          Also applied to spec.model_egress.base_url (F4 — Laura MED).
+         LAURA-001 fix: normalise before ipaddress parse — strip trailing
+         dots, unwrap brackets, reject integer/hex/octal strings, check
+         ipv4_mapped attribute, add fd00::/7 ULA and 0.0.0.0/8.
   C3  — duplicate (tenant_id, name) within a single validate run (stateless
          in v1 — registry uniqueness is a runtime concern; validator flags
          exact duplicate fields in the manifest itself).
+         LAURA-002/003 fix: metadata.name and metadata.tenant_id must match
+         _SLUG_RE (^[a-z0-9][a-z0-9\\-]{0,62}[a-z0-9]$).
   P2  — spec.mcp.identity_propagation == gateway-enforced-only is FORBIDDEN
          when spec.audit.sensitivity_ceiling is CONFIDENTIAL or RESTRICTED.
          Default sensitivity ceiling is CONFIDENTIAL (L-01), so an absent
@@ -29,8 +34,10 @@ W3 additions (v2.25.0 P1):
   P2  — spec.mcp.identity_propagation == gateway-enforced-only is FORBIDDEN
          when spec.audit.sensitivity_ceiling is CONFIDENTIAL or RESTRICTED
          (default is CONFIDENTIAL per L-01).
+  LAURA-001 — _is_private_address SSRF bypass hardening.
+  LAURA-002/003 — slug validation on metadata.name and metadata.tenant_id.
 
-Last updated: 2026-05-28T00:00:00+00:00
+Last updated: 2026-05-29T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -379,30 +386,89 @@ _RFC1918: tuple[ipaddress.IPv4Network, ...] = (
     ipaddress.IPv4Network("172.16.0.0/12"),
     ipaddress.IPv4Network("192.168.0.0/16"),
 )
+# LAURA-001: additional blocked ranges
+_ZERO_V4 = ipaddress.IPv4Network("0.0.0.0/8")          # 0.0.0.0/8 — routes to localhost on Docker
+_ULA_V6 = ipaddress.IPv6Network("fc00::/7")             # fd00::/7 ULA (fc00::/7 covers both fc::/8 and fd::/8)
 _LOOPBACK_V6 = ipaddress.IPv6Network("::1/128")
 _LINK_LOCAL_V6 = ipaddress.IPv6Network("fe80::/10")
+_IPV4_MAPPED_V6 = ipaddress.IPv6Network("::ffff:0:0/96")  # IPv4-mapped (::ffff:<ipv4>)
+
+# LAURA-001: reject non-standard IP text encodings before handing to ipaddress.
+# Decimal integers (2852039166), hex (0xAA9EFEA), octal (0252...)  are accepted
+# by getaddrinfo but raise ValueError in ipaddress.ip_address().  We must block
+# them explicitly so they are not silently passed as "hostnames".
+# Only dotted-quad IPv4 or standard colon-hex IPv6 (optionally bracket-wrapped)
+# are acceptable literal IP forms.
+# _PURE_DECIMAL_RE: any string that is purely digits is a decimal-encoded IP.
+_PURE_DECIMAL_RE = re.compile(r"^\d+$")
+# _HEX_IP_RE: 0x-prefixed hex strings are also alternative IP encodings.
+_HEX_IP_RE = re.compile(r"^0[xX][0-9a-fA-F]+$")
 
 
 def _is_private_address(host: str) -> bool:
     """
-    Return True if ``host`` is a literal RFC1918, loopback, or link-local address.
+    Return True if ``host`` is a literal RFC1918, loopback, link-local,
+    ULA, zero-address, or IPv4-mapped-IPv6 address.
+
+    LAURA-001 hardening (v2.25.0):
+    - Strip a trailing dot before parsing (169.254.169.254. bypass).
+    - Unwrap [...] brackets (IPv6 bracket form from URL parsing).
+    - Reject decimal-integer strings (2852039166) and hex strings
+      (0xAA9EFE...) — getaddrinfo resolves them but ipaddress raises
+      ValueError, causing the old code to pass them as "hostnames".
+    - Add fd00::/7 (IPv6 ULA, covers fc00::/7 and fd00::/7) to blocklist.
+    - Add 0.0.0.0/8 to blocklist.
+    - For IPv6Address, unwrap ipv4_mapped and re-run check on the IPv4.
+    - Add ::ffff:0:0/96 (IPv4-mapped) to IPv6 blocklist.
 
     Hostnames (non-IP strings) are NOT resolved — that is the codegen's job.
     Only literal IP addresses are checked here.
     """
+    # --- normalise ---
+    # Strip trailing dot (C1-E bypass: "169.254.169.254.")
+    if host.endswith("."):
+        host = host[:-1]
+
+    # Unwrap IPv6 bracket form (C1-A bypass: "[::ffff:169.254.169.254]")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
+    # Reject pure-decimal integers (C1-B bypass: "2852039166")
+    # and hex strings ("0xAA9EFEA") — these are alternative IP encodings
+    # that ipaddress rejects with ValueError, but getaddrinfo resolves.
+    if _PURE_DECIMAL_RE.match(host) or _HEX_IP_RE.match(host):
+        # These are not valid hostname characters either, but treat as
+        # private to fail closed (getaddrinfo may resolve them to private).
+        return True
+
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return False  # hostname — not a literal IP
+        return False  # genuine hostname — not a literal IP
 
     if isinstance(addr, ipaddress.IPv4Address):
         return (
             addr in _LOOPBACK_V4
             or addr in _LINK_LOCAL_V4
+            or addr in _ZERO_V4        # LAURA-001: 0.0.0.0/8
             or any(addr in net for net in _RFC1918)
         )
     if isinstance(addr, ipaddress.IPv6Address):
-        return addr in _LOOPBACK_V6 or addr in _LINK_LOCAL_V6
+        # LAURA-001: unwrap IPv4-mapped IPv6 and re-run IPv4 check (C1-A)
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return (
+                mapped in _LOOPBACK_V4
+                or mapped in _LINK_LOCAL_V4
+                or mapped in _ZERO_V4
+                or any(mapped in net for net in _RFC1918)
+            )
+        return (
+            addr in _LOOPBACK_V6
+            or addr in _LINK_LOCAL_V6
+            or addr in _ULA_V6         # LAURA-001: fc00::/7 ULA
+            or addr in _IPV4_MAPPED_V6  # LAURA-001: ::ffff:0:0/96
+        )
     return False
 
 
@@ -530,10 +596,21 @@ def _lint_identity_propagation_p2(parsed: dict) -> list[LintError]:
 # C3 — duplicate (tenant_id, agent_id) check within a single manifest
 # ---------------------------------------------------------------------------
 
+# LAURA-002/003: slug constraint for metadata.name and metadata.tenant_id.
+# Enforces lowercase alphanumeric + hyphen, 2-64 chars, no leading/trailing hyphen.
+# This closes all four INJ sub-findings simultaneously (Caddy, shell, YAML, Kyverno).
+# Characters like }, ", \n, / cannot appear in a valid slug.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$")
+
+
 def _lint_name_uniqueness(parsed: dict) -> list[LintError]:
     """
     C3 — within a single manifest file, metadata.name + metadata.tenant_id
-    must not be empty (the combination must be non-trivial).
+    must not be empty, and must match the slug format.
+
+    LAURA-002/003 fix: enforce _SLUG_RE on both fields.  A slug-valid name
+    cannot contain }, ", \\n, /, or .. — closing all injection sub-findings
+    (INJ-A Caddy, INJ-B shell, INJ-C YAML, INJ-D Kyverno).
 
     Full registry-level uniqueness is enforced at runtime; the linter only
     flags the stateless case where both fields are empty (usually a template
@@ -543,14 +620,31 @@ def _lint_name_uniqueness(parsed: dict) -> list[LintError]:
     metadata = parsed.get("metadata") or {}
     name = metadata.get("name", "")
     tenant_id = metadata.get("tenant_id", "")
+
+    _SLUG_FIX = (
+        "Use only lowercase letters (a-z), digits (0-9), and hyphens (-). "
+        "Must start and end with a letter or digit. Length 2–64 characters. "
+        "No /, \\n, }, \", or other special characters."
+    )
+
     if not name:
         errors.append(LintError(
             "C3_name_empty",
             "metadata.name is required and must not be empty.",
             field="metadata.name",
-            fix="Set metadata.name to a lowercase alphanumeric identifier for this agent "
-                "(e.g. name: my-agent).",
+            fix="Set metadata.name to a lowercase alphanumeric slug (e.g. name: my-agent).",
         ))
+    elif not _SLUG_RE.match(name):
+        errors.append(LintError(
+            "C3_name_invalid_slug",
+            "metadata.name %r does not match the required slug format. "
+            "Names are interpolated into Caddy config, shell variables, YAML, and "
+            "Kyverno manifests — non-slug characters enable injection attacks "
+            "(LAURA-002/003 — SSRF / injection prevention)." % name,
+            field="metadata.name",
+            fix=_SLUG_FIX,
+        ))
+
     if not tenant_id:
         errors.append(LintError(
             "C3_tenant_id_empty",
@@ -558,6 +652,16 @@ def _lint_name_uniqueness(parsed: dict) -> list[LintError]:
             field="metadata.tenant_id",
             fix="Set metadata.tenant_id to your organisation's tenant identifier "
                 "(e.g. tenant_id: acme-corp).",
+        ))
+    elif not _SLUG_RE.match(tenant_id):
+        errors.append(LintError(
+            "C3_tenant_id_invalid_slug",
+            "metadata.tenant_id %r does not match the required slug format. "
+            "Tenant IDs are interpolated into Caddy config, shell variables, YAML, and "
+            "Kyverno manifests — non-slug characters enable injection attacks "
+            "(LAURA-002/003 — injection prevention)." % tenant_id,
+            field="metadata.tenant_id",
+            fix=_SLUG_FIX,
         ))
     return errors
 
