@@ -46,9 +46,21 @@ metadata:
     helm.sh/resource-policy: keep
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
-    # B13: PSA baseline enforcement — defence-in-depth regardless of Kyverno posture.
-    pod-security.kubernetes.io/enforce: baseline
-    pod-security.kubernetes.io/enforce-version: latest
+    # B13: PSA baseline labels (LIVE-B13-002 post-live-verify revision).
+    #
+    # Live-verify on kind v1.35.0 caught that enforce=baseline REJECTS the caddy
+    # pod because caddy requires CAP_NET_ADMIN for the ip6tables OUTPUT egress
+    # hardening (YSG-RISK-061, c838004). PSA baseline forbids NET_ADMIN. Result:
+    # caddy ReplicaSet sees FailedCreate for every spawn, 0 ready replicas, the
+    # auth perimeter is down. enforce=baseline + NET_ADMIN are incompatible at
+    # the namespace tier — they cannot coexist without a namespace-per-pod split.
+    #
+    # Revised posture: warn + audit baseline only. Operators get full visibility
+    # (cluster events + audit log entries) but pods admit. Hard enforcement is
+    # delegated to Kyverno (admissionPolicies.enabled=true) which CAN express
+    # the "caddy is exempt from NET_ADMIN rule" exception that PSA cannot.
+    # This is honest: we don't claim enforcement we cannot deliver chart-wide
+    # (per Tiago no-legacy-dishonest-mode-flags rule).
     pod-security.kubernetes.io/warn: baseline
     pod-security.kubernetes.io/warn-version: latest
     pod-security.kubernetes.io/audit: baseline
