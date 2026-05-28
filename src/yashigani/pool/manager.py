@@ -83,7 +83,7 @@ class CertMount:
             self.spiffe_identity
         ):
             raise ValueError(
-                "CertMount.spiffe_identity %r does not match the required prefix "
+                f"CertMount.spiffe_identity {self.spiffe_identity!r} does not match the required prefix "
                 "spiffe://yashigani.internal/agents/ — arbitrary SPIFFE identities "
                 "must not flow silently into ContainerInfo. "
                 "Use spiffe://yashigani.internal/agents/<tenant_id>/<agent_name> "
