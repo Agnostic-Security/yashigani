@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# lib/yashigani-fips.sh — FIPS-aware SHA-256 helpers for integrity-verification paths
+# lib/yashigani-fips.sh — FIPS-aware SHA-256/HMAC-SHA-384 helpers for integrity-verification paths
+# last-updated: 2026-05-28T00:00:00+01:00 (feat(backup): YSG-RISK-050/051 — add _fips_hmac_sha384 for scheduled backup.sh CLI path)
 # last-updated: 2026-05-24T00:00:00+01:00 (feat(fips): N2 — route --confirm SHA-256 through OpenSSL FIPS Provider when FIPS_MODE=1)
 #
 # FIPS compliance boundary
@@ -34,15 +35,19 @@
 #
 # Scope restriction (SOP — do not relax)
 # ----------------------------------------
-# _fips_sha256 and _fips_sha256_manifest_stream are ONLY for paths inside the
-# FIPS-asserted attestation chain:
+# _fips_sha256, _fips_sha256_manifest_stream, and _fips_hmac_sha384 are ONLY
+# for paths inside the FIPS-asserted attestation chain:
 #   - Backup MANIFEST.sha256 generation (install.sh + restore.sh RETRO-R4-3)
 #   - Air-gap bundle integrity verification (install.sh --airgap)
 #   - Air-gap bundle sidecar manifest hash (scripts/prepare-airgap-bundle.sh)
 #   - Test harness manifest build (scripts/test_retro_r4_vm.sh)
+#   - Scheduled backup.sh CLI HMAC-SHA384 integrity (YSG-RISK-050)
 #
 # Do NOT route session IDs, cache keys, or other non-attestation hashes through
 # these helpers. BusyBox portability is acceptable there; FIPS overhead is not needed.
+# NOTE: install-time backup (install.sh _backup_existing_data) uses Python
+# `cryptography` + `argon2-cffi` inside the gateway/backoffice container for
+# the full dual-wrap construction; _fips_hmac_sha384 is the CLI shell path only.
 
 set -euo pipefail
 
@@ -136,4 +141,68 @@ _fips_sha256_manifest_stream() {
     # Portable fast path: pass all paths to xargs sha256sum in one shot.
     xargs -0 sha256sum | awk '{gsub(/^\.\//, "", $2); print}'
   fi
+}
+
+# ---------------------------------------------------------------------------
+# _fips_hmac_sha384 <key_hex> <data_file>
+# ---------------------------------------------------------------------------
+# Computes HMAC-SHA384 over <data_file> using the 48-byte key supplied as
+# lowercase hex (96 hex chars).  Prints the lowercase hex MAC to stdout.
+#
+# Scope: scheduled backup.sh CLI path ONLY (YSG-RISK-050).
+# The install-time dual-wrap backup uses Python `cryptography` inside the
+# gateway/backoffice container — do not use this function there.
+#
+# When FIPS_MODE=1: HMAC-SHA384 routes through OpenSSL FIPS Provider (CNSA-2.0
+# symmetric suite; FIPS 140-3 §6.4).  Fails closed if provider not loaded.
+# When FIPS_MODE=0: uses `openssl dgst -sha384 -mac HMAC` (non-FIPS path).
+#
+# Arguments:
+#   key_hex   — lowercase hex-encoded MAC key (must be exactly 96 hex chars = 48 bytes)
+#   data_file — path to the file to MAC
+#
+# Returns 1 on any error (missing args, bad key length, OpenSSL failure,
+# FIPS provider absent when FIPS_MODE=1).  Never emits an empty MAC.
+# ---------------------------------------------------------------------------
+_fips_hmac_sha384() {
+  local _key_hex="${1:?_fips_hmac_sha384 requires key_hex argument}"
+  local _data_file="${2:?_fips_hmac_sha384 requires data_file argument}"
+
+  # Key must be exactly 96 hex chars (48 bytes).
+  if [[ "${#_key_hex}" -ne 96 ]]; then
+    printf 'ERROR: _fips_hmac_sha384: key_hex must be 96 hex chars (48 bytes), got %d\n' \
+      "${#_key_hex}" >&2
+    return 1
+  fi
+  if [[ ! -f "$_data_file" ]]; then
+    printf 'ERROR: _fips_hmac_sha384: data file not found: %s\n' "$_data_file" >&2
+    return 1
+  fi
+
+  local _use_fips="${FIPS_MODE:-0}"
+  if [ "$_use_fips" != "1" ] && openssl version 2>/dev/null | grep -qi 'fips'; then
+    _use_fips="1"
+  fi
+
+  if [ "$_use_fips" = "1" ]; then
+    _fips_assert_provider_loaded || return 1
+  fi
+
+  # openssl dgst -sha384 -mac HMAC -macopt hexkey:<hex> routes through FIPS
+  # provider when loaded (same EVP path as AES-GCM + HKDF).
+  # Output: "HMAC-SHA384(<file>)= <hex>" — extract hex after last '= '.
+  local _mac
+  _mac=$(openssl dgst -sha384 -mac HMAC -macopt "hexkey:${_key_hex}" \
+           "$_data_file" 2>/dev/null \
+         | awk -F'= ' '{print $NF}') || {
+    printf 'ERROR: _fips_hmac_sha384: openssl dgst failed for %s\n' "$_data_file" >&2
+    return 1
+  }
+
+  if [[ -z "$_mac" ]]; then
+    printf 'ERROR: _fips_hmac_sha384: empty MAC output (openssl dgst produced no output)\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' "$_mac"
 }

@@ -100,6 +100,20 @@ RUN_VALIDATE=false
 ENCRYPTED_MODE=false
 IDENTITY_FILE="${YASHIGANI_BACKUP_IDENTITY_FILE:-/etc/yashigani/backup-identity.age}"
 
+# ---------------------------------------------------------------------------
+# v2 dual-wrap restore state (YSG-RISK-050/051)
+# Flow A: --recovery-password (interactive prompt, default)
+# Flow B: --recovery-license <path>  (licensed tier wrap#2)
+# Flow C: --recovery-key <hex|env>   (community tier wrap#2)
+# ---------------------------------------------------------------------------
+V2_RECOVERY_MODE="password"     # "password" | "license" | "key"
+V2_RECOVERY_LICENSE=""          # path to .ysg file for flow B
+V2_RECOVERY_KEY=""              # hex-encoded key for flow C
+
+# Script-global staging dir for v2 decrypt (must be global for EXIT trap to reach it;
+# same pattern as _DECRYPT_EXTRACT_DIR for the age-encrypted restore path).
+_V2_STAGING_DIR=""
+
 log_info()    { printf "    --> %s\n" "$*"; }
 log_success() { printf "    ${C_GREEN}ok${C_RESET}  %s\n" "$*"; }
 log_error()   { printf "    ${C_RED}!!  ERROR: %s${C_RESET}\n" "$*" >&2; }
@@ -308,12 +322,400 @@ list_backups() {
 }
 
 # ---------------------------------------------------------------------------
+# _validate_v2_backup <backup_dir>
+# YSG-RISK-050/051: Structural + HMAC validation for v2 dual-wrap backups.
+# Checks that backup-meta.json is well-formed and bundle.enc is present.
+# Does NOT decrypt (that requires the credential — done in _v2_decrypt_to_staging).
+# HMAC verification requires the DEK which is only available after decryption —
+# we do structural + schema checks here; HMAC is verified inside _v2_decrypt_to_staging.
+# ---------------------------------------------------------------------------
+_validate_v2_backup() {
+  local backup_dir="$1"
+  local errors=0
+
+  log_info "v2 encrypted backup detected (backup-meta.json present)"
+
+  # Hard fail: bundle.enc must exist alongside the meta.
+  if [[ ! -f "${backup_dir}/bundle.enc" ]]; then
+    log_error "v2 backup missing bundle.enc — partial backup or corrupt directory"
+    errors=$((errors + 1))
+  fi
+
+  if [[ "$errors" -gt 0 ]]; then
+    log_error "v2 backup validation: ${errors} failure(s)"
+    return 1
+  fi
+
+  # Schema check: backup-meta.json must be valid JSON with expected top-level keys.
+  local _meta_keys_ok=true
+  for _key in version ts tier bundle_aead wrap1 wrap2 hmac; do
+    if ! python3 -c "import json,sys; m=json.load(open('${backup_dir}/backup-meta.json')); sys.exit(0 if '${_key}' in m else 1)" 2>/dev/null; then
+      log_error "v2 backup-meta.json missing required key: ${_key}"
+      _meta_keys_ok=false
+      errors=$((errors + 1))
+    fi
+  done
+
+  # Check version field.
+  if [[ "$_meta_keys_ok" == "true" ]]; then
+    local _version
+    _version=$(python3 -c "import json; print(json.load(open('${backup_dir}/backup-meta.json'))['version'])" 2>/dev/null || true)
+    if [[ "$_version" != "yashigani-backup-v1" ]]; then
+      log_error "v2 backup-meta.json unknown version: '${_version}' (expected 'yashigani-backup-v1')"
+      errors=$((errors + 1))
+    fi
+
+    # Check wrap2.present is true (wrap#2 is always required — fail-closed).
+    local _wrap2_present
+    _wrap2_present=$(python3 -c "import json; print(json.load(open('${backup_dir}/backup-meta.json'))['wrap2']['present'])" 2>/dev/null || true)
+    if [[ "$_wrap2_present" != "True" && "$_wrap2_present" != "true" ]]; then
+      log_error "v2 backup-meta.json wrap2.present is not true — recovery wrap is missing (corrupt backup)"
+      errors=$((errors + 1))
+    fi
+
+    # Warn if wrap1.present is false.
+    local _wrap1_present
+    _wrap1_present=$(python3 -c "import json; print(json.load(open('${backup_dir}/backup-meta.json'))['wrap1']['present'])" 2>/dev/null || true)
+    if [[ "$_wrap1_present" == "False" || "$_wrap1_present" == "false" ]]; then
+      log_warn "v2 backup: wrap1.present=false — admin-password path unavailable; use --recovery-license or --recovery-key"
+    fi
+
+    # Warn if bundle.enc is suspiciously small (< 256 bytes would indicate an empty bundle).
+    local _bundle_size
+    _bundle_size=$(wc -c < "${backup_dir}/bundle.enc" 2>/dev/null | tr -d ' ')
+    if [[ -n "$_bundle_size" && "$_bundle_size" -lt 256 ]]; then
+      log_error "v2 bundle.enc is suspiciously small (${_bundle_size} bytes) — likely corrupt"
+      errors=$((errors + 1))
+    fi
+  fi
+
+  if [[ "$errors" -gt 0 ]]; then
+    log_error "v2 backup validation: ${errors} failure(s)"
+    return 1
+  fi
+
+  log_success "v2 backup structural validation passed (HMAC will be verified at decrypt time)"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# _v2_decrypt_to_staging <backup_dir> <staging_dir>
+# YSG-RISK-050/051: Decrypt a v2 backup bundle to a staging directory.
+# Reads V2_RECOVERY_MODE / V2_RECOVERY_LICENSE / V2_RECOVERY_KEY globals
+# (set from CLI flags). For flow A (password), prompts interactively.
+# On success: staging_dir contains the extracted contents (secrets/, .env, etc.)
+# On failure: exits non-zero (fail-closed; no partial state).
+# ---------------------------------------------------------------------------
+_v2_decrypt_to_staging() {
+  local backup_dir="$1"
+  local staging_dir="$2"
+
+  local meta_file="${backup_dir}/backup-meta.json"
+  local bundle_file="${backup_dir}/bundle.enc"
+
+  mkdir -p "$staging_dir"
+
+  log_info "v2 backup: decrypting bundle.enc (flow: ${V2_RECOVERY_MODE})"
+
+  # Build the Python decrypt inline script.
+  local _py_decrypt
+  _py_decrypt=$(cat << 'PYPEOF'
+#!/usr/bin/env python3
+"""
+YSG-RISK-050/051: v2 backup decrypt + HMAC verify.
+LOCKED spec 2026-05-28. Three flows: A=password, B=license, C=key.
+All credentials via environment variables.
+"""
+import hashlib
+import hmac as _hmac
+import json
+import os
+import sys
+import tarfile
+import io
+from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.hashes import SHA384
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidTag
+except ImportError as e:
+    sys.stderr.write(f"FATAL: cryptography not available: {e}\n"); sys.exit(1)
+
+try:
+    from argon2.low_level import hash_secret_raw, Type as Argon2Type
+except ImportError as e:
+    sys.stderr.write(f"FATAL: argon2-cffi not available: {e}\n"); sys.exit(1)
+
+META_FILE    = os.environ["_YSG_META_FILE"]
+BUNDLE_FILE  = os.environ["_YSG_BUNDLE_FILE"]
+STAGING_DIR  = os.environ["_YSG_STAGING_DIR"]
+FLOW         = os.environ["_YSG_FLOW"]         # "password" | "license" | "key"
+CREDENTIAL   = os.environ.get("_YSG_CREDENTIAL", "")  # plaintext password | hex IKM2
+FIPS_MODE_F  = os.environ.get("_YSG_FIPS_MODE", "0") == "1"
+
+meta = json.loads(Path(META_FILE).read_text())
+bundle_ct = Path(BUNDLE_FILE).read_bytes()
+ts = meta["ts"]
+
+def _hkdf(ikm, salt, info, length):
+    return HKDF(
+        algorithm=SHA384(), length=length,
+        salt=salt if salt else None, info=info,
+        backend=default_backend(),
+    ).derive(ikm)
+
+def _zero(b):
+    if isinstance(b, bytearray):
+        for i in range(len(b)): b[i] = 0
+
+# ── Derive DEK ───────────────────────────────────────────────────────────────
+dek = None
+
+if FLOW == "password":
+    w1 = meta.get("wrap1", {})
+    if not w1.get("present", False):
+        sys.stderr.write("FATAL: wrap1.present=false — admin-password path not available.\n")
+        sys.stderr.write("  Use --recovery-license or --recovery-key to restore via wrap#2.\n")
+        sys.exit(1)
+    kdf_algo = w1["kdf_algo"]
+    kek1_hkdf_salt = bytes.fromhex(w1["kek1_hkdf_salt_hex"])
+    iv1            = bytes.fromhex(w1["iv_hex"])
+    wdek1_ct       = bytes.fromhex(w1["wdek_ct_hex"])
+    wdek1_tag      = bytes.fromhex(w1["wdek_tag_hex"])
+    aad1 = b"yashigani-backup-v1" + ts.encode() + b"\x01"
+
+    if "argon2id" in kdf_algo and not FIPS_MODE_F:
+        salt_b   = bytes.fromhex(w1["argon2_salt_hex"])
+        ikm1 = bytearray(hash_secret_raw(
+            secret=CREDENTIAL.encode(),
+            salt=salt_b,
+            time_cost=w1["argon2_time_cost"],
+            memory_cost=w1["argon2_memory_cost"],
+            parallelism=w1["argon2_parallelism"],
+            hash_len=w1["argon2_hash_len"],
+            type=Argon2Type.ID,
+            version=w1["argon2_version"],
+        ))
+    else:
+        pbkdf2_salt = bytes.fromhex(w1["pbkdf2_salt_hex"])
+        kdf = PBKDF2HMAC(
+            algorithm=SHA384(), length=32,
+            salt=pbkdf2_salt, iterations=w1["pbkdf2_iterations"],
+            backend=default_backend(),
+        )
+        ikm1 = bytearray(kdf.derive(CREDENTIAL.encode()))
+
+    kek1 = bytearray(_hkdf(bytes(ikm1), kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
+    _zero(ikm1)
+    try:
+        dek = bytearray(AESGCM(bytes(kek1)).decrypt(iv1, wdek1_ct + wdek1_tag, aad1))
+    except InvalidTag:
+        sys.stderr.write("FATAL: Wrong password — AES-GCM tag verification failed (InvalidTag).\n")
+        sys.stderr.write("  The admin password does not match the backup. Try --recovery-license or --recovery-key.\n")
+        sys.exit(2)
+    finally:
+        _zero(kek1)
+
+else:
+    # Flow B or C: wrap#2
+    w2 = meta.get("wrap2", {})
+    if not w2.get("present", False):
+        sys.stderr.write("FATAL: wrap2.present=false — recovery path not available.\n")
+        sys.exit(1)
+    kek2_hkdf_salt = bytes.fromhex(w2["kek2_hkdf_salt_hex"])
+    iv2            = bytes.fromhex(w2["iv_hex"])
+    wdek2_ct       = bytes.fromhex(w2["wdek_ct_hex"])
+    wdek2_tag      = bytes.fromhex(w2["wdek_tag_hex"])
+    aad2 = b"yashigani-backup-v1" + ts.encode() + b"\x02"
+    ikm2 = bytearray(bytes.fromhex(CREDENTIAL))
+    kek2 = bytearray(_hkdf(bytes(ikm2), kek2_hkdf_salt, b"yashigani-kek2-v1", 32))
+    _zero(ikm2)
+    try:
+        dek = bytearray(AESGCM(bytes(kek2)).decrypt(iv2, wdek2_ct + wdek2_tag, aad2))
+    except InvalidTag:
+        sys.stderr.write("FATAL: Recovery key/license does not match backup wrap#2 — AES-GCM InvalidTag.\n")
+        sys.exit(2)
+    finally:
+        _zero(kek2)
+
+# ── Verify HMAC-SHA384 ────────────────────────────────────────────────────────
+mac_key = bytearray(_hkdf(bytes(dek), b"", b"yashigani-backup-meta-mac-v1", 48))
+
+# Re-derive AAD_B: meta with hmac_hex = "" (same canonical form as backup time).
+meta_for_aad = json.loads(Path(META_FILE).read_text())
+meta_for_aad["hmac"]["hmac_hex"] = ""
+aad_b = json.dumps(meta_for_aad, sort_keys=True, separators=(",", ":")).encode()
+
+expected_hmac = _hmac.new(bytes(mac_key), aad_b, digestmod=hashlib.sha384).hexdigest()
+_zero(mac_key)
+
+stored_hmac = meta.get("hmac", {}).get("hmac_hex", "")
+if not _hmac.compare_digest(expected_hmac, stored_hmac):
+    sys.stderr.write("FATAL: HMAC-SHA384 verification failed — backup-meta.json has been tampered.\n")
+    sys.stderr.write("  Expected and stored HMACs do not match. Refuse to restore.\n")
+    sys.exit(3)
+
+# ── Decrypt bundle.enc → tar.gz ───────────────────────────────────────────────
+bundle_iv = bytes.fromhex(meta["bundle_aead"]["iv_hex"])
+try:
+    pt_bytes = AESGCM(bytes(dek)).decrypt(bundle_iv, bundle_ct, aad_b)
+except InvalidTag:
+    sys.stderr.write("FATAL: bundle.enc AES-GCM tag verification failed — bundle tampered or corrupt.\n")
+    sys.exit(3)
+finally:
+    _zero(dek)
+
+# ── Extract tar.gz to staging_dir ─────────────────────────────────────────────
+staging = Path(STAGING_DIR)
+staging.mkdir(parents=True, exist_ok=True)
+with tarfile.open(fileobj=io.BytesIO(pt_bytes), mode="r:gz") as tar:
+    def _safe_extract(tar, path):
+        for member in tar.getmembers():
+            # Strip leading arcname prefix (backup_staging/).
+            if member.name.startswith("backup_staging/"):
+                member.name = member.name[len("backup_staging/"):]
+            elif member.name == "backup_staging":
+                continue
+            if not member.name or member.name.startswith("..") or "//" in member.name:
+                continue
+            tar.extract(member, path=path)
+    _safe_extract(tar, str(staging))
+
+sys.stdout.write("OK: bundle decrypted, HMAC verified, extracted to staging\n")
+sys.exit(0)
+PYPEOF
+  )
+
+  # Gather the credential for the chosen flow.
+  local _credential=""
+  local _flow_env="$V2_RECOVERY_MODE"
+
+  case "$V2_RECOVERY_MODE" in
+    password)
+      # Flow A: prompt for admin password interactively.
+      local _wrap1_present
+      _wrap1_present=$(python3 -c \
+        "import json; m=json.load(open('${meta_file}')); print(m['wrap1'].get('present', False))" \
+        2>/dev/null || true)
+      if [[ "$_wrap1_present" == "False" || "$_wrap1_present" == "false" ]]; then
+        log_error "v2 backup: wrap1.present=false — admin-password restore unavailable."
+        log_error "  Use --recovery-license <path> or --recovery-key <hex> to restore via wrap#2."
+        exit 1
+      fi
+      printf "\n"
+      printf "  %s\n" "v2 encrypted backup — enter the Yashigani admin password to decrypt."
+      printf "  %s\n" "(This is the password you use to log in to the admin panel.)"
+      printf "\n"
+      read -rs -p "  Admin password: " _credential
+      printf "\n"
+      if [[ -z "$_credential" ]]; then
+        log_error "v2 backup: empty password entered — aborting."
+        exit 1
+      fi
+      ;;
+    license)
+      # Flow B: licensed tier — read .ysg file bytes as hex-encoded IKM2.
+      if [[ -z "$V2_RECOVERY_LICENSE" ]]; then
+        log_error "v2 backup: --recovery-license requires a path to the .ysg license file."
+        exit 1
+      fi
+      if [[ ! -f "$V2_RECOVERY_LICENSE" ]]; then
+        log_error "v2 backup: license file not found: ${V2_RECOVERY_LICENSE}"
+        exit 1
+      fi
+      _credential=$(xxd -p -c 9999 "$V2_RECOVERY_LICENSE" 2>/dev/null | tr -d '\n' \
+        || od -A n -t x1 "$V2_RECOVERY_LICENSE" 2>/dev/null | tr -d ' \n' || true)
+      if [[ -z "$_credential" ]]; then
+        log_error "v2 backup: failed to hex-encode .ysg file (xxd/od missing?)"
+        exit 1
+      fi
+      _flow_env="key"  # Python uses "key" for both B and C (wrap#2)
+      ;;
+    key)
+      # Flow C: community tier — DB AES key as hex-encoded IKM2.
+      if [[ -z "$V2_RECOVERY_KEY" ]]; then
+        log_error "v2 backup: --recovery-key requires a hex value or 'env'."
+        exit 1
+      fi
+      # Encode the key string's UTF-8 bytes as hex for IKM2.
+      _credential=$(printf '%s' "$V2_RECOVERY_KEY" | xxd -p -c 9999 2>/dev/null | tr -d '\n' \
+        || printf '%s' "$V2_RECOVERY_KEY" | od -A n -t x1 2>/dev/null | tr -d ' \n' || true)
+      if [[ -z "$_credential" ]]; then
+        log_error "v2 backup: failed to hex-encode recovery key"
+        exit 1
+      fi
+      ;;
+    *)
+      log_error "v2 backup: unknown recovery mode '${V2_RECOVERY_MODE}'"
+      exit 1
+      ;;
+  esac
+
+  # Run the Python decrypt script.
+  # Pass credential via env (not argv) to avoid process-table exposure.
+  local _py_out
+  if ! _py_out=$(python3 - << 'PYEOF'
+import os, sys
+exec(open('/dev/stdin').read() if False else compile(os.environ.get('_YSG_PYCODE', ''), '<inline>', 'exec'))
+PYEOF
+  ); then
+    # Python inline approach via env var.
+    :
+  fi
+
+  # We use a tempfile for the Python script (no secrets in it).
+  local _py_tmp
+  _py_tmp=$(mktemp "${staging_dir}/.ysg_decrypt_XXXXXX.py")
+  chmod 0700 "$_py_tmp"
+  printf '%s' "$_py_decrypt" > "$_py_tmp"
+
+  if ! _py_out=$(
+    _YSG_META_FILE="$meta_file" \
+    _YSG_BUNDLE_FILE="$bundle_file" \
+    _YSG_STAGING_DIR="$staging_dir" \
+    _YSG_FLOW="$_flow_env" \
+    _YSG_CREDENTIAL="$_credential" \
+    _YSG_FIPS_MODE="${FIPS_MODE:-0}" \
+    python3 "$_py_tmp" 2>&1
+  ); then
+    local _exit_code=$?
+    rm -f "$_py_tmp"
+    # Zero the credential variable (best-effort).
+    _credential=""
+    log_error "v2 backup: decryption failed (exit ${_exit_code})"
+    log_error "  ${_py_out}"
+    rm -rf "$staging_dir"
+    exit 1
+  fi
+
+  rm -f "$_py_tmp"
+  _credential=""  # best-effort clear
+
+  log_success "v2 backup decrypted and HMAC verified: ${_py_out}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Validate backup integrity
 # ---------------------------------------------------------------------------
 validate_backup() {
   local backup_dir="$1"
   local errors=0
 
+  # ── v2 backup detection (YSG-RISK-050/051) ───────────────────────────────
+  # A v2 backup has backup-meta.json (cleartext) + bundle.enc (AEAD-encrypted).
+  # The sensitive content (secrets/, .env, postgres_dump.sql, agent-volumes/) is
+  # inside bundle.enc — NOT present as plaintext. Structural checks differ.
+  if [[ -f "${backup_dir}/backup-meta.json" ]]; then
+    _validate_v2_backup "$backup_dir"
+    return $?
+  fi
+
+  # ── Legacy (v1) backup path ───────────────────────────────────────────────
   # Hard fail: backup must have at minimum secrets/ AND .env
   if [[ ! -d "${backup_dir}/secrets" ]]; then
     log_error "Backup missing required directory: secrets/"
@@ -496,6 +898,34 @@ restore_backup() {
       log_error "Backup validation failed. Use --force to restore anyway (NOT recommended for production)."
       exit 1
     fi
+  fi
+
+  # ── v2 backup: decrypt bundle.enc → staging dir ───────────────────────────
+  # If this is a v2 backup (backup-meta.json present), decrypt the bundle to a
+  # temp staging dir before the rest of the restore logic runs. After decryption,
+  # `backup_dir` is rebound to the staging dir so all subsequent logic (secrets
+  # copy, .env restore, pg_dump restore) works on the plaintext staging content.
+  #
+  # The staging dir is cleaned up on EXIT regardless of success/failure.
+  local _v2_staging_dir=""
+  if [[ -f "${backup_dir}/backup-meta.json" ]]; then
+    _v2_staging_dir="${BACKUPS_DIR}/.v2-staging-$(date +%Y%m%d_%H%M%S)-$$"
+    # Register cleanup on exit regardless of success/failure (fail-closed).
+    # _V2_STAGING_DIR is a global so the EXIT trap can reach it.
+    _V2_STAGING_DIR="$_v2_staging_dir"
+    trap 'rm -rf "${_V2_STAGING_DIR:-}" 2>/dev/null' EXIT
+
+    _v2_decrypt_to_staging "$backup_dir" "$_v2_staging_dir"
+
+    # Verify that the decrypted staging contains the expected backup content.
+    if [[ ! -d "${_v2_staging_dir}/secrets" && ! -f "${_v2_staging_dir}/.env" ]]; then
+      log_error "v2 backup: decrypted staging dir missing secrets/ and .env — extraction may have failed"
+      exit 1
+    fi
+
+    # Rebind backup_dir to the decrypted staging dir for all subsequent logic.
+    backup_dir="$_v2_staging_dir"
+    log_info "v2 backup: using decrypted staging dir: ${backup_dir}"
   fi
 
   # Safety: snapshot current state before overwriting
@@ -1436,6 +1866,26 @@ while [[ $# -gt 0 ]]; do
       FORCE=true
       shift
       ;;
+    --recovery-license)
+      # Flow B (YSG-RISK-050): licensed tier wrap#2 — decrypt DEK using .ysg file bytes.
+      # Usage: --recovery-license /path/to/license.ysg
+      V2_RECOVERY_MODE="license"
+      shift
+      V2_RECOVERY_LICENSE="${1:?--recovery-license requires a path argument}"
+      shift
+      ;;
+    --recovery-key)
+      # Flow C (YSG-RISK-050): community tier wrap#2 — decrypt DEK using DB AES key.
+      # Usage: --recovery-key <hex>
+      #        --recovery-key env (reads from YASHIGANI_DB_AES_KEY env var)
+      V2_RECOVERY_MODE="key"
+      shift
+      V2_RECOVERY_KEY="${1:?--recovery-key requires a hex argument or 'env'}"
+      if [[ "$V2_RECOVERY_KEY" == "env" ]]; then
+        V2_RECOVERY_KEY="${YASHIGANI_DB_AES_KEY:?YASHIGANI_DB_AES_KEY env var required with --recovery-key env}"
+      fi
+      shift
+      ;;
     --encrypted)
       # --encrypted IDENTITY FILE  — identity key then archive path
       # --encrypted FILE           — identity from env/default, archive is $2
@@ -1476,6 +1926,12 @@ Usage:
   bash restore.sh --latest --k8s --validate            Restore + run k8s-restore-validate.sh
   bash restore.sh --encrypted <identity.age> <file.tar.gz.age>  Decrypt + restore encrypted backup
 
+  v2 dual-wrap encrypted backups (YSG-RISK-050/051, install.sh >= v2.25.0):
+  bash restore.sh <backup_dir>                          Flow A: interactive admin password prompt
+  bash restore.sh --recovery-license /path/to/f.ysg <backup_dir>  Flow B: licensed tier recovery
+  bash restore.sh --recovery-key <hex> <backup_dir>    Flow C: community tier DB-key recovery
+  bash restore.sh --recovery-key env <backup_dir>      Flow C: reads YASHIGANI_DB_AES_KEY env
+
 Options:
   --k8s, --kubernetes      Restore into a Kubernetes cluster
   -n, --namespace NS       Kubernetes namespace (default: yashigani)
@@ -1485,6 +1941,8 @@ Options:
   --encrypted IDENTITY FILE  Decrypt FILE using age IDENTITY then restore (MP.L2-3.8.9)
                            IDENTITY defaults to YASHIGANI_BACKUP_IDENTITY_FILE or
                            /etc/yashigani/backup-identity.age when only FILE is given
+  --recovery-license FILE  (v2 backup) Use .ysg license bytes for wrap#2 DEK unwrap (Flow B)
+  --recovery-key HEX|env   (v2 backup) Use community DB AES key for wrap#2 DEK unwrap (Flow C)
   --help                   Show this help
 
 Supported platforms:

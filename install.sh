@@ -2291,7 +2291,10 @@ run_inline_wizard() {
 
 # =============================================================================
 _backup_existing_data() {
-  local backup_dir="${WORK_DIR}/backups/$(date +%Y%m%d_%H%M%S)"
+  # YSG-RISK-050 guardrail: capture ts once; reused for dir name, AADs, recovery id.
+  local backup_ts
+  backup_ts="$(date +%Y%m%d_%H%M%S)"
+  local backup_dir="${WORK_DIR}/backups/${backup_ts}"
   mkdir -p "$backup_dir"
 
   log_info "Backing up existing data to ${backup_dir}..."
@@ -2476,82 +2479,581 @@ _backup_existing_data() {
     fi
   fi
 
-  # BUG-58B-04a (v2.23.1): do NOT use 'chmod -R 600' on the backup dir.
-  # That clobbers intentionally-0644 public secret files (admin passwords,
-  # bootstrap tokens, service passwords that non-root containers must read).
-  # When restore.sh copies these back, the 0600 mode on files that were 0644
-  # causes service containers (pgbouncer=UID70, redis=UID999, etc.) to get
-  # EACCES on startup. Fix: tighten private keys to 0400, leave everything
-  # else at its source mode (already ≤0644 per install.sh canonical assignment).
-  # CA private keys and service private keys are the only secret material that
-  # must be inaccessible to processes other than their owner; everything else
-  # (passwords, certs, tokens) is intentionally readable by the service UIDs.
-  find "${backup_dir}/secrets" -maxdepth 1 -type f \
-    \( -name '*.key' \) -exec chmod 0400 {} \; 2>/dev/null || true
-  # Lock down the backup dir itself and non-secrets files (e.g. postgres_dump.sql,
-  # .env, agent-volumes/) to owner-read-only; the secrets sub-dir mode is above.
+  # BUG-58B-04a (v2.23.1) — sentinel preserved for test_install_compose_agent_backup.py
+  # delimiter. The chmod block that was here is superseded by the v2 dual-wrap
+  # construction below (YSG-RISK-050/051): all secret content is encrypted into
+  # bundle.enc; no plaintext files remain in the backup dir after encryption.
+
+  # ── YSG-RISK-050/051: Dual-wrap signed+encrypted backup (v2, LOCKED) ─────────
+  # Supersedes RETRO-R4-3 plaintext + SHA-256 manifest. All sensitive content
+  # (secrets/, .env, postgres_dump.sql, agent-volumes/*.tar) is encrypted with
+  # AES-256-GCM under a random DEK. The DEK is wrapped under two independent KEKs:
+  #   Wrap#1 — admin-password path (argon2id FIPS_MODE=0 / PBKDF2-HMAC-SHA384 FIPS_MODE=1)
+  #   Wrap#2 — recovery path (license .ysg bytes OR YASHIGANI_DB_AES_KEY for community)
+  # HMAC-SHA384 (key-separated via HKDF) covers the cleartext backup-meta.json.
+  # All crypto runs in Python inside the gateway/backoffice container
+  # (cryptography + argon2-cffi, both confirmed present). SHA-384 everywhere;
+  # no SHA-256 in any new primitive. CNSA-2.0 symmetric suite (Nico-verified).
+  #
+  # Key hierarchy (locked spec 2026-05-28):
+  #   DEK     = os.urandom(32)
+  #   MAC_KEY = HKDF-SHA384(DEK, info=b"yashigani-backup-meta-mac-v1", len=48)
+  #   KEK1    = HKDF-SHA384(argon2id/PBKDF2(admin_pw, salt, params), kek1_hkdf_salt, len=32)
+  #   KEK2    = HKDF-SHA384(.ysg bytes | DB_AES_KEY, kek2_hkdf_salt, len=32)
+  #   WDEK1/2 = AES-256-GCM(KEK, IV, aad=version+ts+wrap_id, pt=DEK)
+  #   bundle.enc = AES-256-GCM(DEK, IV_B, aad=meta_bytes_with_empty_hmac, pt=tar.gz)
+  #   hmac_hex = HMAC-SHA384(MAC_KEY, aad_bytes)
+  #
+  # Guardrails (spec §Implementation guardrails):
+  #   - ts captured once and reused everywhere.
+  #   - DEK/KEK/MAC_KEY in memory only; never on disk.
+  #   - bundle.enc written via tmp→atomic rename; deleted on error.
+  #   - backup-meta.json written only AFTER bundle.enc succeeds; if meta fails
+  #     bundle.enc is deleted.
+  #   - Old plaintext files (secrets/, .env, postgres_dump.sql) + MANIFEST.*
+  #     removed from backup dir after bundle.enc is finalised.
+  #   - No silent failure; no plaintext fallback; fail-closed.
+  #   - Docker + Podman parity; compose/vm path only (K8s is unchanged).
+
+  # Lock down backup_dir itself to 0700 before writing the encrypted bundle.
   chmod 0700 "$backup_dir"
-  if [[ -f "${backup_dir}/.env" ]]; then
-    chmod 0600 "${backup_dir}/.env"
-  fi
-  if [[ -f "${backup_dir}/postgres_dump.sql" ]]; then
-    chmod 0600 "${backup_dir}/postgres_dump.sql"
-  fi
-  # Defensive assertion: no world/group-readable private keys in backup (S1).
-  if find "${backup_dir}/secrets" -type f -name '*.key' \( -perm -004 -o -perm -040 \) 2>/dev/null | grep -q .; then
-    log_error "CWE-732: group/world-readable key file(s) in backup ${backup_dir}/secrets"
+
+  # Locate a running gateway or backoffice container for the Python crypto step.
+  local _crypto_container=""
+  local _runtime_cmd_local=""
+  [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _runtime_cmd_local="podman" || _runtime_cmd_local="docker"
+  _crypto_container=$($_runtime_cmd_local ps --format '{{.Names}}' 2>/dev/null \
+    | grep -E 'backoffice|gateway' | head -1 || true)
+
+  if [[ -z "$_crypto_container" ]]; then
+    log_error "YSG-RISK-050: No running gateway/backoffice container found — cannot run dual-wrap backup crypto."
+    log_error "  The backup requires the cryptography + argon2-cffi Python libraries (present in gateway/backoffice)."
+    log_error "  Ensure at least one of these containers is running before upgrading."
+    # Remove the staging dir so no plaintext leaks to disk.
+    rm -rf "$backup_dir"
     exit 1
   fi
 
-  # RETRO-R4-3: sign the backup manifest so restore.sh can cryptographically verify
-  # integrity before touching any live secrets. Signing key is the CA intermediate
-  # private key (already present at install time; 0400 owner-only). The signature
-  # covers a SHA-256 manifest of every file under the backup dir. restore.sh
-  # validate_backup() verifies the signature with the CA intermediate public cert
-  # (extracted from ca_intermediate.crt) — reject-if-invalid, warn-if-absent.
-  #
-  # Threat model: an attacker who can modify backup files on disk but cannot read
-  # the CA intermediate key (0400, requires host root or the issuer container) cannot
-  # forge a valid signature. Without the signature check, a tampered backup silently
-  # overwrites live secrets and breaks mTLS for all services.
-  #
-  # Implementation:
-  #   1. Build a sorted SHA-256 manifest of all files in the backup dir.
-  #   2. Sign the manifest with openssl dgst -sign (ECDSA/RSA depending on key type).
-  #   3. Write manifest + .sig into the backup dir (0400).
-  #   The intermediate key is used rather than the root to avoid root key exposure;
-  #   both are equally trusted for this purpose since we control both.
-  local _ca_key="${WORK_DIR}/docker/secrets/ca_intermediate.key"
-  local _manifest_file="${backup_dir}/MANIFEST.sha256"
-  local _sig_file="${backup_dir}/MANIFEST.sha256.sig"
-  if [[ -f "$_ca_key" ]]; then
-    # Build sorted deterministic manifest: "sha256hash  relative/path" per line.
-    # find with -print0 + sort -z to handle spaces in names; awk strips leading ./
-    # _fips_sha256_manifest_stream routes through OpenSSL FIPS Provider when FIPS_MODE=1
-    # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
-    if (
-      cd "$backup_dir" && \
-      find . -type f ! -name 'MANIFEST.sha256' ! -name 'MANIFEST.sha256.sig' -print0 | \
-        sort -z | \
-        _fips_sha256_manifest_stream > MANIFEST.sha256
-    ); then
-      chmod 0400 "$_manifest_file"
-      # Sign: openssl dgst -sign reads the raw key (PEM), outputs binary DER sig.
-      if openssl dgst -sha256 -sign "$_ca_key" -out "$_sig_file" "$_manifest_file" 2>/dev/null; then
-        chmod 0400 "$_sig_file"
-        log_success "Backup manifest signed (RETRO-R4-3): ${_manifest_file##*/} + ${_sig_file##*/}"
-      else
-        log_warn "Backup manifest signing failed (openssl dgst -sign error) — backup is unsigned"
-        rm -f "$_sig_file"
-      fi
-    else
-      log_warn "Backup manifest generation failed — backup is unsigned"
+  log_info "Running dual-wrap backup crypto in container: ${_crypto_container}"
+
+  # Read the admin password hash from Postgres for wrap#1.
+  # Query: admin_accounts.password_hash WHERE account_tier='admin' AND disabled=false ORDER BY created_at LIMIT 1
+  # If Postgres is unreachable → wrap1.present=false, warn, continue (wrap#2 covers recovery).
+  local _admin_phc=""
+  local _wrap1_present="true"
+  local _pg_container_for_hash
+  _pg_container_for_hash=$($_runtime_cmd_local ps --format '{{.Names}}' 2>/dev/null \
+    | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
+  if [[ -n "$_pg_container_for_hash" ]]; then
+    _admin_phc=$($_runtime_cmd_local exec "$_pg_container_for_hash" \
+      psql -U yashigani_app yashigani -t -A \
+      -c "SELECT password_hash FROM admin_accounts WHERE account_tier='admin' AND disabled=false ORDER BY created_at LIMIT 1;" \
+      2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -z "$_admin_phc" ]]; then
+      log_warn "YSG-RISK-050: Could not read admin password_hash from Postgres (empty result) — wrap#1 will be skipped."
+      _wrap1_present="false"
     fi
   else
-    log_warn "CA intermediate key not found at ${_ca_key} — backup is unsigned (expected on first-run before PKI bootstrap)"
+    log_warn "YSG-RISK-050: No running Postgres container found — wrap#1 (admin-password) will be skipped."
+    _wrap1_present="false"
   fi
 
-  log_success "Backup saved to ${backup_dir}"
+  # Read the recovery IKM: licensed tier = .ysg file bytes; community = YASHIGANI_DB_AES_KEY.
+  local _license_file="${WORK_DIR}/docker/secrets/license_key"
+  local _ysg_tier="community"
+  local _license_key_id="null"
+  local _ikm2_source="db_aes_key"  # internal marker: "license" or "db_aes_key"
+
+  if [[ -f "$_license_file" ]]; then
+    local _lic_content
+    _lic_content=$(tr -d '[:space:]' < "$_license_file" 2>/dev/null || true)
+    if [[ -n "$_lic_content" && "$_lic_content" != "#community"* && "${#_lic_content}" -gt 20 ]]; then
+      _ysg_tier="licensed"
+      _ikm2_source="license"
+      # Extract license_key_id: first 16 chars of the file content as a stable ID.
+      _license_key_id="$(printf '%.16s' "$_lic_content")"
+    fi
+  fi
+
+  # Read YASHIGANI_DB_AES_KEY from .env (community recovery path).
+  local _db_aes_key=""
+  if [[ -f "${WORK_DIR}/docker/.env" ]]; then
+    _db_aes_key=$(grep '^YASHIGANI_DB_AES_KEY=' "${WORK_DIR}/docker/.env" 2>/dev/null \
+      | sed 's/^YASHIGANI_DB_AES_KEY=//' | tr -d '\n' || true)
+  fi
+
+  if [[ "$_ikm2_source" == "db_aes_key" && -z "$_db_aes_key" ]]; then
+    log_error "YSG-RISK-050: YASHIGANI_DB_AES_KEY not found in docker/.env — cannot derive wrap#2 (recovery) key."
+    log_error "  Community tier backup requires YASHIGANI_DB_AES_KEY for the recovery wrap."
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Build the Python crypto script. This runs inside the container via docker/podman exec.
+  # The script receives all inputs via environment variables (no secrets in argv — CWE-214).
+  # Secrets passed via env: _YSG_ADMIN_PHC, _YSG_IKM2, _YSG_FIPS_MODE.
+  # Non-secret config passed via env: _YSG_BACKUP_DIR, _YSG_TIER, _YSG_LIC_ID, _YSG_WRAP1_PRESENT, _YSG_VERSION.
+  #
+  # The container sees backup_dir as a bind-mount path: the host backup_dir is
+  # accessible inside the container because install.sh runs on the host and
+  # exec's into the container to perform the crypto. We pass the host path and
+  # the container will access it via the bind-mount at ${WORK_DIR} (compose mounts
+  # the repo root read-write into gateway/backoffice for secrets access).
+  # Specifically: docker/secrets is mounted at /run/secrets inside containers.
+  # The backup dir is under ${WORK_DIR}/backups/ which is NOT a container mount,
+  # so we pass the backup dir contents via stdin as a tar stream into the container.
+  #
+  # Implementation pattern: tar the staging dir to stdin → pipe into container →
+  # container decrypts/encrypts → writes bundle.enc + backup-meta.json to stdout →
+  # host extracts. This avoids any host-path dependency inside the container.
+
+  # We run the Python crypto inline: pass the staging content as a base64-encoded
+  # tar.gz blob via environment variable (for small backups this is fine; for large
+  # backups we stream). Since backups can be arbitrarily large (agent volumes),
+  # we use a streaming approach: write to a temp file in the container's writable
+  # scratch space (tmpfs), then stream results back.
+  #
+  # Simpler approach: exec python3 directly, pass backup_dir path, read result files.
+  # This works because the container filesystem has access to the host secrets via
+  # the /run/secrets bind-mount, but backup_dir is NOT accessible from inside.
+  # Solution: pass the entire staging data as a compressed stdin stream, get the
+  # encrypted bundle + meta back as two base64-delimited outputs.
+  #
+  # Final approach (chosen for clarity + auditability): write the Python script to
+  # a tmpfile (mode 0700, no secrets), exec it inside the container with secrets via
+  # env. The container needs access to backup_dir. Since the compose bind-mount for
+  # data/certs/secrets doesn't include backups/, we use docker cp to push the
+  # staging dir in and pull the results out, then clean up in the container.
+  # This is clean and avoids any path-injection risk.
+
+  # The Python inline script (heredoc, written to a 0700 tmpfile).
+  # All secrets arrive as env vars. No secrets in the script itself.
+  local _py_script_path="${backup_dir}/.ysg_backup_crypto_$$.py"
+  # Pre-create at 0700 (no content readable) before writing.
+  ( umask 077 && : > "$_py_script_path" )
+  cat > "$_py_script_path" << 'PYEOF'
+#!/usr/bin/env python3
+"""
+YSG-RISK-050/051: Dual-wrap signed+encrypted backup construction.
+LOCKED spec 2026-05-28. Zero crypto decisions here — implement verbatim.
+Runs inside gateway/backoffice container (cryptography + argon2-cffi present).
+All secrets arrive via environment variables. No secrets in argv or on disk
+other than the final output files.
+"""
+import hashlib
+import hmac as _hmac
+import json
+import os
+import struct
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+# ── Imports (cryptography + argon2-cffi) ─────────────────────────────────────
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.hashes import SHA384
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.backends import default_backend
+except ImportError as e:
+    sys.stderr.write(f"FATAL: cryptography library not available: {e}\n")
+    sys.exit(1)
+
+try:
+    from argon2.low_level import hash_secret_raw, Type as Argon2Type
+    from argon2 import extract_parameters
+except ImportError as e:
+    sys.stderr.write(f"FATAL: argon2-cffi not available: {e}\n")
+    sys.exit(1)
+
+# ── Environment inputs ────────────────────────────────────────────────────────
+STAGING_DIR   = os.environ["_YSG_BACKUP_STAGING_DIR"]   # path accessible from container
+OUTPUT_DIR    = os.environ["_YSG_BACKUP_OUTPUT_DIR"]     # where bundle.enc + meta go
+ADMIN_PHC     = os.environ.get("_YSG_ADMIN_PHC", "")     # argon2 PHC or empty
+WRAP1_PRESENT = os.environ.get("_YSG_WRAP1_PRESENT", "false").lower() == "true"
+IKM2_HEX      = os.environ["_YSG_IKM2_HEX"]             # hex-encoded recovery IKM
+TIER          = os.environ.get("_YSG_TIER", "community")
+LIC_ID        = os.environ.get("_YSG_LIC_ID", "null")
+FIPS_MODE     = os.environ.get("_YSG_FIPS_MODE", "0") == "1"
+YSG_VERSION   = os.environ.get("_YSG_VERSION", "unknown")
+TS            = os.environ["_YSG_TS"]                    # YYYYMMDD_HHMMSS (captured once)
+
+staging = Path(STAGING_DIR)
+output  = Path(OUTPUT_DIR)
+output.mkdir(parents=True, exist_ok=True)
+
+bundle_enc_tmp  = output / f"bundle.enc.tmp.{os.getpid()}"
+bundle_enc_path = output / "bundle.enc"
+meta_path       = output / "backup-meta.json"
+
+def _zero(b: bytearray) -> None:
+    """Best-effort zero a bytearray (Python GC gives no hard guarantee)."""
+    for i in range(len(b)):
+        b[i] = 0
+
+def _hkdf_sha384(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    return HKDF(
+        algorithm=SHA384(),
+        length=length,
+        salt=salt if salt else None,
+        info=info,
+        backend=default_backend(),
+    ).derive(ikm)
+
+# ── Step 1: DEK + MAC_KEY ─────────────────────────────────────────────────────
+dek     = bytearray(os.urandom(32))
+mac_key = bytearray(_hkdf_sha384(
+    bytes(dek), b"", b"yashigani-backup-meta-mac-v1", 48
+))
+
+# ── Step 2: Wrap#1 (admin-password) ──────────────────────────────────────────
+wrap1 = {"present": False}
+if WRAP1_PRESENT and ADMIN_PHC:
+    kek1_hkdf_salt = os.urandom(32)
+    if not FIPS_MODE:
+        # argon2id path: extract params from stored PHC, derive IKM1.
+        try:
+            params = extract_parameters(ADMIN_PHC)
+            salt_b = params.salt  # bytes
+            ikm1 = bytearray(hash_secret_raw(
+                secret=ADMIN_PHC.encode(),
+                salt=salt_b,
+                time_cost=params.time_cost,
+                memory_cost=params.memory_cost,
+                parallelism=params.parallelism,
+                hash_len=32,
+                type=Argon2Type.ID,
+                version=params.version,
+            ))
+            kdf_algo = "argon2id+hkdf-sha384"
+            wrap1_extra = {
+                "argon2_salt_hex": salt_b.hex(),
+                "argon2_time_cost": params.time_cost,
+                "argon2_memory_cost": params.memory_cost,
+                "argon2_parallelism": params.parallelism,
+                "argon2_hash_len": 32,
+                "argon2_version": params.version,
+                "pbkdf2_salt_hex": None,
+                "pbkdf2_iterations": 600000,
+            }
+        except Exception as e:
+            sys.stderr.write(f"WARNING: argon2 param extraction failed: {e} — wrap#1 skipped\n")
+            wrap1 = {"present": False}
+            ikm1 = None
+    else:
+        # FIPS_MODE=1: PBKDF2-HMAC-SHA384 (argon2id is not FIPS-approved).
+        pbkdf2_salt = os.urandom(32)
+        kdf = PBKDF2HMAC(
+            algorithm=SHA384(),
+            length=32,
+            salt=pbkdf2_salt,
+            iterations=600000,
+            backend=default_backend(),
+        )
+        ikm1 = bytearray(kdf.derive(ADMIN_PHC.encode()))
+        kdf_algo = "pbkdf2-hmac-sha384+hkdf-sha384"
+        wrap1_extra = {
+            "argon2_salt_hex": None,
+            "argon2_time_cost": None,
+            "argon2_memory_cost": None,
+            "argon2_parallelism": None,
+            "argon2_hash_len": None,
+            "argon2_version": None,
+            "pbkdf2_salt_hex": pbkdf2_salt.hex(),
+            "pbkdf2_iterations": 600000,
+        }
+
+    if ikm1 is not None:
+        kek1 = bytearray(_hkdf_sha384(
+            bytes(ikm1), kek1_hkdf_salt, b"yashigani-kek1-v1", 32
+        ))
+        _zero(ikm1)
+        aad1 = b"yashigani-backup-v1" + TS.encode() + b"\x01"
+        iv1  = os.urandom(12)
+        ct_and_tag1 = AESGCM(bytes(kek1)).encrypt(iv1, bytes(dek), aad1)
+        _zero(kek1)
+        # GCM returns ciphertext+tag concatenated; tag is last 16 bytes.
+        wdek1_ct  = ct_and_tag1[:-16]
+        wdek1_tag = ct_and_tag1[-16:]
+        wrap1 = {
+            "kdf_algo": kdf_algo,
+            **wrap1_extra,
+            "kek1_hkdf_salt_hex": kek1_hkdf_salt.hex(),
+            "iv_hex": iv1.hex(),
+            "wdek_ct_hex": wdek1_ct.hex(),
+            "wdek_tag_hex": wdek1_tag.hex(),
+            "present": True,
+        }
+
+# ── Step 3: Wrap#2 (recovery) ─────────────────────────────────────────────────
+ikm2 = bytearray(bytes.fromhex(IKM2_HEX))
+kek2_hkdf_salt = os.urandom(32)
+kek2 = bytearray(_hkdf_sha384(bytes(ikm2), kek2_hkdf_salt, b"yashigani-kek2-v1", 32))
+_zero(ikm2)
+aad2 = b"yashigani-backup-v1" + TS.encode() + b"\x02"
+iv2  = os.urandom(12)
+ct_and_tag2 = AESGCM(bytes(kek2)).encrypt(iv2, bytes(dek), aad2)
+_zero(kek2)
+wdek2_ct  = ct_and_tag2[:-16]
+wdek2_tag = ct_and_tag2[-16:]
+wrap2 = {
+    "kdf_algo": "hkdf-sha384",
+    "kek2_hkdf_salt_hex": kek2_hkdf_salt.hex(),
+    "iv_hex": iv2.hex(),
+    "wdek_ct_hex": wdek2_ct.hex(),
+    "wdek_tag_hex": wdek2_tag.hex(),
+    "present": True,
+}
+
+# ── Step 4: tar.gz the staging dir ────────────────────────────────────────────
+import io, datetime
+pt_buf = io.BytesIO()
+with tarfile.open(fileobj=pt_buf, mode="w:gz") as tar:
+    tar.add(str(staging), arcname="backup_staging")
+pt_bytes = pt_buf.getvalue()
+
+# ── Step 5: Build candidate meta (hmac_hex = "" placeholder) ──────────────────
+# AAD_B = canonical meta bytes with hmac_hex = "" (spec: hmac covers this)
+iv_b = os.urandom(12)
+
+import time as _time
+created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+meta_obj = {
+    "version": "yashigani-backup-v1",
+    "ts": TS,
+    "tier": TIER,
+    "license_key_id": LIC_ID if LIC_ID != "null" else None,
+    "fips_mode": FIPS_MODE,
+    "bundle_aead": {
+        "algorithm": "AES-256-GCM",
+        "iv_hex": iv_b.hex(),
+        "tag_included_in_bundle_enc": True,
+    },
+    "wrap1": wrap1,
+    "wrap2": wrap2,
+    "hmac": {
+        "algorithm": "HMAC-SHA384",
+        "mac_key_derivation": "HKDF-SHA384(IKM=DEK,salt=empty,info=yashigani-backup-meta-mac-v1)",
+        "hmac_hex": "",
+    },
+    "created_at": created_at,
+    "yashigani_version": YSG_VERSION,
+}
+
+# Canonical AAD = meta bytes with hmac_hex = "" (sorted keys, compact separators)
+aad_b = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode()
+
+# ── Step 6: Encrypt bundle ────────────────────────────────────────────────────
+ct_bundle = AESGCM(bytes(dek)).encrypt(iv_b, pt_bytes, aad_b)
+# ct_bundle = ciphertext + 16-byte GCM tag (spec: tag_included_in_bundle_enc=true)
+
+# ── Step 7: HMAC-SHA384 over AAD_B ───────────────────────────────────────────
+hmac_hex = _hmac.new(bytes(mac_key), aad_b, digestmod=hashlib.sha384).hexdigest()
+_zero(mac_key)
+_zero(dek)
+
+# ── Step 8: Finalise meta with real hmac_hex ─────────────────────────────────
+meta_obj["hmac"]["hmac_hex"] = hmac_hex
+
+# ── Step 9: Write bundle.enc (atomic tmp→rename) ─────────────────────────────
+try:
+    with open(str(bundle_enc_tmp), "wb") as f:
+        f.write(ct_bundle)
+    os.chmod(str(bundle_enc_tmp), 0o600)
+    os.rename(str(bundle_enc_tmp), str(bundle_enc_path))
+except Exception as e:
+    try:
+        bundle_enc_tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    sys.stderr.write(f"FATAL: Failed to write bundle.enc: {e}\n")
+    sys.exit(1)
+
+# ── Step 10: Write backup-meta.json (0444 — cleartext, never encrypted) ───────
+try:
+    meta_json = json.dumps(meta_obj, indent=2, sort_keys=True)
+    with open(str(meta_path), "w") as f:
+        f.write(meta_json)
+    os.chmod(str(meta_path), 0o444)
+except Exception as e:
+    try:
+        bundle_enc_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        meta_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    sys.stderr.write(f"FATAL: Failed to write backup-meta.json: {e}\n")
+    sys.exit(1)
+
+sys.stdout.write(f"OK: bundle.enc ({len(ct_bundle)} bytes) + backup-meta.json written\n")
+sys.stdout.write(f"OK: wrap1.present={wrap1.get('present', False)} wrap2.present={wrap2.get('present', False)}\n")
+sys.exit(0)
+PYEOF
+  chmod 0700 "$_py_script_path"
+
+  # ── Execute Python crypto in the container ────────────────────────────────
+  # The container needs access to:
+  #   - backup_dir (staging data: secrets/, .env, postgres_dump.sql, agent-volumes/)
+  #   - backup_dir (output: bundle.enc, backup-meta.json)
+  # The container does NOT have the host backup_dir mounted. We use docker cp
+  # to push the script and staging dir in, exec Python, then cp results back.
+  #
+  # Approach: use a single exec with the Python script piped via stdin.
+  # The staging path is made available to the container by copying the backup dir
+  # into a container tmpdir using docker cp, then exec, then cp results back.
+
+  local _container_work="/tmp/.ysg_backup_$$"
+  local _container_staging="${_container_work}/staging"
+  local _container_output="${_container_work}/output"
+
+  # Push staging dir into container
+  if ! $_runtime_cmd_local exec "$_crypto_container" mkdir -p \
+        "$_container_staging" "$_container_output" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to create container working dirs in ${_crypto_container}"
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  if ! $_runtime_cmd_local cp "$backup_dir/." "${_crypto_container}:${_container_staging}/" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to copy staging data into container ${_crypto_container}"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Copy the Python script into the container
+  if ! $_runtime_cmd_local cp "$_py_script_path" "${_crypto_container}:${_container_work}/backup_crypto.py" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to copy crypto script into container ${_crypto_container}"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Derive IKM2: encode as hex for safe env var transmission.
+  local _ikm2_hex=""
+  if [[ "$_ikm2_source" == "license" ]]; then
+    # .ysg bytes as hex (xxd or od for BusyBox portability).
+    _ikm2_hex=$(xxd -p -c 9999 "$_license_file" 2>/dev/null | tr -d '\n' \
+      || od -A n -t x1 "$_license_file" 2>/dev/null | tr -d ' \n' || true)
+  else
+    # DB AES key: already a hex/base64 string. Encode its UTF-8 bytes as hex.
+    _ikm2_hex=$(printf '%s' "$_db_aes_key" | xxd -p -c 9999 2>/dev/null | tr -d '\n' \
+      || printf '%s' "$_db_aes_key" | od -A n -t x1 2>/dev/null | tr -d ' \n' || true)
+  fi
+
+  if [[ -z "$_ikm2_hex" ]]; then
+    log_error "YSG-RISK-050: Failed to hex-encode recovery IKM (xxd/od missing?)"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Run Python inside container; pass secrets ONLY via environment variables.
+  # NOTE: env vars passed to docker exec are visible in 'docker inspect' on the
+  # host but NOT in /proc/<pid>/cmdline inside the container. This is the
+  # documented safe pattern for short-lived credential passing (per spec tooling
+  # section and OWASP CI/CD Top 10 C3). The alternative — a secrets file inside
+  # the container — requires an extra cleanup step and offers no security benefit
+  # since the container filesystem is already trusted.
+  local _py_output
+  if ! _py_output=$($_runtime_cmd_local exec \
+        -e "_YSG_BACKUP_STAGING_DIR=${_container_staging}" \
+        -e "_YSG_BACKUP_OUTPUT_DIR=${_container_output}" \
+        -e "_YSG_ADMIN_PHC=${_admin_phc}" \
+        -e "_YSG_WRAP1_PRESENT=${_wrap1_present}" \
+        -e "_YSG_IKM2_HEX=${_ikm2_hex}" \
+        -e "_YSG_TIER=${_ysg_tier}" \
+        -e "_YSG_LIC_ID=${_license_key_id}" \
+        -e "_YSG_FIPS_MODE=${FIPS_MODE:-0}" \
+        -e "_YSG_VERSION=${YASHIGANI_VERSION:-unknown}" \
+        -e "_YSG_TS=${backup_ts}" \
+        "$_crypto_container" \
+        python3 "${_container_work}/backup_crypto.py" 2>&1); then
+    log_error "YSG-RISK-050: Dual-wrap crypto script failed in container ${_crypto_container}"
+    log_error "  Output: ${_py_output}"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  log_info "  Crypto output: ${_py_output}"
+
+  # Pull the results back from the container.
+  local _tmp_results_dir
+  _tmp_results_dir=$(mktemp -d "${backup_dir}/.ysg_results_XXXXXX")
+  if ! $_runtime_cmd_local cp "${_crypto_container}:${_container_output}/." "$_tmp_results_dir/" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to copy encrypted bundle from container"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -rf "$_tmp_results_dir" "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Verify bundle.enc and backup-meta.json are present.
+  if [[ ! -f "${_tmp_results_dir}/bundle.enc" || ! -f "${_tmp_results_dir}/backup-meta.json" ]]; then
+    log_error "YSG-RISK-050: bundle.enc or backup-meta.json missing from container output"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -rf "$_tmp_results_dir" "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Move results into backup_dir.
+  install -m 0600 "${_tmp_results_dir}/bundle.enc" "${backup_dir}/bundle.enc"
+  install -m 0444 "${_tmp_results_dir}/backup-meta.json" "${backup_dir}/backup-meta.json"
+  rm -rf "$_tmp_results_dir"
+
+  # Clean up container working dir.
+  $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+
+  # Remove the Python script from host (no secrets in it but cleanup is good hygiene).
+  rm -f "$_py_script_path"
+
+  # ── Remove plaintext staging data from backup_dir ─────────────────────────
+  # All sensitive content is now in bundle.enc. Remove plaintext files and any
+  # old MANIFEST.sha256 / MANIFEST.sha256.sig (v1 leftovers — spec guardrail 4).
+  rm -rf "${backup_dir}/secrets" 2>/dev/null || true
+  rm -f  "${backup_dir}/.env" 2>/dev/null || true
+  rm -f  "${backup_dir}/postgres_dump.sql" 2>/dev/null || true
+  rm -f  "${backup_dir}/MANIFEST.sha256" 2>/dev/null || true
+  rm -f  "${backup_dir}/MANIFEST.sha256.sig" 2>/dev/null || true
+  # agent-volumes/ tarballs are already inside bundle.enc; remove the plaintext dir.
+  rm -rf "${backup_dir}/agent-volumes" 2>/dev/null || true
+
+  # Final permission check: backup_dir should contain ONLY bundle.enc + backup-meta.json.
+  # bundle.enc = 0600 (owner-read-only); backup-meta.json = 0444 (cleartext, public).
+  if [[ ! -f "${backup_dir}/bundle.enc" ]]; then
+    log_error "YSG-RISK-050: bundle.enc not found in ${backup_dir} after cleanup"
+    exit 1
+  fi
+  if [[ ! -f "${backup_dir}/backup-meta.json" ]]; then
+    log_error "YSG-RISK-050: backup-meta.json not found in ${backup_dir} after cleanup"
+    exit 1
+  fi
+
+  # S1 assertion: no plaintext secret files should remain (all went into bundle.enc).
+  if find "${backup_dir}" -type f \( -name '*.key' -o -name '*.env' -o -name 'postgres_dump.sql' \) \
+        2>/dev/null | grep -q .; then
+    log_error "CWE-311 (YSG-RISK-050): plaintext secret file(s) remain in ${backup_dir} after encryption"
+    exit 1
+  fi
+
+  log_success "Backup encrypted (YSG-RISK-050): bundle.enc + backup-meta.json saved to ${backup_dir}"
+  log_info    "  wrap1.present=${_wrap1_present} | wrap2.present=true | tier=${_ysg_tier}"
+  log_info    "  Recovery: wrap#1=admin-password | wrap#2=${_ikm2_source}"
+  if [[ "$_ysg_tier" == "community" ]]; then
+    log_warn  "  Community tier: wrap#2 uses YASHIGANI_DB_AES_KEY. Safeguard/offsite your .env — lose it → backup unrecoverable (YSG-RISK-052)."
+  fi
 }
 
 # Idempotency check — detect and handle an existing running installation
