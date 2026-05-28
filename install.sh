@@ -3930,15 +3930,24 @@ _fix_config_perms() {
   #          unconditionally on every install/reinstall. Non-secret, non-executable.
   #          (A3 / Iris §2 / iris-letta-openapi-write-design-review.md 2026-05-21
   #           / laura-letta-openapi-0666-threat-model.md 2026-05-21)
+  # LIVE-BACKUP-PERMS-001 (VM smoke 2026-05-28, CWE-732): backups/ MUST be
+  # pruned. _backup_existing_data() copies docker/secrets, docker/.env, the
+  # postgres dump, and (B5/FIX-2) agent-volume tarballs into backups/<ts>/ and
+  # locks them to 0600/0700. Without this prune the o+rX sweep below re-exposes
+  # every one of those backup copies to world-read — the live docker/secrets is
+  # pruned but its BACKUP COPY was not, so the S1 assertion passed while backup
+  # copies of admin_initial_password, redis_password, agent tokens, the .env,
+  # and the DB dump were all 0604/0644. Prune the whole backups/ tree.
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
+    -not \( -path "${work_dir}/backups" -prune \) \
     -exec chmod o+rX {} + 2>/dev/null \
     || log_warn "chmod o+rX sweep had partial failures (non-fatal — secrets/ not touched)"
 
-  log_info "  Config sweep applied (work_dir minus secrets/.git/.ysg_work/docker/.env)"
+  log_info "  Config sweep applied (work_dir minus secrets/.git/.ysg_work/docker/.env/backups)"
 
   # Invariant: secrets dir must NOT have been touched — assert no world-readable
   # non-certificate files under docker/secrets/ (CWE-732 / v2.23.1 S1).

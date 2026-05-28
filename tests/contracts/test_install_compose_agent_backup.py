@@ -296,3 +296,22 @@ def test_agent_vol_alpine_digest_pinned():
     assert "docker.io/library/alpine:3.20" not in text, (
         "floating alpine:3.20 tag must not appear; use the pinned digest fallback"
     )
+
+
+def test_orX_sweep_prunes_backups_dir():
+    """LIVE-BACKUP-PERMS-001 (VM smoke 2026-05-28, CWE-732): the work_dir-wide
+    `chmod o+rX` config sweep MUST prune backups/. _backup_existing_data() copies
+    docker/secrets, docker/.env, the postgres dump, and agent-volume tarballs into
+    backups/<ts>/ at 0600/0700. If backups/ is not pruned from the o+rX sweep, every
+    backup copy of a secret becomes world-readable (the live docker/secrets is pruned
+    but its backup copy was not — the S1 assertion only checks live secrets, so it
+    passed while backup copies leaked). Regression guard for the prune."""
+    text = _read_install()
+    # The sweep is the `find "${work_dir}" ... -exec chmod o+rX` block.
+    assert "chmod o+rX" in text, "o+rX config sweep must exist"
+    # backups/ must be pruned alongside docker/secrets in that find.
+    assert '-path "${work_dir}/backups" -prune' in text, (
+        "LIVE-BACKUP-PERMS-001 REGRESSION: the o+rX config sweep must prune "
+        '`${work_dir}/backups` or backup copies of secrets/.env/dump/agent-tarballs '
+        "become world-readable (CWE-732)."
+    )
