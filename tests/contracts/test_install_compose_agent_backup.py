@@ -102,6 +102,29 @@ class TestComposeAgentBackupVolumes:
             "compose backups."
         )
 
+    def test_agent_volumes_use_compose_project_prefix(self, backup_body: str) -> None:
+        """LIVE-FIX2-001 (VM smoke 2026-05-28): compose-created volumes carry the
+        project prefix (compose file in docker/ => 'docker_langflow_data', NOT bare
+        'langflow_data'). The backup MUST inspect the prefixed names or it always
+        reports 'not present — skipping' and silently loses agent state. The first
+        VM smoke caught exactly this. Guard: the _agent_volumes array must build
+        names from _compose_project_prefix, matching the agent-bundle chown path."""
+        assert "_compose_project_prefix" in backup_body, (
+            "LIVE-FIX2-001 REGRESSION: _backup_existing_data() agent-volume block "
+            "must use _compose_project_prefix to build the volume names. Bare "
+            "'langflow_data' will not match the live 'docker_langflow_data' volume."
+        )
+        assert '${_compose_project_prefix}_langflow_data' in backup_body, (
+            "LIVE-FIX2-001 REGRESSION: langflow volume name must be prefixed "
+            "(${_compose_project_prefix}_langflow_data), not bare langflow_data."
+        )
+        assert '${_compose_project_prefix}_letta_data' in backup_body, (
+            "LIVE-FIX2-001 REGRESSION: letta volume name must be prefixed."
+        )
+        assert '${_compose_project_prefix}_openclaw_data' in backup_body, (
+            "LIVE-FIX2-001 REGRESSION: openclaw volume name must be prefixed."
+        )
+
     # ── 2. Warn-not-fail pattern ──────────────────────────────────────────────
 
     def test_absent_volume_produces_warn_not_fail(self, backup_body: str) -> None:

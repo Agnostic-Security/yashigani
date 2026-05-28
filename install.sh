@@ -2409,11 +2409,19 @@ _backup_existing_data() {
   #     (scripts/backup.sh --extra-dirs, B5 Helm side).  This block runs only
   #     on compose/Podman installs.
   if [[ "${MODE:-compose}" != "k8s" && "${YSG_RUNTIME:-}" != "k8s" ]]; then
+    # LIVE-FIX2-001 (VM smoke 2026-05-28): compose-created named volumes carry
+    # the compose project prefix. The compose file lives in docker/, so the
+    # project name is "docker" and volumes are "docker_langflow_data" etc. —
+    # NOT bare "langflow_data". The chown path at the post-install step already
+    # uses _compose_project_prefix="docker" (see the agent-bundle chown block);
+    # mirror it here so `volume inspect` actually finds the volume instead of
+    # always reporting "not present — skipping" and silently losing agent state.
+    local _compose_project_prefix="docker"
     # Ordered list: <volume_name>:<bundle_label>
     local -a _agent_volumes=(
-      "langflow_data:langflow"
-      "letta_data:letta"
-      "openclaw_data:openclaw"
+      "${_compose_project_prefix}_langflow_data:langflow"
+      "${_compose_project_prefix}_letta_data:letta"
+      "${_compose_project_prefix}_openclaw_data:openclaw"
     )
     local _agent_vol_dir="${backup_dir}/agent-volumes"
     local _agent_vol_any=false
