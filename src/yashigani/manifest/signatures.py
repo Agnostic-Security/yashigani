@@ -215,8 +215,10 @@ def _assert_rsa_3072(public_key: object) -> None:
     """
     Guard: assert the RSA key is exactly 3072 bits.
 
-    Nico review hook — do not remove this check.  CMVP #4985 approved
-    mode requires RSA-3072; smaller keys fail the FIPS compliance assertion.
+    Nico review hook — do not remove this check.  CMVP #4985 (OpenSSL FIPS
+    Provider) approves RSA >= 2048; RSA-3072 is the Yashigani policy floor
+    (128-bit security target), not a CMVP requirement.  Smaller keys fail
+    this assertion.
     """
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey  # noqa: PLC0415
     if not isinstance(public_key, RSAPublicKey):
