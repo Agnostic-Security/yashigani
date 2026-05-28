@@ -439,7 +439,6 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.hashes import SHA384
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.backends import default_backend
     from cryptography.exceptions import InvalidTag
 except ImportError as e:
@@ -455,7 +454,6 @@ BUNDLE_FILE  = os.environ["_YSG_BUNDLE_FILE"]
 STAGING_DIR  = os.environ["_YSG_STAGING_DIR"]
 FLOW         = os.environ["_YSG_FLOW"]         # "password" | "license" | "key"
 CREDENTIAL   = os.environ.get("_YSG_CREDENTIAL", "")  # plaintext password | hex IKM2
-FIPS_MODE_F  = os.environ.get("_YSG_FIPS_MODE", "0") == "1"
 
 meta = json.loads(Path(META_FILE).read_text())
 bundle_ct = Path(BUNDLE_FILE).read_bytes()
@@ -473,6 +471,9 @@ def _zero(b):
         for i in range(len(b)): b[i] = 0
 
 # ── Derive DEK ───────────────────────────────────────────────────────────────
+# wrap#1 kdf_algo is always "argon2id+hkdf-sha384" (Nico ruling 2026-05-28).
+# Under FIPS_MODE=1, wrap1.present=false — the flow cannot reach this branch.
+# The PBKDF2 branch is removed: PBKDF2 cannot reproduce an argon2 verifier.
 dek = None
 
 if FLOW == "password":
@@ -481,15 +482,17 @@ if FLOW == "password":
         sys.stderr.write("FATAL: wrap1.present=false — admin-password path not available.\n")
         sys.stderr.write("  Use --recovery-license or --recovery-key to restore via wrap#2.\n")
         sys.exit(1)
-    kdf_algo = w1["kdf_algo"]
+    kdf_algo = w1.get("kdf_algo", "argon2id+hkdf-sha384")
     kek1_hkdf_salt = bytes.fromhex(w1["kek1_hkdf_salt_hex"])
     iv1            = bytes.fromhex(w1["iv_hex"])
     wdek1_ct       = bytes.fromhex(w1["wdek_ct_hex"])
     wdek1_tag      = bytes.fromhex(w1["wdek_tag_hex"])
     aad1 = b"yashigani-backup-v1" + ts.encode() + b"\x01"
 
-    if "argon2id" in kdf_algo and not FIPS_MODE_F:
-        salt_b   = bytes.fromhex(w1["argon2_salt_hex"])
+    if "argon2id" in kdf_algo:
+        # Flow A: recompute V = argon2id_raw(typed_plaintext, argon2_salt_from_meta, params).
+        # This matches the V that backup extracted from the stored PHC iff password unchanged.
+        salt_b = bytes.fromhex(w1["argon2_salt_hex"])
         ikm1 = bytearray(hash_secret_raw(
             secret=CREDENTIAL.encode(),
             salt=salt_b,
@@ -501,13 +504,9 @@ if FLOW == "password":
             version=w1["argon2_version"],
         ))
     else:
-        pbkdf2_salt = bytes.fromhex(w1["pbkdf2_salt_hex"])
-        kdf = PBKDF2HMAC(
-            algorithm=SHA384(), length=32,
-            salt=pbkdf2_salt, iterations=w1["pbkdf2_iterations"],
-            backend=default_backend(),
-        )
-        ikm1 = bytearray(kdf.derive(CREDENTIAL.encode()))
+        sys.stderr.write(f"FATAL: Unsupported wrap#1 kdf_algo: {kdf_algo!r}\n")
+        sys.stderr.write("  Only 'argon2id+hkdf-sha384' is supported (Nico ruling 2026-05-28).\n")
+        sys.exit(1)
 
     kek1 = bytearray(_hkdf(bytes(ikm1), kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
     _zero(ikm1)
@@ -570,20 +569,25 @@ finally:
     _zero(dek)
 
 # ── Extract tar.gz to staging_dir ─────────────────────────────────────────────
+# Use filter="data" (Python ≥3.12, confirmed in pyproject.toml) which blocks
+# absolute paths, ".." traversal, symlink attacks, and special files.
+# (FINDING-4 fix: manual filter with startswith("..") / "//" checks did NOT
+# block absolute paths like "/etc/passwd" or "a/../../etc/evil".)
 staging = Path(STAGING_DIR)
 staging.mkdir(parents=True, exist_ok=True)
 with tarfile.open(fileobj=io.BytesIO(pt_bytes), mode="r:gz") as tar:
-    def _safe_extract(tar, path):
-        for member in tar.getmembers():
-            # Strip leading arcname prefix (backup_staging/).
-            if member.name.startswith("backup_staging/"):
-                member.name = member.name[len("backup_staging/"):]
-            elif member.name == "backup_staging":
-                continue
-            if not member.name or member.name.startswith("..") or "//" in member.name:
-                continue
-            tar.extract(member, path=path)
-    _safe_extract(tar, str(staging))
+    # Strip the leading arcname prefix (backup_staging/) from member names
+    # before extraction so the staging dir gets the bare contents.
+    members = []
+    for member in tar.getmembers():
+        if member.name == "backup_staging":
+            continue
+        if member.name.startswith("backup_staging/"):
+            member.name = member.name[len("backup_staging/"):]
+        if not member.name:
+            continue
+        members.append(member)
+    tar.extractall(path=str(staging), members=members, filter="data")
 
 sys.stdout.write("OK: bundle decrypted, HMAC verified, extracted to staging\n")
 sys.exit(0)
@@ -654,18 +658,6 @@ PYPEOF
       exit 1
       ;;
   esac
-
-  # Run the Python decrypt script.
-  # Pass credential via env (not argv) to avoid process-table exposure.
-  local _py_out
-  if ! _py_out=$(python3 - << 'PYEOF'
-import os, sys
-exec(open('/dev/stdin').read() if False else compile(os.environ.get('_YSG_PYCODE', ''), '<inline>', 'exec'))
-PYEOF
-  ); then
-    # Python inline approach via env var.
-    :
-  fi
 
   # We use a tempfile for the Python script (no secrets in it).
   local _py_tmp

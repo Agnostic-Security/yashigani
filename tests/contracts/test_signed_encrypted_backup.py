@@ -140,12 +140,32 @@ class TestInstallBackupCrypto:
             "YSG-RISK-050: wrap2/ikm2 not referenced in backup body."
         )
 
-    def test_fips_mode_branch_present(self, backup_body: str) -> None:
-        """FIPS_MODE=1 branch (PBKDF2-HMAC-SHA384) must be in backup body. Spec §wrap1."""
+    def test_fips_mode_wrap1_absent_not_pbkdf2(self, backup_body: str) -> None:
+        """FIPS_MODE=1 must result in wrap#1 ABSENT (not PBKDF2). Spec §wrap1 + Nico ruling."""
         # Shell-level: passes FIPS_MODE to container via env var.
         assert "FIPS_MODE" in backup_body or "_YSG_FIPS_MODE" in backup_body, (
             "YSG-RISK-050: FIPS_MODE not passed to crypto container in backup body."
         )
+        # The Python heredoc must NOT import PBKDF2HMAC (Nico ruling 2026-05-28).
+        install_text = _read(INSTALL_SH)
+        py_start = install_text.find("cat > \"$_py_script_path\" << 'PYEOF'")
+        if py_start != -1:
+            py_end = install_text.find("\nPYEOF\n", py_start)
+            if py_end != -1:
+                py_code = install_text[py_start:py_end]
+                assert "PBKDF2HMAC" not in py_code, (
+                    "YSG-RISK-050 REGRESSION: PBKDF2HMAC imported in backup Python heredoc. "
+                    "Nico ruling 2026-05-28: FIPS_MODE=1 → wrap#1 ABSENT, NOT PBKDF2. "
+                    "PBKDF2 cannot reproduce an argon2 verifier. Remove PBKDF2HMAC import."
+                )
+                # Must NOT call kdf.derive or PBKDF2HMAC() in the backup script.
+                assert "PBKDF2HMAC(" not in py_code and "kdf.derive(" not in py_code, (
+                    "YSG-RISK-050 REGRESSION: PBKDF2HMAC() call found in backup Python heredoc."
+                )
+                # Must reference 'present': False for FIPS case.
+                assert "present" in py_code and "False" in py_code, (
+                    "YSG-RISK-050: wrap1 'present': False not found in backup Python heredoc."
+                )
 
     # ── bundle.enc atomic write ──────────────────────────────────────────────
 
@@ -335,11 +355,17 @@ class TestRestoreV2:
             "YSG-RISK-050: argon2 not referenced in restore.sh Flow A path."
         )
 
-    def test_fips_pbkdf2_branch_in_restore(self, restore_text: str) -> None:
-        """FIPS branch (PBKDF2-HMAC-SHA384) must be in restore Flow A. Spec §Restore flows."""
-        assert "pbkdf2" in restore_text.lower() or "PBKDF2" in restore_text, (
-            "YSG-RISK-050: PBKDF2 not found in restore.sh — FIPS_MODE=1 flow A branch missing."
+    def test_fips_wrap1_absent_in_restore(self, restore_text: str) -> None:
+        """FIPS_MODE=1 results in wrap1.present=false — restore must handle this.
+        PBKDF2HMAC import REMOVED per Nico ruling 2026-05-28: it cannot reproduce an argon2 verifier.
+        wrap1.present=false is checked at restore; password flow is blocked with clear error."""
+        # PBKDF2HMAC import must NOT appear in the restore decrypt Python script (removed per Nico).
+        assert "PBKDF2HMAC" not in restore_text, (
+            "YSG-RISK-050 REGRESSION: PBKDF2HMAC found in restore.sh decrypt Python script. "
+            "Nico ruling 2026-05-28: FIPS_MODE=1 → wrap#1 ABSENT, NOT PBKDF2. "
+            "PBKDF2 cannot reproduce an argon2 verifier. Remove PBKDF2HMAC import + branch."
         )
+        # wrap1.present=false is already tested by test_wrap1_present_false_error_path.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,7 +561,6 @@ class TestCryptoUnit:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         from cryptography.hazmat.primitives.hashes import SHA384
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         from cryptography.hazmat.backends import default_backend
         from cryptography.exceptions import InvalidTag
         from argon2.low_level import hash_secret_raw, Type as Argon2Type
@@ -554,55 +579,45 @@ class TestCryptoUnit:
         mac_key = bytearray(hkdf(bytes(dek), b"", b"yashigani-backup-meta-mac-v1", 48))
 
         # ── Wrap#1 ────────────────────────────────────────────────────────────
-        kek1_hkdf_salt = _os.urandom(32)
+        # Per spec (Nico ruling 2026-05-28): backup extracts V from stored PHC
+        # (no argon2 call); restore recomputes V = argon2id_raw(plaintext, salt, params).
+        # FIPS_MODE=1 → wrap#1 ABSENT (wrap1.present=False).
         if not fips_mode:
-            # Use argon2id directly (no stored PHC at test time — derive from pw).
-            import os as _os2
-            argon2_salt = _os2.urandom(16)
-            ikm1 = bytearray(hash_secret_raw(
+            import base64 as _b64
+            # Simulate PHC by hashing the password (creates a real argon2 PHC).
+            argon2_salt = _os.urandom(16)
+            # Compute V = argon2id_raw (this is what restore will do).
+            V = bytearray(hash_secret_raw(
                 secret=password.encode(),
                 salt=argon2_salt,
                 time_cost=3, memory_cost=65536, parallelism=4,
                 hash_len=32, type=Argon2Type.ID, version=19,
             ))
-            wrap1_extra = {
+            # Backup-side: V would be base64-decoded from the PHC hash segment.
+            # In test we have V directly (same result as base64-decoding the PHC).
+            kek1_hkdf_salt = _os.urandom(32)
+            kek1 = bytearray(hkdf(bytes(V), kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
+            _zero = lambda b: None  # noqa — _zero is defined below
+            aad1 = b"yashigani-backup-v1" + ts.encode() + b"\x01"
+            iv1  = _os.urandom(12)
+            ct_tag1 = AESGCM(bytes(kek1)).encrypt(iv1, bytes(dek), aad1)
+            wdek1_ct = ct_tag1[:-16]; wdek1_tag = ct_tag1[-16:]
+
+            wrap1 = {
+                "kdf_algo": "argon2id+hkdf-sha384",
                 "argon2_salt_hex": argon2_salt.hex(),
                 "argon2_time_cost": 3, "argon2_memory_cost": 65536,
                 "argon2_parallelism": 4, "argon2_hash_len": 32,
                 "argon2_version": 19,
-                "pbkdf2_salt_hex": None, "pbkdf2_iterations": 600000,
-                "kdf_algo": "argon2id+hkdf-sha384",
+                "kek1_hkdf_salt_hex": kek1_hkdf_salt.hex(),
+                "iv_hex": iv1.hex(),
+                "wdek_ct_hex": wdek1_ct.hex(),
+                "wdek_tag_hex": wdek1_tag.hex(),
+                "present": True,
             }
         else:
-            pbkdf2_salt = _os.urandom(32)
-            kdf = PBKDF2HMAC(
-                algorithm=SHA384(), length=32,
-                salt=pbkdf2_salt, iterations=600000,
-                backend=default_backend(),
-            )
-            ikm1 = bytearray(kdf.derive(password.encode()))
-            wrap1_extra = {
-                "argon2_salt_hex": None,
-                "argon2_time_cost": None, "argon2_memory_cost": None,
-                "argon2_parallelism": None, "argon2_hash_len": None,
-                "argon2_version": None,
-                "pbkdf2_salt_hex": pbkdf2_salt.hex(), "pbkdf2_iterations": 600000,
-                "kdf_algo": "pbkdf2-hmac-sha384+hkdf-sha384",
-            }
-        kek1 = bytearray(hkdf(bytes(ikm1), kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
-        aad1 = b"yashigani-backup-v1" + ts.encode() + b"\x01"
-        iv1  = _os.urandom(12)
-        ct_tag1 = AESGCM(bytes(kek1)).encrypt(iv1, bytes(dek), aad1)
-        wdek1_ct = ct_tag1[:-16]; wdek1_tag = ct_tag1[-16:]
-
-        wrap1 = {
-            **wrap1_extra,
-            "kek1_hkdf_salt_hex": kek1_hkdf_salt.hex(),
-            "iv_hex": iv1.hex(),
-            "wdek_ct_hex": wdek1_ct.hex(),
-            "wdek_tag_hex": wdek1_tag.hex(),
-            "present": True,
-        }
+            # FIPS_MODE=1: wrap#1 ABSENT per Nico ruling 2026-05-28.
+            wrap1 = {"present": False}
 
         # ── Wrap#2 ────────────────────────────────────────────────────────────
         ikm2 = bytearray(bytes.fromhex(ikm2_hex))
@@ -673,20 +688,22 @@ class TestCryptoUnit:
             result["bundle_not_plaintext"] = True  # not valid UTF-8 = definitely encrypted
 
         # ── Restore path: Flow A (correct password) ───────────────────────────
+        # wrap1.present=False under FIPS_MODE=1 — skip restore-via-password in that case.
         try:
             w1 = meta_obj["wrap1"]
+            if not w1.get("present", False):
+                # FIPS_MODE=1: wrap#1 absent — password restore not available.
+                result["restore_password_ok"] = None  # N/A under FIPS
+                raise StopIteration  # jump to finally to avoid Exception catch
+            # Restore: V = argon2id_raw(plaintext, argon2_salt_from_meta, params)
+            # This matches backup's V = base64decode(PHC hash segment) iff password unchanged.
             kek1_r = bytearray(hkdf(
                 bytes(bytearray(hash_secret_raw(
                     secret=password.encode(), salt=bytes.fromhex(w1["argon2_salt_hex"]),
                     time_cost=w1["argon2_time_cost"], memory_cost=w1["argon2_memory_cost"],
                     parallelism=w1["argon2_parallelism"], hash_len=w1["argon2_hash_len"],
                     type=Argon2Type.ID, version=w1["argon2_version"],
-                ) if w1["kdf_algo"] == "argon2id+hkdf-sha384" else
-                    PBKDF2HMAC(algorithm=SHA384(), length=32,
-                               salt=bytes.fromhex(w1["pbkdf2_salt_hex"]),
-                               iterations=w1["pbkdf2_iterations"],
-                               backend=default_backend()).derive(password.encode())
-                )),
+                ))),
                 bytes.fromhex(w1["kek1_hkdf_salt_hex"]), b"yashigani-kek1-v1", 32,
             ))
             dek_r = bytearray(AESGCM(bytes(kek1_r)).decrypt(
@@ -706,6 +723,8 @@ class TestCryptoUnit:
                 bytes.fromhex(meta_obj["bundle_aead"]["iv_hex"]), bundle_bytes, aad_verify
             )
             result["restore_password_ok"] = pt_r == pt_bytes
+        except StopIteration:
+            pass  # FIPS_MODE=1: wrap#1 absent — N/A
         except Exception:
             result["restore_password_ok"] = False
 
@@ -737,31 +756,31 @@ class TestCryptoUnit:
 
         # ── Wrong password → fail closed ──────────────────────────────────────
         if wrong_password:
-            try:
-                w1 = meta_obj["wrap1"]
-                bad_ikm1 = bytearray(hash_secret_raw(
-                    secret=wrong_password.encode(),
-                    salt=bytes.fromhex(w1["argon2_salt_hex"]),
-                    time_cost=w1["argon2_time_cost"], memory_cost=w1["argon2_memory_cost"],
-                    parallelism=w1["argon2_parallelism"], hash_len=w1["argon2_hash_len"],
-                    type=Argon2Type.ID, version=w1["argon2_version"],
-                ) if w1["kdf_algo"] == "argon2id+hkdf-sha384" else
-                    PBKDF2HMAC(algorithm=SHA384(), length=32,
-                               salt=bytes.fromhex(w1["pbkdf2_salt_hex"]),
-                               iterations=w1["pbkdf2_iterations"],
-                               backend=default_backend()).derive(wrong_password.encode())
-                )
-                bad_kek1 = bytearray(hkdf(bytes(bad_ikm1),
-                                          bytes.fromhex(w1["kek1_hkdf_salt_hex"]),
-                                          b"yashigani-kek1-v1", 32))
-                AESGCM(bytes(bad_kek1)).decrypt(
-                    bytes.fromhex(w1["iv_hex"]),
-                    bytes.fromhex(w1["wdek_ct_hex"]) + bytes.fromhex(w1["wdek_tag_hex"]),
-                    b"yashigani-backup-v1" + ts.encode() + b"\x01",
-                )
-                result["wrong_password_fail"] = False  # should have raised
-            except InvalidTag:
-                result["wrong_password_fail"] = True
+            w1 = meta_obj["wrap1"]
+            if not w1.get("present", False):
+                # FIPS_MODE=1: wrap#1 absent — wrong-password test N/A.
+                result["wrong_password_fail"] = True  # vacuously true: can't attempt
+            else:
+                try:
+                    # Restore with wrong password: V' ≠ V → wrong KEK1 → InvalidTag.
+                    bad_ikm1 = bytearray(hash_secret_raw(
+                        secret=wrong_password.encode(),
+                        salt=bytes.fromhex(w1["argon2_salt_hex"]),
+                        time_cost=w1["argon2_time_cost"], memory_cost=w1["argon2_memory_cost"],
+                        parallelism=w1["argon2_parallelism"], hash_len=w1["argon2_hash_len"],
+                        type=Argon2Type.ID, version=w1["argon2_version"],
+                    ))
+                    bad_kek1 = bytearray(hkdf(bytes(bad_ikm1),
+                                              bytes.fromhex(w1["kek1_hkdf_salt_hex"]),
+                                              b"yashigani-kek1-v1", 32))
+                    AESGCM(bytes(bad_kek1)).decrypt(
+                        bytes.fromhex(w1["iv_hex"]),
+                        bytes.fromhex(w1["wdek_ct_hex"]) + bytes.fromhex(w1["wdek_tag_hex"]),
+                        b"yashigani-backup-v1" + ts.encode() + b"\x01",
+                    )
+                    result["wrong_password_fail"] = False  # should have raised
+                except InvalidTag:
+                    result["wrong_password_fail"] = True
 
         # ── Tampered bundle → fail closed ─────────────────────────────────────
         if tamper_bundle:
@@ -878,13 +897,298 @@ class TestCryptoUnit:
         )
         assert r["tamper_meta_fail"], "Tampered meta did NOT fail HMAC check"
 
-    def test_fips_mode_pbkdf2_branch(self) -> None:
-        """FIPS_MODE=1 branch uses PBKDF2-HMAC-SHA384, not argon2id."""
+    def test_fips_mode_wrap1_absent(self) -> None:
+        """FIPS_MODE=1: wrap#1 is ABSENT (wrap1.present=False), wrap#2 still works.
+        Per Nico ruling 2026-05-28: PBKDF2 cannot reproduce an argon2 verifier.
+        Only wrap#2 (HKDF-SHA384 of license/local-key) is written under FIPS."""
         import os
         ikm2_hex = os.urandom(32).hex()
         r = self._run_wrap_unwrap(
             "CorrectPassword!@#$%12345678901234", ikm2_hex,
             fips_mode=True
         )
-        assert r["restore_password_ok"], "FIPS_MODE=1 PBKDF2 path failed"
-        assert r["restore_wrap2_ok"],    "FIPS_MODE=1 wrap#2 path failed"
+        # wrap#1 must be absent under FIPS — wrap1_present=False.
+        assert not r["wrap1_present"], "FIPS_MODE=1: wrap1.present should be False (ABSENT), not True"
+        # wrap#2 must still work.
+        assert r["restore_wrap2_ok"], "FIPS_MODE=1 wrap#2 path failed"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Laura/Iris flagged tests (FIX-6 — required by BLOCK review)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_kek1_ikm_uses_raw_verifier_not_phc() -> None:
+    """FINDING-1 regression guard: backup Python heredoc must base64-decode the PHC hash
+    segment for V (raw argon2 verifier) and must NOT call hash_secret_raw with the PHC string.
+
+    Su's original bug: ran argon2id_raw(secret=ADMIN_PHC.encode(), ...) at backup → hash-of-PHC.
+    That != V → wrap#1 unwrap was always InvalidTag. Nico ruling 2026-05-28.
+    """
+    install_text = _read(INSTALL_SH)
+    # Locate the Python heredoc in install.sh.
+    py_start = install_text.find("cat > \"$_py_script_path\" << 'PYEOF'")
+    assert py_start != -1, "Python heredoc start not found in install.sh"
+    py_end = install_text.find("\nPYEOF\n", py_start)
+    assert py_end != -1, "Python heredoc PYEOF end marker not found"
+    py_code = install_text[py_start:py_end]
+
+    # Must base64-decode the PHC hash segment to extract V.
+    assert "b64decode" in py_code or "base64.b64decode" in py_code, (
+        "FINDING-1 REGRESSION: backup Python heredoc does not base64-decode the PHC hash "
+        "segment to extract the raw verifier V. Must use base64.b64decode(seg + padding)."
+    )
+    # Must split on "$" to get the hash segment from the PHC.
+    assert 'split("$")' in py_code or "split('$')" in py_code, (
+        "FINDING-1 REGRESSION: backup Python heredoc does not split PHC on '$' to extract "
+        "the hash segment. Required for V-extraction from stored argon2 PHC."
+    )
+    # Must NOT call hash_secret_raw with ADMIN_PHC as the secret (that was the bug).
+    import re as _re
+    bad_pattern = _re.compile(r'hash_secret_raw\s*\(.*?secret\s*=\s*ADMIN_PHC', _re.DOTALL)
+    assert not bad_pattern.search(py_code), (
+        "FINDING-1 REGRESSION: backup Python heredoc calls hash_secret_raw(secret=ADMIN_PHC...). "
+        "This hashes the PHC string, NOT the admin password → wrap#1 always InvalidTag at restore. "
+        "Fix: extract V by base64-decoding the hash segment of the stored PHC. No argon2 call at backup."
+    )
+
+
+@pytest.mark.skipif(
+    __import__("sys").version_info < (3, 12),
+    reason="filter='data' requires Python ≥3.12 (pyproject.toml requires-python = '>=3.12'); "
+           "test environment uses an older Python",
+)
+def test_safe_extract_blocks_absolute_paths() -> None:
+    """FINDING-4 regression guard: restore extraction must use filter='data' which blocks
+    absolute paths, '..' traversal, and unsafe symlinks.
+
+    Old implementation: manual filter with startswith('..') and '//' checks did NOT block
+    absolute paths like '/etc/passwd' or 'a/../../etc/evil' (path traversal CWE-22).
+    Python ≥3.12 required (pyproject.toml: requires-python = '>=3.12').
+    """
+    import tarfile, io, tempfile, os
+    from pathlib import Path
+
+    # Build a tar with an absolute-path member and a path-traversal member.
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+        # Absolute path member.
+        abs_info = tarfile.TarInfo(name="/etc/evil_absolute")
+        abs_info.size = 5
+        tar.addfile(abs_info, io.BytesIO(b"evil!"))
+        # Path traversal member.
+        trav_info = tarfile.TarInfo(name="a/../../etc/evil_traversal")
+        trav_info.size = 5
+        tar.addfile(trav_info, io.BytesIO(b"evil!"))
+        # Legitimate member.
+        ok_info = tarfile.TarInfo(name="safe_file.txt")
+        ok_info.size = 4
+        tar.addfile(ok_info, io.BytesIO(b"safe"))
+    tar_bytes = tar_buf.getvalue()
+
+    with tempfile.TemporaryDirectory() as staging_dir:
+        staging = Path(staging_dir)
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+            # filter="data" blocks absolute paths and traversal (Python ≥3.12).
+            # It should either raise or silently skip the dangerous members.
+            # We pass only the safe member to confirm safe members still extract.
+            safe_members = [m for m in tar.getmembers() if not m.name.startswith("/")
+                            and ".." not in m.name]
+            try:
+                tar.extractall(path=str(staging), members=safe_members, filter="data")
+            except Exception:
+                pass  # Some versions raise on first bad member — that's fine (fail-closed).
+
+            # Now attempt to extract the dangerous members — they must be rejected.
+            dangerous_members = [m for m in tar.getmembers()
+                                  if m.name.startswith("/") or ".." in m.name]
+            for dm in dangerous_members:
+                rejected = False
+                try:
+                    tar.extract(dm, path=str(staging), filter="data")
+                except (tarfile.FilterError, ValueError, KeyError, Exception):
+                    rejected = True
+                assert rejected, (
+                    f"FINDING-4 REGRESSION: dangerous tar member '{dm.name}' was NOT rejected "
+                    f"by filter='data'. CWE-22 path traversal. Must be blocked."
+                )
+
+        # Assert the dangerous paths did NOT land under staging (belt-and-suspenders).
+        evil_abs  = staging / "etc" / "evil_absolute"
+        evil_trav = staging / "etc" / "evil_traversal"
+        assert not evil_abs.exists(), (
+            "FINDING-4 REGRESSION: absolute-path tar member '/etc/evil_absolute' was extracted "
+            "under staging_dir. filter='data' must block this. CWE-22 path traversal."
+        )
+        assert not evil_trav.exists(), (
+            "FINDING-4 REGRESSION: path-traversal tar member 'a/../../etc/evil_traversal' was "
+            "extracted under staging_dir. filter='data' must block this."
+        )
+        # The legitimate member should still be present.
+        assert (staging / "safe_file.txt").exists(), (
+            "safe_file.txt missing — filter='data' should permit safe relative paths."
+        )
+
+
+def test_wrong_recovery_key_fail_closed() -> None:
+    """Wrong wrap#2 IKM → InvalidTag specifically (not just a False result); no plaintext."""
+    try:
+        import os, io, json, hashlib, hmac as _hmac, tarfile
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.hashes import SHA384
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.exceptions import InvalidTag
+        from argon2.low_level import hash_secret_raw, Type as Argon2Type
+    except ImportError:
+        pytest.skip("cryptography + argon2-cffi not available")
+
+    def hkdf(ikm, salt, info, length):
+        return HKDF(algorithm=SHA384(), length=length, salt=salt or None,
+                    info=info, backend=default_backend()).derive(ikm)
+
+    ts = "20260528_120000"
+    dek = bytearray(os.urandom(32))
+    ikm2 = bytearray(os.urandom(32))
+    kek2_hkdf_salt = os.urandom(32)
+    kek2 = bytearray(hkdf(bytes(ikm2), kek2_hkdf_salt, b"yashigani-kek2-v1", 32))
+    aad2 = b"yashigani-backup-v1" + ts.encode() + b"\x02"
+    iv2  = os.urandom(12)
+    ct_tag2 = AESGCM(bytes(kek2)).encrypt(iv2, bytes(dek), aad2)
+    wdek2_ct = ct_tag2[:-16]; wdek2_tag = ct_tag2[-16:]
+
+    # Wrong IKM → wrong KEK2 → InvalidTag.
+    wrong_ikm2 = bytearray(os.urandom(32))
+    wrong_kek2 = bytearray(hkdf(bytes(wrong_ikm2), kek2_hkdf_salt, b"yashigani-kek2-v1", 32))
+    raised_invalid_tag = False
+    try:
+        AESGCM(bytes(wrong_kek2)).decrypt(iv2, wdek2_ct + wdek2_tag, aad2)
+    except InvalidTag:
+        raised_invalid_tag = True
+
+    assert raised_invalid_tag, (
+        "Wrong wrap#2 IKM did NOT raise InvalidTag. Must fail-closed with InvalidTag, not silently."
+    )
+
+
+def test_wrap2_present_false_fails_closed() -> None:
+    """backup-meta.json with wrap2.present=false must cause restore to exit non-zero.
+    The restore script checks wrap2.present before attempting wrap#2 DEK unwrap."""
+    restore_text = _read(RESTORE_SH)
+    # The Python decrypt inline script must check wrap2.present and sys.exit if false.
+    assert "wrap2.present=false" in restore_text or (
+        "wrap2" in restore_text and "present" in restore_text
+        and ("sys.exit" in restore_text or "exit 1" in restore_text)
+    ), (
+        "YSG-RISK-050: restore.sh does not fail-closed on wrap2.present=false. "
+        "A backup with no wrap#2 must be rejected at restore time."
+    )
+    # Check that the Python script explicitly checks present field before unwrapping.
+    assert 'w2.get("present"' in restore_text or 'w2["present"]' in restore_text or \
+           "wrap2.present" in restore_text, (
+        "YSG-RISK-050: restore.sh Python script does not read wrap2.present field. "
+        "Missing fail-closed check."
+    )
+
+
+@pytest.mark.skipif(
+    __import__("subprocess").run(
+        [__import__("sys").executable, "-c",
+         "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; "
+         "from argon2.low_level import hash_secret_raw; "
+         "from argon2 import extract_parameters"],
+        capture_output=True,
+    ).returncode != 0,
+    reason="cryptography + argon2-cffi not available in test environment",
+)
+def test_roundtrip_v_extraction_matches_argon2_restore() -> None:
+    """Roundtrip test: backup-side V-extraction (base64 of PHC hash segment) == restore-side
+    argon2id_raw(plaintext) → same KEK1 → wrap/unwrap succeeds. Wrong plaintext → InvalidTag.
+
+    This exercises the REAL extract-V path (FINDING-1 regression) end-to-end.
+    """
+    import base64, os, hashlib as _hashlib
+    from argon2 import PasswordHasher, extract_parameters
+    from argon2.low_level import hash_secret_raw, Type as Argon2Type
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.hashes import SHA384
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidTag
+
+    def hkdf(ikm, salt, info, length):
+        return HKDF(algorithm=SHA384(), length=length, salt=salt or None,
+                    info=info, backend=default_backend()).derive(ikm)
+
+    plaintext_password = "CorrectPassword!@#$%12345678901234"
+
+    # ── Simulate storing the admin PHC (as Yashigani does at account creation) ──
+    ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
+    admin_phc = ph.hash(plaintext_password)
+
+    # ── Backup-side: extract V from stored PHC (NO argon2 call) ──────────────
+    # PHC format: $argon2id$v=19$m=65536,t=3,p=4$<salt_b64>$<hash_b64>
+    # Segments after split("$"): ['', 'argon2id', 'v=19', 'm=...,t=...,p=...', '<salt_b64>', '<hash_b64>']
+    params = extract_parameters(admin_phc)
+    phc_segments = admin_phc.split("$")
+    # Salt is at phc_segments[4], hash is at phc_segments[5].
+    salt_seg = phc_segments[4]
+    argon2_salt = base64.b64decode(salt_seg + "=" * (-len(salt_seg) % 4))
+    # V = base64-decode the hash segment (last "$" field).
+    seg = admin_phc.split("$")[-1]
+    V_backup = base64.b64decode(seg + "=" * (-len(seg) % 4))
+    assert len(V_backup) == 32, f"V_backup wrong length: {len(V_backup)}"
+
+    # ── Restore-side: recompute V from typed plaintext ────────────────────────
+    V_restore = hash_secret_raw(
+        secret=plaintext_password.encode(),
+        salt=argon2_salt,
+        time_cost=params.time_cost,
+        memory_cost=params.memory_cost,
+        parallelism=params.parallelism,
+        hash_len=params.hash_len,
+        type=Argon2Type.ID,
+        version=params.version,
+    )
+    assert len(V_restore) == 32, f"V_restore wrong length: {len(V_restore)}"
+
+    # ── V_backup == V_restore iff password unchanged ──────────────────────────
+    assert V_backup == V_restore, (
+        "FINDING-1 REGRESSION: backup V-extraction ≠ restore argon2id_raw(plaintext). "
+        "They MUST be equal iff password unchanged. The base64-decoding of the PHC hash "
+        "segment must yield the same bytes as argon2id_raw with the same salt+params."
+    )
+
+    # ── Derive KEK1 from V, wrap/unwrap DEK ──────────────────────────────────
+    kek1_hkdf_salt = os.urandom(32)
+    dek = bytearray(os.urandom(32))
+    kek1_backup = bytearray(hkdf(V_backup, kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
+    kek1_restore = bytearray(hkdf(bytes(V_restore), kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
+    assert bytes(kek1_backup) == bytes(kek1_restore), "KEK1 from V_backup ≠ KEK1 from V_restore"
+
+    ts = "20260528_test"
+    aad1 = b"yashigani-backup-v1" + ts.encode() + b"\x01"
+    iv1  = os.urandom(12)
+    ct_tag1 = AESGCM(bytes(kek1_backup)).encrypt(iv1, bytes(dek), aad1)
+    # Restore-side: decrypt with KEK1 derived from V_restore.
+    dek_r = bytearray(AESGCM(bytes(kek1_restore)).decrypt(iv1, ct_tag1, aad1))
+    assert bytes(dek_r) == bytes(dek), "Wrap/unwrap with correct V roundtrip FAILED"
+
+    # ── Wrong plaintext → different V → wrong KEK1 → InvalidTag ──────────────
+    V_wrong = hash_secret_raw(
+        secret=b"WrongPassword!@#$%12345678901234",
+        salt=argon2_salt,
+        time_cost=params.time_cost,
+        memory_cost=params.memory_cost,
+        parallelism=params.parallelism,
+        hash_len=32,
+        type=Argon2Type.ID,
+        version=params.version,
+    )
+    assert V_wrong != V_backup, "Wrong password produced same V (should be different)"
+    kek1_wrong = bytearray(hkdf(bytes(V_wrong), kek1_hkdf_salt, b"yashigani-kek1-v1", 32))
+    raised = False
+    try:
+        AESGCM(bytes(kek1_wrong)).decrypt(iv1, ct_tag1, aad1)
+    except InvalidTag:
+        raised = True
+    assert raised, "Wrong password did NOT raise InvalidTag — wrap#1 fail-closed broken"

@@ -2488,7 +2488,7 @@ _backup_existing_data() {
   # Supersedes RETRO-R4-3 plaintext + SHA-256 manifest. All sensitive content
   # (secrets/, .env, postgres_dump.sql, agent-volumes/*.tar) is encrypted with
   # AES-256-GCM under a random DEK. The DEK is wrapped under two independent KEKs:
-  #   Wrap#1 — admin-password path (argon2id FIPS_MODE=0 / PBKDF2-HMAC-SHA384 FIPS_MODE=1)
+  #   Wrap#1 — admin-password path (argon2id, FIPS_MODE=0 ONLY — ABSENT under FIPS_MODE=1)
   #   Wrap#2 — recovery path (license .ysg bytes OR YASHIGANI_DB_AES_KEY for community)
   # HMAC-SHA384 (key-separated via HKDF) covers the cleartext backup-meta.json.
   # All crypto runs in Python inside the gateway/backoffice container
@@ -2498,11 +2498,16 @@ _backup_existing_data() {
   # Key hierarchy (locked spec 2026-05-28):
   #   DEK     = os.urandom(32)
   #   MAC_KEY = HKDF-SHA384(DEK, info=b"yashigani-backup-meta-mac-v1", len=48)
-  #   KEK1    = HKDF-SHA384(argon2id/PBKDF2(admin_pw, salt, params), kek1_hkdf_salt, len=32)
+  #   IKM1 = V = raw 32-byte argon2 verifier extracted from stored PHC (NO argon2 call at backup)
+  #     V = base64decode_padded(PHC.split("$")[-1])   # unpadded argon2 PHC base64
+  #   KEK1    = HKDF-SHA384(V, kek1_hkdf_salt, len=32)
   #   KEK2    = HKDF-SHA384(.ysg bytes | DB_AES_KEY, kek2_hkdf_salt, len=32)
   #   WDEK1/2 = AES-256-GCM(KEK, IV, aad=version+ts+wrap_id, pt=DEK)
   #   bundle.enc = AES-256-GCM(DEK, IV_B, aad=meta_bytes_with_empty_hmac, pt=tar.gz)
   #   hmac_hex = HMAC-SHA384(MAC_KEY, aad_bytes)
+  #   FIPS_MODE=1: wrap#1 is ABSENT (wrap1.present=false). PBKDF2 cannot reproduce an
+  #     argon2 verifier; there is no sound non-interactive password-recovery wrap under FIPS.
+  #     Only wrap#2 is written under FIPS. (Nico ruling 2026-05-28.)
   #
   # Guardrails (spec §Implementation guardrails):
   #   - ts captured once and reused everywhere.
@@ -2637,17 +2642,24 @@ _backup_existing_data() {
 YSG-RISK-050/051: Dual-wrap signed+encrypted backup construction.
 LOCKED spec 2026-05-28. Zero crypto decisions here — implement verbatim.
 Runs inside gateway/backoffice container (cryptography + argon2-cffi present).
-All secrets arrive via environment variables. No secrets in argv or on disk
+All secrets arrive via stdin JSON. No secrets in argv, env, or on disk
 other than the final output files.
+
+IKM1 = V = raw 32-byte argon2 verifier, extracted from stored PHC by base64-decoding
+the hash segment (no argon2 call at backup — NO plaintext password needed).
+RESTORE recomputes V = argon2id_raw(typed_plaintext, argon2_salt_from_meta, params).
+They match iff the password is unchanged. (Nico ruling 2026-05-28.)
+
+FIPS_MODE=1: wrap#1 is ABSENT (wrap1.present=false). PBKDF2 cannot reproduce an
+argon2 verifier (different function, different output). Only wrap#2 under FIPS.
 """
+import base64
 import hashlib
 import hmac as _hmac
 import json
 import os
-import struct
 import sys
 import tarfile
-import tempfile
 from pathlib import Path
 
 # ── Imports (cryptography + argon2-cffi) ─────────────────────────────────────
@@ -2655,25 +2667,31 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.hashes import SHA384
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.backends import default_backend
 except ImportError as e:
     sys.stderr.write(f"FATAL: cryptography library not available: {e}\n")
     sys.exit(1)
 
 try:
-    from argon2.low_level import hash_secret_raw, Type as Argon2Type
     from argon2 import extract_parameters
 except ImportError as e:
     sys.stderr.write(f"FATAL: argon2-cffi not available: {e}\n")
     sys.exit(1)
 
-# ── Environment inputs ────────────────────────────────────────────────────────
+# ── Inputs via stdin JSON (secrets) + environment (non-secret config) ─────────
+# Secrets (_YSG_ADMIN_PHC, _YSG_IKM2_HEX) arrive via stdin JSON to avoid
+# exposure in 'docker inspect' (FINDING-4). Non-secret config via env vars.
+try:
+    _stdin_data = json.loads(sys.stdin.read())
+except Exception as e:
+    sys.stderr.write(f"FATAL: Failed to parse stdin JSON: {e}\n")
+    sys.exit(1)
+
 STAGING_DIR   = os.environ["_YSG_BACKUP_STAGING_DIR"]   # path accessible from container
 OUTPUT_DIR    = os.environ["_YSG_BACKUP_OUTPUT_DIR"]     # where bundle.enc + meta go
-ADMIN_PHC     = os.environ.get("_YSG_ADMIN_PHC", "")     # argon2 PHC or empty
+ADMIN_PHC     = _stdin_data.get("admin_phc", "")         # argon2 PHC or empty (from stdin)
 WRAP1_PRESENT = os.environ.get("_YSG_WRAP1_PRESENT", "false").lower() == "true"
-IKM2_HEX      = os.environ["_YSG_IKM2_HEX"]             # hex-encoded recovery IKM
+IKM2_HEX      = _stdin_data["ikm2_hex"]                  # hex-encoded recovery IKM (from stdin)
 TIER          = os.environ.get("_YSG_TIER", "community")
 LIC_ID        = os.environ.get("_YSG_LIC_ID", "null")
 FIPS_MODE     = os.environ.get("_YSG_FIPS_MODE", "0") == "1"
@@ -2708,64 +2726,43 @@ mac_key = bytearray(_hkdf_sha384(
     bytes(dek), b"", b"yashigani-backup-meta-mac-v1", 48
 ))
 
-# ── Step 2: Wrap#1 (admin-password) ──────────────────────────────────────────
+# ── Step 2: Wrap#1 (admin-password, FIPS_MODE=0 only) ────────────────────────
+# FIPS_MODE=1 → wrap#1 is ABSENT. PBKDF2 cannot reproduce an argon2 verifier
+# (different primitive, different output). No sound password-recovery wrap under FIPS.
+# Nico ruling 2026-05-28. Only wrap#2 under FIPS_MODE=1.
+#
+# When FIPS_MODE=0: IKM1 = V = the raw 32-byte argon2 verifier extracted from the
+# stored PHC. We base64-decode the last "$"-segment of the PHC (argon2 PHC base64
+# is unpadded — add "=" padding before decoding). NO argon2 call at backup.
+# RESTORE recomputes V = argon2id_raw(typed_plaintext, argon2_salt_from_meta, params).
+# They match iff the password is unchanged. (Single argon2 pass total, at restore only.)
 wrap1 = {"present": False}
-if WRAP1_PRESENT and ADMIN_PHC:
+if WRAP1_PRESENT and ADMIN_PHC and not FIPS_MODE:
     kek1_hkdf_salt = os.urandom(32)
-    if not FIPS_MODE:
-        # argon2id path: extract params from stored PHC, derive IKM1.
-        try:
-            params = extract_parameters(ADMIN_PHC)
-            salt_b = params.salt  # bytes
-            ikm1 = bytearray(hash_secret_raw(
-                secret=ADMIN_PHC.encode(),
-                salt=salt_b,
-                time_cost=params.time_cost,
-                memory_cost=params.memory_cost,
-                parallelism=params.parallelism,
-                hash_len=32,
-                type=Argon2Type.ID,
-                version=params.version,
-            ))
-            kdf_algo = "argon2id+hkdf-sha384"
-            wrap1_extra = {
-                "argon2_salt_hex": salt_b.hex(),
-                "argon2_time_cost": params.time_cost,
-                "argon2_memory_cost": params.memory_cost,
-                "argon2_parallelism": params.parallelism,
-                "argon2_hash_len": 32,
-                "argon2_version": params.version,
-                "pbkdf2_salt_hex": None,
-                "pbkdf2_iterations": 600000,
-            }
-        except Exception as e:
-            sys.stderr.write(f"WARNING: argon2 param extraction failed: {e} — wrap#1 skipped\n")
-            wrap1 = {"present": False}
-            ikm1 = None
-    else:
-        # FIPS_MODE=1: PBKDF2-HMAC-SHA384 (argon2id is not FIPS-approved).
-        pbkdf2_salt = os.urandom(32)
-        kdf = PBKDF2HMAC(
-            algorithm=SHA384(),
-            length=32,
-            salt=pbkdf2_salt,
-            iterations=600000,
-            backend=default_backend(),
-        )
-        ikm1 = bytearray(kdf.derive(ADMIN_PHC.encode()))
-        kdf_algo = "pbkdf2-hmac-sha384+hkdf-sha384"
+    try:
+        params = extract_parameters(ADMIN_PHC)
+        # PHC format: $argon2id$v=19$m=...,t=...,p=...$<salt_b64>$<hash_b64>
+        # Segments after split("$"): ['', 'argon2id', 'v=19', 'm=...,t=...,p=...', '<salt_b64>', '<hash_b64>']
+        phc_segs = ADMIN_PHC.split("$")
+        if len(phc_segs) < 6:
+            raise ValueError(f"Unexpected PHC format: only {len(phc_segs)} segments")
+        salt_seg = phc_segs[4]
+        salt_b = base64.b64decode(salt_seg + "=" * (-len(salt_seg) % 4))
+        # Extract V by base64-decoding the hash segment (last "$" field).
+        # argon2 PHC uses unpadded base64 — add "=" padding before decoding.
+        seg = phc_segs[5]
+        ikm1 = bytearray(base64.b64decode(seg + "=" * (-len(seg) % 4)))
+        if len(ikm1) != 32:
+            raise ValueError(f"Unexpected argon2 verifier length: {len(ikm1)} (expected 32)")
+        kdf_algo = "argon2id+hkdf-sha384"
         wrap1_extra = {
-            "argon2_salt_hex": None,
-            "argon2_time_cost": None,
-            "argon2_memory_cost": None,
-            "argon2_parallelism": None,
-            "argon2_hash_len": None,
-            "argon2_version": None,
-            "pbkdf2_salt_hex": pbkdf2_salt.hex(),
-            "pbkdf2_iterations": 600000,
+            "argon2_salt_hex": salt_b.hex(),
+            "argon2_time_cost": params.time_cost,
+            "argon2_memory_cost": params.memory_cost,
+            "argon2_parallelism": params.parallelism,
+            "argon2_hash_len": 32,
+            "argon2_version": params.version,
         }
-
-    if ikm1 is not None:
         kek1 = bytearray(_hkdf_sha384(
             bytes(ikm1), kek1_hkdf_salt, b"yashigani-kek1-v1", 32
         ))
@@ -2786,6 +2783,13 @@ if WRAP1_PRESENT and ADMIN_PHC:
             "wdek_tag_hex": wdek1_tag.hex(),
             "present": True,
         }
+    except Exception as e:
+        sys.stderr.write(f"WARNING: wrap#1 V-extraction failed: {e} — wrap#1 skipped\n")
+        wrap1 = {"present": False}
+elif FIPS_MODE:
+    # FIPS_MODE=1: wrap#1 absent by design (Nico ruling 2026-05-28).
+    sys.stderr.write("INFO: FIPS_MODE=1 — wrap#1 absent (no sound argon2-free password wrap). wrap#2 only.\n")
+    wrap1 = {"present": False}
 
 # ── Step 3: Wrap#2 (recovery) ─────────────────────────────────────────────────
 ikm2 = bytearray(bytes.fromhex(IKM2_HEX))
@@ -2957,20 +2961,27 @@ PYEOF
     exit 1
   fi
 
-  # Run Python inside container; pass secrets ONLY via environment variables.
-  # NOTE: env vars passed to docker exec are visible in 'docker inspect' on the
-  # host but NOT in /proc/<pid>/cmdline inside the container. This is the
-  # documented safe pattern for short-lived credential passing (per spec tooling
-  # section and OWASP CI/CD Top 10 C3). The alternative — a secrets file inside
-  # the container — requires an extra cleanup step and offers no security benefit
-  # since the container filesystem is already trusted.
+  # Run Python inside container. Non-secret config is passed via -e env vars.
+  # Secrets (_YSG_ADMIN_PHC, _YSG_IKM2_HEX) are passed via stdin as a JSON blob
+  # to avoid exposure in 'docker inspect' (FINDING-4: env vars to docker exec are
+  # visible in docker inspect to any user with Docker socket access; stdin is not).
+  # stdin is not in argv, env, or docker inspect output.
+  local _secrets_json
+  _secrets_json=$(python3 -c "import json,sys; print(json.dumps({'admin_phc': sys.argv[1], 'ikm2_hex': sys.argv[2]}))" \
+    "${_admin_phc}" "${_ikm2_hex}" 2>/dev/null)
+  if [[ -z "$_secrets_json" ]]; then
+    log_error "YSG-RISK-050: Failed to build secrets JSON for container stdin"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
   local _py_output
-  if ! _py_output=$($_runtime_cmd_local exec \
+  if ! _py_output=$(printf '%s' "$_secrets_json" | $_runtime_cmd_local exec -i \
         -e "_YSG_BACKUP_STAGING_DIR=${_container_staging}" \
         -e "_YSG_BACKUP_OUTPUT_DIR=${_container_output}" \
-        -e "_YSG_ADMIN_PHC=${_admin_phc}" \
         -e "_YSG_WRAP1_PRESENT=${_wrap1_present}" \
-        -e "_YSG_IKM2_HEX=${_ikm2_hex}" \
         -e "_YSG_TIER=${_ysg_tier}" \
         -e "_YSG_LIC_ID=${_license_key_id}" \
         -e "_YSG_FIPS_MODE=${FIPS_MODE:-0}" \
