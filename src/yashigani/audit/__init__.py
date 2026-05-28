@@ -22,6 +22,19 @@ from yashigani.audit.chain import (
 )
 # v2.24.1 LU-AMEND-01 wave 2 — daily checkpoint scheduler
 from yashigani.audit.checkpoint_job import AuditCheckpointScheduler
+# v2.25.0 P1 W0a — 10 ring-fence onboarding event dataclasses (Lu-Gap-06 / G3)
+from yashigani.audit.schema import (
+    ManifestOnboardEvent,
+    ManifestOffboardEvent,
+    ManifestValidateFailedEvent,
+    DynamicCertIssuedEvent,
+    DynamicCertRevokedEvent,
+    McpCallEvent,
+    McpToolDescriptionFetchedEvent,
+    KmsSecretDistributedToAgentEvent,
+    OpaDecisionOnMcpEvent,
+    EgressAllowUsedEvent,
+)
 
 __all__ = [
     "AuditEvent",
@@ -48,4 +61,15 @@ __all__ = [
     "day_anchor",
     # v2.24.1 LU-AMEND-01 wave 2
     "AuditCheckpointScheduler",
+    # v2.25.0 P1 W0a — ring-fence onboarding events (Lu-Gap-06 / G3)
+    "ManifestOnboardEvent",
+    "ManifestOffboardEvent",
+    "ManifestValidateFailedEvent",
+    "DynamicCertIssuedEvent",
+    "DynamicCertRevokedEvent",
+    "McpCallEvent",
+    "McpToolDescriptionFetchedEvent",
+    "KmsSecretDistributedToAgentEvent",
+    "OpaDecisionOnMcpEvent",
+    "EgressAllowUsedEvent",
 ]

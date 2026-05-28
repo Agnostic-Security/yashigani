@@ -246,6 +246,31 @@ class EventType(str, Enum):
     # (SoD-005). Same username/email exists in both admin_accounts and
     # identity_registry. Operator must remediate manually.
     IDENTITY_STORE_CONFLICT = "IDENTITY_STORE_CONFLICT"
+    # ---------------------------------------------------------------------------
+    # v2.25.0 — P1 Universal Ring-fence Onboarding (W0a — Lu-Gap-06 / G3)
+    # All 10 event types registered ahead of the emitting features so the
+    # Merkle chain schema is consistent before any feature dispatch lands.
+    #
+    # Compliance hook (Lu — do NOT assign control IDs here; map in G6 workflow):
+    #   AU-2 / AU-12 / CC7.1 — these events must appear in every ring-fence
+    #   audit trail.  Per-agent control mapping is deferred to Lu's G6 gate.
+    # ---------------------------------------------------------------------------
+    # Manifest lifecycle
+    MANIFEST_ONBOARD = "MANIFEST_ONBOARD"
+    MANIFEST_OFFBOARD = "MANIFEST_OFFBOARD"
+    MANIFEST_VALIDATE_FAILED = "MANIFEST_VALIDATE_FAILED"
+    # PKI / mTLS — dynamic cert operations (v1 = onboard-time; on-demand = v2)
+    DYNAMIC_CERT_ISSUED = "DYNAMIC_CERT_ISSUED"
+    DYNAMIC_CERT_REVOKED = "DYNAMIC_CERT_REVOKED"
+    # MCP data-plane events
+    MCP_CALL = "MCP_CALL"
+    MCP_TOOL_DESCRIPTION_FETCHED = "MCP_TOOL_DESCRIPTION_FETCHED"
+    # KMS secret distribution to a ring-fenced agent
+    KMS_SECRET_DISTRIBUTED_TO_AGENT = "KMS_SECRET_DISTRIBUTED_TO_AGENT"
+    # OPA decision on an MCP tool call (distinct from OPA_RESPONSE_CHECK_FAILED)
+    OPA_DECISION_ON_MCP = "OPA_DECISION_ON_MCP"
+    # Egress allowlist entry exercised (covert-channel audit — TM-URF-023 / G3)
+    EGRESS_ALLOW_USED = "EGRESS_ALLOW_USED"
 
 
 # ---------------------------------------------------------------------------
@@ -2039,3 +2064,283 @@ class IdentityStoreConflictEvent(AuditEvent):
     identity_id: str = ""               # identity_registry identity_id
     conflict_field: str = ""            # "username" | "email"
     conflict_value_hash: str = ""       # HMAC-SHA256 of the conflicting value
+
+
+# ---------------------------------------------------------------------------
+# v2.25.0 — P1 Universal Ring-fence Onboarding event dataclasses (W0a)
+# Lu-Gap-06 / G3 — register ahead of emitting features.
+#
+# Compliance hook: control-ID mapping is intentionally ABSENT from these
+# dataclasses.  Lu maps controls in the G6 per-agent gate (workflow doc).
+# Inserting control IDs here would couple the dataclass to Lu's mapping
+# cadence; the event_type string in EventType is the stable identifier.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ManifestOnboardEvent(AuditEvent):
+    """
+    Emitted when ``yashigani onboard <manifest.yaml>`` completes successfully.
+
+    Records the agent name, tenant, manifest SHA-256, operator identity, and
+    the five ring-fence artifacts generated.  The raw manifest YAML is never
+    stored — only the SHA-256.
+
+    Security invariants:
+      - masking_applied is always True (operator identity masked in lower sinks).
+      - manifest_sha256 is the hex SHA-256 of the canonical YAML blob.
+      - artifacts_generated is a list of artifact-type labels, not paths.
+
+    v2.25.0 / Lu-Gap-06 / W0a.
+    """
+
+    event_type: str = EventType.MANIFEST_ONBOARD
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    tenant_id: str = ""              # from manifest metadata.tenant_id
+    agent_name: str = ""             # from manifest metadata.name
+    manifest_sha256: str = ""        # hex SHA-256 of the YAML blob
+    operator_identity: str = ""      # sub from operator token, or "unknown"
+    token_jti: str = ""              # operator token jti, or ""
+    artifacts_generated: list = None  # type: ignore[assignment]
+    runtime: str = ""                # YSG_RUNTIME value at onboard time
+
+    def __post_init__(self) -> None:
+        if self.artifacts_generated is None:
+            self.artifacts_generated = []
+
+
+@dataclass
+class ManifestOffboardEvent(AuditEvent):
+    """
+    Emitted when ``yashigani offboard <name>`` completes.
+
+    Records whether each artifact was removed cleanly and whether a cert
+    rotation was triggered.
+
+    v2.25.0 / Lu-Gap-06 / W0a / S5 offboard lifecycle.
+    """
+
+    event_type: str = EventType.MANIFEST_OFFBOARD
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    operator_identity: str = ""
+    artifacts_removed: list = None  # type: ignore[assignment]
+    cert_rotation_triggered: bool = False
+
+    def __post_init__(self) -> None:
+        if self.artifacts_removed is None:
+            self.artifacts_removed = []
+
+
+@dataclass
+class ManifestValidateFailedEvent(AuditEvent):
+    """
+    Emitted when ``yashigani validate`` (or the parser inside ``onboard``)
+    rejects a manifest.
+
+    Carries the rule that fired and a sanitised excerpt of the field that
+    failed (raw field values are never stored — only the field name and
+    rule label).  masking_applied is always True.
+
+    v2.25.0 / Lu-Gap-06 / W0a / M1-M9.
+    """
+
+    event_type: str = EventType.MANIFEST_VALIDATE_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    rule: str = ""              # e.g. "M1_size_cap" | "M2_tenant_id_regex" | "M7_unsigned"
+    field_name: str = ""        # the manifest field path that failed, e.g. "spec.image.digest"
+    detail: str = ""            # human-readable reason (no raw field values)
+    manifest_sha256: str = ""   # best-effort; empty when size cap fires before hash
+
+
+@dataclass
+class DynamicCertIssuedEvent(AuditEvent):
+    """
+    Emitted when a leaf mTLS cert is issued for a ring-fenced agent at
+    onboard time (v1) or on-demand (v2, PKI Issuer API).
+
+    Security invariants:
+      - Private key material is NEVER stored.
+      - serial_hex is the certificate serial number in hex (for revocation lookup).
+      - spiffe_id is the full SPIFFE URI assigned to the agent.
+      - expires_at is ISO-8601 UTC.
+
+    v2.25.0 / Lu-Gap-06 / W0a / Nico NICO-002/003.
+    """
+
+    event_type: str = EventType.DYNAMIC_CERT_ISSUED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    spiffe_id: str = ""          # spiffe://yashigani.internal/agents/{tenant}/{name}
+    serial_hex: str = ""         # cert serial number in hex
+    issued_at: str = ""          # ISO-8601 UTC
+    expires_at: str = ""         # ISO-8601 UTC
+    issuance_mode: str = ""      # "onboard_time" | "on_demand"
+
+
+@dataclass
+class DynamicCertRevokedEvent(AuditEvent):
+    """
+    Emitted when a ring-fenced agent's mTLS leaf cert is revoked (on offboard
+    or explicit rotation).
+
+    v2.25.0 / Lu-Gap-06 / W0a / Nico NICO-003.
+    """
+
+    event_type: str = EventType.DYNAMIC_CERT_REVOKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    spiffe_id: str = ""
+    serial_hex: str = ""
+    revocation_reason: str = ""  # "offboard" | "rotation" | "compromise"
+
+
+@dataclass
+class McpCallEvent(AuditEvent):
+    """
+    Emitted on every MCP tool call brokered by the Yashigani gateway.
+
+    Security invariants:
+      - Tool input/output are NEVER stored — only tool_name and
+        args_redacted (a boolean flag) plus OPA decision.
+      - identity_id is the resolved agent SPIFFE identity slug.
+      - request_id correlates with GatewayRequestEvent.
+
+    v2.25.0 / Lu-Gap-06 / W0a / P3 MCP broker.
+    """
+
+    event_type: str = EventType.MCP_CALL
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    identity_id: str = ""        # resolved SPIFFE identity slug
+    request_id: str = ""
+    tool_name: str = ""
+    server_id: str = ""          # upstream MCP server identifier
+    opa_decision: str = ""       # "allow" | "deny" | "redact"
+    args_redacted: bool = False
+    elapsed_ms: Optional[int] = None
+
+
+@dataclass
+class McpToolDescriptionFetchedEvent(AuditEvent):
+    """
+    Emitted when the MCP broker fetches tool descriptions from an upstream
+    MCP server (tools/list or prompts/list response).
+
+    Used to audit the tool-catalogue integrity path (M4 + P3).  The tool
+    description text is NEVER stored — only the tool_name and whether the
+    sanitisation filter modified it.
+
+    v2.25.0 / Lu-Gap-06 / W0a / M4 prompt-injection filter.
+    """
+
+    event_type: str = EventType.MCP_TOOL_DESCRIPTION_FETCHED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    server_id: str = ""
+    tool_count: int = 0          # number of tool descriptors fetched
+    filtered_count: int = 0      # number of descriptors modified by sanitiser
+    rejected_count: int = 0      # number of descriptors rejected (over cap / pattern)
+    fetch_type: str = ""         # "tools_list" | "prompts_list"
+
+
+@dataclass
+class KmsSecretDistributedToAgentEvent(AuditEvent):
+    """
+    Emitted when the KMS layer distributes a secret to a ring-fenced agent
+    (file-based bind-mount at onboard time, or runtime refresh).
+
+    Security invariants:
+      - Secret value is NEVER stored.
+      - kms_key_name is the logical key name (e.g. ``/tenant/acme/agent-goose/openai``),
+        never the raw secret value.
+      - masking_applied is always True.
+
+    v2.25.0 / Lu-Gap-06 / W0a / spec.secrets KMS flow.
+    """
+
+    event_type: str = EventType.KMS_SECRET_DISTRIBUTED_TO_AGENT
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    kms_key_name: str = ""       # logical KMS key path (never the value)
+    kms_provider: str = ""       # "vault" | "aws" | "azure" | "gcp" | "keeper"
+    distribution_mode: str = ""  # "onboard_time" | "runtime_refresh"
+
+
+@dataclass
+class OpaDecisionOnMcpEvent(AuditEvent):
+    """
+    Emitted for every OPA policy decision on an MCP tool call.
+
+    Distinct from OPA_RESPONSE_CHECK_FAILED (which covers OPA errors/timeouts).
+    This event covers deliberate policy decisions — allow, deny, or redact —
+    including tool sensitivity class, budget gate, and multi-hop chain depth.
+
+    Security invariants:
+      - Tool input/output are never stored.
+      - deny_reason is a label, not a raw policy string.
+      - chain_depth is the JWT chain depth (multi-hop guard, Lu-Gap-02).
+
+    v2.25.0 / Lu-Gap-06 / W0a / P3 mcp.rego.
+    """
+
+    event_type: str = EventType.OPA_DECISION_ON_MCP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    tool_name: str = ""
+    server_id: str = ""
+    request_id: str = ""
+    decision: str = ""           # "allow" | "deny" | "redact"
+    deny_reason: str = ""        # label if denied: "sensitivity_ceiling" | "budget" | "chain_depth" | "not_in_allowlist"
+    tool_sensitivity: str = ""   # "PUBLIC" | "INTERNAL" | "CONFIDENTIAL" | "RESTRICTED"
+    chain_depth: int = 0         # JWT identity chain depth (multi-hop)
+    elapsed_ms: Optional[int] = None
+
+
+@dataclass
+class EgressAllowUsedEvent(AuditEvent):
+    """
+    Emitted every time a ring-fenced agent's traffic traverses a declared
+    ``egress_allow`` entry (Agent → Caddy → OPA → external destination).
+
+    Used as the covert-channel audit control (TM-URF-023 / G3).  For
+    CONFIDENTIAL/RESTRICTED ceiling agents, ``egress_allow`` entries require
+    operator justification; this event is the evidence trail for that
+    justification.
+
+    Security invariants:
+      - The request URL path is truncated to 128 chars and the query string
+        is dropped (no raw user-supplied values in the audit log).
+      - The response body is never stored.
+      - client_identity is the resolved SPIFFE identity slug.
+
+    v2.25.0 / Lu-Gap-06 / W0a / C-adjacent / egress_allow_used audit type.
+    """
+
+    event_type: str = EventType.EGRESS_ALLOW_USED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    client_identity: str = ""    # resolved SPIFFE identity slug
+    egress_entry: str = ""       # the egress_allow entry label (e.g. "openai.com")
+    method: str = ""             # HTTP method
+    path_truncated: str = ""     # request path, max 128 chars, query stripped
+    upstream_status: Optional[int] = None
+    elapsed_ms: Optional[int] = None
