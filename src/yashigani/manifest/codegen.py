@@ -718,8 +718,7 @@ def _gen_networkpolicy_overlay(
         networkPolicy:
           enabled: true
           agent{agent_name_camel}:
-            ingress:
-              - []  # deny all ingress by default
+            ingress: []  # deny all ingress (empty list = deny-all per K8s NP spec)
             egress:
         {egress_section}
     """).format(

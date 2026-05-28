@@ -628,6 +628,21 @@ class TestW3F2NetworkPolicyEgress:
         assert "app.kubernetes.io/name: caddy" in netpol
         assert "k8s-app: kube-dns" in netpol
 
+    def test_netpol_overlay_ingress_parses_as_empty_deny_all(self) -> None:
+        """Captain re-gate: ingress must render as ``ingress: []`` (empty list =
+        deny-all), NOT ``ingress: - []`` which YAML-parses to ``[[]]`` and is an
+        invalid K8s NetworkPolicyIngressRule. Parse the rendered YAML — a substring
+        check misses this, which is how the original defect slipped."""
+        import yaml
+        artifacts = _fresh_engine().render(dry_run=True)
+        netpol = artifacts["helm/yashigani/values-hermes-agent-networkpolicy.yaml"]
+        doc = yaml.safe_load(netpol)
+        agent_keys = [k for k in doc["networkPolicy"] if k.startswith("agent")]
+        ingress = doc["networkPolicy"][agent_keys[0]]["ingress"]
+        assert ingress == [], (
+            "Captain re-gate: ingress must parse as [] (deny-all), got %r" % (ingress,)
+        )
+
 
 # ---------------------------------------------------------------------------
 # W3-F3 — Caddy reverse_proxy syntax
