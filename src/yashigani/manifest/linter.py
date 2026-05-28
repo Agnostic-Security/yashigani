@@ -13,6 +13,7 @@ Rules implemented here:
   N1  — SPIFFE identity /agents/{tenant_id}/{name} prefix mandate.
   C1  — egress_allow host must not resolve to RFC1918/loopback/link-local
          (static parse-time check on literal values; full DNS is codegen).
+         Also applied to spec.model_egress.base_url (F4 — Laura MED).
   C3  — duplicate (tenant_id, name) within a single validate run (stateless
          in v1 — registry uniqueness is a runtime concern; validator flags
          exact duplicate fields in the manifest itself).
@@ -29,6 +30,7 @@ import logging
 import os
 import re
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 _log = logging.getLogger(__name__)
 
@@ -260,8 +262,60 @@ def verify_digests_live(parsed: dict, *, _inspector: Any = None) -> list[LintErr
 
 
 # ---------------------------------------------------------------------------
-# N1 — SPIFFE identity prefix mandate
+# N1 — SPIFFE identity prefix mandate + URI resolver (P1-F-01)
 # ---------------------------------------------------------------------------
+
+_SPIFFE_TRUST_DOMAIN = "yashigani.internal"
+_SPIFFE_AGENTS_PREFIX = "spiffe://%s/agents" % _SPIFFE_TRUST_DOMAIN
+
+
+def resolve_spiffe_uri(parsed: dict) -> str:
+    """
+    P1-F-01 (Iris LOW) — resolve the canonical SPIFFE URI for an agent manifest.
+
+    Returns ``spec.identity.spiffe.override_id`` if set, otherwise constructs
+    the default URI:
+
+        spiffe://yashigani.internal/agents/{tenant_id}/{name}
+
+    Note: ``spec.identity.spiffe`` is a **dict** (not a plain string); the
+    ``override_id`` key is the string field within it.
+
+    Args:
+        parsed: A parsed manifest dict (output of ``parse_manifest``).
+
+    Returns:
+        A string SPIFFE URI.
+
+    Raises:
+        ValueError: if neither override_id nor both tenant_id and name are
+                    available to construct a URI.
+
+    Usage (W3 codegen, Captain W2 §11):
+        from yashigani.manifest import resolve_spiffe_uri
+        spiffe_id = resolve_spiffe_uri(parsed)
+    """
+    # Check for override_id
+    override_id: Optional[str] = (
+        ((parsed.get("spec") or {}).get("identity") or {})
+        .get("spiffe") or {}
+    ).get("override_id")
+
+    if override_id is not None:
+        return override_id
+
+    # Construct default URI
+    metadata = parsed.get("metadata") or {}
+    tenant_id: str = metadata.get("tenant_id", "")
+    name: str = metadata.get("name", "")
+
+    if not tenant_id or not name:
+        raise ValueError(
+            "Cannot resolve SPIFFE URI: manifest is missing metadata.tenant_id "
+            "and/or metadata.name, and no spec.identity.spiffe.override_id is set."
+        )
+
+    return "%s/%s/%s" % (_SPIFFE_AGENTS_PREFIX, tenant_id, name)
 
 
 def _lint_spiffe_prefix(parsed: dict) -> list[LintError]:
@@ -368,6 +422,53 @@ def _lint_egress_allow(parsed: dict) -> list[LintError]:
                     "literal IP address.  If you need to allow a private upstream, "
                     "contact your security team (C1 requires operator justification).",
             ))
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# C1 (extended) — model_egress.base_url SSRF / private-IP check (F4)
+# ---------------------------------------------------------------------------
+
+
+def _lint_model_egress_base_url(parsed: dict) -> list[LintError]:
+    """
+    F4 (Laura MED) — C1 extension: spec.model_egress.base_url must not
+    contain a private/loopback/link-local/metadata IP address.
+
+    Only spec.network.egress_allow[].host was previously checked.  A
+    base_url of ``http://169.254.169.254/...`` (AWS IMDS / metadata service)
+    or any RFC1918/loopback address passes right through the old check.
+
+    The ``_is_private_address`` helper is reused; the URL is parsed to
+    extract the hostname/IP component.  Non-parseable URLs are silently
+    passed (the codegen and schema validate URL syntax).
+    """
+    errors: list[LintError] = []
+    model_egress = (parsed.get("spec") or {}).get("model_egress") or {}
+    base_url = model_egress.get("base_url")
+    if not base_url or not isinstance(base_url, str):
+        return errors
+
+    try:
+        parsed_url = urlparse(base_url)
+        host = parsed_url.hostname or ""
+    except Exception:  # noqa: BLE001 — urlparse is permissive; malformed URLs silently skip
+        return errors
+
+    if not host:
+        return errors
+
+    if _is_private_address(host):
+        errors.append(LintError(
+            "C1_model_egress_private_url",
+            "spec.model_egress.base_url host %r is a private/loopback/link-local address. "
+            "Using internal addresses as model egress endpoints enables SSRF attacks "
+            "(C1 — SSRF prevention / F4)." % host,
+            field="spec.model_egress.base_url",
+            fix="Use a public model API endpoint (e.g. https://api.openai.com/v1) "
+                "instead of a private IP address.  If a private upstream is required, "
+                "contact your security team (C1 / operator justification needed).",
+        ))
     return errors
 
 
@@ -554,6 +655,9 @@ def validate_manifest(
 
     # C1 — egress_allow private IPs
     errors.extend(_lint_egress_allow(parsed))
+
+    # C1 (extended) — model_egress.base_url private-IP / SSRF check (F4)
+    errors.extend(_lint_model_egress_base_url(parsed))
 
     # C3 — name/tenant_id presence
     errors.extend(_lint_name_uniqueness(parsed))

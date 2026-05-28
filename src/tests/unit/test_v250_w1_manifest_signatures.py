@@ -119,13 +119,14 @@ class TestRsaPssPath:
         )
 
     def _sign_with_rsa_pss(self, data: bytes, private_key) -> str:
-        from cryptography.hazmat.primitives import hashes, serialization
+        """Sign using DIGEST_LENGTH — the FIPS 186-5 §5.4 compliant salt length."""
+        from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
         sig = private_key.sign(
             data,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA384()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=padding.PSS.DIGEST_LENGTH,  # FIX-1: FIPS 186-5 §5.4 cap = hLen = 48 bytes
             ),
             hashes.SHA384(),
         )

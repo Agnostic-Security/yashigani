@@ -15,12 +15,21 @@ Two code paths keyed on ``signature.algorithm``:
                         OpenSSL FIPS Provider CMVP #4985 is active at process
                         start — we do NOT load the provider here; it is the
                         operator's responsibility).
+                        PSS salt length: DIGEST_LENGTH (48 bytes for SHA-384),
+                        per FIPS 186-5 §5.4 cap of hLen.
                         Nico review hook: see ``_verify_rsa_pss`` docstring.
 
 Environment gate:
   YSG_REQUIRE_SIGNED_MANIFEST=
     unset / "warn"  → WARN in dev (default)
     "fail"          → FAIL (required for CI / prod)
+
+FIPS mode algorithm gate:
+  When YASHIGANI_FIPS=1, only ``rsa-pss-3072-sha384`` is permitted.
+  Any other algorithm — including unknown/future values — is an
+  unconditional hard-fail regardless of YSG_REQUIRE_SIGNED_MANIFEST.
+  The warn/skip enforcement level does NOT apply to FIPS algorithm checks
+  (FIX-2 — Nico gate).
 
 Decisions:
   - decision #8: setrlimit v1, seccomp-bpf v2
@@ -34,8 +43,8 @@ Nico review hook (M7 FIPS path):
   Before enabling in production FIPS mode, Nico must confirm:
     1. OpenSSL FIPS Provider CMVP #4985 is loaded (YASHIGANI_FIPS=1 gate).
     2. RSA key size is exactly 3072 bits (assert_rsa_3072 guard enforces this).
-    3. PSS salt length is PSS.MAX_LENGTH (cryptography default — matches
-       CMVP #4985 approved mode).
+    3. PSS salt length is PSS.DIGEST_LENGTH (= hLen = 48 bytes for SHA-384),
+       per FIPS 186-5 §5.4.  MAX_LENGTH MUST NOT be used in FIPS mode.
   Tag this module for Nico sign-off before any FIPS deployment.
 
 Last updated: 2026-05-28T00:00:00+00:00
@@ -67,7 +76,8 @@ _ENV_FIPS = "YASHIGANI_FIPS"
 # Nico review hook constant — do not remove.
 _NICO_REVIEW_REQUIRED = (
     "FIPS RSA-PSS path requires Nico sign-off before production deployment. "
-    "Confirm: OpenSSL FIPS Provider CMVP #4985 loaded, RSA-3072, PSS.MAX_LENGTH."
+    "Confirm: OpenSSL FIPS Provider CMVP #4985 loaded, RSA-3072, "
+    "PSS.DIGEST_LENGTH (= hLen = 48 bytes for SHA-384, per FIPS 186-5 §5.4)."
 )
 
 
@@ -232,7 +242,9 @@ def _verify_rsa_pss(
 
     # Nico review hook: THIS FUNCTION requires Nico sign-off before use in
     # production FIPS mode.  See module docstring / _NICO_REVIEW_REQUIRED.
-    # The PSS salt length is PSS.MAX_LENGTH (auto — cryptography default).
+    # PSS salt length MUST be DIGEST_LENGTH (hLen = 48 bytes for SHA-384)
+    # per FIPS 186-5 §5.4.  MAX_LENGTH (333 bytes for RSA-3072/SHA-384)
+    # EXCEEDS the FIPS cap and must NOT be used here.
 
     Args:
         manifest_bytes: The canonical manifest bytes.
@@ -286,15 +298,17 @@ def _verify_rsa_pss(
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey as _RSAPublicKey  # noqa: PLC0415
     rsa_public_key: _RSAPublicKey = public_key  # type: ignore[assignment]
 
-    # Verify RSA-PSS / SHA-384
-    # PSS salt length = PSS.MAX_LENGTH (cryptography default — CMVP #4985 approved).
+    # Verify RSA-PSS / SHA-384.
+    # salt_length=DIGEST_LENGTH (48 bytes for SHA-384) is mandated by
+    # FIPS 186-5 §5.4 (salt length ≤ hLen).  Using MAX_LENGTH (333 bytes
+    # for RSA-3072/SHA-384) would EXCEED the FIPS cap and is NOT permitted.
     try:
         rsa_public_key.verify(
             sig_bytes,
             manifest_bytes,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA384()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA384(),
         )
@@ -342,11 +356,28 @@ def verify_manifest_signature(
         ManifestSignatureError: if enforcement=fail and verification fails.
     """
     level = _enforcement_level()
+
+    # FIX-2 (Nico BLOCK): In FIPS mode, the algorithm gate is unconditional.
+    # It fires BEFORE the skip-return so that a FIPS deployment with
+    # YSG_REQUIRE_SIGNED_MANIFEST=skip cannot smuggle a non-FIPS algorithm
+    # through.  The guard only fires when a signature block is present with a
+    # non-rsa-pss-3072-sha384 algorithm.
+    sig_block = (parsed.get("spec") or {}).get("signature")
+    if sig_block and _is_fips_mode():
+        _algorithm_early = sig_block.get("algorithm", "")
+        if _algorithm_early and _algorithm_early != "rsa-pss-3072-sha384":
+            raise ManifestSignatureError(
+                "FIPS mode requires algorithm rsa-pss-3072-sha384; "
+                "algorithm %r is not permitted in FIPS mode (Nico NICO-005 / FIX-2). "
+                "This error is unconditional — YSG_REQUIRE_SIGNED_MANIFEST level does not apply."
+                % _algorithm_early,
+                algorithm=_algorithm_early,
+            )
+
     if level == "skip":
         _log.info("M7: manifest signature check skipped (YSG_REQUIRE_SIGNED_MANIFEST=skip)")
         return
 
-    sig_block = (parsed.get("spec") or {}).get("signature")
     if not sig_block:
         msg = (
             "manifest has no spec.signature block; "
@@ -374,14 +405,11 @@ def verify_manifest_signature(
         )
         return
 
+    # At this point, FIPS-mode non-rsa-pss-3072-sha384 is already guarded above.
     try:
         if algorithm == "cosign-bundled-key":
-            if _is_fips_mode():
-                raise ManifestSignatureError(
-                    "cosign/Sigstore is BLOCKED in FIPS mode (Nico NICO-005). "
-                    "Use rsa-pss-3072-sha384 algorithm instead.",
-                    algorithm="cosign-bundled-key",
-                )
+            # FIPS guard above already handles this case; this branch is
+            # only reachable in non-FIPS mode.
             _verify_cosign(manifest_bytes, signature_hex)
             _log.info("M7: cosign-bundled-key signature verified OK")
 

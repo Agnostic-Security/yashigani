@@ -2,11 +2,16 @@
 Yashigani Manifest CLI — ``yashigani validate``.
 
 Usage:
-    yashigani validate <manifest.yaml> [--verify-digests]
+    yashigani validate <manifest.yaml> [--verify-digests] [--fips-pubkey <pem-path>]
     python -m yashigani.manifest.cli validate <manifest.yaml> [--verify-digests]
 
 Error messages are human-quality (K3 — Nora launch gate):
   Every error includes what failed, why it matters, and how to fix it.
+
+F3 (Laura MED): ``--fips-pubkey <pem-path>`` threads the RSA-3072 public key
+into verify_manifest_signature() so that FIPS-signed manifests can be
+validated via the CLI.  Without this flag, rsa-pss-3072-sha384 manifests
+always failed with "fips_public_key_pem required".
 
 Last updated: 2026-05-28T00:00:00+00:00
 """
@@ -41,6 +46,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Perform live registry digest inspection (M6 live path). "
             "Requires docker/skopeo and network access. "
             "Skip for air-gap deployments."
+        ),
+    )
+    parser.add_argument(
+        "--fips-pubkey",
+        metavar="PEM_PATH",
+        default=None,
+        help=(
+            "Path to a PEM-encoded RSA-3072 public key used to verify "
+            "rsa-pss-3072-sha384 (FIPS) signatures.  Required when the "
+            "manifest spec.signature.algorithm is rsa-pss-3072-sha384. "
+            "Without this flag, FIPS-signed manifests cannot be verified."
         ),
     )
     parser.add_argument(
@@ -93,9 +109,24 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # 3. Signature verification (crypto — after structural lint)
+    # F3: load FIPS public key if --fips-pubkey was supplied.
+    fips_public_key_pem: bytes | None = None
+    if args.fips_pubkey is not None:
+        fips_pubkey_path = Path(args.fips_pubkey)
+        try:
+            fips_public_key_pem = fips_pubkey_path.read_bytes()
+        except OSError as exc:
+            _emit_error(
+                "Cannot read FIPS public key file: %s\n"
+                "  Fix: ensure %s exists and is a PEM-encoded RSA-3072 public key."
+                % (exc, args.fips_pubkey),
+                args.json,
+            )
+            return 2
+
     from yashigani.manifest.signatures import verify_manifest_signature, ManifestSignatureError  # noqa: PLC0415
     try:
-        verify_manifest_signature(manifest_bytes, parsed)
+        verify_manifest_signature(manifest_bytes, parsed, fips_public_key_pem=fips_public_key_pem)
     except ManifestSignatureError as exc:
         from yashigani.manifest.linter import LintError  # noqa: PLC0415
         result.errors.append(LintError(
