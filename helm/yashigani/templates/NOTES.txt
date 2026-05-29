@@ -72,6 +72,33 @@ AUDIT LOG — DURABILITY NOTICE (Iris coord #3 / Lu A.8.15):
   auditLog.enabled=false does NOT satisfy these controls — document the gap
   in your risk register if running without persistent audit.
 
+MCP BUNDLE (agentBundles.filesystemMcp) — OPERATOR RUNBOOK (K8s SB-2):
+
+  The filesystem-mcp bundle requires a JWT signing key delivered as a K8s
+  Secret. In Docker/Compose, install.sh writes the key to a host path and
+  bind-mounts it. On Kubernetes, you must pre-create the Secret:
+
+    kubectl create secret generic yashigani-mcp-signing-key \
+      -n {{ .Release.Namespace }} \
+      --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
+
+  Then reference it in your values override:
+
+    gateway:
+      mcpSigningKey:
+        existingSecretName: yashigani-mcp-signing-key
+        secretKey: mcp_identity_signing_key
+
+  IMPORTANT: gateway.mcpServers must NOT be set unless
+  agentBundles.filesystemMcp.enabled=true — the chart will fail at template
+  time if this invariant is violated (validate-security.yaml MCP-GUARD-001).
+  Set BOTH or NEITHER.
+
+  For GitOps/Sealed Secrets workflows, seal the Secret with:
+    kubeseal --scope namespace-wide -o yaml \
+      < mcp-signing-key.yaml > sealed-mcp-signing-key.yaml
+  and commit the SealedSecret to your cluster repo.
+
 KUBERNETES vs DOCKER/PODMAN FOOTPRINT DIFFERENCES (B11 — DRIFT-001):
 
   The following components are present in the Docker/Podman Compose deployment

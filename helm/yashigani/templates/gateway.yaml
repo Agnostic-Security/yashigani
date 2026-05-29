@@ -297,6 +297,20 @@ spec:
               subPath: license_key
               readOnly: true
             {{- end }}
+            {{- if .Values.agentBundles.filesystemMcp.enabled }}
+            {{- if .Values.gateway.mcpSigningKey.existingSecretName }}
+            # K8s SB-2 fix: mount MCP identity signing key from a standalone Secret.
+            # Logically separate from mTLS PKI — distinct key-management lifecycle
+            # (JWT signing key rotation is independent of TLS cert rotation).
+            # subPath mount lands at /run/secrets/mcp_identity_signing_key —
+            # the default path expected by _jwt.py (YASHIGANI_MCP_SIGNING_KEY_PATH).
+            # Does NOT interfere with the PKI Secret already at /run/secrets/.
+            - name: mcp-signing-key
+              mountPath: /run/secrets/mcp_identity_signing_key
+              subPath: {{ .Values.gateway.mcpSigningKey.secretKey | quote }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -334,6 +348,17 @@ spec:
         - name: license
           secret:
             secretName: yashigani-license
+            defaultMode: 0440
+        {{- end }}
+        {{- if and .Values.agentBundles.filesystemMcp.enabled .Values.gateway.mcpSigningKey.existingSecretName }}
+        # K8s SB-2 fix: standalone MCP identity signing key volume.
+        # Only rendered when filesystemMcp is enabled AND existingSecretName is set.
+        # The operator must pre-create this Secret before running helm install/upgrade:
+        #   kubectl create secret generic yashigani-mcp-signing-key -n <ns> \
+        #     --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
+        - name: mcp-signing-key
+          secret:
+            secretName: {{ .Values.gateway.mcpSigningKey.existingSecretName }}
             defaultMode: 0440
         {{- end }}
 ---

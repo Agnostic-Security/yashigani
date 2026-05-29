@@ -302,6 +302,50 @@ gateway:
   pdb:
     enabled: true
     minAvailable: 1
+  # ---------------------------------------------------------------------------
+  # v2.25.0 P3: MCP broker server list.  JSON-serialised into YASHIGANI_MCP_SERVERS.
+  # Default empty list = no MCP servers registered (gateway behaves as v2.24.x).
+  # Each entry: {agent_name, upstream_url, tenant_id, is_filesystem_agent (opt)}.
+  # NOTE: gateway.mcpServers MUST NOT be set unless agentBundles.filesystemMcp.enabled=true.
+  # Setting mcpServers without the bundle enabled is a configuration error — the Helm
+  # chart will fail at template time (validate-security.yaml MCP-GUARD-001).
+  # Example (pair with agentBundles.filesystemMcp.enabled=true):
+  #   gateway:
+  #     mcpServers:
+  #       - agent_name: filesystem-mcp
+  #         upstream_url: http://filesystem-mcp:8000
+  #         tenant_id: acme
+  #         is_filesystem_agent: true
+  # ---------------------------------------------------------------------------
+  mcpServers: []
+  # ---------------------------------------------------------------------------
+  # K8s SB-2 fix: MCP identity signing key delivery for Kubernetes deployments.
+  #
+  # Choice: Option B (separate Secret, separate mount — logically distinct from mTLS PKI).
+  # Rationale: mcp_identity_signing_key is a JWT signing secret, not a TLS certificate.
+  # Mixing it into the mTLS PKI Secret (Option A) couples two distinct key-management
+  # lifecycles (TLS cert rotation vs JWT key rotation) and risks conflating their
+  # security properties. A standalone Secret follows least-privilege and allows
+  # independent rotation without touching the mTLS bundle.
+  #
+  # In Docker/Compose: install.sh writes the key to a host path and bind-mounts it.
+  # In Kubernetes: the operator must pre-create a K8s Secret containing the key, then
+  # reference it here via mcpSigningKey.existingSecretName + mcpSigningKey.secretKey.
+  # The gateway pod mounts the key via subPath to /run/secrets/mcp_identity_signing_key.
+  #
+  # Pre-create the Secret:
+  #   kubectl create secret generic yashigani-mcp-signing-key \
+  #     -n <namespace> \
+  #     --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
+  # Then set:
+  #   --set gateway.mcpSigningKey.existingSecretName=yashigani-mcp-signing-key
+  #
+  # Only required when agentBundles.filesystemMcp.enabled=true.
+  # Leave existingSecretName empty if not using MCP bundles.
+  # ---------------------------------------------------------------------------
+  mcpSigningKey:
+    existingSecretName: ""   # name of the pre-created K8s Secret
+    secretKey: "mcp_identity_signing_key"  # key inside the Secret
   env:
     upstreamUrl: ""
     opaUrl: "https://yashigani-policy:8181"
@@ -313,16 +357,6 @@ gateway:
     agentTokenMinLength: "64"
     # v0.5.0
     deploymentStream: "opensource"
-    # v2.25.0 P3: MCP broker server list.  JSON-serialised into YASHIGANI_MCP_SERVERS.
-    # Default empty list = no MCP servers registered (gateway behaves as v2.24.x).
-    # Each entry: {agent_name, upstream_url, tenant_id, is_filesystem_agent (opt)}.
-    # Example:
-    #   mcpServers:
-    #     - agent_name: filesystem-mcp
-    #       upstream_url: http://filesystem-mcp:8000
-    #       tenant_id: acme
-    #       is_filesystem_agent: true
-    mcpServers: []
     # M-01 fix: overridden to grpcs:// by gateway.yaml when mtls.enabled=true.
     # This value applies only when mTLS is disabled (non-default, testing only).
     otelEndpoint: "http://otel-collector:4317"

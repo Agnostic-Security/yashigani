@@ -126,6 +126,33 @@
   This is a template-time assertion only — the chart cannot verify
   third-party images (OPA, Redis, Grafana etc.) without manifest inspect.
 */ -}}
+{{- /*
+  Laura SB-2 / MCP-GUARD-001: reject configurations where gateway.mcpServers is
+  non-empty but agentBundles.filesystemMcp.enabled is false.
+
+  Without filesystemMcp enabled:
+    • The Deployment + Service for filesystem-mcp are NOT rendered (no pod
+      exists to receive traffic).
+    • The NetworkPolicy egress rule allowing gateway→TCP/8000 is NOT rendered.
+    • The ingress NetworkPolicy allowing TCP/8000 into Shape-C pods is NOT rendered.
+
+  Yet a JWT would still be issued for an upstream registered in the broker
+  registry (built from YASHIGANI_MCP_SERVERS at gateway startup) — the gateway
+  would forward the call to a non-existent endpoint, proving Laura's path:
+  registry entry present, reachable endpoint absent.
+
+  The correct configuration is: set BOTH, or NEITHER.
+  If you are onboarding a custom MCP server that is NOT the bundled filesystemMcp,
+  you must still set agentBundles.filesystemMcp.enabled=true (or add a dedicated
+  bundle value key for your server). Any future MCP bundle additions MUST add the
+  same gate here, paired with their own enabled flag.
+
+  Finding: Laura SB-2 (2026-05-29).
+*/ -}}
+{{- if and .Values.gateway.mcpServers (not .Values.agentBundles.filesystemMcp.enabled) -}}
+  {{- fail "MCP-GUARD-001 CONFIGURATION ERROR: gateway.mcpServers is non-empty but agentBundles.filesystemMcp.enabled is false. The MCP broker registry would reference upstream(s) with no corresponding Deployment, Service, or NetworkPolicy rendered. A JWT would be issued for an unreachable call target. Set agentBundles.filesystemMcp.enabled=true alongside gateway.mcpServers, or set gateway.mcpServers=[] to disable MCP routing. Finding: Laura SB-2." -}}
+{{- end -}}
+
 {{- if (.Values.imagePolicy).requireImageDigests -}}
   {{- if not (contains "@sha256:" .Values.gateway.image.tag) -}}
     {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but gateway.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' yashigani-gateway:<tag>` and set gateway.image.tag=\"<tag>@sha256:<digest>\"." -}}
