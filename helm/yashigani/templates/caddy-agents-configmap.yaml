@@ -1,0 +1,48 @@
+{{- if .Values.caddy.enabled }}
+{{- /* Last updated: 2026-05-29T00:00:00+00:00 (S4: P1 W3 Phase 2a — agent import sentinel) */ -}}
+---
+# S4 — Caddy agent snippet ConfigMap (P1 W3 Phase 2a)
+#
+# PURPOSE
+#   Provides the /etc/caddy/agents/ directory mount for the Caddy pod.
+#   The Caddyfile ends with `import /etc/caddy/agents/*.caddy` which picks
+#   up per-agent route snippets from this ConfigMap.
+#
+# BASE INSTALL
+#   Empty by default — no agents onboarded. Caddy will log:
+#     "import: no files matching pattern /etc/caddy/agents/*.caddy"
+#   and continue normally. This is expected behaviour per Caddy documentation:
+#   a glob import that matches nothing is a non-fatal warning, not an error.
+#
+# ONBOARDING AN AGENT
+#   The ringfence-init codegen engine (P1 W3 Phase 1) generates per-agent
+#   Helm values and Kyverno policy files. The onboarding flow adds each agent
+#   snippet as a new key in this ConfigMap (or in a projected volume from a
+#   per-agent ConfigMap). The Caddy pod must be restarted (or a `caddy reload`
+#   triggered via the admin unix socket) to pick up new snippets.
+#
+# NEVER regenerate the monolith Caddyfile — all agent routes live in snippets.
+#
+# SECURITY
+#   The ConfigMap is mounted read-only in the Caddy pod. Only operators with
+#   K8s RBAC access to update ConfigMaps in the Yashigani namespace can add
+#   agent snippets. There is no runtime-writable path to this mount.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yashigani-caddy-agents
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-caddy-agents
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: caddy-agent-snippets
+    {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    yashigani.io/s4-sentinel: "true"
+    yashigani.io/p1-phase: "W3-P2a"
+    yashigani.io/rationale: >-
+      Empty base ConfigMap for the Caddy agent snippet directory.
+      Populated by ringfence-init codegen when agents are onboarded.
+      Mounted at /etc/caddy/agents/ in the Caddy pod (read-only).
+data: {}
+{{- end }}
