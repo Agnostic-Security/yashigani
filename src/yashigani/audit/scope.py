@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from yashigani.audit.masking import IMMUTABLE_FLOOR_EVENTS
+from yashigani.audit.masking import AUDIT_INTEGRITY_EVENTS, IMMUTABLE_FLOOR_EVENTS
 from yashigani.audit.schema import AuditEvent
 
 
@@ -47,6 +47,11 @@ class MaskingScopeConfig:
         # Immutable floor — cannot be overridden
         if event.event_type in IMMUTABLE_FLOOR_EVENTS:
             return True
+
+        # Audit-integrity events — never masked regardless of config.
+        # These carry SHA-256 / SHA-384 anchors that auditors must read.
+        if event.event_type in AUDIT_INTEGRITY_EVENTS:
+            return False
 
         # Collect override values that apply to this event
         overrides: list[bool] = []

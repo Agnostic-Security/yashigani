@@ -30,6 +30,22 @@ IMMUTABLE_FLOOR_EVENTS: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Audit-integrity events — NEVER masked (complement of IMMUTABLE_FLOOR)
+#
+# These event types carry cryptographic audit anchors (SHA-256 / SHA-384
+# hashes) that MUST be plaintext for auditors to cross-reference change
+# tickets against the Merkle chain. Masking them would undermine the
+# CM-3 / CC8.1 detective control.
+#
+# v2.25.0 / Lu-Gap-06 / G2.
+# ---------------------------------------------------------------------------
+
+AUDIT_INTEGRITY_EVENTS: frozenset[str] = frozenset({
+    "MANIFEST_ONBOARD",   # manifest_sha256 must be readable by auditors
+    "MANIFEST_OFFBOARD",  # audit trail completeness (no secret fields)
+})
+
+# ---------------------------------------------------------------------------
 # Regex patterns — compiled once at module import
 # ---------------------------------------------------------------------------
 

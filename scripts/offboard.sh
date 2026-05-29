@@ -574,7 +574,7 @@ _offboard_step8_ledger() {
   local _agent="$1"
   local _ledger_dir="${WORK_DIR}/docker/var"
   local _ledger_file="${_ledger_dir}/offboard-ledger.log"
-  _log_step "8/8 Write offboard ledger entry"
+  _log_step "8/8 Write offboard ledger and MANIFEST_OFFBOARD audit event"
 
   if _dry_print "ledger: offboard ${_agent} @ $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
     return 0
@@ -595,6 +595,92 @@ _offboard_step8_ledger() {
   chmod 0640 "$_ledger_file" 2>/dev/null || true
 
   _log_info "  Ledger entry written: ${_ledger_file}"
+
+  # G2 stage-6a: emit MANIFEST_OFFBOARD Merkle audit event (Lu-Gap-06 / G2.2).
+  # Operator identity is read from YSG_OPERATOR_IDENTITY env var, set by the
+  # step-up gate in install.sh before _username is cleared. Unset on fresh
+  # installs (no running system) — falls back to os user.
+  _offboard_emit_merkle_event "$_agent" "$_ts" "$_uid" "$_user"
+}
+
+# ---------------------------------------------------------------------------
+# _offboard_emit_merkle_event — G2 stage-6a MANIFEST_OFFBOARD audit event
+#
+# Belt-and-suspenders: called from _offboard_step8_ledger after all
+# artifact removals succeed. Failure logs a warning but does NOT abort
+# (all artifact removals are already durable).
+#
+# The artifacts_removed list mirrors the eight offboard steps.
+# cert_rotation_triggered is always true: step 6 runs rotate-leaves.
+# ---------------------------------------------------------------------------
+_offboard_emit_merkle_event() {
+  local _agent="$1"
+  local _ts="$2"
+  local _uid="$3"
+  local _user="$4"
+
+  if _dry_print "merkle-audit: MANIFEST_OFFBOARD for ${_agent}"; then
+    return 0
+  fi
+
+  # Resolve Python path (same approach as install.sh codegen heredoc)
+  local _src_dir="${WORK_DIR}/src"
+  local _operator="${YSG_OPERATOR_IDENTITY:-}"
+  if [[ -z "$_operator" ]]; then
+    _operator="${_user}@local (uid=${_uid}, no step-up)"
+  fi
+  local _audit_log_path="${YASHIGANI_AUDIT_LOG_PATH:-${WORK_DIR}/docker/var/audit.log}"
+
+  python3 - "$_agent" "$_src_dir" "$_operator" "$_audit_log_path" \
+      "${YSG_RUNTIME:-unknown}" <<'OFFBOARD_PYEOF' || \
+    _log_warn "  MANIFEST_OFFBOARD audit event write failed (non-fatal)"
+
+import sys, os
+
+agent_name     = sys.argv[1]
+src_dir        = sys.argv[2]
+operator       = sys.argv[3]
+audit_log_path = sys.argv[4]
+runtime        = sys.argv[5]
+
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+try:
+    from yashigani.audit.writer import AuditLogWriter
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.schema import ManifestOffboardEvent
+except ImportError as e:
+    print('[offboard] WARN: cannot import audit package: %s' % e, file=sys.stderr)
+    sys.exit(0)  # non-fatal
+
+# artifacts_removed: labels for the eight offboard steps
+_artifacts_removed = [
+    'service_identities.yaml entry',
+    'pki_ownership.sh tuple',
+    'caddy snippet',
+    'compose override',
+    'secrets/certs',
+    'pki rotate-leaves',
+    'helm values',
+    'offboard ledger',
+]
+
+_config = AuditConfig(
+    log_path=audit_log_path,
+    max_file_size_mb=int(os.environ.get('YASHIGANI_AUDIT_MAX_FILE_SIZE_MB', '100')),
+    retention_days=int(os.environ.get('YASHIGANI_AUDIT_RETENTION_DAYS', '90')),
+)
+_writer = AuditLogWriter(config=_config)
+_writer.write(ManifestOffboardEvent(
+    agent_name=agent_name,
+    operator_identity=operator,
+    artifacts_removed=_artifacts_removed,
+    cert_rotation_triggered=True,
+))
+_writer.close()
+print('[offboard] MANIFEST_OFFBOARD audit event written (operator=%s)' % operator)
+OFFBOARD_PYEOF
 }
 
 # ---------------------------------------------------------------------------

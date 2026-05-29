@@ -10290,8 +10290,13 @@ PYJSON
   # ── Shell-side audit record ───────────────────────────────────────────────
   # MANIFEST_ONBOARD / MANIFEST_OFFBOARD events are emitted by Python codegen
   # and offboard.sh respectively (G2 stages 5c/6a). This log line is the
-  # shell-side record that the step-up gate was satisfied.
+  # belt-and-suspenders shell record that the step-up gate was satisfied.
   log_info "  Audit: ${_op_label} step-up gate passed for user '${_username}' at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Export operator identity so the Python codegen heredoc and offboard.sh
+  # can carry it into the Merkle audit event (G2 stage-5c/6a requirement).
+  # Exported before _username is cleared — this is the only path that sets it.
+  export YSG_OPERATOR_IDENTITY="${_username}"
 
   _username=""
   return 0
@@ -10617,6 +10622,54 @@ if has_kms:
     print('[onboard] S7: ensure GID 2002 exists on host: groupadd -g 2002 ysg-secrets')
 
 print('[onboard] Onboard complete for agent: %s (tenant: %s)' % (agent_name, tenant_id))
+
+# G2 stage-5c: emit MANIFEST_ONBOARD Merkle audit event (Lu-Gap-06 / G2.2)
+# Reads operator identity from YSG_OPERATOR_IDENTITY env var (set by the
+# step-up gate before _username is cleared). Falls back to "unknown" when
+# running on a fresh install where the gate was not invoked.
+try:
+    import hashlib, json as _json, os as _os
+    from yashigani.audit.writer import AuditLogWriter
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.schema import ManifestOnboardEvent
+
+    # Canonical manifest SHA-256: full SHA-256 of the raw YAML bytes
+    _manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+
+    # Operator identity threaded from the step-up gate via env var
+    _operator = _os.environ.get('YSG_OPERATOR_IDENTITY', 'unknown') or 'unknown'
+
+    # Artifact labels (relative paths without WORK_DIR)
+    _artifact_labels = sorted(artifacts.keys())
+
+    # AuditConfig: default log path; override via YASHIGANI_AUDIT_LOG_PATH.
+    # On a running system the volume path is /var/log/yashigani/audit.log.
+    _audit_log_path = _os.environ.get(
+        'YASHIGANI_AUDIT_LOG_PATH',
+        _os.path.join(output_root, 'docker', 'var', 'audit.log'),
+    )
+    _audit_config = AuditConfig(
+        log_path=_audit_log_path,
+        max_file_size_mb=int(_os.environ.get('YASHIGANI_AUDIT_MAX_FILE_SIZE_MB', '100')),
+        retention_days=int(_os.environ.get('YASHIGANI_AUDIT_RETENTION_DAYS', '90')),
+    )
+    _writer = AuditLogWriter(config=_audit_config)
+    _writer.write(ManifestOnboardEvent(
+        tenant_id=tenant_id,
+        agent_name=agent_name,
+        manifest_sha256=_manifest_sha256,
+        operator_identity=_operator,
+        artifacts_generated=_artifact_labels,
+        runtime=runtime,
+    ))
+    _writer.close()
+    print('[onboard] MANIFEST_ONBOARD audit event written (operator=%s sha256=%.16s...)' % (
+        _operator, _manifest_sha256))
+except Exception as _audit_exc:
+    # Belt-and-suspenders: the onboard itself already succeeded.
+    # Audit write failure is logged but does NOT abort the operation
+    # (the primary artifact writes are already durable).
+    print('[onboard] WARN: MANIFEST_ONBOARD audit write failed: %s' % _audit_exc, file=sys.stderr)
 PYEOF
 
   if [[ "$_codegen_rc" -ne 0 ]]; then
@@ -10666,6 +10719,7 @@ handle_offboard_subcommand() {
 
   WORK_DIR="$WORK_DIR" \
   YSG_RUNTIME="${YSG_RUNTIME:-}" \
+  YSG_OPERATOR_IDENTITY="${YSG_OPERATOR_IDENTITY:-}" \
     bash "$_offboard_sh" "$_agent"
   local _rc=$?
 
