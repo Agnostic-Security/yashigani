@@ -58,6 +58,10 @@ spec:
     posture: mcp-b          # MCP-B: expose tools
     transport: stdio        # Shape-C: stdio subprocess
     session_mode: persistent
+    # FIX-IRIS-F3: gateway-enforced-only is intentional and SAFE here because
+    # sensitivity_ceiling is INTERNAL (line ~140). The linter P2 rule only
+    # hard-fails when sensitivity_ceiling is CONFIDENTIAL/RESTRICTED. Do NOT
+    # change identity_propagation without re-checking the P2 rule.
     identity_propagation: gateway-enforced-only  # MCP-B with INTERNAL ceiling (§4.5)
     exposes:
       listen_port: null     # stdio: no network listener

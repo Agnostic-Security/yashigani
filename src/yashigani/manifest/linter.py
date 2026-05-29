@@ -190,10 +190,36 @@ def _lint_inbound_ports(parsed: dict) -> list[LintError]:
 _SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 
+def _is_placeholder_digest(digest: str) -> bool:
+    """
+    FIX-NICO-001: return True if ``digest`` is a placeholder / all-identical-char
+    digest that passes ``_SHA256_PATTERN`` but has not been replaced with a real
+    scanned image digest.
+
+    Placeholder patterns detected:
+      - All 64 hex chars are the same (e.g. sha256:000...000, sha256:aaa...aaa)
+        This covers the common template default ``sha256:0000...0000`` as well as
+        any run of the same hex character.
+
+    The filesystem-mcp.yaml bundle ships with the template placeholder
+    ``sha256:0000...0000`` intentionally; the linter must reject it until the
+    operator replaces it with the real scanned digest (Trivy/D5 ceremony step).
+    """
+    if not _SHA256_PATTERN.match(digest):
+        return False  # format check catches non-matching strings separately
+    hex_chars = digest[len("sha256:"):]
+    # All 64 hex chars identical → placeholder
+    return len(set(hex_chars)) == 1
+
+
 def _lint_image_digests(parsed: dict) -> list[LintError]:
     """
     M6 — spec.image.digest and all spec.sidecars[*].image.digest must be
     present and in the form ``sha256:<64 hex chars>``.
+
+    FIX-NICO-001: additionally rejects placeholder/all-identical-char digests
+    (e.g. sha256:000...000, sha256:aaa...aaa) with M6_image_digest_placeholder.
+    These pass the regex but are not real digests — they are template defaults.
     """
     errors: list[LintError] = []
     spec = parsed.get("spec") or {}
@@ -216,6 +242,17 @@ def _lint_image_digests(parsed: dict) -> list[LintError]:
             "spec.image.digest %r is not a valid SHA-256 digest." % digest,
             field="spec.image.digest",
             fix="Use the form sha256:<64 lowercase hex characters>.",
+        ))
+    elif _is_placeholder_digest(digest):
+        errors.append(LintError(
+            "M6_image_digest_placeholder",
+            "spec.image.digest %r is a placeholder (all identical hex characters). "
+            "This template default has not been replaced with a real image digest. "
+            "Placeholder digests provide no integrity guarantee (FIX-NICO-001)." % digest,
+            field="spec.image.digest",
+            fix="Replace spec.image.digest with the real sha256 digest of your built "
+                "image. Run: docker manifest inspect <image> | jq '.[0].Digest' "
+                "or: skopeo inspect docker://<image> | jq .Digest",
         ))
 
     # Sidecars
@@ -241,6 +278,16 @@ def _lint_image_digests(parsed: dict) -> list[LintError]:
                 "sidecar %r digest %r is not a valid SHA-256 digest." % (sc_name, sc_digest),
                 field=field,
                 fix="Use the form sha256:<64 lowercase hex characters>.",
+            ))
+        elif _is_placeholder_digest(sc_digest):
+            errors.append(LintError(
+                "M6_image_digest_placeholder",
+                "sidecar %r digest %r is a placeholder (all identical hex characters). "
+                "Replace with the real scanned digest before onboarding "
+                "(FIX-NICO-001)." % (sc_name, sc_digest),
+                field=field,
+                fix="Replace with the real sha256 digest from: "
+                    "docker manifest inspect <image> | jq '.[0].Digest'",
             ))
 
     return errors

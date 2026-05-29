@@ -498,21 +498,97 @@ _fs_write_tools := {
 # named-volume mount boundary (the container has no /etc, no host paths).
 # OPA adds a policy-layer pre-call assertion.
 #
+# FIX-P3-001 (broker-layer normalisation): The broker _normalize_tool_args()
+# function iteratively percent-decodes + NFKC-normalises all path-bearing args
+# BEFORE building the OPA input document.  A path that reaches OPA as
+# "..%2fetc%2fshadow" is therefore decoded to "../etc/shadow" before the
+# literal "../" check fires here — closing the encoded-traversal bypass.
+#
+# This OPA rule is the belt-and-suspenders layer; broker normalisation is the
+# primary decode layer.  Both are required (defence-in-depth).
+#
 # Rules:
 #   - args.path must not contain "../"
 #   - args.path must not start with "/" (absolute paths rejected;
 #     the server's --allowed-dir is the root, not the container's root)
+#   - args.path must not contain residual encoded dots/slashes (%2e, %2f)
+#     after the broker normalization layer.  A path that still contains these
+#     patterns post-decode is anomalous and likely adversarial.
 #   - When no path arg is present (e.g. list_directory of root), pass.
+#
+# FIX-P3-002: singular args.path check only. args.paths array check is in
+# _fs_paths_array_safe below.
 # ---------------------------------------------------------------------------
 
 _fs_path_arg_safe(args) if {
     is_string(args.path)
     not contains(args.path, "../")
     not startswith(args.path, "/")
+    # Belt-and-suspenders: reject residual percent-encoded dots/slashes that
+    # survived broker normalisation.  Lower-case comparison is sufficient
+    # because unquote() produces lower-case hex and NFKC does not introduce
+    # upper-case percent sequences.
+    not contains(lower(args.path), "%2e")
+    not contains(lower(args.path), "%2f")
 }
 
 _fs_path_arg_safe(args) if {
     not args.path
+}
+
+# ---------------------------------------------------------------------------
+# FIX-P3-002 — paths-array safety (read_multiple_files)
+#
+# read_multiple_files uses args.paths (an array).  _fs_path_arg_safe only
+# checks args.path (singular).  An array traversal bypassed the old check.
+#
+# _fs_paths_array_safe(args) is satisfied when:
+#   - args.paths is absent (tool uses singular args.path), OR
+#   - args.paths is present, is an array, and EVERY element passes the
+#     same checks as _fs_path_arg_safe (no "../", no leading "/",
+#     no residual %2e/%2f after normalisation).
+#
+# Also covers move_file's args.source and args.destination path args.
+# ---------------------------------------------------------------------------
+
+# Paths array absent (single-path tools) — safe
+_fs_paths_array_safe(args) if {
+    not args.paths
+}
+
+# Paths array present — every element must be safe
+_fs_paths_array_safe(args) if {
+    is_array(args.paths)
+    every p in args.paths {
+        is_string(p)
+        not contains(p, "../")
+        not startswith(p, "/")
+        not contains(lower(p), "%2e")
+        not contains(lower(p), "%2f")
+    }
+}
+
+# FIX-P3-002 (move_file): validate args.source and args.destination separately.
+# move_file is in _fs_write_tools so it is already denied in readonly posture.
+# This helper guards the readwrite path.
+_fs_move_args_safe(args) if {
+    # source must not traverse
+    is_string(args.source)
+    not contains(args.source, "../")
+    not startswith(args.source, "/")
+    not contains(lower(args.source), "%2e")
+    not contains(lower(args.source), "%2f")
+    # destination must not traverse
+    is_string(args.destination)
+    not contains(args.destination, "../")
+    not startswith(args.destination, "/")
+    not contains(lower(args.destination), "%2e")
+    not contains(lower(args.destination), "%2f")
+}
+
+_fs_move_args_safe(args) if {
+    not args.source
+    not args.destination
 }
 
 # ---------------------------------------------------------------------------
@@ -556,15 +632,23 @@ _fs_search_files_safe(args) if {
 
 default filesystem_tool_allowed := false
 
-# Read-only tools: PERMIT (always) with path validation
-# Excludes directory_tree (has depth cap) and search_files (has pattern-length cap)
-# — both handled by their own dedicated rules below.
+# Read-only tools (singular args.path): PERMIT with path validation.
+# Excludes read_multiple_files (uses args.paths array — separate rule below).
+# Excludes directory_tree (depth cap) and search_files (pattern cap).
+# Excludes list_allowed_directories (always denied — info-disclosure).
 filesystem_tool_allowed if {
     input.tool.name in _fs_readonly_tools
     not input.tool.name == "list_allowed_directories"
     not input.tool.name == "directory_tree"
     not input.tool.name == "search_files"
+    not input.tool.name == "read_multiple_files"
     _fs_path_arg_safe(input.tool.args)
+}
+
+# FIX-P3-002: read_multiple_files — validate every path in the array.
+filesystem_tool_allowed if {
+    input.tool.name == "read_multiple_files"
+    _fs_paths_array_safe(input.tool.args)
 }
 
 # directory_tree: depth cap + path validation
@@ -581,16 +665,25 @@ filesystem_tool_allowed if {
     _fs_search_files_safe(input.tool.args)
 }
 
-# Write tools: PERMIT only when write_posture=readwrite in data bundle
+# Write tools: PERMIT only when write_posture=readwrite in data bundle.
 # Operator sets: PUT /v1/data/yashigani/mcp/filesystem_write_posture "readwrite"
+# FIX-P3-002: move_file uses source/destination args — validated separately.
 _fs_write_posture := p if {
     p := data.yashigani.mcp.filesystem_write_posture
 } else := "readonly"
 
 filesystem_tool_allowed if {
     input.tool.name in _fs_write_tools
+    not input.tool.name == "move_file"
     _fs_write_posture == "readwrite"
     _fs_path_arg_safe(input.tool.args)
+}
+
+# FIX-P3-002: move_file uses source + destination, not args.path.
+filesystem_tool_allowed if {
+    input.tool.name == "move_file"
+    _fs_write_posture == "readwrite"
+    _fs_move_args_safe(input.tool.args)
 }
 
 # list_allowed_directories: ALWAYS denied (info-disclosure — Laura §2.2.5)
@@ -610,6 +703,38 @@ filesystem_deny_reason := "fs_path_traversal_attempt" if {
     not filesystem_tool_allowed
     is_string(input.tool.args.path)
     startswith(input.tool.args.path, "/")
+}
+
+# FIX-P3-001 belt-and-suspenders: residual encoded traversal after normalisation
+filesystem_deny_reason := "fs_path_traversal_encoded_attempt" if {
+    not filesystem_tool_allowed
+    is_string(input.tool.args.path)
+    contains(lower(input.tool.args.path), "%2e")
+}
+
+filesystem_deny_reason := "fs_path_traversal_encoded_attempt" if {
+    not filesystem_tool_allowed
+    is_string(input.tool.args.path)
+    contains(lower(input.tool.args.path), "%2f")
+}
+
+# FIX-P3-002: traversal in paths array (read_multiple_files)
+filesystem_deny_reason := "fs_paths_array_traversal_attempt" if {
+    not filesystem_tool_allowed
+    input.tool.name == "read_multiple_files"
+    is_array(input.tool.args.paths)
+    some p in input.tool.args.paths
+    is_string(p)
+    contains(p, "../")
+}
+
+filesystem_deny_reason := "fs_paths_array_traversal_attempt" if {
+    not filesystem_tool_allowed
+    input.tool.name == "read_multiple_files"
+    is_array(input.tool.args.paths)
+    some p in input.tool.args.paths
+    is_string(p)
+    startswith(p, "/")
 }
 
 filesystem_deny_reason := "fs_directory_tree_depth_exceeded" if {

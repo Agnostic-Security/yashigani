@@ -1403,8 +1403,12 @@ def _gen_compose_override_shape_c(
             "Remove all egress_allow entries." % agent_name,
         )
 
-    # Generate volume name (tenant-namespaced)
-    vol_name = _sc_volume_name(tenant_id, agent_name)
+    # Generate volume name (tenant-namespaced).
+    # FIX-IRIS-F1: prefer mounts[0].name when the manifest declares it so that
+    # codegen output agrees with what the linter validates.  Fall back to the
+    # auto-generated name only when the manifest omits it.
+    _declared_vol_name = mounts[0].get("name") if mounts and isinstance(mounts[0], dict) else None
+    vol_name = _declared_vol_name if _declared_vol_name else _sc_volume_name(tenant_id, agent_name)
 
     # Build volume mounts from spec.storage.mounts
     # Default: workspace at /workspace if mounts not declared

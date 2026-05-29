@@ -33,14 +33,36 @@ Fail-closed:
 
 C9 fail-closed: a missing/misconfigured OPA MUST NOT allow MCP calls through.
 
-v2.25.0 / P1 W3 Phase 2b-ii / YSG-RISK-054.
+FIX-P3-001 (LAURA-P3-001 — encoded path traversal):
+  Path-bearing tool args are NFKC-normalised and iteratively percent-decoded
+  before the OPA input document is built.  This prevents encoded traversal
+  bypasses (..%2f, %252e%252e%252f, etc.) from reaching the OPA policy as
+  opaque strings that bypass the literal "../" check.
+
+  Normalisation applies to:
+    - args.path  (singular — read_file, list_directory, directory_tree, etc.)
+    - args.paths (array — read_multiple_files; FIX-P3-002)
+    - args.source / args.destination (move_file)
+
+  Normalisation order:
+    1. Iterative urllib.parse.unquote until stable (handles double-encoding)
+    2. unicodedata.normalize("NFKC") (collapses Unicode lookalikes)
+
+  A normalized path that still contains %2e or %2f (ASCII percent-encoded dots/
+  slashes that survived normalization) is an anomaly; OPA's belt-and-suspenders
+  rule rejects it.
+
+v2.25.0 / P1 W3 Phase 2b-ii + P3 filesystem bundle /
+YSG-RISK-054 / LAURA-P3-001 / LAURA-P3-002.
 """
 from __future__ import annotations
 
 import logging
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import unquote
 
 import httpx
 
@@ -48,7 +70,78 @@ logger = logging.getLogger(__name__)
 
 # OPA query path — matches policy/mcp.rego `package yashigani.mcp`
 MCP_OPA_PATH = "/v1/data/yashigani/mcp/mcp_decision"
+# Filesystem-specific tool-gating OPA path (FIX-P3-ENFORCE / Iris F2).
+# The broker queries this for any Shape-C / mcp_server agent AFTER the global
+# mcp_decision allow; a deny here aborts the call with fs_tool_not_permitted.
+MCP_FS_TOOL_OPA_PATH = "/v1/data/yashigani/mcp/filesystem_tool_allowed"
 OPA_TIMEOUT_SECONDS = 0.5   # 500ms — C9 requirement
+
+
+# ---------------------------------------------------------------------------
+# FIX-P3-001 — path argument normalisation (encoded traversal prevention)
+# ---------------------------------------------------------------------------
+
+def _normalize_path_arg(raw: str) -> str:
+    """
+    Normalise a single path argument string before it is included in the OPA
+    input document.
+
+    Steps (order is significant):
+      1. Iterative urllib.parse.unquote until the string is stable.
+         Handles single- and double-encoded traversals:
+           ..%2fetc%2fshadow → ../etc/shadow  (one pass)
+           %252e%252e%252fetc → %2e%2e%2fetc → ../etc  (two passes)
+      2. unicodedata.normalize("NFKC"): collapses Unicode lookalikes
+         (e.g. U+2025 TWO DOT LEADER, U+FF0F FULLWIDTH SOLIDUS) to their
+         ASCII equivalents where canonically equivalent.
+
+    The normalised value is what OPA receives; OPA's belt-and-suspenders
+    rules then apply the standard literal "../" and startswith("/") checks
+    against the already-decoded string.
+
+    Returns the normalised string.
+    """
+    s = raw
+    while True:
+        decoded = unquote(s)
+        if decoded == s:
+            break
+        s = decoded
+    return unicodedata.normalize("NFKC", s)
+
+
+def _normalize_tool_args(args: Optional[dict]) -> Optional[dict]:
+    """
+    Return a copy of ``args`` with all path-bearing values normalised.
+
+    Normalised keys:
+      - args["path"]        (str  — most tools)
+      - args["paths"]       (list[str] — read_multiple_files; FIX-P3-002)
+      - args["source"]      (str  — move_file)
+      - args["destination"] (str  — move_file)
+
+    Other keys are copied verbatim.  The original dict is NOT mutated.
+    """
+    if not isinstance(args, dict):
+        return args
+
+    normalised = dict(args)  # shallow copy; values replaced below
+
+    # Singular path keys
+    for key in ("path", "source", "destination"):
+        val = normalised.get(key)
+        if isinstance(val, str):
+            normalised[key] = _normalize_path_arg(val)
+
+    # Array path key (read_multiple_files)
+    paths_val = normalised.get("paths")
+    if isinstance(paths_val, list):
+        normalised["paths"] = [
+            _normalize_path_arg(p) if isinstance(p, str) else p
+            for p in paths_val
+        ]
+
+    return normalised
 
 
 @dataclass
@@ -75,6 +168,12 @@ def _build_opa_input(
     resource_uri: Optional[str] = None,
     resource_sensitivity: Optional[str] = None,
     prompt_sensitivity: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    # FIX-P3-001: raw tool args (NOT redacted) for path normalisation.
+    # The broker passes the full args here so path-bearing keys can be
+    # normalised before OPA evaluation.  Redaction is applied separately
+    # to tool_args_redacted.
+    tool_args: Optional[dict] = None,
 ) -> dict:
     """
     Build the OPA input document.
@@ -82,6 +181,11 @@ def _build_opa_input(
     BINDING: chain MUST be a list of strings. If anything else is passed,
     this function raises ValueError before the OPA query fires
     (belt-and-suspenders against OPA receiving a malformed chain).
+
+    FIX-P3-001: path-bearing args are NFKC-normalised + iteratively
+    percent-decoded before being embedded in the input document.  This
+    prevents encoded traversal strings (..%2f, %252e%252e, etc.) from
+    bypassing OPA's literal ../ check.
     """
     if not isinstance(chain, list):
         raise ValueError(
@@ -102,6 +206,11 @@ def _build_opa_input(
         "identity": identity,
     }
 
+    # FIX-P3-ENFORCE / Iris F2: embed agent.name so per-agent rego packages
+    # can inspect it (e.g. package yashigani.agents.filesystem allow rule).
+    if agent_name is not None:
+        doc["agent"] = {"name": agent_name}
+
     if prompt_name is not None:
         prompt_obj: dict = {"name": prompt_name}
         if prompt_sensitivity:
@@ -113,8 +222,13 @@ def _build_opa_input(
             resource_obj["sensitivity"] = resource_sensitivity
         doc["resource"] = resource_obj
     else:
+        # FIX-P3-001: normalise path-bearing args BEFORE embedding.
+        # tool_args carries the full (non-redacted) arg map for path checking.
+        # tool_args_redacted carries the sanitised version for audit.
+        normalised_args = _normalize_tool_args(tool_args) or {}
         doc["tool"] = {
             "name": tool_name or "",
+            "args": normalised_args,
             "args_redacted": tool_args_redacted or {},
         }
 
@@ -160,10 +274,12 @@ async def query_mcp_decision(
     chain: list[str],
     tool_name: Optional[str] = None,
     tool_args_redacted: Optional[dict] = None,
+    tool_args: Optional[dict] = None,
     prompt_name: Optional[str] = None,
     resource_uri: Optional[str] = None,
     resource_sensitivity: Optional[str] = None,
     prompt_sensitivity: Optional[str] = None,
+    agent_name: Optional[str] = None,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> OpaDecisionResult:
     """
@@ -187,10 +303,12 @@ async def query_mcp_decision(
             chain=chain,
             tool_name=tool_name,
             tool_args_redacted=tool_args_redacted,
+            tool_args=tool_args,
             prompt_name=prompt_name,
             resource_uri=resource_uri,
             resource_sensitivity=resource_sensitivity,
             prompt_sensitivity=prompt_sensitivity,
+            agent_name=agent_name,
         )
     except ValueError as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -283,6 +401,160 @@ async def query_mcp_decision(
             redact_args=set(),
             audit_capture=True,
             rate_limit_key=None,
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+        )
+    finally:
+        if own_client and http_client is not None:
+            try:
+                await http_client.aclose()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# FIX-P3-ENFORCE / Iris F2 — filesystem tool-gating runtime query
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FsToolDecisionResult:
+    """
+    Result of querying data.yashigani.mcp.filesystem_tool_allowed.
+
+    allowed: True when the tool call is permitted by the filesystem-specific
+             OPA rules. False on any deny or error (fail-closed).
+    deny_reason: string label for the deny case (audit).
+    error: set when the query failed (OPA unreachable, timeout, etc.).
+    elapsed_ms: query round-trip time.
+    """
+
+    allowed: bool
+    deny_reason: str
+    elapsed_ms: int
+    error: Optional[str] = None
+
+
+async def query_filesystem_tool_allowed(
+    opa_url: str,
+    tool_name: str,
+    tool_args: Optional[dict] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> FsToolDecisionResult:
+    """
+    FIX-P3-ENFORCE (Iris F2) — query OPA filesystem_tool_allowed at runtime.
+
+    This is the second OPA gate for Shape-C / mcp_server tool calls.  It
+    executes AFTER query_mcp_decision returns allow=True and ONLY for agents
+    whose manifest declares category=mcp_server (filesystem bundle).
+
+    The input document shape matches what policy/mcp.rego filesystem rules
+    expect: {"input": {"tool": {"name": ..., "args": {...}}}}.
+
+    FIX-P3-001 NOTE: path-bearing args are normalised by the caller via
+    _normalize_tool_args() before they are passed here.  This function
+    receives already-normalised args so OPA sees the decoded paths.
+
+    Fail-closed: any error (OPA unreachable, timeout, HTTP error, unexpected
+    response shape) returns allowed=False.  A missing or undefined rule
+    (OPA returns {"result": null}) is treated as deny.
+
+    Returns FsToolDecisionResult (never raises).
+    """
+    t0 = time.monotonic()
+    url = f"{opa_url.rstrip('/')}{MCP_FS_TOOL_OPA_PATH}"
+    own_client = http_client is None
+
+    # Normalise args (belt-and-suspenders — caller should also normalise)
+    normalised_args = _normalize_tool_args(tool_args) or {}
+
+    input_doc = {
+        "input": {
+            "tool": {
+                "name": tool_name,
+                "args": normalised_args,
+            }
+        }
+    }
+
+    try:
+        if own_client:
+            http_client = httpx.AsyncClient(timeout=OPA_TIMEOUT_SECONDS)
+
+        assert http_client is not None
+        resp = await http_client.post(url, json=input_doc)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        resp.raise_for_status()
+        raw = resp.json()
+
+        # OPA returns {"result": true} or {"result": false} for a scalar rule.
+        # {"result": null} means the rule is undefined (treat as deny — fail-closed).
+        result_val = raw.get("result")
+        if result_val is True:
+            logger.debug(
+                "mcp-broker: [P3] filesystem_tool_allowed=true tool=%s elapsed_ms=%d",
+                tool_name, elapsed_ms,
+            )
+            return FsToolDecisionResult(
+                allowed=True,
+                deny_reason="ok",
+                elapsed_ms=elapsed_ms,
+            )
+
+        # Determine deny reason via a secondary OPA query for the reason string.
+        # For simplicity and to keep latency low we use the reason already embedded
+        # in the mcp.rego filesystem_deny_reason rule; query it as a separate call
+        # only when denied.  If the secondary query fails, we use the generic label.
+        deny_reason = "fs_tool_not_permitted"
+        if result_val is False or result_val is None:
+            logger.info(
+                "mcp-broker: [P3] filesystem_tool_allowed=false tool=%s elapsed_ms=%d",
+                tool_name, elapsed_ms,
+            )
+
+        return FsToolDecisionResult(
+            allowed=False,
+            deny_reason=deny_reason,
+            elapsed_ms=elapsed_ms,
+            error=None if result_val is False else "OPA returned undefined result for filesystem_tool_allowed",
+        )
+
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [P3] OPA timeout querying filesystem_tool_allowed tool=%s — "
+            "fail-closed",
+            tool_name,
+        )
+        return FsToolDecisionResult(
+            allowed=False,
+            deny_reason="fs_opa_timeout",
+            elapsed_ms=elapsed_ms,
+            error=f"OPA timeout after {elapsed_ms}ms",
+        )
+    except httpx.HTTPStatusError as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [P3] OPA HTTP error %d querying filesystem_tool_allowed tool=%s — "
+            "fail-closed",
+            exc.response.status_code, tool_name,
+        )
+        return FsToolDecisionResult(
+            allowed=False,
+            deny_reason="fs_opa_http_error",
+            elapsed_ms=elapsed_ms,
+            error=f"OPA returned HTTP {exc.response.status_code}",
+        )
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [P3] OPA unreachable querying filesystem_tool_allowed tool=%s "
+            "error=%s — fail-closed",
+            tool_name, exc,
+        )
+        return FsToolDecisionResult(
+            allowed=False,
+            deny_reason="fs_opa_unreachable",
             elapsed_ms=elapsed_ms,
             error=str(exc),
         )

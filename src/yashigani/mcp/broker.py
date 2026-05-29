@@ -47,7 +47,11 @@ from yashigani.mcp._types import (
 )
 from yashigani.mcp._jwt import ChainDepthExceeded, McpJwtIssuer, McpJwtVerifier
 from yashigani.mcp._nonce import NonceStore, InMemoryNonceStore
-from yashigani.mcp._opa import query_mcp_decision
+from yashigani.mcp._opa import (
+    query_mcp_decision,
+    query_filesystem_tool_allowed,
+    _normalize_tool_args,
+)
 from yashigani.mcp._content_filter import (
     FilterResult,
     ToolCatalogueStore,
@@ -125,6 +129,13 @@ class McpBrokerConfig:
     catalogue_store: Optional[ToolCatalogueStore] = None
     upstream_pin_configs: Optional[list] = None  # list[UpstreamPinConfig]
     pool_manager: Optional[TenantPoolManager] = None
+
+    # FIX-P3-ENFORCE (Iris F2): Shape-C filesystem MCP-server flag.
+    # When True, broker runs a SECOND OPA gate (filesystem_tool_allowed)
+    # after the global mcp_decision allow, enforcing per-tool + path-arg
+    # constraints from policy/mcp.rego §P3.
+    # Set to True for any agent whose manifest declares category=mcp_server.
+    is_filesystem_agent: bool = False
 
 
 class McpBroker:
@@ -255,6 +266,8 @@ class McpBroker:
 
         # FIX-C (Iris FIND-001): pass sensitivity fields so OPA audit_capture
         # escalation for CONFIDENTIAL/RESTRICTED resources/prompts is reachable.
+        # FIX-P3-001: pass tool_args (full args) for path normalisation; also
+        # pass agent_name so per-agent rego packages can inspect it.
         opa_result = await query_mcp_decision(
             opa_url=self._opa_url,
             posture=ctx.posture.value,
@@ -263,10 +276,12 @@ class McpBroker:
             chain=chain_for_opa,
             tool_name=ctx.tool_name,
             tool_args_redacted=ctx.tool_args_redacted,
+            tool_args=ctx.tool_args_redacted,   # normalisation applied inside _opa.py
             prompt_name=ctx.prompt_name,
             resource_uri=ctx.resource_uri,
             resource_sensitivity=ctx.resource_sensitivity,
             prompt_sensitivity=ctx.prompt_sensitivity,
+            agent_name=ctx.agent_name,
         )
 
         elapsed = int((time.monotonic() - t0) * 1000)
@@ -292,6 +307,53 @@ class McpBroker:
             )
             await self._emit_audit(ctx, decision)
             return decision
+
+        # Step 2b (FIX-P3-ENFORCE / Iris F2): Shape-C filesystem tool-gating.
+        #
+        # For agents declared as category=mcp_server (is_filesystem_agent=True),
+        # the global mcp_decision allow is NECESSARY but NOT SUFFICIENT.
+        # A second OPA gate enforces the filesystem-specific per-tool allowlist,
+        # path-traversal checks, directory_tree depth cap, and search_files
+        # ReDoS cap defined in policy/mcp.rego §P3 (filesystem_tool_allowed rule).
+        #
+        # Without this second gate, the filesystem rules exist only in OPA policy
+        # source but are NEVER queried at runtime — making them dead code.
+        # This closes the Iris F2 finding: "gating MAY BE inert".
+        #
+        # Path normalisation (FIX-P3-001): _normalize_tool_args() was already
+        # applied inside _build_opa_input() for the mcp_decision query above.
+        # We re-apply here to ensure the filesystem gate receives normalised args
+        # even if called standalone in tests or future refactors.
+        if self._config.is_filesystem_agent and ctx.tool_name is not None:
+            fs_args = _normalize_tool_args(ctx.tool_args_redacted)
+            fs_result = await query_filesystem_tool_allowed(
+                opa_url=self._opa_url,
+                tool_name=ctx.tool_name,
+                tool_args=fs_args,
+            )
+            if not fs_result.allowed:
+                fs_elapsed = int((time.monotonic() - t0) * 1000)
+                fs_decision = BrokerDecision(
+                    call_id=call_id,
+                    allow=False,
+                    deny_reason=fs_result.deny_reason,
+                    opa_decision=OpaDecision(
+                        allow=False,
+                        deny_reason=fs_result.deny_reason,
+                        redact_args=set(),
+                        audit_capture=True,
+                        rate_limit_key=None,
+                    ),
+                    chain_depth=len(chain_for_opa),
+                    elapsed_ms=fs_elapsed,
+                    error=fs_result.error,
+                )
+                logger.info(
+                    "mcp-broker: [P3] filesystem tool denied call_id=%s tool=%s reason=%s",
+                    call_id, ctx.tool_name, fs_result.deny_reason,
+                )
+                await self._emit_audit(ctx, fs_decision)
+                return fs_decision
 
         # Step 3: issue gateway-signed JWT (only on OPA allow)
         #

@@ -1248,3 +1248,138 @@ test_fs_allow_search_files_no_pattern if {
 test_fs_default_write_posture_is_readonly if {
     data.yashigani.mcp._fs_write_posture == "readonly"
 }
+
+# ---------------------------------------------------------------------------
+# 13. FIX-P3-001 — URL-encoded path traversal regression tests
+#     (LAURA-P3-001 PoC → must flip FAIL → PASS after broker normalisation)
+#
+# NOTE: OPA receives already-decoded paths from the broker (_normalize_tool_args).
+# These tests verify the OPA belt-and-suspenders layer catches:
+#   a) Paths that are still encoded AFTER normalisation (anomaly / bypass attempt)
+#   b) Paths that have been decoded to literal "../" (OPA literal check)
+#
+# The PoC test class TestFinding001 calls `opa eval` directly with the encoded
+# string — it tests the full OPA rule (broker normalisation is bypassed in that
+# test path). After FIX-P3-001, the OPA rule ALSO rejects residual %2e/%2f.
+# ---------------------------------------------------------------------------
+
+# 13.1 Residual %2e in path (should never appear post-broker; OPA rejects as anomaly)
+test_fix_p3001_residual_percent2e_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "..%2fetc%2fshadow"}},
+    }
+}
+
+test_fix_p3001_residual_percent2e_deny_reason if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "tool": {"name": "read_file", "args": {"path": "..%2fetc%2fshadow"}},
+    }
+    r == "fs_path_traversal_encoded_attempt"
+}
+
+# 13.2 Double-encoded path — %252e%252f
+# NOTE: purely double-encoded (%252e) does NOT produce %2e as a literal substring,
+# so OPA's contains(..., "%2e") check does not fire on the raw %252e string.
+# The broker's _normalize_path_arg() decodes it in two iterations before OPA sees it.
+# By the time OPA evaluates this input, the broker has decoded %252e%252e%252f to ../
+# (or blocked the call at the broker layer).
+# The broker decode regression is covered in test_v250_p3_filesystem_mcp.py::TestNormalizePathArg.
+# Here we test what OPA actually receives from the broker: the fully-decoded form.
+test_fix_p3001_double_encoded_broker_decoded_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "../etc/shadow"}},
+    }
+}
+
+# 13.3 Upper-case encoded form (%2E, %2F) — OPA uses lower() so both fire
+test_fix_p3001_uppercase_encoded_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "..%2Fetc%2Fshadow"}},
+    }
+}
+
+# 13.4 Decoded traversal: broker delivers "../etc/shadow" → OPA literal check fires
+test_fix_p3001_decoded_traversal_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "../etc/shadow"}},
+    }
+}
+
+test_fix_p3001_decoded_traversal_deny_reason if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "tool": {"name": "read_file", "args": {"path": "../etc/shadow"}},
+    }
+    r == "fs_path_traversal_attempt"
+}
+
+# 13.5 Clean path remains allowed (no regression on happy path)
+test_fix_p3001_clean_path_still_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "docs/readme.md"}},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 14. FIX-P3-002 — read_multiple_files paths-array regression tests
+#     (LAURA-P3-002 PoC → must flip FAIL → PASS)
+# ---------------------------------------------------------------------------
+
+# 14.1 Traversal in paths array → denied
+test_fix_p3002_traversal_in_paths_array_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["../../../etc/shadow", "safe.txt"]}},
+    }
+}
+
+test_fix_p3002_traversal_in_paths_array_deny_reason if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["../../../etc/shadow", "safe.txt"]}},
+    }
+    r == "fs_paths_array_traversal_attempt"
+}
+
+# 14.2 Absolute path in array → denied
+test_fix_p3002_absolute_path_in_array_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["/etc/passwd", "safe.txt"]}},
+    }
+}
+
+# 14.3 Encoded traversal in array → denied (belt-and-suspenders)
+test_fix_p3002_encoded_traversal_in_array_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["..%2fetc%2fshadow"]}},
+    }
+}
+
+# 14.4 Clean paths array → allowed
+test_fix_p3002_clean_paths_array_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["docs/readme.md", "src/index.ts"]}},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 15. FIX-P3-002 — move_file source/destination path validation
+# ---------------------------------------------------------------------------
+
+# 15.1 move_file traversal in source → denied even in readwrite
+test_fix_p3002_move_source_traversal_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "move_file", "args": {"source": "../../../etc/shadow", "destination": "out.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# 15.2 move_file traversal in destination → denied
+test_fix_p3002_move_dest_traversal_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "move_file", "args": {"source": "safe.txt", "destination": "../../../etc/cron.d/evil"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# 15.3 move_file clean args in readwrite → allowed
+test_fix_p3002_move_clean_args_allowed_readwrite if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "move_file", "args": {"source": "old.txt", "destination": "new.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
