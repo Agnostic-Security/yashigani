@@ -10290,8 +10290,13 @@ PYJSON
   # ── Shell-side audit record ───────────────────────────────────────────────
   # MANIFEST_ONBOARD / MANIFEST_OFFBOARD events are emitted by Python codegen
   # and offboard.sh respectively (G2 stages 5c/6a). This log line is the
-  # shell-side record that the step-up gate was satisfied.
+  # belt-and-suspenders shell record that the step-up gate was satisfied.
   log_info "  Audit: ${_op_label} step-up gate passed for user '${_username}' at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Export operator identity so the Python codegen heredoc and offboard.sh
+  # can carry it into the Merkle audit event (G2 stage-5c/6a requirement).
+  # Exported before _username is cleared — this is the only path that sets it.
+  export YSG_OPERATOR_IDENTITY="${_username}"
 
   _username=""
   return 0
@@ -10617,10 +10622,105 @@ if has_kms:
     print('[onboard] S7: ensure GID 2002 exists on host: groupadd -g 2002 ysg-secrets')
 
 print('[onboard] Onboard complete for agent: %s (tenant: %s)' % (agent_name, tenant_id))
+
+# G2 stage-5c: emit MANIFEST_ONBOARD Merkle audit event (Lu-Gap-06 / G2.2)
+# Reads operator identity from YSG_OPERATOR_IDENTITY env var (set by the
+# step-up gate before _username is cleared). Falls back to "unknown" when
+# running on a fresh install where the gate was not invoked.
+try:
+    import hashlib, json as _json, os as _os
+    from yashigani.audit.writer import AuditLogWriter
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.schema import ManifestOnboardEvent
+
+    # Canonical manifest SHA-256: full SHA-256 of the raw YAML bytes
+    _manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+
+    # Operator identity threaded from the step-up gate via env var
+    _operator = _os.environ.get('YSG_OPERATOR_IDENTITY', 'unknown') or 'unknown'
+
+    # Artifact labels (relative paths without WORK_DIR)
+    _artifact_labels = sorted(artifacts.keys())
+
+    # AuditConfig: default log path; override via YASHIGANI_AUDIT_LOG_PATH.
+    # On a running system the volume path is /var/log/yashigani/audit.log.
+    _audit_log_path = _os.environ.get(
+        'YASHIGANI_AUDIT_LOG_PATH',
+        _os.path.join(output_root, 'docker', 'var', 'audit.log'),
+    )
+    _audit_config = AuditConfig(
+        log_path=_audit_log_path,
+        max_file_size_mb=int(_os.environ.get('YASHIGANI_AUDIT_MAX_FILE_SIZE_MB', '100')),
+        retention_days=int(_os.environ.get('YASHIGANI_AUDIT_RETENTION_DAYS', '90')),
+    )
+    _writer = AuditLogWriter(config=_audit_config)
+    _writer.write(ManifestOnboardEvent(
+        tenant_id=tenant_id,
+        agent_name=agent_name,
+        manifest_sha256=_manifest_sha256,
+        operator_identity=_operator,
+        artifacts_generated=_artifact_labels,
+        runtime=runtime,
+    ))
+    _writer.close()
+    print('[onboard] MANIFEST_ONBOARD audit event written (operator=%s sha256=%.16s...)' % (
+        _operator, _manifest_sha256))
+except Exception as _audit_exc:
+    # FIX-03 (YCS-...-W6-03): onboard audit-write must NOT be silent.
+    # A change-management control (AU-2 / CM-3 / CC8.1) applied with NO
+    # Merkle event is a control failure. The operator and auditor MUST see it.
+    # Artifacts are already durable — we do NOT un-apply them.
+    import datetime as _dt, json as _json2, os as _os2
+    # Fallbacks: these locals may be unset if the exception fired before
+    # they were assigned (e.g., import error at the top of the try block).
+    _operator = locals().get('_operator', _os2.environ.get('YSG_OPERATOR_IDENTITY', 'unknown') or 'unknown')
+    _audit_log_path = locals().get('_audit_log_path', _os2.path.join(output_root, 'docker', 'var', 'audit.log'))
+    # (1) LOUD operator-facing error to stderr.
+    print('', file=sys.stderr)
+    print('=' * 72, file=sys.stderr)
+    print('[onboard] ERROR: MANIFEST_ONBOARD audit event write FAILED', file=sys.stderr)
+    print('[onboard] ERROR: The ring-fence artifacts were applied but the', file=sys.stderr)
+    print('[onboard] ERROR: Merkle audit record could NOT be written.', file=sys.stderr)
+    print('[onboard] ERROR: This is a change-management control failure.', file=sys.stderr)
+    print('[onboard] ERROR: Agent=%s  Operator=%s' % (agent_name, _operator), file=sys.stderr)
+    print('[onboard] ERROR: Cause: %s' % _audit_exc, file=sys.stderr)
+    print('[onboard] ERROR: Action required: investigate audit volume, then', file=sys.stderr)
+    print('[onboard] ERROR:   manually add a MANIFEST_ONBOARD record or', file=sys.stderr)
+    print('[onboard] ERROR:   re-run onboard once the audit volume is healthy.', file=sys.stderr)
+    print('=' * 72, file=sys.stderr)
+    # (2) Fallback breadcrumb — write a minimal JSON record next to the audit log
+    # so the failure is recorded somewhere even if the main audit volume is broken.
+    _breadcrumb = {
+        'event_type': 'MANIFEST_ONBOARD_AUDIT_WRITE_FAILED',
+        'timestamp': _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        'agent_name': agent_name,
+        'operator_identity': _operator,
+        'cause': str(_audit_exc),
+    }
+    try:
+        _bc_dir = _os2.path.dirname(_audit_log_path)
+        _bc_path = _os2.path.join(
+            _bc_dir,
+            'audit-write-failed-%s.json' % agent_name.replace('/', '_'),
+        )
+        _os2.makedirs(_bc_dir, exist_ok=True)
+        with open(_bc_path, 'w', encoding='utf-8') as _bc_f:
+            _bc_f.write(_json2.dumps(_breadcrumb) + '\n')
+        print('[onboard] ERROR: breadcrumb written to %s' % _bc_path, file=sys.stderr)
+    except Exception as _bc_exc:
+        print('[onboard] ERROR: breadcrumb write also failed: %s' % _bc_exc, file=sys.stderr)
+    # (3) Advisory non-zero exit so the shell caller signals the failure.
+    sys.exit(1)
 PYEOF
 
   if [[ "$_codegen_rc" -ne 0 ]]; then
-    log_error "Onboard failed (codegen exit ${_codegen_rc})"
+    # FIX-03: codegen exit non-zero covers both real codegen errors AND
+    # the audit-write failure path above. Artifacts are applied in both cases;
+    # the operator must investigate the audit volume.
+    log_error "Onboard completed but audit event write FAILED (exit ${_codegen_rc})"
+    log_error "  Merkle audit record is missing — this is a control failure."
+    log_error "  Check stderr above and the breadcrumb file in the audit log directory."
+    log_error "  Investigate and restore the audit record before considering this onboard complete."
     exit 1
   fi
 
@@ -10666,6 +10766,7 @@ handle_offboard_subcommand() {
 
   WORK_DIR="$WORK_DIR" \
   YSG_RUNTIME="${YSG_RUNTIME:-}" \
+  YSG_OPERATOR_IDENTITY="${YSG_OPERATOR_IDENTITY:-}" \
     bash "$_offboard_sh" "$_agent"
   local _rc=$?
 

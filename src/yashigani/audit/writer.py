@@ -197,6 +197,12 @@ class AuditLogWriter:
         if self._masking_scope.should_mask(event, agent_id, user_handle, component):
             event = self._masker.mask_event(event)
             object.__setattr__(event, "masking_applied", True) if dataclasses.is_dataclass(event) else setattr(event, "masking_applied", True)
+        else:
+            # Masking did NOT run (e.g. AUDIT_INTEGRITY_EVENTS exemption).
+            # Record the truth so an auditor reading the persisted record is not
+            # misled by the dataclass default of masking_applied=True.
+            # YCS-20260529-v250-W6-01 / FIX-01 (honesty — Lu GRC gate).
+            object.__setattr__(event, "masking_applied", False) if dataclasses.is_dataclass(event) else setattr(event, "masking_applied", False)
 
         with self._lock:
             # Compute and inject prev_event_hash before serialisation

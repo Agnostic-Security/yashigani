@@ -8,7 +8,7 @@ from yashigani.audit.schema import (
     PasswordChangedEvent,
     SessionsInvalidatedEvent,
 )
-from yashigani.audit.masking import CredentialMasker, IMMUTABLE_FLOOR_EVENTS
+from yashigani.audit.masking import CredentialMasker, IMMUTABLE_FLOOR_EVENTS, AUDIT_INTEGRITY_EVENTS
 from yashigani.audit.scope import MaskingScopeConfig
 from yashigani.audit.writer import AuditLogWriter, AuditWriteError, SiemTarget
 from yashigani.audit.export import AuditLogExporter
@@ -48,6 +48,7 @@ __all__ = [
     "SessionsInvalidatedEvent",
     "CredentialMasker",
     "IMMUTABLE_FLOOR_EVENTS",
+    "AUDIT_INTEGRITY_EVENTS",
     "MaskingScopeConfig",
     "AuditLogWriter",
     "AuditWriteError",
