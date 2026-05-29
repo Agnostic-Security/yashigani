@@ -138,12 +138,16 @@
       "title": "MCP OPA Decision Shape",
       "description": "Shape returned by OPA at /v1/data/yashigani/mcp/mcp_decision. NOT an input field — documented here for gateway implementers.",
       "type": "object",
-      "required": ["allow", "redact_args", "audit_capture", "rate_limit_key"],
+      "required": ["allow", "deny_reason", "redact_args", "audit_capture", "rate_limit_key"],
       "additionalProperties": false,
       "properties": {
         "allow": {
           "type": "boolean",
           "description": "Whether the request is permitted."
+        },
+        "deny_reason": {
+          "type": "string",
+          "description": "Human-readable reason for the deny decision. Value is 'ok' when allow is true. Values: ok, missing_spiffe_identity, invalid_posture, chain_depth_exceeded, multiple_subjects_in_request, missing_subject, unrecognised_action, tool_not_in_exposed_allowlist, mcp_c_requires_chain."
         },
         "redact_args": {
           "type": "array",

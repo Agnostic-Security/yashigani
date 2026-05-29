@@ -45,8 +45,13 @@ default allow := false
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-# _spiffe_present — true when a non-empty SPIFFE URI is present in input
+# _spiffe_present — true when a non-empty SPIFFE URI string is present in input.
+# FIX LAURA-MCP-004 (Info): non-string spiffe guard.
+# Without is_string, a truthy non-string value (integer 1, boolean true,
+# non-empty object) satisfies != "" and passes the SPIFFE check, allowing a
+# request with a forged/non-string SPIFFE to reach the allow path.
 _spiffe_present if {
+    is_string(input.identity.spiffe)
     input.identity.spiffe != ""
 }
 
@@ -89,11 +94,17 @@ _exactly_one_subject if {
 # attempt — deny and force audit capture.
 #
 # When input.identity.chain is absent (mcp-a / mcp-b), the guard is skipped.
+#
+# FIX LAURA-MCP-001 / LU-MCP-01 (HIGH): malformed-chain depth bypass.
+# _chain_depth is ONLY computed from an array whose every element is a string.
+# An object, array-of-objects, or array-of-ints yields 0 (fail-closed).
+# Previously: count(obj) counted object keys, allowing a 1-key object to pass
+# a depth ≤ 3 check and reach the mcp-c ALLOW path without a real chain.
 # ---------------------------------------------------------------------------
 
 _chain_depth := count(input.identity.chain) if {
-    input.identity.chain
-    count(input.identity.chain) > 0
+    is_array(input.identity.chain)
+    every e in input.identity.chain { is_string(e) }
 } else := 0
 
 _chain_depth_ok if {
@@ -110,6 +121,26 @@ _chain_depth_ok if {
 #   - Valid posture
 #   - Exactly one subject (tool OR prompt OR resource)
 #   - Action must be a recognised MCP action prefix
+#
+# NOTE (LAURA-MCP-003 / FIX-5): MCP-A intentionally skips _tool_authz_ok.
+# This is safe ONLY under the following BINDING TRANSPORT REQUIREMENTS.
+# The transport/JWT chunk invoking this policy path MUST guarantee:
+#
+#   1. `posture` MUST be derived from the physical channel (OS pipe FD,
+#      Unix-socket peer-cred, localhost-only bind) — NEVER from
+#      `input.posture` in the request body. A network-arriving request with
+#      a body that asserts posture=="mcp-a" MUST be rejected or reassigned
+#      to mcp-b/mcp-c at the transport layer BEFORE this policy runs.
+#
+#   2. If the transport cannot positively guarantee that the request
+#      originates from a local-only channel, mcp-a MUST NOT be assigned
+#      and the request MUST be evaluated under mcp-b or mcp-c (which
+#      enforce _tool_authz_ok).
+#
+#   3. This is not currently exploitable because no MCP handler invoking
+#      this policy exists yet. This comment is an advance binding requirement
+#      for the transport chunk authors. See: LAURA-MCP-003 tracked gate.
+#      Maxine is registering this as a transport-chunk gate for P2/N-next.
 allow if {
     input.posture == "mcp-a"
     _posture_valid
@@ -303,16 +334,29 @@ _subject_count := _tool_count + _prompt_count + _resource_count
 # This list is a secondary policy-layer assertion for audit enforcement.
 # ---------------------------------------------------------------------------
 
+# FIX LAURA-MCP-002 / LU-MCP-02 (MED): secret-redaction gaps.
+# Added exact-match entries: aws_secret_access_key, aws_session_token,
+# client_secret, refresh_token, session_token, pat, x-api-key.
+# Exact-match is intentional — do NOT switch to substring matching, which
+# would over-redact innocent keys like sort_key and cache_key.
+# Nested-key redaction (e.g. config.api_key inside an object value) is the
+# gateway CHS's (Credential Hiding Service) responsibility, not policy.
 _secret_key_patterns := {
     "api_key", "apikey", "token", "secret", "password", "passwd", "credential",
     "credentials", "private_key", "private_token", "auth", "authorization",
     "bearer", "key", "access_key", "secret_key",
+    "aws_secret_access_key", "aws_session_token", "client_secret",
+    "refresh_token", "session_token", "pat", "x-api-key",
 }
 
+# FIX LAURA-MCP-004 (Info): non-object args_redacted guard.
+# If args_redacted is not an object (e.g. an array or boolean), is_object fails
+# and redact_args falls through to the else := set() — audit still emits an
+# empty redact list rather than crashing or silently suppressing audit.
 redact_args := ra if {
     allow
     _tool_present
-    input.tool.args_redacted
+    is_object(input.tool.args_redacted)
     ra := {k |
         k := object.keys(input.tool.args_redacted)[_]
         lower(k) in _secret_key_patterns
