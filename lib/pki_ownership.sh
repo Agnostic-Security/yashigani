@@ -198,3 +198,81 @@ pki_services_all() {
     printf '%s\n' "${_entry%%:*}"
   done
 }
+
+# ---------------------------------------------------------------------------
+# pki_key_missing_is_error <service>
+#   Returns 0 (is_error=true) if the named service's private key MUST exist
+#   after PKI bootstrap — i.e. its absence is an operator error, not silence.
+#
+#   Returns 1 (is_error=false) if the service is unknown or its key is
+#   optional (not all services in the map are mandatory on every install;
+#   profile-gated services like langflow/letta/openclaw may be absent on
+#   lean installs).
+#
+#   Mandatory services: those that are part of the core control plane and
+#   must always have a client cert regardless of install profile.
+#   Optional services: profile-gated (open-webui, langflow, letta, openclaw,
+#   letta-pgbouncer) — their absence is normal on lean installs.
+#
+#   S8 (MEDIUM): this function was declared-but-unimplemented in prior versions.
+#   Implemented v2.25.0 P1 W4.
+# ---------------------------------------------------------------------------
+pki_key_missing_is_error() {
+  local _svc="$1"
+  # If the service is not in the map at all, absence is not our error.
+  if ! pki_service_uid "$_svc" >/dev/null 2>&1; then
+    return 1
+  fi
+  # Profile-gated (optional) services — absence is NOT an operator error.
+  case "$_svc" in
+    open-webui|langflow|letta|letta-pgbouncer|openclaw)
+      return 1
+      ;;
+    *)
+      # All other services in the map are mandatory core services.
+      return 0
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# pki_ownership_portability_check
+#   Portability self-test: verify this file uses only bash-3.2-safe constructs.
+#   Returns 0 if all checks pass.
+#   Used by the S6 test gate in tests/install/test_pki_ownership.sh.
+#
+#   bash-3.2 incompatible constructs that must NOT appear in this file:
+#     declare -A       (associative arrays — bash 4.0+)
+#     ${var,,}         (lowercase expansion — bash 4.0+)
+#     ${var^^}         (uppercase expansion — bash 4.0+)
+#     mapfile / readarray  (bash 4.0+)
+#
+#   This function is informational — the static grep check in the test suite
+#   is the authoritative gate.
+# ---------------------------------------------------------------------------
+pki_ownership_portability_check() {
+  local _self
+  _self="${BASH_SOURCE[0]:-${0}}"
+  local _fail=0
+  if grep -q 'declare -A' "$_self" 2>/dev/null; then
+    printf '[pki_ownership] FAIL: declare -A (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  if grep -qE '\$\{[a-zA-Z_][a-zA-Z0-9_]*,,' "$_self" 2>/dev/null; then
+    # Single quotes intentional: printing literal text, not shell-expanding it.
+    # shellcheck disable=SC2016
+    printf '[pki_ownership] FAIL: ${var,,} (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  if grep -qE '\$\{[a-zA-Z_][a-zA-Z0-9_]*\^\^' "$_self" 2>/dev/null; then
+    # Single quotes intentional: printing literal text, not shell-expanding it.
+    # shellcheck disable=SC2016
+    printf '[pki_ownership] FAIL: ${var^^} (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  if grep -qE '^[[:space:]]*(mapfile|readarray)' "$_self" 2>/dev/null; then
+    printf '[pki_ownership] FAIL: mapfile/readarray (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  return "$_fail"
+}

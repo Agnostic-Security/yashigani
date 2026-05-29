@@ -195,6 +195,19 @@ YASHIGANI_INTERMEDIATE_LIFETIME_DAYS="${YASHIGANI_INTERMEDIATE_LIFETIME_DAYS:-18
 YASHIGANI_CERT_LIFETIME_DAYS="${YASHIGANI_CERT_LIFETIME_DAYS:-90}"
 PKI_ACTION=""             # --pki-action=bootstrap|rotate-leaves|rotate-intermediate|rotate-root|status
 
+# S3 (SHIP-BLOCKER): manifest cosign signature gate.
+# YSG_REQUIRE_SIGNED_MANIFEST controls enforcement level for the shell gate.
+# Values: unset/"warn" (dev default) | "fail" (CI + prod hard-fail).
+# The Python signatures.py has its own enforcement; this shell gate guards the
+# install path before the Python layer is invoked.
+# YSG_RUNTIME_4WAY is set by _detect_runtime() (W2 lib/detect_runtime.sh) after
+# resolve_compose_cmd() completes. Used by the onboard codegen path.
+YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}"
+
+# P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
+ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
+OFFBOARD_AGENT=""         # --offboard <agent-name>
+
 # Public-access SAN for demo / system-use deployments (YSG-CERT-SAN-001).
 # Tiago directive 2026-05-18: VM-IP / hostname access is a supported customer
 # path for demo and system-use; CA / Let's Encrypt is the proper-deployment path.
@@ -502,6 +515,18 @@ parse_args() {
         ;;
       --pki-action)
         PKI_ACTION="${2:?'--pki-action requires: bootstrap|rotate-leaves|rotate-intermediate|rotate-root|status'}"
+        shift 2
+        ;;
+      --onboard)
+        # P1 W4: onboard a new agent manifest.
+        # Usage: ./install.sh --onboard path/to/agent-manifest.yaml
+        ONBOARD_MANIFEST="${2:?'--onboard requires a path to the agent manifest YAML'}"
+        shift 2
+        ;;
+      --offboard)
+        # P1 W4: offboard a named agent (reverses codegen artifacts).
+        # Usage: ./install.sh --offboard <agent-name>
+        OFFBOARD_AGENT="${2:?'--offboard requires the agent name to remove'}"
         shift 2
         ;;
       --root-ca-lifetime-years)
@@ -9155,6 +9180,67 @@ _pki_chown_client_keys() {
 }
 
 # ---------------------------------------------------------------------------
+# _ysg_ensure_gid_2002 — S7 (HIGH): ensure GID 2002 (ysg-secrets) exists on the
+# host and that file-based (source: kms) agent secrets are owned by GID 2002.
+#
+# Agents declaring spec.secrets[].source=kms receive group_add:["2002"] in
+# compose (and supplementalGroups:[2002] in Helm) from the codegen. This
+# function ensures the host-side GID exists so the bind-mount ownership is
+# correct at container startup.
+#
+# Linux-only: macOS does not use the GID 2002 pattern (virtiofs remaps).
+# K8s: Helm fsGroup handles this — skip on k8s.
+#
+# S1 (security): never chmod 0644 on secrets files. GID 2002 means 0640 only.
+# ---------------------------------------------------------------------------
+_ysg_ensure_gid_2002() {
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+
+  # K8s path: Helm fsGroup handles supplementalGroups — skip.
+  if [[ "${YSG_RUNTIME:-docker}" == "k8s" || "${MODE:-compose}" == "k8s" ]]; then
+    log_info "_ysg_ensure_gid_2002: K8s runtime — GID 2002 handled by Helm fsGroup, skipping host-side provisioning"
+    return 0
+  fi
+
+  # macOS: virtiofs UID/GID remapping makes host-side GID provisioning irrelevant.
+  local _os_type
+  _os_type="$(uname -s 2>/dev/null || printf 'Linux')"
+  if [[ "$_os_type" == "Darwin" ]]; then
+    log_info "_ysg_ensure_gid_2002: macOS — virtiofs remaps UIDs/GIDs, skipping host GID check"
+    return 0
+  fi
+
+  # Check if GID 2002 exists (Linux).
+  if ! getent group 2002 >/dev/null 2>&1; then
+    log_warn "S7: GID 2002 (ysg-secrets) not found on this host."
+    log_warn "  KMS-source agent secrets require GID 2002 for group_add:[\"2002\"] bind-mount access."
+    log_warn "  Create it: sudo groupadd -g 2002 ysg-secrets"
+    # Non-fatal: the agent will fail to read its secrets, but offboard is safe.
+    return 0
+  fi
+
+  log_info "_ysg_ensure_gid_2002: GID 2002 exists on host"
+
+  # Apply GID 2002 group ownership to any *_secret files under docker/secrets/
+  # that were written for kms-source agents (identified by their naming pattern).
+  # The codegen names these with the pattern: <agent>_kms_secret (placeholder).
+  # At install/onboard time these files may not yet exist — this is a best-effort
+  # post-codegen pass.
+  if [[ -d "$_secrets_dir" ]]; then
+    local _count=0
+    while IFS= read -r _f; do
+      if _do_chgrp "2002" "$_f" "${_f##*/}" 2>/dev/null; then
+        _do_chmod_0640 "$_f" "${_f##*/}" 2>/dev/null || true
+        _count=$((_count + 1))
+      fi
+    done < <(find "$_secrets_dir" -maxdepth 1 -type f -name '*_kms_secret' 2>/dev/null || true)
+    if [[ "$_count" -gt 0 ]]; then
+      log_info "  Applied GID 2002 + mode 0640 to ${_count} kms-source secret file(s)"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # _pki_detect_uri_san_drift — compare URI SANs on existing leaf certs against
 # docker/service_identities.yaml. Detects certs minted before the manifest's
 # spiffe_id for a service existed (or where the spiffe_id was changed since
@@ -9878,6 +9964,360 @@ _activate_byo_ca_rerun() {
   exit 0
 }
 
+# =============================================================================
+# P1 W4 — S3: cosign manifest signature shell gate
+#
+# Invokes `cosign verify-blob` against the bundled public key.
+# Enforcement level mirrors signatures.py (Python side):
+#   YSG_REQUIRE_SIGNED_MANIFEST=unset/"warn" → WARN in dev
+#   YSG_REQUIRE_SIGNED_MANIFEST=fail/1/true  → FAIL in CI+prod
+#   YASHIGANI_ENV=production|staging         → implicit FAIL
+#
+# The shell gate runs BEFORE the Python parser/validator so a corrupt or
+# unsigned manifest cannot reach the codegen pipeline.
+#
+# Bundled cosign public key location:
+#   src/yashigani/manifest/keys/manifest-signing.pub
+#
+# Hard FAIL on any non-zero cosign exit (S3 / Su-003 / M7).
+# =============================================================================
+_ysg_cosign_gate() {
+  local _manifest_file="$1"
+  local _sig_file="${_manifest_file}.cosign.sig"
+
+  # C-001 (Nico MED): FIPS guard — cosign uses Go crypto, NOT covered by
+  # CMVP #4985.  Under FIPS_MODE=1 the Python signatures.py path enforces
+  # its own gate using RSA-PSS-3072/SHA-384 (FIPS-validated).  We defer to
+  # that path and skip cosign entirely.
+  if [[ "${FIPS_MODE:-0}" == "1" ]]; then
+    log_info "S3: FIPS mode — cosign bypassed; manifest verification defers to signatures.py (RSA-PSS-3072/SHA-384)"
+    return 0
+  fi
+
+  # Resolve enforcement level
+  local _level="warn"
+  local _env_val="${YSG_REQUIRE_SIGNED_MANIFEST:-}"
+  case "${_env_val}" in
+    fail|1|true|yes) _level="fail" ;;
+    skip|off|false|0) _level="skip" ;;
+  esac
+  # Implicit production gate
+  local _ysg_env="${YASHIGANI_ENV:-}"
+  if [[ "$_ysg_env" == "production" || "$_ysg_env" == "staging" || "$_ysg_env" == "prod" ]]; then
+    _level="fail"
+  fi
+
+  if [[ "$_level" == "skip" ]]; then
+    log_info "S3: manifest signature check skipped (YSG_REQUIRE_SIGNED_MANIFEST=skip)"
+    return 0
+  fi
+
+  # Locate the bundled cosign public key
+  local _key_candidates=(
+    "${_YSG_SCRIPT_DIR}/src/yashigani/manifest/keys/manifest-signing.pub"
+    "${_YSG_SCRIPT_DIR}/keys/manifest-signing.pub"
+  )
+  local _bundled_key=""
+  local _k
+  for _k in "${_key_candidates[@]}"; do
+    if [[ -f "$_k" ]]; then
+      _bundled_key="$_k"
+      break
+    fi
+  done
+
+  if [[ -z "$_bundled_key" ]]; then
+    local _msg="S3: bundled cosign public key not found. Expected at src/yashigani/manifest/keys/manifest-signing.pub"
+    if [[ "$_level" == "fail" ]]; then
+      log_error "$_msg"
+      return 1
+    fi
+    log_warn "$_msg (S3: non-fatal in dev mode)"
+    return 0
+  fi
+
+  # Check for detached signature file
+  if [[ ! -f "$_sig_file" ]]; then
+    local _msg2="S3: cosign detached signature not found at ${_sig_file}"
+    if [[ "$_level" == "fail" ]]; then
+      log_error "$_msg2"
+      log_error "  Sign the manifest with: cosign sign-blob --key <signing-key> ${_manifest_file} > ${_sig_file}"
+      return 1
+    fi
+    log_warn "$_msg2 (S3: non-fatal in dev — set YSG_REQUIRE_SIGNED_MANIFEST=fail for CI/prod)"
+    return 0
+  fi
+
+  # Check cosign is on PATH
+  if ! command -v cosign >/dev/null 2>&1; then
+    local _msg3="S3: cosign binary not found in PATH"
+    if [[ "$_level" == "fail" ]]; then
+      log_error "$_msg3"
+      log_error "  Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/"
+      return 1
+    fi
+    log_warn "$_msg3 (S3: non-fatal in dev)"
+    return 0
+  fi
+
+  # Execute cosign verify-blob — hard FAIL on any non-zero exit (S3).
+  local _cosign_out
+  local _cosign_rc=0
+  _cosign_out="$(cosign verify-blob \
+      --key "$_bundled_key" \
+      --signature "$_sig_file" \
+      "$_manifest_file" 2>&1)" || _cosign_rc=$?
+
+  if [[ "$_cosign_rc" -ne 0 ]]; then
+    log_error "S3 (SHIP-BLOCKER): cosign verify-blob FAILED (exit ${_cosign_rc})."
+    log_error "  Manifest:   ${_manifest_file}"
+    log_error "  Signature:  ${_sig_file}"
+    log_error "  Public key: ${_bundled_key}"
+    log_error "  cosign output: ${_cosign_out}"
+    log_error "  Manifests must be signed before onboarding in CI/prod."
+    log_error "  Set YSG_REQUIRE_SIGNED_MANIFEST=skip to bypass in dev (never in prod)."
+    # Hard FAIL regardless of enforcement level — any non-zero cosign exit is fatal.
+    return 1
+  fi
+
+  log_info "S3: cosign verify-blob passed for ${_manifest_file}"
+  return 0
+}
+
+# =============================================================================
+# P1 W4 — S2: onboard handler
+#
+# Wires _detect_runtime (W2) into the codegen path, invokes Python codegen,
+# and applies the generated artifacts (service_identities.yaml append,
+# pki_ownership.sh tuple append, compose override write, Helm values write).
+#
+# The issuer reads service_identities.yaml automatically — no function-body
+# edit of install.sh is needed. All additions use BEGIN/END sentinels.
+# =============================================================================
+handle_onboard_subcommand() {
+  local _manifest="${ONBOARD_MANIFEST}"
+
+  if [[ -z "$_manifest" ]]; then
+    log_error "--onboard requires a path to an agent manifest YAML"
+    exit 1
+  fi
+  if [[ ! -f "$_manifest" ]]; then
+    log_error "--onboard: manifest file not found: ${_manifest}"
+    exit 1
+  fi
+
+  log_step "-" "Onboarding agent from manifest: ${_manifest}"
+
+  # S3: cosign signature gate BEFORE anything else
+  _ysg_cosign_gate "$_manifest" || exit 1
+
+  # Resolve WORK_DIR
+  if [[ -z "${WORK_DIR:-}" || ! -d "${WORK_DIR}" ]]; then
+    detect_working_directory
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+      cd "$WORK_DIR"
+    fi
+  fi
+
+  # Wire _detect_runtime (W2/L10) — resolve the 4-way runtime BEFORE codegen.
+  # Wrong-runtime codegen silently produces no ring-fence (L10).
+  if [[ -f "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh" ]]; then
+    # shellcheck source=lib/detect_runtime.sh
+    # shellcheck disable=SC1091
+    source "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh"
+    _detect_runtime 2>/dev/null || true
+    log_info "Runtime 4-way: ${YSG_RUNTIME_4WAY:-unknown} — ${YSG_RUNTIME_4WAY_NOTE:-}"
+  else
+    log_warn "lib/detect_runtime.sh not found — YSG_RUNTIME_4WAY will be inferred from YSG_RUNTIME"
+    # Map legacy YSG_RUNTIME to 4-way for codegen
+    case "${YSG_RUNTIME:-}" in
+      docker) YSG_RUNTIME_4WAY="docker" ;;
+      podman) YSG_RUNTIME_4WAY="podman-rootless" ;;
+      k8s)    YSG_RUNTIME_4WAY="k8s" ;;
+      *)      YSG_RUNTIME_4WAY="docker" ;;
+    esac
+    export YSG_RUNTIME_4WAY
+  fi
+
+  if [[ "${YSG_RUNTIME_4WAY:-unknown}" == "unknown" ]]; then
+    log_error "Runtime detection failed. Set YSG_RUNTIME_4WAY=docker|podman-rootful|podman-rootless|k8s"
+    exit 1
+  fi
+
+  # Invoke Python codegen pipeline:
+  #   parse → validate → verify_signature (Python side) → codegen → apply artifacts
+  log_info "Running Python codegen for manifest: ${_manifest}"
+  local _codegen_rc=0
+
+  python3 - "$_manifest" "$WORK_DIR" "${YSG_RUNTIME_4WAY}" \
+      "${YSG_REQUIRE_SIGNED_MANIFEST:-warn}" <<'PYEOF' || _codegen_rc=$?
+import sys, os
+
+manifest_path = sys.argv[1]
+output_root   = sys.argv[2]
+runtime       = sys.argv[3]
+sig_level     = sys.argv[4]
+
+# Extend sys.path to find the yashigani package in the repo src/ tree.
+src_dir = os.path.join(output_root, 'src')
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+try:
+    from yashigani.manifest import (
+        parse_manifest, validate_manifest, verify_manifest_signature,
+        CodegenEngine, reset_codegen_registry,
+    )
+except ImportError as e:
+    print('[onboard] ERROR: yashigani.manifest package not found: %s' % e, file=sys.stderr)
+    print('[onboard] Ensure the package is installed or run from the repo root.', file=sys.stderr)
+    sys.exit(1)
+
+from pathlib import Path
+
+manifest_bytes = Path(manifest_path).read_bytes()
+
+# Parse
+try:
+    parsed = parse_manifest(manifest_bytes)
+except Exception as e:
+    print('[onboard] FAIL: manifest parse error: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# Validate
+try:
+    validate_manifest(parsed)
+except Exception as e:
+    print('[onboard] FAIL: manifest validation error: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# S3 (Python side): signature verification
+os.environ.setdefault('YSG_REQUIRE_SIGNED_MANIFEST', sig_level)
+try:
+    verify_manifest_signature(manifest_bytes, parsed)
+except Exception as e:
+    print('[onboard] FAIL: signature verification: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# Codegen — write artifacts to output_root
+reset_codegen_registry()
+try:
+    engine = CodegenEngine(parsed, runtime)
+    artifacts = engine.render(output_root=Path(output_root), dry_run=False)
+    print('[onboard] Codegen complete. Artifacts written:')
+    for rel_path in sorted(artifacts.keys()):
+        print('  + %s' % rel_path)
+except Exception as e:
+    print('[onboard] FAIL: codegen error: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# S2: append service_identities.yaml entry (sentinel-guarded)
+# The issuer reads service_identities.yaml automatically — this appends
+# the onboarded agent's SPIFFE identity for PKI issuance on next rotate-leaves.
+import re
+
+meta = parsed.get('metadata') or {}
+spec = parsed.get('spec') or {}
+agent_name = meta.get('name', '')
+tenant_id  = meta.get('tenant_id', '')
+sid_file   = os.path.join(output_root, 'docker', 'service_identities.yaml')
+
+if not os.path.isfile(sid_file):
+    print('[onboard] WARN: service_identities.yaml not found — skipping PKI identity append', file=sys.stderr)
+else:
+    content = open(sid_file, encoding='utf-8').read()
+    begin_marker = '# BEGIN YSG-ONBOARD-' + agent_name
+    if begin_marker in content:
+        print('[onboard] service_identities.yaml: entry for %r already present — idempotent' % agent_name)
+    else:
+        # Append sentinel-guarded entry before the last line of the file
+        spiffe_id = 'spiffe://yashigani.internal/agents/%s/%s' % (tenant_id, agent_name)
+        entry = (
+            '\n  # BEGIN YSG-ONBOARD-{name}\n'
+            '  # Onboarded agent — managed by yashigani onboard/offboard\n'
+            '  - name: {name}\n'
+            '    dns_sans: [{name}, {name}.internal]\n'
+            '    spiffe_id: {spiffe_id}\n'
+            '    purpose: "BYO agent — ring-fenced (P1 onboarding)"\n'
+            '    mtls_capable: false\n'
+            '    bootstrap_token_sha256: ""\n'
+            '    revoked: false\n'
+            '  # END YSG-ONBOARD-{name}\n'
+        ).format(name=agent_name, spiffe_id=spiffe_id)
+        import tempfile
+        dir_ = os.path.dirname(sid_file)
+        fd, tmp = tempfile.mkstemp(dir=dir_, prefix='.ysg-onboard-tmp-', suffix='.yaml')
+        try:
+            os.write(fd, (content + entry).encode('utf-8'))
+            os.close(fd); fd = -1
+            os.chmod(tmp, os.stat(sid_file).st_mode & 0o777)
+            os.rename(tmp, sid_file)
+        except Exception:
+            if fd != -1: os.close(fd)
+            os.unlink(tmp)
+            raise
+        print('[onboard] service_identities.yaml: appended entry for %r' % agent_name)
+
+# S7: apply GID 2002 ownership for kms-secret agents
+#   The codegen already emits group_add/supplementalGroups in compose/helm.
+#   Here we log the requirement; actual chown is deferred to _pki_chown_client_keys
+#   post-PKI-bootstrap (the key doesn't exist yet at onboard time).
+secrets_list = spec.get('secrets') or []
+has_kms = any(s.get('source') == 'kms' for s in secrets_list if isinstance(s, dict))
+if has_kms:
+    print('[onboard] S7: kms secrets detected — GID 2002 group_add will apply at PKI bootstrap.')
+    print('[onboard] S7: ensure GID 2002 exists on host: groupadd -g 2002 ysg-secrets')
+
+print('[onboard] Onboard complete for agent: %s (tenant: %s)' % (agent_name, tenant_id))
+PYEOF
+
+  if [[ "$_codegen_rc" -ne 0 ]]; then
+    log_error "Onboard failed (codegen exit ${_codegen_rc})"
+    exit 1
+  fi
+
+  log_success "Agent onboarded. Next step: ./install.sh --pki-action=rotate-leaves"
+  log_info "  (Rotate-leaves issues the new agent's client cert from service_identities.yaml)"
+}
+
+# =============================================================================
+# P1 W4 — S5: offboard handler (delegates to scripts/offboard.sh)
+# =============================================================================
+handle_offboard_subcommand() {
+  local _agent="${OFFBOARD_AGENT}"
+
+  if [[ -z "$_agent" ]]; then
+    log_error "--offboard requires an agent name"
+    exit 1
+  fi
+
+  log_step "-" "Offboarding agent: ${_agent}"
+
+  # Resolve WORK_DIR
+  if [[ -z "${WORK_DIR:-}" || ! -d "${WORK_DIR}" ]]; then
+    detect_working_directory
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+      cd "$WORK_DIR"
+    fi
+  fi
+
+  local _offboard_sh="${_YSG_SCRIPT_DIR}/scripts/offboard.sh"
+  if [[ ! -f "$_offboard_sh" ]]; then
+    log_error "scripts/offboard.sh not found at ${_offboard_sh}"
+    exit 1
+  fi
+
+  WORK_DIR="$WORK_DIR" \
+  YSG_RUNTIME="${YSG_RUNTIME:-}" \
+    bash "$_offboard_sh" "$_agent"
+  local _rc=$?
+
+  if [[ "$_rc" -ne 0 ]]; then
+    log_error "Offboard failed (exit ${_rc})"
+    exit 1
+  fi
+}
+
 # Subcommand entry — for `install.sh --pki-action=<action>` used in maintenance.
 handle_pki_subcommand() {
   case "$PKI_ACTION" in
@@ -9941,6 +10381,16 @@ main() {
     detect_working_directory
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then cd "$WORK_DIR"; fi
     handle_pki_subcommand
+    exit 0
+  fi
+
+  # P1 W4: Short-circuit path for onboard/offboard: no full install, no wizard.
+  if [[ -n "${ONBOARD_MANIFEST:-}" ]]; then
+    handle_onboard_subcommand
+    exit 0
+  fi
+  if [[ -n "${OFFBOARD_AGENT:-}" ]]; then
+    handle_offboard_subcommand
     exit 0
   fi
 
@@ -10111,6 +10561,22 @@ main() {
       esac
     fi
     _check_contaminated_volumes
+
+    # W2/L10 — wire _detect_runtime after resolve_compose_cmd succeeds.
+    # YSG_RUNTIME_4WAY is used by the onboard codegen path to emit the correct
+    # ring-fence artifacts. Wrong-runtime codegen silently produces no ring-fence (L10).
+    # Called here (after runtime is resolved, before any codegen step) so the
+    # 4-way value is available for the rest of the install flow.
+    if [[ -f "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh" ]]; then
+      # shellcheck source=lib/detect_runtime.sh
+      # shellcheck disable=SC1091
+      source "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh"
+      _detect_runtime 2>/dev/null || true
+      log_info "Runtime 4-way: ${YSG_RUNTIME_4WAY:-unknown}"
+      if [[ "${YSG_RUNTIME_4WAY:-}" == "podman-rootless" ]]; then
+        log_warn "L1 network-plane containment NOT active (rootless Podman). L2+L3 active."
+      fi
+    fi
 
     # Write AES key to .env
     _write_aes_key_to_env
