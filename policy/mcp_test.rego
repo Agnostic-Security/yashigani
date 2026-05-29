@@ -978,3 +978,273 @@ test_fix5_mcp_b_enforces_tool_allowlist if {
         "tool": {"name": "dangerous_exec", "args_redacted": {}},
     } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
 }
+
+# ---------------------------------------------------------------------------
+# 12. P3 Filesystem MCP server tool gating (Laura threat model §5)
+#     References: LAURA-FS-001 through LAURA-FS-010 regression attack tests
+# ---------------------------------------------------------------------------
+
+# --- 12.1 Read-only tool set: PERMIT ---
+
+test_fs_read_file_allowed_readonly_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "documents/report.md"}},
+    }
+}
+
+test_fs_read_multiple_files_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["a.txt", "b.txt"]}},
+    }
+}
+
+test_fs_list_directory_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_directory", "args": {}},
+    }
+}
+
+test_fs_get_file_info_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "get_file_info", "args": {"path": "report.md"}},
+    }
+}
+
+# --- 12.2 Path traversal denial (LAURA-FS-001 — §5.1) ---
+
+# LAURA-FS-001: read_file with ../ traversal → deny
+test_fs_deny_path_traversal_dotdot if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "../../../etc/shadow"}},
+    }
+}
+
+test_fs_deny_reason_path_traversal if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "../../../etc/shadow"}},
+    }
+    r == "fs_path_traversal_attempt"
+}
+
+# Absolute path rejection
+test_fs_deny_absolute_path if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "/etc/passwd"}},
+    }
+}
+
+test_fs_deny_reason_absolute_path if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "/etc/passwd"}},
+    }
+    r == "fs_path_traversal_attempt"
+}
+
+# --- 12.3 Write tool denial in readonly posture (LAURA-FS-003) ---
+
+# LAURA-FS-003: write_file denied by default
+test_fs_deny_write_file_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "output.txt", "content": "hello"}},
+    }
+}
+
+test_fs_deny_reason_write_file_readonly if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "output.txt", "content": "hello"}},
+    }
+    r == "fs_tool_denied_readonly_posture"
+}
+
+# LAURA-FS-010: move_file denied
+test_fs_deny_move_file_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "move_file", "args": {"source": "a.txt", "destination": "b.txt"}},
+    }
+}
+
+test_fs_deny_reason_move_file_readonly if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "move_file", "args": {"source": "a.txt", "destination": "b.txt"}},
+    }
+    r == "fs_tool_denied_readonly_posture"
+}
+
+# edit_file and create_directory also denied in readonly posture
+test_fs_deny_edit_file_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "edit_file", "args": {"path": "a.txt"}},
+    }
+}
+
+test_fs_deny_create_directory_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "create_directory", "args": {"path": "newdir"}},
+    }
+}
+
+# --- 12.4 Write posture: readwrite enables write tools ---
+
+test_fs_allow_write_file_readwrite_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "output.txt", "content": "hello"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+test_fs_allow_edit_file_readwrite_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "edit_file", "args": {"path": "a.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+test_fs_allow_move_file_readwrite_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "move_file", "args": {"source": "a.txt", "destination": "b.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# Write tools in readwrite posture still reject path traversal
+test_fs_deny_write_file_with_traversal_even_in_readwrite if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "../../../etc/cron.d/evil"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# --- 12.5 list_allowed_directories: ALWAYS denied (LAURA-FS-004) ---
+
+test_fs_deny_list_allowed_directories_always if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_allowed_directories", "args": {}},
+    }
+}
+
+test_fs_deny_reason_list_allowed_directories if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_allowed_directories", "args": {}},
+    }
+    r == "fs_list_allowed_directories_denied"
+}
+
+# list_allowed_directories denied even in readwrite posture
+test_fs_deny_list_allowed_directories_in_readwrite_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_allowed_directories", "args": {}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# --- 12.6 directory_tree depth cap (LAURA-FS-006 — §5.2) ---
+
+# LAURA-FS-006: maxDepth=100 → deny
+test_fs_deny_directory_tree_depth_exceeded if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs", "maxDepth": 100}},
+    }
+}
+
+test_fs_deny_reason_directory_tree_depth if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs", "maxDepth": 100}},
+    }
+    r == "fs_directory_tree_depth_exceeded"
+}
+
+# maxDepth=5 → allow (at limit)
+test_fs_allow_directory_tree_depth_at_limit if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs", "maxDepth": 5}},
+    }
+}
+
+# maxDepth absent → allow (broker enforces default cap)
+test_fs_allow_directory_tree_no_depth if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs"}},
+    }
+}
+
+# --- 12.7 search_files pattern length cap (LAURA-FS-005 — §5.3 ReDoS) ---
+
+# LAURA-FS-005: 500-char pattern → deny
+test_fs_deny_search_files_pattern_too_long if {
+    _long_pattern := concat("", [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aa",
+    ])
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {"pattern": _long_pattern}},
+    }
+}
+
+test_fs_deny_reason_search_pattern_too_long if {
+    _long_pattern := concat("", [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aa",
+    ])
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {"pattern": _long_pattern}},
+    }
+    r == "fs_search_pattern_too_long"
+}
+
+# 256-char pattern → allow (at limit)
+test_fs_allow_search_files_pattern_at_limit if {
+    _limit_pattern := concat("", [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ])
+    count(_limit_pattern) == 256
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {"pattern": _limit_pattern}},
+    }
+}
+
+# Pattern absent → allow
+test_fs_allow_search_files_no_pattern if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {}},
+    }
+}
+
+# --- 12.8 Default posture is readonly (write posture absent = readonly) ---
+
+test_fs_default_write_posture_is_readonly if {
+    data.yashigani.mcp._fs_write_posture == "readonly"
+}

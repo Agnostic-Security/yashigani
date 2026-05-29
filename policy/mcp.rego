@@ -455,3 +455,186 @@ deny_reason_value := deny_reason if { not allow }
 deny_reason_value := "ok" if { allow }
 
 ra := redact_args
+
+# ---------------------------------------------------------------------------
+# P3 — Filesystem MCP server tool gating (Laura threat model §5)
+#
+# These rules enforce the filesystem-specific OPA constraints for the
+# @modelcontextprotocol/server-filesystem bundle.  They are checked by the
+# gateway broker AFTER the global allow path when input.agent.name == "filesystem"
+# (or any agent whose name matches a manifest with category=mcp_server).
+#
+# The global mcp.rego allow path (above) handles posture/SPIFFE/chain checks.
+# These rules add the agent-specific per-tool authz layer (P9).
+#
+# References:
+#   LAURA-FS-TM-001  path traversal (§2.2.1)
+#   LAURA-FS-TM-003  ReDoS via search_files (§2.3)
+#   LAURA-FS-TM-005  list_allowed_directories info-disclosure (§2.2.5)
+# ---------------------------------------------------------------------------
+
+# Filesystem read-only tool set (permitted by default)
+_fs_readonly_tools := {
+    "read_file",
+    "read_multiple_files",
+    "list_directory",
+    "directory_tree",
+    "get_file_info",
+    "search_files",
+}
+
+# Filesystem write/mutating tool set (denied by default; allowed when write_posture=readwrite)
+_fs_write_tools := {
+    "write_file",
+    "edit_file",
+    "create_directory",
+    "move_file",
+}
+
+# ---------------------------------------------------------------------------
+# Path argument safety (LAURA-FS-TM-001 §5.1)
+#
+# Belt-and-suspenders against path traversal. Primary control is the
+# named-volume mount boundary (the container has no /etc, no host paths).
+# OPA adds a policy-layer pre-call assertion.
+#
+# Rules:
+#   - args.path must not contain "../"
+#   - args.path must not start with "/" (absolute paths rejected;
+#     the server's --allowed-dir is the root, not the container's root)
+#   - When no path arg is present (e.g. list_directory of root), pass.
+# ---------------------------------------------------------------------------
+
+_fs_path_arg_safe(args) if {
+    is_string(args.path)
+    not contains(args.path, "../")
+    not startswith(args.path, "/")
+}
+
+_fs_path_arg_safe(args) if {
+    not args.path
+}
+
+# ---------------------------------------------------------------------------
+# directory_tree depth cap (LAURA-FS-TM-003 §5.2)
+#
+# Prevents recursive directory traversal DoS.
+# maxDepth must be <= 5 or absent (broker enforces cap when absent).
+# ---------------------------------------------------------------------------
+
+_fs_directory_tree_safe(args) if {
+    not args.maxDepth
+}
+
+_fs_directory_tree_safe(args) if {
+    to_number(args.maxDepth) <= 5
+}
+
+# ---------------------------------------------------------------------------
+# search_files pattern length cap (LAURA-FS-TM-003 §5.3 — ReDoS)
+#
+# The glob package has had historical ReDoS vulnerabilities.
+# Cap pattern length at 256 characters.
+# ---------------------------------------------------------------------------
+
+_fs_search_files_safe(args) if {
+    is_string(args.pattern)
+    count(args.pattern) <= 256
+}
+
+_fs_search_files_safe(args) if {
+    not args.pattern
+}
+
+# ---------------------------------------------------------------------------
+# filesystem_tool_allowed — the compound filesystem tool decision
+#
+# Called from the gateway broker's per-agent authz layer.
+# Returns true when the tool call is permitted for the filesystem bundle.
+# Fail-closed: default := false means any unmatched combination is denied.
+# ---------------------------------------------------------------------------
+
+default filesystem_tool_allowed := false
+
+# Read-only tools: PERMIT (always) with path validation
+# Excludes directory_tree (has depth cap) and search_files (has pattern-length cap)
+# — both handled by their own dedicated rules below.
+filesystem_tool_allowed if {
+    input.tool.name in _fs_readonly_tools
+    not input.tool.name == "list_allowed_directories"
+    not input.tool.name == "directory_tree"
+    not input.tool.name == "search_files"
+    _fs_path_arg_safe(input.tool.args)
+}
+
+# directory_tree: depth cap + path validation
+filesystem_tool_allowed if {
+    input.tool.name == "directory_tree"
+    _fs_path_arg_safe(input.tool.args)
+    _fs_directory_tree_safe(input.tool.args)
+}
+
+# search_files: path + pattern-length cap
+filesystem_tool_allowed if {
+    input.tool.name == "search_files"
+    _fs_path_arg_safe(input.tool.args)
+    _fs_search_files_safe(input.tool.args)
+}
+
+# Write tools: PERMIT only when write_posture=readwrite in data bundle
+# Operator sets: PUT /v1/data/yashigani/mcp/filesystem_write_posture "readwrite"
+_fs_write_posture := p if {
+    p := data.yashigani.mcp.filesystem_write_posture
+} else := "readonly"
+
+filesystem_tool_allowed if {
+    input.tool.name in _fs_write_tools
+    _fs_write_posture == "readwrite"
+    _fs_path_arg_safe(input.tool.args)
+}
+
+# list_allowed_directories: ALWAYS denied (info-disclosure — Laura §2.2.5)
+# No allow rule matches for this tool; default := false catches it.
+
+# ---------------------------------------------------------------------------
+# filesystem_deny_reason — reason string for denied filesystem tool calls
+# ---------------------------------------------------------------------------
+
+filesystem_deny_reason := "fs_path_traversal_attempt" if {
+    not filesystem_tool_allowed
+    is_string(input.tool.args.path)
+    contains(input.tool.args.path, "../")
+}
+
+filesystem_deny_reason := "fs_path_traversal_attempt" if {
+    not filesystem_tool_allowed
+    is_string(input.tool.args.path)
+    startswith(input.tool.args.path, "/")
+}
+
+filesystem_deny_reason := "fs_directory_tree_depth_exceeded" if {
+    not filesystem_tool_allowed
+    input.tool.name == "directory_tree"
+    is_number(to_number(input.tool.args.maxDepth))
+    to_number(input.tool.args.maxDepth) > 5
+}
+
+filesystem_deny_reason := "fs_search_pattern_too_long" if {
+    not filesystem_tool_allowed
+    input.tool.name == "search_files"
+    is_string(input.tool.args.pattern)
+    count(input.tool.args.pattern) > 256
+}
+
+filesystem_deny_reason := "fs_tool_denied_readonly_posture" if {
+    not filesystem_tool_allowed
+    input.tool.name in _fs_write_tools
+    _fs_write_posture == "readonly"
+}
+
+filesystem_deny_reason := "fs_list_allowed_directories_denied" if {
+    not filesystem_tool_allowed
+    input.tool.name == "list_allowed_directories"
+}
+
+default filesystem_deny_reason := "fs_tool_not_permitted"

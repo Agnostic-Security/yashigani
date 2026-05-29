@@ -1,5 +1,5 @@
 """
-Yashigani Manifest — Linter (M5, M6, M7, C1-C3, N1, N2).
+Yashigani Manifest — Linter (M5, M6, M7, C1-C3, N1, N2, FS1).
 
 Applies all semantic validation rules that go beyond the JSON-Schema (M8)
 and the parser-level guards (M1-M3).  The linter is the ``yashigani validate``
@@ -43,6 +43,13 @@ Rules implemented here:
          when spec.audit.sensitivity_ceiling is CONFIDENTIAL or RESTRICTED.
          Default sensitivity ceiling is CONFIDENTIAL (L-01), so an absent
          ceiling also triggers this check.
+  FS1 — Shape-C storage.mounts validation (LAURA-FS-TM-001/002 mitigations).
+         hostPath type BLOCKED in v1.
+         container_path must not be /, /etc, /run, /run/secrets, /var, /opt.
+         Volume name must match ysg_fs_{tenant_id}_ prefix pattern
+         (tenant-namespace isolation — LAURA-FS-TM-008).
+         Errors: FS1_hostpath_blocked, FS1_dangerous_container_path,
+                 FS1_volume_name_not_tenant_namespaced.
 
 Error messages are human-quality (K3 — Nora launch gate):
   Every error includes: what failed, why it matters, how to fix it.
@@ -61,6 +68,10 @@ W5 additions (v2.25.0 P1):
          /agents/<tenant_id>/ prefix.
   N2  — New rule: on-demand + container_per:identity blocked in v1 (PKI
          Issuer API required for on-demand per-identity issuance).
+
+P3 additions (v2.25.0 P3 filesystem-mcp bundle):
+  FS1 — Shape-C storage.mounts validation per Laura threat model §4.3.
+        hostPath blocked, container_path blocklist, tenant-namespaced volume names.
 
 Last updated: 2026-05-29T00:00:00+00:00
 """
@@ -824,6 +835,124 @@ def _lint_lifecycle_n2(parsed: dict) -> list[LintError]:
 
 
 # ---------------------------------------------------------------------------
+# FS1 — Shape-C storage.mounts validation (Laura LAURA-FS-TM-001/002/008)
+# ---------------------------------------------------------------------------
+
+# Container paths that are dangerous to use as writable workspace mounts
+# because they overlap with system or Yashigani-internal directories.
+_DANGEROUS_CONTAINER_PATHS: frozenset[str] = frozenset({
+    "/",
+    "/etc",
+    "/run",
+    "/run/secrets",
+    "/var",
+    "/opt",
+    "/opt/yashigani",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/root",
+    "/home",
+})
+
+# Tenant-namespaced volume name prefix pattern for filesystem MCP mounts.
+# Codegen generates names as ysg_fs_{tenant_id}_workspace.
+# The linter enforces the prefix to prevent cross-tenant volume collision.
+_FS_VOLUME_NAME_RE = re.compile(r"^ysg_fs_[a-z0-9][a-z0-9_]{0,60}$")
+
+
+def _lint_storage_mounts_shape_c(parsed: dict) -> list[LintError]:
+    """
+    FS1 — Shape-C storage.mounts validation.
+
+    Enforces Laura threat model §4.3 constraints:
+    1. hostPath type is BLOCKED in v1 (LAURA-FS-TM-002).
+    2. container_path must not be in _DANGEROUS_CONTAINER_PATHS.
+    3. Volume name must match ysg_fs_{tenant_id}_* pattern (tenant-namespace
+       isolation — LAURA-FS-TM-008; codegen contract: two tenant_ids produce
+       distinct volume names).
+
+    These rules only fire when spec.storage.mounts is populated.  The rule
+    is silent for Shape-A manifests that do not declare storage.mounts.
+    """
+    errors: list[LintError] = []
+    spec = parsed.get("spec") or {}
+    storage = spec.get("storage") or {}
+    mounts = storage.get("mounts") or []
+
+    if not mounts:
+        return errors
+
+    metadata = parsed.get("metadata") or {}
+    tenant_id = metadata.get("tenant_id", "")
+
+    for i, mount in enumerate(mounts):
+        if not isinstance(mount, dict):
+            continue
+
+        mount_type = mount.get("type", "")
+        container_path = mount.get("container_path", "")
+        volume_name = mount.get("name", "")
+
+        # FS1a: hostPath blocked in v1
+        if mount_type == "hostPath":
+            errors.append(LintError(
+                "FS1_hostpath_blocked",
+                "spec.storage.mounts[%d].type 'hostPath' is BLOCKED in v1. "
+                "Host filesystem pass-through creates container-escape paths "
+                "(Laura LAURA-FS-TM-002 / §4.3 D2). Use type: volume (named "
+                "Docker volume) instead." % i,
+                field="spec.storage.mounts[%d].type" % i,
+                fix="Change spec.storage.mounts[%d].type to 'volume'. Named "
+                    "Docker volumes are tenant-namespaced and isolated. "
+                    "hostPath support requires a new Laura threat model review "
+                    "(v2)." % i,
+            ))
+
+        # FS1b: dangerous container_path
+        if container_path and container_path in _DANGEROUS_CONTAINER_PATHS:
+            errors.append(LintError(
+                "FS1_dangerous_container_path",
+                "spec.storage.mounts[%d].container_path %r is a system or "
+                "Yashigani-internal path. Mounting a workspace here can "
+                "overwrite system files or expose secrets "
+                "(Laura §4.3 / LAURA-FS-TM-001)." % (i, container_path),
+                field="spec.storage.mounts[%d].container_path" % i,
+                fix="Use a dedicated, non-sensitive path such as /workspace "
+                    "or /data for the MCP server workspace.",
+            ))
+
+        # FS1c: volume name must be tenant-namespaced
+        if volume_name and tenant_id:
+            if not _FS_VOLUME_NAME_RE.match(volume_name):
+                errors.append(LintError(
+                    "FS1_volume_name_not_tenant_namespaced",
+                    "spec.storage.mounts[%d].name %r does not match the "
+                    "required ysg_fs_<tenant_id>_* pattern. "
+                    "Non-namespaced volume names can cause cross-tenant volume "
+                    "collision (Laura LAURA-FS-TM-008 — §2.5 BOLA)." % (i, volume_name),
+                    field="spec.storage.mounts[%d].name" % i,
+                    fix="Use 'ysg_fs_%s_workspace' as the volume name. The "
+                        "tenant_id prefix ensures each tenant's filesystem "
+                        "server uses a distinct volume." % tenant_id,
+                ))
+            elif tenant_id and not volume_name.startswith("ysg_fs_%s_" % tenant_id.replace("-", "_")):
+                errors.append(LintError(
+                    "FS1_volume_name_wrong_tenant",
+                    "spec.storage.mounts[%d].name %r does not include the "
+                    "tenant_id %r in the expected position "
+                    "(ysg_fs_%s_*). Cross-tenant volume name collisions "
+                    "enable BOLA (LAURA-FS-TM-008)." % (
+                        i, volume_name, tenant_id,
+                        tenant_id.replace("-", "_")),
+                    field="spec.storage.mounts[%d].name" % i,
+                    fix="Rename to 'ysg_fs_%s_workspace'." % tenant_id.replace("-", "_"),
+                ))
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -927,6 +1056,9 @@ def validate_manifest(
 
     # N2 — on-demand + container_per:identity blocked in v1 (W5)
     errors.extend(_lint_lifecycle_n2(parsed))
+
+    # FS1 — Shape-C storage.mounts validation (P3 filesystem-mcp bundle)
+    errors.extend(_lint_storage_mounts_shape_c(parsed))
 
     passed = len(errors) == 0
     return LintResult(errors=errors, warnings=warnings, passed=passed)
