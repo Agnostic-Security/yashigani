@@ -10,7 +10,9 @@ Implements Nico's locked crypto spec (mcp-identity-jwt-spec-20260529.md):
   - Clock-skew tolerance: ±5 seconds (per RFC 7519 §4.1.4).
   - Gateway pre-validates chain depth before signing (belt-and-suspenders).
   - JWKS Cache-Control: max-age=300 (see _jwks.py).
-  - KMS-backed key in production; PEM file in dev (./secrets/mcp_identity_signing_key).
+  - KMS-backed key in production; PEM file at /run/secrets/mcp_identity_signing_key
+    (mounted by install.sh from docker/secrets/, overridable via
+    YASHIGANI_MCP_SIGNING_KEY_PATH env var).
 
 Startup self-test:
   At import time, McpJwtIssuer performs a startup self-test:
@@ -56,7 +58,9 @@ _AUDIENCE = "yashigani-mcp-upstream"
 _JWT_TTL_SECONDS = int(os.environ.get("YASHIGANI_MCP_JWT_TTL_SECONDS", "60"))
 _CLOCK_SKEW_SECONDS = 5
 _DEFAULT_CHAIN_MAX_DEPTH = 3
-_DEV_KEY_PATH = Path("./secrets/mcp_identity_signing_key")
+_SIGNING_KEY_PATH = Path(
+    os.environ.get("YASHIGANI_MCP_SIGNING_KEY_PATH", "/run/secrets/mcp_identity_signing_key")
+)
 
 
 def _b64url_no_pad(data: bytes) -> str:
@@ -76,10 +80,14 @@ class McpJwtIssuer:
     """
     Issues ES384-signed MCP identity JWTs per Nico spec §1-§5.
 
-    Key loading order (dev mode, no KMS):
+    Key loading order:
       1. YASHIGANI_MCP_SIGNING_KEY_PEM env var (base64-encoded PEM, for testing)
-      2. ./secrets/mcp_identity_signing_key (0600, PEM file)
-      3. Generates a new ephemeral key (WARN: not persisted, for unit tests only)
+      2. PEM file at the path in YASHIGANI_MCP_SIGNING_KEY_PATH
+         (default /run/secrets/mcp_identity_signing_key — docker secret bind-mount;
+         install.sh writes docker/secrets/mcp_identity_signing_key which appears
+         at that path inside the gateway container, 0600).
+      3. Generates a new ephemeral key (WARN: not persisted, for unit tests only;
+         REFUSED in production/staging — Fix-5).
 
     Production: key is KMS-backed (Vault Transit, AWS KMS, etc.).
     The KMS abstraction is a drop-in replacement for this class that implements
@@ -210,9 +218,9 @@ class McpJwtIssuer:
                 ) from exc
 
         # 2. Dev-mode PEM file
-        if _DEV_KEY_PATH.exists():
+        if _SIGNING_KEY_PATH.exists():
             try:
-                pem = _DEV_KEY_PATH.read_bytes()
+                pem = _SIGNING_KEY_PATH.read_bytes()
                 key = serialization.load_pem_private_key(pem, password=None)
                 if not isinstance(key, EllipticCurvePrivateKey):
                     raise ValueError("MCP signing key must be an EC private key")
@@ -223,12 +231,12 @@ class McpJwtIssuer:
                     )
                 logger.info(
                     "mcp-broker: loaded MCP signing key from %s (DEV MODE — not KMS-backed)",
-                    _DEV_KEY_PATH,
+                    _SIGNING_KEY_PATH,
                 )
                 return key
             except Exception as exc:
                 raise RuntimeError(
-                    f"Failed to load MCP signing key from {_DEV_KEY_PATH}: {exc}"
+                    f"Failed to load MCP signing key from {_SIGNING_KEY_PATH}: {exc}"
                 ) from exc
 
         # 3. Ephemeral key (unit tests only) — FAIL-CLOSED in production/staging.
@@ -250,7 +258,7 @@ class McpJwtIssuer:
                 "was found. An ephemeral key is NOT acceptable in production/staging "
                 "(multi-replica JWKS mismatch + restart key rotation risk). "
                 f"Set YASHIGANI_MCP_SIGNING_KEY_PEM (base64 PEM) or mount the key at "
-                f"{_DEV_KEY_PATH} (0600, PEM format). "
+                f"{_SIGNING_KEY_PATH} (0600, PEM format). "
                 "See install.sh for key generation. "
                 "Nico spec §2: KMS-backed persistent key required in production."
             )
@@ -260,7 +268,7 @@ class McpJwtIssuer:
             "(NOT PERSISTED — dev/test mode only). "
             "Set YASHIGANI_MCP_SIGNING_KEY_PEM or provide %s for persistent key. "
             "Nico spec §2: KMS-backed key required in production.",
-            _DEV_KEY_PATH,
+            _SIGNING_KEY_PATH,
         )
         return ec.generate_private_key(SECP384R1())
 

@@ -7377,23 +7377,11 @@ generate_secrets() {
       log_info "mcp_identity_signing_key already present — preserving (upgrade path)"
     fi
 
-    # Sync YASHIGANI_MCP_SIGNING_KEY_PEM into .env (upgrade path).
-    local _mcp_key_b64_up
-    if [[ -f "$_mcp_key_file_up" ]] && \
-       _mcp_key_b64_up="$(base64 -w0 "${_mcp_key_file_up}" 2>/dev/null \
-                          || base64 -b 0 "${_mcp_key_file_up}" 2>/dev/null)"; then
-      if grep -q "^YASHIGANI_MCP_SIGNING_KEY_PEM=" "$_env_file_up" 2>/dev/null; then
-        local _tmp_env_mcp_up; _tmp_env_mcp_up="$(mktemp)"
-        sed "s|^YASHIGANI_MCP_SIGNING_KEY_PEM=.*|YASHIGANI_MCP_SIGNING_KEY_PEM=${_mcp_key_b64_up}|" \
-            "$_env_file_up" > "$_tmp_env_mcp_up"
-        mv "$_tmp_env_mcp_up" "$_env_file_up"
-      else
-        printf 'YASHIGANI_MCP_SIGNING_KEY_PEM=%s\n' "$_mcp_key_b64_up" >> "$_env_file_up"
-      fi
-      log_info "YASHIGANI_MCP_SIGNING_KEY_PEM synced into .env (base64 PEM, upgrade path)"
-    else
-      log_warn "Could not base64-encode mcp_identity_signing_key — YASHIGANI_MCP_SIGNING_KEY_PEM not updated"
-    fi
+    # No .env sync needed — the gateway reads the key from
+    # /run/secrets/mcp_identity_signing_key (file-tier in _jwt.py), which is
+    # exposed via the existing docker-compose bind-mount `./secrets:/run/secrets:ro`.
+    # Storing the raw private key in .env is wider exposure (docker inspect,
+    # backup tools, process env) and is intentionally avoided.
     # END YSG-P3-MCP-SIGKEY-UPGRADE
 
     return 0
@@ -7663,19 +7651,20 @@ generate_secrets() {
   # BEGIN YSG-P3-MCP-SIGKEY
   # --- MCP identity signing key (P-384 / ES384) — Nico ship-blocker ---
   # The MCP JWT issuer (src/yashigani/mcp/_jwt.py) performs a 3-tier key lookup:
-  #   1. YASHIGANI_MCP_SIGNING_KEY_PEM env var (base64-encoded PEM)
-  #   2. ./secrets/mcp_identity_signing_key PEM file (dev-mode relative path)
+  #   1. YASHIGANI_MCP_SIGNING_KEY_PEM env var (base64-encoded PEM, testing only)
+  #   2. PEM file at $YASHIGANI_MCP_SIGNING_KEY_PATH
+  #      (default /run/secrets/mcp_identity_signing_key — bind-mounted into the
+  #      gateway container by the existing compose pattern ./secrets:/run/secrets:ro)
   #   3. Ephemeral key — REFUSED in production/staging (RuntimeError)
   #
-  # Install.sh owns path #1: generate a P-384 EC private key, write it as a PEM
-  # file to ${secrets_dir}/mcp_identity_signing_key (0600), then base64-encode it
-  # into YASHIGANI_MCP_SIGNING_KEY_PEM in .env so the gateway always finds it.
+  # Install.sh owns path #2: generate a P-384 EC private key and write it to
+  # ${secrets_dir}/mcp_identity_signing_key (0600); the existing compose
+  # bind-mount exposes it at /run/secrets/mcp_identity_signing_key inside the
+  # gateway container, where _jwt.py reads it. No .env env-var sync —
+  # storing the raw private key in .env is wider exposure (docker inspect,
+  # backup tools, process env) and is intentionally avoided.
   #
-  # _DEV_KEY_PATH in _jwt.py resolves relative to the gateway process CWD (/app),
-  # which does NOT match the compose /run/secrets bind-mount.  The env var path
-  # is the correct production wiring — never rely on _DEV_KEY_PATH in production.
-  #
-  # Idempotent: if the key file already exists, preserve it and re-sync .env.
+  # Idempotent: if the key file already exists, preserve it.
   # Rotation: use scripts/rotate-secret.sh (separate documented operation).
   # Backup: the file lands in ${secrets_dir}/ which is captured by
   #   _backup_existing_data → bundle.enc (YSG-RISK-050/051 dual-wrap).
@@ -7718,25 +7707,11 @@ generate_secrets() {
     fi
   fi
 
-  # Sync YASHIGANI_MCP_SIGNING_KEY_PEM into .env as base64-encoded PEM.
-  # The gateway reads this env var at startup (path #1 in _jwt.py tier lookup).
-  # base64 -w0 (GNU) / base64 -b 0 (macOS) — both produce single-line output.
-  local _mcp_key_b64
-  if _mcp_key_b64="$(base64 -w0 "${_mcp_key_file}" 2>/dev/null \
-                     || base64 -b 0 "${_mcp_key_file}" 2>/dev/null)"; then
-    if grep -q "^YASHIGANI_MCP_SIGNING_KEY_PEM=" "$env_file" 2>/dev/null; then
-      local _tmp_env_mcp; _tmp_env_mcp="$(mktemp)"
-      sed "s|^YASHIGANI_MCP_SIGNING_KEY_PEM=.*|YASHIGANI_MCP_SIGNING_KEY_PEM=${_mcp_key_b64}|" \
-          "$env_file" > "$_tmp_env_mcp"
-      mv "$_tmp_env_mcp" "$env_file"
-    else
-      printf 'YASHIGANI_MCP_SIGNING_KEY_PEM=%s\n' "$_mcp_key_b64" >> "$env_file"
-    fi
-    log_info "YASHIGANI_MCP_SIGNING_KEY_PEM synced into .env (base64 PEM)"
-  else
-    log_error "Failed to base64-encode mcp_identity_signing_key — gateway startup WILL FAIL in production"
-    return 1
-  fi
+  # No .env sync needed — the gateway reads the key from
+  # /run/secrets/mcp_identity_signing_key (file-tier in _jwt.py), which is
+  # exposed via the existing docker-compose bind-mount `./secrets:/run/secrets:ro`.
+  # Storing the raw private key in .env is wider exposure (docker inspect,
+  # backup tools, process env) and is intentionally avoided.
   # END YSG-P3-MCP-SIGKEY
 
   log_success "All passwords and 2FA secrets generated (${secrets_dir}/)"
