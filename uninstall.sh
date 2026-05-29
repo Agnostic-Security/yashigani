@@ -665,8 +665,15 @@ if [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
     _state_runtime="$(grep -E '^RUNTIME=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
     _INSTALL_UID="$(grep -E '^INSTALL_UID=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
     _INSTALL_USER="$(grep -E '^INSTALL_USER=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
-    _state_namespace="$(grep -E '^NAMESPACE=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
-    _state_helm_release="$(grep -E '^HELM_RELEASE=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
+    # #21 FIX: grep exits 1 when the pattern is absent (compose state files have
+    # no NAMESPACE= or HELM_RELEASE= lines).  Under `set -euo pipefail` the
+    # command substitution propagates the non-zero exit and the script aborts
+    # silently before printing any error output — the customer sees nothing and
+    # has to tear the stack down manually.  `|| true` guards each no-match path;
+    # the variable is left empty and the k8s-only propagation block below is a
+    # no-op for compose runtimes (correct behaviour).
+    _state_namespace="$(grep -E '^NAMESPACE=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]' || true)"
+    _state_helm_release="$(grep -E '^HELM_RELEASE=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]' || true)"
     if [ -z "$RUNTIME" ] && { [ "$_state_runtime" = "docker" ] || [ "$_state_runtime" = "podman" ] || [ "$_state_runtime" = "k8s" ]; }; then
         RUNTIME="$_state_runtime"
         log_info "Using runtime from install state file: $RUNTIME"

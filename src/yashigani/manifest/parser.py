@@ -335,7 +335,25 @@ def _parse_sandboxed(text: str) -> dict:
     On macOS (no RLIMIT_AS support) the subprocess still runs in a separate
     process for isolation; the resource limits silently no-op.
     """
-    ctx = multiprocessing.get_context("spawn")
+    # Use "fork" on Linux to avoid multiprocessing.spawn's requirement to
+    # re-import __main__ from a file path.  When install.sh calls the codegen
+    # as `python3 - <<'HEREDOC'`, __main__ has no importable file path
+    # (<stdin>), which causes spawn to raise FileNotFoundError.  fork() copies
+    # the process image directly without needing to reload __main__.
+    # On macOS "fork" is also available; resource-limit sandbox still applies.
+    # Resolves Bug J4-B1 found in P1 first live E2E run (2026-05-29).
+    #
+    # SECURITY (Laura ruling 2026-05-29): fork is acceptable HERE because at the
+    # fork point the parent (a throwaway `python3` codegen invocation) holds NO
+    # secrets — the W6 password/TOTP are shell-only and zeroed before this runs;
+    # only YSG_OPERATOR_IDENTITY (a username) + runtime env are inherited; open
+    # fds are stdin/stdout/stderr only (no socket/secrets-dir/CA-key); heap holds
+    # only the manifest bytes + imports. The untrusted-YAML sandbox thus has
+    # nothing sensitive to read, and the RLIMIT sandbox + JSON-only queue still
+    # apply. REVISIT (switch to temp-file + spawn) if codegen ever loads secret
+    # material into this process's heap/fds before parse_manifest().
+    _ctx_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    ctx = multiprocessing.get_context(_ctx_method)
     q: multiprocessing.Queue = ctx.Queue()  # type: ignore[type-arg]
     proc = ctx.Process(target=_sandbox_worker_entry, args=(text, q), daemon=True)
     proc.start()

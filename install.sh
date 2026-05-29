@@ -9233,6 +9233,52 @@ _pki_chown_client_keys() {
       _do_chmod_0640 "$_atpath" "$_atf" || return 1
     fi
   done
+
+  # C-003 FIX: chown dynamically-onboarded agent client keys.
+  #
+  # Background: pki_services_all() returns only the STATIC service map from
+  # lib/pki_ownership.sh.  Agents onboarded via `install.sh --onboard` are
+  # appended to docker/service_identities.yaml (B-002 fix) so that rotate-leaves
+  # issues them a client cert/key.  But the static map has no entry for them —
+  # the issued key lands owned by the PKI issuer UID (1001 post-:U remap on
+  # Docker, subuid-range on Podman rootless) and is unreadable by the agent
+  # container (UID 65534, set in compose override by codegen — codegen.py:560).
+  # Without this block every post-onboard rotate-leaves leaves the agent key
+  # unreadable → agent crash-loops on mTLS handshake.
+  #
+  # Implementation: read sentinel-guarded agent names from
+  # docker/service_identities.yaml (the same file the issuer reads).  Extract
+  # `# BEGIN YSG-ONBOARD-<name>` markers; chown each `<name>_client.key` to
+  # UID 65534 (nobody — the hardcoded compose `user:` for all BYO agents).
+  # Mode 0600 (owner-read-only; nobody is the sole consumer).
+  #
+  # This is safe to call on a fresh install with no onboarded agents: the
+  # grep produces no output and the loop body never executes.
+  #
+  # UID contract: codegen.py line 560 → `user: "65534:65534"` for ALL
+  # Shape-A BYO agents.  A future manifest field (spec.container_uid) may
+  # allow override — when that lands, update this block to read from the
+  # service_identities entry rather than hardcoding 65534.
+  local _sid_runtime="${WORK_DIR}/docker/service_identities.yaml"
+  if [[ ! -f "$_sid_runtime" ]]; then
+    # Runtime manifest not yet seeded (fresh install pre-PKI); fall back to
+    # the IaC source file.
+    _sid_runtime="${WORK_DIR}/docker/service_identities.yaml"
+  fi
+  if [[ -f "$_sid_runtime" ]]; then
+    local _onboarded_agent
+    while IFS= read -r _onboarded_agent; do
+      # Strip leading/trailing whitespace and extract name from sentinel comment.
+      _onboarded_agent="${_onboarded_agent#"# BEGIN YSG-ONBOARD-"}"
+      _onboarded_agent="${_onboarded_agent%%[[:space:]]*}"
+      [[ -z "$_onboarded_agent" ]] && continue
+      local _agent_key="${_secrets_dir}/${_onboarded_agent}_client.key"
+      if [[ -f "$_agent_key" ]]; then
+        log_info "C-003: chown'ing onboarded agent key ${_onboarded_agent}_client.key → UID 65534 (nobody)"
+        _do_chown "65534" "$_agent_key" "${_onboarded_agent}_client.key" "0600" || return 1
+      fi
+    done < <(grep -E '^[[:space:]]*# BEGIN YSG-ONBOARD-' "$_sid_runtime" 2>/dev/null || true)
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -10583,10 +10629,26 @@ else:
     if begin_marker in content:
         print('[onboard] service_identities.yaml: entry for %r already present — idempotent' % agent_name)
     else:
-        # Append sentinel-guarded entry before the last line of the file
+        # B-002 FIX: insert sentinel-guarded entry INSIDE the top-level
+        # `services:` mapping, not at EOF (which puts it after `canary_policy:`
+        # and outside the mapping → structurally invalid YAML).
+        #
+        # Strategy: locate the insertion boundary — the first line at column 0
+        # that is NOT inside the services: mapping (i.e. a top-level key or
+        # comment-section separator that follows the last services entry).
+        # We look for:
+        #   (a) the pattern `\n\n# ────…` (the decorative separator line
+        #       before endpoint_acls: or other top-level sections), OR
+        #   (b) `\n^[a-z_]+:` (any top-level key at column 0 after a blank line)
+        # whichever comes first AFTER the `services:` line.
+        #
+        # This is safe for any valid service_identities.yaml: if onboarded
+        # agents have already been inserted (prior runs), `begin_marker` check
+        # above would have caught the duplicate; this path only runs when the
+        # entry is absent.
         spiffe_id = 'spiffe://yashigani.internal/agents/%s/%s' % (tenant_id, agent_name)
-        entry = (
-            '\n  # BEGIN YSG-ONBOARD-{name}\n'
+        entry_block = (
+            '  # BEGIN YSG-ONBOARD-{name}\n'
             '  # Onboarded agent — managed by yashigani onboard/offboard\n'
             '  - name: {name}\n'
             '    dns_sans: [{name}, {name}.internal]\n'
@@ -10597,11 +10659,37 @@ else:
             '    revoked: false\n'
             '  # END YSG-ONBOARD-{name}\n'
         ).format(name=agent_name, spiffe_id=spiffe_id)
+
+        # Find the services: key position first, then search only past it.
+        services_match = re.search(r'^services:\s*$', content, re.MULTILINE)
+        if services_match is None:
+            print('[onboard] FAIL: service_identities.yaml has no top-level `services:` key — cannot insert entry', file=sys.stderr)
+            sys.exit(1)
+        search_start = services_match.end()
+
+        # Look for the first separator comment block (decorative ─── lines
+        # used as section dividers in service_identities.yaml) OR any
+        # top-level YAML key (word chars + colon at column 0, preceded by
+        # a blank line). Whichever comes first after `services:` is the
+        # boundary — we insert the new block immediately before it.
+        boundary_re = re.compile(
+            r'\n(?=# [─]{5}|[a-z_][a-zA-Z0-9_]*:)',
+            re.MULTILINE,
+        )
+        boundary_match = boundary_re.search(content, search_start)
+        if boundary_match is None:
+            # Fallback: no boundary found — append before EOF (last resort).
+            insert_pos = len(content)
+            new_content = content.rstrip('\n') + '\n' + entry_block
+        else:
+            insert_pos = boundary_match.start() + 1  # after the \n
+            new_content = content[:insert_pos] + entry_block + '\n' + content[insert_pos:]
+
         import tempfile
         dir_ = os.path.dirname(sid_file)
         fd, tmp = tempfile.mkstemp(dir=dir_, prefix='.ysg-onboard-tmp-', suffix='.yaml')
         try:
-            os.write(fd, (content + entry).encode('utf-8'))
+            os.write(fd, new_content.encode('utf-8'))
             os.close(fd); fd = -1
             os.chmod(tmp, os.stat(sid_file).st_mode & 0o777)
             os.rename(tmp, sid_file)
@@ -10794,6 +10882,15 @@ handle_pki_subcommand() {
       _pki_run_issuer rotate-leaves \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS" \
         "${_rl_san_args[@]}"
+      # Re-chown private keys to container UIDs after rotation (C-003 fix).
+      # _pki_run_issuer regenerates keys with fresh material and writes them
+      # mode 0400 owned by the installer UID. Without the chown step the
+      # container service processes (e.g. pgbouncer UID 70, backoffice UID 1000)
+      # can no longer read their own private keys → crash-loop on next restart.
+      # The inline pki_action path did not call _pki_chown_client_keys; the
+      # offboard-triggered path (install.sh --pki-action rotate-leaves) therefore
+      # left keys unreadable by their owning containers.
+      _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-leaves — keys may be unreadable by containers"; return 1; }
       log_success "Leaf certs rotated — restart services to pick up new certs"
       log_info "  docker compose restart gateway backoffice postgres pgbouncer redis budget-redis policy"
       ;;
