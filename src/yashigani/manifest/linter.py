@@ -1,5 +1,5 @@
 """
-Yashigani Manifest — Linter (M5, M6, M7, C1-C3, N1).
+Yashigani Manifest — Linter (M5, M6, M7, C1-C3, N1, N2).
 
 Applies all semantic validation rules that go beyond the JSON-Schema (M8)
 and the parser-level guards (M1-M3).  The linter is the ``yashigani validate``
@@ -10,7 +10,24 @@ Rules implemented here:
   M6  — spec.image.digest + all spec.sidecars[*].image.digest present;
          --verify-digests live-inspect path (behind flag; mock in tests).
   M7  — signature enforcement gate (via signatures.py).
-  N1  — SPIFFE identity /agents/{tenant_id}/{name} prefix mandate.
+  N1  — SPIFFE identity /agents/{tenant_id}/{name} namespace mandate.
+         If spec.identity.spiffe.override_id is set it MUST start with
+         ``spiffe://yashigani.internal/agents/<tenant_id>/``.  Prevents
+         escape to the /agents/<other_tenant>/ namespace and prevents
+         collision with core-service identities (Nico NICO-002).
+         Error code: N1_spiffe_override_out_of_namespace.
+  N2  — Onboard-time cert issuance constraint (v2.25.0 P1 W5).
+         v1 issues certs at onboard time; runtime/on-demand per-identity
+         issuance requires the v2.24.0 PKI Issuer API.  The combination
+         ``lifecycle.mode: on-demand`` + ``pool.container_per: identity``
+         is therefore blocked in v1.  Persistent mode (and on-demand
+         without container_per:identity) pass.
+         Error code: N2_ondemand_identity_v1_blocked.
+         Note: ``lifecycle.mode: on-demand`` is also rejected by the
+         JSON-Schema enum (M8) since the schema currently permits only
+         ``persistent``; the N2 linter rule adds a human-quality error
+         message that explicitly names the v2.24.0 constraint and the
+         affected combination.
   C1  — egress_allow host must not resolve to RFC1918/loopback/link-local
          (static parse-time check on literal values; full DNS is codegen).
          Also applied to spec.model_egress.base_url (F4 — Laura MED).
@@ -36,6 +53,14 @@ W3 additions (v2.25.0 P1):
          (default is CONFIDENTIAL per L-01).
   LAURA-001 — _is_private_address SSRF bypass hardening.
   LAURA-002/003 — slug validation on metadata.name and metadata.tenant_id.
+
+W5 additions (v2.25.0 P1):
+  N1  — Error code renamed from N1_spiffe_prefix to
+         N1_spiffe_override_out_of_namespace (more precise; existing tests
+         updated).  Semantics unchanged: override_id must start with the
+         /agents/<tenant_id>/ prefix.
+  N2  — New rule: on-demand + container_per:identity blocked in v1 (PKI
+         Issuer API required for on-demand per-identity issuance).
 
 Last updated: 2026-05-29T00:00:00+00:00
 """
@@ -336,14 +361,26 @@ def resolve_spiffe_uri(parsed: dict) -> str:
 
 def _lint_spiffe_prefix(parsed: dict) -> list[LintError]:
     """
-    N1 — The SPIFFE URI for this agent must be
-    ``spiffe://yashigani.internal/agents/{tenant_id}/{name}``.
+    N1 — SPIFFE override_id namespace mandate (W5, v2.25.0 P1).
 
-    If spec.identity.spiffe.override_id is supplied, it must start with
-    ``spiffe://yashigani.internal/agents/{tenant_id}/``.  The trailing
-    ``/{name}`` is not mandatory in the override (allows subpath).
+    If spec.identity.spiffe.override_id is supplied it MUST start with
+    ``spiffe://yashigani.internal/agents/<tenant_id>/``.
 
-    The /agents/ prefix prevents core-service collision (Nico NICO-002).
+    This enforces two invariants simultaneously:
+    1. Core-service collision prevention: IDs not under ``/agents/`` (e.g.
+       ``spiffe://yashigani.internal/gateway``) are structurally impossible.
+    2. Cross-tenant namespace isolation: an override for tenant ``acme-corp``
+       cannot set a URI that begins with another tenant's prefix (e.g.
+       ``spiffe://yashigani.internal/agents/evil-corp/...``).
+
+    The trailing ``/<name>`` is NOT mandatory in the override (subpaths under
+    the tenant namespace are permitted).
+
+    No override (default) is always accepted — resolve_spiffe_uri() constructs
+    the correct canonical URI at codegen time.
+
+    Error code: N1_spiffe_override_out_of_namespace.
+    Reference: Nico NICO-002.
     """
     errors: list[LintError] = []
     metadata = parsed.get("metadata") or {}
@@ -363,13 +400,18 @@ def _lint_spiffe_prefix(parsed: dict) -> list[LintError]:
     if override is not None:
         if not override.startswith(required_prefix):
             errors.append(LintError(
-                "N1_spiffe_prefix",
-                "spec.identity.spiffe.override_id %r does not start with "
-                "the required prefix %r." % (override, required_prefix),
+                "N1_spiffe_override_out_of_namespace",
+                "spec.identity.spiffe.override_id %r is outside the allowed "
+                "namespace for tenant %r.  The override must begin with %r.  "
+                "Identities outside this namespace can collide with core-service "
+                "identities (e.g. spiffe://yashigani.internal/gateway) or impersonate "
+                "agents belonging to another tenant (Nico NICO-002 / N1)." % (
+                    override, tenant_id, required_prefix),
                 field="spec.identity.spiffe.override_id",
-                fix="SPIFFE IDs for ring-fenced agents must begin with "
-                    "%r to prevent collision with core-service identities "
-                    "(Nico NICO-002 / N1)." % required_prefix,
+                fix="Change override_id to start with %r, e.g. %s%s.  "
+                    "Remove override_id entirely to use the auto-constructed default "
+                    "URI spiffe://yashigani.internal/agents/%s/%s." % (
+                        required_prefix, required_prefix, name, tenant_id, name),
             ))
 
     return errors
@@ -722,6 +764,66 @@ def _lint_signature_gate(parsed: dict, manifest_bytes: bytes) -> list[LintError]
 
 
 # ---------------------------------------------------------------------------
+# N2 — onboard-time cert issuance constraint (W5, v2.25.0 P1)
+# ---------------------------------------------------------------------------
+
+
+def _lint_lifecycle_n2(parsed: dict) -> list[LintError]:
+    """
+    N2 — ``lifecycle.mode: on-demand`` combined with ``pool.container_per: identity``
+    is BLOCKED in v1.
+
+    v1 issues agent TLS certificates at onboard time (one cert per manifest
+    registration).  Runtime per-identity cert issuance requires the v2.24.0
+    PKI Issuer API (Nico NICO-003), which is not present in v1.
+
+    The blocked combination is:
+        spec.lifecycle.mode: on-demand   AND   spec.pool.container_per: identity
+
+    This is the only sub-case that requires per-identity runtime issuance.
+    All other combinations pass:
+        - lifecycle.mode: persistent (any container_per) — issued at onboard time, OK.
+        - lifecycle.mode: on-demand + container_per: agent — one shared cert per
+          agent pool entry, OK (onboard-time issuance still works).
+
+    Note: ``lifecycle.mode: on-demand`` is ALSO rejected by the JSON-Schema enum
+    (M8 rule) since the schema currently only permits ``persistent``.  The N2
+    linter rule fires in addition to (or before) M8 to provide a human-quality
+    error message that explicitly names the constraint and its v2.24.0 resolution
+    path.
+
+    Error code: N2_ondemand_identity_v1_blocked.
+    Reference: Nico NICO-003 / v2.24.0 PKI Issuer API.
+    """
+    errors: list[LintError] = []
+    spec = parsed.get("spec") or {}
+
+    lifecycle = spec.get("lifecycle") or {}
+    lifecycle_mode = lifecycle.get("mode", "")
+
+    pool = spec.get("pool") or {}
+    container_per = pool.get("container_per", "")
+
+    if lifecycle_mode == "on-demand" and container_per == "identity":
+        errors.append(LintError(
+            "N2_ondemand_identity_v1_blocked",
+            "The combination of lifecycle.mode: 'on-demand' and "
+            "pool.container_per: 'identity' is not supported in v1.  "
+            "Per-identity on-demand container creation requires the PKI Issuer API "
+            "(runtime per-identity cert issuance) which is not available until v2.24.0 "
+            "(Nico NICO-003).  v1 issues TLS certificates at onboard time only.",
+            field="spec.lifecycle.mode + spec.pool.container_per",
+            fix="Change spec.lifecycle.mode to 'persistent'.  Per-identity isolation "
+                "is fully supported with persistent mode in v1 — each identity gets its "
+                "own container and the cert is issued once at onboard time.  "
+                "If you specifically require on-demand per-identity cert issuance, "
+                "upgrade to a Yashigani release that includes the v2.24.0 PKI Issuer API.",
+        ))
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -808,7 +910,7 @@ def validate_manifest(
     # M7 — signature gate (structural; crypto in signatures.py)
     errors.extend(_lint_signature_gate(parsed, manifest_bytes))
 
-    # N1 — SPIFFE prefix
+    # N1 — SPIFFE override_id namespace mandate (W5)
     errors.extend(_lint_spiffe_prefix(parsed))
 
     # C1 — egress_allow private IPs
@@ -822,6 +924,9 @@ def validate_manifest(
 
     # P2 — gateway-enforced-only forbidden for CONFIDENTIAL/RESTRICTED
     errors.extend(_lint_identity_propagation_p2(parsed))
+
+    # N2 — on-demand + container_per:identity blocked in v1 (W5)
+    errors.extend(_lint_lifecycle_n2(parsed))
 
     passed = len(errors) == 0
     return LintResult(errors=errors, warnings=warnings, passed=passed)
