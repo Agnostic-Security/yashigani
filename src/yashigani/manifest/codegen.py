@@ -1310,24 +1310,37 @@ _SC_MEM_LIMIT: str = "256Mi"
 _SC_CPU_REQUEST: str = "0.1"
 _SC_MEM_REQUEST: str = "64Mi"
 
+# Shape-C first-party bridge HTTP port (Laura SB-5 / Captain T2 design).
+# The first-party shim (src/yashigani/mcp/_bridge.py) listens on this port
+# inside the bundle container.  The gateway reaches it over the ringfence
+# bridge (internal:true).  stdio MCP semantics use spec.mcp.exposes.listen_port
+# (which stays null — the MCP *protocol* has no listener); this port is the
+# shim's HTTP listener, declared separately as spec.mcp.exposes.shim_port.
+_SC_BRIDGE_PORT: int = 8000
+
 
 def _is_shape_c(parsed: dict) -> bool:
     """
-    Return True if this manifest describes a Shape-C stdio MCP-server.
+    Return True if this manifest describes a Shape-C MCP-server bundle.
 
     Detection criteria (any one sufficient):
     - metadata.category == "mcp_server", OR
-    - spec.mcp.transport == "stdio" AND spec.mcp.posture == "mcp-b"
+    - spec.mcp.posture == "mcp-b" AND transport in ("stdio", "streamable-http")
 
-    Shape-C agents are MCP-B posture (they EXPOSE tools via stdio to the
-    broker subprocess manager) and declare no network listener
-    (mcp.exposes.listen_port is null or absent).
+    Shape-C is the isolated-container MCP-server pattern (T2 topology, v2.25.0).
+    The transport field describes the gateway↔bridge channel:
+    - "stdio" was the original v1 Shape-C designation (pre-T2 design).
+    - "streamable-http" is correct under T2: the bridge exposes Streamable HTTP;
+      the underlying MCP server still speaks stdio internally.
+    Both are valid Shape-C indicators when posture is mcp-b.
     """
     meta = parsed.get("metadata") or {}
     if meta.get("category") == "mcp_server":
         return True
     mcp = (parsed.get("spec") or {}).get("mcp") or {}
-    return mcp.get("transport") == "stdio" and mcp.get("posture") == "mcp-b"
+    if mcp.get("posture") != "mcp-b":
+        return False
+    return mcp.get("transport") in ("stdio", "streamable-http")
 
 
 def _sc_volume_name(tenant_id: str, agent_name: str) -> str:
@@ -1375,6 +1388,7 @@ def _gen_compose_override_shape_c(
     tmpfs_list = storage.get("tmpfs") or []
     network = spec.get("network") or {}
     egress_allow = network.get("egress_allow") or []
+    subprocess_spec = spec.get("subprocess") or {}
 
     agent_name = meta.get("name", "")
     tenant_id = meta.get("tenant_id", "")
@@ -1458,14 +1472,59 @@ def _gen_compose_override_shape_c(
     if runtime == "podman-rootless":
         rootless_note = "      # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
 
+    # Laura SB-5 / Captain T2: build the bridge launch command.
+    # The first-party shim (src/yashigani/mcp/_bridge.py) is launched via uvicorn
+    # inside this container.  It reads YASHIGANI_MCP_SUBPROCESS_COMMAND from the
+    # environment to spawn the underlying stdio MCP server.
+    # spec.subprocess.command + args describe the underlying stdio server command;
+    # those are passed via the env var, not as the container's main command.
+    _subprocess_cmd_parts = subprocess_spec.get("command") or []
+    _subprocess_args_parts = subprocess_spec.get("args") or []
+    _all_subprocess_parts = _subprocess_cmd_parts + _subprocess_args_parts
+    _subprocess_env_val = " ".join(_all_subprocess_parts) if _all_subprocess_parts else ""
+
+    # Container command: launch the first-party bridge via uvicorn on _SC_BRIDGE_PORT.
+    # Module path: yashigani.mcp._bridge (see _bridge.py:30 uvicorn launch docstring).
+    _bridge_command_line = (
+        '    command: ["uvicorn", "yashigani.mcp._bridge:get_app", '
+        '"--factory", "--host", "0.0.0.0", "--port", "%d"]' % _SC_BRIDGE_PORT
+    )
+    _subprocess_env_line = (
+        '    environment:\n'
+        '      - YASHIGANI_MCP_SUBPROCESS_COMMAND=%s' % _subprocess_env_val
+        if _subprocess_env_val else ""
+    )
+
     lines = [
         _header_comment(manifest_hash, runtime),
         "# Shape C compose override for MCP-server agent: %s (tenant: %s)" % (agent_name, tenant_id),
         "# SC-EGRESS-NONE: no caddy_internal bridge — this server makes no outbound calls",
         "# SC-NO-SECRETS: spec.secrets=[] confirmed — group_add 2002 NOT emitted",
+        "#",
+        "# OPERATOR ACTION REQUIRED (Captain restart-on-onboard):",
+        "# Before onboarding this agent, add '%s' to the gateway service's" % ringfence_bridge,
+        "# networks list in docker-compose.yml so the gateway can reach the bridge on",
+        "# TCP/%d.  Example patch:" % _SC_BRIDGE_PORT,
+        "#   services:",
+        "#     gateway:",
+        "#       networks:",
+        "#         - %s   # ADD THIS" % ringfence_bridge,
+        "# Then restart the gateway: docker compose up -d gateway",
+        "# YASHIGANI_MCP_SERVERS entry for gateway (add to gateway environment):",
+        '#   - {"agent_name": "%s", "upstream_url": "http://%s:%d/mcp",' % (
+            agent_name, agent_name, _SC_BRIDGE_PORT,
+        ),
+        '#     "tenant_id": "%s", "is_filesystem_agent": true}' % tenant_id,
         "services:",
         "  %s:" % agent_name,
         "    image: %s:%s@%s" % (repo, tag, digest),
+        _bridge_command_line,
+        _subprocess_env_line if _subprocess_env_line else "",
+        "    # Laura SB-5: bridge HTTP port exposed on the ringfence bridge (internal:true)",
+        "    # Not externally routable — only the gateway container on the same bridge",
+        "    # can reach TCP/%d." % _SC_BRIDGE_PORT,
+        "    expose:",
+        '      - "%d"' % _SC_BRIDGE_PORT,
         "    networks:",
         "      - %s" % ringfence_bridge,
         "    volumes:",
@@ -1505,6 +1564,7 @@ def _gen_compose_override_shape_c(
         "",
         "# W3-F1: isolated ringfence bridge — L2 default-deny containment",
         "# SC-EGRESS-NONE: internal:true + no caddy_internal = no outbound path",
+        "# TCP/%d reachable from gateway only (after OPERATOR ACTION above)" % _SC_BRIDGE_PORT,
         "networks:",
         "  %s:" % ringfence_bridge,
         "    driver: bridge",
@@ -1601,6 +1661,8 @@ def _gen_values_yaml_shape_c(
             - mountPath: /tmp
               medium: Memory
               sizeLimit: 64Mi
+          # Laura SB-5 / T2: first-party bridge HTTP listener port
+          containerPort: {bridge_port}
           # L10 — runtime tag embedded for drift detection
           runtimeTag: "{runtime}"
         {rootless_note}
@@ -1619,6 +1681,7 @@ def _gen_values_yaml_shape_c(
         mem_req=_SC_MEM_REQUEST,
         vol_name=vol_name,
         workspace_path=workspace_path,
+        bridge_port=_SC_BRIDGE_PORT,
         runtime=runtime,
         rootless_note=rootless_note,
     )
@@ -1659,14 +1722,31 @@ def _gen_networkpolicy_shape_c(
         "              port: 53"
     )
 
+    # Laura SB-2: allow gateway→bridge ingress on TCP/_SC_BRIDGE_PORT.
+    # Previously ingress: [] (deny-all) blocked the gateway from reaching the shim.
+    # Under T2 the gateway Pod must reach port _SC_BRIDGE_PORT on the MCP-server Pod
+    # over HTTP.  Only the gateway Pod is permitted as source.
+    gateway_ingress = (
+        "        # Laura SB-2: gateway Pod may reach bridge on TCP/%d\n"
+        "        - from:\n"
+        "            - podSelector:\n"
+        "                matchLabels:\n"
+        "                  app.kubernetes.io/name: yashigani-gateway\n"
+        "          ports:\n"
+        "            - protocol: TCP\n"
+        "              port: %d"
+    ) % (_SC_BRIDGE_PORT, _SC_BRIDGE_PORT)
+
     content = textwrap.dedent("""\
         {header}
         # Shape C NetworkPolicy overlay for MCP-server agent: {agent_name} (tenant: {tenant_id})
         # SC-EGRESS-NONE: no external egress, no Caddy route
+        # Laura SB-2: ingress from gateway only on TCP/{bridge_port} (T2 first-party bridge)
         networkPolicy:
           enabled: true
           agent{agent_name_camel}:
-            ingress: []  # deny all ingress (stdio subprocess — no network listener)
+            ingress:
+        {gateway_ingress}
             egress:
         {dns_egress}
     """).format(
@@ -1674,6 +1754,8 @@ def _gen_networkpolicy_shape_c(
         agent_name=agent_name,
         agent_name_camel=_to_camel(agent_name),
         tenant_id=tenant_id,
+        bridge_port=_SC_BRIDGE_PORT,
+        gateway_ingress=gateway_ingress,
         dns_egress=dns_egress,
     )
     return content
@@ -2157,14 +2239,21 @@ class CodegenEngineShapeC:
                 "Remove all entries from spec.secrets." % self._agent_id,
             )
 
-        # SC: no network listener on stdio shape
+        # SC: no MCP-protocol network listener on stdio shape (Laura SB-4).
+        # listen_port describes the MCP *protocol* listener — stdio has none.
+        # The first-party bridge HTTP port is declared separately as shim_port
+        # (spec.mcp.exposes.shim_port, default _SC_BRIDGE_PORT).  Operators must
+        # NOT set listen_port to the bridge port — that would blur the semantic
+        # distinction between the MCP protocol transport and the shim layer.
         listen_port = mcp_exposes.get("listen_port")
         if listen_port is not None:
             raise CodegenError(
                 "SC_listen_port_on_stdio",
                 "Shape-C manifest for agent %r declares mcp.exposes.listen_port=%r. "
-                "stdio MCP-servers have no network listener — listen_port must be null "
-                "or absent for Shape-C agents (Laura §4.5)." % (self._agent_id, listen_port),
+                "stdio MCP-servers have no MCP-protocol network listener — listen_port "
+                "must be null or absent for Shape-C agents (Laura §4.5). "
+                "To configure the first-party bridge port use spec.mcp.exposes.shim_port "
+                "(default %d)." % (self._agent_id, listen_port, _SC_BRIDGE_PORT),
             )
 
     def render(

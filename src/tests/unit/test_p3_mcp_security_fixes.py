@@ -104,7 +104,7 @@ class TestFix1McpCallRoutedThroughCatchAll:
     def test_dispatch_mcp_call_exists_and_is_callable(self):
         """dispatch_mcp_call must be importable and be an async function."""
         from yashigani.gateway.mcp_router_runtime import dispatch_mcp_call
-        assert asyncio.iscoroutinefunction(dispatch_mcp_call), (
+        assert inspect.iscoroutinefunction(dispatch_mcp_call), (
             "dispatch_mcp_call must be an async function"
         )
 
