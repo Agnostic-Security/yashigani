@@ -175,8 +175,13 @@ spec:
           emptyDir: {}
         # MUST-4 / v2.24.1: writable dir for the admin unix socket.
         # emptyDir is ephemeral and pod-local — socket is never shared.
+        # Iris-F2 / LAURA-002 (LOW): memory-backed + bounded to match compose
+        # tmpfs /run/caddy:size=1m,mode=0700. medium:Memory gives tmpfs
+        # semantics (no host-disk writes); sizeLimit:1Mi caps runaway growth.
         - name: caddy-admin-sock
-          emptyDir: {}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         - name: caddyfile
           configMap:
             name: yashigani-caddy-config

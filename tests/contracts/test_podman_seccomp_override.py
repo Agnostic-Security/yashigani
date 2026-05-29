@@ -212,3 +212,31 @@ def test_podman_override_references_ysg_risk_074() -> None:
         "Podman override: YSG-RISK-074 reference not found. "
         "The override must document the BUG-NEW-002 fix rationale. BUG-NEW-002."
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 7: LAURA-003 — unshare not in seccomp allowlist
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_seccomp_profile_no_unshare_in_allowlist() -> None:
+    """yashigani.json allowlist must NOT contain the 'unshare' syscall.
+
+    LAURA-003 (LOW): unshare(2) creates new namespaces (user, mount, pid, net)
+    and is a recognised user-namespace-escape precursor. Caddy, gateway, and
+    backoffice do not need namespace creation at runtime. All 'podman unshare'
+    calls in the codebase are host-side Podman CLI invocations (install.sh,
+    uninstall.sh, test harnesses) — they run on the host, not inside containers,
+    and therefore never invoke the unshare(2) syscall within a container.
+    Removed from the allowlist as part of W3-P2a gate-fix (2026-05-29).
+    """
+    parsed = json.loads(_read(SECCOMP_PROFILE))
+    allowlisted: list[str] = []
+    for rule in parsed.get("syscalls", []):
+        if rule.get("action") == "SCMP_ACT_ALLOW":
+            allowlisted.extend(rule.get("names", []))
+    assert "unshare" not in allowlisted, (
+        "docker/seccomp/yashigani.json: 'unshare' found in SCMP_ACT_ALLOW list. "
+        "Remove it — Caddy/gateway/backoffice do not need namespace creation inside "
+        "the container. All 'podman unshare' calls are host-side CLI invocations. "
+        "LAURA-003 / W3-P2a."
+    )

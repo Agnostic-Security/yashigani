@@ -197,6 +197,11 @@ services:
       # (mTLS client). Its own client cert lives in ./secrets; the runtime manifest
       # (with per-install bootstrap_token_sha256 values) is mounted read-only.
       # Source is docker/var/runtime/ (gitignored, populated by install.sh).
+      # LAURA-001 (MED, RISK-REGISTERED): flat ./secrets mount exposes
+      # caddy_client.key to ~18 services sharing this bind-mount. Pre-existing
+      # compose architecture constraint; per-service secret-split is tracked as
+      # a risk item (not in scope for this branch). K8s uses pki-certs Secret
+      # (caddy.yaml) which is already correctly isolated to the caddy pod only.
       - ./secrets:/run/secrets:ro
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
     healthcheck:

@@ -236,6 +236,25 @@ class TestC6ContainerHardening:
             "caddy.yaml: capabilities.drop must include ALL (C6)."
         )
 
+    def test_helm_caddy_admin_sock_emptydir_bounded(self):
+        """Helm caddy-admin-sock emptyDir must have medium:Memory + sizeLimit:1Mi.
+
+        Iris-F2 / LAURA-002 (LOW): matches compose tmpfs /run/caddy:size=1m.
+        Memory-backed emptyDir is tmpfs-equivalent (no host-disk writes);
+        sizeLimit caps runaway growth from a misbehaving admin-sock client.
+        """
+        text = _load(_CADDY_YAML)
+        assert "medium: Memory" in text, (
+            "caddy.yaml: caddy-admin-sock emptyDir must have 'medium: Memory' "
+            "(tmpfs-equivalent, matches compose /run/caddy:size=1m). "
+            "Iris-F2 / LAURA-002."
+        )
+        assert "sizeLimit: 1Mi" in text, (
+            "caddy.yaml: caddy-admin-sock emptyDir must have 'sizeLimit: 1Mi' "
+            "(bounded to match compose /run/caddy:size=1m). "
+            "Iris-F2 / LAURA-002."
+        )
+
 
 # ---------------------------------------------------------------------------
 # C7 — TLS private key isolation + TLS 1.3
