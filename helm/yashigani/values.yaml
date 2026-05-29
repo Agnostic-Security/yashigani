@@ -1236,6 +1236,41 @@ agentBundles:
             mountPath: /run/secrets
             readOnly: true
 
+  # filesystem-mcp — Shape-C MCP server bundle (codegen-emitted; placeholder here for
+  # label verification only).  Real values are emitted by _gen_values_yaml_shape_c()
+  # at agent-onboard time.  shape: "c" causes agent-bundles.yaml to emit the
+  # yashigani.io/shape=c pod label that networkpolicy.yaml gateway-egress rule selects on.
+  filesystemMcp:
+    enabled: false
+    shape: "c"
+    image:
+      # Placeholder — replaced by codegen with the pinned digest at onboard time.
+      repository: ghcr.io/agnosticsec/filesystem-mcp
+      tag: "not-yet-available"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    env: {}
+    service:
+      port: 8000
+      type: ClusterIP
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+    # Shape-C bundles run as non-root, read-only rootfs, all caps dropped.
+    # No persistence — MCP servers are stateless (workspace is a bind-mount volume).
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
 # Image pulled unmodified from ghcr.io/open-webui/open-webui (upstream).

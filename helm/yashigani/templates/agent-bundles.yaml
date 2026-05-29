@@ -66,6 +66,9 @@ spec:
         app.kubernetes.io/instance: {{ $root.Release.Name }}
         app.kubernetes.io/component: agent-bundle
         yashigani.io/bundle: {{ $bundleID | quote }}
+        {{- if $bundle.shape }}
+        yashigani.io/shape: {{ $bundle.shape | quote }}
+        {{- end }}
     spec:
       # BUG-NEW-003 fix: readOnlyRootFilesystem: true (default for all bundles) blocks
       # K8s from creating /var/run/secrets/kubernetes.io/serviceaccount/ in the container
