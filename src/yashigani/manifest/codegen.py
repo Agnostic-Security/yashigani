@@ -865,14 +865,19 @@ def _gen_caddy_snippet(
     # Build upstream list from egress_allow + model_egress.base_url
     upstreams: list[str] = []
 
-    # model_egress.base_url is the primary upstream for Shape A
+    # model_egress.base_url is the primary upstream for Shape A.
+    # MUST include an explicit port so Caddy's reverse_proxy dials the correct
+    # port. Without an explicit port, Caddy always dials :80 regardless of the
+    # transport http { tls } subdirective — caddy adapt exposes this as
+    # {"dial":"host:80"} even for HTTPS upstreams (Captain gate, v2.25.0 P1).
     if base_url:
-        # Extract host:port for Caddy reverse_proxy
         from urllib.parse import urlparse
         parsed_url = urlparse(base_url)
-        upstream_host = parsed_url.netloc or parsed_url.path
-        if upstream_host:
-            upstreams.append(upstream_host)
+        _hostname = parsed_url.hostname  # lowercased, no port
+        if _hostname:
+            _scheme = parsed_url.scheme.lower() if parsed_url.scheme else ""
+            _port = parsed_url.port or (443 if _scheme == "https" else 80)
+            upstreams.append("%s:%d" % (_hostname, _port))
 
     # Additional egress_allow entries
     egress_allow = network.get("egress_allow") or []

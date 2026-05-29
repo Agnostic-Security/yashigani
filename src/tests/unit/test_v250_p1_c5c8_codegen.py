@@ -26,7 +26,13 @@ All tests use dry_run=True (no file writes).
 from __future__ import annotations
 
 import copy
+import json
 import re
+import shutil
+import subprocess
+import tempfile
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # Shared fixtures — extend base manifest from W3 test suite
@@ -555,3 +561,150 @@ class TestExtractTlsServerName:
 
     def test_subdomain_url(self) -> None:
         assert self._extract("https://my.custom.llm.example.com/api") == "my.custom.llm.example.com"
+
+
+# ---------------------------------------------------------------------------
+# caddy adapt gate — semantic port check (what caddy validate cannot catch)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("caddy") is None, reason="caddy binary not on PATH")
+class TestCaddyAdaptDialPorts:
+    """
+    Regression for v2.25.0 P1 Captain gate: `caddy validate` passes bare-host
+    upstreams (syntax OK), but `caddy adapt` reveals Caddy always dials :80
+    when no port is explicit — even with `transport http { tls }`.
+
+    Class of bug: `parsed_url.netloc` (e.g. "api.openai.com") instead of
+    `parsed_url.hostname + explicit port` (e.g. "api.openai.com:443").
+
+    Every `reverse_proxy` upstream dial in the adapted JSON MUST end in :443
+    for HTTPS providers.  No :80 entry.  No duplicate dials.
+    """
+
+    _CADDY = shutil.which("caddy") or "caddy"
+
+    def _adapt_snippet(self, snippet: str) -> dict:
+        """Write snippet to a temp file, run caddy adapt, return parsed JSON."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".caddy", delete=False,
+            dir="/Users/max/Documents/Claude/YSG"
+        ) as f:
+            f.write(snippet)
+            fname = f.name
+        try:
+            result = subprocess.run(
+                [self._CADDY, "adapt", "--adapter", "caddyfile", "--config", fname],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0, (
+                "caddy adapt returned non-zero: %s" % result.stderr
+            )
+            return json.loads(result.stdout)
+        finally:
+            import os
+            os.unlink(fname)
+
+    def _extract_dials(self, adapted: dict) -> list[str]:
+        """Extract all reverse_proxy upstream dial strings from adapted JSON."""
+        dials: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("handler") == "reverse_proxy":
+                    for u in node.get("upstreams", []):
+                        if "dial" in u:
+                            dials.append(u["dial"])
+                for v in node.values():
+                    _walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(adapted)
+        return dials
+
+    def test_caddy_adapt_upstreams_dial_443_not_80(self) -> None:
+        """
+        Shape A (HTTPS base_url) — caddy adapt must produce dial :443, never :80.
+        Regression: bare netloc upstream ("api.openai.com") caused Caddy to emit
+        {"dial":"api.openai.com:80"} even with transport http { tls }.
+        """
+        snippet = _caddy_snippet()
+        adapted = self._adapt_snippet(snippet)
+        dials = self._extract_dials(adapted)
+
+        assert dials, "caddy adapt produced no reverse_proxy upstreams"
+
+        port80_dials = [d for d in dials if d.endswith(":80")]
+        assert not port80_dials, (
+            "caddy adapt: found upstream dial(s) on :80 — Caddy will NOT upgrade "
+            "these to TLS even with `transport http { tls }`. Dials: %s" % port80_dials
+        )
+
+    def test_caddy_adapt_upstreams_all_443(self) -> None:
+        """Every dial entry in the adapted JSON ends with :443 for HTTPS providers."""
+        snippet = _caddy_snippet()
+        adapted = self._adapt_snippet(snippet)
+        dials = self._extract_dials(adapted)
+
+        assert dials, "caddy adapt produced no reverse_proxy upstreams"
+
+        non_443 = [d for d in dials if not d.endswith(":443")]
+        assert not non_443, (
+            "caddy adapt: unexpected upstream dial port(s). "
+            "All HTTPS upstreams must dial :443. Found: %s" % non_443
+        )
+
+    def test_caddy_adapt_no_duplicate_dials(self) -> None:
+        """
+        Dedup is effective: base_url-derived upstream and egress_allow entry for
+        the same host:port must collapse to a single dial entry (not two).
+        Regression: bare netloc "api.openai.com" != "api.openai.com:443" from
+        egress_allow — dedup missed them, producing two entries round-robined.
+        """
+        snippet = _caddy_snippet()
+        adapted = self._adapt_snippet(snippet)
+        dials = self._extract_dials(adapted)
+
+        assert dials, "caddy adapt produced no reverse_proxy upstreams"
+
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for d in dials:
+            if d in seen:
+                duplicates.append(d)
+            seen.add(d)
+
+        assert not duplicates, (
+            "caddy adapt: duplicate upstream dial entries — base_url and "
+            "egress_allow for same host:port were not deduped. "
+            "Duplicates: %s (all dials: %s)" % (duplicates, dials)
+        )
+
+    def test_caddy_adapt_explicit_port_base_url_still_443(self) -> None:
+        """
+        base_url with explicit :443 in the URL (e.g. https://api.openai.com:443/v1)
+        also produces a single :443 dial — not :80, not duplicate.
+        """
+        parsed = copy.deepcopy(_BASE_PARSED)
+        parsed["spec"]["model_egress"]["base_url"] = "https://api.openai.com:443/v1"
+        parsed["spec"]["network"]["egress_allow"] = [
+            {"host": "api.openai.com", "ports": [443]}
+        ]
+        snippet = _caddy_snippet(parsed=parsed)
+        adapted = self._adapt_snippet(snippet)
+        dials = self._extract_dials(adapted)
+
+        assert dials, "caddy adapt produced no reverse_proxy upstreams"
+
+        port80_dials = [d for d in dials if d.endswith(":80")]
+        assert not port80_dials, (
+            "caddy adapt: explicit-port base_url still produced :80 dial(s): %s" % port80_dials
+        )
+        assert len(dials) == 1, (
+            "caddy adapt: explicit-port base_url produced duplicate dials: %s" % dials
+        )
+        assert dials[0] == "api.openai.com:443", (
+            "caddy adapt: expected single dial 'api.openai.com:443', got: %s" % dials
+        )
