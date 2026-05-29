@@ -665,9 +665,16 @@ class TestW3F3CaddyReverseProxySyntax:
       - `reverse_proxy {\n    <bare-hostname>\n}` — bare hostname NOT valid
     """
 
-    def test_single_upstream_uses_inline_form(self) -> None:
+    def test_single_upstream_uses_block_form(self) -> None:
         """
-        W3-F3: single upstream emits `reverse_proxy <upstream>` (inline form).
+        W3-F3 updated for C5/C8: single upstream now emits block form
+        `reverse_proxy { to <upstream> transport http { ... } }`.
+
+        Prior to C5/C8, single upstream used inline `reverse_proxy <upstream>`.
+        C5 (per-upstream TLS verification) requires block form for the transport
+        subdirective.  The W3-F3 invariant — no bare hostname as a raw sub-line
+        without `to` prefix — is still enforced.
+
         Not using a mock — asserting on the actual generated text.
         """
         from yashigani.manifest.codegen import reset_codegen_registry
@@ -681,20 +688,29 @@ class TestW3F3CaddyReverseProxySyntax:
         artifacts = engine.render(dry_run=True)
         caddy = artifacts["docker/caddy/agents/hermes-agent.caddy"]
 
-        # Must contain `reverse_proxy api.openai.com` (inline, no bare sub-line)
-        assert "        reverse_proxy api.openai.com" in caddy, (
-            "W3-F3: single upstream must use inline form 'reverse_proxy <upstream>'.\n"
+        # C5/C8: single upstream now uses block form
+        assert "        reverse_proxy {" in caddy, (
+            "C5/C8: single upstream must now use block form 'reverse_proxy { ... }' "
+            "to carry transport http subdirective.\nGot caddy snippet:\n%s" % caddy
+        )
+        # Must have `to api.openai.com` sub-line (block form, not bare hostname)
+        assert "            to api.openai.com" in caddy, (
+            "W3-F3: expected 'to api.openai.com' sub-line in single-upstream block.\n"
             "Got caddy snippet:\n%s" % caddy
         )
-        # Must NOT have a bare hostname as a sub-line (the old buggy form)
+        # W3-F3 invariant: must NOT have a bare hostname as a raw sub-line (old buggy form)
         for line in caddy.split("\n"):
             stripped = line.strip()
             if stripped == "api.openai.com":
                 raise AssertionError(
-                    "W3-F3: bare hostname 'api.openai.com' found as a sub-line "
-                    "(old buggy form). Must use 'reverse_proxy <upstream>' inline.\n"
+                    "W3-F3: bare hostname 'api.openai.com' found as a raw sub-line "
+                    "(old buggy form). Must use 'to api.openai.com' in block form.\n"
                     "Got caddy snippet:\n%s" % caddy
                 )
+        # C5: transport block must be present for TLS verification
+        assert "transport http {" in caddy, (
+            "C5: transport http block missing from single-upstream snippet"
+        )
 
     def test_multiple_upstreams_uses_to_form(self) -> None:
         """

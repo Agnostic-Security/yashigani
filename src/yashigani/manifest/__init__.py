@@ -7,7 +7,7 @@ Package layout:
   linter.py     — M5/M6/M7/N1/N2/C1/C3/P2 semantic lint rules + resolve_spiffe_uri
   signatures.py — M7 signature verification (cosign + RSA-PSS FIPS split)
   cli.py        — yashigani validate CLI entrypoint (K3 human-quality errors)
-  codegen.py    — W3 Shape A artifact generator (C1/C3/C10/M9/S6/L3/L7/L9/S7)
+  codegen.py    — W3 Shape A artifact generator (C1/C3/C5/C8/C10/M9/S6/L3/L7/L9/S7)
   schemas/      — bundled JSON-Schema bundle (agent-manifest-v1alpha1.schema.json)
   keys/         — bundled cosign public key (manifest-signing.pub)
 
