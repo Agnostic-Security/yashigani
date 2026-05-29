@@ -243,7 +243,8 @@ class TestEventSerialization:
             request_id="req-abc-123",
             decision="deny",
             deny_reason="sensitivity_ceiling",
-            tool_sensitivity="CONFIDENTIAL",
+            # FIX-F(1) / Iris FIND-002: tool_sensitivity removed from schema
+            # (mcp.rego does not return a tool_sensitivity label).
             chain_depth=1,
             elapsed_ms=3,
         )

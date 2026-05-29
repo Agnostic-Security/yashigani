@@ -2307,9 +2307,22 @@ class OpaDecisionOnMcpEvent(AuditEvent):
     server_id: str = ""
     request_id: str = ""
     decision: str = ""           # "allow" | "deny" | "redact"
-    deny_reason: str = ""        # label if denied: "sensitivity_ceiling" | "budget" | "chain_depth" | "not_in_allowlist"
-    tool_sensitivity: str = ""   # "PUBLIC" | "INTERNAL" | "CONFIDENTIAL" | "RESTRICTED"
-    chain_depth: int = 0         # JWT identity chain depth (multi-hop)
+    deny_reason: str = ""        # label if denied: "sensitivity_ceiling" | "budget" | "chain_depth_exceeded" | "not_in_allowlist"
+    # FIX-F(1) / Iris FIND-002: tool_sensitivity removed.
+    # mcp.rego's mcp_decision compound document does NOT return a tool_sensitivity
+    # field — the policy does not classify individual tool sensitivity labels.
+    # An always-empty string is misleading in audit records and suggests a
+    # capability the policy layer doesn't implement.  Removed rather than left
+    # as a permanently-empty stub.  If the policy gains tool sensitivity
+    # classification in a future sprint, re-add with a matching rego key.
+    # FIX-E (Lu FIX-3): persist the full SPIFFE identity chain (ordered list) so
+    # an auditor sees WHICH identities were in the chain, not just how many.
+    # G5 multi-hop: previously only chain_depth (int) was recorded.
+    # identity_chain is the upstream_chain at the time of OPA evaluation — i.e.
+    # the chain the caller presented, before this gateway hop appended its own
+    # SPIFFE URI.  For first-hop (mcp-a/mcp-b) this is an empty list.
+    identity_chain: list = field(default_factory=list)
+    chain_depth: int = 0         # JWT identity chain depth (multi-hop) — kept for backward compat
     elapsed_ms: Optional[int] = None
 
 
