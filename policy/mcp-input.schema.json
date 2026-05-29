@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yashigani.local/policy/mcp-input.schema.json",
+  "title": "Yashigani MCP OPA Input Schema",
+  "description": "Input document schema for the mcp.rego policy package. Describes the structure of input passed by the gateway when evaluating MCP-posture requests and their responses.",
+  "type": "object",
+  "required": ["posture", "action", "identity"],
+  "additionalProperties": false,
+  "properties": {
+    "posture": {
+      "type": "string",
+      "enum": ["mcp-a", "mcp-b", "mcp-c"],
+      "description": "MCP deployment posture. mcp-a: local stdio Shape A, mcp-b: remote Streamable-HTTP Shape B, mcp-c: multi-hop chained Shape C."
+    },
+    "action": {
+      "type": "string",
+      "description": "The MCP action being requested. Use dot-notation: mcp.prompts.list, mcp.tools.call, mcp.resources.read, etc.",
+      "examples": ["mcp.prompts.list", "mcp.tools.call", "mcp.resources.read"]
+    },
+    "identity": {
+      "type": "object",
+      "description": "Resolved caller identity, populated by the gateway from the SPIFFE certificate or JWT.",
+      "required": ["spiffe"],
+      "additionalProperties": false,
+      "properties": {
+        "spiffe": {
+          "type": "string",
+          "description": "SPIFFE URI of the immediate caller, e.g. spiffe://cluster.local/ns/default/sa/langflow. Empty string when SPIFFE is not present (treated as anonymous in policy).",
+          "examples": ["spiffe://cluster.local/ns/default/sa/langflow", ""]
+        },
+        "chain": {
+          "type": "array",
+          "description": "Full upstream identity chain for multi-hop MCP-C calls. Each entry is a SPIFFE URI representing a hop in call-order (index 0 = originating caller, last = immediate caller). Populated by the MCP-C JWT (P2/N3 chunk). Absent on mcp-a and mcp-b. Policy enforces max depth via mcp_chain_max_depth.",
+          "items": {
+            "type": "string",
+            "description": "SPIFFE URI of a hop in the chain."
+          },
+          "examples": [
+            ["spiffe://cluster.local/ns/default/sa/origin-agent",
+             "spiffe://cluster.local/ns/default/sa/relay-agent"]
+          ]
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "description": "Present when action is mcp.tools.call. Mutually exclusive with prompt and resource (oneOf enforced by policy). Must NOT be present together with prompt or resource.",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Tool name as declared in the MCP server manifest's tools list."
+        },
+        "args_redacted": {
+          "type": "object",
+          "description": "Tool call arguments with all secret-like values redacted to '<REDACTED>'. The gateway must perform redaction before populating this field. The policy uses this field for audit capture only — never for allow/deny decisions on argument values.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "description": "Present when action is mcp.prompts.list or mcp.prompts.get. Mutually exclusive with tool and resource (oneOf enforced by policy).",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Prompt name as declared in the MCP server manifest."
+        },
+        "sensitivity": {
+          "type": "string",
+          "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"],
+          "description": "Sensitivity label of the prompt content. Absent when not classified — policy treats absent as PUBLIC (conservative for prompt listing, caller-ceiling-checked for prompt content)."
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "description": "Present when action is mcp.resources.read or mcp.resources.list. Mutually exclusive with tool and prompt (oneOf enforced by policy).",
+      "required": ["uri"],
+      "additionalProperties": false,
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Resource URI as declared in the MCP server manifest, e.g. file:///data/reports or https://internal.example.com/docs/api."
+        },
+        "sensitivity": {
+          "type": "string",
+          "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"],
+          "description": "Sensitivity label of the resource content. Absent when not classified — policy treats absent as PUBLIC."
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "description": "Agent context. Present when the caller is a registered Yashigani agent.",
+      "additionalProperties": false,
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "description": "Agent runtime identifier, e.g. langflow, n8n, openai-assistant, custom. Used by policy for posture-specific enforcement.",
+          "examples": ["langflow", "n8n", "openai-assistant", "custom"]
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "description": "Budget context for cost-aware gating. All fields optional — absent budget fields are treated as unconstrained (allow). Operators who configure budgets populate this field via the gateway budget enforcer.",
+      "additionalProperties": false,
+      "properties": {
+        "this_call_estimate": {
+          "type": ["number", "null"],
+          "description": "Estimated cost of this call in abstract token-equivalent units. null means unknown/unconstrained. Policy uses this for rate_limit_key selection but does NOT block on cost (budget blocking is handled by the gateway budget enforcer upstream of OPA)."
+        }
+      }
+    }
+  },
+
+  "allOf": [
+    {
+      "description": "tool, prompt, resource are mutually exclusive. Exactly zero or one may be present. (At least one SHOULD be present for tool/prompt/resource actions, but the policy does not require it at the schema level — absence of all three results in deny.)",
+      "not": {
+        "anyOf": [
+          {"required": ["tool", "prompt"]},
+          {"required": ["tool", "resource"]},
+          {"required": ["prompt", "resource"]}
+        ]
+      }
+    }
+  ],
+
+  "$comment": "Decision return shape (not validated here — returned by OPA, not sent to OPA): { allow: bool, redact_args: [string], audit_capture: bool, rate_limit_key: string | null }",
+
+  "definitions": {
+    "mcp_decision": {
+      "title": "MCP OPA Decision Shape",
+      "description": "Shape returned by OPA at /v1/data/yashigani/mcp/mcp_decision. NOT an input field — documented here for gateway implementers.",
+      "type": "object",
+      "required": ["allow", "redact_args", "audit_capture", "rate_limit_key"],
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "boolean",
+          "description": "Whether the request is permitted."
+        },
+        "redact_args": {
+          "type": "array",
+          "description": "List of tool argument keys that must be redacted before logging. Empty when tool is not present.",
+          "items": {"type": "string"}
+        },
+        "audit_capture": {
+          "type": "boolean",
+          "description": "Whether the gateway must write a full audit record (including redacted args) for this call."
+        },
+        "rate_limit_key": {
+          "type": ["string", "null"],
+          "description": "Rate-limit bucket key for this call, e.g. spiffe + action + tool name. null means no rate limiting required."
+        }
+      }
+    }
+  }
+}
