@@ -1,0 +1,148 @@
+# Yashigani P3 Bundle — @modelcontextprotocol/server-filesystem
+#
+# Laura threat model: p3-filesystem-mcp-threatmodel-20260529.md — GO-WITH-CONSTRAINTS
+# Shape: C (stdio MCP-server, gateway-managed subprocess)
+# Write posture: readonly (default) — operator sets write_posture: readwrite to enable
+#
+# REQUIRED before onboarding ceremony:
+#   1. Build digest-pinned image from the Dockerfile in the threat model §3.1.
+#   2. Run Trivy scan — CVSS >= 7.0 in Node.js runtime or glob package blocks ceremony (D5).
+#   3. Replace spec.image.digest with the real sha256 of your built image.
+#   4. Replace metadata.tenant_id with your tenant identifier.
+#
+# DO NOT:
+#   - Set spec.secrets entries (this server needs no credentials).
+#   - Set spec.network.egress_allow entries (no outbound network need).
+#   - Change spec.mcp.exposes.listen_port from null (stdio has no listener).
+#   - Use write_posture: readwrite without explicit Laura sign-off.
+#
+apiVersion: yashigani.io/v1alpha1
+kind: AgentIntegration
+
+metadata:
+  name: filesystem
+  tenant_id: replace-with-your-tenant-id   # REQUIRED: replace before onboarding
+  description: >-
+    Official MCP filesystem server (@modelcontextprotocol/server-filesystem).
+    Provides read (and optionally write) access to a configured workspace
+    directory. No LLM calls. No network egress. Runs as a gateway-managed
+    stdio subprocess.
+  category: mcp_server
+  vendor: "Anthropic (modelcontextprotocol)"
+  licence: MIT
+  upstream: "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
+
+spec:
+  image:
+    # Build from the Dockerfile in Laura's threat model §3.1.
+    # Replace digest with the actual sha256 of your built image.
+    # NEVER use a mutable tag without a digest — M6 requires digest pinning.
+    repository: registry.yashigani.internal/bundles/mcp-filesystem
+    tag: "latest"
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    # ^^^ REPLACE with real digest from: docker manifest inspect <image> | jq '.[0].Digest'
+
+  # Shape-C: stdio MCP-server subprocess invocation
+  # Codegen hardcodes /workspace as --allowed-dir (from storage.mounts[0].container_path)
+  subprocess:
+    command: ["node", "index.js"]
+    args:
+      - "/workspace"    # --allowed-dir: workspace mount only (Laura §4.8)
+
+  # Network: EGRESS NONE (Laura §4.1 — no legitimate outbound)
+  network:
+    egress_allow: []    # SC-EGRESS-NONE: no entries permitted
+
+  # MCP: expose tools via stdio to the gateway broker
+  mcp:
+    posture: mcp-b          # MCP-B: expose tools
+    transport: stdio        # Shape-C: stdio subprocess
+    session_mode: persistent
+    # FIX-IRIS-F3: gateway-enforced-only is intentional and SAFE here because
+    # sensitivity_ceiling is INTERNAL (line ~140). The linter P2 rule only
+    # hard-fails when sensitivity_ceiling is CONFIDENTIAL/RESTRICTED. Do NOT
+    # change identity_propagation without re-checking the P2 rule.
+    identity_propagation: gateway-enforced-only  # MCP-B with INTERNAL ceiling (§4.5)
+    exposes:
+      listen_port: null     # stdio: no network listener
+      tools:
+        # READ-ONLY DEFAULT POSTURE (Laura threat model §2.3)
+        - name: read_file
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: read_multiple_files
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: list_directory
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: directory_tree
+          allowed: true
+          sensitivity_class: INTERNAL
+          max_depth_arg: 5           # OPA enforces; prevents recursive DoS
+        - name: get_file_info
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: search_files
+          allowed: true
+          sensitivity_class: INTERNAL
+          max_pattern_len_arg: 256   # ReDoS mitigation (glob package)
+        # WRITE OPERATIONS — DENIED IN DEFAULT POSTURE
+        - name: write_file
+          allowed: false
+          reason: "Denied by default. Set write_posture: readwrite to enable."
+        - name: edit_file
+          allowed: false
+          reason: "Denied by default."
+        - name: create_directory
+          allowed: false
+          reason: "Denied by default."
+        - name: move_file
+          allowed: false
+          reason: "Highest risk; denied. Explicit operator override required."
+        - name: list_allowed_directories
+          allowed: false
+          reason: "Information disclosure — reveals operator mount layout (Laura §2.2.5)."
+
+  # Write posture: readonly (default) per Laura threat model D1
+  # Change to 'readwrite' ONLY after explicit Laura threat model review.
+  write_posture: readonly
+
+  # Storage: dedicated tenant-namespaced named volume (Laura §4.3 / LAURA-FS-TM-002)
+  # hostPath is BLOCKED in v1.
+  storage:
+    mounts:
+      - name: ysg_fs_replace_with_your_tenant_id_filesystem_workspace
+        # ^^^ REPLACE 'replace_with_your_tenant_id' with your tenant_id
+        # (hyphens in tenant_id become underscores)
+        type: volume
+        container_path: /workspace
+        read_only: false     # writable workspace (write ops still gated by OPA)
+        create_if_missing: true
+    tmpfs:
+      - path: /tmp
+        size_limit: 64m      # Node.js tmpdir; keeps root FS read-only (Laura §2.6.1)
+
+  # Secrets: NONE (Laura §4.4 — no credentials needed)
+  # group_add 2002 (S7) will NOT be emitted when spec.secrets is empty.
+  secrets: []
+
+  # Identity (Laura §4.7)
+  # SPIFFE URI is auto-constructed: spiffe://yashigani.internal/agents/{tenant_id}/filesystem
+  # No override needed.
+
+  # Lifecycle
+  lifecycle:
+    mode: persistent
+
+  # Audit (Laura §4.9)
+  audit:
+    capture:
+      - mcp_call
+      - mcp_tool_description_fetched
+      - opa_decision_on_mcp
+    sensitivity_ceiling: INTERNAL    # No CONFIDENTIAL/RESTRICTED data expected
+
+  # EU AI Act (Laura §4.10)
+  eu_ai_act:
+    annex_iii_category: null    # Not a high-risk AI system — tool server only

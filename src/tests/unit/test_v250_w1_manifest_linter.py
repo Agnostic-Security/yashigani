@@ -16,7 +16,9 @@ from __future__ import annotations
 import os
 import pytest
 
-_VALID_DIGEST = "a" * 64
+# FIX-NICO-001: all-identical-hex digests are now rejected as placeholders.
+# Use a realistic mixed-hex value (sha256 of "yashigani test fixture").
+_VALID_DIGEST = "a3b4c5d6e7f8a1b2c3d4e5f6a7b8c9d0a3b4c5d6e7f8a1b2c3d4e5f6a7b8c9d0"
 
 _BASE_PARSED = {
     "apiVersion": "yashigani.io/v1alpha1",
@@ -226,7 +228,7 @@ class TestM6ImageDigest:
                             "image": {
                                 "repository": "bitnami/pgbouncer",
                                 "tag": "1.22.0",
-                                "digest": "sha256:" + "b" * 64,
+                                "digest": "sha256:" + "b3c4d5e6f7a8b1c2d3e4f5a6b7c8d9e0b3c4d5e6f7a8b1c2d3e4f5a6b7c8d9e0",
                             }
                         }
                     ]

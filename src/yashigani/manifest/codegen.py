@@ -1,9 +1,10 @@
 """
-Yashigani Manifest — Codegen engine for Shape A (LLM-calling / Hermes-class).
+Yashigani Manifest — Codegen engine for Shape A (LLM-calling / Hermes-class)
+and Shape C (stdio MCP-server / Prometheus-class).
 
-W3 Phase 1 — Shape A only.  Given a validated parsed manifest and a detected
-runtime string, emit the full artifact set for onboarding an LLM-calling agent
-into the ring-fence.
+W3 Phase 1 — Shape A.  P3 — Shape C added.
+Given a validated parsed manifest and a detected runtime string, emit the full
+artifact set for onboarding an agent into the ring-fence.
 
 Security controls baked in (each has a proving test):
   C1   (SHIP-BLOCKER) Caddy routes use uri strip_prefix; upstreams hardcoded
@@ -34,6 +35,14 @@ Security controls baked in (each has a proving test):
   L7   (compose)   depends_on with condition: service_completed_successfully.
   S7              group_add 2002 for agents declaring kms secrets.
 
+Shape-C specific controls (P3 / Laura threat model):
+  SC-EGRESS-NONE  Shape-C agents have egress_allow: [] — no Caddy egress route
+                  generated (confirmed by asserting no caddy snippet is written).
+  SC-NO-SECRETS   group_add 2002 MUST NOT fire for zero-secrets agents (S7 guard).
+  SC-VOLUME       Named tenant-namespaced volume mount; no hostPath.
+  SC-TMPFS        /tmp tmpfs overlay (64Mi default) — keeps root FS read-only.
+  SC-L9-RUNUSER   runAsUser: 10001 (dedicated non-root UID for MCP process).
+
 Artifact set (Shape A):
   docker-compose.override.yml stanza
   values-<agent>.yaml + -networkpolicy overlay (Helm)
@@ -45,6 +54,15 @@ Artifact set (Shape A):
   tests/contracts/test_<agent>_compose.py stub
   tests/contracts/test_<agent>_helm.py stub
 
+Artifact set (Shape C) — same as Shape A MINUS the Caddy snippet:
+  docker-compose.override.yml stanza  (volume mount, tmpfs, L9 runAsUser 10001)
+  values-<agent>.yaml + -networkpolicy overlay (Helm)
+  templates/agents/<agent>-policy-exception.yaml (Kyverno)
+  service_identities.yaml append entry
+  pki_ownership.sh tuple fragment (shell)
+  opa/<agent>.rego (full — OPA registry wiring with per-tool allowlist)
+  tests/contracts/test_<agent>_compose.py stub
+
 Each generated file carries:
   - .yashigani-manifest-hash comment (M9 drift detection)
   - YSG_RUNTIME comment (L10 — wrong-runtime codegen silently produces no ring-fence)
@@ -52,7 +70,7 @@ Each generated file carries:
 Dry-run render mode: CodegenEngine(manifest, runtime).render(dry_run=True) returns a
 dict of {relative_path: content} without writing any files.
 
-Shapes B + C, offboard, and deep OPA authoring are out of scope (later phases).
+Shape B (off-process HTTP) and offboard are out of scope (later phases).
 
 Last updated: 2026-05-29T00:00:00+00:00
 """
@@ -1277,6 +1295,750 @@ def _gen_contract_test_helm(
 
 
 # ---------------------------------------------------------------------------
+# Shape C artifact generators
+# ---------------------------------------------------------------------------
+
+# Shape-C hardened container UID (Laura §4.6 — dedicated non-root UID).
+_SC_RUN_AS_USER: int = 10001
+
+# Shape-C tmpfs /tmp default size (Laura §4.3 / §2.6.1 — Node.js tmpdir).
+_SC_TMPFS_SIZE_DEFAULT: str = "64m"
+
+# Shape-C CPU/memory resource limits (Laura §4.6).
+_SC_CPU_LIMIT: str = "0.5"
+_SC_MEM_LIMIT: str = "256Mi"
+_SC_CPU_REQUEST: str = "0.1"
+_SC_MEM_REQUEST: str = "64Mi"
+
+
+def _is_shape_c(parsed: dict) -> bool:
+    """
+    Return True if this manifest describes a Shape-C stdio MCP-server.
+
+    Detection criteria (any one sufficient):
+    - metadata.category == "mcp_server", OR
+    - spec.mcp.transport == "stdio" AND spec.mcp.posture == "mcp-b"
+
+    Shape-C agents are MCP-B posture (they EXPOSE tools via stdio to the
+    broker subprocess manager) and declare no network listener
+    (mcp.exposes.listen_port is null or absent).
+    """
+    meta = parsed.get("metadata") or {}
+    if meta.get("category") == "mcp_server":
+        return True
+    mcp = (parsed.get("spec") or {}).get("mcp") or {}
+    return mcp.get("transport") == "stdio" and mcp.get("posture") == "mcp-b"
+
+
+def _sc_volume_name(tenant_id: str, agent_name: str) -> str:
+    """
+    Generate the tenant-namespaced Docker volume name for a Shape-C workspace.
+
+    Format: ysg_fs_{tenant_id}_{agent_name}_workspace
+    Tenant_id hyphens are replaced with underscores (Docker volume name constraint).
+
+    Codegen contract test: two distinct tenant_ids produce distinct volume names.
+    """
+    safe_tid = tenant_id.replace("-", "_")
+    safe_name = agent_name.replace("-", "_")
+    return "ysg_fs_%s_%s_workspace" % (safe_tid, safe_name)
+
+
+def _gen_compose_override_shape_c(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate the docker-compose.override.yml stanza for a Shape C MCP-server.
+
+    Shape-C specific differences from Shape A:
+    - Named-volume workspace mount (ysg_fs_{tenant_id}_{agent}_workspace → /workspace)
+    - tmpfs /tmp overlay (64Mi — keeps readOnlyRootFilesystem: true with Node.js)
+    - read_only: true (root FS; writable only at /workspace + /tmp tmpfs)
+    - runAsUser: 10001 (dedicated UID — Laura §4.6)
+    - S7: group_add 2002 MUST NOT fire (spec.secrets is empty — SC-NO-SECRETS)
+    - SC-EGRESS-NONE: no caddy_internal bridge (no egress needed)
+    - egress_allow: [] is asserted; no upstream block generated
+
+    Raises:
+        CodegenError: SC_secrets_with_gid2002 if spec.secrets is non-empty
+                      (Shape-C filesystem bundle must have no secrets).
+    """
+    meta = parsed.get("metadata") or {}
+    spec = parsed.get("spec") or {}
+    image = spec.get("image") or {}
+    secrets_list = spec.get("secrets") or []
+    storage = spec.get("storage") or {}
+    mounts = storage.get("mounts") or []
+    tmpfs_list = storage.get("tmpfs") or []
+    network = spec.get("network") or {}
+    egress_allow = network.get("egress_allow") or []
+
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    repo = image.get("repository", "")
+    tag = image.get("tag", "")
+    digest = image.get("digest", "")
+
+    # SC-NO-SECRETS: Shape-C filesystem server must declare zero secrets.
+    # group_add 2002 (S7) is forbidden here — the MCP server needs no KMS access.
+    if secrets_list:
+        raise CodegenError(
+            "SC_secrets_with_gid2002",
+            "Shape-C manifest for agent %r declares spec.secrets but "
+            "the filesystem MCP server must have no secrets (Laura §4.4). "
+            "group_add 2002 (S7 KMS secrets GID) must NOT be emitted for "
+            "this agent. Remove all entries from spec.secrets." % agent_name,
+        )
+
+    # SC-EGRESS-NONE: assert egress_allow is empty.
+    if egress_allow:
+        raise CodegenError(
+            "SC_egress_not_empty",
+            "Shape-C manifest for agent %r declares spec.network.egress_allow "
+            "entries but the filesystem MCP server has no legitimate outbound "
+            "network need (Laura §4.1 / §2.1 — egress NONE). "
+            "Remove all egress_allow entries." % agent_name,
+        )
+
+    # Generate volume name (tenant-namespaced).
+    # FIX-IRIS-F1: prefer mounts[0].name when the manifest declares it so that
+    # codegen output agrees with what the linter validates.  Fall back to the
+    # auto-generated name only when the manifest omits it.
+    _declared_vol_name = mounts[0].get("name") if mounts and isinstance(mounts[0], dict) else None
+    vol_name = _declared_vol_name if _declared_vol_name else _sc_volume_name(tenant_id, agent_name)
+
+    # Build volume mounts from spec.storage.mounts
+    # Default: workspace at /workspace if mounts not declared
+    workspace_path = "/workspace"
+    volume_mounts_lines: list[str] = []
+    if mounts:
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                continue
+            m_path = mount.get("container_path", workspace_path)
+            m_readonly = mount.get("read_only", False)
+            ro_flag = ":ro" if m_readonly else ""
+            volume_mounts_lines.append(
+                "      - %s:%s%s" % (vol_name, m_path, ro_flag)
+            )
+            workspace_path = m_path
+    else:
+        volume_mounts_lines.append("      - %s:%s" % (vol_name, workspace_path))
+
+    # Build tmpfs entries
+    tmpfs_mounts_lines: list[str] = []
+    if tmpfs_list:
+        for tf in tmpfs_list:
+            if not isinstance(tf, dict):
+                continue
+            tf_path = tf.get("path", "/tmp")
+            tf_size = tf.get("size_limit", _SC_TMPFS_SIZE_DEFAULT)
+            tmpfs_mounts_lines.append(
+                "      - target: %s\n        tmpfs-size: %s" % (tf_path, tf_size)
+            )
+    else:
+        # Default: /tmp tmpfs for Node.js runtime
+        tmpfs_mounts_lines.append(
+            "      - target: /tmp\n        tmpfs-size: %s" % _SC_TMPFS_SIZE_DEFAULT
+        )
+
+    volumes_section = "\n".join(volume_mounts_lines)
+    tmpfs_section = "\n".join(tmpfs_mounts_lines)
+
+    # L7: depends_on ringfence-init
+    init_svc = "ringfence-init-%s" % agent_name
+
+    # L1 isolated bridge (internal: true) — no caddy_internal (egress NONE)
+    ringfence_bridge = "ringfence_%s" % agent_name
+
+    rootless_note = ""
+    if runtime == "podman-rootless":
+        rootless_note = "      # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
+
+    lines = [
+        _header_comment(manifest_hash, runtime),
+        "# Shape C compose override for MCP-server agent: %s (tenant: %s)" % (agent_name, tenant_id),
+        "# SC-EGRESS-NONE: no caddy_internal bridge — this server makes no outbound calls",
+        "# SC-NO-SECRETS: spec.secrets=[] confirmed — group_add 2002 NOT emitted",
+        "services:",
+        "  %s:" % agent_name,
+        "    image: %s:%s@%s" % (repo, tag, digest),
+        "    networks:",
+        "      - %s" % ringfence_bridge,
+        "    volumes:",
+        volumes_section,
+        "    tmpfs:",
+        tmpfs_section,
+        "    # L9 — hardened security defaults (Shape-C)",
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    cap_drop:",
+        "      - ALL",
+        "    read_only: true",
+        "    user: \"%d:%d\"" % (_SC_RUN_AS_USER, _SC_RUN_AS_USER),
+        "    # L3 — IPv6 default-deny",
+        "    sysctls:",
+        "      net.ipv6.conf.all.disable_ipv6: 1",
+        "      net.ipv6.conf.default.disable_ipv6: 1",
+        "    # L9 — resource limits (CVSS cap for subprocess DoS — Laura §4.6)",
+        "    deploy:",
+        "      resources:",
+        "        limits:",
+        "          cpus: '%s'" % _SC_CPU_LIMIT,
+        "          memory: %s" % _SC_MEM_LIMIT,
+        "        reservations:",
+        "          cpus: '%s'" % _SC_CPU_REQUEST,
+        "          memory: %s" % _SC_MEM_REQUEST,
+        "    # L7 — block on ringfence-init completion",
+        "    depends_on:",
+        "      %s:" % init_svc,
+        "        condition: service_completed_successfully",
+        rootless_note.rstrip("\n") if rootless_note else "",
+        "",
+        "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
+        "volumes:",
+        "  %s:" % vol_name,
+        "    driver: local",
+        "",
+        "# W3-F1: isolated ringfence bridge — L2 default-deny containment",
+        "# SC-EGRESS-NONE: internal:true + no caddy_internal = no outbound path",
+        "networks:",
+        "  %s:" % ringfence_bridge,
+        "    driver: bridge",
+        "    enable_ipv6: false",
+        "    internal: true",
+    ]
+
+    content = "\n".join(line for line in lines if line != "")
+    return content + "\n"
+
+
+def _gen_values_yaml_shape_c(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate values-<agent>.yaml for Helm (Shape C).
+
+    Shape-C specific Helm values:
+    - runAsUser: 10001 (Laura §4.6)
+    - PVC/volume claim for workspace (tenant-namespaced)
+    - tmpfs emptyDir for /tmp
+    - No supplementalGroups 2002 (no KMS secrets)
+    - CPU/memory limits per Laura §4.6
+    """
+    meta = parsed.get("metadata") or {}
+    spec = parsed.get("spec") or {}
+    image = spec.get("image") or {}
+    storage = spec.get("storage") or {}
+    mounts = storage.get("mounts") or []
+
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    repo = image.get("repository", "")
+    tag = image.get("tag", "")
+    digest = image.get("digest", "")
+
+    vol_name = _sc_volume_name(tenant_id, agent_name)
+
+    workspace_path = "/workspace"
+    if mounts and isinstance(mounts[0], dict):
+        workspace_path = mounts[0].get("container_path", workspace_path)
+
+    rootless_note = ""
+    if runtime == "podman-rootless":
+        rootless_note = "  # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
+
+    content = textwrap.dedent("""\
+        {header}
+        # Shape C Helm values for MCP-server agent: {agent_name} (tenant: {tenant_id})
+        # SC-EGRESS-NONE: no Caddy egress route generated for this agent
+        # SC-NO-SECRETS: no supplementalGroups 2002 (no KMS secrets)
+        agent{agent_name_camel}:
+          enabled: true
+          image:
+            repository: {repo}
+            tag: "{tag}"
+            digest: "{digest}"
+          # L9 — hardened K8s security context (Shape-C / Laura §4.6)
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: {run_as_user}
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          # SC-NO-SECRETS: no supplementalGroups 2002 — filesystem server needs no KMS access
+          podSecurityContext:
+            # supplementalGroups: [] # explicitly absent — S7 guard
+          # L9 — resource limits (Laura §4.6 — DoS resistance)
+          resources:
+            limits:
+              cpu: "{cpu_limit}"
+              memory: "{mem_limit}"
+            requests:
+              cpu: "{cpu_req}"
+              memory: "{mem_req}"
+          # Shape-C workspace volume (tenant-namespaced PVC — LAURA-FS-TM-008)
+          persistence:
+            workspace:
+              enabled: true
+              existingClaim: ""
+              volumeName: {vol_name}
+              mountPath: {workspace_path}
+              storageClass: ""
+              size: 1Gi
+          # Shape-C /tmp tmpfs overlay (Node.js runtime — Laura §2.6.1)
+          tmpfs:
+            - mountPath: /tmp
+              medium: Memory
+              sizeLimit: 64Mi
+          # L10 — runtime tag embedded for drift detection
+          runtimeTag: "{runtime}"
+        {rootless_note}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        agent_name=agent_name,
+        agent_name_camel=_to_camel(agent_name),
+        tenant_id=tenant_id,
+        repo=repo,
+        tag=tag,
+        digest=digest,
+        run_as_user=_SC_RUN_AS_USER,
+        cpu_limit=_SC_CPU_LIMIT,
+        mem_limit=_SC_MEM_LIMIT,
+        cpu_req=_SC_CPU_REQUEST,
+        mem_req=_SC_MEM_REQUEST,
+        vol_name=vol_name,
+        workspace_path=workspace_path,
+        runtime=runtime,
+        rootless_note=rootless_note,
+    )
+    return content
+
+
+def _gen_networkpolicy_shape_c(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate values-<agent>-networkpolicy.yaml Helm overlay (Shape C).
+
+    Shape-C: egress is NONE (no LLM calls, no outbound).
+    Only kube-dns is allowed (for service name resolution within the cluster).
+    No Caddy egress allow (SC-EGRESS-NONE).
+    """
+    meta = parsed.get("metadata") or {}
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+
+    # SC-EGRESS-NONE: kube-dns only — no external egress, no Caddy egress
+    dns_egress = (
+        "        # SC-EGRESS-NONE: only kube-dns allowed (no Caddy egress for MCP-server)\n"
+        "        - to:\n"
+        "            - namespaceSelector:\n"
+        "                matchLabels:\n"
+        "                  kubernetes.io/metadata.name: kube-system\n"
+        "              podSelector:\n"
+        "                matchLabels:\n"
+        "                  k8s-app: kube-dns\n"
+        "          ports:\n"
+        "            - protocol: UDP\n"
+        "              port: 53\n"
+        "            - protocol: TCP\n"
+        "              port: 53"
+    )
+
+    content = textwrap.dedent("""\
+        {header}
+        # Shape C NetworkPolicy overlay for MCP-server agent: {agent_name} (tenant: {tenant_id})
+        # SC-EGRESS-NONE: no external egress, no Caddy route
+        networkPolicy:
+          enabled: true
+          agent{agent_name_camel}:
+            ingress: []  # deny all ingress (stdio subprocess — no network listener)
+            egress:
+        {dns_egress}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        agent_name=agent_name,
+        agent_name_camel=_to_camel(agent_name),
+        tenant_id=tenant_id,
+        dns_egress=dns_egress,
+    )
+    return content
+
+
+def _gen_opa_filesystem_bundle(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate OPA policy for Shape-C filesystem MCP-server (P9 per-tool authz).
+
+    Wires the per-tool allowlist derived from the manifest's
+    spec.mcp.exposes.tools into the OPA data bundle for this agent.
+    The generated policy is NOT a stub — it emits real allow/deny rules
+    for the filesystem tool set as specified by Laura's threat model §5.
+
+    write_posture:
+    - readonly (default): PERMIT read/list/stat/search tools; DENY write/move/mkdir
+    - readwrite (operator override): PERMIT all except list_allowed_directories
+
+    Path argument validation (LAURA-FS-TM-001 belt-and-suspenders):
+    - Reject args.path containing ../ or starting with /
+
+    directory_tree depth cap: maxDepth <= 5 (Laura §5.2)
+    search_files pattern length cap: <= 256 chars (Laura §5.3 — ReDoS)
+    """
+    meta = parsed.get("metadata") or {}
+    spec = parsed.get("spec") or {}
+
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    write_posture = spec.get("write_posture", "readonly")
+
+    content = textwrap.dedent("""\
+        {header}
+        # OPA policy for Shape-C MCP-server agent: {agent_name} (tenant: {tenant_id})
+        # write_posture: {write_posture}
+        # Laura threat model §5 — per-tool authz + path-arg validation + caps
+        package yashigani.agents.{pkg_name}
+
+        import rego.v1
+
+        # Agent metadata (informational)
+        agent_name := "{agent_name}"
+        tenant_id := "{tenant_id}"
+        shape := "c"
+        write_posture := "{write_posture}"
+        manifest_hash := "{manifest_hash}"
+
+        # ---------------------------------------------------------------------------
+        # Per-tool allowlist — Shape-C filesystem MCP server
+        #
+        # READ-ONLY tools: always permitted (write_posture=readonly or readwrite)
+        # WRITE tools: permitted only when write_posture=readwrite
+        # list_allowed_directories: ALWAYS denied (info-disclosure — Laura §2.2.5)
+        # ---------------------------------------------------------------------------
+
+        _fs_readonly_tools := {{
+            "read_file",
+            "read_multiple_files",
+            "list_directory",
+            "directory_tree",
+            "get_file_info",
+            "search_files",
+        }}
+
+        _fs_write_tools := {{
+            "write_file",
+            "edit_file",
+            "create_directory",
+            "move_file",
+        }}
+
+        # ---------------------------------------------------------------------------
+        # Path argument safety helper (LAURA-FS-TM-001 belt-and-suspenders)
+        #
+        # Reject any path that contains ../ components or starts with /.
+        # Primary control is the named-volume mount boundary; this is belt-and-suspenders.
+        # ---------------------------------------------------------------------------
+
+        _path_arg_safe(args) if {{
+            is_string(args.path)
+            not contains(args.path, "../")
+            not startswith(args.path, "/")
+        }}
+
+        # When path arg is absent (e.g. list_directory), pass the path check
+        _path_arg_safe(args) if {{
+            not args.path
+        }}
+
+        # ---------------------------------------------------------------------------
+        # directory_tree depth cap (Laura §5.2 — ReDoS/DoS prevention)
+        # maxDepth <= 5; absent maxDepth passes (gateway broker enforces cap)
+        # ---------------------------------------------------------------------------
+
+        _directory_tree_safe(args) if {{
+            not args.maxDepth
+        }}
+
+        _directory_tree_safe(args) if {{
+            to_number(args.maxDepth) <= 5
+        }}
+
+        # ---------------------------------------------------------------------------
+        # search_files pattern length cap (Laura §5.3 — ReDoS prevention)
+        # pattern length <= 256 characters
+        # ---------------------------------------------------------------------------
+
+        _search_files_safe(args) if {{
+            is_string(args.pattern)
+            count(args.pattern) <= 256
+        }}
+
+        _search_files_safe(args) if {{
+            not args.pattern
+        }}
+
+        # ---------------------------------------------------------------------------
+        # allow — per-agent tool decision
+        # Called by the gateway broker after the global mcp.rego allow path.
+        # This is the agent-specific authz layer (P9).
+        # ---------------------------------------------------------------------------
+
+        default allow := false
+
+        # Read-only tools: PERMIT (both postures) with path-arg validation
+        allow if {{
+            input.agent.name == "{agent_name}"
+            input.tool.name in _fs_readonly_tools
+            not input.tool.name == "list_allowed_directories"
+            _path_arg_safe(input.tool.args)
+        }}
+
+        # directory_tree: additional depth cap
+        allow if {{
+            input.agent.name == "{agent_name}"
+            input.tool.name == "directory_tree"
+            _path_arg_safe(input.tool.args)
+            _directory_tree_safe(input.tool.args)
+        }}
+
+        # search_files: path-arg + pattern-length cap
+        allow if {{
+            input.agent.name == "{agent_name}"
+            input.tool.name == "search_files"
+            _path_arg_safe(input.tool.args)
+            _search_files_safe(input.tool.args)
+        }}
+
+        {write_rules}
+
+        # list_allowed_directories: ALWAYS DENIED (info-disclosure — Laura §2.2.5)
+        # No allow rule matches; default := false catches it.
+
+        # ---------------------------------------------------------------------------
+        # deny_reason for agent-level denials
+        # ---------------------------------------------------------------------------
+
+        deny_reason := "fs_path_traversal_attempt" if {{
+            not allow
+            is_string(input.tool.args.path)
+            contains(input.tool.args.path, "../")
+        }}
+
+        deny_reason := "fs_path_traversal_attempt" if {{
+            not allow
+            is_string(input.tool.args.path)
+            startswith(input.tool.args.path, "/")
+        }}
+
+        deny_reason := "fs_directory_tree_depth_exceeded" if {{
+            not allow
+            input.tool.name == "directory_tree"
+            to_number(input.tool.args.maxDepth) > 5
+        }}
+
+        deny_reason := "fs_search_pattern_too_long" if {{
+            not allow
+            input.tool.name == "search_files"
+            is_string(input.tool.args.pattern)
+            count(input.tool.args.pattern) > 256
+        }}
+
+        deny_reason := "fs_tool_denied_readonly_posture" if {{
+            not allow
+            input.tool.name in _fs_write_tools
+            write_posture == "readonly"
+        }}
+
+        deny_reason := "fs_list_allowed_directories_denied" if {{
+            not allow
+            input.tool.name == "list_allowed_directories"
+        }}
+
+        default deny_reason := "fs_tool_not_permitted"
+    """).format(
+        header=_header_comment(manifest_hash, runtime, comment_char="#"),
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        write_posture=write_posture,
+        pkg_name=agent_name.replace("-", "_"),
+        manifest_hash=manifest_hash,
+        write_rules=_gen_opa_write_rules(agent_name, write_posture),
+    )
+    return content
+
+
+def _gen_opa_write_rules(agent_name: str, write_posture: str) -> str:
+    """Generate the write-tool OPA allow rules based on write_posture."""
+    if write_posture == "readwrite":
+        return textwrap.dedent("""\
+            # Write tools: PERMIT when write_posture=readwrite (operator-enabled)
+            allow if {{
+                input.agent.name == "{agent_name}"
+                input.tool.name in _fs_write_tools
+                _path_arg_safe(input.tool.args)
+            }}""").format(agent_name=agent_name)
+    else:
+        return (
+            "# Write tools: DENIED in readonly posture (default)\n"
+            "# Set write_posture: readwrite in the manifest to enable write operations."
+        )
+
+
+def _gen_service_identity_entry_shape_c(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate service_identities.yaml append entry (Shape C).
+
+    Shape-C uses SPIFFE URI: spiffe://yashigani.internal/agents/{tenant_id}/{name}
+    (same pattern as Shape-A; shape marker differs).
+    """
+    from yashigani.manifest.linter import resolve_spiffe_uri  # noqa: PLC0415
+
+    meta = parsed.get("metadata") or {}
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    spiffe_id = resolve_spiffe_uri(parsed)
+
+    content = textwrap.dedent("""\
+        {header}
+        # service_identities.yaml append entry for Shape-C MCP-server: {agent_name} (tenant: {tenant_id})
+        - name: {agent_name}
+          tenant_id: {tenant_id}
+          spiffe_id: {spiffe_id}
+          shape: "c"
+          manifest_hash: "{manifest_hash}"
+          runtime: "{runtime}"
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        spiffe_id=spiffe_id,
+        manifest_hash=manifest_hash,
+        runtime=runtime,
+    )
+    return content
+
+
+def _gen_contract_test_compose_shape_c(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate contract test stub for Shape-C compose override.
+
+    Tests Shape-C specific invariants:
+    - Named-volume workspace mount present
+    - tmpfs /tmp present
+    - group_add 2002 absent (SC-NO-SECRETS)
+    - No caddy_internal network (SC-EGRESS-NONE)
+    - runAsUser 10001 (Laura §4.6)
+    - L9 security context
+    """
+    meta = parsed.get("metadata") or {}
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    class_name = "Test%sShapeCCompose" % _to_class_name(agent_name)
+    vol_name = _sc_volume_name(tenant_id, agent_name)
+
+    content = textwrap.dedent("""\
+        {header_py}
+        \"\"\"
+        Contract test stub: Shape-C compose override for MCP-server agent {agent_name}.
+
+        Codegen is the SINGLE source of truth for compose and Helm artifacts.
+        These tests prove Shape-C security invariants. Stubs — flesh out at integration phase.
+
+        Manifest hash: {manifest_hash}
+        Runtime: {runtime}
+        \"\"\"
+        from __future__ import annotations
+        import pathlib
+        import pytest
+
+
+        COMPOSE_OVERRIDE = pathlib.Path(__file__).parent.parent.parent / "docker" / "{agent_name}-compose.override.yml"
+        EXPECTED_VOLUME_NAME = "{vol_name}"
+
+
+        class {class_name}:
+            \"\"\"Shape-C compose parity contract tests for agent {agent_name} (tenant {tenant_id}).\"\"\"
+
+            def test_compose_override_file_exists(self) -> None:
+                \"\"\"STUB: override file should exist after onboard.\"\"\"
+                pytest.skip("compose override not yet written to disk in this test env")
+
+            def test_sc_no_caddy_internal_network(self) -> None:
+                \"\"\"Shape-C: caddy_internal MUST NOT appear (SC-EGRESS-NONE).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_sc_named_volume_workspace_present(self) -> None:
+                \"\"\"Shape-C: tenant-namespaced volume mount must be present.\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_sc_tmpfs_tmp_present(self) -> None:
+                \"\"\"Shape-C: /tmp tmpfs overlay must be present (readOnlyRootFilesystem).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_sc_no_group_add_2002(self) -> None:
+                \"\"\"SC-NO-SECRETS: group_add 2002 MUST NOT appear (no KMS secrets for MCP-server).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_sc_run_as_user_10001(self) -> None:
+                \"\"\"Laura §4.6: user must be 10001:10001 (dedicated non-root UID).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_l9_read_only_true(self) -> None:
+                \"\"\"L9: read_only must be true (root FS read-only; writable only at /workspace + /tmp).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_l9_cap_drop_all(self) -> None:
+                \"\"\"L9: cap_drop must include ALL.\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_sc_volume_name_tenant_namespaced(self) -> None:
+                \"\"\"LAURA-FS-TM-008: volume name must be tenant-namespaced ({vol_name}).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+
+            def test_sc_resource_limits_present(self) -> None:
+                \"\"\"Laura §4.6: CPU and memory limits must be present (DoS resistance).\"\"\"
+                pytest.skip("stub — implement after onboard writes override file")
+    """).format(
+        header_py=_header_comment(manifest_hash, runtime),
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        manifest_hash=manifest_hash,
+        runtime=runtime,
+        class_name=class_name,
+        vol_name=vol_name,
+    )
+    return content
+
+
+# ---------------------------------------------------------------------------
 # String utilities
 # ---------------------------------------------------------------------------
 
@@ -1288,6 +2050,207 @@ def _to_camel(name: str) -> str:
 def _to_class_name(name: str) -> str:
     """Convert kebab-case agent name to a Python class-name fragment."""
     return "".join(part.capitalize() for part in name.split("-"))
+
+
+# ---------------------------------------------------------------------------
+# CodegenEngineShapeC — public API for Shape C (stdio MCP-server)
+# ---------------------------------------------------------------------------
+
+
+class CodegenEngineShapeC:
+    """
+    Codegen engine for Shape C (stdio MCP-server / Prometheus-class) agents.
+
+    Shape-C agents are MCP-B posture servers that run as gateway-managed stdio
+    subprocesses. They have no network listener, no LLM egress, and no secrets.
+
+    Key differences from Shape-A (CodegenEngine):
+    - No Caddy snippet generated (SC-EGRESS-NONE — caddy validate NOT called)
+    - Named-volume workspace mount (tenant-namespaced — LAURA-FS-TM-008)
+    - tmpfs /tmp overlay (64Mi — keeps readOnlyRootFilesystem with Node.js)
+    - runAsUser 10001 (Laura §4.6)
+    - S7 guard: group_add 2002 MUST NOT fire (zero-secrets — SC-NO-SECRETS)
+    - OPA policy is a full policy file (not a stub) with per-tool authz
+    - write_posture from manifest.spec.write_posture (readonly | readwrite)
+
+    Artifact set:
+      docker/<agent>-compose.override.yml
+      helm/yashigani/values-<agent>.yaml
+      helm/yashigani/values-<agent>-networkpolicy.yaml
+      helm/yashigani/templates/agents/<agent>-policy-exception.yaml (Kyverno)
+      service_identities.yaml.fragment
+      pki_ownership-<agent>.sh
+      opa/<agent>.rego  (full per-tool policy — NOT a stub)
+      tests/contracts/test_<agent>_shape_c_compose.py
+
+    No Caddy snippet is generated. Callers can assert this via:
+        "docker/caddy/agents/<agent>.caddy" not in artifacts
+
+    Usage::
+
+        engine = CodegenEngineShapeC(parsed_manifest, runtime="docker")
+        artifacts = engine.render(dry_run=True)
+        assert "docker/caddy/agents/filesystem.caddy" not in artifacts
+
+    Args:
+        parsed: validated parsed manifest (output of parse_manifest + validate_manifest).
+        runtime: 4-way runtime string — one of "docker", "podman-rootful",
+                 "podman-rootless", "k8s".
+    """
+
+    def __init__(
+        self,
+        parsed: dict,
+        runtime: str,
+    ) -> None:
+        if runtime not in VALID_RUNTIMES:
+            raise CodegenError(
+                "INVALID_RUNTIME",
+                "runtime %r is not one of %s" % (runtime, sorted(VALID_RUNTIMES)),
+            )
+        if not _is_shape_c(parsed):
+            raise CodegenError(
+                "NOT_SHAPE_C",
+                "CodegenEngineShapeC requires a Shape-C manifest "
+                "(metadata.category='mcp_server' OR spec.mcp.transport='stdio' "
+                "with spec.mcp.posture='mcp-b'). "
+                "Use CodegenEngine for Shape-A LLM-calling agents.",
+            )
+        self._parsed = parsed
+        self._runtime = runtime
+
+        meta = parsed.get("metadata") or {}
+        self._tenant_id = meta.get("tenant_id", "")
+        self._agent_id = meta.get("name", "")
+        self._manifest_hash = _manifest_hash(parsed)
+
+    def _validate_shape_c_constraints(self) -> None:
+        """
+        Validate Shape-C specific constraints before artifact generation.
+
+        Raises:
+            CodegenError: on SC_egress_not_empty, SC_secrets_with_gid2002,
+                          SC_listen_port_on_stdio.
+        """
+        spec = self._parsed.get("spec") or {}
+        network = spec.get("network") or {}
+        mcp = spec.get("mcp") or {}
+        mcp_exposes = mcp.get("exposes") or {}
+
+        # SC-EGRESS-NONE: no egress_allow entries
+        egress_allow = network.get("egress_allow") or []
+        if egress_allow:
+            raise CodegenError(
+                "SC_egress_not_empty",
+                "Shape-C manifest for agent %r has spec.network.egress_allow entries. "
+                "MCP-server agents must have egress_allow: [] (SC-EGRESS-NONE). "
+                "Remove all egress entries." % self._agent_id,
+            )
+
+        # SC-NO-SECRETS: no secrets declared
+        secrets_list = spec.get("secrets") or []
+        if secrets_list:
+            raise CodegenError(
+                "SC_secrets_with_gid2002",
+                "Shape-C manifest for agent %r declares spec.secrets. "
+                "The filesystem MCP server must have no secrets (Laura §4.4 / SC-NO-SECRETS). "
+                "Remove all entries from spec.secrets." % self._agent_id,
+            )
+
+        # SC: no network listener on stdio shape
+        listen_port = mcp_exposes.get("listen_port")
+        if listen_port is not None:
+            raise CodegenError(
+                "SC_listen_port_on_stdio",
+                "Shape-C manifest for agent %r declares mcp.exposes.listen_port=%r. "
+                "stdio MCP-servers have no network listener — listen_port must be null "
+                "or absent for Shape-C agents (Laura §4.5)." % (self._agent_id, listen_port),
+            )
+
+    def render(
+        self,
+        *,
+        output_root: Optional[Path] = None,
+        dry_run: bool = True,
+    ) -> dict[str, str]:
+        """
+        Render all Shape-C artifacts.
+
+        Args:
+            output_root: root directory for file writes (required if dry_run=False).
+            dry_run: if True, return rendered content without writing files.
+
+        Returns:
+            dict mapping relative artifact paths to their rendered content.
+            The key "docker/caddy/agents/<agent>.caddy" is NOT present
+            (SC-EGRESS-NONE — assert this in tests).
+
+        Raises:
+            CodegenError: on any security violation or validation failure.
+        """
+        if not dry_run and output_root is None:
+            raise CodegenError(
+                "MISSING_OUTPUT_ROOT",
+                "output_root is required when dry_run=False",
+            )
+
+        # Shape-C constraint validation
+        self._validate_shape_c_constraints()
+
+        # C3 — duplicate pair check
+        _assert_unique_agent_pair(self._tenant_id, self._agent_id)
+
+        agent_name = self._agent_id
+        mhash = self._manifest_hash
+        runtime = self._runtime
+
+        kwargs: dict[str, Any] = {"manifest_hash": mhash, "runtime": runtime}
+
+        compose_content = _gen_compose_override_shape_c(self._parsed, **kwargs)
+        values_content = _gen_values_yaml_shape_c(self._parsed, **kwargs)
+        netpol_content = _gen_networkpolicy_shape_c(self._parsed, **kwargs)
+        kyverno_content = _gen_kyverno_policy_exception(self._parsed, **kwargs)
+        svcid_content = _gen_service_identity_entry_shape_c(self._parsed, **kwargs)
+        pki_content = _gen_pki_ownership_fragment(self._parsed, **kwargs)
+        opa_content = _gen_opa_filesystem_bundle(self._parsed, **kwargs)
+        test_compose_content = _gen_contract_test_compose_shape_c(self._parsed, **kwargs)
+
+        # S6 — validate shell fragment
+        _validate_shell_fragment(pki_content, "pki_ownership-%s.sh" % agent_name)
+
+        # NOTE: No Caddy snippet generated (SC-EGRESS-NONE).
+        # No _validate_caddy_snippet call for Shape-C.
+        _log.info(
+            "codegen: Shape-C agent %r — no Caddy snippet generated (SC-EGRESS-NONE)",
+            agent_name,
+        )
+
+        artifacts: dict[str, str] = {
+            "docker/%s-compose.override.yml" % agent_name: compose_content,
+            "helm/yashigani/values-%s.yaml" % agent_name: values_content,
+            "helm/yashigani/values-%s-networkpolicy.yaml" % agent_name: netpol_content,
+            "helm/yashigani/templates/agents/%s-policy-exception.yaml" % agent_name: kyverno_content,
+            "service_identities.yaml.fragment": svcid_content,
+            "pki_ownership-%s.sh" % agent_name: pki_content,
+            "opa/%s.rego" % agent_name: opa_content,
+            "tests/contracts/test_%s_shape_c_compose.py" % agent_name: test_compose_content,
+        }
+
+        # SC-EGRESS-NONE assertion: no caddy file in artifact map
+        caddy_key = "docker/caddy/agents/%s.caddy" % agent_name
+        assert caddy_key not in artifacts, (
+            "BUG: Caddy snippet unexpectedly in Shape-C artifact map for %r. "
+            "SC-EGRESS-NONE violated." % agent_name
+        )
+
+        if not dry_run:
+            assert output_root is not None
+            for rel_path, content in artifacts.items():
+                dest = output_root / rel_path
+                _safe_write(dest, content, output_root)
+                _log.info("codegen: wrote %s", rel_path)
+
+        return artifacts
 
 
 # ---------------------------------------------------------------------------

@@ -172,20 +172,48 @@
                 }
               }
             },
+            "session_mode": {
+              "type": "string",
+              "enum": ["stateless", "persistent"],
+              "description": "MCP session mode. persistent = long-lived stdio subprocess (Shape-C / L-05). stateless = HTTP only."
+            },
+            "transport": {
+              "type": "string",
+              "enum": ["stdio", "streamable_http"],
+              "description": "MCP transport. stdio = Shape-C subprocess channel; streamable_http = Shape-B HTTP listener."
+            },
             "exposes": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
                 "listen_port": {
-                  "type": "integer",
-                  "minimum": 1024,
-                  "maximum": 49151,
-                  "description": "Port the agent exposes for MCP (mcp-b/mcp-c only). Only port in inbound_ports range allowed (M5)."
+                  "description": "Port the agent exposes for MCP (mcp-b/mcp-c HTTP only). null for stdio shape (Shape-C has no network listener).",
+                  "oneOf": [
+                    {"type": "integer", "minimum": 1024, "maximum": 49151},
+                    {"type": "null"}
+                  ]
                 },
                 "tools": {
                   "type": "array",
-                  "items": {"type": "string", "maxLength": 128},
-                  "description": "Tool names this agent exposes (P9 per-tool OPA authz)."
+                  "items": {
+                    "oneOf": [
+                      {"type": "string", "maxLength": 128},
+                      {
+                        "type": "object",
+                        "required": ["name", "allowed"],
+                        "additionalProperties": false,
+                        "properties": {
+                          "name":           {"type": "string", "maxLength": 128},
+                          "allowed":        {"type": "boolean"},
+                          "sensitivity_class": {"type": "string", "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"]},
+                          "reason":         {"type": "string", "maxLength": 512},
+                          "max_depth_arg":  {"type": "integer", "minimum": 1, "maximum": 100, "description": "OPA enforces directory_tree maxDepth <= this value."},
+                          "max_pattern_len_arg": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "OPA enforces search_files pattern length <= this value."}
+                        }
+                      }
+                    ]
+                  },
+                  "description": "Tool names/objects this agent exposes (P9 per-tool OPA authz). String form = allowed:true with no caps. Object form allows explicit allowed/denied tools and per-tool OPA constraints."
                 }
               }
             }
@@ -277,6 +305,31 @@
           }
         },
 
+        "write_posture": {
+          "type": "string",
+          "enum": ["readonly", "readwrite"],
+          "default": "readonly",
+          "description": "Shape-C MCP-server write posture. readonly (default): write/move tools denied by OPA. readwrite: operator explicitly enables mutating tools. Requires Laura sign-off per feedback_laura_review_new_third_party_components."
+        },
+
+        "subprocess": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Shape-C stdio subprocess invocation spec. All args hardcoded by codegen — no operator-supplied field reaches subprocess argv unquoted (M3).",
+          "properties": {
+            "command": {
+              "type": "array",
+              "items": {"type": "string", "maxLength": 512},
+              "description": "Subprocess argv[0..n-1]. Hardcoded at codegen time from manifest fields only."
+            },
+            "args": {
+              "type": "array",
+              "items": {"type": "string", "maxLength": 512},
+              "description": "Additional argv entries appended after command. Codegen validates all entries before emitting."
+            }
+          }
+        },
+
         "storage": {
           "type": "object",
           "additionalProperties": false,
@@ -291,6 +344,61 @@
                   "name":       {"type": "string", "maxLength": 64},
                   "mount_path": {"type": "string", "maxLength": 512},
                   "read_only":  {"type": "boolean"}
+                }
+              }
+            },
+            "mounts": {
+              "type": "array",
+              "description": "Shape-C named-volume mounts. hostPath is BLOCKED in v1 (Laura LAURA-FS-TM-002). Each entry must use type=volume with a tenant-namespaced name.",
+              "items": {
+                "type": "object",
+                "required": ["name", "type", "container_path"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Volume name. Must follow tenant-namespace pattern enforced by linter."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["volume"],
+                    "description": "Only 'volume' (named Docker volume) is permitted in v1. hostPath requires a separate Laura review (v2)."
+                  },
+                  "container_path": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "description": "Container-side mount path. Must not be /, /etc, /run, /run/secrets, /var, /opt (linter enforces)."
+                  },
+                  "read_only": {
+                    "type": "boolean",
+                    "description": "If true, mount is read-only inside the container."
+                  },
+                  "create_if_missing": {
+                    "type": "boolean",
+                    "description": "If true, codegen emits a volume definition so Docker creates it on first run."
+                  }
+                }
+              }
+            },
+            "tmpfs": {
+              "type": "array",
+              "description": "tmpfs overlays for Shape-C containers (e.g. /tmp for Node.js runtime — keeps root FS read-only).",
+              "items": {
+                "type": "object",
+                "required": ["path"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "description": "Mount path for the tmpfs overlay."
+                  },
+                  "size_limit": {
+                    "type": "string",
+                    "maxLength": 16,
+                    "description": "Size limit (e.g. '64m'). Passed as tmpfs-size to compose/Helm."
+                  }
                 }
               }
             }
