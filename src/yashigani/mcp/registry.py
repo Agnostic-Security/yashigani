@@ -190,11 +190,17 @@ def build_registry_from_env(
         from yashigani.mcp._nonce import InMemoryNonceStore
         _nonce_store = InMemoryNonceStore()
 
-    # Build one shared issuer + JWKS store (one key per installation)
-    # The first entry's tenant_id is used as the issuer tenant; each broker
-    # gets its own McpJwtIssuer instance with the same key material via env var.
-    # In production, the key is loaded from YASHIGANI_MCP_SIGNING_KEY_PEM or
-    # the secrets file (see _jwt.py §1 — 3-tier key lookup).
+    # Build one shared issuer + JWKS store (one key per installation).
+    #
+    # Iris F-1 fix: "one key per installation, not per server" (design §3.4).
+    # All brokers share a single McpJwtIssuer — per-broker instantiation caused
+    # each broker to load (or generate) its OWN key in dev mode, resulting in
+    # JWTs from broker B being rejected against shared_issuer's JWKS (broker A's
+    # key).  The tenant_id in JWT claims identifies the tenant; it does NOT
+    # determine the signing key.  The shared issuer signs for all tenants.
+    #
+    # The first entry's tenant_id is used to label the shared issuer (JWKS kid
+    # and iss prefix).  This is a cosmetic choice — the key itself is shared.
     first_tenant = entries[0].get("tenant_id", "default")
     shared_issuer = McpJwtIssuer(tenant_id=first_tenant)
     jwks_store = JwksStore(primary_issuer=shared_issuer)
@@ -217,7 +223,7 @@ def build_registry_from_env(
         broker_cfg = McpBrokerConfig(
             opa_url=opa_url,
             tenant_id=tenant_id,
-            issuer=McpJwtIssuer(tenant_id=tenant_id),
+            issuer=shared_issuer,  # Iris F-1: shared issuer, not per-broker instance
             audit_writer=audit_writer,
             is_filesystem_agent=is_filesystem_agent,
             nonce_store=_nonce_store,

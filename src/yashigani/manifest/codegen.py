@@ -1621,6 +1621,13 @@ def _gen_values_yaml_shape_c(
         # SC-NO-SECRETS: no supplementalGroups 2002 (no KMS secrets)
         agent{agent_name_camel}:
           enabled: true
+          # Iris F-2: v1 session-affinity constraint — DO NOT scale above 1.
+          # MCP sessions are stateful stdio↔HTTP bridges pinned to a single process.
+          # Scaling to N>1 replicas without session-affinity routing causes ~(N-1)/N
+          # of requests to land on the wrong replica and fail with 404/session-not-found.
+          # v2 design item: Mcp-Session-Id affinity routing.
+          # See src/yashigani/gateway/mcp_router_runtime.py:26-34.
+          replicaCount: 1
           image:
             repository: {repo}
             tag: "{tag}"

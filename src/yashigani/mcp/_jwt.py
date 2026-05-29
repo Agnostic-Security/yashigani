@@ -58,9 +58,19 @@ _AUDIENCE = "yashigani-mcp-upstream"
 _JWT_TTL_SECONDS = int(os.environ.get("YASHIGANI_MCP_JWT_TTL_SECONDS", "60"))
 _CLOCK_SKEW_SECONDS = 5
 _DEFAULT_CHAIN_MAX_DEPTH = 3
-_SIGNING_KEY_PATH = Path(
-    os.environ.get("YASHIGANI_MCP_SIGNING_KEY_PATH", "/run/secrets/mcp_identity_signing_key")
-)
+_DEFAULT_SIGNING_KEY_PATH = "/run/secrets/mcp_identity_signing_key"
+
+
+def _get_signing_key_path() -> Path:
+    """Return the MCP signing key path, reading YASHIGANI_MCP_SIGNING_KEY_PATH at call time.
+
+    Deliberately NOT evaluated at module import so that tests can monkeypatch
+    YASHIGANI_MCP_SIGNING_KEY_PATH without requiring importlib.reload().
+    Laura SB-1 fix.
+    """
+    return Path(
+        os.environ.get("YASHIGANI_MCP_SIGNING_KEY_PATH", _DEFAULT_SIGNING_KEY_PATH)
+    )
 
 
 def _b64url_no_pad(data: bytes) -> str:
@@ -121,10 +131,17 @@ class McpJwtIssuer:
 
         if private_key is not None:
             self._key = private_key
+            # When key is injected directly (tests / KMS wrapper), use the
+            # caller-supplied key_generated_at or fall back to now().
+            stable_generated_at: Optional[int] = None
         else:
-            self._key = self._load_or_generate_key()
+            self._key, stable_generated_at = self._load_or_generate_key()
 
-        self._generated_at = key_generated_at or int(time.time())
+        # Nico kid-stability fix: prefer (in order):
+        #   1. caller-supplied key_generated_at (explicit override / tests)
+        #   2. stable_generated_at from _load_or_generate_key() (file mtime for path #2)
+        #   3. int(time.time()) fallback (env-var PEM path #1, ephemeral path #3)
+        self._generated_at = key_generated_at or stable_generated_at or int(time.time())
         self._kid = f"mcp-{tenant_id}-{self._generated_at}"
 
         # Derive the JWK for JWKS publication
@@ -189,13 +206,23 @@ class McpJwtIssuer:
             "mcp-broker: FIPS_MODE=1 — OpenSSL FIPS provider confirmed loaded"
         )
 
-    def _load_or_generate_key(self) -> EllipticCurvePrivateKey:
+    def _load_or_generate_key(self) -> tuple[EllipticCurvePrivateKey, Optional[int]]:
         """
         Load the signing key from env, secrets file, or generate ephemeral.
+
+        Returns (key, stable_generated_at) where stable_generated_at is:
+          - None  for path #1 (env-var PEM; caller uses int(time.time()) fallback)
+          - int   derived from the file's mtime for path #2 — ensures all replicas
+                  holding the SAME file produce the SAME kid (Nico kid-stability fix)
+          - None  for path #3 (ephemeral; kid will differ per process — dev only)
 
         WARNING: ephemeral key generation means the JWKS changes on restart —
         downstream verifiers caching the JWKS will reject tokens after restart.
         Only acceptable for unit tests.
+
+        Laura SB-1: YASHIGANI_MCP_SIGNING_KEY_PATH is read HERE (at call time),
+        not at module import, so monkeypatching the env var takes effect without
+        importlib.reload().
         """
         # 1. Env var (base64-encoded PEM — for test injection)
         pem_b64 = os.environ.get("YASHIGANI_MCP_SIGNING_KEY_PEM", "")
@@ -211,16 +238,20 @@ class McpJwtIssuer:
                         "Nico spec §1: ES384 only."
                     )
                 logger.info("mcp-broker: loaded MCP signing key from env var")
-                return key
+                # Path #1: no stable file mtime — return None so __init__ uses its
+                # key_generated_at parameter (or falls back to int(time.time())).
+                return key, None
             except Exception as exc:
                 raise RuntimeError(
                     f"YASHIGANI_MCP_SIGNING_KEY_PEM is set but invalid: {exc}"
                 ) from exc
 
-        # 2. Dev-mode PEM file
-        if _SIGNING_KEY_PATH.exists():
+        # 2. PEM file (docker secret bind-mount in prod; arbitrary path in dev)
+        # Read YASHIGANI_MCP_SIGNING_KEY_PATH at call time (Laura SB-1 fix).
+        signing_key_path = _get_signing_key_path()
+        if signing_key_path.exists():
             try:
-                pem = _SIGNING_KEY_PATH.read_bytes()
+                pem = signing_key_path.read_bytes()
                 key = serialization.load_pem_private_key(pem, password=None)
                 if not isinstance(key, EllipticCurvePrivateKey):
                     raise ValueError("MCP signing key must be an EC private key")
@@ -231,12 +262,16 @@ class McpJwtIssuer:
                     )
                 logger.info(
                     "mcp-broker: loaded MCP signing key from %s (DEV MODE — not KMS-backed)",
-                    _SIGNING_KEY_PATH,
+                    signing_key_path,
                 )
-                return key
+                # Path #2 (Nico kid-stability fix): derive stable_generated_at from
+                # the file's mtime so that all replicas mounting the SAME file produce
+                # the SAME kid, regardless of when they start.
+                file_mtime = int(signing_key_path.stat().st_mtime)
+                return key, file_mtime
             except Exception as exc:
                 raise RuntimeError(
-                    f"Failed to load MCP signing key from {_SIGNING_KEY_PATH}: {exc}"
+                    f"Failed to load MCP signing key from {signing_key_path}: {exc}"
                 ) from exc
 
         # 3. Ephemeral key (unit tests only) — FAIL-CLOSED in production/staging.
@@ -252,13 +287,14 @@ class McpJwtIssuer:
         # Point the operator at the correct setup (secrets file or env var).
         # dev/test environments continue to allow ephemeral keys (unchanged).
         _env = os.environ.get("YASHIGANI_ENV", "").strip().lower()
+        signing_key_path_str = str(_get_signing_key_path())
         if _env in {"production", "staging"}:
             raise RuntimeError(
                 f"McpJwtIssuer: YASHIGANI_ENV={_env!r} but no persistent MCP signing key "
                 "was found. An ephemeral key is NOT acceptable in production/staging "
                 "(multi-replica JWKS mismatch + restart key rotation risk). "
                 f"Set YASHIGANI_MCP_SIGNING_KEY_PEM (base64 PEM) or mount the key at "
-                f"{_SIGNING_KEY_PATH} (0600, PEM format). "
+                f"{signing_key_path_str} (0600, PEM format). "
                 "See install.sh for key generation. "
                 "Nico spec §2: KMS-backed persistent key required in production."
             )
@@ -268,9 +304,10 @@ class McpJwtIssuer:
             "(NOT PERSISTED — dev/test mode only). "
             "Set YASHIGANI_MCP_SIGNING_KEY_PEM or provide %s for persistent key. "
             "Nico spec §2: KMS-backed key required in production.",
-            _SIGNING_KEY_PATH,
+            signing_key_path_str,
         )
-        return ec.generate_private_key(SECP384R1())
+        # Path #3: ephemeral — no stable generated_at; kid will differ per process.
+        return ec.generate_private_key(SECP384R1()), None
 
     def _startup_self_test(self) -> None:
         """

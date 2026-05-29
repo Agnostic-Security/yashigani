@@ -627,3 +627,297 @@ class TestStaleVersionAudit:
             "lazy lock (uvicorn import-time — module-level `app = create_bridge_app()` "
             "runs before uvicorn starts the event loop)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Laura SB-1: _SIGNING_KEY_PATH import-time freeze fix
+# ---------------------------------------------------------------------------
+
+class TestLauraSB1SigningKeyPathLazyEval:
+    """
+    Laura SB-1: YASHIGANI_MCP_SIGNING_KEY_PATH must be read at key-load time,
+    not frozen at module import.  monkeypatch must take effect on a fresh
+    McpJwtIssuer() construction WITHOUT requiring importlib.reload().
+    """
+
+    def test_monkeypatched_path_used_without_reload(self, monkeypatch, tmp_path):
+        """
+        Set YASHIGANI_MCP_SIGNING_KEY_PATH to a temp dir path (does not exist),
+        ensure McpJwtIssuer reads the patched value — not the module-import-time
+        default — without any importlib.reload().
+
+        Proof: if the path were frozen at import, the Path.exists() call inside
+        _load_or_generate_key() would check the OLD default path.  After the fix,
+        it checks the monkeypatched path.  We verify by pointing the env var at
+        a path that does NOT exist so the issuer falls to ephemeral (path #3),
+        and separately assert that _get_signing_key_path() returns our custom path.
+        """
+        import importlib
+        custom_path = str(tmp_path / "custom_mcp_key")
+        monkeypatch.setenv("YASHIGANI_MCP_SIGNING_KEY_PATH", custom_path)
+        monkeypatch.delenv("YASHIGANI_MCP_SIGNING_KEY_PEM", raising=False)
+        monkeypatch.delenv("YASHIGANI_ENV", raising=False)
+        monkeypatch.delenv("FIPS_MODE", raising=False)
+
+        # Import AFTER monkeypatch to ensure we're using the live env.
+        # Crucially: we do NOT reload _jwt here — that's the point of the fix.
+        from yashigani.mcp._jwt import _get_signing_key_path, McpJwtIssuer
+        import pathlib
+
+        # _get_signing_key_path() must return the monkeypatched value
+        resolved = _get_signing_key_path()
+        assert str(resolved) == custom_path, (
+            f"Laura SB-1: _get_signing_key_path() returned {resolved!r}, "
+            f"expected {custom_path!r}. Path must be read at call time."
+        )
+
+        # McpJwtIssuer construction must succeed (falls to ephemeral since path
+        # does not exist) — proving the constructor used the patched path lookup.
+        issuer = McpJwtIssuer(tenant_id="sb1-test")
+        assert issuer is not None
+
+    def test_signing_key_path_not_frozen_at_module_scope(self):
+        """
+        _jwt.py must NOT define a module-level _SIGNING_KEY_PATH = Path(...) binding.
+        The old frozen constant is replaced by _get_signing_key_path().
+        """
+        import pathlib
+        src = pathlib.Path("src/yashigani/mcp/_jwt.py").read_text()
+        # The old frozen binding: `_SIGNING_KEY_PATH = Path(`
+        assert "_SIGNING_KEY_PATH = Path(" not in src, (
+            "Laura SB-1 regression: _SIGNING_KEY_PATH = Path(...) module-scope binding "
+            "still present. Replace with _get_signing_key_path() lazy helper."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Nico kid-stability: two issuers against the same file → identical kid
+# ---------------------------------------------------------------------------
+
+class TestNicoKidStabilityAcrossReplicas:
+    """
+    Nico kid-stability fix: two McpJwtIssuer instances loading the SAME key file
+    must produce IDENTICAL kid values, regardless of when they were constructed.
+
+    This simulates two gateway replicas mounting the same docker secret at the
+    same path — they must agree on kid so JWKS lookups succeed cross-replica.
+    """
+
+    def test_two_issuers_same_file_same_kid(self, monkeypatch, tmp_path):
+        """
+        Write a P-384 key file, construct two issuers against it, assert kid equality.
+        """
+        import base64
+        import time
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.ec import SECP384R1
+        from cryptography.hazmat.primitives import serialization
+
+        monkeypatch.delenv("YASHIGANI_MCP_SIGNING_KEY_PEM", raising=False)
+        monkeypatch.delenv("YASHIGANI_ENV", raising=False)
+        monkeypatch.delenv("FIPS_MODE", raising=False)
+
+        key_file = tmp_path / "mcp_key"
+        raw_key = ec.generate_private_key(SECP384R1())
+        pem = raw_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        key_file.write_bytes(pem)
+
+        monkeypatch.setenv("YASHIGANI_MCP_SIGNING_KEY_PATH", str(key_file))
+
+        from yashigani.mcp._jwt import McpJwtIssuer
+
+        issuer_a = McpJwtIssuer(tenant_id="replica-test")
+        # Simulate replica B starting slightly later
+        time.sleep(0.01)
+        issuer_b = McpJwtIssuer(tenant_id="replica-test")
+
+        assert issuer_a.kid == issuer_b.kid, (
+            f"Nico kid-stability: two issuers on the same key file produced "
+            f"different kids: {issuer_a.kid!r} vs {issuer_b.kid!r}. "
+            "kid must be derived from file mtime, not int(time.time())."
+        )
+
+    def test_ephemeral_key_kid_not_required_to_be_stable(self, monkeypatch):
+        """
+        Path #3 (ephemeral): kid MAY differ across instances (dev only).
+        This test documents the ACCEPTABLE behaviour — not a requirement.
+        The fail-closed guard (Fix-5) prevents ephemeral keys in production.
+        """
+        monkeypatch.delenv("YASHIGANI_MCP_SIGNING_KEY_PEM", raising=False)
+        monkeypatch.delenv("YASHIGANI_ENV", raising=False)
+        monkeypatch.delenv("FIPS_MODE", raising=False)
+        monkeypatch.setenv("YASHIGANI_MCP_SIGNING_KEY_PATH", "/nonexistent/path/key")
+
+        from yashigani.mcp._jwt import McpJwtIssuer
+
+        issuer = McpJwtIssuer(tenant_id="ephemeral-test")
+        # Kid is a string of the expected format
+        assert issuer.kid.startswith("mcp-ephemeral-test-"), (
+            f"kid must follow mcp-{{tenant_id}}-{{epoch}} format; got {issuer.kid!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Iris F-1: per-broker issuer isolation → shared issuer
+# ---------------------------------------------------------------------------
+
+class TestIrisF1SharedIssuerAcrossBrokers:
+    """
+    Iris F-1: all brokers in the registry must share the same McpJwtIssuer instance
+    (same kid, same signing key).  Per-broker instantiation causes each broker to
+    load/generate its OWN key in dev mode → JWKS mismatch across brokers.
+    """
+
+    def test_all_brokers_share_same_issuer_kid(self, monkeypatch):
+        """
+        Build a registry with two servers.  The broker for each server must
+        share the same issuer kid — proving they use the same key material.
+        """
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("YASHIGANI_MCP_SIGNING_KEY_PEM", raising=False)
+        monkeypatch.delenv("YASHIGANI_ENV", raising=False)
+        monkeypatch.delenv("FIPS_MODE", raising=False)
+        monkeypatch.setenv("YASHIGANI_MCP_SERVERS", json.dumps([
+            {
+                "agent_name": "server-a",
+                "upstream_url": "http://server-a:8000",
+                "tenant_id": "acme",
+            },
+            {
+                "agent_name": "server-b",
+                "upstream_url": "http://server-b:8000",
+                "tenant_id": "acme",
+            },
+        ]))
+
+        import importlib
+        import yashigani.mcp.registry as _reg_module
+        importlib.reload(_reg_module)
+
+        from yashigani.mcp.registry import build_registry_from_env
+        reg, jwks_store = build_registry_from_env(opa_url="http://policy:8181")
+        assert len(reg) == 2
+
+        broker_a, _ = reg.get("server-a")
+        broker_b, _ = reg.get("server-b")
+
+        kid_a = broker_a._issuer.kid
+        kid_b = broker_b._issuer.kid
+
+        assert kid_a == kid_b, (
+            f"Iris F-1: brokers server-a and server-b have different kids: "
+            f"{kid_a!r} vs {kid_b!r}. All brokers must share the same issuer "
+            "(one key per installation, not per server — design §3.4)."
+        )
+
+    def test_all_brokers_share_same_issuer_instance(self, monkeypatch):
+        """
+        Stronger check: the _issuer attribute on all brokers must be the
+        SAME Python object (identity check).
+        """
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("YASHIGANI_MCP_SIGNING_KEY_PEM", raising=False)
+        monkeypatch.delenv("YASHIGANI_ENV", raising=False)
+        monkeypatch.delenv("FIPS_MODE", raising=False)
+        monkeypatch.setenv("YASHIGANI_MCP_SERVERS", json.dumps([
+            {
+                "agent_name": "alpha",
+                "upstream_url": "http://alpha:8000",
+                "tenant_id": "beta",
+            },
+            {
+                "agent_name": "gamma",
+                "upstream_url": "http://gamma:8000",
+                "tenant_id": "beta",
+            },
+            {
+                "agent_name": "delta",
+                "upstream_url": "http://delta:8000",
+                "tenant_id": "beta",
+            },
+        ]))
+
+        import importlib
+        import yashigani.mcp.registry as _reg_module
+        importlib.reload(_reg_module)
+
+        from yashigani.mcp.registry import build_registry_from_env
+        reg, _ = build_registry_from_env(opa_url="http://policy:8181")
+        assert len(reg) == 3
+
+        broker_alpha, _ = reg.get("alpha")
+        broker_gamma, _ = reg.get("gamma")
+        broker_delta, _ = reg.get("delta")
+
+        assert broker_alpha._issuer is broker_gamma._issuer, (
+            "Iris F-1: alpha and gamma brokers must share the SAME issuer instance"
+        )
+        assert broker_alpha._issuer is broker_delta._issuer, (
+            "Iris F-1: alpha and delta brokers must share the SAME issuer instance"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Iris F-2: Shape-C codegen emits replicaCount: 1
+# ---------------------------------------------------------------------------
+
+class TestIrisF2ShapeCReplicaCount:
+    """
+    Iris F-2: _gen_values_yaml_shape_c must emit replicaCount: 1 with an
+    explanatory comment pointing at the v1 session-affinity constraint.
+    """
+
+    def _make_minimal_parsed(self) -> dict:
+        return {
+            "metadata": {
+                "name": "test-agent",
+                "tenant_id": "acme",
+            },
+            "spec": {
+                "image": {
+                    "repository": "example.com/test-agent",
+                    "tag": "1.0.0",
+                    "digest": "sha256:abc123",
+                },
+                "storage": {
+                    "mounts": [
+                        {"container_path": "/workspace"},
+                    ],
+                },
+            },
+        }
+
+    def test_replica_count_1_emitted(self):
+        """_gen_values_yaml_shape_c output must contain 'replicaCount: 1'."""
+        from yashigani.manifest.codegen import _gen_values_yaml_shape_c
+
+        output = _gen_values_yaml_shape_c(
+            self._make_minimal_parsed(),
+            manifest_hash="deadbeef",
+            runtime="docker",
+        )
+        assert "replicaCount: 1" in output, (
+            "Iris F-2: _gen_values_yaml_shape_c must emit 'replicaCount: 1'. "
+            "Operator '--set .replicaCount=3' would break MCP sessions (v1 "
+            "session-affinity constraint)."
+        )
+
+    def test_replica_count_comment_references_constraint(self):
+        """The replicaCount line must be accompanied by the v1 constraint comment."""
+        from yashigani.manifest.codegen import _gen_values_yaml_shape_c
+
+        output = _gen_values_yaml_shape_c(
+            self._make_minimal_parsed(),
+            manifest_hash="deadbeef",
+            runtime="docker",
+        )
+        # The comment must mention session-affinity or the router module so
+        # operators understand WHY they must not scale it.
+        assert "session" in output.lower() or "mcp_router_runtime" in output, (
+            "Iris F-2: the replicaCount: 1 line must be accompanied by a comment "
+            "explaining the v1 session-affinity constraint."
+        )
