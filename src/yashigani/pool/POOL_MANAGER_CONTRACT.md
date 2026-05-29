@@ -463,7 +463,8 @@ The following bindings in the compose codegen template are DEFERRED pending Tom'
 #     and   name      = parsed["metadata"]["name"]
 #
 # Cross-reference: yashigani.manifest.resolve_spiffe_uri (W1, Tom)
-#                  src/yashigani/manifest/linter.py _lint_spiffe_prefix (N1 rule)
+#                  src/yashigani/manifest/linter.py _lint_spiffe_prefix
+#                  (N1 rule; emits N1_spiffe_override_out_of_namespace)
 #
 # From manifest spec.network (W1 field):
 #   networks = [f"ringfence_{agent_name}", "caddy_internal"]

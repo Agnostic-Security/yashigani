@@ -109,7 +109,7 @@ class TestM5InboundPorts:
             del os.environ["YSG_REQUIRE_SIGNED_MANIFEST"]
 
     def test_port_below_1024_rejected(self) -> None:
-        from yashigani.manifest import validate_manifest, LintError
+        from yashigani.manifest import validate_manifest
         os.environ["YSG_REQUIRE_SIGNED_MANIFEST"] = "skip"
         try:
             parsed = _deep_merge(_BASE_PARSED, {
@@ -365,7 +365,7 @@ class TestN1SpiffePrefix:
             })
             result = validate_manifest(parsed)
             rules = [e.rule for e in result.errors]
-            assert "N1_spiffe_prefix" in rules
+            assert "N1_spiffe_override_out_of_namespace" in rules
         finally:
             del os.environ["YSG_REQUIRE_SIGNED_MANIFEST"]
 
@@ -385,7 +385,7 @@ class TestN1SpiffePrefix:
             })
             result = validate_manifest(parsed)
             rules = [e.rule for e in result.errors]
-            assert "N1_spiffe_prefix" in rules
+            assert "N1_spiffe_override_out_of_namespace" in rules
         finally:
             del os.environ["YSG_REQUIRE_SIGNED_MANIFEST"]
 
