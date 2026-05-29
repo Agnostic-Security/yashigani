@@ -139,6 +139,14 @@ spec:
               mountPath: /etc/caddy/Caddyfile
               subPath: Caddyfile
               readOnly: true
+            # S4 (P1 W3 Phase 2a): agent Caddyfile snippet directory.
+            # Populated by the yashigani-caddy-agents ConfigMap (empty at base
+            # install). The Caddyfile ends with `import /etc/caddy/agents/*.caddy`
+            # which picks up per-agent route snippets as agents are onboarded.
+            # Read-only: snippets are written by ringfence-init codegen, not Caddy.
+            - name: caddy-agents
+              mountPath: /etc/caddy/agents
+              readOnly: true
             # MUST-4 / v2.24.1: admin unix socket lives here.
             # readOnlyRootFilesystem requires an explicit writable mount for
             # the socket directory — Caddy creates admin.sock at startup.
@@ -167,11 +175,24 @@ spec:
           emptyDir: {}
         # MUST-4 / v2.24.1: writable dir for the admin unix socket.
         # emptyDir is ephemeral and pod-local — socket is never shared.
+        # Iris-F2 / LAURA-002 (LOW): memory-backed + bounded to match compose
+        # tmpfs /run/caddy:size=1m,mode=0700. medium:Memory gives tmpfs
+        # semantics (no host-disk writes); sizeLimit:1Mi caps runaway growth.
         - name: caddy-admin-sock
-          emptyDir: {}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         - name: caddyfile
           configMap:
             name: yashigani-caddy-config
+        # S4 (P1 W3 Phase 2a): agent snippet directory.
+        # Base ConfigMap is empty (no agents onboarded). Caddy logs a non-fatal
+        # warning for the empty glob and continues normally. Populated by
+        # ringfence-init onboarding flow as agents are added.
+        - name: caddy-agents
+          configMap:
+            name: yashigani-caddy-agents
+            defaultMode: 0444
         {{- if .Values.mtls.enabled }}
         - name: pki-certs
           secret:
