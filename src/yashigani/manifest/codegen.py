@@ -10,6 +10,16 @@ Security controls baked in (each has a proving test):
        from egress_allow config; rejects any RFC1918/loopback/link-local upstream.
   C3   (HIGH)         Routes namespaced /agents/{tenant_id}/{agent_id}/;
                       duplicate (tenant_id, agent_id) aborts codegen.
+  C5   (MED)          Per-upstream TLS verification: each reverse_proxy transport
+                      block emits explicit `tls_server_name <provider-host>` set
+                      from manifest config; tls_insecure_skip_verify NEVER emitted;
+                      Caddy verifies upstream cert against system roots by default.
+  C8   (MED)          Connection-pool exhaustion cap: `max_conns_per_host 64`
+                      (default; see _C8_MAX_CONNS_PER_HOST_DEFAULT) in each
+                      transport block limits upstream connections per
+                      (tenant, agent, provider) → DoS resistance.
+                      OPA budget-gate half of C8 is deferred (policy layer,
+                      finding YSG-C8-OPA-BUDGET).
   C10  (HIGH)         caddy validate on each snippet; absent caddy binary →
                       skip with WARNING; present → must pass.
   M9   (MEDIUM)       All writes via realpath + allowed-roots prefix check +
@@ -44,7 +54,7 @@ dict of {relative_path: content} without writing any files.
 
 Shapes B + C, offboard, and deep OPA authoring are out of scope (later phases).
 
-Last updated: 2026-05-28T00:00:00+00:00
+Last updated: 2026-05-29T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -77,6 +87,19 @@ VALID_RUNTIMES: frozenset[str] = frozenset({
 # Allowed roots for file writes (M9).
 # Codegen writes into an output_root supplied by the caller.
 # The realpath of every output file must be under the realpath of output_root.
+
+# C8 (MED) — connection-pool exhaustion cap.
+# Max simultaneous upstream connections per (tenant, agent, provider) in Caddy's
+# transport pool.  64 is a generous upper bound for a single ring-fenced agent:
+#   - OpenAI / Anthropic / Mistral rate-limit at the API key level; 64 concurrent
+#     calls per agent is already well above any sane workload.
+#   - Keeps the Caddy FD budget bounded: 64 * (active agents) << 1024 default.
+#   - OPA budget-gate (per-token / per-minute spend cap) is the complementary
+#     control at the policy layer — see YSG-C8-OPA-BUDGET (deferred, policy layer).
+# Manifest schema override deferred to avoid cross-branch schema changes this wave;
+# this constant is the single place to bump the default.
+_C8_MAX_CONNS_PER_HOST_DEFAULT: int = 64
+
 _ROOTLESS_L1_GAP_WARNING = (
     "# ROOTLESS-PODMAN-L1-GAP: ringfence-init iptables sidecar cannot apply "
     "L1 containment (CAP_NET_ADMIN unavailable rootless). "
@@ -784,6 +807,25 @@ def _gen_kyverno_policy_exception(
     return content
 
 
+def _extract_tls_server_name(base_url: str) -> str:
+    """
+    C5 (MED): extract the TLS SNI hostname from model_egress.base_url.
+
+    The SNI is always the hostname from the manifest-configured base_url —
+    NEVER derived from request headers, query parameters, or any runtime input.
+    This prevents Host-header injection from influencing TLS verification.
+
+    Returns the bare hostname (no port) for use as tls_server_name.
+    Returns empty string if base_url is absent or unparseable.
+    """
+    if not base_url:
+        return ""
+    from urllib.parse import urlparse
+    parsed_url = urlparse(base_url)
+    # urlparse.hostname strips port and lowercases the host
+    return parsed_url.hostname or ""
+
+
 def _gen_caddy_snippet(
     parsed: dict,
     *,
@@ -797,6 +839,15 @@ def _gen_caddy_snippet(
         URI strip_prefix path canonicalisation applied.
         Private IP upstreams rejected before reaching this function (CodegenEngine).
     C3: route namespaced /agents/{tenant_id}/{agent_id}/.
+    C5: per-upstream TLS verification — explicit transport http block with
+        tls_server_name set from manifest base_url (hardcoded, never from request).
+        tls_insecure_skip_verify is NEVER emitted.  Caddy verifies the upstream
+        certificate against system roots.  The SNI hostname is always the provider
+        host from model_egress.base_url — Caddy never proxies a client-supplied
+        Host value to the upstream TLS handshake.
+    C8: max_conns_per_host _C8_MAX_CONNS_PER_HOST_DEFAULT caps upstream connection
+        pool to prevent (tenant, agent, provider) connection exhaustion DoS.
+        OPA budget-gate half deferred — see YSG-C8-OPA-BUDGET.
     """
     meta = parsed.get("metadata") or {}
     spec = parsed.get("spec") or {}
@@ -806,11 +857,15 @@ def _gen_caddy_snippet(
     agent_name = meta.get("name", "")
     tenant_id = meta.get("tenant_id", "")
 
+    # C5: extract primary provider host for tls_server_name (from manifest config,
+    # NEVER from request headers).  This is set once at codegen time.
+    base_url = model_egress.get("base_url", "")
+    tls_server_name = _extract_tls_server_name(base_url)
+
     # Build upstream list from egress_allow + model_egress.base_url
     upstreams: list[str] = []
 
     # model_egress.base_url is the primary upstream for Shape A
-    base_url = model_egress.get("base_url", "")
     if base_url:
         # Extract host:port for Caddy reverse_proxy
         from urllib.parse import urlparse
@@ -846,15 +901,52 @@ def _gen_caddy_snippet(
     if not deduped_upstreams:
         # No upstream configured — emit a placeholder route that returns 502
         upstream_block = "        respond \"no upstream configured\" 502"
-    elif len(deduped_upstreams) == 1:
-        # W3-F3: Caddy requires `reverse_proxy <upstream>` (inline) for a single
-        # upstream, NOT bare hostnames as sub-lines inside a block.
-        # Single upstream: `reverse_proxy <upstream>` (inline form).
-        upstream_block = "        reverse_proxy %s" % deduped_upstreams[0]
     else:
-        # W3-F3: multiple upstreams use `reverse_proxy { to <upstream> }` block form.
+        # C5 + C8: always use block form so we can embed the transport http
+        # subdirective.  Both single- and multi-upstream paths use block form.
+        #
+        # transport http subdirective layout:
+        #   tls                     — enable TLS to the upstream (mandatory for C5)
+        #   tls_server_name <host>  — hardcode SNI from manifest (C5 SSRF guard)
+        #                             NEVER from request headers/Host
+        #   max_conns_per_host <N>  — connection-pool cap (C8 DoS resistance)
+        #
+        # Note: tls_insecure_skip_verify is intentionally absent.  Caddy verifies
+        # the upstream certificate against system roots by default when tls is set.
+        # Absent tls_insecure_skip_verify = verification ON (fail-closed).
         to_lines = "\n".join("            to %s" % u for u in deduped_upstreams)
-        upstream_block = "        reverse_proxy {\n%s\n        }" % to_lines
+        if tls_server_name:
+            transport_block = (
+                "            # C5: TLS to upstream — SNI hardcoded from manifest (NEVER from request)\n"
+                "            # C8: connection-pool cap — DoS resistance (OPA budget-gate: YSG-C8-OPA-BUDGET)\n"
+                "            transport http {{\n"
+                "                tls\n"
+                "                tls_server_name {tls_server_name}\n"
+                "                max_conns_per_host {max_conns}\n"
+                "            }}"
+            ).format(
+                tls_server_name=tls_server_name,
+                max_conns=_C8_MAX_CONNS_PER_HOST_DEFAULT,
+            )
+        else:
+            # No base_url → no SNI to pin; still cap connections (C8)
+            transport_block = (
+                "            # C8: connection-pool cap — DoS resistance (OPA budget-gate: YSG-C8-OPA-BUDGET)\n"
+                "            transport http {{\n"
+                "                tls\n"
+                "                max_conns_per_host {max_conns}\n"
+                "            }}"
+            ).format(max_conns=_C8_MAX_CONNS_PER_HOST_DEFAULT)
+
+        upstream_block = (
+            "        reverse_proxy {{\n"
+            "{to_lines}\n"
+            "{transport_block}\n"
+            "        }}"
+        ).format(
+            to_lines=to_lines,
+            transport_block=transport_block,
+        )
 
     rootless_note = ""
     if runtime == "podman-rootless":
@@ -865,6 +957,8 @@ def _gen_caddy_snippet(
         # Shape A LLM egress route for agent: {agent_name} (tenant: {tenant_id})
         # C1: upstreams hardcoded — never from request headers/query (SSRF prevention)
         # C3: route namespaced /agents/{{tenant_id}}/{{agent_id}}/
+        # C5: transport http tls_server_name hardcoded from manifest — SSRF/SNI guard
+        # C8: max_conns_per_host {max_conns} — connection-pool DoS cap
         :443 {{
             handle_path {route_prefix}/* {{
                 # C1 — path canonicalisation (strip_prefix equivalent)
@@ -886,6 +980,7 @@ def _gen_caddy_snippet(
         route_prefix=route_prefix,
         upstream_block=upstream_block,
         rootless_note=rootless_note,
+        max_conns=_C8_MAX_CONNS_PER_HOST_DEFAULT,
     )
     return content
 

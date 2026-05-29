@@ -7,7 +7,7 @@ Package layout:
   linter.py     — M5/M6/M7/N1/C1/C3/P2 semantic lint rules + resolve_spiffe_uri
   signatures.py — M7 signature verification (cosign + RSA-PSS FIPS split)
   cli.py        — yashigani validate CLI entrypoint (K3 human-quality errors)
-  codegen.py    — W3 Shape A artifact generator (C1/C3/C10/M9/S6/L3/L7/L9/S7)
+  codegen.py    — W3 Shape A artifact generator (C1/C3/C5/C8/C10/M9/S6/L3/L7/L9/S7)
   schemas/      — bundled JSON-Schema bundle (agent-manifest-v1alpha1.schema.json)
   keys/         — bundled cosign public key (manifest-signing.pub)
 
@@ -21,7 +21,7 @@ Entry points:
   CodegenError                    — W3 codegen failure type
   reset_codegen_registry()        — W3 C3 duplicate-pair registry reset
 
-Last updated: 2026-05-28T00:00:00+00:00
+Last updated: 2026-05-29T00:00:00+00:00
 """
 from yashigani.manifest.parser import parse_manifest, ManifestParseError
 from yashigani.manifest.schema import validate_schema, assert_schema_valid, ManifestSchemaError
