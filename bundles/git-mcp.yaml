@@ -44,7 +44,7 @@ kind: AgentIntegration
 
 metadata:
   name: git
-  tenant_id: replace-with-your-tenant-id   # REQUIRED: replace before onboarding
+  tenant_id: iter4-test
   description: >-
     Official MCP git server (modelcontextprotocol/servers/src/git).
     Provides git operations against a local workspace mount. No remote git
@@ -60,7 +60,7 @@ spec:
   image:
     repository: registry.yashigani.internal/bundles/mcp-git
     tag: "latest"
-    digest: "sha256:4ac73c6ef53f0901ec1b50fbf754986687ff5d77646813e9c0edd65a751d9a19"
+    digest: "sha256:dfd423c32895ce2ffb6918378f4fa11e8f93c1b6514747a7809fe06ee84cc6a2"
     # Built 2026-05-30 by scripts/build-git-mcp.sh --platform linux/arm64.
     # End-to-end smoke verified: POST /mcp initialize + tools/call git_status
     # both succeed on an empty volume (launcher initialises the workspace
@@ -153,9 +153,7 @@ spec:
   # operate on the volume regardless of original owner UID.
   storage:
     mounts:
-      - name: ysg_git_replace_with_your_tenant_id_git_workspace
-        # ^^^ REPLACE 'replace_with_your_tenant_id' with your tenant_id
-        # (hyphens in tenant_id become underscores)
+      - name: ysg_git_iter4_test_git_workspace
         type: volume
         container_path: /workspace
         read_only: false     # working tree must be writable; git ops still OPA-gated

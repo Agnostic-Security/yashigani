@@ -1471,6 +1471,18 @@ def _gen_compose_override_shape_c(
 
     # Build tmpfs entries
     tmpfs_mounts_lines: list[str] = []
+    # NEW-BUG-G FIX (Ava iter-4 2026-05-30): podman-compose 1.x does NOT support
+    # the long-form mapping syntax for tmpfs:
+    #   tmpfs:
+    #     - target: /tmp
+    #       tmpfs-size: 64m
+    # It only accepts the short-form string syntax that matches the rest of the
+    # codebase (see docker-compose.yml line ~218):
+    #   tmpfs:
+    #     - /tmp:size=64m,mode=1777
+    # The long-form causes podman-compose to pass the raw dict repr as the mount
+    # path → "Error: invalid container path \"{'target'\"".
+    # Fix: use short-form for all tmpfs entries.
     if tmpfs_list:
         for tf in tmpfs_list:
             if not isinstance(tf, dict):
@@ -1478,12 +1490,12 @@ def _gen_compose_override_shape_c(
             tf_path = tf.get("path", "/tmp")
             tf_size = tf.get("size_limit", _SC_TMPFS_SIZE_DEFAULT)
             tmpfs_mounts_lines.append(
-                "      - target: %s\n        tmpfs-size: %s" % (tf_path, tf_size)
+                "      - %s:size=%s,mode=1777" % (tf_path, tf_size)
             )
     else:
-        # Default: /tmp tmpfs for Node.js runtime
+        # Default: /tmp tmpfs for bridge runtime
         tmpfs_mounts_lines.append(
-            "      - target: /tmp\n        tmpfs-size: %s" % _SC_TMPFS_SIZE_DEFAULT
+            "      - /tmp:size=%s,mode=1777" % _SC_TMPFS_SIZE_DEFAULT
         )
 
     volumes_section = "\n".join(volume_mounts_lines)

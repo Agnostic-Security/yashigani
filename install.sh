@@ -9064,7 +9064,29 @@ print('pki-merge: preserved %d/%d bootstrap_token_sha256 values: %s' % (
 PYMERGE
     _merge_ok=false
     local _merge_log2; _merge_log2="$(mktemp)"
-    python3 "$_merge_py" "$_canonical_manifest" "$manifest_in" 2>"$_merge_log2" && _merge_ok=true
+    # NEW-BUG-H FIX (Ava iter-4 2026-05-30): on Podman rootless, service_identities.yaml
+    # in docker/var/runtime/ is owned by the subuid-mapped UID for container UID 1001
+    # (e.g. UID 101000 when max=1000 and subuid starts at 100000).  Running plain
+    # python3 as UID 1000 raises PermissionError on both read and write paths.
+    # Fix: detect rootless Podman via any of: YSG_PODMAN_RUNTIME=true, YSG_RUNTIME=podman,
+    # or simply "podman available + /etc/subuid present + running as non-root on Linux".
+    # Wrap the merge in `podman unshare` so it runs as UID 0 inside the user namespace
+    # (which maps to the PKI-issuer-owned subuid range outside).
+    # Note: this check is runtime-agnostic and does NOT depend on YSG_PODMAN_RUNTIME
+    # having been set by resolve_compose_cmd, so it works on --pki-action invocations too.
+    local _use_unshare=false
+    if [[ "$(uname -s)" == "Linux" ]] && \
+       [[ "$(id -u)" != "0" ]] && \
+       command -v podman >/dev/null 2>&1 && \
+       [[ -f /etc/subuid ]]; then
+      _use_unshare=true
+    fi
+    if [[ "$_use_unshare" == "true" ]]; then
+      podman unshare python3 "$_merge_py" "$_canonical_manifest" "$manifest_in" \
+        2>"$_merge_log2" && _merge_ok=true
+    else
+      python3 "$_merge_py" "$_canonical_manifest" "$manifest_in" 2>"$_merge_log2" && _merge_ok=true
+    fi
     if [[ -s "$_merge_log2" ]]; then
       while IFS= read -r _ml; do log_info "_pki_run_issuer merge: ${_ml}"; done < "$_merge_log2"
     fi
@@ -9073,8 +9095,14 @@ PYMERGE
       log_info "_pki_run_issuer: merged canonical → runtime manifest (bootstrap_token_sha256 values preserved)"
     else
       log_warn "_pki_run_issuer: manifest merge failed — falling back to canonical (bootstrap_token_sha256 values will be re-issued)"
-      cp -f "$_canonical_manifest" "$manifest_in" \
-        || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+      # NEW-BUG-H: same podman unshare wrapper for the fallback copy.
+      if [[ "$_use_unshare" == "true" ]]; then
+        podman unshare cp -f "$_canonical_manifest" "$manifest_in" \
+          || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+      else
+        cp -f "$_canonical_manifest" "$manifest_in" \
+          || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+      fi
     fi
   fi
 
