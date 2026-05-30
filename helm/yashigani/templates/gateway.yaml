@@ -130,6 +130,12 @@ spec:
             */}}
             - name: YASHIGANI_MCP_SERVERS
               value: {{ .Values.gateway.mcpServers | default list | toJson | quote }}
+            # Iris F-2: MCP broker OPA AsyncClient reads this CA path
+            # (src/yashigani/mcp/_opa.py:_make_opa_http_client).  Without it on
+            # K8s, OPA HTTPS verify falls through to system trust store and
+            # every tools/call fails closed.  Companion to docker-compose.yml.
+            - name: YASHIGANI_CA_CERT
+              value: "/run/secrets/ca_root.crt"
             {{- if .Values.mtls.enabled }}
             # M-01 fix: mTLS OTLP endpoint (grpcs://). Gateway presents its
             # leaf cert. Python OTEL exporter goes through Python ssl —
