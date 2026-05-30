@@ -91,12 +91,15 @@ All pull+run in Ollama. VRAM ≈ disk size + KV cache (the live `vram_mb` readin
 
 ## ⭐ Recommended model MIX (client-facing)
 
+> **How to read "best" vs "most lightweight":** *lightweight* = smallest VRAM / fastest that adequately does the job; *best* = highest **capability/quality that still fits 12 GB and runs at interactive speed** (so 14B models that drop to 11–23 tok/s are excluded). **Caveat:** these benchmarks measured **throughput, prompt-speed, and VRAM — not output quality.** "Best" is therefore a capability judgement (model reputation + size + measured speed), **not an empirical quality score.** For a data-backed quality ranking, run a per-tier accuracy eval (task set) — not yet done. tok/s figures are gen-rate unless noted;  is estimated (≈ qwen2.5:7b 65 tok/s — coder-bench rate-parse failed, VRAM captured).
+
+
 A **mix**, not one model — pick best vs lightweight per function. All Ollama-runnable; sizing assumes one RTX 3060-class 12 GB card.
 
 | Function | Most lightweight | Best (quality) |
 |---|---|---|
 | **Yashigani internal — sensitivity** | `gemma3:1b` (0.8 GB, 206 tok/s) | `qwen3:1.7b` (1.4 GB, 194 tok/s) |
-| **Yashigani internal — injection/safety guard** | `llama-guard3:1b` (1.6 GB, 9.4k prompt tok/s) | `shieldgemma:2b` (1.7 GB) |
+| **Yashigani internal — injection/safety guard** | `llama-guard3:1b` (1.6 GB, 9.4k prompt tok/s) | `shieldgemma:2b` (1.7 GB, 188 gen / 5.1k prompt tok/s) |
 | **General usage (chat)** | `gemma3:4b` (3.3 GB, 98 tok/s) | `gemma3:12b` (8.1 GB, 40 tok/s) |
 | **Developer (coding)** | `qwen2.5-coder:7b` (4.7 GB, ~65 tok/s) | `deepseek-coder-v2:16b` (8.9 GB, 44 tok/s) |
 | **Other functions (reasoning)** | `qwen3:8b` (5.2 GB, 60 tok/s) | `deepseek-r1:14b` (9 GB, 13 tok/s — batch only) |
