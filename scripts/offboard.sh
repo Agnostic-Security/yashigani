@@ -403,25 +403,88 @@ _offboard_step3_caddy_snippet() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: Remove compose override stanza
-# docker/<agent>-compose.override.yml
+# Step 4: Remove compose override stanza + YASHIGANI_MCP_SERVERS entry
+#
+# docker/<agent>-compose.override.yml (Shape A/B)
+# docker/.env YASHIGANI_MCP_SERVERS entry (Shape C MCP broker)
+#
+# Shape-C onboarding adds the agent to YASHIGANI_MCP_SERVERS in docker/.env
+# (a JSON array read by the gateway at startup).  Offboard must remove the
+# entry to prevent the gateway from attempting to connect to a deprovisioned
+# MCP bridge on next restart.
+#
+# Implementation: Python one-liner using json + re so no jq dependency.
+# The entry is matched by "agent_name" field.  If the array is empty after
+# removal, YASHIGANI_MCP_SERVERS is set to [] (not removed) so the gateway
+# treats it as an empty registry (no servers configured).
+#
+# P3 broker E2E gate — J13-Offboard-FsMcp fix (2026-05-30).
 # ---------------------------------------------------------------------------
 _offboard_step4_compose_override() {
   local _agent="$1"
   local _override="${WORK_DIR}/docker/${_agent}-compose.override.yml"
+  local _env_file="${WORK_DIR}/docker/.env"
   _log_step "4/8 Remove compose override for '${_agent}'"
 
-  if [[ ! -f "$_override" ]]; then
+  if [[ -f "$_override" ]]; then
+    if _dry_print "rm ${_override}"; then
+      :
+    else
+      _three_tier_rm "$_override" || return 1
+      _log_info "  Removed compose override: ${_override}"
+    fi
+  else
     _log_info "  Compose override not present: ${_override}"
+  fi
+
+  # Remove from YASHIGANI_MCP_SERVERS in docker/.env (Shape-C cleanup)
+  if [[ ! -f "$_env_file" ]]; then
+    _log_info "  docker/.env not present — YASHIGANI_MCP_SERVERS cleanup skipped"
     return 0
   fi
 
-  if _dry_print "rm ${_override}"; then
+  if ! grep -q "^YASHIGANI_MCP_SERVERS=" "$_env_file" 2>/dev/null; then
+    _log_info "  YASHIGANI_MCP_SERVERS not in docker/.env — MCP registry cleanup skipped"
     return 0
   fi
 
-  _three_tier_rm "$_override" || return 1
-  _log_info "  Removed compose override: ${_override}"
+  if _dry_print "remove '${_agent}' from YASHIGANI_MCP_SERVERS in docker/.env"; then
+    return 0
+  fi
+
+  # Python one-liner: remove matching agent_name entry from the JSON array
+  # and write back.  Works whether the current value is [] or a populated array.
+  local _py_result
+  _py_result=$(python3 - "$_env_file" "$_agent" <<'PYEOF'
+import sys, re, json
+env_file, agent_name = sys.argv[1], sys.argv[2]
+with open(env_file, "r") as fh:
+    content = fh.read()
+m = re.search(r'^YASHIGANI_MCP_SERVERS=(.*)$', content, re.MULTILINE)
+if not m:
+    sys.exit(0)
+try:
+    current = json.loads(m.group(1)) if m.group(1).strip() else []
+except Exception:
+    current = []
+updated = [s for s in current if s.get("agent_name") != agent_name]
+new_val = json.dumps(updated)
+new_content = re.sub(
+    r'^YASHIGANI_MCP_SERVERS=.*',
+    'YASHIGANI_MCP_SERVERS=' + new_val,
+    content,
+    flags=re.MULTILINE,
+)
+with open(env_file, "w") as fh:
+    fh.write(new_content)
+print("ok")
+PYEOF
+)
+  if [[ "$_py_result" == "ok" ]]; then
+    _log_info "  Removed '${_agent}' from YASHIGANI_MCP_SERVERS in docker/.env"
+  else
+    _log_warn "  Could not remove '${_agent}' from YASHIGANI_MCP_SERVERS — manual cleanup may be needed"
+  fi
 }
 
 # ---------------------------------------------------------------------------

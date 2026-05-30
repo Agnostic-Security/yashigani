@@ -43,6 +43,42 @@ allow if {
 }
 
 # ---------------------------------------------------------------------------
+# Allow MCP broker calls from authenticated human sessions
+#
+# MCP calls to /mcp/<agent_name> originate from human sessions (browser
+# cookie or API key) — NOT from agent-to-agent calls.  Human sessions do
+# not carry X-Yashigani-Agent-Id, so the general allow rule above would
+# deny them (agent_id = "unknown").
+#
+# This rule permits /mcp/* access when:
+#   1. A valid non-anonymous session is present (cookie or API-key hash).
+#   2. The HTTP method is in the allowed set.
+#   3. The path is not in the blocked set.
+#
+# Per-tool authz is enforced AFTER this gate by the MCP broker's own
+# enforce() pipeline (broker.py → mcp.rego filesystem_tool_allowed).
+# This gate only establishes that a session exists — it is NOT a
+# bypass of per-tool policy.
+#
+# P3 broker E2E gate — J9-ToolsCall / J10-WriteTool (2026-05-30).
+# ASVS V4.1.3: access control is default-deny except for explicit allow.
+# ---------------------------------------------------------------------------
+
+allow if {
+    input.session_id != ""
+    input.session_id != "anonymous"
+    input.method in allowed_methods
+    # FastAPI {path:path} strips the leading slash — accept both forms.
+    # Gateway sends "mcp/filesystem-mcp"; direct OPA probes send "/mcp/filesystem-mcp".
+    # FIX-OPA-MCP-PATH (2026-05-30): match regardless of leading slash.
+    _path_is_mcp
+    not path_blocked
+}
+
+_path_is_mcp if { startswith(input.path, "/mcp/") }
+_path_is_mcp if { startswith(input.path, "mcp/") }
+
+# ---------------------------------------------------------------------------
 # Allowed HTTP methods for MCP traffic
 # ---------------------------------------------------------------------------
 

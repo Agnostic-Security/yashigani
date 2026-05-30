@@ -1511,7 +1511,9 @@ def _gen_compose_override_shape_c(
         "#         - %s   # ADD THIS" % ringfence_bridge,
         "# Then restart the gateway: docker compose up -d gateway",
         "# YASHIGANI_MCP_SERVERS entry for gateway (add to gateway environment):",
-        '#   - {"agent_name": "%s", "upstream_url": "http://%s:%d/mcp",' % (
+        # FIX-UPSTREAM-URL-DOUBLE-MCP (2026-05-30): upstream_url is the BASE URL only.
+        # McpHttpTransport.forward() appends path="/mcp" — do NOT include /mcp here.
+        '#   - {"agent_name": "%s", "upstream_url": "http://%s:%d",' % (
             agent_name, agent_name, _SC_BRIDGE_PORT,
         ),
         '#     "tenant_id": "%s", "is_filesystem_agent": true}' % tenant_id,

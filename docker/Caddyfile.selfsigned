@@ -222,6 +222,23 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── MCP JWKS — /.well-known/yashigani-mcp-jwks.json (PUBLIC, no auth) ──
+    # This endpoint is intentionally unauthenticated — upstream MCP verifiers
+    # (bridge containers, external JWT validators) must be able to fetch the
+    # JWKS without holding a Yashigani session cookie.
+    # ASVS V2.6.3: public key material must be publicly retrievable.
+    # Must appear BEFORE the catch-all handle {} block; Caddy matches handles
+    # in declaration order and first-match wins for non-path-prefix handles.
+    # Last updated: 2026-05-30 (P3 broker E2E gate — J8-JWKS fix)
+    handle /.well-known/yashigani-mcp-jwks.json {
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
     # ── MCP proxy — /mcp/* ─────────────────────────────────────────────
     handle /mcp/* {
         reverse_proxy https://gateway:8080 {

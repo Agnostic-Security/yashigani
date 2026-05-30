@@ -275,6 +275,11 @@ services:
       YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
       # v2.23.2: OPA serves mTLS; gateway uses internal_httpx_client (EX-231-01).
       YASHIGANI_OPA_URL: https://policy:8181
+      # FIX-OPA-SSL (2026-05-30): MCP broker OPA httpx client needs the internal CA
+      # cert to verify OPA's TLS cert (issued by the Yashigani internal PKI).
+      # Without this, _opa.py AsyncClient → [SSL: CERTIFICATE_VERIFY_FAILED] →
+      # opa_unreachable → tools/call fail-closed deny.
+      YASHIGANI_CA_CERT: /run/secrets/ca_root.crt
       OLLAMA_BASE_URL: http://ollama:11434  # Ollama has no TLS; internal bridge-only + bearer token (honest gap, tracked in manifest as mtls_capable: false)
       REDIS_HOST: redis
       REDIS_PORT: "6380"                     # TLS-only port
@@ -325,6 +330,14 @@ services:
       # Without OPA, inspection produces a classification with nothing to consume it.
       # See docs/operator-guide.md §2 for the opt-in recipe and YSG-RISK-057 for rationale.
       YASHIGANI_INSPECT_RESPONSES: ${YASHIGANI_INSPECT_RESPONSES:-false}
+      # P3 MCP broker — JSON array of registered MCP server descriptors.
+      # Written by install.sh --onboard (Shape C) and cleared by install.sh --offboard.
+      # Default [] = no MCP servers (broker disabled at startup).
+      # Format: [{"agent_name":"<name>","upstream_url":"http://<host>:8000/mcp","tenant_id":"<tid>"}]
+      # gateway reads this at lifespan startup; changes require container recreate:
+      #   docker compose -f docker/docker-compose.yml up --no-deps -d gateway
+      # P3 broker E2E gate (2026-05-30): must be declared here so compose passes it into container.
+      YASHIGANI_MCP_SERVERS: ${YASHIGANI_MCP_SERVERS:-[]}
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap

@@ -77,6 +77,38 @@ MCP_FS_TOOL_OPA_PATH = "/v1/data/yashigani/mcp/filesystem_tool_allowed"
 OPA_TIMEOUT_SECONDS = 0.5   # 500ms — C9 requirement
 
 
+def _make_opa_http_client(timeout: float = OPA_TIMEOUT_SECONDS) -> httpx.AsyncClient:
+    """
+    FIX-OPA-SSL (2026-05-30): OPA is exposed only via HTTPS with the internal
+    Yashigani PKI CA.  httpx's default trust store does NOT include the internal
+    CA → [SSL: CERTIFICATE_VERIFY_FAILED] → opa_unreachable → tools/call denied.
+
+    Read YASHIGANI_CA_CERT env var (= /run/secrets/ca_root.crt in the gateway
+    container) and pass it as the CA bundle to httpx.AsyncClient.
+
+    If the env var is unset or the file does not exist, fall back to the default
+    trust store so that dev/test environments with a public-CA OPA still work.
+    The fallback is intentional: local/unit-test OPA may run over plain HTTP or
+    with a public cert; we only hard-require the CA for the production stack.
+
+    This function is the SINGLE place AsyncClient is created for OPA queries —
+    both query_mcp_decision and query_filesystem_tool_allowed use it.
+    """
+    import os
+    ca_cert = os.environ.get("YASHIGANI_CA_CERT", "").strip()
+    if ca_cert and os.path.isfile(ca_cert):
+        logger.debug("mcp-broker: OPA client using CA cert %s", ca_cert)
+        return httpx.AsyncClient(timeout=timeout, verify=ca_cert)
+    # Fallback: system trust store (covers HTTP OPA in dev, or public-CA OPA)
+    if ca_cert:
+        logger.warning(
+            "mcp-broker: YASHIGANI_CA_CERT=%r set but file not found — "
+            "falling back to system trust store",
+            ca_cert,
+        )
+    return httpx.AsyncClient(timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
 # FIX-P3-001 — path argument normalisation (encoded traversal prevention)
 # ---------------------------------------------------------------------------
@@ -336,7 +368,9 @@ async def query_mcp_decision(
 
     try:
         if own_client:
-            http_client = httpx.AsyncClient(timeout=OPA_TIMEOUT_SECONDS)
+            # FIX-OPA-SSL (2026-05-30): use _make_opa_http_client so the internal
+            # CA cert is applied when YASHIGANI_CA_CERT env var is set.
+            http_client = _make_opa_http_client()
 
         assert http_client is not None
         resp = await http_client.post(url, json=input_doc)
@@ -478,7 +512,9 @@ async def query_filesystem_tool_allowed(
 
     try:
         if own_client:
-            http_client = httpx.AsyncClient(timeout=OPA_TIMEOUT_SECONDS)
+            # FIX-OPA-SSL (2026-05-30): use _make_opa_http_client so the internal
+            # CA cert is applied when YASHIGANI_CA_CERT env var is set.
+            http_client = _make_opa_http_client()
 
         assert http_client is not None
         resp = await http_client.post(url, json=input_doc)

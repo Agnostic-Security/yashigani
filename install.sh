@@ -7707,6 +7707,28 @@ generate_secrets() {
     fi
   fi
 
+  # FIX-MCP-SIGKEY-PERM: chown the signing key to UID 1001 (gateway container user).
+  #
+  # The key is generated as 0600 owned by the installer user (UID 1000 = max).
+  # The gateway container runs as UID 1001 (maxine on the VM host = uid=1001).
+  # Docker rootful bind-mounts expose host UID/GID directly — 0600 uid=1000 is
+  # unreadable by the gateway (uid=1001), causing PermissionError at startup.
+  #
+  # Fix: use _do_chown (V240-002 helper) to set ownership to 1001:1001.  When
+  # the installer runs as a non-root user (typical Docker install), bare chown
+  # fails silently (EPERM); _do_chown falls through to the docker_run path
+  # (alpine container with bind-mount) which succeeds because Docker is rootful.
+  # The 0600 mode is preserved — only the owner changes.  This mirrors the
+  # convention for other private key files in docker/secrets/ (e.g.
+  # gateway_client.key is 0600 1001:1001).
+  #
+  # P3 broker E2E gate — J8/J9/J10 gateway PermissionError fix (2026-05-30).
+  # ASVS V2.6.3: key generation and storage must follow least-privilege.
+  if [[ -f "$_mcp_key_file" ]]; then
+    _do_chown "1001:1001" "${_mcp_key_file}" "mcp_identity_signing_key" "" "${secrets_dir}" \
+      || log_warn "mcp_identity_signing_key: _do_chown 1001:1001 failed — gateway may fail to start"
+  fi
+
   # No .env sync needed — the gateway reads the key from
   # /run/secrets/mcp_identity_signing_key (file-tier in _jwt.py), which is
   # exposed via the existing docker-compose bind-mount `./secrets:/run/secrets:ro`.
@@ -10973,29 +10995,66 @@ PYEOF
 
       # Determine the gateway container name.
       # Compose names containers as <project>-<service>-<index>; the project
-      # defaults to the directory name.  Use COMPOSE_PROJECT_NAME if set, or
-      # fall back to the `docker compose ps` query.
+      # defaults to the directory name of the compose file.
+      #
+      # We CANNOT use `compose ps -q gateway` here because docker-compose.yml
+      # declares YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
+      # — the :? makes it required, so compose errors out when UPSTREAM_MCP_URL
+      # is empty (e.g. non-interactive install without --upstream-url).
+      # Instead we resolve the container name via `docker/podman ps --filter`
+      # which needs no compose-file interpolation.  YSG-P3-MCP-BRIDGE-JOIN-FIX.
       local _gw_container=""
-      if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
-        _gw_container="$("${COMPOSE_CMD[@]}" -f "$_compose_file" ps -q gateway 2>/dev/null \
-                          | head -1 || true)"
+      local _runtime_bin_ps="${COMPOSE_CMD[0]:-docker}"
+      # strip -compose suffix: "docker-compose" → "docker", "podman-compose" → "podman"
+      _runtime_bin_ps="${_runtime_bin_ps%%-compose}"
+
+      # Derive the compose project name from the compose-file directory name
+      # (same logic Docker Compose v2 uses by default).
+      local _compose_project
+      _compose_project="$(basename "$(dirname "$_compose_file")")"
+
+      # Primary: docker/podman ps --filter label (set by compose v2 on every container)
+      _gw_container="$(
+        "$_runtime_bin_ps" ps \
+          --filter "label=com.docker.compose.project=${_compose_project}" \
+          --filter "label=com.docker.compose.service=gateway" \
+          --format "{{.Names}}" 2>/dev/null \
+        | head -1 || true
+      )"
+
+      # Fallback: match by deterministic compose-v2 name pattern <project>-gateway-1
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "name=^${_compose_project}-gateway-" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # Last resort: any running container whose name contains "gateway"
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "name=gateway" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
       fi
 
       if [[ -z "$_gw_container" ]]; then
-        log_warn "Shape-C bridge-join: gateway container not found via compose ps."
-        log_warn "  This is expected on a fresh install (gateway not yet started)."
-        log_warn "  After starting the stack, run:"
-        log_warn "    ${COMPOSE_CMD[*]} -f ${_compose_file} up --no-deps -d gateway"
+        log_warn "Shape-C bridge-join: gateway container not found via docker ps."
+        log_warn "  Tried: label filter (project=${_compose_project},service=gateway),"
+        log_warn "         name pattern ${_compose_project}-gateway-*, name=gateway."
+        log_warn "  Ensure the stack is running before --onboard for Shape-C agents."
+        log_warn "  After starting the stack, rerun:"
+        log_warn "    bash install.sh --onboard <manifest> --runtime ${YSG_RUNTIME_4WAY:-docker}"
       else
-        log_step "-" "Shape-C: joining gateway to ${_ringfence_net}"
+        log_step "-" "YSG-P3-MCP-BRIDGE-JOIN: joining gateway to ${_ringfence_net}"
 
-        # Determine network connect command based on runtime.
-        local _net_connect_cmd="${COMPOSE_CMD[0]%%[[:space:]]*}"
-        # COMPOSE_CMD[0] is 'docker', 'podman', or 'podman-compose'.
+        # Use the runtime binary we already derived above (_runtime_bin_ps).
         # For network connect we always use the base container runtime (docker/podman).
-        local _runtime_bin="${COMPOSE_CMD[0]%%-compose}"   # strip -compose suffix
-        [[ "$_runtime_bin" == "podman-compose" ]] && _runtime_bin="podman"
-        [[ "$_runtime_bin" == "docker-compose" ]] && _runtime_bin="docker"
+        local _runtime_bin="$_runtime_bin_ps"
 
         # Check if gateway is already connected to the ringfence bridge (idempotent).
         local _already_connected=false
@@ -11053,7 +11112,11 @@ tenant = '${_tenant_id_safe}'
 port = ${_bridge_port}
 desc = {
     'agent_name': agent,
-    'upstream_url': 'http://%s:%d/mcp' % (agent, port),
+    # FIX-UPSTREAM-URL-DOUBLE-MCP (2026-05-30): McpHttpTransport.forward() always
+    # appends path="/mcp" to upstream_url.  Do NOT include /mcp in upstream_url —
+    # the base URL only (http://filesystem:8000).  Adding /mcp here causes
+    # double-path: http://filesystem:8000/mcp/mcp → HTTP 404.
+    'upstream_url': 'http://%s:%d' % (agent, port),
     'tenant_id': tenant,
     'is_filesystem_agent': True,
 }
@@ -11119,6 +11182,15 @@ PYREPLACE
           # Uses `compose up --no-deps gateway` (Captain spec — restarts only gateway,
           # not the entire stack).  Fail-loud: if this fails, the operator gets
           # explicit recovery instructions.
+          #
+          # FIX-COMPOSE-CMD: when invoked via `install.sh --onboard`, COMPOSE_CMD is
+          # not set by the main install flow.  Resolve it on-demand here so the
+          # gateway recreate can proceed in both install-time and standalone --onboard
+          # invocations.
+          # P3 broker E2E gate — J8/J9 gateway-not-reloaded fix (2026-05-30).
+          if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+            resolve_compose_cmd 2>/dev/null || true
+          fi
           log_step "-" "Shape-C: recreating gateway with updated YASHIGANI_MCP_SERVERS env"
           if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
             local _gw_up_rc=0

@@ -175,6 +175,19 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── MCP JWKS — /.well-known/yashigani-mcp-jwks.json (PUBLIC, no auth) ──
+    # Public key retrieval endpoint — no forward_auth gate required.
+    # ASVS V2.6.3; must appear before catch-all handle {} block.
+    # Last updated: 2026-05-30 (P3 broker E2E gate — J8-JWKS fix)
+    handle /.well-known/yashigani-mcp-jwks.json {
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
     handle /mcp/* {
         reverse_proxy https://gateway:8080 {
         import internal-mtls
