@@ -262,7 +262,7 @@ services:
   # ---------------------------------------------------------------------------
   gateway:
     dns_search: ["."]
-    image: yashigani/gateway:${YASHIGANI_VERSION:-2.23.4}
+    image: yashigani/gateway:${YASHIGANI_VERSION:-2.25.0}
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
@@ -416,7 +416,7 @@ services:
   # ---------------------------------------------------------------------------
   backoffice:
     dns_search: ["."]
-    image: yashigani/backoffice:${YASHIGANI_VERSION:-2.23.4}
+    image: yashigani/backoffice:${YASHIGANI_VERSION:-2.25.0}
     build:
       context: ..
       dockerfile: docker/Dockerfile.backoffice
