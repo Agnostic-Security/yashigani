@@ -44,7 +44,7 @@ kind: AgentIntegration
 
 metadata:
   name: git
-  tenant_id: iter4-test
+  tenant_id: replace-with-your-tenant-id   # REQUIRED: replace before onboarding
   description: >-
     Official MCP git server (modelcontextprotocol/servers/src/git).
     Provides git operations against a local workspace mount. No remote git
@@ -153,7 +153,9 @@ spec:
   # operate on the volume regardless of original owner UID.
   storage:
     mounts:
-      - name: ysg_git_iter4_test_git_workspace
+      - name: ysg_git_replace_with_your_tenant_id_git_workspace
+        # ^^^ REPLACE 'replace_with_your_tenant_id' with your tenant_id
+        # (hyphens in tenant_id become underscores)
         type: volume
         container_path: /workspace
         read_only: false     # working tree must be writable; git ops still OPA-gated
