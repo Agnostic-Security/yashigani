@@ -8987,7 +8987,18 @@ _pki_run_issuer() {
   else
     # Runtime manifest exists — merge, preserving bootstrap_token_sha256 fields.
     local _merge_ok=false
-    python3 - "$_canonical_manifest" "$manifest_in" <<'PYMERGE' 2>/dev/null && _merge_ok=true
+    # NEW-BUG-C FIX (cascade audit 2026-05-30):
+    #   (a) Removed 2>/dev/null — stderr captured and echoed via log_info so
+    #       errors surface in the install log instead of being silently swallowed.
+    #   (b) Fixed name-extraction regex: service_identities.yaml uses YAML list
+    #       syntax "  - name: caddy" (list-item), not "  name: caddy" (map key).
+    #       The old regex r'^\s{0,4}name:...' never matched "  - name:" lines
+    #       → runtime_tokens always empty → merge silently produced canonical
+    #       output, erasing all bootstrap_token_sha256 values on every PKI call.
+    #       Fixed regex accepts both "  - name: svc" and "  name: svc" forms.
+    # Strategy: write the Python body to a mktemp file, run once, capture stderr.
+    local _merge_py; _merge_py="$(mktemp)"
+    cat > "$_merge_py" <<'PYMERGE'
 import sys, re
 
 canonical_path, runtime_path = sys.argv[1], sys.argv[2]
@@ -8999,32 +9010,35 @@ with open(runtime_path, encoding='utf-8') as f:
     runtime_text = f.read()
 
 # Extract bootstrap_token_sha256 values from the runtime file.
-# Pattern: lines like "  bootstrap_token_sha256: \"<hex>\"" with non-empty value.
-# We preserve them by name: map service_name -> sha256_value.
-# Strategy: find each service block in runtime, extract name + hash.
-token_re = re.compile(
-    r'^(\s*)bootstrap_token_sha256:\s*"([0-9a-fA-F]{64})"',
-    re.MULTILINE
-)
+# Pattern: lines like "    bootstrap_token_sha256: \"<hex>\"" with non-empty value.
+# We preserve them by service name: map service_name -> sha256_value.
+#
+# BUGFIX (2026-05-30): service_identities.yaml uses YAML list syntax:
+#   services:
+#     - name: caddy
+# The old regex r'^\s{0,4}name:' never matched "  - name:" list-item lines.
+# Updated regex accepts both "  - name: svc" and "  name: svc" forms.
 runtime_tokens = {}
-
-# Associate each token with the preceding service name.
-# Walk line by line.
 current_service = None
 for line in runtime_text.splitlines():
-    name_m = re.match(r'^\s{0,4}name:\s*["\']?(\w[\w\-]*)["\']?', line)
+    # Match "  - name: svc" (list item) or "    name: svc" (map key)
+    name_m = re.match(r'^\s+(?:-\s+)?name:\s*["\']?([\w][\w\-]*)["\']?', line)
     if name_m:
         current_service = name_m.group(1)
     tok_m = re.match(r'^\s+bootstrap_token_sha256:\s*"([0-9a-fA-F]{64})"', line)
     if tok_m and current_service:
         runtime_tokens[current_service] = tok_m.group(1)
 
+if not runtime_tokens:
+    print('pki-merge: no bootstrap_token_sha256 values found in runtime manifest (fresh install or empty runtime)', file=sys.stderr)
+
 # Now rewrite canonical: for each service that has a runtime token, replace
 # the empty bootstrap_token_sha256 placeholder with the runtime value.
 current_service = None
 out_lines = []
+substituted = []
 for line in canonical_text.splitlines():
-    name_m = re.match(r'^\s{0,4}name:\s*["\']?(\w[\w\-]*)["\']?', line)
+    name_m = re.match(r'^\s+(?:-\s+)?name:\s*["\']?([\w][\w\-]*)["\']?', line)
     if name_m:
         current_service = name_m.group(1)
     if current_service and current_service in runtime_tokens:
@@ -9033,6 +9047,7 @@ for line in canonical_text.splitlines():
         if bts_m:
             prefix = bts_m.group(1)
             line = '%s "%s"' % (prefix, runtime_tokens[current_service])
+            substituted.append(current_service)
     out_lines.append(line)
 
 merged_text = '\n'.join(out_lines)
@@ -9041,7 +9056,19 @@ if not merged_text.endswith('\n'):
 
 with open(runtime_path, 'w', encoding='utf-8') as f:
     f.write(merged_text)
+
+print('pki-merge: preserved %d/%d bootstrap_token_sha256 values: %s' % (
+    len(substituted), len(runtime_tokens),
+    ', '.join(substituted) if substituted else '(none)'),
+    file=sys.stderr)
 PYMERGE
+    _merge_ok=false
+    local _merge_log2; _merge_log2="$(mktemp)"
+    python3 "$_merge_py" "$_canonical_manifest" "$manifest_in" 2>"$_merge_log2" && _merge_ok=true
+    if [[ -s "$_merge_log2" ]]; then
+      while IFS= read -r _ml; do log_info "_pki_run_issuer merge: ${_ml}"; done < "$_merge_log2"
+    fi
+    rm -f "$_merge_py" "$_merge_log2"
     if [[ "$_merge_ok" == "true" ]]; then
       log_info "_pki_run_issuer: merged canonical → runtime manifest (bootstrap_token_sha256 values preserved)"
     else
@@ -9664,14 +9691,27 @@ _prepare_secrets_dir_for_pki() {
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     if [[ "$(id -u)" == "0" ]]; then
       # Rootful Podman running as root — plain chown works
-      chown 1001:1001 "$secrets_dir" 2>/dev/null || true
-      log_info "secrets_dir chown 1001:1001 applied (rootful)"
+      chown -R 1001:1001 "$secrets_dir" 2>/dev/null || true
+      log_info "secrets_dir chown -R 1001:1001 applied (rootful)"
     else
-      # Rootless Podman — use podman unshare to map through the user namespace
-      if podman unshare chown 1001:1001 "$secrets_dir" 2>/dev/null; then
-        log_info "secrets_dir chown 1001:1001 applied via podman unshare (rootless)"
+      # Rootless Podman — use podman unshare to map through the user namespace.
+      #
+      # NEW-BUG-B FIX (cascade audit 2026-05-30): the previous call only chowned
+      # the DIRECTORY (secrets_dir), not the FILES inside it.  The installer runs
+      # as host UID 1000 and writes secret files at UID 1000.  The PKI issuer
+      # runs as container UID 1001 (mapped to subuid-range host UID, e.g. 101001).
+      # Mode-0400 files owned by host UID 1000 are unreadable by UID 101001 →
+      # the issuer gets EPERM when reading existing secrets (e.g. on re-issue
+      # or rotate-leaves paths).
+      # Fix: chown the directory AND all files inside it to 1001:1001 via
+      # podman unshare (which maps 1001 through the user-namespace correctly).
+      # Use find + xargs to avoid shell glob limits on large secrets dirs.
+      if podman unshare bash -c "chown 1001:1001 '$secrets_dir' && find '$secrets_dir' -maxdepth 1 -mindepth 1 -exec chown 1001:1001 {} +" 2>/dev/null; then
+        log_info "secrets_dir + files chown 1001:1001 applied via podman unshare (rootless)"
       else
-        log_warn "Could not chown ${secrets_dir} via podman unshare — PKI issuer and all service containers use :U remapping (podman-override.yml); ownership is consistent across the stack"
+        # Fallback: try plain chown on the directory only (rootless without unshare — e.g. old kernel)
+        podman unshare chown 1001:1001 "$secrets_dir" 2>/dev/null \
+          || log_warn "Could not chown ${secrets_dir} via podman unshare — PKI issuer and all service containers use :U remapping (podman-override.yml); ownership is consistent across the stack"
       fi
     fi
   fi
@@ -11120,6 +11160,15 @@ PYEOF
       # is empty (e.g. non-interactive install without --upstream-url).
       # Instead we resolve the container name via `docker/podman ps --filter`
       # which needs no compose-file interpolation.  YSG-P3-MCP-BRIDGE-JOIN-FIX.
+      #
+      # NEW-BUG-A Part 1 FIX (cascade audit 2026-05-30): on standalone --onboard
+      # invocations COMPOSE_CMD is still the empty global.  _runtime_bin_ps would
+      # then default to "docker" even on Podman-only stacks, causing all five
+      # detection tiers to run "docker ps" and find nothing.
+      # Fix: resolve COMPOSE_CMD here, before the detection block.
+      if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+        resolve_compose_cmd 2>/dev/null || true
+      fi
       local _gw_container=""
       local _runtime_bin_ps="${COMPOSE_CMD[0]:-docker}"
       # strip -compose suffix: "docker-compose" → "docker", "podman-compose" → "podman"

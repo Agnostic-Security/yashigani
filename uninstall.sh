@@ -1183,10 +1183,18 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
         _secrets_verify() {
             # Returns 0 (success) when secrets_dir has no remaining files.
             local _d="$1"
-            # find -maxdepth 1 -not -name . lists immediate children.
-            # If output is non-empty → files still present (return 1).
+            # NEW-BUG-E FIX (cascade audit 2026-05-30): the old expression
+            #   find DIR -maxdepth 1 -not -name .
+            # ALWAYS returns at least one line — the directory's own absolute
+            # path — because -not -name . only excludes the "." entry returned
+            # when find descends into the dir, NOT the initial DIR argument at
+            # depth 0.  On BSD/macOS find, `find /a/b -maxdepth 1 -not -name .`
+            # always outputs "/a/b" even when the directory is empty.
+            # This made _secrets_verify always return 1 (fail), so Tier-1 and
+            # Tier-2 always appeared to fail and all three tiers ran every time.
+            # Fix: use -mindepth 1 which truly restricts to children only.
             local _found
-            _found="$(find "${_d}" -maxdepth 1 -not -name . 2>/dev/null | head -1)"
+            _found="$(find "${_d}" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)"
             [ -z "$_found" ]
         }
 

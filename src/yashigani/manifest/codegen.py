@@ -550,8 +550,15 @@ def _gen_compose_override(
     if runtime == "podman-rootless":
         rootless_note = "      # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
 
-    # L7: depends_on — ringfence-init must complete before agent starts
+    # L7: depends_on — ringfence-init must complete before agent starts.
+    # NEW-BUG-F FIX (cascade audit 2026-05-30): ringfence-init-<agent> is NOT
+    # generated for podman-rootless (L1 gap — CAP_NET_ADMIN unavailable rootless).
+    # Emitting depends_on for a service that doesn't exist causes podman-compose
+    # to raise KeyError on 'ringfence-init-<agent>' during `compose up`.
+    # Gate: only emit depends_on when the init sidecar is actually generated
+    # (i.e. runtime != "podman-rootless").
     init_svc = "ringfence-init-%s" % agent_name
+    emit_depends_on = runtime != "podman-rootless"
 
     # W3-F1: emit BOTH the isolated ringfence bridge and caddy_internal.
     # Replicates the existing <agent>_isolated pattern at docker-compose.yml:2405-2413
@@ -559,6 +566,15 @@ def _gen_compose_override(
     # enable_ipv6:false).  The ringfence bridge provides L2 default-deny
     # containment; caddy_internal is the only bridge that reaches Caddy egress.
     ringfence_bridge = "ringfence_%s" % agent_name
+
+    depends_on_lines: list[str] = []
+    if emit_depends_on:
+        depends_on_lines = [
+            "    # L7 — block on ringfence-init completion",
+            "    depends_on:",
+            "      %s:" % init_svc,
+            "        condition: service_completed_successfully",
+        ]
 
     lines = [
         _header_comment(manifest_hash, runtime),
@@ -581,10 +597,7 @@ def _gen_compose_override(
         "    sysctls:",
         "      net.ipv6.conf.all.disable_ipv6: 1",
         "      net.ipv6.conf.default.disable_ipv6: 1",
-        "    # L7 — block on ringfence-init completion",
-        "    depends_on:",
-        "      %s:" % init_svc,
-        "        condition: service_completed_successfully",
+    ] + depends_on_lines + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
         "# W3-F1: isolated ringfence bridge — L2 default-deny containment (YSG-RISK-055)",
@@ -1476,8 +1489,12 @@ def _gen_compose_override_shape_c(
     volumes_section = "\n".join(volume_mounts_lines)
     tmpfs_section = "\n".join(tmpfs_mounts_lines)
 
-    # L7: depends_on ringfence-init
+    # L7: depends_on ringfence-init.
+    # NEW-BUG-F FIX (cascade audit 2026-05-30): same gate as Shape A.
+    # ringfence-init-<agent> is NOT generated for podman-rootless (L1 gap).
+    # Emitting depends_on for a non-existent service → KeyError in podman-compose.
     init_svc = "ringfence-init-%s" % agent_name
+    emit_depends_on = runtime != "podman-rootless"
 
     # L1 isolated bridge (internal: true) — no caddy_internal (egress NONE)
     ringfence_bridge = "ringfence_%s" % agent_name
@@ -1567,10 +1584,14 @@ def _gen_compose_override_shape_c(
         "        reservations:",
         "          cpus: '%s'" % _SC_CPU_REQUEST,
         "          memory: %s" % _SC_MEM_REQUEST,
-        "    # L7 — block on ringfence-init completion",
-        "    depends_on:",
-        "      %s:" % init_svc,
-        "        condition: service_completed_successfully",
+    ] + (
+        [
+            "    # L7 — block on ringfence-init completion",
+            "    depends_on:",
+            "      %s:" % init_svc,
+            "        condition: service_completed_successfully",
+        ] if emit_depends_on else []
+    ) + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
         "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
