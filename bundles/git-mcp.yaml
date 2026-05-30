@@ -60,14 +60,25 @@ spec:
   image:
     repository: registry.yashigani.internal/bundles/mcp-git
     tag: "latest"
-    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-    # ^^^ REPLACE with real digest from: scripts/build-git-mcp.sh --platform linux/<arch>
+    digest: "sha256:4ac73c6ef53f0901ec1b50fbf754986687ff5d77646813e9c0edd65a751d9a19"
+    # Built 2026-05-30 by scripts/build-git-mcp.sh --platform linux/arm64.
+    # End-to-end smoke verified: POST /mcp initialize + tools/call git_status
+    # both succeed on an empty volume (launcher initialises the workspace
+    # as a git repo at first start).
 
   # Shape-C subprocess: GIT-TM-001 — --repository /workspace HARDCODED.
   # Without this arg the upstream's validate_repo_path is a no-op and any path
   # passed at tool-call time is accepted (workspace-escape).
+  #
+  # The launcher (/usr/local/bin/git-mcp-launcher) baked into the image first
+  # idempotently `git init -q -b main /workspace` (no-op if .git already exists)
+  # then exec's `python -m mcp_server_git "$@"`.  Required because the upstream
+  # server exits at startup when --repository points at a non-repo, and the
+  # codegen-emitted volume is empty on first onboard.  Bridge's
+  # YASHIGANI_MCP_SUBPROCESS_COMMAND is space-split, so the launcher MUST be a
+  # single token (no shell wrapping).
   subprocess:
-    command: ["python", "-m", "mcp_server_git"]
+    command: ["/usr/local/bin/git-mcp-launcher"]
     args:
       - "--repository"
       - "/workspace"

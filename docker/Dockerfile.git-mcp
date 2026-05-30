@@ -107,6 +107,24 @@ RUN mkdir -p /etc/yashigani \
 # it was originally populated (owner UID mismatch guard).
 RUN git config --system safe.directory /workspace
 
+# Workspace-init launcher: mcp-server-git requires --repository to point at a
+# valid git repo at startup; without one the subprocess exits at first launch.
+# The codegen-emitted workspace volume is empty on first onboard, so we provide
+# a tiny launcher that idempotently `git init`s the workspace then exec's the
+# real server.  Bundle YAML's subprocess.command points at this launcher.
+#
+# The launcher is intentionally minimal:
+#  - `git init -q -b main /workspace` (or no-op if already initialised)
+#  - `exec` to replace the shell with the python process (PID 1 semantics,
+#    signal forwarding, no extra layer in the process tree).
+#  - args after the launcher path are passed through to mcp_server_git.
+#
+# The bridge's YASHIGANI_MCP_SUBPROCESS_COMMAND is space-split (no quoting),
+# so the launcher is a single token and any args after it are individual
+# space-separated tokens — matches the contract.
+RUN printf '#!/bin/sh\nset -e\nif [ ! -d "/workspace/.git" ]; then\n  git init -q -b main /workspace 2>/dev/null || true\nfi\nexec /usr/local/bin/python -m mcp_server_git "$@"\n' > /usr/local/bin/git-mcp-launcher \
+ && chmod 0755 /usr/local/bin/git-mcp-launcher
+
 # Install mcp-server-git at exact version with hash verification.
 # Laura GIT-TM-003 HARD GATE: immediately after mcp-server-git install, force
 # gitpython==3.1.50 to override the loose >=3.1.45 constraint.
@@ -128,13 +146,15 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" \
 # Verify gitpython is exactly 3.1.50 — exits non-zero if version does not match.
 # Laura GIT-TM-003: this RUN step is the build-time assertion.
 # A loose transitive re-install would be caught here before the image is tagged.
+#
+# We assert via `import git` (the gitpython module's own __version__), NOT via
+# `pip show` — the previous RUN uninstalled pip itself, so `python3 -m pip show`
+# fails with "no module named pip" and stdout is empty regardless of whether
+# gitpython is actually installed.  `import git; git.__version__` is independent
+# of pip and the canonical version source.
 RUN python3 -c "\
-import subprocess, sys; \
-result = subprocess.run(['python3', '-m', 'pip', 'show', 'gitpython'], \
-  capture_output=True, text=True); \
-lines = {l.split(': ')[0]: l.split(': ')[1].strip() \
-  for l in result.stdout.splitlines() if ': ' in l}; \
-ver = lines.get('Version', ''); \
+import sys, git; \
+ver = git.__version__; \
 print(f'gitpython version: {ver}'); \
 sys.exit(0 if ver == '3.1.50' else 1)\
 " || (echo 'FATAL: gitpython version != 3.1.50 — GIT-TM-003 violated' >&2 && exit 1)
