@@ -2,6 +2,25 @@
 
 Measured on the live e2e box (host Docker, RTX 3060 via nvidia CDI). Method: `ollama` `/api/generate` (stream=false), one warm run per model, `num_predict=120`. Raw data: `testing_runs/metrics/llm-bench-20260530/llm_bench.csv`.
 
+## ⚠️ Methodology, definitions & caveats (read first)
+
+We size and recommend on **measured data, not gut feeling** — so it matters exactly what was and wasn't measured:
+
+**What we measured (data):** generation throughput (tok/s), prompt-eval/prefill speed (tok/s), VRAM/disk footprint, concurrency scaling, and sustained-load latency (p50/p95/p99). Every number here is from this box.
+
+**What "best" vs "most lightweight" mean:**
+- *Most lightweight* = the smallest-VRAM / fastest model that **adequately** does the job for that function.
+- *Best* = the **highest-capability model that still fits 12 GB and runs at interactive speed** — which is why 14B-class models (qwen3:14b, phi4, deepseek-r1:14b) are **excluded from "best"**: at 11–23 tok/s they're too slow for interactive use, regardless of quality.
+- **"Best" is a capability judgement — NOT a measured quality score.** It's inferred from model reputation/family + parameter size + the measured speed/footprint. We did **not** measure answer quality/accuracy.
+
+**NOT yet tested / estimated (treat as caveats, not facts):**
+1. **Output quality / accuracy — UNTESTED.** No task-accuracy eval was run; "best" quality is reputation-based. A per-tier eval (classification accuracy for inspection, answer quality for chat, code pass-rate for dev) is needed to make "best" data-backed. *(Can build this.)*
+2. **Single-run throughput.** tok/s is one warm run per model, not averaged over many — expect ±10–15%.
+3. **`qwen2.5-coder:7b` tok/s is estimated** (≈ qwen2.5:7b, 65 tok/s) — its bench rate-parse failed; VRAM was captured.
+4. **Other-GPU numbers are extrapolations**, not measured (only the RTX 3060 + GTX 1060 were benchmarked). See the capacity doc; validate by benchmarking the client's actual card.
+5. **Quality vs prompt size / long context untested** — measured with short prompts + ~120–200 token outputs.
+6. Models confirmed to **pull + run** in Ollama on this box; not validated inside Yashigani's live pipeline (gateway/inspection wiring) per-model.
+
 | model | tier | gen tok/s | prompt tok/s | VRAM | disk |
 |---|---|---:|---:|---:|---|
 | qwen2.5:0.5b | inspection | **371** | 4221 | 1.6 GB | 0.4 GB |
@@ -91,7 +110,7 @@ All pull+run in Ollama. VRAM ≈ disk size + KV cache (the live `vram_mb` readin
 
 ## ⭐ Recommended model MIX (client-facing)
 
-> **How to read "best" vs "most lightweight":** *lightweight* = smallest VRAM / fastest that adequately does the job; *best* = highest **capability/quality that still fits 12 GB and runs at interactive speed** (so 14B models that drop to 11–23 tok/s are excluded). **Caveat:** these benchmarks measured **throughput, prompt-speed, and VRAM — not output quality.** "Best" is therefore a capability judgement (model reputation + size + measured speed), **not an empirical quality score.** For a data-backed quality ranking, run a per-tier accuracy eval (task set) — not yet done. tok/s figures are gen-rate unless noted;  is estimated (≈ qwen2.5:7b 65 tok/s — coder-bench rate-parse failed, VRAM captured).
+> **How to read "best" vs "most lightweight":** *lightweight* = smallest VRAM / fastest that adequately does the job; *best* = highest **capability/quality that still fits 12 GB and runs at interactive speed** (so 14B models that drop to 11–23 tok/s are excluded). **Caveat:** these benchmarks measured **throughput, prompt-speed, and VRAM — not output quality.** "Best" is therefore a capability judgement (model reputation + size + measured speed), **not an empirical quality score.** For a data-backed quality ranking, run a per-tier accuracy eval (task set) — not yet done. tok/s figures are gen-rate unless noted; `qwen2.5-coder:7b` is estimated (≈ qwen2.5:7b 65 tok/s — coder-bench rate-parse failed, VRAM captured).
 
 
 A **mix**, not one model — pick best vs lightweight per function. All Ollama-runnable; sizing assumes one RTX 3060-class 12 GB card.
