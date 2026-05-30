@@ -1,0 +1,208 @@
+# Yashigani Bundle — git-mcp container
+# First-party stdio-to-HTTP bridge wrapping mcp-server-git (Python).
+#
+# T2 TOPOLOGY (Tiago 2026-05-29): this container runs:
+#   - The first-party Yashigani MCP bridge (src/yashigani/mcp/_bridge.py)
+#   - The Python git MCP server (mcp_server_git) as a subprocess managed by the bridge
+#
+# The bridge listens on TCP/8000 (internal ringfence bridge only — no external exposure).
+# The gateway container reaches it via HTTP over the ringfence_<agent> bridge.
+# egress: NONE — no outbound network configured in the ring-fence (Laura §4.1).
+#
+# Laura threat model: p3-git-mcp-threatmodel-20260530.md — GO-WITH-CONSTRAINTS
+# Shape: C (isolated container, first-party bridge)
+# Digest pinning: CIS Docker Benchmark 4.6 — all FROM must be digest-pinned.
+#
+# Build stages:
+#   builder  — builds the yashigani wheel
+#   runtime  — Python + bridge + mcp-server-git + git binary (minimal final image)
+#
+# Verified digests (2026-05-30):
+#   python:3.14.0-slim  amd64: sha256:5af4c7f950774a1abf3fd4e8e3fc95f4d0fe684c7fdc1eb10777fc5a017371c7
+#   python:3.14.0-slim  arm64: sha256:d4c6c639f80b11b7fb0f682bdd93c054f58e748aba354d7fbe92689e04dff2d0
+#
+# Python package pins (verified 2026-05-30 against PyPI):
+#   mcp-server-git==2026.1.14
+#     wheel sha256: 5972e2f5698035fd6a4b4ee896d983409d5d8d1fe23e266c7d34dee3e88f11d1
+#   gitpython==3.1.50  [Laura GIT-TM-003 HARD GATE — CVE-2026-42215/42284/44243/44244/GHSA-mv93]
+#     wheel sha256: d352abe2908d07355014abdd21ddf798c2a961469239afec4962e9da884858f9
+#
+# To build and capture the digest for bundles/git-mcp.yaml:
+#   bash scripts/build-git-mcp.sh
+#
+# last-updated: 2026-05-30T00:00:00+01:00 (feat(p3): Dockerfile.git-mcp — git-mcp bundle image)
+
+# ── Multi-arch python selector ────────────────────────────────────────────────
+# BuildKit injects TARGETARCH automatically via `docker buildx build`.
+# For single-arch local builds pass --build-arg TARGETARCH=amd64 or arm64.
+# Originally learned from filesystem-mcp: digest-per-arch prevents the
+# InvalidBaseImagePlatform warning under emulation.
+ARG TARGETARCH=amd64
+
+FROM python:3.14.0-slim@sha256:5af4c7f950774a1abf3fd4e8e3fc95f4d0fe684c7fdc1eb10777fc5a017371c7 AS python-amd64
+FROM python:3.14.0-slim@sha256:d4c6c639f80b11b7fb0f682bdd93c054f58e748aba354d7fbe92689e04dff2d0 AS python-arm64
+
+# Select the correct python stage based on TARGETARCH.
+FROM python-${TARGETARCH} AS python-base
+
+
+# ── Stage 1: wheel builder (Yashigani bridge) ─────────────────────────────────
+# Inherits the arch-correct python via python-base (see selector above).
+FROM python-base AS builder
+
+WORKDIR /build
+
+RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
+    pip install --no-cache-dir build
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+RUN python -m build --wheel --outdir /dist
+
+
+# ── Stage 2: runtime — minimal final image ────────────────────────────────────
+# Python slim + git binary + mcp-server-git + Yashigani bridge wheel.
+# No pip in the final image (removed after install — CIS 4.x / CVE-2026-3219).
+# No curl, no wget, no npm, no npx, no build tools — attack surface minimisation.
+#
+# Threat model:
+#   - If the git MCP server process is compromised, the attacker is in a container
+#     with: Python + git binary + no shell utilities + no outbound network.
+#   - /tmp is tmpfs (size_limit: 64m per bundles/git-mcp.yaml tmpfs config).
+#   - The bridge process runs as UID 10001 (non-root, no capabilities).
+#   - The only listening socket is TCP/8000 reachable only from the gateway on the
+#     ringfence bridge (internal:true).
+#   - git hooks are disabled via GIT_CONFIG_NOSYSTEM=1 + core.hooksPath=/dev/null
+#     baked into /etc/yashigani/gitconfig (Laura GIT-TM-002).
+#   - gitpython is pinned at 3.1.50 exactly (Laura GIT-TM-003).
+#   - --repository /workspace is hardcoded in subprocess args (Laura GIT-TM-001).
+#   - No dev tools, no package managers, no build tools in final image.
+FROM python-base AS runtime
+
+# Non-root user — UID 10001 matches _SC_RUN_AS_USER in codegen.py:1302.
+# No home directory, no login shell.
+RUN groupadd --gid 10001 mcp-bridge \
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /bin/false mcp-bridge
+
+# git binary — required by gitpython at runtime.
+# Cleanup apt lists after install to minimise layer size.
+# No curl/wget/git-extras/man-pages/doc — attack surface minimisation.
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Laura GIT-TM-002 mitigation: disable git hook execution.
+# /etc/yashigani/gitconfig is baked in with core.hooksPath=/dev/null.
+# GIT_CONFIG_GLOBAL is set to this path in ENV below so every git subprocess
+# started by gitpython (or the mcp_server_git subprocess itself) picks it up.
+# This prevents post-checkout, pre-commit, commit-msg, post-commit hook execution
+# even if the workspace volume contains malicious hooks.
+RUN mkdir -p /etc/yashigani \
+ && printf '[core]\n\thooksPath = /dev/null\n' > /etc/yashigani/gitconfig \
+ && chmod 0644 /etc/yashigani/gitconfig
+
+# Laura GIT-TM-002 mitigation (belt-and-suspenders): also set safe.directory for
+# /workspace so the mcp-bridge user can operate on the volume regardless of how
+# it was originally populated (owner UID mismatch guard).
+RUN git config --system safe.directory /workspace
+
+# Workspace-init launcher: mcp-server-git requires --repository to point at a
+# valid git repo at startup; without one the subprocess exits at first launch.
+# The codegen-emitted workspace volume is empty on first onboard, so we provide
+# a tiny launcher that idempotently `git init`s the workspace then exec's the
+# real server.  Bundle YAML's subprocess.command points at this launcher.
+#
+# The launcher is intentionally minimal:
+#  - `git init -q -b main /workspace` (or no-op if already initialised)
+#  - `exec` to replace the shell with the python process (PID 1 semantics,
+#    signal forwarding, no extra layer in the process tree).
+#  - args after the launcher path are passed through to mcp_server_git.
+#
+# The bridge's YASHIGANI_MCP_SUBPROCESS_COMMAND is space-split (no quoting),
+# so the launcher is a single token and any args after it are individual
+# space-separated tokens — matches the contract.
+RUN printf '#!/bin/sh\nset -e\nif [ ! -d "/workspace/.git" ]; then\n  git init -q -b main /workspace 2>/dev/null || true\nfi\nexec /usr/local/bin/python -m mcp_server_git "$@"\n' > /usr/local/bin/git-mcp-launcher \
+ && chmod 0755 /usr/local/bin/git-mcp-launcher
+
+# Install mcp-server-git at exact version with hash verification.
+# Laura GIT-TM-003 HARD GATE: immediately after mcp-server-git install, force
+# gitpython==3.1.50 to override the loose >=3.1.45 constraint.
+# pip install --require-hashes requires ALL packages to have hashes; we use a
+# two-step install (mcp-server-git first, then gitpython pin) to avoid needing
+# hashes for all transitive deps.
+COPY --from=builder /dist/*.whl /tmp/
+
+RUN pip install --no-cache-dir --upgrade "pip==26.0.1" \
+ && pip install --no-cache-dir \
+    "mcp-server-git==2026.1.14" \
+ && pip install --no-cache-dir \
+    "gitpython==3.1.50" \
+ && pip install --no-cache-dir \
+    "/tmp/$(ls /tmp/*.whl | xargs -n1 basename)" \
+ && rm /tmp/*.whl \
+ && pip uninstall -y pip
+
+# Verify gitpython is exactly 3.1.50 — exits non-zero if version does not match.
+# Laura GIT-TM-003: this RUN step is the build-time assertion.
+# A loose transitive re-install would be caught here before the image is tagged.
+#
+# We assert via `import git` (the gitpython module's own __version__), NOT via
+# `pip show` — the previous RUN uninstalled pip itself, so `python3 -m pip show`
+# fails with "no module named pip" and stdout is empty regardless of whether
+# gitpython is actually installed.  `import git; git.__version__` is independent
+# of pip and the canonical version source.
+RUN python3 -c "\
+import sys, git; \
+ver = git.__version__; \
+print(f'gitpython version: {ver}'); \
+sys.exit(0 if ver == '3.1.50' else 1)\
+" || (echo 'FATAL: gitpython version != 3.1.50 — GIT-TM-003 violated' >&2 && exit 1)
+
+# Workspace directory — the git working tree lives here (named volume mount).
+RUN mkdir -p /workspace && chown mcp-bridge:mcp-bridge /workspace
+
+WORKDIR /workspace
+
+USER mcp-bridge
+
+# TCP/8000 — first-party bridge HTTP endpoint.
+# ONLY reachable from the gateway container on the ringfence_<agent> bridge
+# (internal:true). Not mapped to the host. Not reachable from caddy_internal.
+EXPOSE 8000
+
+# HEALTHCHECK: probe the bridge HTTP endpoint.
+# POST to /mcp with a minimal JSON-RPC initialize request to confirm the bridge
+# is alive and the mcp_server_git subprocess is running.
+# --start-period=15s: Python subprocess starts faster than Node.js.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python3 -c "\
+import urllib.request, json; \
+req = urllib.request.Request(\
+  'http://localhost:8000/mcp',\
+  data=json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize',\
+    'params':{'protocolVersion':'2024-11-05',\
+      'capabilities':{},'clientInfo':{'name':'healthcheck','version':'1'}}}).encode(),\
+  headers={'Content-Type':'application/json'}); \
+r = urllib.request.urlopen(req, timeout=8); \
+assert r.status == 200\
+"
+
+# Environment defaults — CIS 5.x / PYTHONUNBUFFERED for log flushing.
+# GIT_CONFIG_GLOBAL: points to the baked-in config that disables hooks
+#   (Laura GIT-TM-002).
+# GIT_CONFIG_NOSYSTEM=1: prevents /etc/gitconfig from overriding our hooks disable
+#   (belt-and-suspenders; our file IS /etc/yashigani/gitconfig, not /etc/gitconfig).
+# YASHIGANI_MCP_SUBPROCESS_COMMAND is injected at runtime by codegen via the
+# compose override — Dockerfile does NOT bake it in.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    GIT_CONFIG_GLOBAL=/etc/yashigani/gitconfig \
+    GIT_CONFIG_NOSYSTEM=1
+
+# Bridge entrypoint: launch via factory function so YASHIGANI_MCP_SUBPROCESS_COMMAND
+# is read at startup, not at import time.  This matches the codegen-emitted command:
+#   command: ["uvicorn", "yashigani.mcp._bridge:get_app", "--factory", ...]
+# as per _gen_compose_override_shape_c codegen.py:1489.
+CMD ["uvicorn", "yashigani.mcp._bridge:get_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

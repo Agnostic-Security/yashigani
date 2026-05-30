@@ -519,17 +519,22 @@ async def _proxy_request_body(
                 endpoint_ratelimit_violations_total.labels(path=ep_result.endpoint_hash[:8]).inc()
             except Exception:
                 logger.debug("proxy: metric increment failed for endpoint_ratelimit_violations_total", exc_info=True)
+            # BUG-8-FIX (Ava 2026-05-30): EndpointRLResult uses field name
+            # `retry_after` (Optional[int]), not `retry_after_seconds`.
+            # The old reference raised AttributeError → ASGI returned 500
+            # instead of 429 on rate-limit triggers.
+            _ep_retry = ep_result.retry_after or 1
             return JSONResponse(
                 status_code=429,
                 content={
                     "error": "ENDPOINT_RATE_LIMIT_EXCEEDED",
                     "endpoint": norm_path,
                     "request_id": request_id,
-                    "retry_after_seconds": ep_result.retry_after_seconds,
+                    "retry_after_seconds": _ep_retry,
                 },
                 headers={
                     "X-Yashigani-Request-Id": request_id,
-                    "Retry-After": str(ep_result.retry_after_seconds),
+                    "Retry-After": str(_ep_retry),
                 },
             )
 

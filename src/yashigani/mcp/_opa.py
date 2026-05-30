@@ -74,6 +74,9 @@ MCP_OPA_PATH = "/v1/data/yashigani/mcp/mcp_decision"
 # The broker queries this for any Shape-C / mcp_server agent AFTER the global
 # mcp_decision allow; a deny here aborts the call with fs_tool_not_permitted.
 MCP_FS_TOOL_OPA_PATH = "/v1/data/yashigani/mcp/filesystem_tool_allowed"
+# Git-specific tool-gating OPA path (P3-GIT / GIT-TM-001..004).
+# Queried for agents with is_git_agent=True after mcp_decision allow.
+MCP_GIT_TOOL_OPA_PATH = "/v1/data/yashigani/mcp/git_tool_allowed"
 OPA_TIMEOUT_SECONDS = 0.5   # 500ms — C9 requirement
 
 
@@ -450,6 +453,7 @@ async def query_mcp_decision(
 # FIX-P3-ENFORCE / Iris F2 — filesystem tool-gating runtime query
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FsToolDecisionResult:
     """
@@ -591,6 +595,148 @@ async def query_filesystem_tool_allowed(
         return FsToolDecisionResult(
             allowed=False,
             deny_reason="fs_opa_unreachable",
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+        )
+    finally:
+        if own_client and http_client is not None:
+            try:
+                await http_client.aclose()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# P3-GIT / GIT-TM-001..004 — git tool-gating runtime query
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GitToolDecisionResult:
+    """
+    Result of querying data.yashigani.mcp.git_tool_allowed.
+
+    allowed: True when the tool call is permitted by the git-specific OPA rules.
+             False on any deny or error (fail-closed).
+    deny_reason: string label for the deny case (audit).
+    error: set when the query failed (OPA unreachable, timeout, etc.).
+    elapsed_ms: query round-trip time.
+    """
+
+    allowed: bool
+    deny_reason: str
+    elapsed_ms: int
+    error: Optional[str] = None
+
+
+async def query_git_tool_allowed(
+    opa_url: str,
+    tool_name: str,
+    tool_args: Optional[dict] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> GitToolDecisionResult:
+    """
+    P3-GIT — query OPA git_tool_allowed at runtime.
+
+    Second OPA gate for git MCP-server agents.  Executes AFTER
+    query_mcp_decision returns allow=True and ONLY for agents whose registry
+    entry has is_git_agent=True.
+
+    Input document shape:
+        {"input": {"tool": {"name": ..., "args": {...}}}}
+
+    Implements GIT-TM-001 (repo_path boundary), GIT-TM-004 (timestamp
+    option injection guard) via the mcp.rego git_tool_allowed rule.
+
+    Fail-closed: any error (OPA unreachable, timeout, HTTP error, undefined
+    rule) returns allowed=False.  Never raises.
+    """
+    t0 = time.monotonic()
+    url = f"{opa_url.rstrip('/')}{MCP_GIT_TOOL_OPA_PATH}"
+    own_client = http_client is None
+
+    normalised_args = _normalize_tool_args(tool_args) or {}
+
+    input_doc = {
+        "input": {
+            "tool": {
+                "name": tool_name,
+                "args": normalised_args,
+            }
+        }
+    }
+
+    try:
+        if own_client:
+            http_client = _make_opa_http_client()
+
+        assert http_client is not None
+        resp = await http_client.post(url, json=input_doc)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        resp.raise_for_status()
+        raw = resp.json()
+
+        result_val = raw.get("result")
+        if result_val is True:
+            logger.debug(
+                "mcp-broker: [P3-GIT] git_tool_allowed=true tool=%s elapsed_ms=%d",
+                tool_name, elapsed_ms,
+            )
+            return GitToolDecisionResult(
+                allowed=True,
+                deny_reason="ok",
+                elapsed_ms=elapsed_ms,
+            )
+
+        if result_val is False or result_val is None:
+            logger.info(
+                "mcp-broker: [P3-GIT] git_tool_allowed=false tool=%s elapsed_ms=%d",
+                tool_name, elapsed_ms,
+            )
+
+        return GitToolDecisionResult(
+            allowed=False,
+            deny_reason="git_tool_not_permitted",
+            elapsed_ms=elapsed_ms,
+            error=None if result_val is False else "OPA returned undefined result for git_tool_allowed",
+        )
+
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [P3-GIT] OPA timeout querying git_tool_allowed tool=%s — "
+            "fail-closed",
+            tool_name,
+        )
+        return GitToolDecisionResult(
+            allowed=False,
+            deny_reason="git_opa_timeout",
+            elapsed_ms=elapsed_ms,
+            error=f"OPA timeout after {elapsed_ms}ms",
+        )
+    except httpx.HTTPStatusError as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [P3-GIT] OPA HTTP error %d querying git_tool_allowed tool=%s — "
+            "fail-closed",
+            exc.response.status_code, tool_name,
+        )
+        return GitToolDecisionResult(
+            allowed=False,
+            deny_reason="git_opa_http_error",
+            elapsed_ms=elapsed_ms,
+            error=f"OPA returned HTTP {exc.response.status_code}",
+        )
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [P3-GIT] OPA unreachable querying git_tool_allowed tool=%s "
+            "error=%s — fail-closed",
+            tool_name, exc,
+        )
+        return GitToolDecisionResult(
+            allowed=False,
+            deny_reason="git_opa_unreachable",
             elapsed_ms=elapsed_ms,
             error=str(exc),
         )

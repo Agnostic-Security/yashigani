@@ -763,3 +763,170 @@ filesystem_deny_reason := "fs_list_allowed_directories_denied" if {
 }
 
 default filesystem_deny_reason := "fs_tool_not_permitted"
+
+# ===========================================================================
+# §P3-GIT — git MCP-server per-tool authorisation (GIT-TM-001..004)
+#
+# Called from the gateway broker's second OPA gate after a global
+# mcp_decision allow.  Fail-closed: default := false.
+#
+# Tool sets:
+#   _git_read_tools  — 7 read-only tools (always permitted)
+#   _git_write_tools — 5 mutating tools (only when write_posture=readwrite)
+#
+# Helpers:
+#   _git_repo_path_safe(args)  — GIT-TM-001 belt-and-suspenders path guard
+#   _git_timestamp_safe(ts)    — GIT-TM-004 git_log option injection guard
+# ===========================================================================
+
+# Read-only tools (Laura §5 — default posture)
+_git_read_tools := {
+    "git_status",
+    "git_diff_unstaged",
+    "git_diff_staged",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_init",
+}
+
+# Mutating tools — denied by default; permitted only with write_posture=readwrite
+_git_write_tools := {
+    "git_add",
+    "git_commit",
+    "git_reset",
+    "git_checkout",
+    "git_create_branch",
+}
+
+# ---------------------------------------------------------------------------
+# _git_repo_path_safe — GIT-TM-001 belt-and-suspenders path guard
+#
+# The upstream server enforces --repository /workspace when the arg is
+# present.  OPA enforces the path boundary as a second layer:
+#   - Must start with /workspace
+#   - Must not contain ../ (traversal)
+#   - Must not contain %2e (percent-encoded dot — decoded upstream by broker)
+#   - Must not contain %2f (percent-encoded slash)
+# When args.repo_path is absent (upstream uses the configured default),
+# OPA passes — the subprocess --repository /workspace is the binding
+# constraint (GIT-TM-001).
+# ---------------------------------------------------------------------------
+
+_git_repo_path_safe(args) if {
+    not args.repo_path
+}
+
+_git_repo_path_safe(args) if {
+    is_string(args.repo_path)
+    startswith(args.repo_path, "/workspace")
+    not contains(args.repo_path, "../")
+    not contains(lower(args.repo_path), "%2e")
+    not contains(lower(args.repo_path), "%2f")
+}
+
+# ---------------------------------------------------------------------------
+# _git_timestamp_safe — GIT-TM-004 git_log option injection guard
+#
+# git_log passes start_timestamp / end_timestamp directly to repo.git.log()
+# as argv elements via ['--since', ts, '--until', ts].  A value beginning
+# with '--' injects a git top-level option (e.g. --exec-path).
+# Reject: anything starting with '-', and percent-encoded equivalents.
+# Allow: null/absent, ISO 8601 dates, git relative date strings.
+# Allowlist pattern: [A-Za-z0-9 .:+\-/]+ (no leading dashes, no control chars)
+# ---------------------------------------------------------------------------
+
+_git_timestamp_safe(ts) if {
+    ts == null
+}
+
+_git_timestamp_safe(ts) if {
+    not ts
+}
+
+_git_timestamp_safe(ts) if {
+    is_string(ts)
+    not startswith(ts, "-")
+    not contains(lower(ts), "%2d")
+    regex.match(`^[A-Za-z0-9 .:+\-/]+$`, ts)
+}
+
+# ---------------------------------------------------------------------------
+# git_tool_allowed — compound git tool decision
+#
+# Fail-closed: default := false catches any unmatched combination.
+# ---------------------------------------------------------------------------
+
+default git_tool_allowed := false
+
+# Read tools: PERMIT with repo_path validation.
+git_tool_allowed if {
+    input.tool.name in _git_read_tools
+    not input.tool.name == "git_log"
+    _git_repo_path_safe(input.tool.args)
+}
+
+# git_log: additionally validate timestamp args (GIT-TM-004)
+# BUG-7-FIX (Ava 2026-05-30): use object.get() to default absent timestamp fields
+# to null before passing to _git_timestamp_safe.  In OPA, accessing an absent
+# key via input.tool.args.start_timestamp yields `undefined`, and passing
+# undefined to a function that only handles null/string caused the entire rule
+# body to be undefined → git_tool_allowed=false even for valid calls without
+# timestamps.  Fix: object.get(args, key, null) guarantees the argument is
+# either a string or null — both handled by _git_timestamp_safe.
+git_tool_allowed if {
+    input.tool.name == "git_log"
+    _git_repo_path_safe(input.tool.args)
+    _git_timestamp_safe(object.get(input.tool.args, "start_timestamp", null))
+    _git_timestamp_safe(object.get(input.tool.args, "end_timestamp", null))
+}
+
+# Write tools: PERMIT only when write_posture=readwrite.
+# Operator sets via data bundle: PUT /v1/data/yashigani/mcp/git_write_posture "readwrite"
+_git_write_posture := p if {
+    p := data.yashigani.mcp.git_write_posture
+} else := "readonly"
+
+git_tool_allowed if {
+    input.tool.name in _git_write_tools
+    _git_write_posture == "readwrite"
+    _git_repo_path_safe(input.tool.args)
+}
+
+# ---------------------------------------------------------------------------
+# git_deny_reason — reason string for denied git tool calls
+# ---------------------------------------------------------------------------
+
+git_deny_reason := "git_repo_path_traversal_attempt" if {
+    not git_tool_allowed
+    is_string(input.tool.args.repo_path)
+    contains(input.tool.args.repo_path, "../")
+}
+
+git_deny_reason := "git_repo_path_outside_workspace" if {
+    not git_tool_allowed
+    is_string(input.tool.args.repo_path)
+    not startswith(input.tool.args.repo_path, "/workspace")
+}
+
+git_deny_reason := "git_timestamp_option_injection" if {
+    not git_tool_allowed
+    input.tool.name == "git_log"
+    is_string(input.tool.args.start_timestamp)
+    startswith(input.tool.args.start_timestamp, "-")
+}
+
+git_deny_reason := "git_timestamp_option_injection" if {
+    not git_tool_allowed
+    input.tool.name == "git_log"
+    is_string(input.tool.args.end_timestamp)
+    startswith(input.tool.args.end_timestamp, "-")
+}
+
+git_deny_reason := "git_tool_denied_readonly_posture" if {
+    not git_tool_allowed
+    input.tool.name in _git_write_tools
+    _git_write_posture == "readonly"
+}
+
+default git_deny_reason := "git_tool_not_permitted"

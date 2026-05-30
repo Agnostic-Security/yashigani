@@ -50,6 +50,7 @@ from yashigani.mcp._nonce import NonceStore, InMemoryNonceStore
 from yashigani.mcp._opa import (
     query_mcp_decision,
     query_filesystem_tool_allowed,
+    query_git_tool_allowed,
     _normalize_tool_args,
 )
 from yashigani.mcp._content_filter import (
@@ -136,6 +137,13 @@ class McpBrokerConfig:
     # constraints from policy/mcp.rego §P3.
     # Set to True for any agent whose manifest declares category=mcp_server.
     is_filesystem_agent: bool = False
+
+    # P3-GIT: Shape-C git MCP-server flag.
+    # When True, broker runs a second OPA gate (git_tool_allowed) after the
+    # global mcp_decision allow, enforcing per-tool + repo_path constraints
+    # and git_log timestamp injection guard (GIT-TM-001, GIT-TM-004).
+    # Set to True for the git bundle (metadata.name == "git").
+    is_git_agent: bool = False
 
 
 class McpBroker:
@@ -354,6 +362,42 @@ class McpBroker:
                 )
                 await self._emit_audit(ctx, fs_decision)
                 return fs_decision
+
+        # Step 2c (P3-GIT): git tool-gating — parallel to step 2b for filesystem.
+        #
+        # For git agents (is_git_agent=True), enforce GIT-TM-001 repo_path
+        # boundary check and GIT-TM-004 timestamp option injection guard via the
+        # git_tool_allowed OPA rule.  Same fail-closed pattern as filesystem gate.
+        if self._config.is_git_agent and ctx.tool_name is not None:
+            git_args = _normalize_tool_args(ctx.tool_args_redacted)
+            git_result = await query_git_tool_allowed(
+                opa_url=self._opa_url,
+                tool_name=ctx.tool_name,
+                tool_args=git_args,
+            )
+            if not git_result.allowed:
+                git_elapsed = int((time.monotonic() - t0) * 1000)
+                git_decision = BrokerDecision(
+                    call_id=call_id,
+                    allow=False,
+                    deny_reason=git_result.deny_reason,
+                    opa_decision=OpaDecision(
+                        allow=False,
+                        deny_reason=git_result.deny_reason,
+                        redact_args=set(),
+                        audit_capture=True,
+                        rate_limit_key=None,
+                    ),
+                    chain_depth=len(chain_for_opa),
+                    elapsed_ms=git_elapsed,
+                    error=git_result.error,
+                )
+                logger.info(
+                    "mcp-broker: [P3-GIT] git tool denied call_id=%s tool=%s reason=%s",
+                    call_id, ctx.tool_name, git_result.deny_reason,
+                )
+                await self._emit_audit(ctx, git_decision)
+                return git_decision
 
         # Step 3: issue gateway-signed JWT (only on OPA allow)
         #

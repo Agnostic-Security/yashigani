@@ -111,12 +111,43 @@ class _BridgeProcess:
         # id → asyncio.Future[str] — maps in-flight request ids to their waiters
         self._pending: dict[str, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        # NEW-BUG-D fix: drain stderr so pipe buffer never fills and deadlocks subprocess
+        self._stderr_drain_task: Optional[asyncio.Task] = None
 
     def _get_lock(self) -> asyncio.Lock:
         """Return the asyncio.Lock, creating it lazily on first async call."""
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
+
+    async def _stderr_drain_loop(self) -> None:
+        """
+        Background task: drain subprocess stderr to prevent pipe-buffer deadlock.
+
+        mcp-server-git (and other MCP subprocess servers) write log/debug output
+        to stderr.  If stderr=PIPE is set and the pipe buffer fills (~64 KB), the
+        subprocess blocks waiting for the parent to drain it — while the parent is
+        waiting for a stdout response.  This is a classic subprocess deadlock.
+
+        Fix: read stderr in a tight loop and log each line at DEBUG level.
+        The logging call is cheap when the logger's effective level is above DEBUG
+        (the common production case), so this does not materially increase log volume.
+        """
+        assert self._proc is not None
+        assert self._proc.stderr is not None
+        try:
+            while True:
+                line = await self._proc.stderr.readline()
+                if not line:
+                    break
+                logger.debug(
+                    "mcp-bridge: subprocess stderr: %s",
+                    line.decode("utf-8", errors="replace").rstrip(),
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("mcp-bridge: stderr drain error: %s", exc)
 
     async def start(self) -> None:
         """Spawn the subprocess and start the background reader."""
@@ -133,12 +164,17 @@ class _BridgeProcess:
         )
         logger.info("mcp-bridge: subprocess started pid=%d cmd=%s", self._proc.pid, self._command)
 
+        loop = asyncio.get_running_loop()
         # Start background reader for response correlation.
         # Use get_running_loop() — we are inside an async def (start() is awaited),
         # so a running loop is guaranteed.  get_event_loop() is deprecated in 3.10+
         # and raises DeprecationWarning when there is no current event loop.
-        self._reader_task = asyncio.get_running_loop().create_task(
+        self._reader_task = loop.create_task(
             self._reader_loop(), name="mcp-bridge-reader"
+        )
+        # NEW-BUG-D fix: drain stderr continuously to prevent pipe-buffer deadlock.
+        self._stderr_drain_task = loop.create_task(
+            self._stderr_drain_loop(), name="mcp-bridge-stderr-drain"
         )
 
     async def stop(self) -> None:
@@ -150,6 +186,14 @@ class _BridgeProcess:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self._reader_task = None
+
+        if self._stderr_drain_task is not None:
+            self._stderr_drain_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._stderr_drain_task), timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._stderr_drain_task = None
 
         if self._proc is not None:
             try:

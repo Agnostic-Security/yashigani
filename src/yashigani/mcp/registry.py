@@ -25,12 +25,27 @@ class McpBrokerServerConfig:
 
     upstream_url:
         URL of the stdio↔HTTP bridge inside the server container
-        (e.g. "http://filesystem-mcp:8000").
+        (e.g. "http://filesystem-mcp:8000" or "http://git-mcp:8000").
 
     is_filesystem_agent:
         When True, broker.enforce() runs the second OPA gate
         (filesystem_tool_allowed) after the global mcp_decision allow.
-        Set True for agents whose manifest declares category=mcp_server.
+        Set True for agents whose manifest declares category=mcp_server
+        and metadata.name == "filesystem" (or equivalent filesystem bundles).
+
+    is_git_agent:
+        When True, broker.enforce() runs the git OPA gate (git_tool_allowed)
+        after the global mcp_decision allow.  Enforces GIT-TM-001 repo_path
+        boundary and GIT-TM-004 timestamp option injection guard.
+        Set True for the git bundle (metadata.name == "git").
+
+    YASHIGANI_MCP_SERVERS JSON example:
+        [
+          {"agent_name": "filesystem-mcp", "upstream_url": "http://filesystem-mcp:8000",
+           "tenant_id": "acme", "is_filesystem_agent": true},
+          {"agent_name": "git", "upstream_url": "http://git-mcp:8000",
+           "tenant_id": "acme", "is_git_agent": true}
+        ]
 
     tenant_id:
         Tenant identifier — matches the broker's McpBrokerConfig.tenant_id.
@@ -45,6 +60,7 @@ class McpBrokerServerConfig:
     is_filesystem_agent: bool
     tenant_id: str
     agent_name: str
+    is_git_agent: bool = False
 
 
 class McpBrokerRegistry:
@@ -219,6 +235,7 @@ def build_registry_from_env(
         upstream_url = str(entry["upstream_url"])
         tenant_id = str(entry["tenant_id"])
         is_filesystem_agent = bool(entry.get("is_filesystem_agent", False))
+        is_git_agent = bool(entry.get("is_git_agent", False))
 
         broker_cfg = McpBrokerConfig(
             opa_url=opa_url,
@@ -226,6 +243,7 @@ def build_registry_from_env(
             issuer=shared_issuer,  # Iris F-1: shared issuer, not per-broker instance
             audit_writer=audit_writer,
             is_filesystem_agent=is_filesystem_agent,
+            is_git_agent=is_git_agent,
             nonce_store=_nonce_store,
         )
         broker = McpBroker(config=broker_cfg)
@@ -233,11 +251,18 @@ def build_registry_from_env(
         server_cfg = McpBrokerServerConfig(
             upstream_url=upstream_url,
             is_filesystem_agent=is_filesystem_agent,
+            is_git_agent=is_git_agent,
             tenant_id=tenant_id,
             agent_name=agent_name,
         )
 
         registry.register(agent_name, broker, server_cfg)
+        logger.info(
+            "mcp-registry: registered agent=%r upstream=%r "
+            "is_filesystem=%s is_git=%s tenant=%r",
+            agent_name, upstream_url,
+            is_filesystem_agent, is_git_agent, tenant_id,
+        )
 
     logger.info(
         "mcp-registry: built registry with %d server(s): %s",

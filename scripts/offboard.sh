@@ -559,13 +559,49 @@ _offboard_step6_pki_rotate() {
 
   # Call install.sh as a subprocess with --pki-action to avoid side-effects.
   # YSG_RUNTIME is passed through so the right runtime is used.
+  #
+  # J11 FIX (Ava 2026-05-30): on rootless Podman the secrets dir contains files
+  # owned by subuid-remapped UIDs (e.g. UID 101001).  podman run -v ...:rw,Z,U
+  # calls lchown on the bind-mount source, which fails with EPERM when the caller
+  # (UID 1000) does not own the subuid-remapped files.
+  #
+  # Fix: when YSG_RUNTIME_4WAY is podman-rootless AND the caller is non-root,
+  # wrap the rotate-leaves subprocess in `podman unshare` so it runs inside the
+  # user namespace where the caller appears as UID 0 (namespace-root) and can
+  # lchown subuid-mapped files.
+  #
+  # podman unshare exits with the exit code of its child process, so _rc captures
+  # the real rotate-leaves exit code in all paths.
   local _rc=0
-  YSG_RUNTIME="${YSG_RUNTIME:-docker}" \
-  YSG_NO_LOG=true \
-    bash "$_install_sh" --pki-action rotate-leaves 2>&1 | \
-    while IFS= read -r _line; do
-      _log_info "  pki: ${_line}"
-    done || _rc=$?
+  local _use_podman_unshare=false
+  if [[ "${YSG_RUNTIME_4WAY:-unknown}" == "podman-rootless" ]] && [[ "$(id -u)" != "0" ]]; then
+    _use_podman_unshare=true
+  elif [[ -z "${YSG_RUNTIME_4WAY:-}" ]] && [[ "${YSG_RUNTIME:-}" == "podman" ]] && [[ "$(id -u)" != "0" ]]; then
+    # Fallback: 4WAY not set but legacy YSG_RUNTIME=podman + non-root → assume rootless.
+    _use_podman_unshare=true
+  fi
+
+  if [[ "$_use_podman_unshare" == "true" ]] && command -v podman >/dev/null 2>&1; then
+    _log_info "  J11: rootless Podman detected — wrapping rotate-leaves in podman unshare"
+    YSG_RUNTIME="${YSG_RUNTIME:-docker}" \
+    YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}" \
+    YSG_NO_LOG=true \
+      podman unshare -- bash "$_install_sh" --pki-action rotate-leaves 2>&1 | \
+      while IFS= read -r _line; do
+        _log_info "  pki: ${_line}"
+      done || _rc=$?
+  else
+    YSG_RUNTIME="${YSG_RUNTIME:-docker}" \
+    YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}" \
+    YSG_NO_LOG=true \
+      bash "$_install_sh" --pki-action rotate-leaves 2>&1 | \
+      while IFS= read -r _line; do
+        _log_info "  pki: ${_line}"
+      done || _rc=$?
+  fi
+
+  # With set -euo pipefail, `cmd | while ... done || _rc=$?` propagates the
+  # non-zero exit from cmd through the pipeline; _rc is set correctly above.
   if [[ "$_rc" -ne 0 ]]; then
     # C-002: promote to ERROR so alerting / operators see this.
     # The offboarded agent's identity is already removed from service_identities.yaml
@@ -808,9 +844,22 @@ main() {
   _offboard_step3_caddy_snippet    "$_agent"  # non-fatal: Caddy reload not required
   _offboard_step4_compose_override "$_agent"  || { _log_error "Step 4 failed"; exit 1; }
   _offboard_step5_secrets          "$_agent"  # non-fatal: best-effort cleanup
+
+  # J11 FIX (Ava 2026-05-30): emit MANIFEST_OFFBOARD audit event BEFORE step 6
+  # (PKI rotate-leaves) so the audit record exists even if step 6 fails due to
+  # lchown EPERM on rootless Podman.  The dangling-leaf risk from a step-6 failure
+  # is still a real concern (cert remains valid until expiry), but the change-
+  # management Merkle record must not be contingent on PKI plumbing succeeding.
+  # _offboard_emit_merkle_event is non-fatal (warnings only on failure).
+  local _audit_ts _audit_uid _audit_user
+  _audit_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _audit_uid="$(id -u 2>/dev/null || printf 'unknown')"
+  _audit_user="$(id -un 2>/dev/null || printf 'unknown')"
+  _offboard_emit_merkle_event "$_agent" "$_audit_ts" "$_audit_uid" "$_audit_user"
+
   _offboard_step6_pki_rotate       "$_agent"  || { _log_error "Step 6 (PKI rotate-leaves) failed — dangling-leaf risk; see above"; exit 1; }
   _offboard_step7_helm             "$_agent"  # non-fatal: Helm files may not exist
-  _offboard_step8_ledger           "$_agent"  # non-fatal: ledger is advisory
+  _offboard_step8_ledger           "$_agent"  # non-fatal: ledger is advisory (audit already written above)
 
   printf "\n"
   if [[ "${YSG_DRY_RUN:-false}" == "true" ]]; then

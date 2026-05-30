@@ -1,0 +1,192 @@
+# Yashigani P3 Bundle — modelcontextprotocol/servers/src/git
+#
+# Laura threat model: p3-git-mcp-threatmodel-20260530.md — GO-WITH-CONSTRAINTS
+# Shape: C (isolated container, first-party stdio-to-HTTP bridge inside container)
+# Write posture: readonly (default) — operator sets write_posture: readwrite to enable
+#
+# T2 TOPOLOGY (Tiago 2026-05-29): the MCP server runs in a dedicated isolated
+# container (ringfence bridge, internal:true, egress NONE).  Inside the container
+# the first-party bridge (src/yashigani/mcp/_bridge.py) wraps the stdio MCP server
+# process and exposes a Streamable HTTP endpoint on TCP/8000.  The subprocess is
+# managed by the BRIDGE (not by the gateway); the gateway reaches it via HTTP over
+# the ringfence bridge.
+#
+# Remote git operations (clone/fetch/push/pull) are NOT exposed by the upstream
+# server — that limit + egress=NONE makes the v1 ring-fence honest.  When a
+# customer needs remote git, the Shape-D (Caddy-mediated egress) topology
+# designed for fetch-mcp will be reused.  v1 ships READ-ONLY by default.
+#
+# Laura HARD CONSTRAINTS (baked in below — DO NOT relax without re-review):
+#   GIT-TM-001: subprocess command MUST hardcode --repository /workspace
+#               (the upstream's validate_repo_path is a no-op when arg is absent).
+#   GIT-TM-002: git hooks are RCE.  Dockerfile sets core.hooksPath=/dev/null.
+#   GIT-TM-003: gitpython==3.1.50 exact pin in image (CVE-2026-42215/44244).
+#               Trivy hard gate enforces.
+#   GIT-TM-004: git_log timestamp args are gitpython-passed, not shell-injectable,
+#               but leading-`--` values can inject git options.  OPA rejects.
+#
+# REQUIRED before onboarding ceremony:
+#   1. Build digest-pinned image from docker/Dockerfile.git-mcp.
+#   2. Run Trivy scan — Laura blocks ceremony if gitpython != 3.1.50.
+#   3. Replace spec.image.digest with the real sha256 of your built image.
+#   4. Replace metadata.tenant_id with your tenant identifier.
+#
+# DO NOT:
+#   - Set spec.secrets entries (no credentials needed; remote ops disabled).
+#   - Set spec.network.egress_allow entries (no outbound network in v1).
+#   - Change spec.mcp.exposes.listen_port from null (the MCP *protocol* has no listener).
+#   - Change spec.mcp.exposes.shim_port from 8000 without also updating the bridge launch.
+#   - Drop the --repository /workspace subprocess args (GIT-TM-001).
+#   - Use write_posture: readwrite without explicit Laura sign-off.
+#
+apiVersion: yashigani.io/v1alpha1
+kind: AgentIntegration
+
+metadata:
+  name: git
+  tenant_id: replace-with-your-tenant-id   # REQUIRED: replace before onboarding
+  description: >-
+    Official MCP git server (modelcontextprotocol/servers/src/git).
+    Provides git operations against a local workspace mount. No remote git
+    (clone/fetch/push/pull) — egress NONE in v1.  No LLM calls.  Runs in an
+    isolated container behind the first-party stdio-to-HTTP bridge
+    (src/yashigani/mcp/_bridge.py).
+  category: mcp_server
+  vendor: "Anthropic (modelcontextprotocol)"
+  licence: MIT
+  upstream: "https://github.com/modelcontextprotocol/servers/tree/main/src/git"
+
+spec:
+  image:
+    repository: registry.yashigani.internal/bundles/mcp-git
+    tag: "latest"
+    digest: "sha256:dfd423c32895ce2ffb6918378f4fa11e8f93c1b6514747a7809fe06ee84cc6a2"
+    # Built 2026-05-30 by scripts/build-git-mcp.sh --platform linux/arm64.
+    # End-to-end smoke verified: POST /mcp initialize + tools/call git_status
+    # both succeed on an empty volume (launcher initialises the workspace
+    # as a git repo at first start).
+
+  # Shape-C subprocess: GIT-TM-001 — --repository /workspace HARDCODED.
+  # Without this arg the upstream's validate_repo_path is a no-op and any path
+  # passed at tool-call time is accepted (workspace-escape).
+  #
+  # The launcher (/usr/local/bin/git-mcp-launcher) baked into the image first
+  # idempotently `git init -q -b main /workspace` (no-op if .git already exists)
+  # then exec's `python -m mcp_server_git "$@"`.  Required because the upstream
+  # server exits at startup when --repository points at a non-repo, and the
+  # codegen-emitted volume is empty on first onboard.  Bridge's
+  # YASHIGANI_MCP_SUBPROCESS_COMMAND is space-split, so the launcher MUST be a
+  # single token (no shell wrapping).
+  subprocess:
+    command: ["/usr/local/bin/git-mcp-launcher"]
+    args:
+      - "--repository"
+      - "/workspace"
+
+  # Network: EGRESS NONE (Laura §4.1 — no remote git operations in v1)
+  network:
+    egress_allow: []    # SC-EGRESS-NONE: no entries permitted
+
+  # MCP: expose tools via the first-party bridge to the gateway broker
+  mcp:
+    posture: mcp-b
+    transport: streamable-http
+    session_mode: persistent
+    # gateway-enforced-only with INTERNAL ceiling — same posture as filesystem-mcp
+    # (linter P2 only hard-fails on CONFIDENTIAL/RESTRICTED).  Operators storing
+    # repos with secrets should set sensitivity_ceiling: CONFIDENTIAL and require
+    # mTLS identity propagation (separate Laura sign-off).
+    identity_propagation: gateway-enforced-only
+    exposes:
+      listen_port: null     # MCP protocol: stdio has no network listener
+      shim_port: 8000       # The first-party bridge HTTP port (codegen _SC_BRIDGE_PORT)
+      tools:
+        # READ-ONLY DEFAULT POSTURE (Laura §2.3): 7 read tools allowed.
+        - name: git_status
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: git_diff_unstaged
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: git_diff_staged
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: git_diff
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: git_log
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: git_show
+          allowed: true
+          sensitivity_class: INTERNAL
+        - name: git_init
+          allowed: true
+          sensitivity_class: INTERNAL
+          # init creates a new repo in /workspace if absent — non-destructive to
+          # existing data.  Read-class for posture gating purposes.
+        # WRITE OPERATIONS — DENIED by default (gated by write_posture: readwrite)
+        - name: git_add
+          allowed: false
+          reason: "Denied by default. Set write_posture: readwrite to enable."
+        - name: git_commit
+          allowed: false
+          reason: "Denied by default."
+        - name: git_reset
+          allowed: false
+          reason: "Denied by default — can erase uncommitted work."
+        - name: git_checkout
+          allowed: false
+          reason: "Denied by default — changes working tree."
+        - name: git_create_branch
+          allowed: false
+          reason: "Denied by default — modifies refs."
+
+  # Write posture: readonly (default).  Set to readwrite ONLY after explicit
+  # Laura review — the 5 write tools modify the repo.
+  write_posture: readonly
+
+  # Storage: dedicated tenant-namespaced named volume.
+  # The git working tree lives here.  Volume ownership UID 10001 must be set by
+  # codegen (matches _SC_RUN_AS_USER) — the Dockerfile bakes
+  # `git config --global safe.directory /workspace` so the bridge user can
+  # operate on the volume regardless of original owner UID.
+  storage:
+    mounts:
+      - name: ysg_git_replace_with_your_tenant_id_git_workspace
+        # ^^^ REPLACE 'replace_with_your_tenant_id' with your tenant_id
+        # (hyphens in tenant_id become underscores)
+        type: volume
+        container_path: /workspace
+        read_only: false     # working tree must be writable; git ops still OPA-gated
+        create_if_missing: true
+    tmpfs:
+      - path: /tmp
+        size_limit: 64m      # bridge tmpdir + git temp objects
+
+  # Secrets: NONE (Laura §4.4 — no credentials needed; remote ops disabled in v1).
+  # group_add 2002 (S7) will NOT be emitted when spec.secrets is empty.
+  secrets: []
+
+  # Identity (Laura §4.7)
+  # SPIFFE URI is auto-constructed: spiffe://yashigani.internal/agents/{tenant_id}/git
+  # No override needed.
+
+  # Lifecycle
+  lifecycle:
+    mode: persistent
+
+  # Audit (Laura §4.9)
+  audit:
+    capture:
+      - mcp_call
+      - mcp_tool_description_fetched
+      - opa_decision_on_mcp
+    sensitivity_ceiling: INTERNAL
+    # Operators using git for repos with CONFIDENTIAL content should override
+    # this to CONFIDENTIAL — requires Laura sign-off (changes identity_propagation
+    # mandate via linter P2 rule).
+
+  # EU AI Act (Laura §4.10)
+  eu_ai_act:
+    annex_iii_category: null    # Not a high-risk AI system — tool server only

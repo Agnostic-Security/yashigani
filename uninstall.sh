@@ -1089,6 +1089,49 @@ fi
 echo "=== Network assertion passed — all canonical networks removed. ==="
 
 # ---------------------------------------------------------------------------
+# J12 FIX (Ava 2026-05-30): remove ringfence_<agent> networks created by
+# `yashigani onboard` (Shape-C MCP agents).  These networks are NOT in the
+# hardcoded _CANONICAL_NETWORKS list above because they are dynamically named
+# at onboard time (ringfence_git, ringfence_filesystem, etc.).
+#
+# Discovery: `docker/podman network ls --filter name=ringfence_` lists all
+# networks whose name contains "ringfence_".  We then remove each one.
+#
+# The assertion below logs residuals as WARN (not exit-1): a ringfence network
+# may survive removal if a non-yashigani container joined it.  The operator
+# is told exactly what to do.  We do not block uninstall for onboard residuals.
+# ---------------------------------------------------------------------------
+echo "=== Ringfence network cleanup (J12) ==="
+_ringfence_removed=0
+_ringfence_failed=0
+
+# Use process substitution compatible with bash 3.2 (no readarray/mapfile).
+while IFS= read -r _rfnet; do
+    if [ -z "$_rfnet" ]; then
+        continue
+    fi
+    if "$RUNTIME" network rm "$_rfnet" >/dev/null 2>&1; then
+        echo "  [removed] ringfence: $_rfnet"
+        _ringfence_removed=$(( _ringfence_removed + 1 ))
+    else
+        echo "  [WARN] ringfence network rm failed: $_rfnet (may be in use)" >&2
+        _ringfence_failed=$(( _ringfence_failed + 1 ))
+    fi
+done < <("$RUNTIME" network ls --filter "name=ringfence_" --format "{{.Name}}" 2>/dev/null || true)
+
+if [ "$_ringfence_removed" -gt 0 ] || [ "$_ringfence_failed" -gt 0 ]; then
+    echo "Ringfence network cleanup: ${_ringfence_removed} removed, ${_ringfence_failed} failed."
+    if [ "$_ringfence_failed" -gt 0 ]; then
+        echo "  [WARN] Some ringfence networks could not be removed (in use by a foreign container?)." >&2
+        echo "  Manual remediation:" >&2
+        echo "    ${RUNTIME} network ls --filter name=ringfence_   # list survivors" >&2
+        echo "    ${RUNTIME} network rm <name>                     # after detaching foreign containers" >&2
+    fi
+else
+    echo "  [ok] No ringfence networks found."
+fi
+
+# ---------------------------------------------------------------------------
 # BUG-3-MULTI-USER-INSTALL-PKI / BACKLOG-V240-006: wipe docker/secrets/ on
 # --remove-volumes (sudo-free, container-fallback — Iris+Laura 2026-05-21).
 #
@@ -1122,36 +1165,96 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
         echo "  [skip] docker/secrets/ does not exist — nothing to wipe"
     else
         echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
+        _secrets_wiped=false
+
+        # Tier 1: direct rm (same-user / root — common clean-install case)
         if rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
-            echo "  [removed] docker/secrets/* — direct rm succeeded"
-        else
+            echo "  [removed] docker/secrets/* — direct rm reported success"
+            _secrets_wiped=true
+        fi
+
+        # NEW-BUG-E FIX (Ava 2026-05-30): "rm reported success" ≠ "files are gone".
+        # On rootless Podman, secrets_dir contains files owned by subuid-remapped
+        # UIDs (e.g. UID 101000).  host-side rm exits 0 on glob-expand-to-nothing
+        # even when files remain.  Container-fallback rm also exits 0 (due to
+        # '; true') but cannot delete subuid-remapped files without :U.
+        # Fix: verify the directory is actually empty after EACH tier before
+        # declaring success.  If residuals remain, proceed to the next tier.
+        _secrets_verify() {
+            # Returns 0 (success) when secrets_dir has no remaining files.
+            local _d="$1"
+            # NEW-BUG-E FIX (cascade audit 2026-05-30): the old expression
+            #   find DIR -maxdepth 1 -not -name .
+            # ALWAYS returns at least one line — the directory's own absolute
+            # path — because -not -name . only excludes the "." entry returned
+            # when find descends into the dir, NOT the initial DIR argument at
+            # depth 0.  On BSD/macOS find, `find /a/b -maxdepth 1 -not -name .`
+            # always outputs "/a/b" even when the directory is empty.
+            # This made _secrets_verify always return 1 (fail), so Tier-1 and
+            # Tier-2 always appeared to fail and all three tiers ran every time.
+            # Fix: use -mindepth 1 which truly restricts to children only.
+            local _found
+            _found="$(find "${_d}" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)"
+            [ -z "$_found" ]
+        }
+
+        if [ "$_secrets_wiped" = "true" ] && ! _secrets_verify "${_secrets_dir}"; then
+            echo "  [WARN] Direct rm exited 0 but files remain (subuid-remapped UIDs) — proceeding to podman unshare tier" >&2
             _secrets_wiped=false
-            if [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
-                if podman unshare rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
+        fi
+
+        # Tier 2: podman unshare rm (rootless Podman — namespace-root can delete subuid files)
+        if [ "$_secrets_wiped" = "false" ] && [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
+            if podman unshare sh -c "rm -rf '${_secrets_dir:?}'/* '${_secrets_dir:?}'/.[!.]* '${_secrets_dir:?}'/..?* 2>/dev/null; true" 2>/dev/null; then
+                if _secrets_verify "${_secrets_dir}"; then
                     echo "  [removed] docker/secrets/* — podman unshare rm succeeded"
                     _secrets_wiped=true
+                else
+                    echo "  [WARN] podman unshare rm exited 0 but files remain — proceeding to container tier" >&2
                 fi
-            fi
-            if [ "$_secrets_wiped" = "false" ]; then
-                if "$RUNTIME" run --rm --pull=never \
-                        --volume "${_secrets_dir}:/t:rw" \
-                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
-                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null \
-                   || "$RUNTIME" run --rm \
-                        --volume "${_secrets_dir}:/t:rw" \
-                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
-                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null; then
-                    echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
-                    _secrets_wiped=true
-                fi
-            fi
-            if [ "$_secrets_wiped" = "false" ]; then
-                printf '[ERROR] secrets/ cleanup failed — manual remediation required:\n' >&2
-                printf '[ERROR]   rm -rf '"'"'%s'"'"'  (as root or file owner)\n' "${_secrets_dir}" >&2
-                printf '[ERROR]   or: podman unshare rm -rf '"'"'%s'"'"'\n' "${_secrets_dir}" >&2
-                printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
             fi
         fi
+
+        # Tier 3: ephemeral container with :U flag (maps container UID 0 to subuid range)
+        # NEW-BUG-E FIX: add :U so Podman remaps container UID 0 → caller's subuid root,
+        # allowing rm to delete files owned by any UID in the caller's subuid range.
+        if [ "$_secrets_wiped" = "false" ]; then
+            _run_container_rm() {
+                local _pull_flag="$1"  # "--pull=never" or ""
+                if [ "$RUNTIME" = "podman" ]; then
+                    # :U remaps; :Z SELinux label
+                    "$RUNTIME" run --rm ${_pull_flag:+"$_pull_flag"} \
+                        --volume "${_secrets_dir}:/t:rw,U,Z" \
+                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
+                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null
+                else
+                    # Docker: run as UID 0 inside container (root in default bridge)
+                    "$RUNTIME" run --rm ${_pull_flag:+"$_pull_flag"} \
+                        --user 0:0 \
+                        --volume "${_secrets_dir}:/t:rw" \
+                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
+                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null
+                fi
+            }
+            if _run_container_rm "--pull=never" || _run_container_rm ""; then
+                if _secrets_verify "${_secrets_dir}"; then
+                    echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
+                    _secrets_wiped=true
+                else
+                    echo "  [WARN] container-fallback rm exited 0 but ${_secrets_dir} still has files" >&2
+                fi
+            fi
+        fi
+
+        if [ "$_secrets_wiped" = "false" ]; then
+            # Final residual check — count files for the operator.
+            _residual_count="$(find "${_secrets_dir}" -maxdepth 1 -not -name . 2>/dev/null | wc -l | tr -d ' ')"
+            printf '[ERROR] secrets/ cleanup failed — %s file(s) remain:\n' "${_residual_count}" >&2
+            printf '[ERROR]   rm -rf '"'"'%s'"'"'  (as root or file owner)\n' "${_secrets_dir}" >&2
+            printf '[ERROR]   or: podman unshare rm -rf '"'"'%s'"'"'\n' "${_secrets_dir}" >&2
+            printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
+        fi
+
         rmdir "${_secrets_dir}" 2>/dev/null || true
     fi
 fi

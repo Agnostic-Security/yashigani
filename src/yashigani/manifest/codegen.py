@@ -550,8 +550,15 @@ def _gen_compose_override(
     if runtime == "podman-rootless":
         rootless_note = "      # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
 
-    # L7: depends_on — ringfence-init must complete before agent starts
+    # L7: depends_on — ringfence-init must complete before agent starts.
+    # NEW-BUG-F FIX (cascade audit 2026-05-30): ringfence-init-<agent> is NOT
+    # generated for podman-rootless (L1 gap — CAP_NET_ADMIN unavailable rootless).
+    # Emitting depends_on for a service that doesn't exist causes podman-compose
+    # to raise KeyError on 'ringfence-init-<agent>' during `compose up`.
+    # Gate: only emit depends_on when the init sidecar is actually generated
+    # (i.e. runtime != "podman-rootless").
     init_svc = "ringfence-init-%s" % agent_name
+    emit_depends_on = runtime != "podman-rootless"
 
     # W3-F1: emit BOTH the isolated ringfence bridge and caddy_internal.
     # Replicates the existing <agent>_isolated pattern at docker-compose.yml:2405-2413
@@ -559,6 +566,15 @@ def _gen_compose_override(
     # enable_ipv6:false).  The ringfence bridge provides L2 default-deny
     # containment; caddy_internal is the only bridge that reaches Caddy egress.
     ringfence_bridge = "ringfence_%s" % agent_name
+
+    depends_on_lines: list[str] = []
+    if emit_depends_on:
+        depends_on_lines = [
+            "    # L7 — block on ringfence-init completion",
+            "    depends_on:",
+            "      %s:" % init_svc,
+            "        condition: service_completed_successfully",
+        ]
 
     lines = [
         _header_comment(manifest_hash, runtime),
@@ -581,10 +597,7 @@ def _gen_compose_override(
         "    sysctls:",
         "      net.ipv6.conf.all.disable_ipv6: 1",
         "      net.ipv6.conf.default.disable_ipv6: 1",
-        "    # L7 — block on ringfence-init completion",
-        "    depends_on:",
-        "      %s:" % init_svc,
-        "        condition: service_completed_successfully",
+    ] + depends_on_lines + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
         "# W3-F1: isolated ringfence bridge — L2 default-deny containment (YSG-RISK-055)",
@@ -1343,6 +1356,20 @@ def _is_shape_c(parsed: dict) -> bool:
     return mcp.get("transport") in ("stdio", "streamable-http")
 
 
+def _is_git_bundle(parsed: dict) -> bool:
+    """
+    Return True if this manifest describes the git MCP-server bundle.
+
+    Detection criteria: metadata.name == "git" AND _is_shape_c(parsed).
+    The name-based check is authoritative; category=mcp_server is a necessary
+    but not sufficient condition (other bundles also use that category).
+    """
+    if not _is_shape_c(parsed):
+        return False
+    meta = parsed.get("metadata") or {}
+    return meta.get("name") == "git"
+
+
 def _sc_volume_name(tenant_id: str, agent_name: str) -> str:
     """
     Generate the tenant-namespaced Docker volume name for a Shape-C workspace.
@@ -1444,6 +1471,18 @@ def _gen_compose_override_shape_c(
 
     # Build tmpfs entries
     tmpfs_mounts_lines: list[str] = []
+    # NEW-BUG-G FIX (Ava iter-4 2026-05-30): podman-compose 1.x does NOT support
+    # the long-form mapping syntax for tmpfs:
+    #   tmpfs:
+    #     - target: /tmp
+    #       tmpfs-size: 64m
+    # It only accepts the short-form string syntax that matches the rest of the
+    # codebase (see docker-compose.yml line ~218):
+    #   tmpfs:
+    #     - /tmp:size=64m,mode=1777
+    # The long-form causes podman-compose to pass the raw dict repr as the mount
+    # path → "Error: invalid container path \"{'target'\"".
+    # Fix: use short-form for all tmpfs entries.
     if tmpfs_list:
         for tf in tmpfs_list:
             if not isinstance(tf, dict):
@@ -1451,19 +1490,23 @@ def _gen_compose_override_shape_c(
             tf_path = tf.get("path", "/tmp")
             tf_size = tf.get("size_limit", _SC_TMPFS_SIZE_DEFAULT)
             tmpfs_mounts_lines.append(
-                "      - target: %s\n        tmpfs-size: %s" % (tf_path, tf_size)
+                "      - %s:size=%s,mode=1777" % (tf_path, tf_size)
             )
     else:
-        # Default: /tmp tmpfs for Node.js runtime
+        # Default: /tmp tmpfs for bridge runtime
         tmpfs_mounts_lines.append(
-            "      - target: /tmp\n        tmpfs-size: %s" % _SC_TMPFS_SIZE_DEFAULT
+            "      - /tmp:size=%s,mode=1777" % _SC_TMPFS_SIZE_DEFAULT
         )
 
     volumes_section = "\n".join(volume_mounts_lines)
     tmpfs_section = "\n".join(tmpfs_mounts_lines)
 
-    # L7: depends_on ringfence-init
+    # L7: depends_on ringfence-init.
+    # NEW-BUG-F FIX (cascade audit 2026-05-30): same gate as Shape A.
+    # ringfence-init-<agent> is NOT generated for podman-rootless (L1 gap).
+    # Emitting depends_on for a non-existent service → KeyError in podman-compose.
     init_svc = "ringfence-init-%s" % agent_name
+    emit_depends_on = runtime != "podman-rootless"
 
     # L1 isolated bridge (internal: true) — no caddy_internal (egress NONE)
     ringfence_bridge = "ringfence_%s" % agent_name
@@ -1553,10 +1596,14 @@ def _gen_compose_override_shape_c(
         "        reservations:",
         "          cpus: '%s'" % _SC_CPU_REQUEST,
         "          memory: %s" % _SC_MEM_REQUEST,
-        "    # L7 — block on ringfence-init completion",
-        "    depends_on:",
-        "      %s:" % init_svc,
-        "        condition: service_completed_successfully",
+    ] + (
+        [
+            "    # L7 — block on ringfence-init completion",
+            "    depends_on:",
+            "      %s:" % init_svc,
+            "        condition: service_completed_successfully",
+        ] if emit_depends_on else []
+    ) + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
         "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
@@ -1993,6 +2040,212 @@ def _gen_opa_write_rules(agent_name: str, write_posture: str) -> str:
         )
 
 
+def _gen_opa_git_write_rules(agent_name: str, write_posture: str) -> str:
+    """Generate git write-tool OPA allow rules based on write_posture."""
+    if write_posture == "readwrite":
+        return textwrap.dedent("""\
+            # Write tools: PERMIT when write_posture=readwrite (operator-enabled)
+            # Operator must have explicit Laura sign-off before setting readwrite.
+            allow if {{
+                input.agent.name == "{agent_name}"
+                input.tool.name in _git_write_tools
+                write_posture == "readwrite"
+                _repo_path_safe(input.tool.args)
+            }}""").format(agent_name=agent_name)
+    else:
+        return (
+            "# Write tools: DENIED in readonly posture (default)\n"
+            "# Set write_posture: readwrite in the manifest after explicit Laura sign-off."
+        )
+
+
+def _gen_opa_git_bundle(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate OPA policy for the git MCP-server bundle (P3-GIT per-tool authz).
+
+    Implements GIT-TM-001 (repo_path boundary) and GIT-TM-004 (timestamp
+    option injection guard) as per Laura's threat model §8.
+
+    write_posture:
+    - readonly (default): PERMIT 7 read tools; DENY 5 write tools
+    - readwrite (operator override, requires Laura sign-off): PERMIT all
+
+    Repo path safety (GIT-TM-001 belt-and-suspenders):
+    - Must start with /workspace
+    - No ../ traversal, no %2e/%2f encoded forms
+
+    Timestamp safety (GIT-TM-004):
+    - Reject strings starting with '-' (would inject git options)
+    - Allow ISO 8601 dates, git relative date strings
+    """
+    meta = parsed.get("metadata") or {}
+    spec = parsed.get("spec") or {}
+
+    agent_name = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    write_posture = spec.get("write_posture", "readonly")
+
+    content = textwrap.dedent("""\
+        {header}
+        # OPA policy for Shape-C git MCP-server agent: {agent_name} (tenant: {tenant_id})
+        # write_posture: {write_posture}
+        # Laura threat model §8 — GIT-TM-001 (repo_path) + GIT-TM-004 (timestamp)
+        package yashigani.agents.{pkg_name}
+
+        import rego.v1
+
+        # Agent metadata (informational)
+        agent_name := "{agent_name}"
+        tenant_id := "{tenant_id}"
+        shape := "c"
+        write_posture := "{write_posture}"
+        manifest_hash := "{manifest_hash}"
+
+        # ---------------------------------------------------------------------------
+        # Per-tool allowlist — git MCP server
+        #
+        # READ-ONLY tools (7): always permitted when repo_path is safe
+        # WRITE tools (5): permitted only when write_posture=readwrite
+        # ---------------------------------------------------------------------------
+
+        _git_read_tools := {{
+            "git_status",
+            "git_diff_unstaged",
+            "git_diff_staged",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_init",
+        }}
+
+        _git_write_tools := {{
+            "git_add",
+            "git_commit",
+            "git_reset",
+            "git_checkout",
+            "git_create_branch",
+        }}
+
+        # ---------------------------------------------------------------------------
+        # _repo_path_safe — GIT-TM-001 belt-and-suspenders repo_path guard
+        #
+        # Primary control: --repository /workspace is hardcoded in subprocess args.
+        # This OPA guard is belt-and-suspenders.
+        # ---------------------------------------------------------------------------
+
+        _repo_path_safe(args) if {{
+            not args.repo_path
+        }}
+
+        _repo_path_safe(args) if {{
+            is_string(args.repo_path)
+            startswith(args.repo_path, "/workspace")
+            not contains(args.repo_path, "../")
+            not contains(lower(args.repo_path), "%2e")
+            not contains(lower(args.repo_path), "%2f")
+        }}
+
+        # ---------------------------------------------------------------------------
+        # _timestamp_safe — GIT-TM-004 git_log timestamp option injection guard
+        #
+        # Reject strings starting with '-' (would be passed as git option flags).
+        # Allow: null/absent, ISO 8601 dates, git relative date strings.
+        # ---------------------------------------------------------------------------
+
+        _timestamp_safe(ts) if {{
+            ts == null
+        }}
+
+        _timestamp_safe(ts) if {{
+            not ts
+        }}
+
+        _timestamp_safe(ts) if {{
+            is_string(ts)
+            not startswith(ts, "-")
+            not contains(lower(ts), "%2d")
+            regex.match(`^[A-Za-z0-9 .:+\\-/]+$`, ts)
+        }}
+
+        # ---------------------------------------------------------------------------
+        # allow — per-agent tool decision
+        # ---------------------------------------------------------------------------
+
+        default allow := false
+
+        # Read tools: PERMIT with repo_path validation (both postures)
+        allow if {{
+            input.agent.name == "{agent_name}"
+            input.tool.name in _git_read_tools
+            not input.tool.name == "git_log"
+            _repo_path_safe(input.tool.args)
+        }}
+
+        # git_log: additional timestamp validation (GIT-TM-004)
+        allow if {{
+            input.agent.name == "{agent_name}"
+            input.tool.name == "git_log"
+            _repo_path_safe(input.tool.args)
+            _timestamp_safe(input.tool.args.start_timestamp)
+            _timestamp_safe(input.tool.args.end_timestamp)
+        }}
+
+        {write_rules}
+
+        # ---------------------------------------------------------------------------
+        # deny_reason for agent-level denials
+        # ---------------------------------------------------------------------------
+
+        deny_reason := "git_repo_path_traversal_attempt" if {{
+            not allow
+            is_string(input.tool.args.repo_path)
+            contains(input.tool.args.repo_path, "../")
+        }}
+
+        deny_reason := "git_repo_path_outside_workspace" if {{
+            not allow
+            is_string(input.tool.args.repo_path)
+            not startswith(input.tool.args.repo_path, "/workspace")
+        }}
+
+        deny_reason := "git_timestamp_option_injection" if {{
+            not allow
+            input.tool.name == "git_log"
+            is_string(input.tool.args.start_timestamp)
+            startswith(input.tool.args.start_timestamp, "-")
+        }}
+
+        deny_reason := "git_timestamp_option_injection" if {{
+            not allow
+            input.tool.name == "git_log"
+            is_string(input.tool.args.end_timestamp)
+            startswith(input.tool.args.end_timestamp, "-")
+        }}
+
+        deny_reason := "git_tool_denied_readonly_posture" if {{
+            not allow
+            input.tool.name in _git_write_tools
+            write_posture == "readonly"
+        }}
+
+        default deny_reason := "git_tool_not_permitted"
+    """).format(
+        header=_header_comment(manifest_hash, runtime, comment_char="#"),
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        write_posture=write_posture,
+        pkg_name=agent_name.replace("-", "_"),
+        manifest_hash=manifest_hash,
+        write_rules=_gen_opa_git_write_rules(agent_name, write_posture),
+    )
+    return content
+
+
 def _gen_service_identity_entry_shape_c(
     parsed: dict,
     *,
@@ -2310,7 +2563,16 @@ class CodegenEngineShapeC:
         kyverno_content = _gen_kyverno_policy_exception(self._parsed, **kwargs)
         svcid_content = _gen_service_identity_entry_shape_c(self._parsed, **kwargs)
         pki_content = _gen_pki_ownership_fragment(self._parsed, **kwargs)
-        opa_content = _gen_opa_filesystem_bundle(self._parsed, **kwargs)
+        # Dispatch OPA bundle generation: git bundle gets git-specific rules,
+        # all other Shape-C bundles get the filesystem rules.
+        if _is_git_bundle(self._parsed):
+            opa_content = _gen_opa_git_bundle(self._parsed, **kwargs)
+            _log.info(
+                "codegen: Shape-C agent %r — using git OPA bundle (P3-GIT)",
+                agent_name,
+            )
+        else:
+            opa_content = _gen_opa_filesystem_bundle(self._parsed, **kwargs)
         test_compose_content = _gen_contract_test_compose_shape_c(self._parsed, **kwargs)
 
         # S6 — validate shell fragment
