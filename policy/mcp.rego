@@ -867,11 +867,18 @@ git_tool_allowed if {
 }
 
 # git_log: additionally validate timestamp args (GIT-TM-004)
+# BUG-7-FIX (Ava 2026-05-30): use object.get() to default absent timestamp fields
+# to null before passing to _git_timestamp_safe.  In OPA, accessing an absent
+# key via input.tool.args.start_timestamp yields `undefined`, and passing
+# undefined to a function that only handles null/string caused the entire rule
+# body to be undefined → git_tool_allowed=false even for valid calls without
+# timestamps.  Fix: object.get(args, key, null) guarantees the argument is
+# either a string or null — both handled by _git_timestamp_safe.
 git_tool_allowed if {
     input.tool.name == "git_log"
     _git_repo_path_safe(input.tool.args)
-    _git_timestamp_safe(input.tool.args.start_timestamp)
-    _git_timestamp_safe(input.tool.args.end_timestamp)
+    _git_timestamp_safe(object.get(input.tool.args, "start_timestamp", null))
+    _git_timestamp_safe(object.get(input.tool.args, "end_timestamp", null))
 }
 
 # Write tools: PERMIT only when write_posture=readwrite.
