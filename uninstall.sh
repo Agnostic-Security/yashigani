@@ -1165,36 +1165,88 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
         echo "  [skip] docker/secrets/ does not exist — nothing to wipe"
     else
         echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
+        _secrets_wiped=false
+
+        # Tier 1: direct rm (same-user / root — common clean-install case)
         if rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
-            echo "  [removed] docker/secrets/* — direct rm succeeded"
-        else
+            echo "  [removed] docker/secrets/* — direct rm reported success"
+            _secrets_wiped=true
+        fi
+
+        # NEW-BUG-E FIX (Ava 2026-05-30): "rm reported success" ≠ "files are gone".
+        # On rootless Podman, secrets_dir contains files owned by subuid-remapped
+        # UIDs (e.g. UID 101000).  host-side rm exits 0 on glob-expand-to-nothing
+        # even when files remain.  Container-fallback rm also exits 0 (due to
+        # '; true') but cannot delete subuid-remapped files without :U.
+        # Fix: verify the directory is actually empty after EACH tier before
+        # declaring success.  If residuals remain, proceed to the next tier.
+        _secrets_verify() {
+            # Returns 0 (success) when secrets_dir has no remaining files.
+            local _d="$1"
+            # find -maxdepth 1 -not -name . lists immediate children.
+            # If output is non-empty → files still present (return 1).
+            local _found
+            _found="$(find "${_d}" -maxdepth 1 -not -name . 2>/dev/null | head -1)"
+            [ -z "$_found" ]
+        }
+
+        if [ "$_secrets_wiped" = "true" ] && ! _secrets_verify "${_secrets_dir}"; then
+            echo "  [WARN] Direct rm exited 0 but files remain (subuid-remapped UIDs) — proceeding to podman unshare tier" >&2
             _secrets_wiped=false
-            if [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
-                if podman unshare rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
+        fi
+
+        # Tier 2: podman unshare rm (rootless Podman — namespace-root can delete subuid files)
+        if [ "$_secrets_wiped" = "false" ] && [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
+            if podman unshare sh -c "rm -rf '${_secrets_dir:?}'/* '${_secrets_dir:?}'/.[!.]* '${_secrets_dir:?}'/..?* 2>/dev/null; true" 2>/dev/null; then
+                if _secrets_verify "${_secrets_dir}"; then
                     echo "  [removed] docker/secrets/* — podman unshare rm succeeded"
                     _secrets_wiped=true
+                else
+                    echo "  [WARN] podman unshare rm exited 0 but files remain — proceeding to container tier" >&2
                 fi
-            fi
-            if [ "$_secrets_wiped" = "false" ]; then
-                if "$RUNTIME" run --rm --pull=never \
-                        --volume "${_secrets_dir}:/t:rw" \
-                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
-                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null \
-                   || "$RUNTIME" run --rm \
-                        --volume "${_secrets_dir}:/t:rw" \
-                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
-                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null; then
-                    echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
-                    _secrets_wiped=true
-                fi
-            fi
-            if [ "$_secrets_wiped" = "false" ]; then
-                printf '[ERROR] secrets/ cleanup failed — manual remediation required:\n' >&2
-                printf '[ERROR]   rm -rf '"'"'%s'"'"'  (as root or file owner)\n' "${_secrets_dir}" >&2
-                printf '[ERROR]   or: podman unshare rm -rf '"'"'%s'"'"'\n' "${_secrets_dir}" >&2
-                printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
             fi
         fi
+
+        # Tier 3: ephemeral container with :U flag (maps container UID 0 to subuid range)
+        # NEW-BUG-E FIX: add :U so Podman remaps container UID 0 → caller's subuid root,
+        # allowing rm to delete files owned by any UID in the caller's subuid range.
+        if [ "$_secrets_wiped" = "false" ]; then
+            _run_container_rm() {
+                local _pull_flag="$1"  # "--pull=never" or ""
+                if [ "$RUNTIME" = "podman" ]; then
+                    # :U remaps; :Z SELinux label
+                    "$RUNTIME" run --rm ${_pull_flag:+"$_pull_flag"} \
+                        --volume "${_secrets_dir}:/t:rw,U,Z" \
+                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
+                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null
+                else
+                    # Docker: run as UID 0 inside container (root in default bridge)
+                    "$RUNTIME" run --rm ${_pull_flag:+"$_pull_flag"} \
+                        --user 0:0 \
+                        --volume "${_secrets_dir}:/t:rw" \
+                        "${_ALPINE_IMAGE:?_ALPINE_IMAGE not set}" \
+                        sh -c 'rm -rf /t/* /t/.[!.]* /t/..?* 2>/dev/null; true' 2>/dev/null
+                fi
+            }
+            if _run_container_rm "--pull=never" || _run_container_rm ""; then
+                if _secrets_verify "${_secrets_dir}"; then
+                    echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
+                    _secrets_wiped=true
+                else
+                    echo "  [WARN] container-fallback rm exited 0 but ${_secrets_dir} still has files" >&2
+                fi
+            fi
+        fi
+
+        if [ "$_secrets_wiped" = "false" ]; then
+            # Final residual check — count files for the operator.
+            _residual_count="$(find "${_secrets_dir}" -maxdepth 1 -not -name . 2>/dev/null | wc -l | tr -d ' ')"
+            printf '[ERROR] secrets/ cleanup failed — %s file(s) remain:\n' "${_residual_count}" >&2
+            printf '[ERROR]   rm -rf '"'"'%s'"'"'  (as root or file owner)\n' "${_secrets_dir}" >&2
+            printf '[ERROR]   or: podman unshare rm -rf '"'"'%s'"'"'\n' "${_secrets_dir}" >&2
+            printf '[ERROR] Fresh install by a different user will fail until secrets/ is clean.\n' >&2
+        fi
+
         rmdir "${_secrets_dir}" 2>/dev/null || true
     fi
 fi

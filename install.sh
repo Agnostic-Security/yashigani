@@ -8692,12 +8692,22 @@ _pki_run_issuer_docker() {
 # target UID (subuid-mapped 1001 = e.g. 428680) is outside the host
 # user's UID (1005), so the kernel rejects lchown with EPERM even though
 # the user owns the file and is namespace-root inside the container.
-# The secrets dir is pre-chowned to the remapped UID by
-# _prepare_secrets_dir_for_pki(), so it does not need :U; but keeping :U
-# on secrets_dir is harmless and helps rootful Podman. The manifest is
-# pre-chowned via podman unshare (rootless) or plain chown (rootful) so the
-# container can write back bootstrap_token_sha256 fields. ":U" is NOT
-# applied to the manifest mount on any path.
+#
+# NEW-BUG-B FIX (Ava 2026-05-30): ":U" MUST NOT be applied to secrets_dir either.
+# When secrets_dir already contains files owned by subuid-remapped UIDs (e.g.
+# UID 101000 from a previous PKI bootstrap), Podman's ":U" flag calls lchown
+# on the bind-mount source for each file.  The caller at UID 1000 cannot
+# lchown files owned by UID 101000 — EPERM — even inside podman unshare.
+# The outer UID mapping constraint means user-namespace-root cannot lchown
+# files whose host UID is outside the caller's subuid range mapped into that
+# namespace.  Removing ":U" from secrets_dir is safe: the PKI issuer runs as
+# UID 1001 inside the container, and secrets files are pre-chowned to the
+# remapped equivalent of UID 1001 by _prepare_secrets_dir_for_pki().
+# ":z" (lowercase SELinux label only) is retained — it does NOT call lchown.
+#
+# The manifest is pre-chowned via podman unshare (rootless) or plain chown
+# (rootful) so the container can write back bootstrap_token_sha256 fields.
+# ":U" is NOT applied to any mount on any path in this function.
 # ---------------------------------------------------------------------------
 _pki_run_issuer_podman_linux() {
   local subcmd="$1"; local image="$2"; local manifest_in="$3"; local secrets_in="$4"
@@ -8715,14 +8725,16 @@ _pki_run_issuer_podman_linux() {
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    dry_print "podman run --rm --network=none -v ${secrets_in}:/secrets:rw,Z,U -v ${manifest_in}:/manifest.yaml:rw,Z $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
+    dry_print "podman run --rm --network=none -v ${secrets_in}:/secrets:rw,z -v ${manifest_in}:/manifest.yaml:rw,Z $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
     return 0
   fi
 
   # --network=none: issuer does no network I/O, and cutting the network
   # prevents any accidental telemetry exfil.
+  # NEW-BUG-B: ":U" removed from secrets_dir mount — see gate #ROOTLESS-9 comment.
+  # ":z" (SELinux label, no lchown) replaces ":Z,U" for rootless safety.
   podman run --rm --network=none \
-    -v "${secrets_in}:/secrets:rw,Z,U" \
+    -v "${secrets_in}:/secrets:rw,z" \
     -v "${manifest_in}:/manifest.yaml:rw,Z" \
     "$image" \
     python -m yashigani.pki.issuer \
@@ -8950,9 +8962,94 @@ _pki_run_issuer() {
   # Create the runtime directory and seed the runtime manifest from the canonical.
   # mkdir -p is idempotent — safe to re-run on upgrade.
   mkdir -p "${WORK_DIR}/docker/var/runtime"
-  cp -f "$_canonical_manifest" "$manifest_in" \
-    || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
-  log_info "_pki_run_issuer: seeded runtime manifest at ${manifest_in} (hash-back will populate bootstrap_token_sha256 values)"
+
+  # NEW-BUG-C FIX (Ava 2026-05-30): do NOT unconditionally overwrite the runtime
+  # manifest with the canonical.  The runtime manifest carries runtime-only fields
+  # (bootstrap_token_sha256) written by the PKI issuer and by the onboard handler.
+  # Overwriting with the canonical erases those fields — which breaks BUG-5's
+  # token-population fix: the token is populated at onboard time, then immediately
+  # erased when _pki_run_issuer is called to issue the leaf cert.
+  #
+  # New policy:
+  #   a. If the runtime manifest does NOT exist → copy canonical (bootstrap case).
+  #   b. If the runtime manifest DOES exist → merge: copy canonical structure but
+  #      preserve bootstrap_token_sha256 values from the runtime copy.
+  #
+  # Merge is implemented via Python (already a dependency at this point): parse
+  # both YAML files, take canonical as the base, overlay bootstrap_token_sha256
+  # values from runtime for any service that already has a non-empty hash.
+  # On failure (Python absent / YAML error), fall back to canonical-wins and warn.
+  if [[ ! -f "$manifest_in" ]]; then
+    # Fresh install: runtime manifest absent — seed from canonical.
+    cp -f "$_canonical_manifest" "$manifest_in" \
+      || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+    log_info "_pki_run_issuer: seeded runtime manifest at ${manifest_in} (fresh — hash-back will populate bootstrap_token_sha256 values)"
+  else
+    # Runtime manifest exists — merge, preserving bootstrap_token_sha256 fields.
+    local _merge_ok=false
+    python3 - "$_canonical_manifest" "$manifest_in" <<'PYMERGE' 2>/dev/null && _merge_ok=true
+import sys, re
+
+canonical_path, runtime_path = sys.argv[1], sys.argv[2]
+
+# Read both files as raw text to preserve formatting/comments.
+with open(canonical_path, encoding='utf-8') as f:
+    canonical_text = f.read()
+with open(runtime_path, encoding='utf-8') as f:
+    runtime_text = f.read()
+
+# Extract bootstrap_token_sha256 values from the runtime file.
+# Pattern: lines like "  bootstrap_token_sha256: \"<hex>\"" with non-empty value.
+# We preserve them by name: map service_name -> sha256_value.
+# Strategy: find each service block in runtime, extract name + hash.
+token_re = re.compile(
+    r'^(\s*)bootstrap_token_sha256:\s*"([0-9a-fA-F]{64})"',
+    re.MULTILINE
+)
+runtime_tokens = {}
+
+# Associate each token with the preceding service name.
+# Walk line by line.
+current_service = None
+for line in runtime_text.splitlines():
+    name_m = re.match(r'^\s{0,4}name:\s*["\']?(\w[\w\-]*)["\']?', line)
+    if name_m:
+        current_service = name_m.group(1)
+    tok_m = re.match(r'^\s+bootstrap_token_sha256:\s*"([0-9a-fA-F]{64})"', line)
+    if tok_m and current_service:
+        runtime_tokens[current_service] = tok_m.group(1)
+
+# Now rewrite canonical: for each service that has a runtime token, replace
+# the empty bootstrap_token_sha256 placeholder with the runtime value.
+current_service = None
+out_lines = []
+for line in canonical_text.splitlines():
+    name_m = re.match(r'^\s{0,4}name:\s*["\']?(\w[\w\-]*)["\']?', line)
+    if name_m:
+        current_service = name_m.group(1)
+    if current_service and current_service in runtime_tokens:
+        # Replace empty or existing placeholder.
+        bts_m = re.match(r'^(\s+bootstrap_token_sha256:)\s*(""|"[0-9a-fA-F]{0,64}")', line)
+        if bts_m:
+            prefix = bts_m.group(1)
+            line = '%s "%s"' % (prefix, runtime_tokens[current_service])
+    out_lines.append(line)
+
+merged_text = '\n'.join(out_lines)
+if not merged_text.endswith('\n'):
+    merged_text += '\n'
+
+with open(runtime_path, 'w', encoding='utf-8') as f:
+    f.write(merged_text)
+PYMERGE
+    if [[ "$_merge_ok" == "true" ]]; then
+      log_info "_pki_run_issuer: merged canonical → runtime manifest (bootstrap_token_sha256 values preserved)"
+    else
+      log_warn "_pki_run_issuer: manifest merge failed — falling back to canonical (bootstrap_token_sha256 values will be re-issued)"
+      cp -f "$_canonical_manifest" "$manifest_in" \
+        || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+    fi
+  fi
 
   case "$runtime" in
     docker)
@@ -11033,7 +11130,28 @@ PYEOF
       local _compose_project
       _compose_project="$(basename "$(dirname "$_compose_file")")"
 
-      # Primary: docker/podman ps --filter label (set by compose v2 on every container)
+      # NEW-BUG-A FIX — Part 1: gateway container detection.
+      #
+      # Docker Compose v2 sets com.docker.compose.* labels on containers.
+      # podman-compose sets io.podman.compose.* labels.
+      # Also: podman-compose names containers with underscores
+      # (<project>_<service>_<N>) whereas docker compose v2 uses hyphens
+      # (<project>-<service>-<N>).  We must try both label schemas and both
+      # naming separators.
+      #
+      # We CANNOT use `compose ps -q gateway` here because docker-compose.yml
+      # declares YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
+      # — the :? makes it required, so compose errors out when UPSTREAM_MCP_URL
+      # is empty.  Use ps --filter which needs no file interpolation.
+      #
+      # Detection order:
+      #   1. Docker-Compose-v2 label: com.docker.compose.project + service=gateway
+      #   2. podman-compose label:    io.podman.compose.project + service=gateway
+      #   3. Name pattern hyphen:     <project>-gateway-<N>
+      #   4. Name pattern underscore: <project>_gateway_<N>  (podman-compose)
+      #   5. Last resort:             any container whose name contains "gateway"
+
+      # Primary: Docker Compose v2 labels (docker / rootful podman-compose)
       _gw_container="$(
         "$_runtime_bin_ps" ps \
           --filter "label=com.docker.compose.project=${_compose_project}" \
@@ -11042,11 +11160,32 @@ PYEOF
         | head -1 || true
       )"
 
-      # Fallback: match by deterministic compose-v2 name pattern <project>-gateway-1
+      # Fallback 1: podman-compose labels (io.podman.compose.*)
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "label=io.podman.compose.project=${_compose_project}" \
+            --filter "label=com.docker.compose.service=gateway" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # Fallback 2: deterministic compose-v2 name pattern <project>-gateway-<N>
       if [[ -z "$_gw_container" ]]; then
         _gw_container="$(
           "$_runtime_bin_ps" ps \
             --filter "name=^${_compose_project}-gateway-" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # Fallback 3: podman-compose name pattern <project>_gateway_<N> (underscore)
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "name=^${_compose_project}_gateway_" \
             --format "{{.Names}}" 2>/dev/null \
           | head -1 || true
         )"
@@ -11062,15 +11201,173 @@ PYEOF
         )"
       fi
 
+      # NEW-BUG-A FIX — Part 2: persistent network wiring via docker-compose.yml.
+      #
+      # `docker/podman network connect` is NOT persisted across `compose down/up`
+      # cycles: the gateway container is recreated and the connection is lost.
+      # Fix: write the ringfence_<agent> network into the gateway service's
+      # `networks:` section of docker-compose.yml AND into the top-level
+      # `networks:` definition block.  This way the `compose up --no-deps -d gateway`
+      # later in this block creates the gateway container already connected.
+      # On subsequent `compose down/up` the network persists via the compose file.
+      #
+      # This replaces the one-shot `network connect` call as the PRIMARY wiring
+      # mechanism.  The `network connect` is retained as a LIVE-stack supplement:
+      # it wires the CURRENTLY-RUNNING gateway while we wait for the recreate.
+      log_step "-" "NEW-BUG-A: writing ${_ringfence_net} into docker-compose.yml (persistent network wiring)"
+      local _compose_patch_ok=false
+      python3 - "$_compose_file" "$_ringfence_net" <<'PYCOMPOSE' 2>/dev/null && _compose_patch_ok=true
+import sys, re
+
+compose_path = sys.argv[1]
+ringfence_net = sys.argv[2]
+
+with open(compose_path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+# ── Pass 1: find the gateway service networks: block and add the ringfence net.
+# Strategy: locate "  gateway:" (2-space indent, top-level service) then find
+# its "    networks:" block.  Insert the new entry only if not already present.
+in_gateway = False
+in_gateway_networks = False
+gateway_networks_indent = None
+gateway_networks_end = None  # line index AFTER the last network entry
+already_in_gateway_nets = False
+inserted_gateway = False
+
+i = 0
+result_lines = []
+while i < len(lines):
+    line = lines[i]
+    stripped = line.rstrip('\n')
+
+    # Detect gateway service start (exactly 2-space indent at root level)
+    if re.match(r'^  gateway:\s*$', stripped):
+        in_gateway = True
+        in_gateway_networks = False
+        gateway_networks_indent = None
+        result_lines.append(line)
+        i += 1
+        continue
+
+    # Leaving gateway service (another 2-space-indent key or end of file)
+    if in_gateway and re.match(r'^  \w', stripped) and not re.match(r'^  gateway:', stripped):
+        in_gateway = False
+        in_gateway_networks = False
+
+    if in_gateway:
+        # Detect `    networks:` block (4-space indent)
+        nm = re.match(r'^( {4,})networks:\s*$', stripped)
+        if nm and not in_gateway_networks:
+            in_gateway_networks = True
+            gateway_networks_indent = nm.group(1)
+            result_lines.append(line)
+            i += 1
+            # Walk the network entries
+            entry_indent = gateway_networks_indent + '  '
+            while i < len(lines):
+                entry_line = lines[i]
+                entry_stripped = entry_line.rstrip('\n')
+                # Still inside networks block?
+                if re.match(r'^' + re.escape(entry_indent) + r'- ', entry_stripped):
+                    if ringfence_net in entry_stripped:
+                        already_in_gateway_nets = True
+                    result_lines.append(entry_line)
+                    i += 1
+                else:
+                    # End of networks block for gateway.
+                    # Insert before this line if not already present.
+                    if not already_in_gateway_nets:
+                        result_lines.append('%s- %s\n' % (entry_indent, ringfence_net))
+                        inserted_gateway = True
+                    break
+            continue
+
+    result_lines.append(line)
+    i += 1
+
+# ── Pass 2: find the top-level `networks:` block and add the ringfence net def.
+# Top-level networks: starts at column 0 with no indent.
+# Format to add:
+#   <ringfence_net>:
+#     driver: bridge
+#     enable_ipv6: false
+#     internal: true
+
+in_top_networks = False
+top_networks_entry_re = re.compile(r'^  \w')
+already_in_top_networks = False
+inserted_top = False
+
+final_lines = []
+i = 0
+while i < len(result_lines):
+    line = result_lines[i]
+    stripped = line.rstrip('\n')
+
+    if re.match(r'^networks:\s*$', stripped):
+        in_top_networks = True
+        final_lines.append(line)
+        i += 1
+        # Walk top-level network entries until EOF or next top-level key
+        while i < len(result_lines):
+            nl = result_lines[i]
+            ns = nl.rstrip('\n')
+            # Another top-level key (no indent, not a comment, not empty)
+            if re.match(r'^\w', ns) and not re.match(r'^networks:', ns):
+                break
+            if re.match(r'^  ' + re.escape(ringfence_net) + r':', ns):
+                already_in_top_networks = True
+            final_lines.append(nl)
+            i += 1
+        if not already_in_top_networks:
+            final_lines.append('  # NEW-BUG-A: ringfence bridge for %s MCP agent\n' % ringfence_net)
+            final_lines.append('  %s:\n' % ringfence_net)
+            final_lines.append('    driver: bridge\n')
+            final_lines.append('    enable_ipv6: false\n')
+            final_lines.append('    internal: true\n')
+            inserted_top = True
+        continue
+
+    final_lines.append(line)
+    i += 1
+
+if not (inserted_gateway or already_in_gateway_nets):
+    print('ERROR: could not find gateway service networks: block', file=sys.stderr)
+    sys.exit(1)
+if not (inserted_top or already_in_top_networks):
+    print('ERROR: could not find top-level networks: block', file=sys.stderr)
+    sys.exit(1)
+
+with open(compose_path, 'w', encoding='utf-8') as f:
+    f.writelines(final_lines)
+
+print('compose-patch: gateway networks+=%s, top-level networks+=%s' % (
+    'added' if inserted_gateway else 'already-present',
+    'added' if inserted_top else 'already-present',
+))
+PYCOMPOSE
+
+      if [[ "$_compose_patch_ok" == "true" ]]; then
+        log_success "NEW-BUG-A: ${_ringfence_net} added to docker-compose.yml (gateway + top-level networks)"
+      else
+        log_warn "NEW-BUG-A: could not patch docker-compose.yml — falling back to network connect only."
+        log_warn "  The ringfence network will NOT persist across compose down/up cycles."
+        log_warn "  Manual fix: add '- ${_ringfence_net}' under gateway.networks in docker/docker-compose.yml"
+        log_warn "  and add '${_ringfence_net}: {driver: bridge, enable_ipv6: false, internal: true}'"
+        log_warn "  to the top-level networks: block."
+      fi
+
       if [[ -z "$_gw_container" ]]; then
         log_warn "Shape-C bridge-join: gateway container not found via docker ps."
-        log_warn "  Tried: label filter (project=${_compose_project},service=gateway),"
-        log_warn "         name pattern ${_compose_project}-gateway-*, name=gateway."
+        log_warn "  Tried: Docker Compose v2 labels (com.docker.compose.*), podman-compose labels"
+        log_warn "         (io.podman.compose.*), name patterns '${_compose_project}-gateway-*'"
+        log_warn "         and '${_compose_project}_gateway_*', and substring 'gateway'."
         log_warn "  Ensure the stack is running before --onboard for Shape-C agents."
         log_warn "  After starting the stack, rerun:"
         log_warn "    bash install.sh --onboard <manifest> --runtime ${YSG_RUNTIME_4WAY:-docker}"
       else
-        log_step "-" "YSG-P3-MCP-BRIDGE-JOIN: joining gateway to ${_ringfence_net}"
+        log_step "-" "YSG-P3-MCP-BRIDGE-JOIN: live-stack network connect to ${_ringfence_net}"
 
         # Use the runtime binary we already derived above (_runtime_bin_ps).
         # For network connect we always use the base container runtime (docker/podman).
@@ -11087,19 +11384,16 @@ PYEOF
         if [[ "$_already_connected" == "true" ]]; then
           log_info "Gateway already connected to ${_ringfence_net} — idempotent, no action."
         else
-          log_info "Connecting gateway container (${_gw_container}) to ${_ringfence_net}..."
+          log_info "Connecting live gateway container (${_gw_container}) to ${_ringfence_net}..."
+          # This live-connect is ephemeral (survives until next gateway recreate).
+          # Persistence is via the compose-file patch above.
           if "$_runtime_bin" network connect "${_ringfence_net}" "${_gw_container}" 2>/dev/null; then
-            log_success "Gateway connected to ${_ringfence_net}"
+            log_success "Gateway live-connected to ${_ringfence_net}"
           else
             local _nc_rc=$?
-            log_error "docker/podman network connect failed (exit ${_nc_rc})."
-            log_error "  Container: ${_gw_container}"
-            log_error "  Network:   ${_ringfence_net}"
-            log_error "  Recovery: run manually after the ringfence-init container completes:"
-            log_error "    ${_runtime_bin} network connect ${_ringfence_net} ${_gw_container}"
-            log_error "    ${COMPOSE_CMD[*]} -f ${_compose_file} up --no-deps -d gateway"
-            log_warn "Continuing — bridge-join failure is not fatal at onboard time."
-            log_warn "The gateway WILL NOT reach the MCP server until the network connect succeeds."
+            log_warn "docker/podman network connect failed (exit ${_nc_rc}) — not fatal."
+            log_warn "  Container: ${_gw_container}  Network: ${_ringfence_net}"
+            log_warn "  The compose-file patch ensures connectivity after the gateway recreate below."
           fi
         fi
 
