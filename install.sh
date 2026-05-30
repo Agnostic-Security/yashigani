@@ -11262,8 +11262,50 @@ PYREPLACE
     log_info "Production guard: mcp_identity_signing_key present at ${_mcp_key_check} — OK"
   fi
 
-  log_success "Agent onboarded. Next step: ./install.sh --pki-action=rotate-leaves"
-  log_info "  (Rotate-leaves issues the new agent's client cert from service_identities.yaml)"
+  # BUG-5 FIX (Ava 2026-05-30): run rotate-leaves --only for the newly onboarded
+  # agent immediately so its bootstrap_token_sha256 is populated before the agent
+  # container first starts.  Without this, the agent container calls current_service()
+  # at startup, finds bootstrap_token_sha256: "" in the runtime manifest, and raises
+  # TamperError — refusing to start.
+  #
+  # Precondition: PKI has been bootstrapped (intermediate cert exists).  If the
+  # operator onboards before running bootstrap, skip this with a clear warning —
+  # they will need to run --pki-action=rotate-leaves manually after bootstrap.
+  #
+  # Extract agent name from the manifest (already validated by Python codegen above).
+  # Use the same grep pattern as the Shape-C bridge-join block.
+  local _new_agent_name=""
+  _new_agent_name="$(grep -E '^[[:space:]]*name:[[:space:]]*' "${_manifest}" 2>/dev/null \
+    | head -1 | sed 's/.*name:[[:space:]]*//' | tr -d '[:space:]"'"'"'' || true)"
+
+  if [[ -n "${_new_agent_name}" ]] && [[ "${_new_agent_name}" =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; then
+    local _intermediate_cert="${WORK_DIR}/docker/secrets/ca_intermediate.crt"
+    if [[ -f "$_intermediate_cert" ]]; then
+      log_step "-" "BUG-5: issuing bootstrap token + leaf cert for '${_new_agent_name}' (rotate-leaves --only)"
+      local _rl_rc=0
+      _pki_run_issuer rotate-leaves --only "${_new_agent_name}" || _rl_rc=$?
+      if [[ "$_rl_rc" -ne 0 ]]; then
+        log_warn "BUG-5: rotate-leaves --only '${_new_agent_name}' failed (exit ${_rl_rc})."
+        log_warn "  The agent container will refuse to start until bootstrap_token_sha256 is populated."
+        log_warn "  Run manually: ./install.sh --pki-action=rotate-leaves"
+      else
+        log_success "BUG-5: bootstrap_token_sha256 populated for '${_new_agent_name}' — agent container can start."
+        # Re-chown: rotate-leaves generates key material owned by the issuer UID (1001).
+        # Without chown, the agent container (potentially a different UID) cannot read its key.
+        _pki_chown_client_keys \
+          || log_warn "BUG-5: _pki_chown_client_keys failed after --only rotate — agent key may be unreadable"
+      fi
+    else
+      log_warn "BUG-5: PKI not yet bootstrapped (${_intermediate_cert} missing)."
+      log_warn "  Run bootstrap first, then: ./install.sh --pki-action=rotate-leaves"
+    fi
+  else
+    log_warn "BUG-5: could not extract valid agent name from manifest — skipping bootstrap-token issuance."
+    log_warn "  Run manually: ./install.sh --pki-action=rotate-leaves"
+  fi
+
+  log_success "Agent onboarded. Bootstrap token issued (or: run --pki-action=rotate-leaves if PKI not yet bootstrapped)."
+  log_info "  (Rotate-leaves issues/updates the agent's client cert from service_identities.yaml)"
 }
 
 # =============================================================================

@@ -1089,6 +1089,49 @@ fi
 echo "=== Network assertion passed — all canonical networks removed. ==="
 
 # ---------------------------------------------------------------------------
+# J12 FIX (Ava 2026-05-30): remove ringfence_<agent> networks created by
+# `yashigani onboard` (Shape-C MCP agents).  These networks are NOT in the
+# hardcoded _CANONICAL_NETWORKS list above because they are dynamically named
+# at onboard time (ringfence_git, ringfence_filesystem, etc.).
+#
+# Discovery: `docker/podman network ls --filter name=ringfence_` lists all
+# networks whose name contains "ringfence_".  We then remove each one.
+#
+# The assertion below logs residuals as WARN (not exit-1): a ringfence network
+# may survive removal if a non-yashigani container joined it.  The operator
+# is told exactly what to do.  We do not block uninstall for onboard residuals.
+# ---------------------------------------------------------------------------
+echo "=== Ringfence network cleanup (J12) ==="
+_ringfence_removed=0
+_ringfence_failed=0
+
+# Use process substitution compatible with bash 3.2 (no readarray/mapfile).
+while IFS= read -r _rfnet; do
+    if [ -z "$_rfnet" ]; then
+        continue
+    fi
+    if "$RUNTIME" network rm "$_rfnet" >/dev/null 2>&1; then
+        echo "  [removed] ringfence: $_rfnet"
+        _ringfence_removed=$(( _ringfence_removed + 1 ))
+    else
+        echo "  [WARN] ringfence network rm failed: $_rfnet (may be in use)" >&2
+        _ringfence_failed=$(( _ringfence_failed + 1 ))
+    fi
+done < <("$RUNTIME" network ls --filter "name=ringfence_" --format "{{.Name}}" 2>/dev/null || true)
+
+if [ "$_ringfence_removed" -gt 0 ] || [ "$_ringfence_failed" -gt 0 ]; then
+    echo "Ringfence network cleanup: ${_ringfence_removed} removed, ${_ringfence_failed} failed."
+    if [ "$_ringfence_failed" -gt 0 ]; then
+        echo "  [WARN] Some ringfence networks could not be removed (in use by a foreign container?)." >&2
+        echo "  Manual remediation:" >&2
+        echo "    ${RUNTIME} network ls --filter name=ringfence_   # list survivors" >&2
+        echo "    ${RUNTIME} network rm <name>                     # after detaching foreign containers" >&2
+    fi
+else
+    echo "  [ok] No ringfence networks found."
+fi
+
+# ---------------------------------------------------------------------------
 # BUG-3-MULTI-USER-INSTALL-PKI / BACKLOG-V240-006: wipe docker/secrets/ on
 # --remove-volumes (sudo-free, container-fallback — Iris+Laura 2026-05-21).
 #
