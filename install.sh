@@ -2305,6 +2305,14 @@ run_wizard() {
       log_warn "Defaults or empty values will be used; reconfigure via your .env file."
     fi
 
+    # On upgrade, reuse an existing UPSTREAM_MCP_URL from .env rather than exporting an
+    # empty value. Compose declares it required (${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}),
+    # so a blank export breaks `up` even though the value is already configured — this is
+    # what forced operators to re-pass --upstream-url on every upgrade.
+    if [[ -z "$UPSTREAM_URL" && -f "${WORK_DIR}/docker/.env" ]]; then
+      UPSTREAM_URL="$(grep -m1 '^UPSTREAM_MCP_URL=' "${WORK_DIR}/docker/.env" | cut -d= -f2- || true)"
+      [[ -n "$UPSTREAM_URL" ]] && log_info "Reusing existing UPSTREAM_MCP_URL from .env (upgrade)"
+    fi
     export YASHIGANI_TLS_DOMAIN="$DOMAIN"
     export YASHIGANI_ADMIN_USERNAME="$ADMIN_EMAIL"
     export UPSTREAM_MCP_URL="$UPSTREAM_URL"
@@ -2391,8 +2399,16 @@ _backup_existing_data() {
         rm -rf "$_secrets_dest"
       fi
     else
-      cp -rp "$_secrets_src" "$_secrets_dest"
-      log_info "  secrets/ backed up (ownership/mode preserved)"
+      # Docker/rootful path. Some client certs/keys are owned by container UIDs
+      # (root/999/1000) and unreadable by a non-root install user, so cp -rp returns
+      # non-zero. That must NOT abort the upgrade under set -e: the live volumes still
+      # hold the secrets and the dual-wrap bundle below is the authoritative copy.
+      mkdir -p "$_secrets_dest"
+      if cp -rp "$_secrets_src"/. "$_secrets_dest"/ 2>/dev/null; then
+        log_info "  secrets/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets/ partial copy — some keys owned by container UIDs are unreadable as $(id -un); non-fatal (live volumes + dual-wrap bundle retain them)."
+      fi
     fi
   fi
 
@@ -4543,9 +4559,14 @@ _fix_config_perms() {
     # HMAC handoff); checking -perm -040 caused a false-positive abort on every install.
     # Group-readable is a legitimate design choice for specific files in docker/secrets/;
     # world-readable (o+r) on ANY secret file there is always wrong.
+    # Self-heal THEN assert: tighten any world-readable non-cert secret (e.g. a password
+    # file left 0644 by an earlier step or a prior install) by removing world access, then
+    # fail only if any remain. Tightening rather than aborting keeps upgrades moving without
+    # weakening posture — group bits (e.g. caddy_internal_hmac 0640) are preserved (o-rwx only).
+    find "${_secrets_dir}" -type f ! -name "*.crt" -perm -004 -exec chmod o-rwx {} + 2>/dev/null || true
     if find "${_secrets_dir}" -type f ! -name "*.crt" -perm -004 2>/dev/null | grep -q .; then
-      log_error "CWE-732: world-readable non-cert file(s) found under ${_secrets_dir} after _fix_config_perms" >&2
-      log_error "This is a security regression — check for chmod errors above." >&2
+      log_error "CWE-732: world-readable non-cert file(s) STILL present under ${_secrets_dir} after self-heal" >&2
+      log_error "Could not tighten (ownership/filesystem issue) — investigate." >&2
       exit 1
     fi
   fi
@@ -5437,7 +5458,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 #   YSG_HEALTHZ_TIMEOUT_S   (default: 60)
 #   YSG_HEALTHZ_POLL_S      (default: 2)
 _verify_gateway_healthz() {
-  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-60}"
+  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-180}"   # was 60 — too tight: on a fresh-image first boot + migrations the gateway converges just after 60s, so the gate false-failed a healthy stack. Override with YSG_HEALTHZ_TIMEOUT_S.
   local _poll_s="${YSG_HEALTHZ_POLL_S:-2}"
   local _https_port="${YASHIGANI_HTTPS_PORT:-443}"
   local _domain="${DOMAIN:-localhost}"
