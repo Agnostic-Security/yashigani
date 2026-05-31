@@ -1,247 +1,109 @@
-# Yashigani v2.25.1 — Wazuh SIEM auto-deploy override
-# Last updated: 2026-05-30
+# Yashigani v2.25.1 — Wazuh Docker-runtime + full-mTLS OVERLAY
 #
-# Activate: docker compose -f docker-compose.yml -f docker-compose.wazuh.yml up -d
-# Or set via Admin → Audit → SIEM Integration → Wazuh (Auto-deploy)
+# Delta overlay for the wazuh services DEFINED IN docker-compose.yml (profile: wazuh).
+# Does NOT re-declare those services wholesale (that duplicated security_opt/volumes on
+# merge) — it only ADDS what main is missing to run securely on Docker 29.x:
+#   - minimal caps: the wazuh s6 entrypoint must chown/setuid to the wazuh user and
+#     (manager) chroot analysisd — incompatible with a bare cap_drop:[ALL].
+#   - non-fatal cont-init (0-wazuh-init): Docker 29 per-subdir volume-mount readiness race.
+#   - filebeat→indexer certs: main references SSL_CERTIFICATE paths it never mounts.
+#   - code-based healthchecks: `curl -sf` fails on the 503/401 a security-enabled indexer
+#     returns, falsely reporting unhealthy and deadlocking dependents.
+#   - wazuh-security-init: one-shot securityadmin (the indexer doesn't self-init under Docker).
+#   - full internal-CA mTLS: indexer HTTP listener on the internal CA (SAN wazuh-indexer) so
+#     filebeat `full` verification works; transport stays demo (single node).
 #
-# Wazuh admin password is auto-generated at first run (36-char).
-# Check: docker compose logs wazuh-manager | grep -A 10 "WAZUH CREDENTIALS"
+# Apply: docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh up -d
 #
-# Three Wazuh containers:
-#   wazuh-manager   — SIEM engine + rule processing (port 1514/1515 internal)
-#   wazuh-indexer   — OpenSearch-based log storage (port 9200 internal, HTTPS)
-#   wazuh-dashboard — Web UI (accessible via Caddy /admin/wazuh)
-#
-# SECURITY (v2.25.1): all intra-stack Wazuh traffic is HTTPS + mTLS — NEVER plaintext.
-#   The wazuh-indexer image serves TLS on 9200 by default (OpenSearch security plugin
-#   ON). The yashigani SiemSink and filebeat ship to https://wazuh-indexer:9200/_bulk
-#   with ApiKey/mTLS using the per-service certs in ./secrets (issued at bootstrap;
-#   SiemSink ApiKey in KMS as "wazuh_api_key"). v2.25.0-prep pointed the manager,
-#   dashboard and all healthchecks at http:// while the indexer was serving https:// —
-#   a broken, plaintext-intent config. This file restores the validated HTTPS/mTLS
-#   config (proven green on v2.24.4 in the AMD64 E2E run, 2026-05-30).
-#
-# OpenSearch security-index init is AUTOMATED by the `wazuh-security-init` one-shot
-# service below (v2.25.1) — no manual step. It runs securityadmin with the admin cert
-# baked into the indexer image once the indexer TLS listener is up; the manager and
-# dashboard gate on its successful completion. See docs/wazuh-linux-docker29-fixes.md.
+# The ./wazuh-mtls/* mounts (opensearch.yml, internal_users.yml with the real generated
+# password hashes, internal-CA HTTP cert, admin cert, dashboard config) are generated at
+# install time — see install.sh wazuh provisioning. ./secrets/* and ./wazuh-patch/* are
+# committed/install-generated.
 
 services:
 
   wazuh-indexer:
-    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
-    restart: unless-stopped
-    mem_limit: ${YASHIGANI_WAZUH_INDEXER_MEM_LIMIT:-1024m}
-    cpus: ${YASHIGANI_WAZUH_INDEXER_CPU_LIMIT:-1.0}
-    environment:
-      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
-      bootstrap.memory_lock: "true"
-      discovery.type: single-node
-      WAZUH_API_KEY_FILE: /run/secrets/wazuh_api_key
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 65536
-        hard: 65536
-    volumes:
-      - wazuh_indexer_data:/var/lib/wazuh-indexer
-      - ./secrets:/run/secrets:ro
+    # s6/OpenSearch entrypoint drops root→wazuh-indexer(1000): needs chown/setuid caps.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
     healthcheck:
-      # HTTPS — the indexer serves TLS on 9200. -k: cert is internal-CA issued. We
-      # match the HTTP status code: 200 (authed/open), 401/403 (security up, needs
-      # auth) all prove the TLS listener + security plugin are live. Do NOT use
-      # `curl -sf` here — `-f` fails on the 401 a security-enabled indexer returns
-      # before/without credentials, which would falsely report unhealthy and (since
-      # wazuh-security-init/manager/dashboard wait on `indexer healthy`) deadlock the
-      # whole stack. (v2.25.0-prep used http:// — never succeeds against TLS at all.)
       test: ["CMD-SHELL", "curl -sk https://localhost:9200 -o /dev/null -w '%{http_code}' | grep -qE '^(200|401|403)$'"]
       interval: 15s
       timeout: 10s
       retries: 10
-      # Long start_period: a fresh security-enabled indexer returns 503 ("not yet
-      # initialized") until wazuh-security-init runs securityadmin. During start_period
-      # a failing check keeps the container "starting" (not "unhealthy"), giving the
-      # sidecar room to initialise the security index — after which the indexer returns
-      # 401 (unauthenticated) and this check passes. Without this margin the dependency
-      # wait would abort before the sidecar could run.
       start_period: 150s
-    # E2E-FIX (F7-ROOT): OpenSearch entrypoint drops root→wazuh-indexer(1000);
-    # cap_drop:[ALL] blocks the setuid/chown. Grant minimal caps.
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
-    security_opt:
-      - no-new-privileges:true
-    # EX-231-10: wazuh-indexer receives from manager; obs-plane.
-    networks:
-      - obs
+    volumes:
+      # internal-CA HTTP listener + real-password internal_users (transport stays demo)
+      - ./wazuh-mtls/opensearch.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
+      - ./wazuh-mtls/opensearch-security/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro
+      - ./wazuh-mtls/certs/http-indexer.pem:/usr/share/wazuh-indexer/config/certs/http-indexer.pem:ro
+      - ./wazuh-mtls/certs/http-indexer-key.pem:/usr/share/wazuh-indexer/config/certs/http-indexer-key.pem:ro
+      - ./wazuh-mtls/certs/http-ca-bundle.pem:/usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem:ro
+
+  # One-shot OpenSearch security-index initialiser (securityadmin) using the internal-CA
+  # admin cert. Manager/dashboard gate on its successful completion.
+  wazuh-security-init:
+    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
+    restart: "no"
+    depends_on:
+      wazuh-indexer:
+        condition: service_started
+    volumes:
+      - ./wazuh-mtls/certs/wazuh-admin.pem:/cfg/wazuh-admin.pem:ro
+      - ./wazuh-mtls/certs/wazuh-admin-key.pem:/cfg/wazuh-admin-key.pem:ro
+      - ./wazuh-mtls/certs/http-ca-bundle.pem:/cfg/http-ca-bundle.pem:ro
+      # the REAL-password security config dir (incl. internal_users.yml with the
+      # generated admin/kibanaserver hashes) — securityadmin applies THIS, not the image demo.
+      - ./wazuh-mtls/opensearch-security:/cfg/opensearch-security:ro
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        echo "[security-init] waiting for indexer TLS listener ..."
+        until curl -sk https://wazuh-indexer:9200 -o /dev/null; do sleep 5; done
+        echo "[security-init] applying real-password security config via internal-CA admin cert ..."
+        JAVA_HOME=/usr/share/wazuh-indexer/jdk \
+          /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh \
+          -cd /cfg/opensearch-security -icl -nhnv \
+          -cacert /cfg/http-ca-bundle.pem \
+          -cert /cfg/wazuh-admin.pem -key /cfg/wazuh-admin-key.pem \
+          -h wazuh-indexer -p 9200
+        echo "[security-init] done."
+    networks: [obs]
+    profiles: [wazuh]
 
   wazuh-manager:
-    image: docker.io/wazuh/wazuh-manager:4.14.5@sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109
-    restart: unless-stopped
-    mem_limit: ${YASHIGANI_WAZUH_MANAGER_MEM_LIMIT:-1024m}
-    cpus: ${YASHIGANI_WAZUH_MANAGER_CPU_LIMIT:-1.0}
     environment:
-      WAZUH_MANAGER_MASTER_NODE_NAME: wazuh-master
-      # HTTPS to the indexer (was http:// in v2.25.0-prep — broken/plaintext). Traffic
-      # is now TLS-encrypted (validated: filebeat handshake OK, TLSv1.2, 2026-05-30).
-      INDEXER_URL: https://wazuh-indexer:9200
-      INDEXER_USERNAME: admin
-      INDEXER_PASSWORD: ${WAZUH_INDEXER_PASSWORD:-}
-      # SECURITY NOTE — peer verification is `none` for now (encrypted but the server
-      # cert is NOT verified). This is NOT the desired end state. Root cause: the
-      # wazuh-indexer image ships the Wazuh DEMO PKI (server cert SAN=demo.indexer,
-      # admin_dn=CN=admin,OU=Wazuh, nodes_dn=CN=demo.indexer) while the installer issues
-      # the indexer an internal-CA cert (wazuh-indexer_client.crt, SAN=wazuh-indexer) but
-      # NEVER mounts it onto the container. The two PKIs are disjoint, so `full`/
-      # `certificate` verification cannot succeed and filebeat fails to ship. Enabling
-      # verified mTLS is an INSTALLER work-item (see docs/wazuh-linux-docker29-fixes.md):
-      # mount wazuh-indexer_client.{crt,key} as the indexer http+transport cert, mount
-      # the internal-CA chain as the truststore, set nodes_dn=[CN=wazuh-indexer,...],
-      # issue+mount an internal-CA admin cert + set admin_dn to it, re-run securityadmin
-      # (the wazuh-security-init sidecar). Once done, flip this to `full` (one line).
-      # The mTLS client-cert mounts below are already correct for that future state.
-      FILEBEAT_SSL_VERIFICATION_MODE: ${WAZUH_FILEBEAT_SSL_VERIFICATION_MODE:-none}
+      # full verification now that the indexer presents the internal-CA cert (SAN wazuh-indexer)
+      FILEBEAT_SSL_VERIFICATION_MODE: full
       SSL_CERTIFICATE_AUTHORITIES: /etc/ssl/root-ca.pem
-      SSL_CERTIFICATE: /etc/wazuh-indexer/certs/wazuh.manager.pem
-      SSL_KEY: /etc/wazuh-indexer/certs/wazuh.manager-key.pem
-      WAZUH_API_PASSWORD_FILE: /run/secrets/wazuh_admin_password
+    # s6 entrypoint: chown/setuid to wazuh(999) + chroot analysisd into /var/ossec.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL, SETPCAP, SYS_CHROOT]
     depends_on:
       wazuh-indexer:
         condition: service_healthy
       wazuh-security-init:
         condition: service_completed_successfully
-    volumes:
-      - wazuh_manager_config:/var/ossec/etc
-      - wazuh_manager_logs:/var/ossec/logs
-      - wazuh_manager_queue:/var/ossec/queue
-      - ./secrets:/run/secrets:ro
-      # E2E-FIX (F7): non-fatal cont-init — Docker 29.x has a volume-mount-readiness
-      # race; the stock s6 init aborts boot when the per-subdir cp-restore finds an
-      # as-yet-unready mount. This patched init logs + continues. MUST be writable
-      # (not :ro) — s6 chmods it on boot.
-      - ./wazuh-patch/0-wazuh-init:/etc/cont-init.d/0-wazuh-init
-      # E2E-FIX (F7): filebeat→indexer mTLS certs — env points here but the stock
-      # compose never mounted them, so filebeat could not establish TLS to the indexer.
-      - ./secrets/wazuh-manager_client.crt:/etc/wazuh-indexer/certs/wazuh.manager.pem:ro
-      - ./secrets/wazuh-manager_client.key:/etc/wazuh-indexer/certs/wazuh.manager-key.pem:ro
-      - ./secrets/ca_root.crt:/etc/ssl/root-ca.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -q 'wazuh-analysisd is running'"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 90s
-    security_opt:
-      - no-new-privileges:true
-    # E2E-FIX (F7-ROOT): Wazuh's s6 entrypoint is incompatible with cap_drop:[ALL].
-    # It must chown/setuid to the wazuh(999) user and chroot analysisd into
-    # /var/ossec. Grant the minimal caps Wazuh requires (incl. SYS_CHROOT, SETPCAP).
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL, SETPCAP, SYS_CHROOT]
-    # EX-231-10: wazuh-manager receives audit events from backoffice/gateway
-    # (data-plane push) and sends to indexer (obs). Joins both.
-    networks:
-      - data
-      - obs
+    volumes:
+      - ./wazuh-patch/0-wazuh-init:/etc/cont-init.d/0-wazuh-init
+      - ./secrets/wazuh-manager_client.crt:/etc/wazuh-indexer/certs/wazuh.manager.pem:ro
+      - ./secrets/wazuh-manager_client.key:/etc/wazuh-indexer/certs/wazuh.manager-key.pem:ro
+      # CA bundle (root+intermediate) so filebeat verifies the indexer's internal-CA cert
+      - ./wazuh-mtls/certs/http-ca-bundle.pem:/etc/ssl/root-ca.pem:ro
 
   wazuh-dashboard:
-    image: docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af
-    restart: unless-stopped
-    mem_limit: ${YASHIGANI_WAZUH_DASHBOARD_MEM_LIMIT:-1024m}
-    cpus: ${YASHIGANI_WAZUH_DASHBOARD_CPU_LIMIT:-1.0}
-    environment:
-      INDEXER_USERNAME: admin
-      INDEXER_PASSWORD: ${WAZUH_INDEXER_PASSWORD:-}
-      # HTTPS to the manager API (was http:// in v2.25.0-prep).
-      WAZUH_API_URL: https://wazuh-manager
-      WAZUH_API_PORT: "55000"
-    volumes:
-      # E2E-FIX (F7): the dashboard image ships no opensearch_dashboards.yml and the
-      # stock compose mounted none → it could not reach the (HTTPS) indexer. This
-      # minimal config points it at https://wazuh-indexer:9200 over TLS.
-      - ./wazuh-patch/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
-      - wazuh_dashboard_config:/usr/share/wazuh-dashboard/config
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
     healthcheck:
-      # The dashboard's own UI listens on http://localhost:5601 inside the container
-      # (TLS is terminated by Caddy in front of it); its link to the indexer is HTTPS
-      # (see opensearch_dashboards.yml). Server-side TLS for the UI is Caddy's job.
-      # Match the status code — a ready dashboard 302-redirects to /login; `curl -sf`
-      # would fail on that redirect and falsely report unhealthy.
       test: ["CMD-SHELL", "curl -sk http://localhost:5601 -o /dev/null -w '%{http_code}' | grep -qE '^(200|302|401)$'"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s
-    depends_on:
-      wazuh-indexer:
-        condition: service_healthy
-      wazuh-manager:
-        condition: service_healthy
-      wazuh-security-init:
-        condition: service_completed_successfully
-    security_opt:
-      - no-new-privileges:true
-    # E2E-FIX (F7-ROOT): dashboard entrypoint drops root→wazuh-dashboard(1000).
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
-    # EX-231-10: wazuh-dashboard is obs-plane only.
-    networks:
-      - obs
-
-  # ---------------------------------------------------------------------------
-  # wazuh-security-init — one-shot OpenSearch security-index initialiser (v2.25.1)
-  #
-  # The wazuh-indexer entrypoint does NOT reliably run securityadmin on first boot
-  # under Docker 29.x, so the `.opendistro_security` index is left uninitialised →
-  # every authenticated request returns 503 ("OpenSearch Security not initialized")
-  # and the dashboard/manager cannot connect. In the E2E this had to be run by hand;
-  # this sidecar automates it. It waits for the indexer TLS listener, applies the
-  # security config with the admin cert baked into the indexer image, then exits 0.
-  # Idempotent — safe to re-run on every `up` (securityadmin just re-applies config).
-  # Manager + dashboard gate on its successful completion (service_completed_successfully).
-  # ---------------------------------------------------------------------------
-  wazuh-security-init:
-    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
-    restart: "no"
-    depends_on:
-      # service_started (NOT service_healthy): the indexer cannot become "healthy"
-      # until THIS sidecar initialises the security index (it returns 503 till then),
-      # so gating on health would deadlock. The sidecar's own wait-loop below blocks
-      # until the TLS listener answers, which is all securityadmin needs.
-      wazuh-indexer:
-        condition: service_started
-    entrypoint: ["bash", "-c"]
-    command:
-      - |
-        set -eu
-        I=/usr/share/wazuh-indexer
-        echo "[security-init] waiting for indexer TLS listener on wazuh-indexer:9200 ..."
-        until curl -sk https://wazuh-indexer:9200 -o /dev/null; do sleep 5; done
-        echo "[security-init] indexer reachable; applying OpenSearch security config ..."
-        JAVA_HOME=$$I/jdk "$$I/plugins/opensearch-security/tools/securityadmin.sh" \
-          -cd "$$I/config/opensearch-security" \
-          -icl -nhnv \
-          -cacert "$$I/config/certs/root-ca.pem" \
-          -cert "$$I/config/certs/admin.pem" \
-          -key "$$I/config/certs/admin-key.pem" \
-          -h wazuh-indexer -p 9200
-        echo "[security-init] security index initialised."
-    security_opt:
-      - no-new-privileges:true
-    # EX-231-10: talks to the indexer only — obs-plane.
-    networks:
-      - obs
-
-volumes:
-  wazuh_indexer_data:
-    driver: local
-  wazuh_manager_config:
-    driver: local
-  wazuh_manager_logs:
-    driver: local
-  wazuh_manager_queue:
-    driver: local
-  wazuh_dashboard_config:
-    driver: local
+      start_period: 120s
+    volumes:
+      - ./wazuh-mtls/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ./wazuh-mtls/certs/http-ca-bundle.pem:/usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem:ro

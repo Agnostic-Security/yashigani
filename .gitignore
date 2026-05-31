@@ -101,3 +101,6 @@ CLAUDE.md
 
 # CI artifacts downloaded locally for smoke-test triage — never commit
 ci-artifacts/
+
+# Wazuh mTLS material generated at install time (admin cert/key, real-password configs) — never commit
+docker/wazuh-mtls/

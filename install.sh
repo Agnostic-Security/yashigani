@@ -4556,6 +4556,121 @@ _fix_config_perms() {
 # =============================================================================
 # STEP 10 (compose/vm): docker compose up -d
 # =============================================================================
+# ---------------------------------------------------------------------------
+# v2.25.1: provision Wazuh full internal-CA mTLS material (deploy-local, git-ignored).
+# Generates — idempotently, with NO manual steps — everything docker-compose.wazuh.yml
+# mounts so the indexer HTTP listener runs on the internal CA (SAN wazuh-indexer),
+# filebeat does `full` verification, and admin/kibanaserver authenticate with the REAL
+# generated passwords (the image's demo admin/admin is removed). Output lands under
+# docker/wazuh-mtls/ (git-ignored — contains the admin key + real-password configs).
+# Transport stays on the image demo certs (single node) — only the HTTP layer is re-PKI'd.
+# ---------------------------------------------------------------------------
+_provision_wazuh_mtls() {
+  local secrets="${WORK_DIR}/docker/secrets"
+  local wp="${WORK_DIR}/docker/wazuh-mtls"
+  local idx_img="docker.io/wazuh/wazuh-indexer:4.14.5"
+  local rt="${RUNTIME:-${YSG_RUNTIME:-docker}}"
+
+  # Idempotency: a dedicated marker written LAST (not an intermediate artifact) so a
+  # mid-function abort never leaves a half-provisioned dir that a re-run would skip.
+  if [[ -f "${wp}/.provisioned" ]]; then
+    log_info "Wazuh mTLS material already provisioned — skipping"
+    return 0
+  fi
+  require_cmd openssl
+  umask 077   # private keys are born owner-only; relaxed selectively in step 7
+  log_info "Provisioning Wazuh full-mTLS material (internal-CA admin cert + real-password internal_users)..."
+  rm -rf "${wp}"   # clear any half-provisioned remnant from a prior aborted run
+  mkdir -p "${wp}/certs" "${wp}/opensearch-security"
+
+  # 1. CA bundle (intermediate + root) — HTTP-layer trust anchor
+  cat "${secrets}/ca_intermediate.crt" "${secrets}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+
+  # 2. internal-CA admin cert (EC P-256, PKCS#8 key) signed by the internal intermediate
+  openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
+  openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
+  rm -f "${wp}/certs/.admin-sec1.pem"
+  openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
+    -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
+  openssl x509 -req -in "${wp}/certs/.admin.csr" -CA "${secrets}/ca_intermediate.crt" \
+    -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "${wp}/certs/wazuh-admin.pem" \
+    -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+  rm -f "${wp}/certs/.admin.csr" "${secrets}/ca_intermediate.srl"
+
+  # 3. indexer HTTP server cert = the bootstrap-issued internal-CA cert (SAN wazuh-indexer)
+  cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
+  cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
+  # fail-closed: filebeat `full` verification needs SAN=wazuh-indexer on the HTTP cert
+  if ! openssl x509 -in "${wp}/certs/http-indexer.pem" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:wazuh-indexer'; then
+    log_error "wazuh-indexer_client.crt lacks SAN 'wazuh-indexer' — full mTLS would fail closed; aborting"; return 1
+  fi
+
+  # 4. base opensearch config from the image, then re-PKI ONLY the HTTP listener + admin_dn
+  #    (transport keys are left at the image's demo paths — single node, untouched).
+  local cid; cid="$("$rt" create "$idx_img")" || { log_error "could not create temp indexer container"; return 1; }
+  if ! "$rt" cp "${cid}:/usr/share/wazuh-indexer/config/opensearch.yml" "${wp}/opensearch.yml" \
+     || ! "$rt" cp "${cid}:/usr/share/wazuh-indexer/config/opensearch-security/." "${wp}/opensearch-security/"; then
+    "$rt" rm "$cid" >/dev/null 2>&1; log_error "could not extract base indexer config from image"; return 1
+  fi
+  "$rt" rm "$cid" >/dev/null 2>&1
+  sed -i \
+    -e 's#ssl.http.pemcert_filepath: .*#ssl.http.pemcert_filepath: /usr/share/wazuh-indexer/config/certs/http-indexer.pem#' \
+    -e 's#ssl.http.pemkey_filepath: .*#ssl.http.pemkey_filepath: /usr/share/wazuh-indexer/config/certs/http-indexer-key.pem#' \
+    -e 's#ssl.http.pemtrustedcas_filepath: .*#ssl.http.pemtrustedcas_filepath: /usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem#' \
+    "${wp}/opensearch.yml"
+  python3 - "${wp}/opensearch.yml" <<'PYEOF'
+import sys,re
+p=sys.argv[1]; t=open(p).read()
+t=re.sub(r'plugins\.security\.authcz\.admin_dn:\n((?:[ \t]*- ".*"\n)+)',
+         'plugins.security.authcz.admin_dn:\n- "CN=wazuh-admin,O=Agnostic Security"\n', t)
+open(p,'w').write(t)
+PYEOF
+  # fail-closed: the admin_dn rewrite must have landed, else securityadmin can't authenticate
+  grep -q 'CN=wazuh-admin,O=Agnostic Security' "${wp}/opensearch.yml" \
+    || { log_error "admin_dn substitution failed in opensearch.yml — aborting"; return 1; }
+
+  # 5. internal_users.yml: admin + kibanaserver = bcrypt(real generated passwords).
+  #    Password is passed via the container ENV (never interpolated into a shell string),
+  #    so any password charset is injection-safe.
+  local ah kh
+  ah="$("$rt" run --rm -e RAWPW="$(cat "${secrets}/wazuh_indexer_password")" "$idx_img" \
+        bash -lc 'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$RAWPW"' 2>/dev/null | tail -1)"
+  kh="$("$rt" run --rm -e RAWPW="$(cat "${secrets}/wazuh_dashboard_password")" "$idx_img" \
+        bash -lc 'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$RAWPW"' 2>/dev/null | tail -1)"
+  if [[ ! "$ah" =~ ^\$2[aby]\$ ]] || [[ ! "$kh" =~ ^\$2[aby]\$ ]]; then
+    log_error "bcrypt hash generation failed (admin/kibanaserver not valid \$2 hashes) — aborting"; return 1
+  fi
+  python3 - "${wp}/opensearch-security/internal_users.yml" "$ah" "$kh" <<'PYEOF'
+import sys,yaml
+p,ah,kh=sys.argv[1:4]
+d=yaml.safe_load(open(p))
+if 'admin' in d: d['admin']['hash']=ah
+if 'kibanaserver' in d: d['kibanaserver']['hash']=kh
+yaml.safe_dump(d,open(p,'w'),default_flow_style=False,sort_keys=False)
+PYEOF
+
+  # 6. dashboard config: real indexer password + internal-CA bundle + full verification
+  {
+    printf 'server.host: "0.0.0.0"\nserver.port: 5601\nserver.ssl.enabled: false\n'
+    printf 'opensearch.hosts: ["https://wazuh-indexer:9200"]\n'
+    printf 'opensearch.ssl.verificationMode: full\n'
+    printf 'opensearch.ssl.certificateAuthorities: ["/usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem"]\n'
+    printf 'opensearch.username: "admin"\n'
+    printf 'opensearch.password: "%s"\n' "$(cat "${secrets}/wazuh_indexer_password")"
+    printf 'opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]\n'
+    printf 'opensearch_security.multitenancy.enabled: false\n'
+  } > "${wp}/opensearch_dashboards.yml"
+
+  # 7. ownership: indexer/dashboard/sidecar run as uid 1000; CA bundle world-readable (manager uid 999)
+  "$rt" run --rm -u 0 -v "${wp}":/w "$idx_img" sh -c '
+    chown -R 1000:1000 /w
+    chmod 644 /w/certs/http-ca-bundle.pem /w/certs/http-indexer.pem /w/certs/wazuh-admin.pem /w/opensearch.yml /w/opensearch-security/*.yml
+    chmod 640 /w/certs/http-indexer-key.pem /w/certs/wazuh-admin-key.pem
+    chmod 600 /w/opensearch_dashboards.yml' || { log_error "wazuh-mtls ownership/permission step failed"; return 1; }
+  : > "${wp}/.provisioned"   # marker written LAST — gates idempotent re-runs
+  log_success "Wazuh full-mTLS material provisioned (docker/wazuh-mtls/, git-ignored)"
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -4566,6 +4681,17 @@ compose_up() {
 
   # Auto-apply Podman rootless override when running on Podman
   local compose_files=("-f" "$compose_file")
+
+  # v2.25.1: Wazuh Docker-runtime + full internal-CA mTLS overlay. When the wazuh profile
+  # is active, provision the deploy-local mTLS material (git-ignored) and layer the overlay
+  # that adds caps/cont-init/securityadmin/healthchecks + the internal-CA HTTP listener.
+  # No manual steps — reproducible on every up (SOP: changes in code, not hand-applied).
+  local _wazuh_overlay="${WORK_DIR}/docker/docker-compose.wazuh.yml"
+  if { [[ "${INSTALL_WAZUH:-false}" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; } && [[ -f "$_wazuh_overlay" ]]; then
+    _provision_wazuh_mtls || { log_error "Wazuh mTLS provisioning failed — aborting before compose up (fail-closed)"; return 1; }
+    compose_files+=("-f" "$_wazuh_overlay")
+    log_info "Applying Wazuh Docker-runtime + full-mTLS overlay (docker-compose.wazuh.yml)"
+  fi
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
     log_info "Podman detected — configuring rootless deployment"
 
