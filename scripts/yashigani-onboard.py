@@ -92,6 +92,7 @@ def _info(msg: str) -> None:
 def _build_ssl_context(ca_cert: str | None) -> ssl.SSLContext:
     """Build a TLS context that trusts the Yashigani CA (or system default)."""
     ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3  # TLS 1.3 only (2.25.1)
     if ca_cert:
         if not os.path.isfile(ca_cert):
             _die(f"CA cert file not found: {ca_cert}")
