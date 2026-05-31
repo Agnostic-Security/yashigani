@@ -356,7 +356,6 @@ The table below lists only rows that **differ across tiers**. Rows that are iden
 | **Licensing** | | | | | | | |
 | Free, no license key | Yes | — | — | — | — | — | — |
 | Signed licence key required | — | Yes (verified) | Yes | Yes | Yes | Yes | Yes |
-| Pricing | Free | Free (always) | £1,750/yr | £3,000/yr | £12,000/yr | £80,000/yr | From £200,000/yr *(coming soon)* |
 | Max agents / MCP servers | 20 | Unlimited | 200 | 400 | 2,000 | 16,000 | Unlimited |
 | Max end users | 5 | Unlimited | 50 | 100 | 500 | 4,000 | Unlimited |
 | Max admin seats | 2 | Unlimited | 5 | 10 | 25 | 100 | Unlimited |
@@ -378,11 +377,7 @@ The table below lists only rows that **differ across tiers**. Rows that are iden
 
 Paid tiers support optional 50- or 250-user bundles to grow within a tier before upgrading. The premium increases at higher tiers to create a natural upgrade trigger.
 
-| Tier | Bundle size | Bundle price/yr | Users added | Agents added (4:1) | Max bundles | Tier cap at max bundles |
-|---|---|---|---|---|---|---|
-| Starter | 50 users | £1,627.50 | +50 | +200 | 5 | 350 users / £11,137.50 |
-| Professional | 50 users | £1,350 | +50 | +200 | 50 | 3,000 users / £79,500 |
-| Professional Plus | 250 users | £6,000 | +250 | +1,000 | Unlimited *(during Enterprise pre-launch)* | No cap *(during Enterprise pre-launch)* |
+**Pricing:** see https://agnosticsec.com/yashigani
 
 Each tier's maximum bundle spend is normally set just below the next tier's base price — at that point, upgrading delivers more capacity, features, and better value per user. **While Enterprise is in pre-launch, Professional Plus has no upper bundle cap** — keep adding 250-user bundles as you grow. When Enterprise becomes generally available, customers who've expanded beyond the typical Pro Plus envelope will be invited to migrate at GA. Igniter has no bundles; upgrade to Starter at 51+ users.
 

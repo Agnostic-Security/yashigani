@@ -8,7 +8,11 @@ Every service that listens on the internal network should build a
 Every outbound internal call should build a :func:`client_ssl_context`.
 
 Both contexts enforce:
-  * TLS 1.2 minimum (same floor as the edge TLS policy)
+  * TLS 1.3 minimum (matches the Caddy edge policy; all internal mesh peers —
+    Postgres 16, Redis 7.4, pgbouncer 1.25, uvicorn/OpenSSL 3.x — support TLS 1.3).
+    NOTE: Python's ssl/OpenSSL negotiates a *classical* KEX even at TLS 1.3
+    (no PQC-KEX without the oqs-provider); PQC-hybrid KEX (X25519MLKEM768) is
+    terminated at the Caddy edge. Internal east-west PQC-KEX is tracked separately.
   * Root CA is the trust anchor for Python ssl consumers.  Python 3.12 /
     OpenSSL 3.0 does NOT auto-set X509_V_FLAG_PARTIAL_CHAIN on
     SSLContext.load_verify_locations(), so intermediate-only anchors fail
@@ -66,7 +70,7 @@ def server_ssl_context(identity: Optional[ServiceIdentity] = None) -> ssl.SSLCon
     cert_path, key_path, ca_root = ident.expect_cert_files()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
     ctx.load_verify_locations(cafile=str(ca_root))
     ctx.verify_mode = ssl.CERT_REQUIRED
@@ -89,7 +93,7 @@ def client_ssl_context(identity: Optional[ServiceIdentity] = None) -> ssl.SSLCon
     cert_path, key_path, ca_root = ident.expect_cert_files()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
     ctx.load_verify_locations(cafile=str(ca_root))
     ctx.check_hostname = True
@@ -113,7 +117,7 @@ def ca_trust_only_context(ca_root_path: str | Path) -> ssl.SSLContext:
     admin before a client cert exists.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_verify_locations(cafile=str(ca_root_path))
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
