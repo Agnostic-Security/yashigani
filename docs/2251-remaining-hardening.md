@@ -1,59 +1,39 @@
-# 2.25.1 — remaining hardening (diagnosed, need a TESTED pass)
+# 2.25.1 — hardening from the live 2.24.4→2.25.1 upgrade
 
-Two items from the live 2.24.4→2.25.1 upgrade remain. Both are **precisely diagnosed**
-below but deliberately **not** committed yet: one touches a LOCKED security control and one
-is app code — each needs a focused, *validated* change, not a tail-of-session guess. These
-are 2.25.1 work (not deferred to a later release).
+Status of the items surfaced during the live in-place upgrade. All fixes are codified in
+the repo, pre-push-reviewed (SOP 4.3), and validated end-to-end on the live AMD64/Docker
+29.1.3 stack unless noted.
 
-Already shipped on this branch: Wazuh full-mTLS provisioning (`0317b2c`) + 4 install.sh
-upgrade fixes (`75ead40`) — all pre-push-reviewed (SOP 4.3).
+## ✅ A. Dual-wrap pre-upgrade backup vs read-only containers (YSG-RISK-050/051) — DONE (`91adde0`)
+`docker cp` refuses ReadonlyRootfs=true containers in BOTH directions (Docker 29), so the
+encrypted-backup step aborted ("Failed to copy staging data into container") on our
+read_only gateway/backoffice. Fixed transport-only (LOCKED crypto unchanged): tar-over-`exec`
+in + out, `chmod -R u+rwX` for the umask-000 exec dirs, and a sha256 integrity check on the
+streamed bundle before install (tar streaming isn't atomic). **Validated live:** full
+dual-wrap completes, bundle.enc (1.65 MB) + backup-meta.json produced, integrity-verified,
+saved to host (0600).
 
-## A. Dual-wrap pre-upgrade backup fails against read-only containers (YSG-RISK-050/051 — LOCKED)
+## ✅ B. OPA/RBAC groups dropped on restart — DONE (`2ce1033`)
+OPA holds the RBAC document in memory only; the RBACStore persists write-through to Redis
+db/3 and replays on startup, but the backoffice never re-pushed to OPA — so an OPA/upgrade
+restart left OPA empty until the next mutation. Fixed: re-push the store→OPA at the end of
+the backoffice lifespan startup (post-PKI; NOT _bootstrap, which runs pre-PKI at import).
+Best-effort (retry, warn, never blocks startup). **Validated live end-to-end:** group in
+Redis → OPA emptied → backoffice restart → re-synced → OPA repopulated; confirmed across the
+real 6 groups (now restored durably to the store).
 
-**Symptom:** `install.sh --upgrade` aborts at the encrypted-backup step —
-`YSG-RISK-050: Failed to copy staging data into container docker-backoffice-1`.
+## ⚠️ C. Runtime PKI manifest bootstrap tokens (NEW — needs install.sh attention)
+`docker/var/runtime/service_identities.yaml` carries the per-install `bootstrap_token_sha256`
+values that the internal mTLS client needs for backoffice→OPA pushes (and likely other
+service→service calls). After repeated `install.sh --upgrade` re-runs + a branch checkout
+during this session, that runtime manifest was found with **all tokens empty**, which breaks
+ALL backoffice→OPA pushes ("Service 'backoffice' has no bootstrap_token_sha256 in the
+manifest"). Restored from the pre-upgrade backup (28 populated tokens) to recover the stack.
 
-**Root cause (confirmed live):** the crypto step `docker cp`s the staging dir + script
-INTO a running gateway/backoffice container. Those containers run **`ReadonlyRootfs=true`**,
-and **`docker cp` refuses any read-only-rootfs container even when the target is a writable
-tmpfs** (Docker 29). So the transport is fundamentally incompatible with our hardened
-containers.
-
-**What was tried and is NOT sufficient:** replacing `docker cp` with `tar -cf - | docker
-exec -i tar -xf -` (stream over exec into tmpfs `/tmp`). Live test result: the stream
-"succeeds" but the extracted files land with ownership the in-container app user
-(`yashigani`, uid 1001) **cannot read or remove** (`Permission denied`) — so the crypto,
-which runs as that user, still can't consume the staging. A naive transport swap is wrong.
-
-**Candidate fix (for the tested pass):**
-- stream in via `docker exec -i ... tar -xf - --no-same-owner --no-same-permissions -C <dir>`
-  (extract as the exec user, don't preserve archive uid/mode), OR extract then
-  `chown -R` to the container user; verify the crypto can read the staging.
-- the container has tmpfs `/tmp` (1777) + `/dev/shm` (1777) writable, and RW volume mounts
-  `/data/audit`, `/data/bootstrap` — pick a path the app user owns cleanly.
-- **Validate end-to-end:** run the real backup flow against the read-only containers and
-  confirm `bundle.enc` + `backup-meta.json` are produced AND decryptable (don't just check
-  the transport). This is a LOCKED control (no-plaintext-fallback, fail-closed) — keep that
-  invariant; change only the transport.
-
-**Interim:** the 4 shipped install.sh fixes already make the *plain* secrets staging cp
-non-fatal, so the upgrade is not blocked by the secrets copy; this item is specifically the
-encrypted-bundle step.
-
-## B. OPA / RBAC groups are not persisted (app code)
-
-**Symptom:** RBAC groups created via the admin API (`POST /admin/rbac/groups` + `policy/push`)
-are **lost on any policy-container restart** (e.g. an upgrade). Confirmed: postgres
-`rbac_groups`/`rbac_members`/`identity_group_membership` are **0 rows**, the durable
-`policy/data/rbac_data.json` has empty `groups`, and the groups live **only in OPA's
-in-memory store** (`GET https://policy:8181/v1/data/yashigani/rbac`).
-
-**Fix (for the tested pass, backoffice app code):** the RBAC-group create/push handler must
-persist the group + memberships to postgres (`rbac_groups`/`rbac_members`) and regenerate
-`policy/data/rbac_data.json` (or re-push from postgres on policy startup) — so groups
-survive a restart. Requires a backoffice image rebuild + a test that creates a group,
-restarts the policy container, and confirms the group is still enforced.
-
-**Interim (operational):** export live OPA state before any policy-container recreate
-(`/v1/data/yashigani/rbac` via mTLS) and re-PUT it after — as done during this upgrade
-(backup at `testing_runs/yashigani/backup-pre-nuke-20260531/opa_live_state.json`).
+Root cause not fully isolated (genuine `--upgrade` gap vs. this session's git-checkout/stash
+churn of the runtime file). **Action:** install.sh `--upgrade` must guarantee the runtime
+manifest's bootstrap tokens are present/repopulated (idempotently) — a missing/blanked runtime
+manifest silently breaks internal mTLS auth for the push path. Validate by running `--upgrade`
+on an install and asserting `grep -c 'bootstrap_token_sha256: "[a-f0-9]' var/runtime/...` is
+non-zero afterwards. Until then: if backoffice→OPA pushes fail post-upgrade with the manifest
+error, restore the runtime manifest from the pre-upgrade backup (or re-run bootstrap PKI).
