@@ -9341,6 +9341,60 @@ PYMERGE
       return 1
       ;;
   esac
+  local _issuer_rc=$?
+
+  # ISSUE-009 / finding C (idempotent self-heal, all runtimes): the runtime
+  # manifest's bootstrap_token_sha256 fields MUST be populated from the
+  # authoritative source — docker/secrets/<svc>_bootstrap_token, which persists
+  # across --upgrade. The issuer writes these back, but a write-back miss (merge
+  # fallback, cp race, rootless perms) previously shipped empty tokens, breaking
+  # the internal mesh mTLS client at runtime (ISSUE-009). Re-derive host-side on
+  # every run and fail closed if none land. Mirrors _update_manifest_hashes()
+  # in src/yashigani/pki/issuer.py and the macOS host-side guard above.
+  if [[ -d "$secrets_in" ]] && compgen -G "${secrets_in}/*_bootstrap_token" >/dev/null 2>&1; then
+    local _use_unshare2=false
+    if [[ "$(uname -s)" == "Linux" ]] && [[ "$(id -u)" != "0" ]] \
+       && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]]; then
+      _use_unshare2=true
+    fi
+    local _hashpy; _hashpy="$(mktemp)"
+    cat > "$_hashpy" <<'PYHASH'
+import sys, hashlib, pathlib
+mf=pathlib.Path(sys.argv[1]); sec=pathlib.Path(sys.argv[2])
+out=[]; cur=None; n=0
+for line in mf.read_text().splitlines(keepends=True):
+    s=line.strip()
+    if s.startswith("- name:"): cur=s.split(":",1)[1].strip().strip("'\"")
+    if s.startswith("bootstrap_token_sha256:") and cur:
+        tok=sec/f"{cur}_bootstrap_token"
+        if tok.exists():
+            h=hashlib.sha256(tok.read_bytes().strip()).hexdigest()
+            pre=line[:len(line)-len(line.lstrip())]
+            line=f'{pre}bootstrap_token_sha256: "{h}"\n'; n+=1
+    out.append(line)
+tmp=mf.with_suffix(".yaml.tok_new"); tmp.write_text("".join(out)); tmp.replace(mf)
+print(f"pki-token-ensure: populated {n} bootstrap_token_sha256 field(s) from secrets", file=sys.stderr)
+PYHASH
+    if [[ "$_use_unshare2" == "true" ]]; then
+      podman unshare python3 "$_hashpy" "$manifest_in" "$secrets_in" 2>&1 | while IFS= read -r _l; do log_info "_pki_run_issuer: ${_l}"; done
+    else
+      python3 "$_hashpy" "$manifest_in" "$secrets_in" 2>&1 | while IFS= read -r _l; do log_info "_pki_run_issuer: ${_l}"; done
+    fi
+    rm -f "$_hashpy"
+    # fail-closed verification — the explicit ISSUE-009 action-item gate
+    local _pop
+    if [[ "$_use_unshare2" == "true" ]]; then
+      _pop="$(podman unshare grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+    else
+      _pop="$(grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${_pop:-0}" -lt 1 ]]; then
+      log_error "_pki_run_issuer: runtime manifest has 0 populated bootstrap_token_sha256 fields after issuance (ISSUE-009) — aborting fail-closed"
+      return 1
+    fi
+    log_success "_pki_run_issuer: runtime manifest bootstrap tokens populated (${_pop} service(s))"
+  fi
+  return "$_issuer_rc"
 }
 
 # ---------------------------------------------------------------------------

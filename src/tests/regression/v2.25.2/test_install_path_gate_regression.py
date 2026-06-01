@@ -90,6 +90,17 @@ def test_wazuh_indexer_http_tls13_floor(install_sh: str) -> None:
     assert "TLS 1.3 floor not applied to indexer HTTP listener" in install_sh
 
 
+def test_pki_manifest_token_self_heal(install_sh: str) -> None:
+    """ISSUE-009 / finding C: install/--upgrade must idempotently (re)populate the runtime
+    manifest's bootstrap_token_sha256 fields from the persistent docker/secrets/*_bootstrap_token
+    source, and fail closed if zero land (a write-back miss previously shipped empty tokens →
+    broken internal mesh mTLS client). Self-heal must run for all runtimes, not just macOS."""
+    assert "pki-token-ensure" in install_sh, "generic manifest token self-heal missing"
+    assert "_bootstrap_token" in install_sh
+    # the explicit fail-closed action-item gate
+    assert "0 populated bootstrap_token_sha256 fields after issuance (ISSUE-009)" in install_sh
+
+
 def test_wazuh_overlay_is_clean_delta(overlay: str) -> None:
     """The overlay must be a DELTA onto the main compose: it must NOT redeclare security_opt
     (that duplicated the list on merge and broke `docker compose config`), and it MUST add
