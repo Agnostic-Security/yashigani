@@ -4768,6 +4768,16 @@ compose_up() {
     compose_files+=("-f" "$_wazuh_overlay")
     log_info "Applying Wazuh Docker-runtime + full-mTLS overlay (docker-compose.wazuh.yml)"
   fi
+
+  # GPU overlay (Docker runtime): wire the detected NVIDIA GPU into ollama. The base
+  # ollama service has its GPU reservation commented out and the nvidia runtime is not
+  # the daemon default, so without this ollama runs CPU-only. Pin a card with YSG_GPU_UUID
+  # (defaults to all). Podman uses CDI devices separately; K8s uses the device plugin.
+  local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
+    compose_files+=("-f" "$_gpu_overlay")
+    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_UUID:-all}"
+  fi
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
     log_info "Podman detected — configuring rootless deployment"
 
@@ -5543,16 +5553,15 @@ _verify_gateway_healthz() {
   # No credentials on these polls, but consistent TLS verification prevents
   # a rogue cert on the loopback from going unnoticed (Laura F2 hardening).
   # ca_root.crt is present here: PKI bootstrap (step 9b) ran before compose_up.
-  local _ca_cert_healthz="${WORK_DIR}/docker/secrets/ca_root.crt"
-  local _curl_tls_opt
-  if [[ -f "$_ca_cert_healthz" ]]; then
-    _curl_tls_opt="--cacert ${_ca_cert_healthz}"
-  else
-    # CA not yet present (e.g. DRY_RUN path that somehow reached here).
-    # Log a warning and fall back to --insecure rather than block polling.
-    log_warn "_verify_gateway_healthz: ca_root.crt absent — TLS verification skipped for healthz poll"
-    _curl_tls_opt="--insecure"
-  fi
+  # Loopback liveness poll of the Caddy EDGE (127.0.0.1 via --resolve) → use --insecure.
+  # RECURRING-REGRESSION GUARD (v2.23.x retros — "Caddyfile/cert/probe drift"): the EDGE cert is
+  # whatever Caddy issued for this TLS mode — selfsigned = Caddy's own on-the-fly local CA,
+  # acme = Let's Encrypt, ca = the BYO CA — and is NEVER signed by the internal mesh ca_root.crt.
+  # So `--cacert ca_root` ALWAYS fails verification here (HTTP 000, ssl_verify_result=20) and the
+  # gate hangs until timeout — observed breaking every selfsigned/acme install. This is a
+  # localhost convergence/liveness check (not a security boundary; verifying a loopback edge cert
+  # buys nothing), so use --insecure. DO NOT "harden" this back to --cacert (that is the regression).
+  local _curl_tls_opt="--insecure"
 
   local _deadline=$(( $(date +%s) + _timeout_s ))
   local _gateway_ok=0

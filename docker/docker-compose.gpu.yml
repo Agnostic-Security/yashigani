@@ -1,0 +1,16 @@
+# GPU overlay — wire the host NVIDIA GPU into ollama (Docker compose mode).
+#
+# Without this, ollama runs CPU-only: the base ollama service's GPU reservation is
+# commented out and the nvidia runtime is registered in daemon.json but is NOT the
+# daemon default-runtime, so no device is attached (ollama logs `inference compute
+# id=cpu`). install.sh adds this overlay to compose_files when an NVIDIA GPU is
+# detected (YSG_GPU_TYPE=nvidia) on the Docker runtime.
+#
+# Pin a specific card with YSG_GPU_UUID (e.g. GPU-xxxxxxxx for a multi-GPU host);
+# defaults to all visible GPUs.
+services:
+  ollama:
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${YSG_GPU_UUID:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility

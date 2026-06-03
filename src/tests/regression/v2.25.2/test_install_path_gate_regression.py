@@ -101,6 +101,27 @@ def test_pki_manifest_token_self_heal(install_sh: str) -> None:
     assert "0 populated bootstrap_token_sha256 fields after issuance (ISSUE-009)" in install_sh
 
 
+def test_convergence_gate_uses_insecure_for_loopback_edge(install_sh: str) -> None:
+    """RECURRING REGRESSION (v2.23.x retros — Caddyfile/cert/probe drift): the convergence-gate
+    healthz/login polls hit the Caddy EDGE on loopback. The edge cert is Caddy-local/selfsigned/
+    acme/BYO — NEVER the internal ca_root — so `--cacert ca_root` always fails TLS verify (HTTP
+    000) and the gate hangs, breaking every selfsigned/acme install. The loopback liveness poll
+    must use --insecure. Do NOT re-harden to --cacert."""
+    assert 'local _curl_tls_opt="--insecure"' in install_sh, \
+        "convergence gate must use --insecure for the loopback edge poll"
+    assert '_curl_tls_opt="--cacert ${_ca_cert_healthz}"' not in install_sh, \
+        "convergence gate re-hardened to --cacert against the edge (regression — breaks selfsigned/acme)"
+
+
+def test_gpu_overlay_wires_ollama_on_nvidia(install_sh: str) -> None:
+    """ollama must get the GPU in Docker compose mode. The base ollama service's GPU reservation
+    is commented out and the nvidia runtime is not the daemon default, so without an overlay
+    ollama runs CPU-only. install.sh adds docker-compose.gpu.yml when an NVIDIA GPU is detected."""
+    assert (_ROOT / "docker" / "docker-compose.gpu.yml").is_file(), "GPU overlay file missing"
+    assert "docker-compose.gpu.yml" in install_sh, "install.sh does not wire the GPU overlay"
+    assert '"${YSG_GPU_TYPE:-none}" == "nvidia"' in install_sh, "GPU overlay not gated on nvidia detection"
+
+
 def test_wazuh_overlay_is_clean_delta(overlay: str) -> None:
     """The overlay must be a DELTA onto the main compose: it must NOT redeclare security_opt
     (that duplicated the list on merge and broke `docker compose config`), and it MUST add
