@@ -28,11 +28,15 @@ import rego.v1
 # ---------------------------------------------------------------------------
 
 # Maximum allowed identity-chain depth for MCP-C multi-hop calls.
-# Default: 3 (origin + 1 relay + gateway).  Operators may increase this via:
-#   data.yashigani.mcp.policy.chain_max_depth = <n>
-mcp_chain_max_depth := d if {
-    d := data.yashigani.mcp.policy.chain_max_depth
-} else := 3
+# Pinned to 9 as a policy CONSTANT — intentionally NOT operator-overridable at runtime.
+# YSG-RISK-056 (CWE-15): the previous `data.yashigani.mcp.policy.chain_max_depth` override was
+# writable at runtime via the OPA REST data API, letting any policy-write cert holder raise the
+# limit and defeat the chain-depth guard. 9 covers complex multi-agent + MCP workflows; each hop
+# is independently JWT/SPIFFE-authenticated, so depth is a sanity backstop, not the authN control.
+# Changing it requires a reviewed policy edit + redeploy.
+# TODO (Yashigani backlog): move this to a governed, audited admin-UI setting instead of a
+# hardcoded constant; consider a no-repeat/cycle check so loop defense is identity-based, not depth.
+mcp_chain_max_depth := 9
 
 # ---------------------------------------------------------------------------
 # Default: deny everything.  Every allow path must be explicit.

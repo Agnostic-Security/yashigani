@@ -57,7 +57,7 @@ _ALGORITHM = "ES384"
 _AUDIENCE = "yashigani-mcp-upstream"
 _JWT_TTL_SECONDS = int(os.environ.get("YASHIGANI_MCP_JWT_TTL_SECONDS", "60"))
 _CLOCK_SKEW_SECONDS = 5
-_DEFAULT_CHAIN_MAX_DEPTH = 3
+_DEFAULT_CHAIN_MAX_DEPTH = 9  # sync with pinned OPA policy constant mcp_chain_max_depth (YSG-RISK-056)
 _DEFAULT_SIGNING_KEY_PATH = "/run/secrets/mcp_identity_signing_key"
 
 

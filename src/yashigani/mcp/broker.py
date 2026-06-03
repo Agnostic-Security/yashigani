@@ -93,8 +93,9 @@ class McpBrokerConfig:
         is used (dev mode — not crash-safe; Redis required for production).
 
     chain_max_depth:
-        Maximum allowed chain depth. Default 3. Reads from OPA data bundle
-        at runtime (operator-tunable via data.yashigani.mcp.policy.chain_max_depth).
+        Maximum allowed chain depth. Default 9, kept in sync with the pinned OPA policy
+        constant `mcp_chain_max_depth` (YSG-RISK-056 — no longer runtime-overridable via OPA
+        data; changing it is a reviewed policy edit, pending a governed admin-UI setting).
         Gateway pre-validates before signing; OPA is the authoritative gate.
 
     audit_writer:
@@ -123,7 +124,7 @@ class McpBrokerConfig:
     issuer: Optional[McpJwtIssuer] = None
     verifier: Optional[McpJwtVerifier] = None
     nonce_store: Optional[NonceStore] = None
-    chain_max_depth: int = 3
+    chain_max_depth: int = 9
     audit_writer: Optional[Any] = None   # AuditLogWriter, typed as Any to avoid circular import
 
     # Phase-2 hardening
