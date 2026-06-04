@@ -168,6 +168,14 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         -Alt-Svc
     }
 
+    # OpenSearch Dashboards (Wazuh SIEM) bundles use eval()/Function() and inline
+    # styles, so the strict app CSP (script-src 'self') breaks OSD with an
+    # EvalError. Relax CSP ONLY for the /admin/wazuh/* subpath — the rest of the
+    # surface keeps the strict policy above. This SET replaces the global CSP for
+    # matching requests (declared after the global header block).
+    @wazuh_ui path /admin/wazuh/*
+    header @wazuh_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
         max_size 10MB
