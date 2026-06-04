@@ -22,6 +22,27 @@ sensitivity_rank(level) := 4 if {
 }
 
 # ---------------------------------------------------------------------------
+# _ceiling_rank — rank helper for the CEILING operand (an identity's declared
+# clearance), NOT for content sensitivity.
+#
+# sensitivity_rank maps an UNKNOWN string to rank 4 ("treat unknown CONTENT as
+# the most sensitive" — correct fail-closed for the data operand). But applying
+# that same mapping to the CEILING operand is PERMISSIVE: a garbage ceiling
+# string becomes rank 4 (the HIGHEST ceiling), so RESTRICTED content (rank 3)
+# would satisfy `content <= garbage_ceiling` and be ALLOWED — the opposite of
+# fail-closed. (Laura residual, 2.25.2 — currently unreachable because consumers
+# validate the ceiling, but closed here for defence-in-depth.)
+#
+# _ceiling_rank is defined ONLY for the canonical four levels. An unknown ceiling
+# string leaves it UNDEFINED → the `<=` comparison is undefined → the positive
+# allow rule does not fire → default-deny. ASVS V4.1.3.
+# ---------------------------------------------------------------------------
+_ceiling_rank(level) := 0 if level == "PUBLIC"
+_ceiling_rank(level) := 1 if level == "INTERNAL"
+_ceiling_rank(level) := 2 if level == "CONFIDENTIAL"
+_ceiling_rank(level) := 3 if level == "RESTRICTED"
+
+# ---------------------------------------------------------------------------
 # agent_call_allowed — true when a calling agent is permitted to reach
 # the target agent's path.
 #
@@ -156,9 +177,11 @@ agent_response_allowed if {
     input.caller.agent_id != ""
     input.target_agent.agent_id != ""
 
-    # Caller's clearance ceiling must accommodate response sensitivity
+    # Caller's clearance ceiling must accommodate response sensitivity.
+    # _ceiling_rank is UNDEFINED for an unknown ceiling string → this rule does
+    # not fire → default-deny (fail-closed). See _ceiling_rank docstring.
     response_rank := sensitivity_rank(input.response_sensitivity)
-    ceiling_rank := sensitivity_rank(input.caller.sensitivity_ceiling)
+    ceiling_rank := _ceiling_rank(input.caller.sensitivity_ceiling)
     response_rank <= ceiling_rank
 
     # No PII gate trigger
@@ -179,8 +202,18 @@ agent_response_deny_reason := "response_sensitivity_exceeds_caller_ceiling" if {
     input.caller.agent_id != ""
     input.target_agent.agent_id != ""
     response_rank := sensitivity_rank(input.response_sensitivity)
-    ceiling_rank := sensitivity_rank(input.caller.sensitivity_ceiling)
+    ceiling_rank := _ceiling_rank(input.caller.sensitivity_ceiling)
     response_rank > ceiling_rank
+}
+
+# Invalid / unrecognised caller ceiling — fail-closed deny with an explicit
+# audit reason (otherwise the deny would carry the default reason and the
+# operator could not tell the ceiling string itself was the problem).
+agent_response_deny_reason := "invalid_caller_ceiling" if {
+    not agent_response_allowed
+    input.caller.agent_id != ""
+    input.target_agent.agent_id != ""
+    not _ceiling_rank(input.caller.sensitivity_ceiling)
 }
 
 agent_response_deny_reason := "pii_detected_in_response" if {
@@ -188,7 +221,7 @@ agent_response_deny_reason := "pii_detected_in_response" if {
     input.response_pii_detected == true
     # Only assign this reason when it is not also a ceiling violation
     response_rank := sensitivity_rank(input.response_sensitivity)
-    ceiling_rank := sensitivity_rank(input.caller.sensitivity_ceiling)
+    ceiling_rank := _ceiling_rank(input.caller.sensitivity_ceiling)
     response_rank <= ceiling_rank
 }
 

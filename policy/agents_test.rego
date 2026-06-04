@@ -721,3 +721,133 @@ test_allow_filename_with_embedded_dots if {
         "request": {"remainder_path": "/do/report..final.pdf"},
     }
 }
+
+# ===========================================================================
+# 8. LAURA-OPA-005 closure — top-level `allow` eval_conflict on agent + MCP path
+#
+# Before fix: an agent principal hitting /mcp/* with a valid session fired BOTH
+# the human-MCP-session `allow if {...}` (true) AND `allow := false if
+# {deny_agent_call}` (false) → two complete-rule outputs → OPA eval_conflict_error
+# (HTTP 500 → opaque fail-closed deny). After fix the human-MCP rule is gated to
+# non-agent principals and a positive `allow if {agent_call_allowed}` lifts legit
+# agent calls, so the path evaluates cleanly for every combination.
+#
+# 8a. legit agent + /mcp/* (group allowed) → allow == true, no conflict
+# 8b. illegit agent + /mcp/* (group not allowed) → allow == false, no conflict
+# 8c. human MCP session (no principal) → allow == true (unchanged)
+# 8d. agent + /mcp/* with empty allowed_caller_groups (Laura's exact repro) → false
+# ===========================================================================
+
+# 8a. Legit agent reaching /mcp/* ALLOWs cleanly (no eval_conflict).
+test_opa005_legit_agent_mcp_allows if {
+    data.yashigani.allow with input as {
+        "session_id": "s1",
+        "method": "POST",
+        "path": "/mcp/filesystem-mcp",
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g-yes"]},
+        "target_agent": {
+            "agent_id": "a1",
+            "allowed_caller_groups": ["g-yes"],
+            "allowed_paths": ["/mcp/**"],
+        },
+        "request": {"remainder_path": "/mcp/filesystem-mcp"},
+    }
+}
+
+# 8b. Illegit agent (group not in allowed_caller_groups) → DENY, no conflict.
+test_opa005_illegit_agent_mcp_denies if {
+    not data.yashigani.allow with input as {
+        "session_id": "s1",
+        "method": "POST",
+        "path": "/mcp/filesystem-mcp",
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g-nope"]},
+        "target_agent": {
+            "agent_id": "a1",
+            "allowed_caller_groups": ["g-yes"],
+            "allowed_paths": ["/mcp/**"],
+        },
+        "request": {"remainder_path": "/mcp/filesystem-mcp"},
+    }
+}
+
+# 8c. Human MCP session (no principal object) still ALLOWs — the non-agent guard
+# must not break the human path.
+test_opa005_human_mcp_session_allows if {
+    data.yashigani.allow with input as {
+        "session_id": "s1",
+        "method": "POST",
+        "path": "/mcp/filesystem-mcp",
+    }
+}
+
+# 8d. Laura's exact eval_conflict repro (agent, empty allowed_caller_groups) →
+# clean DENY (was eval_conflict_error before fix).
+test_opa005_laura_repro_denies_cleanly if {
+    not data.yashigani.allow with input as {
+        "principal": {"type": "agent", "agent_id": "a1"},
+        "session_id": "s",
+        "method": "GET",
+        "path": "/mcp/x",
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": [],
+            "allowed_paths": ["**"],
+        },
+        "request": {"remainder_path": "/y"},
+    }
+}
+
+# ===========================================================================
+# 9. sensitivity_rank catch-all hardening — UNKNOWN CEILING string fails closed
+#
+# Laura residual (2.25.2): sensitivity_rank maps an unknown CEILING string to
+# rank 4 (the highest), making a garbage ceiling the MOST permissive — so
+# RESTRICTED content (rank 3) <= garbage-ceiling (rank 4) would ALLOW. The
+# ceiling operand now uses _ceiling_rank, which is UNDEFINED for non-canonical
+# strings → comparison undefined → positive allow does not fire → default-deny.
+#
+# 9a. agents: garbage ceiling + RESTRICTED response → agent_response_allowed false
+# 9b. agents: garbage ceiling deny reason is invalid_caller_ceiling
+# 9c. valid ceiling still allows (regression)
+# ===========================================================================
+
+# 9a. Unknown ceiling string + RESTRICTED → DENY (was ALLOW via permissive rank-4).
+test_unknown_ceiling_restricted_denies_agents if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": "GARBAGE_CEILING"},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+}
+
+# 9b. Deny carries an explicit invalid_caller_ceiling reason (audit clarity).
+test_unknown_ceiling_reason_is_invalid_agents if {
+    d := data.yashigani.agent_response_decision with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": "GARBAGE_CEILING"},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+    d.reason == "invalid_caller_ceiling"
+}
+
+# 9c. Regression: a VALID ceiling still allows within-clearance content.
+test_valid_ceiling_still_allows_agents if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 9d. Empty-string ceiling is also caught (rank undefined → DENY).
+test_empty_ceiling_denies_agents if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": ""},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "PUBLIC",
+        "response_pii_detected": false,
+    }
+}

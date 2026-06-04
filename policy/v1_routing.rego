@@ -93,7 +93,11 @@ trusted_cloud_provider if {
 default sensitivity_allowed := false
 
 sensitivity_allowed if {
-    sensitivity_rank(input.routing_decision.sensitivity) <= sensitivity_rank(input.identity.sensitivity_ceiling)
+    # Content operand: sensitivity_rank (unknown→4, fail-closed for content).
+    # Ceiling operand: _ceiling_rank (undefined for unknown → rule does not fire
+    # → default-deny). Prevents a garbage ceiling string from becoming rank-4 and
+    # admitting RESTRICTED content.
+    sensitivity_rank(input.routing_decision.sensitivity) <= _ceiling_rank(input.identity.sensitivity_ceiling)
 }
 
 sensitivity_rank(level) := 0 if level == "PUBLIC"
@@ -113,6 +117,27 @@ sensitivity_rank(level) := 3 if level == "RESTRICTED"
 sensitivity_rank(level) := 4 if {
     not level in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}
 }
+
+# ---------------------------------------------------------------------------
+# _ceiling_rank — rank helper for the CEILING operand (the identity's declared
+# clearance), NOT for content sensitivity.
+#
+# sensitivity_rank maps an unknown string to rank 4 ("treat unknown CONTENT as
+# the most sensitive" — correct fail-closed for the data operand). Applying the
+# same map to a CEILING string is PERMISSIVE: a garbage ceiling becomes rank 4
+# (the highest ceiling) so RESTRICTED content (rank 3) satisfies
+# `content <= garbage_ceiling` and is ALLOWED — the opposite of fail-closed.
+# (Laura residual, 2.25.2 — currently unreachable because consumers validate the
+# ceiling, but closed here for defence-in-depth.)
+#
+# _ceiling_rank is defined ONLY for the canonical four levels. An unknown ceiling
+# string leaves it UNDEFINED → the `<=` comparison is undefined → the positive
+# allow rule does not fire → default-deny. ASVS V4.1.3.
+# ---------------------------------------------------------------------------
+_ceiling_rank(level) := 0 if level == "PUBLIC"
+_ceiling_rank(level) := 1 if level == "INTERNAL"
+_ceiling_rank(level) := 2 if level == "CONFIDENTIAL"
+_ceiling_rank(level) := 3 if level == "RESTRICTED"
 
 # ── Response-path enforcement ─────────────────────────────────────────────
 #
@@ -171,8 +196,10 @@ default response_allowed := false
 
 response_allowed if {
     # Condition 1: effective sensitivity within ceiling.
-    # Absent ceiling → sensitivity_rank(undefined) undefined → rule does not fire → DENY.
-    _effective_sensitivity_rank <= sensitivity_rank(input.identity.sensitivity_ceiling)
+    # Absent OR unknown ceiling → _ceiling_rank undefined → rule does not fire → DENY.
+    # (Ceiling operand uses _ceiling_rank, not sensitivity_rank, so a garbage
+    # ceiling string can never become rank-4 and admit RESTRICTED content.)
+    _effective_sensitivity_rank <= _ceiling_rank(input.identity.sensitivity_ceiling)
 
     # Condition 2: not blocked-for-non-admin.
     not _response_blocked_by_inspection
@@ -199,12 +226,29 @@ response_reason := "ok" if response_allowed
 
 response_reason := "response_sensitivity_exceeds_ceiling" if {
     not response_allowed
-    _effective_sensitivity_rank > sensitivity_rank(input.identity.sensitivity_ceiling)
+    _effective_sensitivity_rank > _ceiling_rank(input.identity.sensitivity_ceiling)
+}
+
+# Invalid / unrecognised ceiling string — fail-closed deny with an explicit
+# audit reason (otherwise the deny carries the default reason and the operator
+# cannot tell the ceiling string itself was the problem).
+response_reason := "invalid_identity_ceiling" if {
+    not response_allowed
+    _invalid_identity_ceiling
+}
+
+# _invalid_identity_ceiling — ceiling is present but not in the canonical set.
+_invalid_identity_ceiling if {
+    input.identity.sensitivity_ceiling
+    not _ceiling_rank(input.identity.sensitivity_ceiling)
 }
 
 response_reason := "response_blocked_by_inspection" if {
     not response_allowed
     input.response_verdict == "blocked"
+    # Defer to invalid_identity_ceiling when the ceiling itself is unrecognised,
+    # so exactly one reason fires (no eval_conflict on the decision object).
+    not _invalid_identity_ceiling
 }
 
 # ── Combined decision ─────────────────────────────────────────────────────
@@ -350,8 +394,10 @@ default proxy_response_allowed := false
 
 proxy_response_allowed if {
     # Condition 1: effective sensitivity within ceiling.
-    # Absent ceiling → undefined rank → rule does not fire → DENY.
-    _proxy_effective_sensitivity_rank <= sensitivity_rank(input.principal.sensitivity_ceiling)
+    # Absent OR unknown ceiling → _ceiling_rank undefined → rule does not fire → DENY.
+    # Ceiling operand uses _ceiling_rank (not sensitivity_rank) so a garbage
+    # ceiling string cannot become rank-4 and admit RESTRICTED content.
+    _proxy_effective_sensitivity_rank <= _ceiling_rank(input.principal.sensitivity_ceiling)
 
     # Condition 2: not a PII-block for a service account.
     not _proxy_pii_blocked
@@ -380,7 +426,19 @@ proxy_response_reason := "ok" if proxy_response_allowed
 
 proxy_response_reason := "response_sensitivity_exceeds_ceiling" if {
     not proxy_response_allowed
-    _proxy_effective_sensitivity_rank > sensitivity_rank(input.principal.sensitivity_ceiling)
+    _proxy_effective_sensitivity_rank > _ceiling_rank(input.principal.sensitivity_ceiling)
+}
+
+# Invalid / unrecognised ceiling string — fail-closed deny with explicit reason.
+proxy_response_reason := "invalid_principal_ceiling" if {
+    not proxy_response_allowed
+    _invalid_principal_ceiling
+}
+
+# _invalid_principal_ceiling — ceiling present but not in the canonical set.
+_invalid_principal_ceiling if {
+    input.principal.sensitivity_ceiling
+    not _ceiling_rank(input.principal.sensitivity_ceiling)
 }
 
 proxy_response_reason := "response_pii_blocked_for_service_account" if {
@@ -388,6 +446,8 @@ proxy_response_reason := "response_pii_blocked_for_service_account" if {
     input.response_pii_detected == true
     input.principal.kind != "admin"
     input.principal.kind != "human"
+    # Defer to invalid_principal_ceiling so exactly one reason fires.
+    not _invalid_principal_ceiling
 }
 
 proxy_response_decision := {

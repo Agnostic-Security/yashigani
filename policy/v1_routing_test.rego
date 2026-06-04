@@ -199,3 +199,92 @@ test_routing_safe_sensitive_trusted_cloud if {
         "trusted_cloud_providers": ["azure"],
     }
 }
+
+# ===========================================================================
+# sensitivity_rank catch-all hardening — UNKNOWN CEILING string fails closed
+# (v1 response leg + catch-all proxy response leg)
+#
+# Laura residual (2.25.2): the CEILING operand used sensitivity_rank, which maps
+# an unknown string to rank 4 (the highest ceiling) → permissive. It now uses
+# _ceiling_rank, undefined for non-canonical strings → DENY (default-deny).
+# ===========================================================================
+
+# v1 response: garbage ceiling + RESTRICTED content → DENY.
+test_unknown_ceiling_restricted_denies_v1 if {
+    not data.yashigani.v1.response_allowed with input as {
+        "identity": {"kind": "human", "sensitivity_ceiling": "GARBAGE"},
+        "prompt_sensitivity": "PUBLIC",
+        "response_sensitivity": "RESTRICTED",
+        "response_verdict": "clean",
+    }
+}
+
+# v1 response: deny reason is invalid_identity_ceiling.
+test_unknown_ceiling_reason_is_invalid_v1 if {
+    data.yashigani.v1.response_reason == "invalid_identity_ceiling" with input as {
+        "identity": {"kind": "human", "sensitivity_ceiling": "GARBAGE"},
+        "prompt_sensitivity": "PUBLIC",
+        "response_sensitivity": "RESTRICTED",
+        "response_verdict": "clean",
+    }
+}
+
+# v1 response: invalid ceiling + blocked verdict → single reason (no eval_conflict
+# on the decision object), invalid_identity_ceiling takes precedence.
+test_unknown_ceiling_blocked_verdict_single_reason_v1 if {
+    d := data.yashigani.v1.response_decision with input as {
+        "identity": {"kind": "human", "sensitivity_ceiling": "GARBAGE"},
+        "prompt_sensitivity": "PUBLIC",
+        "response_sensitivity": "RESTRICTED",
+        "response_verdict": "blocked",
+    }
+    d.reason == "invalid_identity_ceiling"
+    d.allow == false
+}
+
+# v1 request leg sensitivity_allowed: garbage ceiling → DENY.
+test_unknown_ceiling_request_leg_denies_v1 if {
+    not data.yashigani.v1.sensitivity_allowed with input as {
+        "routing_decision": {"sensitivity": "RESTRICTED"},
+        "identity": {"sensitivity_ceiling": "GARBAGE"},
+    }
+}
+
+# proxy response: garbage ceiling + RESTRICTED → DENY.
+test_unknown_ceiling_restricted_denies_proxy if {
+    not data.yashigani.v1.proxy_response_allowed with input as {
+        "principal": {"kind": "human", "sensitivity_ceiling": "GARBAGE"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+}
+
+# proxy response: invalid ceiling + PII + service account → single reason
+# (invalid_principal_ceiling), no eval_conflict on the decision object.
+test_unknown_ceiling_pii_single_reason_proxy if {
+    d := data.yashigani.v1.proxy_response_decision with input as {
+        "principal": {"kind": "service", "sensitivity_ceiling": "GARBAGE"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": true,
+    }
+    d.reason == "invalid_principal_ceiling"
+    d.allow == false
+}
+
+# Regression: VALID ceiling still allows within-clearance content (v1 + proxy).
+test_valid_ceiling_still_allows_v1 if {
+    data.yashigani.v1.response_allowed with input as {
+        "identity": {"kind": "human", "sensitivity_ceiling": "INTERNAL"},
+        "prompt_sensitivity": "PUBLIC",
+        "response_sensitivity": "PUBLIC",
+        "response_verdict": "clean",
+    }
+}
+
+test_valid_ceiling_still_allows_proxy if {
+    data.yashigani.v1.proxy_response_allowed with input as {
+        "principal": {"kind": "human", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": false,
+    }
+}

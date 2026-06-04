@@ -62,9 +62,25 @@ allow if {
 #
 # P3 broker E2E gate — J9-ToolsCall / J10-WriteTool (2026-05-30).
 # ASVS V4.1.3: access control is default-deny except for explicit allow.
+#
+# LAURA-OPA-005 (2.25.2): this rule is for HUMAN MCP sessions ONLY. Agent
+# principals reach /mcp/* through the agent-to-agent gate (agent_call_allowed),
+# whose deny path (deny_agent_call → `allow := false`) would otherwise fire
+# simultaneously with a `true` here, producing two complete-rule outputs and an
+# OPA eval_conflict_error (HTTP 500 → fail-closed deny, but an opaque one). The
+# `principal.type != "agent"` guard makes the allow rules mutually exclusive:
+# humans go through this session rule, agents go through agent_call_allowed.
+# Cite: OPA complete-rule conflict semantics; ASVS V4.1.3.
 # ---------------------------------------------------------------------------
 
 allow if {
+    # Human MCP sessions only — agents are gated by agent_call_allowed (see above).
+    # `_principal_is_not_agent` is true both when no principal is present (human
+    # cookie/API-key session, which carries no principal object) AND when an
+    # explicit principal has type != "agent". Using the raw expression
+    # `input.principal.type != "agent"` would be UNDEFINED for human sessions
+    # (no principal.type) and silently break the human MCP path.
+    _principal_is_not_agent
     input.session_id != ""
     input.session_id != "anonymous"
     input.method in allowed_methods
@@ -74,6 +90,12 @@ allow if {
     _path_is_mcp
     not path_blocked
 }
+
+# True when the caller is NOT an agent principal: either no principal object at
+# all (human session), or an explicit principal whose type is not "agent".
+_principal_is_not_agent if { not input.principal }
+_principal_is_not_agent if { not input.principal.type }
+_principal_is_not_agent if { input.principal.type != "agent" }
 
 _path_is_mcp if { startswith(input.path, "/mcp/") }
 _path_is_mcp if { startswith(input.path, "mcp/") }
@@ -125,6 +147,18 @@ allow := false if { deny_rbac }
 # Agent-to-agent enforcement
 # agent_call_allowed is defined in agents.rego (same package yashigani).
 # ---------------------------------------------------------------------------
+
+# Allow agent calls that the agent-to-agent gate (agent_call_allowed, agents.rego)
+# explicitly permits. This is the positive counterpart of deny_agent_call below.
+# LAURA-OPA-005 (2.25.2): a legit agent reaching /mcp/* must evaluate to a clean
+# `allow == true` via the top-level decision, not rely on the human-session rule
+# (which is now gated to non-agent principals). Because this rule requires
+# `agent_call_allowed` and deny_agent_call requires `not agent_call_allowed`, the
+# two are mutually exclusive — no eval_conflict can arise from this pair.
+allow if {
+    input.principal.type == "agent"
+    agent_call_allowed
+}
 
 # Deny agent calls that are not explicitly allowed
 deny_agent_call if {
