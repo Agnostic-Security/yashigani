@@ -372,7 +372,7 @@ Hiring: https://agnosticsec.com/careers
     }
 
     # ── Wazuh Dashboard — admin-authenticated access via /admin/wazuh/* ────
-    handle_path /admin/wazuh/* {
+    handle /admin/wazuh/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified

@@ -4889,6 +4889,11 @@ PYEOF
     printf 'opensearch.password: "%s"\n' "$(cat "${secrets}/wazuh_indexer_password")"
     printf 'opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]\n'
     printf 'opensearch_security.multitenancy.enabled: false\n'
+    # Served behind Caddy at /admin/wazuh/* — basePath makes the dashboard
+    # generate links/redirects under that prefix instead of escaping to /app/login
+    # (which falls through to the data-plane verifier). rewriteBasePath=true means
+    # OSD expects the prefix on inbound requests, so Caddy uses `handle` (no strip).
+    printf 'server.basePath: "/admin/wazuh"\nserver.rewriteBasePath: true\n'
   } > "${wp}/opensearch_dashboards.yml"
 
   # 7. ownership: indexer/dashboard/sidecar run as uid 1000; CA bundle world-readable (manager uid 999)
