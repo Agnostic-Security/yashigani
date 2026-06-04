@@ -855,6 +855,10 @@ def create_backoffice_app() -> FastAPI:
     _templates_dir = pathlib.Path(__file__).parent / "templates"
     if _templates_dir.exists():
         _templates = Jinja2Templates(directory=str(_templates_dir))
+        # Single source of truth for the displayed version — no hardcoded
+        # strings in templates. Bump yashigani.__version__ (== pyproject) only.
+        from yashigani import __version__ as _ysg_version
+        _templates.env.globals["yashigani_version"] = _ysg_version
 
         @app.get("/login", include_in_schema=False)
         async def user_login_page(request: Request):
