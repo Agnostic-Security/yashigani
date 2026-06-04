@@ -169,6 +169,14 @@ class EventType(str, Enum):
     # request or response body.  Raw PII values are NEVER logged — only
     # pii_type labels and a count.
     PII_DETECTED = "PII_DETECTED"
+    # v2.25.2 — F-RT1 (red-team verified 2026-05-30): encoded-payload audit.
+    # ENCODED_PAYLOAD_DETECTED: emitted when the decode-before-classify stage
+    # encounters a long, encoded-looking, high-entropy blob that could NOT be
+    # decoded to plaintext (or was oversize).  This closes the F-RT1 silent
+    # pass — an encoded blob in a sensitive context now always leaves an audit
+    # record even when no PII pattern matched.  Raw payload is NEVER logged —
+    # only masked token shapes + counts.  ASVS V7.3.4 + V13.2.6.
+    ENCODED_PAYLOAD_DETECTED = "ENCODED_PAYLOAD_DETECTED"
     # v2.23.4 — Streaming stream-termination event (Iris FINDING-004)
     # STREAM_TERMINATED: emitted when a streaming response is terminated
     # early by the StreamingInspector due to sensitive content detection.
@@ -1618,10 +1626,53 @@ class PIIDetectedEvent(AuditEvent):
     action_taken: str = ""         # "logged" | "redacted" | "blocked"
     destination: str = ""          # "local" | "cloud" | "upstream"
     finding_count: int = 0
+    # v2.25.2 — F-RT1: which normalised views matched (e.g. ["raw", "base64"]).
+    # Records that PII was caught only after decoding an encoded segment.
+    matched_views: list = None     # type: ignore[assignment]
 
     def __post_init__(self):
         if self.pii_types is None:
             self.pii_types = []
+        if self.matched_views is None:
+            self.matched_views = []
+
+
+# ---------------------------------------------------------------------------
+# v2.25.2 — F-RT1 encoded-payload audit event (red-team verified 2026-05-30)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EncodedPayloadDetectedEvent(AuditEvent):
+    """Written when the decode-before-classify stage finds an encoded blob.
+
+    Closes the F-RT1 silent pass: a long, encoded-looking, high-entropy blob
+    that could NOT be decoded to plaintext (or was oversize) now always leaves
+    an audit record, even when no PII pattern matched.
+
+    Security invariants (immutable floors):
+      - Raw payload is NEVER stored — only masked token shapes (first4…last4 +
+        length) and a count.
+      - masking_applied is always True.
+      - direction is "request" or "response".
+
+    ASVS V7.3.4 (sensitive-data audit) + V13.2.6 (LLM input handling).
+    """
+
+    event_type: str = EventType.ENCODED_PAYLOAD_DETECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    direction: str = ""            # "request" | "response"
+    destination: str = ""          # "local" | "cloud" | "upstream"
+    high_entropy: bool = False
+    oversize: bool = False
+    token_count: int = 0
+    masked_tokens: list = None     # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.masked_tokens is None:
+            self.masked_tokens = []
 
 
 # ---------------------------------------------------------------------------

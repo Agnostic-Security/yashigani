@@ -497,7 +497,17 @@ class ResponseInspectionPipeline:
         response_sensitivity_value = "PUBLIC"
         if self._sensitivity_classifier is not None:
             try:
-                sens_result = self._sensitivity_classifier.classify(response_body)
+                # F-RT1 (red-team verified 2026-05-30): decode-before-classify so an
+                # encoded sensitive value in the response body elevates the response
+                # sensitivity (feeds the response-leg OPA ceiling), instead of being
+                # a silent PUBLIC pass.  classify_decoded is a superset of classify
+                # for non-encoded text.  getattr keeps older classifier stubs working.
+                _classify = getattr(
+                    self._sensitivity_classifier,
+                    "classify_decoded",
+                    self._sensitivity_classifier.classify,
+                )
+                sens_result = _classify(response_body)
                 response_sensitivity_value = sens_result.level.value
             except Exception as exc:
                 logger.warning(

@@ -122,6 +122,65 @@ class SensitivityClassifier:
             len(self._patterns), enable_sklearn, enable_ollama,
         )
 
+    def classify_decoded(self, text: str) -> SensitivityResult:
+        """Classify *text* AND every decoded view of it (F-RT1).
+
+        Decode-before-classify: the input is normalised via
+        ``yashigani.pii.decode.decode_views`` — base64 (std + urlsafe), hex,
+        URL percent-encoding, ROT13, bounded nested decoding — and EACH view
+        (raw + decoded) is run through :meth:`classify`.  The result carries
+        the HIGHEST sensitivity level across all views (conservative), so an
+        encoded payload like base64("SSN 123-45-6789") elevates the level the
+        same way the plaintext would.
+
+        A long encoded-looking high-entropy blob that could not be decoded
+        floors the level at CONFIDENTIAL and adds a "decode:suspicious-blob"
+        trigger, so a sensitive-context encoded blob is never a silent PUBLIC
+        pass even when it cannot be read.
+
+        Fully backward-compatible with :meth:`classify` for non-encoded text:
+        the raw view alone determines the level.
+        """
+        from yashigani.pii.decode import decode_views
+
+        decode_result = decode_views(text)
+        final_level = SensitivityLevel.PUBLIC
+        all_triggers: list[str] = []
+        layer_results: dict[str, SensitivityLevel] = {}
+        conflict = False
+
+        for view in decode_result.views:
+            view_result = self.classify(view.text)
+            if view_result.level.rank > final_level.rank:
+                final_level = view_result.level
+            for trig in view_result.triggers:
+                tagged = trig if view.view_name == "raw" else f"{view.view_name}:{trig}"
+                all_triggers.append(tagged)
+            # Keep the raw view's per-layer breakdown for compatibility.
+            if view.view_name == "raw":
+                layer_results = view_result.layer_results
+            conflict = conflict or view_result.conflict
+
+        # F-RT1 silent-pass guard: an undecodable high-entropy encoded blob in a
+        # request is itself a signal.  Floor at CONFIDENTIAL so OPA's sensitivity
+        # ceiling can act on it, and surface it as a trigger for audit.
+        if decode_result.suspicious_blob:
+            all_triggers.append("decode:suspicious-blob")
+            if final_level.rank < SensitivityLevel.CONFIDENTIAL.rank:
+                logger.warning(
+                    "F-RT1: undecodable high-entropy encoded blob present — "
+                    "flooring sensitivity at CONFIDENTIAL (tokens=%s)",
+                    decode_result.flagged_tokens,
+                )
+                final_level = SensitivityLevel.CONFIDENTIAL
+
+        return SensitivityResult(
+            level=final_level,
+            triggers=all_triggers,
+            layer_results=layer_results,
+            conflict=conflict,
+        )
+
     def classify(self, text: str) -> SensitivityResult:
         """
         Run all enabled layers and return the highest sensitivity detected.

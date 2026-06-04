@@ -158,7 +158,14 @@ class StreamingInspector:
             return True
 
         try:
-            result = self._classifier.classify(self._full_text)
+            # F-RT1 (red-team verified 2026-05-30): the final inspect runs on the
+            # FULL accumulated text, so decode-before-classify is safe here — an
+            # encoded sensitive value streamed back is caught before [DONE].
+            # (Incremental per-chunk scans below stay raw-only: partial base64
+            # chunks do not decode cleanly.)  getattr keeps no-op/stub classifiers
+            # working.
+            _classify = getattr(self._classifier, "classify_decoded", self._classifier.classify)
+            result = _classify(self._full_text)
             level = result.level.value
             if level in self._BLOCKING_LEVELS:
                 self._trigger_termination(f"final:{level}", self._full_text[:200])
