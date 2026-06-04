@@ -1685,9 +1685,13 @@ async def _opa_v1_check(
             result = resp.json().get("result", {})
             return {
                 "allow": bool(result.get("allow", False)),
-                "model_allowed": bool(result.get("model_allowed", True)),
-                "routing_safe": bool(result.get("routing_safe", True)),
-                "sensitivity_allowed": bool(result.get("sensitivity_allowed", True)),
+                # Fail-closed on undefined sub-decisions (OPA-003/004 class):
+                # on a bundle-mismatch these fields are absent and must NOT
+                # default permissive. Matches proxy.py:1127 + v1_routing.rego
+                # default-deny.
+                "model_allowed": bool(result.get("model_allowed", False)),
+                "routing_safe": bool(result.get("routing_safe", False)),
+                "sensitivity_allowed": bool(result.get("sensitivity_allowed", False)),
                 "reason": result.get("reason", "unknown"),
             }
     except Exception as exc:

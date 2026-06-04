@@ -264,7 +264,7 @@ test_deny_reason_missing_subject if {
 # ---------------------------------------------------------------------------
 
 test_deny_chain_depth_exceeded_default_max if {
-    # 4 entries > default max of 3
+    # 10 entries > pinned max of 9 (YSG-RISK-056): must DENY
     not data.yashigani.mcp.allow with input as {
         "posture": "mcp-c",
         "action": "mcp.tools.call",
@@ -275,6 +275,12 @@ test_deny_chain_depth_exceeded_default_max if {
                 "spiffe://cluster.local/ns/default/sa/hop2",
                 "spiffe://cluster.local/ns/default/sa/hop3",
                 "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+                "spiffe://cluster.local/ns/default/sa/hop10",
             ],
         },
         "tool": {"name": "web_search", "args_redacted": {}},
@@ -282,6 +288,7 @@ test_deny_chain_depth_exceeded_default_max if {
 }
 
 test_deny_reason_chain_depth_exceeded if {
+    # 10 entries > pinned max of 9 (YSG-RISK-056): deny_reason set
     d := data.yashigani.mcp.deny_reason with input as {
         "posture": "mcp-c",
         "action": "mcp.tools.call",
@@ -292,6 +299,12 @@ test_deny_reason_chain_depth_exceeded if {
                 "spiffe://cluster.local/ns/default/sa/hop2",
                 "spiffe://cluster.local/ns/default/sa/hop3",
                 "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+                "spiffe://cluster.local/ns/default/sa/hop10",
             ],
         },
         "tool": {"name": "web_search", "args_redacted": {}},
@@ -300,29 +313,7 @@ test_deny_reason_chain_depth_exceeded if {
 }
 
 test_allow_chain_depth_at_max if {
-    # Exactly 3 entries == default max: should allow
-    data.yashigani.mcp.allow with input as {
-        "posture": "mcp-c",
-        "action": "mcp.tools.call",
-        "identity": {
-            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
-            "chain": [
-                "spiffe://cluster.local/ns/default/sa/hop1",
-                "spiffe://cluster.local/ns/default/sa/hop2",
-                "spiffe://cluster.local/ns/default/sa/hop3",
-            ],
-        },
-        "tool": {"name": "web_search", "args_redacted": {}},
-    }
-}
-
-test_allow_chain_depth_2_within_default_max if {
-    data.yashigani.mcp.allow with input as _mcp_c_input_ok
-}
-
-test_allow_chain_depth_exceeds_default_with_operator_override if {
-    # Operator data bundle overrides chain_max_depth to 5
-    # 4 entries <= 5: should allow
+    # Exactly 9 entries == pinned max (YSG-RISK-056): boundary must ALLOW
     data.yashigani.mcp.allow with input as {
         "posture": "mcp-c",
         "action": "mcp.tools.call",
@@ -333,10 +324,47 @@ test_allow_chain_depth_exceeds_default_with_operator_override if {
                 "spiffe://cluster.local/ns/default/sa/hop2",
                 "spiffe://cluster.local/ns/default/sa/hop3",
                 "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
             ],
         },
         "tool": {"name": "web_search", "args_redacted": {}},
-    } with data.yashigani.mcp.policy.chain_max_depth as 5
+    }
+}
+
+test_allow_chain_depth_2_within_default_max if {
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+}
+
+test_deny_chain_depth_operator_override_is_inert if {
+    # YSG-RISK-056 (CWE-15): the operator-overridable chain_max_depth was REMOVED;
+    # mcp_chain_max_depth is now a pinned policy CONSTANT (9). A malicious/lax
+    # operator data bundle that tries to raise the ceiling to 99 must be IGNORED:
+    # an 11-entry chain (> pinned 9) must still DENY despite the override mock.
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "chain": [
+                "spiffe://cluster.local/ns/default/sa/hop1",
+                "spiffe://cluster.local/ns/default/sa/hop2",
+                "spiffe://cluster.local/ns/default/sa/hop3",
+                "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+                "spiffe://cluster.local/ns/default/sa/hop10",
+                "spiffe://cluster.local/ns/default/sa/hop11",
+            ],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    } with data.yashigani.mcp.policy.chain_max_depth as 99
 }
 
 test_deny_mcp_c_no_chain if {
@@ -737,7 +765,8 @@ test_fix1_probe1c_array_of_objects_chain_denies_mcp_c if {
 }
 
 # probe1d: chain is an array of integers — not strings
-# Previously counted 3 elements (≤ default max 3) and allowed. Must deny.
+# Previously counted 3 elements (≤ pinned max 9) and allowed. Must deny
+# (non-string chain elements are malformed → fail-closed, not a depth pass).
 test_fix1_probe1d_array_of_ints_chain_denies_mcp_c if {
     not data.yashigani.mcp.allow with input as {
         "posture": "mcp-c",
