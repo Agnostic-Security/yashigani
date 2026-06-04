@@ -1117,7 +1117,14 @@ async def _opa_proxy_response_check(
             )
             resp.raise_for_status()
             result = resp.json().get("result", {})
-            opa_allow = bool(result.get("allow", True))
+            # Fail-closed (False default): if OPA returns HTTP 200 with body
+            # {"result": {}} (undefined rule — partial bundle load, Helm bundle
+            # where v1_routing.rego failed to load, or proxy_response_decision
+            # undefined for this input shape), the absent "allow" key MUST resolve
+            # to DENY, not ALLOW. Mirrors openai_router._opa_response_check and the
+            # MCP broker _opa.py. Closes LAURA-OPA-004 (same class as
+            # LAURA-V243-001 / YSG-RISK-071).
+            opa_allow = bool(result.get("allow", False))
             opa_reason = result.get("reason", "ok")
 
             if not opa_allow:

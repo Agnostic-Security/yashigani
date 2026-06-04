@@ -35,6 +35,12 @@ sensitivity_rank(level) := 4 if {
 #   input.request.remainder_path          path after /agents/{target_agent_id}
 # ---------------------------------------------------------------------------
 
+# Default-deny: agent_call_allowed is undefined unless every condition below
+# holds. The consumer (agent_router._opa_agent_check) treats undefined as deny,
+# but the explicit default makes the fail-closed posture unambiguous and matches
+# agent_response_allowed.
+default agent_call_allowed := false
+
 agent_call_allowed if {
     input.principal.type == "agent"
     input.principal.agent_id != ""
@@ -47,10 +53,34 @@ agent_call_allowed if {
     _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
 }
 
-# Path matching helper — exact or prefix
+# Path matching helper — exact or prefix.
+# LAURA-OPA-001 (2.25.2): a remainder_path containing dot-segment traversal
+# ("../", "..\\") or encoded traversal (%2e, %2f, double-encoded) must NEVER
+# match an allowed prefix. The consumer (agent_router.py) forwards remainder_path
+# verbatim into the httpx URL, and httpx collapses "/do/../admin" -> "/admin" on
+# the wire (RFC-3986) — so the OPA gate would authorise "/do/**" while the request
+# actually reaches "/admin" on the target (confused-deputy). The consumer now
+# rejects traversal BEFORE this check, but this guard is belt-and-braces and
+# mirrors the filesystem-tool rules in mcp.rego (FIX-P3-001/002). ASVS V12.3.1.
 _path_allowed(path, allowed_paths) if {
+    _agent_path_safe(path)
     p := allowed_paths[_]
     _agent_path_matches(p, path)
+}
+
+# _agent_path_safe — true only when the path is free of traversal sequences.
+# Rejects raw dot-segments, backslash variants, and residual encoded dots/slashes.
+_agent_path_safe(path) if {
+    not contains(path, "../")
+    not contains(path, "..\\")
+    not endswith(path, "/..")
+    path != ".."
+    not contains(lower(path), "%2e")
+    not contains(lower(path), "%2f")
+    not contains(lower(path), "%5c")
+    not contains(lower(path), "%252e")
+    not contains(lower(path), "%252f")
+    not contains(lower(path), "%255c")
 }
 
 _agent_path_matches(pattern, path) if { pattern == "**" }
@@ -75,9 +105,16 @@ agent_call_deny_reason := "caller_group_not_in_allowed_caller_groups" if {
     not _caller_group_allowed
 }
 
+agent_call_deny_reason := "path_traversal_attempt" if {
+    input.principal.type == "agent"
+    _caller_group_allowed
+    not _agent_path_safe(input.request.remainder_path)
+}
+
 agent_call_deny_reason := "path_not_in_allowed_paths" if {
     input.principal.type == "agent"
     _caller_group_allowed
+    _agent_path_safe(input.request.remainder_path)
     not _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
 }
 
