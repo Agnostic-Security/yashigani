@@ -181,6 +181,7 @@ def create_gateway_app(
             follow_redirects=False,
         )
         # Create Postgres async pool on the running event loop
+        _db_audit_sink = None
         if os.environ.get("_YASHIGANI_DB_READY") == "1":
             try:
                 from yashigani.db import create_pool
@@ -188,8 +189,48 @@ def create_gateway_app(
                 logger.info("Postgres async pool created (lifespan)")
             except Exception as exc:
                 logger.warning("Postgres pool creation failed in lifespan: %s", exc)
+            else:
+                # v2.25.2 — wire the PostgresSink as a fire-and-forget mirror on
+                # the gateway's AuditLogWriter.  Reuses the asyncpg pool just
+                # created (get_pool, zero-arg) — no second pool.  The file sink
+                # remains canonical; this never blocks or fails a request.
+                # Guarded by AuditConfig.db_sink_enabled (env YASHIGANI_AUDIT_DB_SINK).
+                try:
+                    from yashigani.audit.config import AuditConfig
+                    if AuditConfig.from_env().db_sink_enabled:
+                        from yashigani.db import get_pool
+                        from yashigani.audit.sinks import build_postgres_audit_sink
+                        _db_audit_sink, _ = build_postgres_audit_sink(get_pool)
+                        _aw = _state.get("audit_writer")
+                        if _aw is not None and hasattr(_aw, "attach_db_sink"):
+                            _aw.attach_db_sink(_db_audit_sink)
+                            logger.info("Gateway: DB audit sink attached to audit writer")
+                        else:
+                            logger.warning(
+                                "Gateway: audit_writer missing attach_db_sink — "
+                                "DB audit sink NOT attached (file sink unaffected)"
+                            )
+                    else:
+                        logger.info(
+                            "Gateway: DB audit sink disabled (YASHIGANI_AUDIT_DB_SINK=false)"
+                        )
+                except Exception as exc:
+                    # Non-fatal: the file sink is the canonical anchor.  A DB-sink
+                    # wiring failure must never prevent the gateway from serving.
+                    logger.warning(
+                        "Gateway: DB audit sink wiring failed (%s) — "
+                        "continuing with file sink only", exc
+                    )
         yield
         # Shutdown: close the HTTP client and DB pool
+        # v2.25.2 — drain + stop the DB audit sink first so in-flight audit
+        # events flush before the pool closes.
+        if _db_audit_sink is not None:
+            try:
+                from yashigani.audit.sinks import stop_postgres_audit_sink
+                stop_postgres_audit_sink(_db_audit_sink)
+            except Exception:
+                pass
         client = _state["http_client"]
         if client:
             await client.aclose()

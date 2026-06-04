@@ -330,6 +330,66 @@ async def lifespan(app: FastAPI):
             backoffice_state.anomaly_detector = AnomalyDetector(redis_client=anomaly_client)
             _log.info("Backoffice: DB pool + inference logger + anomaly detector ready (lifespan)")
 
+            # v2.25.2 — wire the PostgresSink (DB audit mirror) + daily merkle
+            # checkpoint scheduler now that the asyncpg pool is open.
+            #   - PostgresSink reuses get_pool (zero-arg) — no second pool.
+            #   - The file sink remains the canonical anchor; the DB sink is a
+            #     fire-and-forget mirror whose failures never affect a request.
+            #   - The same AuditChainService instance backs both row-level
+            #     hashing and the daily checkpoint signer.
+            #   - Guarded by AuditConfig.db_sink_enabled (YASHIGANI_AUDIT_DB_SINK).
+            # Non-fatal: a wiring failure here must NOT crash backoffice — the
+            # file audit trail is the durability anchor.  (This is deliberately
+            # NOT a fail-closed path: audit DB mirroring is defence-in-depth on
+            # top of the always-on file sink, per Tiago's non-blocking mandate.)
+            try:
+                from yashigani.audit.config import AuditConfig as _AuditConfig
+                if _AuditConfig.from_env().db_sink_enabled:
+                    from yashigani.audit.sinks import build_postgres_audit_sink
+                    from yashigani.audit.checkpoint_job import AuditCheckpointScheduler
+                    _audit_db_sink, _audit_chain_svc = build_postgres_audit_sink(get_pool)
+                    backoffice_state.db_audit_sink = _audit_db_sink
+                    _aw = backoffice_state.audit_writer
+                    if _aw is not None and hasattr(_aw, "attach_db_sink"):
+                        _aw.attach_db_sink(_audit_db_sink)
+                        _log.info("Backoffice: DB audit sink attached to audit writer")
+                    else:
+                        _log.warning(
+                            "Backoffice: audit_writer missing attach_db_sink — "
+                            "DB audit sink NOT attached (file sink unaffected)"
+                        )
+                    # Daily merkle-root checkpoint scheduler — now that events
+                    # actually arrive in audit_events, the previously-dormant
+                    # checkpoint capability is activated.  Uses get_pool (zero-arg)
+                    # and the SAME chain service so the signing config matches.
+                    try:
+                        _ckpt_sched = AuditCheckpointScheduler(
+                            chain_service=_audit_chain_svc,
+                            pool_getter=get_pool,
+                        )
+                        _ckpt_sched.start()
+                        backoffice_state.audit_checkpoint_scheduler = _ckpt_sched
+                        _log.info(
+                            "Backoffice: audit checkpoint scheduler started "
+                            "(daily merkle root at 00:05 UTC)"
+                        )
+                    except Exception as _ckpt_exc:
+                        _log.warning(
+                            "Backoffice: audit checkpoint scheduler failed to start "
+                            "(%s) — DB sink still active; checkpoints can be run "
+                            "manually via run_now()", _ckpt_exc,
+                        )
+                else:
+                    _log.info(
+                        "Backoffice: DB audit sink disabled "
+                        "(YASHIGANI_AUDIT_DB_SINK=false)"
+                    )
+            except Exception as _dbsink_exc:
+                _log.warning(
+                    "Backoffice: DB audit sink wiring failed (%s) — "
+                    "continuing with file sink only", _dbsink_exc,
+                )
+
             # v2.24.1 — RuntimeSettingsService: admin-surfaces-all-runtime-settings rule.
             # Seeded from env vars on first boot; subsequent boots read from DB.
             # A separate Redis client on DB 1 (session Redis) is used for pub/sub.
@@ -510,6 +570,19 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if scheduler is not None:
         scheduler.shutdown(wait=False)
+    # v2.25.2 — drain + stop the DB audit sink so in-flight events flush, and
+    # stop the daily checkpoint scheduler.  Both are best-effort + never raise.
+    try:
+        from yashigani.audit.sinks import stop_postgres_audit_sink
+        stop_postgres_audit_sink(backoffice_state.db_audit_sink)
+    except Exception:
+        pass
+    _ckpt = getattr(backoffice_state, "audit_checkpoint_scheduler", None)
+    if _ckpt is not None:
+        try:
+            _ckpt.stop(wait=False)
+        except Exception:
+            pass
 
 
 def create_backoffice_app() -> FastAPI:
