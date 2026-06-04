@@ -627,6 +627,49 @@ async def verify_session(request: Request):
     return resp
 
 
+@router.get("/verify-admin")
+async def verify_admin_session(request: Request):
+    """
+    Caddy forward_auth for ADMIN-only operator proxies (Grafana / Wazuh / Prometheus
+    under /admin/*). This is the INVERSE of /auth/verify: it REQUIRES a valid admin
+    session (account_tier == "admin") and rejects user-tier, provisioning-state, and
+    anonymous requests.
+
+    SoD-003 bars admins from the DATA plane (/auth/verify), but the operator
+    monitoring dashboards are an ADMIN function — admins must reach them and normal
+    users must not. Using /auth/verify here (the bug) rejected admins outright.
+    200 + identity headers → Caddy proceeds. 401 → redirect to /admin/login.
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    assert state.session_store is not None  # set unconditionally at startup
+    token = request.cookies.get(_SESSION_COOKIE)  # admin cookie only
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    session = state.session_store.get(token)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    if session.account_tier != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_session_required",
+                "message": "These operator dashboards require an admin session.",
+            },
+        )
+    record = await state.auth_service.get_account_by_id(session.account_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    from starlette.responses import Response as StarletteResponse
+
+    resp = StarletteResponse(status_code=200)
+    email = record.email or f"{record.username}@yashigani.local"
+    resp.headers["X-Forwarded-User"] = email
+    resp.headers["X-Forwarded-Name"] = record.username
+    resp.headers["X-Forwarded-Email"] = email
+    return resp
+
+
 @router.post("/password/change")
 async def change_password(
     body: PasswordChangeRequest,

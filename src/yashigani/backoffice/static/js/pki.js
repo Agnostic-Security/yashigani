@@ -69,9 +69,9 @@ async function loadPkiStatus() {
             + '<td style="padding:8px 12px;">' + statusBadge + '</td>'
             + '<td style="padding:8px 12px;font-size:0.8rem;color:#475569;">' + expiresStr + '</td>'
             + '<td style="padding:8px 12px;">'
-            + '<button class="btn btn-sm" onclick="showPkiChain(' + JSON.stringify(svc.service) + ')" style="margin-right:4px;">View</button>'
-            + '<button class="btn btn-sm btn-warning" onclick="pkiRotate(' + JSON.stringify(svc.service) + ')" style="margin-right:4px;">Rotate</button>'
-            + '<button class="btn btn-sm" onclick="pkiDownloadBundle(' + JSON.stringify(svc.service) + ')">Download</button>'
+            + '<button class="btn btn-sm" data-action="pkiView" data-service="' + escapeHtml(svc.service) + '" style="margin-right:4px;">View</button>'
+            + '<button class="btn btn-sm btn-warning" data-action="pkiRotate" data-service="' + escapeHtml(svc.service) + '" style="margin-right:4px;">Rotate</button>'
+            + '<button class="btn btn-sm" data-action="pkiDownload" data-service="' + escapeHtml(svc.service) + '">Download</button>'
             + '</td>'
             + '</tr>';
     });
@@ -126,7 +126,7 @@ async function showPkiChain(serviceName) {
     var html = '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin-top:12px;">'
         + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
         + '<strong>Chain details — ' + escapeHtml(serviceName) + '</strong>'
-        + '<button class="btn btn-sm" onclick="hidePkiChain()" style="font-size:0.75rem;">Close</button>'
+        + '<button class="btn btn-sm" data-action="pkiClose" style="font-size:0.75rem;">Close</button>'
         + '</div>'
         + tableHtml
         + '</div>';

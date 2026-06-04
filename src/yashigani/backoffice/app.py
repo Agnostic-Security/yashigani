@@ -919,6 +919,9 @@ def create_backoffice_app() -> FastAPI:
         summary="Machine-readable licence expiry status (v2.23.3)",
     )
     app.include_router(opa_assistant_router, prefix="/admin/opa-assistant", tags=["opa-assistant"])
+    # OPA policy viewer (read-only) — lists/serves the Rego modules loaded in OPA
+    from yashigani.backoffice.routes.policies import router as policies_router
+    app.include_router(policies_router, prefix="/admin/policies", tags=["policies"])
     app.include_router(alerts_router, prefix="/admin/alerts", tags=["alerts"])
     app.include_router(agent_bundles_router, prefix="/admin/agent-bundles", tags=["agent-bundles"])
     # v1.0 — Budget admin API

@@ -358,7 +358,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login?next=/admin/grafana/ 302
@@ -376,7 +376,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
@@ -394,7 +394,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302

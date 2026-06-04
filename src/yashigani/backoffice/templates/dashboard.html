@@ -17,6 +17,7 @@
                 <button data-action="showPage" data-param="accounts">Accounts</button>
                 <button data-action="showPage" data-param="budgets">Budgets</button>
                 <button data-action="showPage" data-param="models">Models</button>
+                <button data-action="showPage" data-param="policies">Policies</button>
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
@@ -28,7 +29,7 @@
             </div>
         </div>
         <div class="nav-right">
-            <span>v2.2</span>
+            <span>v2.25.3</span>
             <button data-action="logout">Logout</button>
         </div>
     </nav>
@@ -412,6 +413,35 @@
             </div>
         </div>
 
+        <!-- Policies Page — read-only view of the Rego modules loaded in OPA -->
+        <div class="page" id="page-policies">
+            <h2>Policies (OPA)</h2>
+            <div class="panel">
+                <div class="panel-header">Active policy modules</div>
+                <div class="panel-body">
+                    <p class="txt-note">Rego policy modules currently loaded in the OPA decision service. These
+                        are deployed declaratively (policy bundle / install-time load) and are read-only here —
+                        editing happens in the policy source, not the admin UI. "Example" modules are the loaded
+                        governance examples (GDPR, EU AI Act, HIPAA, PCI, data residency, …); "Core" are the
+                        gateway's own policies.</p>
+                    <div id="policies-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+            <div class="panel" id="policy-view-panel" style="display:none;">
+                <div class="panel-header">
+                    <span id="policy-view-title">Policy source</span>
+                    <span id="policy-view-badge" style="font-size:0.7rem;margin-left:8px;"></span>
+                    <button class="btn btn-sm" data-action="policyClose" style="float:right;font-size:0.75rem;">Close</button>
+                </div>
+                <div class="panel-body">
+                    <pre id="policy-view-src" style="background:#0f172a;color:#e2e8f0;padding:14px;border-radius:6px;overflow:auto;max-height:520px;font-size:0.8rem;line-height:1.45;white-space:pre;margin:0;"></pre>
+                    <p class="txt-note" style="margin-top:8px;">Example policies are <strong>immutable templates</strong>. Creating an
+                        editable client copy (saved in-app) and activating a policy across subjects (users, agents, MCP, API) on ingress
+                        and egress are in active development.</p>
+                </div>
+            </div>
+        </div>
+
         <!-- Monitoring Page -->
         <div class="page" id="page-monitoring">
             <h2>Monitoring</h2>
@@ -500,7 +530,7 @@
                         <table class="pki-chain-table">
                             <tbody id="pki-chain-table-body"></tbody>
                         </table>
-                        <button onclick="hidePkiChain()" class="btn-pki-close">
+                        <button data-action="pkiClose" class="btn-pki-close">
                             Close
                         </button>
                     </div>
@@ -604,7 +634,7 @@
             <div class="panel">
                 <div class="panel-header">System Info</div>
                 <div class="panel-body">
-                    <p class="txt-version">Version: 2.1 | Runtime: Podman/Docker | TLS: Self-signed</p>
+                    <p class="txt-version">Version: 2.25.3 | Runtime: Podman/Docker | TLS: Self-signed</p>
                 </div>
             </div>
             <div class="panel">
@@ -723,10 +753,10 @@
                    class="stepup-input">
             <p id="stepup-error" class="stepup-error"></p>
             <div class="stepup-buttons">
-                <button id="stepup-submit" onclick="submitStepUp()" class="btn-stepup-submit">
+                <button id="stepup-submit" data-action="stepUpSubmit" class="btn-stepup-submit">
                     Verify
                 </button>
-                <button onclick="cancelStepUp()" class="btn-stepup-cancel">
+                <button data-action="stepUpCancel" class="btn-stepup-cancel">
                     Cancel
                 </button>
             </div>

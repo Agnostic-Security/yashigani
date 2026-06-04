@@ -20,6 +20,7 @@ function showPage(name, triggerEl) {
     if (name === 'budgets') loadBudgets();
     if (name === 'models') loadModels();
     if (name === 'sensitivity') loadSensitivity();
+    if (name === 'policies') loadPolicies();
     if (name === 'settings') loadSettings();
     if (name === 'backup') loadBackup();
     // PKI panel — loadPkiStatus is defined in pki.js (loaded defer).
@@ -28,6 +29,72 @@ function showPage(name, triggerEl) {
     if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
+    if (name === 'policies') loadPolicies();
+}
+
+// ---------------------------------------------------------------------------
+// Policies (OPA) — read-only viewer of the Rego modules loaded in OPA.
+// Example modules are IMMUTABLE templates; editable client copies + activation
+// + ingress/egress enforcement are phased features (opa_policy_management_design).
+// ---------------------------------------------------------------------------
+async function loadPolicies() {
+    var container = document.getElementById('policies-container');
+    if (!container) return;
+    container.innerHTML = '<span class="loading">Loading…</span>';
+    var data = await api('/admin/policies');
+    if (!data || !data.policies) {
+        container.innerHTML = '<p class="error">Could not load policies from the policy service.</p>';
+        return;
+    }
+    var catLabel = { example: 'Templates (immutable examples)', core: 'Core gateway policies', test: 'Test policies' };
+    var catBadge = {
+        example: '<span class="badge" style="background:#fef3c7;color:#92400e;">template</span>',
+        core: '<span class="badge badge-green">core</span>',
+        test: '<span class="badge" style="background:#f1f5f9;color:#64748b;">test</span>'
+    };
+    var groups = {};
+    data.policies.forEach(function(p) { (groups[p.category] = groups[p.category] || []).push(p); });
+    var html = '';
+    ['example', 'core', 'test'].forEach(function(cat) {
+        var list = groups[cat];
+        if (!list || !list.length) return;
+        html += '<h3 style="margin:14px 0 6px;font-size:0.95rem;">' + escapeHtml(catLabel[cat] || cat) + '</h3>';
+        html += '<table><thead><tr><th>Name</th><th>Package</th><th></th><th></th></tr></thead><tbody>';
+        list.forEach(function(p) {
+            html += '<tr>'
+                + '<td style="font-family:monospace;">' + escapeHtml(p.name) + '</td>'
+                + '<td style="font-size:0.8rem;color:#475569;">' + escapeHtml(p.package || '—') + '</td>'
+                + '<td>' + (catBadge[p.category] || '') + '</td>'
+                + '<td><button class="btn btn-sm" data-action="policyView" data-id="' + escapeHtml(p.id) + '" data-cat="' + escapeHtml(p.category) + '">View</button></td>'
+                + '</tr>';
+        });
+        html += '</tbody></table>';
+    });
+    container.innerHTML = html + '<p class="txt-note" style="margin-top:10px;">' +
+        escapeHtml(String(data.count)) + ' policy modules loaded in OPA (' + escapeHtml(data.opa_url || '') + ').</p>';
+}
+
+async function viewPolicy(id, cat) {
+    var panel = document.getElementById('policy-view-panel');
+    var pre = document.getElementById('policy-view-src');
+    var title = document.getElementById('policy-view-title');
+    var badge = document.getElementById('policy-view-badge');
+    if (!panel || !pre) return;
+    title.textContent = id;
+    badge.innerHTML = (cat === 'example')
+        ? '<span class="badge" style="background:#fef3c7;color:#92400e;">immutable template</span>' : '';
+    pre.textContent = 'Loading…';
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // {policy_id:path} — keep the slashes, encode each segment
+    var encoded = id.split('/').map(encodeURIComponent).join('/');
+    var data = await api('/admin/policies/' + encoded);
+    pre.textContent = (data && typeof data.raw === 'string' && data.raw) ? data.raw : 'Could not load policy source.';
+}
+
+function closePolicyView() {
+    var panel = document.getElementById('policy-view-panel');
+    if (panel) panel.style.display = 'none';
 }
 
 async function api(path) {
@@ -85,6 +152,20 @@ async function apiMutate(path, options) {
         console.error('apiMutate failed: ' + path + ' — ' + err.message);
         return null;
     }
+}
+
+// errMsg() extracts a human-readable string from a parsed JSON error body.
+// FastAPI `detail` may be a string, an object ({error,message}), or a Pydantic
+// validation list — never render an object directly or it shows "[object Object]".
+function errMsg(err, status) {
+    var d = err && err.detail;
+    if (d === undefined || d === null) return 'HTTP ' + status;
+    if (typeof d === 'string') return d;
+    if (Array.isArray(d)) {
+        return d.map(function(x) { return (x && (x.msg || x.message)) || JSON.stringify(x); }).join('; ');
+    }
+    if (typeof d === 'object') return d.message || d.error || JSON.stringify(d);
+    return String(d);
 }
 
 function _showStepUpModal() {
@@ -226,11 +307,12 @@ async function registerAgent() {
     if (groups.length) body.groups = groups;
     if (callerGroups.length) body.allowed_caller_groups = callerGroups;
     if (cidrs.length) body.allowed_cidrs = cidrs;
-    var resp = await fetch('/admin/agents', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/agents', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) {
         var data = await resp.json();
         result.innerHTML = '<span class="badge badge-green">Registered</span>';
@@ -242,7 +324,7 @@ async function registerAgent() {
         loadAgents();
     } else {
         var err = await resp.json().catch(function() { return {}; });
-        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail || resp.status);
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
     }
 }
 
@@ -568,8 +650,8 @@ async function addAlias() {
     var result = document.getElementById('alias-result');
     var alias = document.getElementById('alias-name').value.trim();
     if (!alias) { result.textContent = 'Alias name is required.'; return; }
-    var resp = await fetch('/admin/models', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/models', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             alias: alias,
@@ -578,15 +660,17 @@ async function addAlias() {
             force_local: document.getElementById('alias-local').value === 'true'
         })
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('alias-name').value = ''; document.getElementById('alias-model').value = ''; loadModels(); }
-    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail ? (err.detail.error || JSON.stringify(err.detail)) : resp.status); }
+    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
 async function deleteAlias(alias) {
     if (!confirm('Delete alias "' + alias + '"?')) return;
-    var resp = await fetch('/admin/models/' + encodeURIComponent(alias), { method: 'DELETE', credentials: 'same-origin' });
+    var resp = await apiMutate('/admin/models/' + encodeURIComponent(alias), { method: 'DELETE' });
+    if (!resp) return;
     if (resp.ok) loadModels();
-    else alert('Delete failed: ' + resp.status);
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
 }
 
 async function addAllocation() {
@@ -594,8 +678,8 @@ async function addAllocation() {
     var alias = document.getElementById('alloc-alias').value.trim();
     var target = document.getElementById('alloc-target').value.trim();
     if (!alias || !target) { result.textContent = 'All fields required.'; return; }
-    var resp = await fetch('/admin/models/allocations', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/models/allocations', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             model_alias: alias,
@@ -603,14 +687,16 @@ async function addAllocation() {
             target_id: target
         })
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Allocated</span>'; loadModels(); }
-    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail ? (err.detail.error || JSON.stringify(err.detail)) : resp.status); }
+    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
 async function deleteAllocation(id) {
-    var resp = await fetch('/admin/models/allocations/' + id, { method: 'DELETE', credentials: 'same-origin' });
+    var resp = await apiMutate('/admin/models/allocations/' + id, { method: 'DELETE' });
+    if (!resp) return;
     if (resp.ok) loadModels();
-    else alert('Remove failed: ' + resp.status);
+    else { var err = await resp.json().catch(function(){return {};}); alert('Remove failed: ' + errMsg(err, resp.status)); }
 }
 
 // Sensitivity
@@ -646,8 +732,8 @@ async function addPattern() {
     var pattern = document.getElementById('pat-pattern').value.trim();
     var desc = document.getElementById('pat-desc').value.trim();
     if (!pattern || !desc) { result.textContent = 'Pattern and description required.'; return; }
-    var resp = await fetch('/admin/sensitivity/patterns', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/sensitivity/patterns', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             classification: document.getElementById('pat-class').value,
@@ -656,15 +742,17 @@ async function addPattern() {
             description: desc
         })
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('pat-pattern').value = ''; document.getElementById('pat-desc').value = ''; loadSensitivity(); }
-    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail || resp.status); }
+    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
 async function deletePattern(id) {
     if (!confirm('Delete this pattern?')) return;
-    var resp = await fetch('/admin/sensitivity/patterns/' + id, { method: 'DELETE', credentials: 'same-origin' });
+    var resp = await apiMutate('/admin/sensitivity/patterns/' + id, { method: 'DELETE' });
+    if (!resp) return;
     if (resp.ok) loadSensitivity();
-    else alert('Delete failed: ' + resp.status);
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
 }
 
 // Test classifier
@@ -694,8 +782,19 @@ async function loadSettings() {
     var data = await api('/admin/license');
     var container = document.getElementById('license-info');
     if (data) {
+        // Limits live under data.limits.<key>.{maximum,unlimited}; render all
+        // four (agents / users / admins / orgs) the license enforces.
+        var lim = data.limits || {};
+        function fmtLimit(o) {
+            if (!o) return '-';
+            if (o.unlimited) return 'Unlimited';
+            return (o.maximum !== null && o.maximum !== undefined) ? String(o.maximum) : '-';
+        }
         container.innerHTML = '<p style="font-size:0.85rem;color:#334155;"><strong>Tier:</strong> ' + escapeHtml(data.tier || 'community') +
-            ' | <strong>Max Agents:</strong> ' + escapeHtml(data.max_agents === -1 ? 'Unlimited' : (data.max_agents || '-')) +
+            ' | <strong>Max Agents:</strong> ' + escapeHtml(fmtLimit(lim.agents)) +
+            ' | <strong>Users:</strong> ' + escapeHtml(fmtLimit(lim.end_users)) +
+            ' | <strong>Admins:</strong> ' + escapeHtml(fmtLimit(lim.admin_seats)) +
+            ' | <strong>Orgs:</strong> ' + escapeHtml(fmtLimit(lim.orgs)) +
             ' | <strong>Expires:</strong> ' + escapeHtml(data.expires_at || 'Never') + '</p>';
     } else {
         container.innerHTML = '<p style="font-size:0.85rem;color:#334155;"><strong>Tier:</strong> Community Edition — no license required.<br><span style="color:#64748b;">To use other features please add a license for your preferred tier.</span></p>';
@@ -1173,6 +1272,37 @@ document.addEventListener('click', function(e) {
                 rsResetRow(actionEl.getAttribute('data-rs-key'));
             }
             break;
+
+        // PKI actions (defined in pki.js) — data-action so they work under the
+        // strict CSP (script-src 'self'; inline onclick handlers are blocked).
+        case 'pkiView':
+            if (typeof showPkiChain === 'function') showPkiChain(actionEl.getAttribute('data-service'));
+            break;
+        case 'pkiRotate':
+            if (typeof pkiRotate === 'function') pkiRotate(actionEl.getAttribute('data-service'));
+            break;
+        case 'pkiDownload':
+            if (typeof pkiDownloadBundle === 'function') pkiDownloadBundle(actionEl.getAttribute('data-service'));
+            break;
+        case 'pkiClose':
+            if (typeof hidePkiChain === 'function') hidePkiChain();
+            break;
+
+        // Step-up verification modal
+        case 'stepUpSubmit':
+            submitStepUp();
+            break;
+        case 'stepUpCancel':
+            cancelStepUp();
+            break;
+
+        // Policies (OPA) viewer
+        case 'policyView':
+            viewPolicy(actionEl.getAttribute('data-id'), actionEl.getAttribute('data-cat'));
+            break;
+        case 'policyClose':
+            closePolicyView();
+            break;
     }
 });
 
@@ -1197,18 +1327,19 @@ async function loadServices() {
 async function toggleService(serviceId, action) {
     var result = document.getElementById('services-result');
     if (result) result.innerHTML = '<span class="badge badge-yellow">' + action + 'ing ' + serviceId + '...</span>';
-    var r = await fetch('/admin/services/' + serviceId, {
-        method: 'POST', credentials: 'same-origin',
+    var r = await apiMutate('/admin/services/' + serviceId, {
+        method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({action: action})
     });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Failed: request cancelled</span>'; return; }
     if (r.ok) {
         var data = await r.json();
         if (result) result.innerHTML = '<span class="badge badge-green">' + escapeHtml(data.message || 'Done') + '</span>';
         loadServices();
     } else {
         var err = await r.json().catch(function(){return {};});
-        if (result) result.innerHTML = '<span class="badge badge-red">Failed: ' + escapeHtml(err.detail?.error || r.status) + '</span>';
+        if (result) result.innerHTML = '<span class="badge badge-red">Failed: ' + escapeHtml(errMsg(err, r.status)) + '</span>';
     }
 }
 
