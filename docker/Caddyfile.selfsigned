@@ -376,8 +376,8 @@ Hiring: https://agnosticsec.com/careers
         # some browsers resolve the relative asset refs against the dashboard path
         # (e.g. /admin/grafana/d/x/public/build/… → 404). Collapse any extra
         # segment between /admin/grafana/ and /public/ back to the canonical path.
-        @grafana_asset path_regexp gpub ^/admin/grafana/.+/(public/.+)$
-        rewrite @grafana_asset /admin/grafana/{http.regexp.gpub.1}
+        @grafana_misroute path_regexp gmis ^/admin/grafana/.+/((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
