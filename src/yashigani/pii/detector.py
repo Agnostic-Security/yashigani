@@ -59,6 +59,10 @@ class PiiFinding:
     start: int
     end: int
     masked_value: str   # first 2 + '****' + last 2 chars; safe for audit logs
+    # F-RT1: which normalised view the match came from.  "raw" for matches on
+    # the original prompt text; "base64"/"hex"/"url"/"rot13"/... for matches
+    # found only after decoding an encoded segment.  Audit-safe (no raw PII).
+    view: str = "raw"
 
 
 @dataclass
@@ -68,6 +72,20 @@ class PiiResult:
     findings: list[PiiFinding]
     mode: PiiMode
     action_taken: str   # "logged" | "redacted" | "blocked"
+    # F-RT1: distinct views in which PII was found (e.g. {"raw", "base64"}).
+    # Lets the caller record that a payload was caught only after decoding.
+    matched_views: set = None  # type: ignore[assignment]
+    # F-RT1: a long, encoded-looking, high-entropy blob that could NOT be
+    # decoded to plaintext was present.  Even with detected=False this MUST
+    # be audited — the silent pass is the worst part of F-RT1.
+    suspicious_blob: bool = False
+    suspicious_tokens: list = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.matched_views is None:
+            self.matched_views = set()
+        if self.suspicious_tokens is None:
+            self.suspicious_tokens = []
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +184,91 @@ class PiiDetector:
             findings=findings,
             mode=self.mode,
             action_taken="logged",
+        )
+
+    def detect_decoded(self, text: str) -> PiiResult:
+        """Scan *text* AND every decoded view of it for PII (F-RT1).
+
+        The decode-before-classify stage (``yashigani.pii.decode``) normalises
+        plausibly-encoded segments — base64 (std + urlsafe), hex, URL
+        percent-encoding, ROT13, bounded nested decoding — back to plaintext
+        BEFORE the regex scan runs.  A hit in ANY view sets ``detected``; each
+        :class:`PiiFinding` records the ``view`` it came from.
+
+        Even when no PII matches, a long encoded-looking high-entropy blob that
+        could not be decoded sets ``suspicious_blob=True`` so the caller can
+        still emit an audit event (closing the F-RT1 silent-pass).
+
+        This is a read-only scan (action_taken="logged").  For mode-aware
+        request handling use :meth:`process_decoded`.
+        """
+        # Lazy import keeps the detector importable even if decode is stubbed.
+        from yashigani.pii.decode import decode_views
+
+        decode_result = decode_views(text)
+        all_findings: list[PiiFinding] = []
+        matched_views: set[str] = set()
+
+        for view in decode_result.views:
+            view_findings = self._scan(view.text)
+            for f in view_findings:
+                f.view = view.view_name
+                all_findings.append(f)
+                matched_views.add(view.view_name)
+
+        return PiiResult(
+            detected=bool(all_findings),
+            findings=all_findings,
+            mode=self.mode,
+            action_taken="logged",
+            matched_views=matched_views,
+            suspicious_blob=decode_result.suspicious_blob,
+            suspicious_tokens=list(decode_result.flagged_tokens),
+        )
+
+    def process_decoded(self, text: str) -> tuple[str, PiiResult]:
+        """Mode-aware dispatcher that decodes before classifying (F-RT1).
+
+        Mirrors :meth:`process` but classifies across raw + decoded views:
+
+        - LOG / BLOCK: returns the ORIGINAL text unchanged.  ``action_taken``
+          is "blocked" in BLOCK mode (caller drops on ``detected``), else
+          "logged".  Encoded payloads are NOT silently rewritten.
+        - REDACT: redacts matches found in the *raw* view in-place (offsets are
+          only meaningful against the raw text).  Matches found only inside an
+          encoded segment cannot be safely spliced back, so REDACT mode escalates
+          ``action_taken`` to "blocked" for encoded-only hits — the caller MUST
+          drop or refuse the payload rather than forward an un-redactable
+          encoded secret.  ``detected`` is always set when any view matched.
+        """
+        result = self.detect_decoded(text)
+
+        if self.mode == PiiMode.REDACT:
+            raw_findings = [f for f in result.findings if f.view == "raw"]
+            redacted = self._apply_redactions(text, raw_findings)
+            encoded_only = result.detected and not raw_findings
+            # If PII was found only in a decoded view, we cannot redact it in
+            # place — escalate to blocked so the caller refuses the payload.
+            action = "blocked" if encoded_only else "redacted"
+            return redacted, PiiResult(
+                detected=result.detected,
+                findings=result.findings,
+                mode=self.mode,
+                action_taken=action,
+                matched_views=result.matched_views,
+                suspicious_blob=result.suspicious_blob,
+                suspicious_tokens=result.suspicious_tokens,
+            )
+
+        action = "blocked" if self.mode == PiiMode.BLOCK else "logged"
+        return text, PiiResult(
+            detected=result.detected,
+            findings=result.findings,
+            mode=self.mode,
+            action_taken=action,
+            matched_views=result.matched_views,
+            suspicious_blob=result.suspicious_blob,
+            suspicious_tokens=result.suspicious_tokens,
         )
 
     def redact(self, text: str) -> tuple[str, PiiResult]:
