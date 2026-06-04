@@ -39,6 +39,36 @@ _HOP_BY_HOP = frozenset({
 })
 
 _OPA_AGENT_ALLOWED_PATH = "/v1/data/yashigani/agent_call_allowed"
+
+# LAURA-OPA-001 (2.25.2): path-traversal confused-deputy guard.
+# httpx collapses dot-segments ("/do/../admin" -> "/admin") on the wire per
+# RFC-3986, while the OPA gate matched the UN-collapsed path with literal
+# startswith — so an agent scoped to "/do/**" could reach "/admin". We reject
+# any remainder_path that contains a traversal sequence (raw or percent-encoded,
+# single- or double-encoded) BEFORE building the OPA input AND before forwarding,
+# so OPA evaluates a path byte-identical to what httpx forwards (no parser
+# differential). Fail-closed: ambiguous/encoded paths are rejected, not silently
+# normalised. Mirrors the agents.rego _agent_path_safe guard.
+_TRAVERSAL_TOKENS = (
+    "../", "..\\",
+    "%2e", "%2f", "%5c",            # encoded dot / forward-slash / back-slash
+    "%252e", "%252f", "%255c",      # double-encoded
+)
+
+
+def _is_path_traversal(remainder_path: str) -> bool:
+    """True if remainder_path contains any dot-segment or encoded traversal token.
+
+    Case-insensitive on the encoded forms. Also rejects a bare/ trailing ".."
+    segment that the substring check would otherwise miss.
+    """
+    lowered = remainder_path.lower()
+    if any(tok in lowered for tok in _TRAVERSAL_TOKENS):
+        return True
+    # bare ".." or a trailing "/.." segment
+    if remainder_path == ".." or remainder_path.endswith("/.."):
+        return True
+    return False
 # v2.24.1 — GAP-3 / SEC-5: response-leg OPA check
 _OPA_AGENT_RESPONSE_PATH = "/v1/data/yashigani/agent_response_decision"
 
@@ -77,6 +107,42 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
     remainder_path = "/" + parts[1] if len(parts) > 1 else "/"
 
     caller_agent_id = getattr(request.state, "agent_id", "unknown")
+
+    # LAURA-OPA-001: reject path traversal BEFORE OPA evaluation and forwarding.
+    # The path OPA sees must be byte-identical to what httpx forwards; rejecting
+    # traversal up front eliminates the parser differential (fail-closed).
+    if _is_path_traversal(remainder_path):
+        logger.warning(
+            "route_agent_call: path traversal rejected (caller=%s target=%s remainder=%r)",
+            caller_agent_id, target_agent_id, remainder_path,
+        )
+        _write_denied_rbac_audit(
+            audit_writer=audit_writer,
+            caller_agent_id=caller_agent_id,
+            target_agent_id=target_agent_id,
+            path=path,
+            opa_reason="path_traversal_attempt",
+        )
+        try:
+            from yashigani.metrics.registry import agent_calls_total
+            agent_calls_total.labels(
+                caller_agent_id=caller_agent_id,
+                target_agent_id=target_agent_id,
+                outcome="denied_rbac",
+            ).inc()
+        except Exception:
+            logger.debug(
+                "agent_router: metric increment failed for agent_calls_total "
+                "(path_traversal)", exc_info=True,
+            )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "AGENT_CALL_DENIED",
+                "reason": "path_traversal_attempt",
+                "target_agent_id": target_agent_id,
+            },
+        )
 
     # Registry must be available
     if registry is None:

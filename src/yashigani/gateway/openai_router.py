@@ -69,6 +69,7 @@ from pydantic import BaseModel, Field
 from yashigani.pki.client import internal_httpx_client
 from yashigani.metrics.registry import _C as _metric_counter
 from yashigani.audit.schema import (
+    EncodedPayloadDetectedEvent,
     OpaResponseCheckFailedEvent,
     PIIDetectedEvent,
     PoolBackendUnavailableEvent,
@@ -385,11 +386,17 @@ def _make_streaming_audit_adapter(audit_writer):
 
 
 def _pii_audit(request_id: str, direction: str, pii_result, action: str, destination: str) -> None:
-    """Write a PII detection audit event if an audit_writer is configured."""
+    """Write a PII detection audit event if an audit_writer is configured.
+
+    F-RT1: records ``matched_views`` so an encoded-then-decoded hit is visible
+    in the audit sink (e.g. ["base64"] means the PII was caught only after
+    decoding — it would have been a silent pass before the decode stage).
+    """
     if _state.audit_writer is None:
         return
     try:
         pii_types = [f.pii_type.value for f in pii_result.findings]
+        matched_views = sorted(getattr(pii_result, "matched_views", None) or [])
         _state.audit_writer.write(
             PIIDetectedEvent(
                 request_id=request_id,
@@ -398,10 +405,47 @@ def _pii_audit(request_id: str, direction: str, pii_result, action: str, destina
                 action_taken=action,
                 destination=destination,
                 finding_count=len(pii_result.findings),
+                matched_views=matched_views,
             )
         )
     except Exception as exc:
         logger.warning("PII audit write failed (request_id=%s): %s", request_id, exc)
+
+
+def _encoded_payload_audit(
+    request_id: str, direction: str, destination: str, pii_result
+) -> None:
+    """Emit an ENCODED_PAYLOAD_DETECTED audit event (F-RT1 silent-pass guard).
+
+    Called when the decode stage flagged a long, encoded-looking, high-entropy
+    blob that could NOT be decoded to plaintext.  Even with no PII match this
+    leaves an audit record — closing the worst part of F-RT1 (the silent pass).
+    Raw payload is never logged — only masked token shapes + a count.
+    """
+    if _state.audit_writer is None:
+        return
+    if not getattr(pii_result, "suspicious_blob", False):
+        return
+    try:
+        masked = list(getattr(pii_result, "suspicious_tokens", None) or [])
+        _state.audit_writer.write(
+            EncodedPayloadDetectedEvent(
+                request_id=request_id,
+                direction=direction,
+                destination=destination,
+                high_entropy=True,
+                oversize=any(t.startswith("oversize(") for t in masked),
+                token_count=len(masked),
+                masked_tokens=masked,
+            )
+        )
+        logger.warning(
+            "F-RT1: encoded high-entropy blob present (request_id=%s direction=%s "
+            "tokens=%s) — audited, no plaintext PII match",
+            request_id, direction, masked,
+        )
+    except Exception as exc:
+        logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -505,11 +549,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             logger.warning("Content relay check failed: %s", exc)
 
     # ── 3. Sensitivity scan ───────────────────────────────────────────
+    # F-RT1 (red-team verified 2026-05-30): classify the decoded views, not just
+    # the raw prompt.  base64("SSN 123-45-6789") and friends are normalised to
+    # plaintext first so an encoded payload elevates the sensitivity level (and
+    # therefore the OPA ceiling) exactly as the plaintext would.  classify_decoded
+    # is a superset of classify for non-encoded text (raw view alone decides).
     sensitivity_level = "PUBLIC"
     sensitivity_triggers = []
     s_result = None
     if _state.sensitivity_classifier:
-        s_result = _state.sensitivity_classifier.classify(prompt_text)
+        s_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
         sensitivity_level = s_result.level.value
         sensitivity_triggers = s_result.triggers
     if s_result is None:
@@ -733,26 +782,36 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             )
 
         if _run_pii:
+            # F-RT1: decode-before-classify.  process_decoded() scans the raw
+            # prompt AND every decoded view (base64/hex/url/rot13, bounded
+            # nested), so an encoded SSN/credit-card is caught where the old
+            # raw-only process() let it through silently.
             if destination == "local":
                 # Local: detect only — never block, never redact (data is on-premises)
-                _text, _pii_result = _state.pii_detector.process(prompt_text)
+                _text, _pii_result = _state.pii_detector.process_decoded(prompt_text)
+                # F-RT1 silent-pass guard: audit an undecodable encoded blob even
+                # with no plaintext PII match.
+                _encoded_payload_audit(request_id, "request", destination, _pii_result)
                 if _pii_result.detected:
                     pii_detected_on_request = True
                     logger.info(
-                        "PII detected on local request request_id=%s types=%s — log only (local)",
+                        "PII detected on local request request_id=%s types=%s views=%s — log only (local)",
                         request_id,
                         [f.pii_type.value for f in _pii_result.findings],
+                        sorted(_pii_result.matched_views),
                     )
                     _pii_audit(request_id, "request", _pii_result, "logged", destination)
             else:
                 # Cloud: apply configured mode
-                _text, _pii_result = _state.pii_detector.process(prompt_text)
+                _text, _pii_result = _state.pii_detector.process_decoded(prompt_text)
+                _encoded_payload_audit(request_id, "request", destination, _pii_result)
                 if _pii_result.detected:
                     pii_detected_on_request = True
                     logger.info(
-                        "PII detected on cloud request request_id=%s types=%s action=%s",
+                        "PII detected on cloud request request_id=%s types=%s views=%s action=%s",
                         request_id,
                         [f.pii_type.value for f in _pii_result.findings],
+                        sorted(_pii_result.matched_views),
                         _pii_result.action_taken,
                     )
                     _pii_audit(request_id, "request", _pii_result, _pii_result.action_taken, destination)
@@ -768,6 +827,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                     "or enable cloud bypass via the admin panel."
                                 ),
                                 "pii_types": [f.pii_type.value for f in _pii_result.findings],
+                                # F-RT1: surface that an encoded payload was the trigger.
+                                "matched_views": sorted(_pii_result.matched_views),
                                 "request_id": request_id,
                             },
                         )
@@ -775,9 +836,28 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     if _pii_result.action_taken == "redacted":
                         # Redact each message individually so per-message offsets remain
                         # valid, then update prompt_text for downstream logging.
+                        # F-RT1: use process_decoded per message.  An encoded-only hit
+                        # cannot be redacted in place — process_decoded escalates such a
+                        # message's action_taken to "blocked"; refuse the request rather
+                        # than forward an un-redactable encoded secret.
                         for _msg in body.messages:
                             if _msg.content:
-                                _msg_redacted, _ = _state.pii_detector.process(_msg.content)
+                                _msg_redacted, _msg_res = _state.pii_detector.process_decoded(_msg.content)
+                                if _msg_res.action_taken == "blocked":
+                                    raise HTTPException(
+                                        status_code=status.HTTP_403_FORBIDDEN,
+                                        detail={
+                                            "error": "pii_detected_encoded",
+                                            "detail": (
+                                                "Request blocked: PII detected inside an "
+                                                "encoded payload that cannot be redacted in "
+                                                "place. Send the request without encoding or "
+                                                "enable cloud bypass via the admin panel."
+                                            ),
+                                            "matched_views": sorted(_msg_res.matched_views),
+                                            "request_id": request_id,
+                                        },
+                                    )
                                 _msg.content = _msg_redacted
                         prompt_text = "\n".join(
                             m.content for m in body.messages if m.content
@@ -1200,38 +1280,55 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             _resp_run_pii = False
 
         if _resp_run_pii:
+            # F-RT1: decode-before-classify on the response leg too, so an
+            # encoded PII value echoed back by the model is caught.  This feeds
+            # pii_detected_on_response, which feeds the response-leg OPA check
+            # (sensitivity_exceeds_ceiling) — the leg that actually enforces on
+            # LOCAL routing.
             if destination == "local":
-                _resp_text, _resp_pii = _state.pii_detector.process(assistant_content)
+                _resp_text, _resp_pii = _state.pii_detector.process_decoded(assistant_content)
+                _encoded_payload_audit(request_id, "response", destination, _resp_pii)
                 if _resp_pii.detected:
                     pii_detected_on_response = True
                     logger.info(
-                        "PII detected in local response request_id=%s types=%s — log only (local)",
+                        "PII detected in local response request_id=%s types=%s views=%s — log only (local)",
                         request_id,
                         [f.pii_type.value for f in _resp_pii.findings],
+                        sorted(_resp_pii.matched_views),
                     )
                     _pii_audit(request_id, "response", _resp_pii, "logged", destination)
             else:
-                _resp_text, _resp_pii = _state.pii_detector.process(assistant_content)
+                _resp_text, _resp_pii = _state.pii_detector.process_decoded(assistant_content)
+                _encoded_payload_audit(request_id, "response", destination, _resp_pii)
                 if _resp_pii.detected:
                     pii_detected_on_response = True
                     logger.info(
-                        "PII detected in cloud response request_id=%s types=%s action=%s",
+                        "PII detected in cloud response request_id=%s types=%s views=%s action=%s",
                         request_id,
                         [f.pii_type.value for f in _resp_pii.findings],
+                        sorted(_resp_pii.matched_views),
                         _resp_pii.action_taken,
                     )
                     _pii_audit(request_id, "response", _resp_pii, _resp_pii.action_taken, destination)
 
+                    # process_decoded REDACT returns redacted raw text; encoded-only
+                    # hits escalate action_taken to "blocked".  We cannot suppress a
+                    # response that is already generated (same reasoning as the
+                    # response-inspection BLOCKED branch), so on encoded-only hits we
+                    # keep the content but rely on pii_detected_on_response → the
+                    # response-leg OPA check to deny delivery.
                     if _resp_pii.action_taken == "redacted":
                         # Update assistant_content; step 9 will build the response
                         # with the redacted text automatically.
                         assistant_content = _resp_text
-                    # BLOCK mode: log warning, add header, do not suppress response
+                    # BLOCK mode (or encoded-only escalation): log warning, add header,
+                    # do not suppress response — OPA response-leg decides delivery.
                     elif _resp_pii.action_taken == "blocked":
                         logger.warning(
-                            "PII detected in response (BLOCK mode) — adding warning header, "
-                            "response not suppressed. request_id=%s",
-                            request_id,
+                            "PII detected in response (BLOCK/encoded mode) — adding warning "
+                            "header, response not suppressed; OPA response-leg enforces. "
+                            "request_id=%s views=%s",
+                            request_id, sorted(_resp_pii.matched_views),
                         )
 
     # ── 8. Token counting + budget recording ─────────────────────────
@@ -1685,9 +1782,13 @@ async def _opa_v1_check(
             result = resp.json().get("result", {})
             return {
                 "allow": bool(result.get("allow", False)),
-                "model_allowed": bool(result.get("model_allowed", True)),
-                "routing_safe": bool(result.get("routing_safe", True)),
-                "sensitivity_allowed": bool(result.get("sensitivity_allowed", True)),
+                # Fail-closed on undefined sub-decisions (OPA-003/004 class):
+                # on a bundle-mismatch these fields are absent and must NOT
+                # default permissive. Matches proxy.py:1127 + v1_routing.rego
+                # default-deny.
+                "model_allowed": bool(result.get("model_allowed", False)),
+                "routing_safe": bool(result.get("routing_safe", False)),
+                "sensitivity_allowed": bool(result.get("sensitivity_allowed", False)),
                 "reason": result.get("reason", "unknown"),
             }
     except Exception as exc:

@@ -87,6 +87,9 @@ def _make_classifier(
     clf._scan_regex = _scan_regex
     clf._scan_fasttext = _scan_fasttext
     clf.classify = _classify
+    # F-RT1: final_inspect now prefers classify_decoded (decode-before-classify).
+    # The mock returns the same level either way (decode is a superset of classify).
+    clf.classify_decoded = _classify
     return clf
 
 

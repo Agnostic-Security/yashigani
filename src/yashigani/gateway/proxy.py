@@ -48,7 +48,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from yashigani.auth.spiffe import require_spiffe_id
 from yashigani.pki.client import internal_httpx_client
-from yashigani.audit.schema import PIIDetectedEvent
+from yashigani.audit.schema import EncodedPayloadDetectedEvent, PIIDetectedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -634,13 +634,21 @@ async def _proxy_request_body(
     if pii_detector is not None and forwarded_body:
         _req_body_text = _decode_body_safe(forwarded_body)
         if _req_body_text:
-            _req_pii_text, _req_pii_result = pii_detector.process(_req_body_text)
+            # F-RT1 (red-team verified 2026-05-30): decode-before-classify on the
+            # generic-proxy leg too — same encoded-bypass class as /v1/chat/completions.
+            _req_pii_text, _req_pii_result = pii_detector.process_decoded(_req_body_text)
+            # F-RT1 silent-pass guard: audit an undecodable high-entropy blob even
+            # when no plaintext PII matched.
+            _emit_encoded_payload_audit(
+                audit_writer, request_id, "request", "upstream", _req_pii_result
+            )
             if _req_pii_result.detected:
                 pii_detected_on_request = True
                 pii_types = [f.pii_type.value for f in _req_pii_result.findings]
                 logger.info(
-                    "PII detected on proxy request path=%s request_id=%s types=%s action=%s",
-                    path, request_id, pii_types, _req_pii_result.action_taken,
+                    "PII detected on proxy request path=%s request_id=%s types=%s views=%s action=%s",
+                    path, request_id, pii_types, sorted(_req_pii_result.matched_views),
+                    _req_pii_result.action_taken,
                 )
                 if audit_writer is not None:
                     try:
@@ -652,6 +660,7 @@ async def _proxy_request_body(
                                 action_taken=_req_pii_result.action_taken,
                                 destination="upstream",
                                 finding_count=len(_req_pii_result.findings),
+                                matched_views=sorted(_req_pii_result.matched_views),
                             )
                         )
                     except Exception as _exc:
@@ -794,13 +803,18 @@ async def _proxy_request_body(
     if pii_detector is not None and _upstream_content:
         _resp_body_text = _decode_body_safe(_upstream_content)
         if _resp_body_text:
-            _resp_pii_text, _resp_pii_result = pii_detector.process(_resp_body_text)
+            # F-RT1: decode-before-classify on the proxy response leg too.
+            _resp_pii_text, _resp_pii_result = pii_detector.process_decoded(_resp_body_text)
+            _emit_encoded_payload_audit(
+                audit_writer, request_id, "response", "upstream", _resp_pii_result
+            )
             if _resp_pii_result.detected:
                 pii_detected_on_response = True
                 pii_resp_types = [f.pii_type.value for f in _resp_pii_result.findings]
                 logger.info(
-                    "PII detected in proxy response path=%s request_id=%s types=%s action=%s",
-                    path, request_id, pii_resp_types, _resp_pii_result.action_taken,
+                    "PII detected in proxy response path=%s request_id=%s types=%s views=%s action=%s",
+                    path, request_id, pii_resp_types, sorted(_resp_pii_result.matched_views),
+                    _resp_pii_result.action_taken,
                 )
                 if audit_writer is not None:
                     try:
@@ -812,6 +826,7 @@ async def _proxy_request_body(
                                 action_taken=_resp_pii_result.action_taken,
                                 destination="upstream",
                                 finding_count=len(_resp_pii_result.findings),
+                                matched_views=sorted(_resp_pii_result.matched_views),
                             )
                         )
                     except Exception as _exc:
@@ -984,6 +999,49 @@ async def _opa_check(
 
 
 # ---------------------------------------------------------------------------
+# F-RT1 — encoded-payload audit helper (red-team verified 2026-05-30)
+# ---------------------------------------------------------------------------
+
+
+def _emit_encoded_payload_audit(
+    audit_writer, request_id: str, direction: str, destination: str, pii_result
+) -> None:
+    """Emit an ENCODED_PAYLOAD_DETECTED audit event (F-RT1 silent-pass guard).
+
+    Called when the decode stage flagged a long, encoded-looking, high-entropy
+    blob that could NOT be decoded to plaintext.  Even with no PII match this
+    leaves an audit record — closing the worst part of F-RT1 (the silent pass).
+    Raw payload is never logged — only masked token shapes + a count.
+    """
+    if audit_writer is None:
+        return
+    if not getattr(pii_result, "suspicious_blob", False):
+        return
+    try:
+        masked = list(getattr(pii_result, "suspicious_tokens", None) or [])
+        audit_writer.write(
+            EncodedPayloadDetectedEvent(
+                request_id=request_id,
+                direction=direction,
+                destination=destination,
+                high_entropy=True,
+                oversize=any(t.startswith("oversize(") for t in masked),
+                token_count=len(masked),
+                masked_tokens=masked,
+            )
+        )
+        logger.warning(
+            "F-RT1: encoded high-entropy blob on proxy (request_id=%s direction=%s "
+            "tokens=%s) — audited, no plaintext PII match",
+            request_id, direction, masked,
+        )
+    except Exception as _exc:
+        logger.warning(
+            "Encoded-payload audit write failed (request_id=%s): %s", request_id, _exc
+        )
+
+
+# ---------------------------------------------------------------------------
 # Response-leg OPA helpers (GAP-002)
 # ---------------------------------------------------------------------------
 
@@ -1117,7 +1175,14 @@ async def _opa_proxy_response_check(
             )
             resp.raise_for_status()
             result = resp.json().get("result", {})
-            opa_allow = bool(result.get("allow", True))
+            # Fail-closed (False default): if OPA returns HTTP 200 with body
+            # {"result": {}} (undefined rule — partial bundle load, Helm bundle
+            # where v1_routing.rego failed to load, or proxy_response_decision
+            # undefined for this input shape), the absent "allow" key MUST resolve
+            # to DENY, not ALLOW. Mirrors openai_router._opa_response_check and the
+            # MCP broker _opa.py. Closes LAURA-OPA-004 (same class as
+            # LAURA-V243-001 / YSG-RISK-071).
+            opa_allow = bool(result.get("allow", False))
             opa_reason = result.get("reason", "ok")
 
             if not opa_allow:

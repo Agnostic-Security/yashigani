@@ -23,17 +23,34 @@ allow_v1 if {
 
 # ── Model access control ─────────────────────────────────────────────────
 
-# Identity can use the selected model
-default model_allowed := true
+# Identity can use the selected model.
+# LAURA-OPA-003 class-fix (2.25.2): default-DENY + explicit positive-allow,
+# matching the agents.rego pattern. Previously `default := true`, which silently
+# allowed when allowed_models was absent/undefined (inverted default, ASVS V4.1.3).
+# Legit-allow flows (enumerated):
+#   1. identity declares no restriction (allowed_models == [])  → all models OK
+#   2. allowed_models field absent entirely (no restriction declared) → all OK
+#   3. the selected model is explicitly in allowed_models
+#   4. allowed_models contains the "*" wildcard
+default model_allowed := false
 
+# Flow 1: empty allowlist = no restriction
 model_allowed if {
-    count(input.identity.allowed_models) == 0  # No restriction = all models allowed
+    count(input.identity.allowed_models) == 0
 }
 
+# Flow 2: allowed_models absent entirely = no restriction declared.
+# (count(undefined) is undefined, so flow 1 does not cover this — explicit guard.)
+model_allowed if {
+    not input.identity.allowed_models
+}
+
+# Flow 3: selected model explicitly allowed
 model_allowed if {
     input.routing_decision.model in input.identity.allowed_models
 }
 
+# Flow 4: wildcard
 model_allowed if {
     "*" in input.identity.allowed_models
 }
@@ -41,10 +58,23 @@ model_allowed if {
 # ── Routing safety net ────────────────────────────────────────────────────
 
 # CRITICAL: CONFIDENTIAL/RESTRICTED data must NEVER route to cloud
-# unless the provider is in the trusted_cloud_providers list
-default routing_safe := true
+# unless the provider is in the trusted_cloud_providers list.
+# LAURA-OPA-003 class-fix (2.25.2): default-DENY + explicit positive-allow.
+# Legit-allow flows (enumerated) — routing is SAFE when:
+#   1. the routing is NOT a sensitive-to-untrusted-cloud combination
+#      (i.e. NOT(sensitivity in {CONFIDENTIAL,RESTRICTED} AND route==cloud
+#       AND provider not trusted)).
+# The positive rule is the exact logical negation of the previous deny clause,
+# so every input that was SAFE before is still SAFE; only undefined-shaped
+# inputs (which previously fell through to the permissive default) now DENY.
+default routing_safe := false
 
-routing_safe := false if {
+routing_safe if {
+    not _routing_unsafe
+}
+
+# _routing_unsafe — the single sensitive-to-untrusted-cloud violation.
+_routing_unsafe if {
     input.routing_decision.sensitivity in {"CONFIDENTIAL", "RESTRICTED"}
     input.routing_decision.route == "cloud"
     not trusted_cloud_provider
@@ -54,11 +84,16 @@ trusted_cloud_provider if {
     input.routing_decision.provider in input.trusted_cloud_providers
 }
 
-# Identity cannot receive data above their sensitivity ceiling
-default sensitivity_allowed := true
+# Identity cannot receive data above their sensitivity ceiling.
+# LAURA-OPA-003 class-fix (2.25.2): default-DENY + explicit positive-allow.
+# Legit-allow flow (enumerated): the routing sensitivity rank is within the
+# identity's ceiling rank. When the ceiling is ABSENT, sensitivity_rank(undefined)
+# is undefined, the comparison is undefined, the allow rule does not fire, and the
+# decision DENIES (fail-closed) — previously it silently ALLOWED via default:=true.
+default sensitivity_allowed := false
 
-sensitivity_allowed := false if {
-    sensitivity_rank(input.routing_decision.sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
+sensitivity_allowed if {
+    sensitivity_rank(input.routing_decision.sensitivity) <= sensitivity_rank(input.identity.sensitivity_ceiling)
 }
 
 sensitivity_rank(level) := 0 if level == "PUBLIC"
@@ -120,15 +155,31 @@ _effective_sensitivity_rank := r if {
     r := sensitivity_rank(input.prompt_sensitivity)
 }
 
-default response_allowed := true
+# LAURA-OPA-003 class-fix (2.25.2): default-DENY + explicit positive-allow,
+# matching agents.rego agent_response_allowed. Previously `default := true`,
+# which silently delivered a RESTRICTED response to an identity with NO declared
+# ceiling (absent sensitivity_ceiling → undefined rank → undefined comparison →
+# stayed at default true). Inverted default, ASVS V4.1.3 / LLM02.
+# Legit-allow flow (enumerated): the response is delivered when BOTH:
+#   1. effective sensitivity rank (MAX of prompt+response) is within the caller's
+#      ceiling rank, AND
+#   2. the inspection verdict does not block delivery for this identity
+#      (i.e. NOT(verdict==blocked AND kind!=admin)).
+# This is the exact logical negation of the two prior deny clauses, so every
+# input previously ALLOWED is still allowed; absent-ceiling now DENIES.
+default response_allowed := false
 
-# Block response if effective sensitivity exceeds the caller's ceiling
-response_allowed := false if {
-    _effective_sensitivity_rank > sensitivity_rank(input.identity.sensitivity_ceiling)
+response_allowed if {
+    # Condition 1: effective sensitivity within ceiling.
+    # Absent ceiling → sensitivity_rank(undefined) undefined → rule does not fire → DENY.
+    _effective_sensitivity_rank <= sensitivity_rank(input.identity.sensitivity_ceiling)
+
+    # Condition 2: not blocked-for-non-admin.
+    not _response_blocked_by_inspection
 }
 
-# Block response if inspection verdict is BLOCKED and identity is not admin
-response_allowed := false if {
+# _response_blocked_by_inspection — verdict==blocked AND identity is not admin.
+_response_blocked_by_inspection if {
     input.response_verdict == "blocked"
     input.identity.kind != "admin"
 }
@@ -137,6 +188,12 @@ response_decision := {
     "allow": response_allowed,
     "reason": response_reason,
 }
+
+# LAURA-OPA-003 (2.25.2): with response_allowed now default-deny, an input that
+# denies for an undefined-comparison reason (e.g. absent sensitivity_ceiling)
+# would leave response_reason undefined. Provide an explicit default so the audit
+# trail always carries a reason. The specific rules below override it.
+default response_reason := "denied_default_deny"
 
 response_reason := "ok" if response_allowed
 
@@ -279,13 +336,29 @@ _models_list_reason := "identity_not_active_or_anonymous" if not models_list_all
 #
 # Fail-closed: unknown sensitivity strings map to rank 4 via sensitivity_rank.
 
-default proxy_response_allowed := true
+# LAURA-OPA-003 class-fix (2.25.2): default-DENY + explicit positive-allow.
+# Previously `default := true` — a RESTRICTED response was delivered to a
+# principal with NO declared ceiling (absent sensitivity_ceiling → undefined
+# rank → undefined comparison → stayed true). Inverted default, ASVS V4.1.3.
+# Legit-allow flow (enumerated): delivery is permitted when BOTH:
+#   1. proxy effective sensitivity rank is within the principal's ceiling rank
+#      (when response_sensitivity is ABSENT the rank is 0/PUBLIC — pipeline-off
+#       default is preserved: a PUBLIC-rank response is delivered), AND
+#   2. PII delivery is permitted (i.e. NOT(pii AND principal is a service account)).
+# Exact logical negation of the two prior deny clauses; absent-ceiling now DENIES.
+default proxy_response_allowed := false
 
-proxy_response_allowed := false if {
-    _proxy_effective_sensitivity_rank > sensitivity_rank(input.principal.sensitivity_ceiling)
+proxy_response_allowed if {
+    # Condition 1: effective sensitivity within ceiling.
+    # Absent ceiling → undefined rank → rule does not fire → DENY.
+    _proxy_effective_sensitivity_rank <= sensitivity_rank(input.principal.sensitivity_ceiling)
+
+    # Condition 2: not a PII-block for a service account.
+    not _proxy_pii_blocked
 }
 
-proxy_response_allowed := false if {
+# _proxy_pii_blocked — PII present AND principal is neither admin nor human.
+_proxy_pii_blocked if {
     input.response_pii_detected == true
     input.principal.kind != "admin"
     input.principal.kind != "human"
@@ -299,7 +372,9 @@ _proxy_effective_sensitivity_rank := 0 if {
     not input.response_sensitivity
 }
 
-default proxy_response_reason := "ok"
+# LAURA-OPA-003 (2.25.2): default-deny means a denied-by-default decision must
+# not report "ok". The "ok" reason is asserted only when allowed.
+default proxy_response_reason := "denied_default_deny"
 
 proxy_response_reason := "ok" if proxy_response_allowed
 

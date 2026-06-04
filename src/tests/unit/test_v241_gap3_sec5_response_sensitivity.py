@@ -44,6 +44,8 @@ class TestResponseInspectionPipelineSensitivity:
         mock_sens = MagicMock()
         level_enum = SensitivityLevel(sensitivity_level)
         mock_sens.classify.return_value = SensitivityResult(level=level_enum)
+        # F-RT1: pipeline now calls classify_decoded (decode-before-classify).
+        mock_sens.classify_decoded.return_value = SensitivityResult(level=level_enum)
 
         cfg = ResponseInspectionConfig(enabled=True, fasttext_only=False)
         return ResponseInspectionPipeline(
@@ -98,6 +100,8 @@ class TestResponseInspectionPipelineSensitivity:
 
         mock_sens = MagicMock()
         mock_sens.classify.side_effect = RuntimeError("classifier exploded")
+        # F-RT1: pipeline now calls classify_decoded — must also raise.
+        mock_sens.classify_decoded.side_effect = RuntimeError("classifier exploded")
 
         cfg = ResponseInspectionConfig(enabled=True)
         pipeline = ResponseInspectionPipeline(
@@ -135,6 +139,8 @@ class TestResponseInspectionPipelineSensitivity:
 
         mock_sens = MagicMock()
         mock_sens.classify.return_value = SensitivityResult(level=SensitivityLevel.RESTRICTED)
+        # F-RT1: pipeline now calls classify_decoded (decode-before-classify).
+        mock_sens.classify_decoded.return_value = SensitivityResult(level=SensitivityLevel.RESTRICTED)
 
         cfg = ResponseInspectionConfig(enabled=True, blocked_action="502")
         pipeline = ResponseInspectionPipeline(

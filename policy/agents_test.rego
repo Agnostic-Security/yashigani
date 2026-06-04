@@ -614,3 +614,110 @@ test_response_decision_empty_sensitivity_denies_internal_ceiling if {
     d.allow == false
     d.reason == "response_sensitivity_exceeds_ceiling"
 }
+
+# ---------------------------------------------------------------------------
+# LAURA-OPA-001 (2.25.2) — path-traversal confused-deputy regression tests
+#
+# An agent scoped to "/do/**" must NOT reach "/admin" via "/do/../admin".
+# httpx collapses dot-segments on the wire; the OPA gate previously matched the
+# un-collapsed path with literal startswith. The _agent_path_safe guard now
+# rejects any traversal sequence (raw or percent-encoded).
+# PoC: testing_runs/yashigani/opa-bypass-audit-20260604/inputs/proof_004_agent_path_traversal.json
+# ---------------------------------------------------------------------------
+
+test_deny_path_traversal_dotdot_to_admin if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/../admin"},
+    }
+}
+
+test_deny_reason_path_traversal if {
+    data.yashigani.agent_call_deny_reason == "path_traversal_attempt" with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/../admin"},
+    }
+}
+
+test_deny_path_traversal_encoded_dots if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/%2e%2e/admin"},
+    }
+}
+
+test_deny_path_traversal_encoded_slash if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do%2f..%2fadmin"},
+    }
+}
+
+test_deny_path_traversal_double_encoded if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/%252e%252e/admin"},
+    }
+}
+
+test_deny_path_traversal_backslash if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/..\\admin"},
+    }
+}
+
+# Legit traffic that LOOKS dotty but is not traversal must still ALLOW.
+test_allow_legit_path_under_prefix_unchanged if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/run"},
+    }
+}
+
+test_allow_filename_with_embedded_dots if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/report..final.pdf"},
+    }
+}
