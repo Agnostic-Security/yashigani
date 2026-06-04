@@ -160,7 +160,9 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         X-Content-Type-Options    "nosniff"
         X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
-        Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+        # CSP is set per-path below (strict everywhere except the Wazuh SIEM
+        # subpath, whose OSD bundles need unsafe-eval). Not set here to avoid the
+        # global SET shadowing the per-path override.
         Cross-Origin-Opener-Policy "same-origin"
         # Product / fingerprint hygiene (QA Wave 2 observations 5 + 6).
         -Server
@@ -168,12 +170,13 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         -Alt-Svc
     }
 
-    # OpenSearch Dashboards (Wazuh SIEM) bundles use eval()/Function() and inline
-    # styles, so the strict app CSP (script-src 'self') breaks OSD with an
-    # EvalError. Relax CSP ONLY for the /admin/wazuh/* subpath — the rest of the
-    # surface keeps the strict policy above. This SET replaces the global CSP for
-    # matching requests (declared after the global header block).
+    # CSP, set per-path so exactly one policy applies per request:
+    #  - strict everywhere (script-src 'self')
+    #  - relaxed ONLY for /admin/wazuh/* — OpenSearch Dashboards bundles use
+    #    eval()/Function() + inline styles and break the strict policy (EvalError).
     @wazuh_ui path /admin/wazuh/*
+    @not_wazuh_ui not path /admin/wazuh/*
+    header @not_wazuh_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
     header @wazuh_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
