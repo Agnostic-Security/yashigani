@@ -12,7 +12,13 @@ function showPage(name, triggerEl) {
     document.querySelectorAll('.page').forEach(function(p) { p.className = 'page'; });
     document.getElementById('page-' + name).className = 'page active';
     document.querySelectorAll('.nav-links button').forEach(function(b) { b.className = ''; });
-    if (triggerEl) triggerEl.className = 'active';
+    // Highlight the matching nav button by data-param — works whether triggered
+    // from the nav itself, the onboarding checklist, or programmatically (so a
+    // non-button trigger like an onboarding <label> doesn't lose its own class).
+    var navBtn = (triggerEl && triggerEl.tagName === 'BUTTON' && triggerEl.closest && triggerEl.closest('.nav-links'))
+        ? triggerEl
+        : document.querySelector('.nav-links button[data-param="' + name + '"]');
+    if (navBtn) navBtn.className = 'active';
     // Load data for the page
     if (name === 'dashboard') loadDashboard();
     if (name === 'agents') loadAgents();

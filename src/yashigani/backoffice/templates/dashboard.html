@@ -41,10 +41,10 @@
             <div id="onboarding-checklist" class="onboarding">
                 <h3 class="onboarding-title">Getting Started</h3>
                 <div class="onboarding-items">
-                    <label id="ob-password" class="onboarding-lbl"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" class="onboarding-lbl"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" class="onboarding-lbl"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" class="onboarding-lbl"><input type="checkbox" disabled> Set up alert webhooks</label>
+                    <label id="ob-password" class="onboarding-lbl" data-action="showPage" data-param="accounts" style="cursor:pointer"><input type="checkbox" disabled> Change default password</label>
+                    <label id="ob-agent" class="onboarding-lbl" data-action="showPage" data-param="agents" style="cursor:pointer"><input type="checkbox" disabled> Register your first agent</label>
+                    <label id="ob-budget" class="onboarding-lbl" data-action="showPage" data-param="budgets" style="cursor:pointer"><input type="checkbox" disabled> Configure budget allocation</label>
+                    <label id="ob-alerts" class="onboarding-lbl" data-action="showPage" data-param="alerts" style="cursor:pointer"><input type="checkbox" disabled> Set up alert webhooks</label>
                 </div>
                 <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
             </div>
