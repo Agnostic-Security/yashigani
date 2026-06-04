@@ -174,10 +174,15 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     #  - strict everywhere (script-src 'self')
     #  - relaxed ONLY for /admin/wazuh/* — OpenSearch Dashboards bundles use
     #    eval()/Function() + inline styles and break the strict policy (EvalError).
-    @wazuh_ui path /admin/wazuh/*
-    @not_wazuh_ui not path /admin/wazuh/*
-    header @not_wazuh_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @wazuh_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+    # Proxied observability sub-apps (Grafana, Wazuh/OSD, Prometheus) ship inline
+    # bootstrap scripts (nonce-less) and use eval()/inline styles — the strict app
+    # CSP (script-src 'self') blocks them in the browser, so their SPA never mounts
+    # ("failed to load application files"). curl never shows this (it doesn't
+    # enforce CSP). Relax CSP for those subpaths only; everything else stays strict.
+    @subapp_ui path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    @strict_ui not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    header @subapp_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
