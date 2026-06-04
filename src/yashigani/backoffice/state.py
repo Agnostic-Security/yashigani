@@ -59,6 +59,12 @@ class BackofficeState:
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None
+    # v2.25.2 — DB audit sink (PostgresSink) + daily checkpoint scheduler.
+    # Wired in the FastAPI lifespan after create_pool(); held here so the
+    # lifespan shutdown can drain + stop them. None when the DB sink is
+    # disabled (YASHIGANI_AUDIT_DB_SINK=false) or no DB is configured.
+    db_audit_sink: Optional[Any] = None              # PostgresSink instance
+    audit_checkpoint_scheduler: Optional[Any] = None  # AuditCheckpointScheduler
     # SIEM sink runtime config (updated via /admin/audit/siem/config)
     siem_backend: str = "none"
     siem_endpoint: Optional[str] = None

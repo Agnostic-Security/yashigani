@@ -176,6 +176,14 @@ class AuditLogWriter:
         # Hash-chain state (protected by self._lock)
         self._chain_last_hash: Optional[str] = None   # hash of the most recent event
         self._chain_current_day: Optional[str] = None  # "YYYY-MM-DD" of last event
+        # v2.25.2 — optional DB audit sink (PostgresSink). Wired via
+        # attach_db_sink() from the service lifespan AFTER the asyncpg pool is
+        # open.  The file sink above is and remains the canonical durability
+        # anchor; the DB sink is a fire-and-forget MIRROR whose failure modes
+        # (queue full, DB down, pool not ready) are fully isolated from the
+        # request path and from the file write.  Typed loosely to avoid an
+        # import cycle (sinks.py imports nothing from writer at module load).
+        self._db_sink = None  # type: ignore[var-annotated]
 
     # -- Public API ----------------------------------------------------------
 
@@ -230,6 +238,16 @@ class AuditLogWriter:
                     "The triggering operation must be aborted."
                 ) from exc
 
+        # v2.25.2 — DB sink mirror (fire-and-forget, fully isolated).
+        # Runs AFTER the canonical file write has succeeded and OUTSIDE the
+        # file lock.  event_dict here is the masked, hash-chained dict that was
+        # just persisted to file — masked tokens only, no raw PII (masking is
+        # applied above before serialisation; client IPs are stored as
+        # client_ip_hash by the event schema).  enqueue_nowait never blocks and
+        # never raises, so a full queue / down DB cannot affect this request.
+        if self._db_sink is not None:
+            self._mirror_to_db_sink(event_dict)
+
         # SIEM forwarding is fire-and-forget (never blocks volume write)
         if self._siem_targets:
             threading.Thread(
@@ -265,6 +283,38 @@ class AuditLogWriter:
 
     def add_siem_target(self, target: SiemTarget) -> None:
         self._siem_targets.append(target)
+
+    # -- DB sink (PostgresSink) — v2.25.2 ------------------------------------
+
+    def attach_db_sink(self, db_sink) -> None:
+        """Attach an already-started PostgresSink as a fire-and-forget mirror.
+
+        Called from the service lifespan after the asyncpg pool is open and
+        db_sink.start() has been invoked.  Idempotent-safe: replacing an
+        existing sink simply swaps the reference.
+
+        The DB sink is a SECONDARY mirror.  The file sink remains the canonical
+        durability anchor; nothing about the file write path depends on this.
+        """
+        self._db_sink = db_sink
+
+    def _mirror_to_db_sink(self, event_dict: dict) -> None:
+        """Fire-and-forget mirror of a masked event_dict to the DB sink.
+
+        Invoked AFTER the canonical file write succeeds, OUTSIDE the file lock.
+        Fully isolated: any failure (no sink, queue full, enqueue error) is
+        swallowed so the request and the file write are never affected.  The
+        DB sink itself only does a non-blocking put_nowait — no DB I/O happens
+        on this thread; the background drain loop performs the INSERTs.
+        """
+        sink = self._db_sink
+        if sink is None:
+            return
+        try:
+            # enqueue_nowait is sync, loop-agnostic, and never raises.
+            sink.enqueue_nowait(event_dict)
+        except Exception as exc:  # noqa: BLE001 — defence in depth; must not propagate
+            logger.warning("Audit DB sink mirror failed (dropped, file write intact): %s", exc)
 
     # -- Volume sink ---------------------------------------------------------
 

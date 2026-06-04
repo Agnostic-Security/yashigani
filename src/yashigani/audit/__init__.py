@@ -12,6 +12,12 @@ from yashigani.audit.masking import CredentialMasker, IMMUTABLE_FLOOR_EVENTS, AU
 from yashigani.audit.scope import MaskingScopeConfig
 from yashigani.audit.writer import AuditLogWriter, AuditWriteError, SiemTarget
 from yashigani.audit.export import AuditLogExporter
+# v2.25.2 — DB audit sink (PostgresSink) wiring
+from yashigani.audit.sinks import (
+    PostgresSink,
+    build_postgres_audit_sink,
+    stop_postgres_audit_sink,
+)
 from yashigani.audit.config import AuditConfig
 # v2.24.1 LU-AMEND-01 — tamper-evident audit log hash chain
 from yashigani.audit.chain import (
@@ -54,6 +60,10 @@ __all__ = [
     "AuditWriteError",
     "SiemTarget",
     "AuditLogExporter",
+    # v2.25.2 — DB audit sink
+    "PostgresSink",
+    "build_postgres_audit_sink",
+    "stop_postgres_audit_sink",
     "AuditConfig",
     # v2.24.1 LU-AMEND-01
     "AuditChainService",

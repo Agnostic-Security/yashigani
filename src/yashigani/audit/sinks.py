@@ -190,9 +190,22 @@ class PostgresSink(AuditSink):
                         )
         self._last_write = datetime.now(timezone.utc)
 
-    async def write(self, event: dict) -> None:
+    def enqueue_nowait(self, event: dict) -> bool:
+        """Synchronous, non-blocking enqueue (loop-agnostic).
+
+        v2.25.2: called from AuditLogWriter.write() (a sync method invoked from
+        both sync and async request paths) so the DB sink does not depend on a
+        running event loop at the call site.  asyncio.Queue.put_nowait() is
+        thread-safe enough for our single-process fan-out: it only mutates the
+        deque + wakes a waiter via call_soon_threadsafe internally when a loop
+        is bound.  Returns True if enqueued, False if dropped (queue full).
+
+        NEVER raises — queue-full is counted + logged and swallowed so the
+        caller's request and the canonical file write are unaffected.
+        """
         try:
             self._queue.put_nowait(event)
+            return True
         except asyncio.QueueFull:
             try:
                 from yashigani.metrics.registry import audit_queue_overflow_total
@@ -200,6 +213,15 @@ class PostgresSink(AuditSink):
             except Exception:
                 pass
             logger.warning("PostgresSink queue full — audit event dropped")
+            return False
+        except Exception as exc:  # noqa: BLE001 — fan-out must never break caller
+            logger.warning("PostgresSink enqueue error (dropped): %s", exc)
+            return False
+
+    async def write(self, event: dict) -> None:
+        # Delegates to the sync enqueue path so there is a single, audited
+        # drop-and-log code path for both async and sync callers.
+        self.enqueue_nowait(event)
 
     async def last_write_ts(self) -> Optional[datetime]:
         return self._last_write
@@ -465,6 +487,98 @@ class SiemWorker:
                 event.get("audit_event_id", "<unknown>"),
                 exc,
             )
+
+
+# ---------------------------------------------------------------------------
+# v2.25.2 — DB audit-sink wiring helpers
+# ---------------------------------------------------------------------------
+#
+# These helpers are the single construction point for the PostgresSink + the
+# AuditChainService that backs the audit_events hash chain, so both the gateway
+# and backoffice lifespans wire the DB sink identically.  The file sink remains
+# the canonical durability anchor; the DB sink is a fire-and-forget mirror.
+
+
+def _audit_checkpoint_signing() -> tuple[Optional[Any], str]:
+    """Resolve the optional checkpoint signing key path + SPIFFE id from env.
+
+    Returns (signing_key_path | None, signing_spiffe_id).  When the key path is
+    unset or the file is missing, returns (None, spiffe_id) — the chain service
+    + checkpoint scheduler then write UNSIGNED checkpoints (still tamper-evident
+    via the merkle root; signature is an additional non-repudiation layer).
+    """
+    import os
+    from pathlib import Path
+
+    key_path_str = os.environ.get("YASHIGANI_AUDIT_SIGNING_KEY_PATH", "").strip()
+    spiffe_id = os.environ.get(
+        "YASHIGANI_AUDIT_SIGNING_SPIFFE_ID",
+        "spiffe://yashigani.internal/audit",
+    ).strip()
+    if key_path_str:
+        kp = Path(key_path_str)
+        if kp.exists():
+            return kp, spiffe_id
+        logger.warning(
+            "YASHIGANI_AUDIT_SIGNING_KEY_PATH=%s does not exist — "
+            "daily audit checkpoints will be written UNSIGNED",
+            key_path_str,
+        )
+    return None, spiffe_id
+
+
+def build_postgres_audit_sink(pool_getter):
+    """Construct + start a PostgresSink with a row-level hash-chain service.
+
+    Args:
+        pool_getter: zero-arg callable returning the asyncpg pool
+            (yashigani.db.get_pool).  Reused from the existing DB pool — no
+            second pool is created.
+
+    Returns:
+        (PostgresSink, AuditChainService) — the sink is ALREADY started
+        (drain loop scheduled on the running loop); the chain service is the
+        same instance to pass to the daily checkpoint scheduler so the
+        in-process chain pointer is shared.
+
+    The caller MUST be inside a running event loop (call from the FastAPI
+    lifespan) so PostgresSink.start() can schedule its drain task.
+    """
+    from yashigani.audit.chain import AuditChainService
+
+    key_path, spiffe_id = _audit_checkpoint_signing()
+    # Row-level hashing (compute_hashes_for_event) needs no signing key; the
+    # key only matters for the daily checkpoint signature.  We hand the same
+    # service to both so the chain pointer + signing config are shared.
+    chain_service = AuditChainService(
+        signing_key_path=key_path,
+        signing_spiffe_id=spiffe_id,
+    )
+    sink = PostgresSink(pool_getter=pool_getter, chain_service=chain_service)
+    sink.start()
+    logger.info(
+        "PostgresSink started (chain hashing ON, checkpoint signing=%s)",
+        "ON" if key_path is not None else "OFF",
+    )
+    return sink, chain_service
+
+
+def stop_postgres_audit_sink(sink) -> None:
+    """Gracefully drain + stop a PostgresSink (call from lifespan shutdown).
+
+    Cancels the drain task; the drain loop flushes the in-flight batch on
+    CancelledError (see PostgresSink._drain_loop), so events already enqueued
+    are persisted before the loop stops.  Never raises.
+    """
+    if sink is None:
+        return
+    try:
+        task = getattr(sink, "_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            logger.info("PostgresSink drain task cancelled — final batch will flush")
+    except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+        logger.warning("PostgresSink stop error (ignored): %s", exc)
 
 
 class MultiSinkAuditWriter:
