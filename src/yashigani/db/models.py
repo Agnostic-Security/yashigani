@@ -78,6 +78,10 @@ INSERT INTO inference_events (
 )
 """
 
+# NOTE: this module is SHADOWED at runtime by the models/ package
+# (yashigani/db/models/__init__.py).  The authoritative INSERT_AUDIT_EVENT used
+# by audit/sinks.py lives there.  Kept in sync to avoid confusion; RETURNING seq
+# is required because PostgresSink._flush_batch fetchrow()s row["seq"].
 INSERT_AUDIT_EVENT = """
 INSERT INTO audit_events (
     tenant_id, event_type, request_id, session_id, agent_id,
@@ -85,6 +89,7 @@ INSERT INTO audit_events (
     confidence_score, client_ip_hash,
     prev_hash, event_hash
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+RETURNING seq
 """
 
 SELECT_AGENT_BY_TOKEN_HASH = """

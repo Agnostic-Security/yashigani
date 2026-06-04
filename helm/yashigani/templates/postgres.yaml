@@ -77,8 +77,11 @@ spec:
           env:
             - name: POSTGRES_DB
               value: "yashigani"
+            # v2.25.2 (Lu wire-sink-gate P1): bootstrap superuser is the DDL/admin
+            # identity yashigani_admin; runtime services connect as the demoted
+            # NOSUPERUSER role yashigani_app (migration 0001/0015). Compose parity.
             - name: POSTGRES_USER
-              value: "yashigani_app"
+              value: "yashigani_admin"
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -115,21 +118,21 @@ spec:
           # connection, giving init scripts up to 300s to complete.
           startupProbe:
             exec:
-              command: ["pg_isready", "-h", "/var/run/postgresql", "-U", "yashigani_app", "-d", "yashigani"]
+              command: ["pg_isready", "-h", "/var/run/postgresql", "-U", "yashigani_admin", "-d", "yashigani"]
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             exec:
-              command: ["pg_isready", "-h", "/var/run/postgresql", "-U", "yashigani_app", "-d", "yashigani"]
+              command: ["pg_isready", "-h", "/var/run/postgresql", "-U", "yashigani_admin", "-d", "yashigani"]
             initialDelaySeconds: 0
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 5
           livenessProbe:
             exec:
-              command: ["pg_isready", "-h", "/var/run/postgresql", "-U", "yashigani_app", "-d", "yashigani"]
+              command: ["pg_isready", "-h", "/var/run/postgresql", "-U", "yashigani_admin", "-d", "yashigani"]
             initialDelaySeconds: 0
             periodSeconds: 10
             timeoutSeconds: 5
@@ -137,14 +140,14 @@ spec:
           {{- else }}
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "yashigani_app", "-d", "yashigani"]
+              command: ["pg_isready", "-U", "yashigani_admin", "-d", "yashigani"]
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 5
           livenessProbe:
             exec:
-              command: ["pg_isready", "-U", "yashigani_app", "-d", "yashigani"]
+              command: ["pg_isready", "-U", "yashigani_admin", "-d", "yashigani"]
             initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5

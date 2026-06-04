@@ -476,6 +476,25 @@ auditLog:
   retentionDays: "90"
 
 # ---------------------------------------------------------------------------
+# audit — tamper-evident hash-chain checkpoint signing (Lu wire-sink-gate P2)
+# ---------------------------------------------------------------------------
+audit:
+  signingKey:
+    # When true, mount the audit-chain checkpoint signing key (RO) into BACKOFFICE
+    # ONLY and set YASHIGANI_AUDIT_SIGNING_KEY_PATH so daily merkle-root
+    # checkpoints are ECDSA-signed (non-repudiation; NIST AU-10). When false,
+    # checkpoints are written UNSIGNED (still tamper-evident via the merkle root).
+    # CRITICAL: the signing key is never mounted into the gateway/runtime path, so
+    # a held yashigani_app DB credential cannot forge a signed checkpoint.
+    enabled: false
+    # Secret name holding the internal-CA ECDSA leaf private key under the
+    # `audit_signing.key` data key. Create it with the leaf produced by the same
+    # internal CA (see install.sh _provision_audit_signing_key for the issuance
+    # pattern). Marked optional in the mount so a missing Secret => unsigned, not
+    # a pod-start failure.
+    existingSecretName: ""
+
+# ---------------------------------------------------------------------------
 # Backup — age-encrypted CronJob (MP.L2-3.8.9 / CMMC L2)
 # Last updated: 2026-05-09T00:00:00+01:00
 # ---------------------------------------------------------------------------

@@ -1287,7 +1287,7 @@ ALEMBIC_VERSION="$(_vm_run "
 
 if [[ -n "${ALEMBIC_VERSION}" ]]; then
   ALEMBIC_VERSION_VAL="$(_vm_run "
-    ${RUNTIME} exec '${ALEMBIC_VERSION}' psql -U yashigani_app -d yashigani -At \
+    ${RUNTIME} exec '${ALEMBIC_VERSION}' psql -U yashigani_admin -d yashigani -At \
       -c 'SELECT version_num FROM alembic_version ORDER BY version_num DESC LIMIT 1;' 2>/dev/null || echo 'query_failed'
   " 2>/dev/null || echo 'exec_failed')"
   _ev "alembic_version: ${ALEMBIC_VERSION_VAL}"

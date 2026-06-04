@@ -178,9 +178,22 @@ spec:
               # puts both replicas on the same backend (internal K8s integration finding).
               # ca_bundle.crt: same libpq chain-verify fix as YASHIGANI_DB_DSN.
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
+            # v2.25.2 (Lu wire-sink-gate P1): DDL / Alembic migrations run as the
+            # admin superuser yashigani_admin (NOT the demoted runtime role
+            # yashigani_app). run_migrations() prefers the admin DSNs; the runtime
+            # asyncpg pool keeps YASHIGANI_DB_DSN (yashigani_app). Same cert +
+            # password — boundary is role privilege. DDL goes direct to postgres.
+            - name: YASHIGANI_DB_DSN_ADMIN
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
+            - name: YASHIGANI_DB_DSN_ADMIN_DIRECT
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
             {{- else }}
             - name: YASHIGANI_DB_DSN
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-pgbouncer:5432/yashigani"
+            - name: YASHIGANI_DB_DSN_ADMIN
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
+            - name: YASHIGANI_DB_DSN_ADMIN_DIRECT
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
             {{- end }}
             - name: REDIS_PASSWORD
               valueFrom:

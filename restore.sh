@@ -1485,7 +1485,7 @@ _restore_pg_role_password() {
   if [[ -z "$_pg_container" ]]; then
     log_warn "Postgres not running -- role password update deferred."
     log_warn "  After bringing postgres up, run inside the postgres container:"
-    log_warn "    psql -U yashigani_app -d postgres"
+    log_warn "    psql -U yashigani_admin -d postgres"
     log_warn "    ALTER ROLE \"yashigani_app\" WITH PASSWORD '<contents of docker/secrets/postgres_password>';"
     return 0
   fi

@@ -88,17 +88,36 @@ class PostgresSink(AuditSink):
     name = "postgres"
     MAX_QUEUE_DEPTH = 1000
 
-    def __init__(self, pool_getter, chain_service=None) -> None:
+    def __init__(self, pool_getter, chain_service=None, *, require_chain: bool = False) -> None:
         """
         Args:
             pool_getter: zero-argument callable returning an asyncpg pool.
-            chain_service: optional AuditChainService instance.  When supplied,
-                every INSERT populates prev_hash and event_hash.  When None, the
-                columns are left NULL (permitted by the nullable migration 0011
-                columns; chain integrity gaps are counted at checkpoint time).
+            chain_service: AuditChainService instance.  When supplied, every
+                INSERT populates prev_hash and event_hash.
+            require_chain: v2.25.2 (Lu wire-sink-gate P2, irrevocable chain).
+                When True (the production wired path — see
+                build_postgres_audit_sink), the sink is constructed
+                immutable-by-construction:
+                  * chain_service MUST be non-None (else __init__ raises);
+                  * a hash-computation failure REJECTS the event (it is NOT
+                    written with NULL chain links).
+                The DB additionally enforces a CHECK (prev_hash IS NOT NULL AND
+                event_hash IS NOT NULL) NOT VALID constraint (migration 0015),
+                so even a bypassed app guard cannot land an unchained row.
+                require_chain=False is the legacy/test path (no chain).
+
+        Raises:
+            ValueError: if require_chain=True but chain_service is None.
         """
+        if require_chain and chain_service is None:
+            raise ValueError(
+                "PostgresSink(require_chain=True) requires a non-None chain_service — "
+                "an unchained audit sink would defeat the tamper-evident guarantee "
+                "(Lu wire-sink-gate P2 / irrevocable chain)."
+            )
         self._pool_getter = pool_getter
         self._chain_service = chain_service
+        self._require_chain = require_chain
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.MAX_QUEUE_DEPTH)
         self._last_write: Optional[datetime] = None
         self._task: Optional[asyncio.Task] = None
@@ -158,10 +177,39 @@ class PostgresSink(AuditSink):
                         try:
                             prev_hash, event_hash = self._chain_service.compute_hashes_for_event(event)
                         except Exception as exc:
+                            # v2.25.2 (irrevocable chain): on the require_chain
+                            # (production) path, a hash-computation failure must
+                            # REJECT the event, not write it unchained.  Skip the
+                            # INSERT; the canonical file sink still has the event,
+                            # so the trail is not lost — only the DB mirror drops
+                            # this one row, which the checkpoint job surfaces as a
+                            # gap.  On the legacy path we preserve the old
+                            # behaviour (NULL hashes).
+                            if self._require_chain:
+                                try:
+                                    from yashigani.metrics.registry import audit_queue_overflow_total
+                                    audit_queue_overflow_total.inc()
+                                except Exception:
+                                    pass
+                                logger.error(
+                                    "PostgresSink: chain hash computation failed — "
+                                    "REJECTING event (require_chain on): %s",
+                                    exc,
+                                )
+                                continue
                             logger.error(
                                 "PostgresSink: chain hash computation failed — INSERT will have NULL hashes: %s",
                                 exc,
                             )
+                    elif self._require_chain:
+                        # Defensive: should be unreachable (__init__ rejects
+                        # chain_service=None when require_chain).  Never write an
+                        # unchained row on the production path.
+                        logger.error(
+                            "PostgresSink: require_chain on but chain_service is None — "
+                            "REJECTING event"
+                        )
+                        continue
 
                     # RETURNING seq (wave 3): capture the authoritative sequence
                     # value for logging / verification. The seq column is the
@@ -554,10 +602,17 @@ def build_postgres_audit_sink(pool_getter):
         signing_key_path=key_path,
         signing_spiffe_id=spiffe_id,
     )
-    sink = PostgresSink(pool_getter=pool_getter, chain_service=chain_service)
+    # v2.25.2 (Lu wire-sink-gate P2 / irrevocable chain): the wired production
+    # path is immutable-by-construction — require_chain=True so the sink can
+    # never silently write an unchained (NULL-hash) row.
+    sink = PostgresSink(
+        pool_getter=pool_getter,
+        chain_service=chain_service,
+        require_chain=True,
+    )
     sink.start()
     logger.info(
-        "PostgresSink started (chain hashing ON, checkpoint signing=%s)",
+        "PostgresSink started (chain hashing ON [required], checkpoint signing=%s)",
         "ON" if key_path is not None else "OFF",
     )
     return sink, chain_service

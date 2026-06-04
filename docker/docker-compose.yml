@@ -300,6 +300,17 @@ services:
       # connection direct to postgres:5432, bypassing pgbouncer, identical to
       # backoffice line ~306 and Helm gateway.yaml:141.
       YASHIGANI_DB_DSN_DIRECT: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key
+      # v2.25.2 (Lu wire-sink-gate P1 — least-privilege runtime role): DDL /
+      # Alembic migrations run as the admin superuser yashigani_admin, NOT as the
+      # demoted runtime role yashigani_app.  run_migrations() prefers these admin
+      # DSNs; the runtime asyncpg pool keeps using YASHIGANI_DB_DSN (yashigani_app).
+      # Both connect with the SAME client cert (verify-ca; cert is the TLS layer,
+      # role auth is SCRAM via postgres_password) and the SAME password — the
+      # security boundary is ROLE PRIVILEGE, not the credential.  DDL goes direct
+      # to postgres (bypassing pgbouncer transaction-pool) on both the migration
+      # connection and the advisory-lock connection.
+      YASHIGANI_DB_DSN_ADMIN: postgresql://yashigani_admin:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key
+      YASHIGANI_DB_DSN_ADMIN_DIRECT: postgresql://yashigani_admin:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key
       YASHIGANI_DEPLOYMENT_STREAM: ${YASHIGANI_DEPLOYMENT_STREAM:-opensource}
       # M-01 fix: switched from http:// (plaintext) to grpcs:// (mTLS).
       # Pattern A for Python ssl: opentelemetry-exporter-otlp uses Python ssl,
@@ -450,6 +461,19 @@ services:
       # line closes the Compose parity gap (Iris blocker 8, 2026-05-08).
       # POSTGRES_PASSWORD_URLENC is set by install.sh (URL-encoded postgres password).
       YASHIGANI_DB_DSN_DIRECT: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
+      # v2.25.2 (Lu wire-sink-gate P1): admin DSNs for DDL / Alembic (run as
+      # yashigani_admin superuser; runtime pool stays on yashigani_app).
+      YASHIGANI_DB_DSN_ADMIN: postgresql://yashigani_admin:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
+      YASHIGANI_DB_DSN_ADMIN_DIRECT: postgresql://yashigani_admin:${POSTGRES_PASSWORD_URLENC}@postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
+      # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): the daily
+      # audit-chain checkpoint scheduler runs in BACKOFFICE.  The ECDSA signing
+      # key (internal-CA leaf, issued by install.sh _provision_audit_signing_key)
+      # is mounted RO to backoffice ONLY (see volumes below) and is NOT readable
+      # by the runtime yashigani_app DB path — a held runtime credential cannot
+      # forge a signed checkpoint.  When the file is absent, checkpoints are
+      # written unsigned (still tamper-evident via the merkle root).
+      YASHIGANI_AUDIT_SIGNING_KEY_PATH: /run/audit-signing/audit_signing.key
+      YASHIGANI_AUDIT_SIGNING_SPIFFE_ID: spiffe://yashigani.internal/audit/checkpoint-signer
       YASHIGANI_DEPLOYMENT_STREAM: ${YASHIGANI_DEPLOYMENT_STREAM:-opensource}
       OWUI_API_URL: http://open-webui:8080
       # OWUI_SECRET_KEY is required — install.sh generates a fresh random
@@ -543,6 +567,14 @@ services:
       # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
       # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+      # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): audit-chain
+      # checkpoint signing key (internal-CA ECDSA leaf).  Mounted RO to BACKOFFICE
+      # ONLY (the scheduler runs here).  CRITICAL PLACEMENT: this directory is NOT
+      # mounted into the gateway/runtime data path, so a held yashigani_app DB
+      # credential cannot read the key and cannot forge a signed checkpoint.
+      # Source: docker/secrets/audit-signing/ (gitignored, populated by
+      # install.sh _provision_audit_signing_key).
+      - ./secrets/audit-signing:/run/audit-signing:ro
     read_only: true
     tmpfs:
       - /tmp:size=100M
@@ -1178,7 +1210,16 @@ services:
     cpus: ${YASHIGANI_POSTGRES_CPU_LIMIT:-1.0}
     environment:
       POSTGRES_DB: yashigani
-      POSTGRES_USER: yashigani_app
+      # v2.25.2 (Lu wire-sink-gate P1 — least-privilege runtime role):
+      # The bootstrap superuser is the DDL/admin identity yashigani_admin (NOT
+      # the runtime app role).  DDL / migrations connect as yashigani_admin;
+      # runtime services connect as the demoted NOSUPERUSER role yashigani_app
+      # (created + granted by migration 0001/0015).  Both authenticate with the
+      # postgres_password secret — the security boundary is ROLE PRIVILEGE
+      # (NOSUPERUSER + non-owner + REVOKE UPDATE/DELETE + FORCE RLS), not the
+      # password.  A held runtime credential therefore cannot mutate/delete
+      # audit rows or bypass RLS.
+      POSTGRES_USER: yashigani_admin
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -1201,7 +1242,7 @@ services:
       - ./postgres/init-agent-dbs.sh:/docker-entrypoint-initdb.d/11-agent-dbs.sh:ro
     healthcheck:
       # pg_isready over a local socket — doesn't need TLS.
-      test: ["CMD-SHELL", "pg_isready -U yashigani_app -d yashigani"]
+      test: ["CMD-SHELL", "pg_isready -U yashigani_admin -d yashigani"]
       interval: 10s
       timeout: 5s
       retries: 5
