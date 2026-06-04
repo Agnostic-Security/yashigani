@@ -354,7 +354,7 @@ Hiring: https://agnosticsec.com/careers
     # retro #83: Grafana now serves HTTPS on port 3443 with mTLS (Pattern B).
     # Caddy presents caddy_client.crt to Grafana; Grafana verifies via
     # ca_intermediate.crt. The forward_auth check still applies (admin only).
-    handle_path /admin/grafana/* {
+    handle /admin/grafana/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified

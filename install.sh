@@ -5121,6 +5121,25 @@ compose_up() {
       fi
     fi
 
+    # Public base URL (scheme://domain[:port]) — single source for the external
+    # URLs that reverse-proxied sub-apps must self-reference (Grafana root_url,
+    # Wazuh basePath, …). Port suffix omitted when standard 443. Without the
+    # published port these apps 301-redirect to :443 ("site can't be reached"
+    # on a non-standard port). update-or-append into .env.
+    local _pub_port_suffix=""
+    if [[ -n "${YASHIGANI_HTTPS_PORT:-}" && "${YASHIGANI_HTTPS_PORT}" != "443" ]]; then
+      _pub_port_suffix=":${YASHIGANI_HTTPS_PORT}"
+    fi
+    local _pub_url="https://${YASHIGANI_TLS_DOMAIN:-${DOMAIN:-localhost}}${_pub_port_suffix}"
+    if grep -q "^YASHIGANI_PUBLIC_URL=" "$env_file" 2>/dev/null; then
+      local _tmp_env2; _tmp_env2="$(mktemp)"
+      sed "s|^YASHIGANI_PUBLIC_URL=.*|YASHIGANI_PUBLIC_URL=${_pub_url}|" "$env_file" > "$_tmp_env2"
+      mv "$_tmp_env2" "$env_file"
+    else
+      echo "YASHIGANI_PUBLIC_URL=${_pub_url}" >> "$env_file"
+    fi
+    export YASHIGANI_PUBLIC_URL="$_pub_url"
+
     # 3. Create Docker-compatible directories for promtail (best-effort).
     # On CI runners (GitHub Actions / Podman) /var/lib/docker does not exist and
     # is owned by root, so a plain mkdir fails with EPERM. The installer body

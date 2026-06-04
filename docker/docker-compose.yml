@@ -1141,7 +1141,7 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
-      GF_SERVER_ROOT_URL: "https://${YASHIGANI_TLS_DOMAIN}/admin/grafana"
+      GF_SERVER_ROOT_URL: "${YASHIGANI_PUBLIC_URL:-https://${YASHIGANI_TLS_DOMAIN}}/admin/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # retro #83: Grafana ingress mTLS.
       # Grafana serves HTTPS on port 3443. Caddy proxies /admin/grafana/* over
