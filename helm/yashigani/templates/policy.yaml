@@ -148,6 +148,14 @@ spec:
               mountPath: /policies/agents.rego
               subPath: agents.rego
               readOnly: true
+            # LAURA-OPA-002 (v2.25.2): mcp.rego must be mounted here too, else
+            # OPA loads /policies/ without the MCP package and every
+            # data.yashigani.mcp.* decision is undefined on K8s. Mirrors the
+            # compose path (../policy:/policies:ro mounts the whole dir).
+            - name: policies
+              mountPath: /policies/mcp.rego
+              subPath: mcp.rego
+              readOnly: true
             {{- if .Values.mtls.enabled }}
             - name: pki-certs
               mountPath: /run/secrets

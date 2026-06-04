@@ -18,9 +18,15 @@ data:
   # MAX-rule MISSING. agent_response_allowed MISSING.
   # compose DENIES these inputs; K8s helm bundle silently ALLOWED them.
   # Fix: .Files.Get loads canonical policy/*.rego files at helm template time.
-  # files/policy/*.rego are byte-identical copies of the canonical policy/*.rego
-  # (verified by sha256 in tests/contracts/test_helm_opa_bundle_parity.py).
+  # files/policy/*.rego are byte-identical copies of the canonical policy/*.rego,
+  # enforced by sha256 in tests/contracts/test_helm_opa_bundle_parity.py — that
+  # test asserts EVERY policy/*.rego is mirrored here AND mounted in policy.yaml,
+  # and fails if a new policy file is added to policy/ but not to this bundle.
   # Council finding B6: Lu P0-#1.
+  # LAURA-OPA-002 (v2.25.2): mcp.rego was absent from this list and from the
+  # policy.yaml subPath mounts, so K8s OPA never loaded the MCP package — every
+  # data.yashigani.mcp.* query was undefined -> broker fail-closed -> MCP broken
+  # on K8s. Added below. The claimed parity test did not exist; it does now.
   yashigani.rego: |
 {{ .Files.Get "files/policy/yashigani.rego" | indent 4 }}
   v1_routing.rego: |
@@ -29,6 +35,8 @@ data:
 {{ .Files.Get "files/policy/rbac.rego" | indent 4 }}
   agents.rego: |
 {{ .Files.Get "files/policy/agents.rego" | indent 4 }}
+  mcp.rego: |
+{{ .Files.Get "files/policy/mcp.rego" | indent 4 }}
 {{- end }}
 
 {{- if .Values.otelCollector.enabled }}
