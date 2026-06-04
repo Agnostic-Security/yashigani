@@ -40,6 +40,12 @@ allow if {
 
     # Path must not match any blocked pattern
     not path_blocked
+
+    # Deny-overrides (2.25.2 class-fix): every deny condition is a NEGATION inside
+    # the single allow rule, never a competing `allow := false`. When a deny holds,
+    # this positive rule simply does not fire and `default allow := false` yields a
+    # clean, single-valued `false` (no eval_conflict). See _denied below.
+    not _denied
 }
 
 # ---------------------------------------------------------------------------
@@ -89,6 +95,10 @@ allow if {
     # FIX-OPA-MCP-PATH (2026-05-30): match regardless of leading slash.
     _path_is_mcp
     not path_blocked
+
+    # Deny-overrides (2.25.2 class-fix): negate the deny set, never a competing
+    # `allow := false`. RBAC denial cannot co-fire with this `true`.
+    not _denied
 }
 
 # True when the caller is NOT an agent principal: either no principal object at
@@ -140,9 +150,6 @@ deny_rbac if {
     not allow_rbac
 }
 
-# Override the default allow: deny when RBAC says no
-allow := false if { deny_rbac }
-
 # ---------------------------------------------------------------------------
 # Agent-to-agent enforcement
 # agent_call_allowed is defined in agents.rego (same package yashigani).
@@ -158,6 +165,10 @@ allow := false if { deny_rbac }
 allow if {
     input.principal.type == "agent"
     agent_call_allowed
+
+    # Deny-overrides (2.25.2 class-fix): negate the deny set, never a competing
+    # `allow := false`.
+    not _denied
 }
 
 # Deny agent calls that are not explicitly allowed
@@ -166,4 +177,15 @@ deny_agent_call if {
     not agent_call_allowed
 }
 
-allow := false if { deny_agent_call }
+# ---------------------------------------------------------------------------
+# _denied — the single deny set (deny-overrides, 2.25.2)
+# ---------------------------------------------------------------------------
+# A request is denied when ANY deny condition holds. `allow` is a SINGLE
+# decision: a positive precondition set AND `not _denied`. A positive allow and
+# a deny can therefore NEVER co-fire — deny strictly overrides by being a
+# negation in the one allow rule, not a competing `allow := false` definition.
+# This eliminates the complete-rule eval_conflict (OPA 500 → opaque fail-closed
+# deny) that the prior `allow := false if {...}` pattern produced.
+# LAURA-OPA close-out (2.25.2), class-fix for the deny-override anti-pattern.
+_denied if { deny_rbac }
+_denied if { deny_agent_call }

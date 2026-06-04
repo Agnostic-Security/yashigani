@@ -288,3 +288,59 @@ test_valid_ceiling_still_allows_proxy if {
         "response_pii_detected": false,
     }
 }
+
+# ── DENY-OVERRIDES single-reason regression (2.25.2, LAURA-OPA close-out) ────
+#
+# The previously-conflicting case is a VALID ceiling that is EXCEEDED while ANOTHER
+# deny condition (inspection-blocked / PII) ALSO holds. Pre-fix the two deny
+# reason branches co-fired → response_decision / proxy_response_decision OBJECT
+# eval_conflict (OPA 500 → lost audit reason). The fixed precedence makes the
+# reason single-valued. `opa test` fails on any eval_conflict during evaluation,
+# so these tests passing IS the no-conflict proof.
+
+# Laura repro #2 (exact): RESTRICTED response, PUBLIC ceiling (valid, exceeded),
+# verdict=blocked. response_sensitivity_exceeds_ceiling (prec 2) wins over
+# response_blocked_by_inspection (prec 3). allow stays false (unchanged).
+test_laura_repro2_valid_ceiling_exceeded_and_blocked_single_reason_v1 if {
+    d := data.yashigani.v1.response_decision with input as {
+        "identity": {"status": "active", "kind": "human", "sensitivity_ceiling": "PUBLIC"},
+        "response_sensitivity": "RESTRICTED",
+        "response_verdict": "blocked",
+    }
+    d.allow == false
+    d.reason == "response_sensitivity_exceeds_ceiling"
+}
+
+# Within-ceiling but blocked verdict → only blocked_by_inspection fires (prec 3).
+test_within_ceiling_blocked_verdict_single_reason_v1 if {
+    d := data.yashigani.v1.response_decision with input as {
+        "identity": {"status": "active", "kind": "human", "sensitivity_ceiling": "RESTRICTED"},
+        "response_sensitivity": "PUBLIC",
+        "response_verdict": "blocked",
+    }
+    d.allow == false
+    d.reason == "response_blocked_by_inspection"
+}
+
+# proxy: valid ceiling EXCEEDED + PII + service account → exceeds_ceiling (prec 2)
+# wins over response_pii_blocked_for_service_account (prec 3). Single reason.
+test_valid_ceiling_exceeded_and_pii_single_reason_proxy if {
+    d := data.yashigani.v1.proxy_response_decision with input as {
+        "principal": {"kind": "service", "sensitivity_ceiling": "PUBLIC"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": true,
+    }
+    d.allow == false
+    d.reason == "response_sensitivity_exceeds_ceiling"
+}
+
+# proxy: within ceiling + PII + service account → only PII reason fires (prec 3).
+test_within_ceiling_pii_single_reason_proxy if {
+    d := data.yashigani.v1.proxy_response_decision with input as {
+        "principal": {"kind": "service", "sensitivity_ceiling": "RESTRICTED"},
+        "response_sensitivity": "PUBLIC",
+        "response_pii_detected": true,
+    }
+    d.allow == false
+    d.reason == "response_pii_blocked_for_service_account"
+}

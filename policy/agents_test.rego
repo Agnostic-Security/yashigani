@@ -244,20 +244,29 @@ test_deny_reason_target_agent_empty_string_no_deny_reason_fires if {
     }
 }
 
-# 4c. agent_id absent with no matching group: OPA eval_conflict_error
-# POLICY GAP FINDING (UA-07-GAP-003):
-# When target_agent.agent_id is absent AND caller group does not match, both
-# target_agent_not_in_data and caller_group_not_in_allowed_caller_groups conditions
-# are simultaneously true. agent_call_deny_reason is a complete rule (:=) with
-# multiple heads — OPA raises eval_conflict_error (multiple outputs). Gateway must
-# catch this OPA exception and treat it as DENY. Policy should be restructured to
-# use prioritised ordered rules (default + override) to avoid the conflict.
-# Routing: file against Tom for rule restructure (policy/agents.rego — contract layer,
-# Iris owns the contract gap filing; rule restructure is Tom's implementation).
-# Test documents the conflict: the deny_reason evaluation MUST NOT succeed cleanly.
-test_deny_reason_conflict_when_target_id_absent_and_group_mismatch if {
-    # We verify agent_call_allowed is false (no allow fires without group match)
+# 4c. agent_id absent with no matching group — UA-07-GAP-003 RESOLVED (2.25.2).
+# Previously: target_agent_not_in_data AND caller_group_not_in_allowed_caller_groups
+# both fired → agent_call_deny_reason eval_conflict_error (OPA 500). The class-fix
+# folds target_agent_not_in_data behind `_caller_group_allowed` (precedence 4), so
+# caller-not-authorised (precedence 1) now wins cleanly. The deny_reason MUST now
+# evaluate to a single value with NO eval_conflict.
+test_deny_reason_conflict_resolved_when_target_id_absent_and_group_mismatch if {
+    # Decision unchanged: still denied.
     not data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-alpha",
+            "groups": ["unrelated-group"],
+        },
+        "target_agent": {
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["**"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+    # Reason is now single-valued (no eval_conflict) and deterministic:
+    # caller authorisation (precedence 1) wins over target-data (precedence 4).
+    data.yashigani.agent_call_deny_reason == "caller_group_not_in_allowed_caller_groups" with input as {
         "principal": {
             "type": "agent",
             "agent_id": "agent-alpha",

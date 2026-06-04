@@ -222,13 +222,26 @@ response_decision := {
 # trail always carries a reason. The specific rules below override it.
 default response_reason := "denied_default_deny"
 
+# DENY-OVERRIDES / SINGLE-REASON PRECEDENCE (2.25.2 class-fix, LAURA-OPA close-out)
+# ------------------------------------------------------------------------------
+# response_reason is a complete rule (:=). If two deny branches fired for one
+# input the decision OBJECT would eval_conflict (OPA 500 → lost audit reason).
+# When multiple deny conditions hold simultaneously we pick ONE reason by a fixed,
+# documented precedence so the rule is single-valued:
+#
+#   1. invalid_identity_ceiling          (config/input error — ceiling string is
+#                                          not a canonical level; highest signal,
+#                                          the comparison cannot be trusted)
+#   2. response_sensitivity_exceeds_ceiling  (clearance violation)
+#   3. response_blocked_by_inspection    (inspection verdict)
+#
+# Each lower-precedence branch carries `not <higher-precedence condition>` guards
+# so exactly one branch fires for any input. The DECISION (allow=false) is
+# unchanged; only the reason is now deterministic and conflict-free.
+
 response_reason := "ok" if response_allowed
 
-response_reason := "response_sensitivity_exceeds_ceiling" if {
-    not response_allowed
-    _effective_sensitivity_rank > _ceiling_rank(input.identity.sensitivity_ceiling)
-}
-
+# Precedence 1 — invalid ceiling (no guards needed; it is the top of the order).
 # Invalid / unrecognised ceiling string — fail-closed deny with an explicit
 # audit reason (otherwise the deny carries the default reason and the operator
 # cannot tell the ceiling string itself was the problem).
@@ -237,18 +250,27 @@ response_reason := "invalid_identity_ceiling" if {
     _invalid_identity_ceiling
 }
 
+# Precedence 2 — clearance exceeded. Defer to invalid-ceiling (precedence 1).
+response_reason := "response_sensitivity_exceeds_ceiling" if {
+    not response_allowed
+    not _invalid_identity_ceiling
+    _effective_sensitivity_rank > _ceiling_rank(input.identity.sensitivity_ceiling)
+}
+
 # _invalid_identity_ceiling — ceiling is present but not in the canonical set.
 _invalid_identity_ceiling if {
     input.identity.sensitivity_ceiling
     not _ceiling_rank(input.identity.sensitivity_ceiling)
 }
 
+# Precedence 3 — inspection-blocked. Defer to precedence 1 (invalid ceiling) and
+# precedence 2 (clearance exceeded) so exactly one reason fires (no eval_conflict
+# on the decision object).
 response_reason := "response_blocked_by_inspection" if {
     not response_allowed
     input.response_verdict == "blocked"
-    # Defer to invalid_identity_ceiling when the ceiling itself is unrecognised,
-    # so exactly one reason fires (no eval_conflict on the decision object).
     not _invalid_identity_ceiling
+    not _effective_sensitivity_rank > _ceiling_rank(input.identity.sensitivity_ceiling)
 }
 
 # ── Combined decision ─────────────────────────────────────────────────────
@@ -422,17 +444,33 @@ _proxy_effective_sensitivity_rank := 0 if {
 # not report "ok". The "ok" reason is asserted only when allowed.
 default proxy_response_reason := "denied_default_deny"
 
+# DENY-OVERRIDES / SINGLE-REASON PRECEDENCE (2.25.2 class-fix, LAURA-OPA close-out)
+# ------------------------------------------------------------------------------
+# Same precedence discipline as response_reason above. Without it,
+# response_sensitivity_exceeds_ceiling co-fires with
+# response_pii_blocked_for_service_account → decision OBJECT eval_conflict
+# (OPA 500 → lost audit reason). Fixed, documented precedence:
+#
+#   1. invalid_principal_ceiling                  (config/input error)
+#   2. response_sensitivity_exceeds_ceiling       (clearance violation)
+#   3. response_pii_blocked_for_service_account   (PII gate)
+#
+# Lower-precedence branches carry `not <higher>` guards so exactly one fires.
+
 proxy_response_reason := "ok" if proxy_response_allowed
 
-proxy_response_reason := "response_sensitivity_exceeds_ceiling" if {
-    not proxy_response_allowed
-    _proxy_effective_sensitivity_rank > _ceiling_rank(input.principal.sensitivity_ceiling)
-}
-
+# Precedence 1 — invalid ceiling (top of order).
 # Invalid / unrecognised ceiling string — fail-closed deny with explicit reason.
 proxy_response_reason := "invalid_principal_ceiling" if {
     not proxy_response_allowed
     _invalid_principal_ceiling
+}
+
+# Precedence 2 — clearance exceeded. Defer to invalid-ceiling (precedence 1).
+proxy_response_reason := "response_sensitivity_exceeds_ceiling" if {
+    not proxy_response_allowed
+    not _invalid_principal_ceiling
+    _proxy_effective_sensitivity_rank > _ceiling_rank(input.principal.sensitivity_ceiling)
 }
 
 # _invalid_principal_ceiling — ceiling present but not in the canonical set.
@@ -441,13 +479,15 @@ _invalid_principal_ceiling if {
     not _ceiling_rank(input.principal.sensitivity_ceiling)
 }
 
+# Precedence 3 — PII block. Defer to precedence 1 (invalid ceiling) and
+# precedence 2 (clearance exceeded) so exactly one reason fires.
 proxy_response_reason := "response_pii_blocked_for_service_account" if {
     not proxy_response_allowed
     input.response_pii_detected == true
     input.principal.kind != "admin"
     input.principal.kind != "human"
-    # Defer to invalid_principal_ceiling so exactly one reason fires.
     not _invalid_principal_ceiling
+    not _proxy_effective_sensitivity_rank > _ceiling_rank(input.principal.sensitivity_ceiling)
 }
 
 proxy_response_decision := {

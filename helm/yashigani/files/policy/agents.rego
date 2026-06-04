@@ -121,6 +121,26 @@ _agent_path_matches(pattern, path) if {
 # agent_call_deny_reason — human-readable explanation used in audit events
 # ---------------------------------------------------------------------------
 
+# DENY-OVERRIDES / SINGLE-REASON PRECEDENCE (2.25.2 class-fix, LAURA-OPA close-out)
+# ------------------------------------------------------------------------------
+# agent_call_deny_reason is a complete rule (:=). Previously, when the caller
+# group did NOT match AND target_agent.agent_id was absent, BOTH
+# caller_group_not_in_allowed_caller_groups (caller-side) and
+# target_agent_not_in_data (target-side) fired → eval_conflict_error (OPA 500;
+# documented UA-07-GAP-003 in agents_test.rego). The caller-/path-side reasons
+# already form a chain via _caller_group_allowed / _agent_path_safe guards. We
+# fold target_agent_not_in_data into the same single-valued order with a fixed,
+# documented precedence (caller authorisation evaluated before target-data
+# completeness):
+#
+#   1. caller_group_not_in_allowed_caller_groups  (caller not authorised)
+#   2. path_traversal_attempt                     (caller path is malicious)
+#   3. path_not_in_allowed_paths                  (caller path not permitted)
+#   4. target_agent_not_in_data                   (target data incomplete)
+#
+# Precedence 4 defers to 1 (`_caller_group_allowed`) so exactly one reason fires.
+# The DECISION is unchanged (these are all denies); only the reason is now
+# deterministic and conflict-free.
 agent_call_deny_reason := "caller_group_not_in_allowed_caller_groups" if {
     input.principal.type == "agent"
     not _caller_group_allowed
@@ -139,9 +159,14 @@ agent_call_deny_reason := "path_not_in_allowed_paths" if {
     not _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
 }
 
+# Precedence 4 — target data incomplete. Defer to precedence 1 (caller-group
+# authorisation) so caller-not-authorised takes priority and exactly one reason
+# fires (no eval_conflict). Test 4a (group matches, agent_id absent) still
+# returns this reason because _caller_group_allowed holds there.
 agent_call_deny_reason := "target_agent_not_in_data" if {
     input.principal.type == "agent"
     not input.target_agent.agent_id
+    _caller_group_allowed
 }
 
 _caller_group_allowed if {
