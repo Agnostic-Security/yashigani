@@ -489,6 +489,15 @@ Hiring: https://agnosticsec.com/careers
             handle_response @unauthorized {
                 redir * /login?next={http.request.uri} 302
             }
+
+            # Admin sessions are blocked from the data plane (SoD). Instead of
+            # surfacing the raw {admin_session_not_allowed_data_plane} 403 JSON
+            # (confusing — looks broken; hit on /, /query, etc.), bounce them to
+            # the admin console.
+            @admin_on_dataplane status 403
+            handle_response @admin_on_dataplane {
+                redir * /admin/ 302
+            }
         }
 
         # inject-caddy-verified: open-webui does not validate the header but
