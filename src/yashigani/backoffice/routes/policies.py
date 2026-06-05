@@ -25,6 +25,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
+from yashigani.backoffice.state import backoffice_state
 from yashigani.pki.client import internal_httpx_client
 
 router = APIRouter()
@@ -181,4 +182,108 @@ async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # 
         "name": name,
         "category": "client",
         "message": "Saved and loaded into OPA (usable now). To persist across a full redeploy, add it to your policy bundle.",
+    }
+
+
+class GeneratePolicyRequest(BaseModel):
+    prompt: str = Field(min_length=4, max_length=2000)
+    name: str = Field(default="generated", max_length=41)
+
+
+# Few-shot system prompt. Small local models can't infer the decision contract
+# from a terse instruction, so we give them the contract, the input vocabulary,
+# AND a concrete working exemplar to copy. {name} is substituted via .replace
+# (NOT str.format) because the embedded Rego contains literal { } braces.
+_REGO_GEN_SYSTEM = """You are an OPA Rego policy author for the Yashigani AI security gateway.
+Write ONE Rego policy module for the operator's requirement, copying the structure
+of the EXAMPLE below exactly.
+
+Decision contract (every gateway policy is a decision document):
+  data.clients.<name>.decision = {"allow": bool, "deny": set of strings, "obligations": set of strings}
+  - default-deny: allow is true ONLY when count(deny) == 0
+  - deny       = short machine-readable violation codes
+  - obligations = actions the gateway must perform (audit / redact / ...)
+
+Inputs the gateway supplies (use what's relevant):
+  input.identity.{agent,role,clearance,groups}
+  input.request.{purpose,lawful_basis}
+  input.routing_decision.{route,provider,model}
+  input.tool, input.method, input.path, input.data_tags[]
+
+EXAMPLE — copy this structure:
+----
+package clients.example_agent_email
+import rego.v1
+
+default decision := {"allow": false, "deny": set(), "obligations": set()}
+decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
+
+# Forbid the delete/trash email tools for this agent.
+deny contains "email_delete_forbidden" if {
+	input.identity.agent == "openclaw"
+	input.tool in {"email.delete", "email.trash"}
+}
+
+obligations contains "audit_email_access" if startswith(input.tool, "email.")
+----
+
+Now write the policy:
+- start with: package clients.{name}
+- import rego.v1
+- use `deny contains "code" if { ... }` rules; allow = count(deny) == 0
+- Output ONLY valid Rego. No prose. No markdown fences."""
+
+
+@router.post("/generate")
+async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  # noqa: ARG001
+    """
+    NL -> Rego draft via the internal LLM (Ollama). Returns a draft the operator
+    reviews/edits in the policy editor, then saves (which OPA-compiles it). The
+    draft is NOT auto-applied. (LLM loop/over-block sanity checks are a follow-up.)
+    """
+    name = re.sub(r"[^a-z0-9_]", "", (body.name or "generated").strip().lower()) or "generated"
+    ollama_url = (getattr(backoffice_state, "ollama_url", None)
+                  or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")).rstrip("/")
+    # Use a model that's actually loaded — the configured one if present, else the
+    # first available (the demo may run gemma3:4b, others qwen2.5:3b, etc.).
+    _pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as _c:
+            _tags = (await _c.get(ollama_url + "/api/tags")).json().get("models", [])
+        _avail = [m.get("name") for m in _tags if m.get("name")]
+    except Exception:
+        _avail = []
+    model = _pref if (_pref and _pref in _avail) else (_avail[0] if _avail else (_pref or "qwen2.5:3b"))
+    prompt = (
+        _REGO_GEN_SYSTEM.replace("{name}", name)
+        + f"\n\nRequirement: {body.prompt}\n\nRego policy (package clients.{name}):\n"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                ollama_url + "/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+            )
+            resp.raise_for_status()
+            raw = (resp.json().get("response") or "").strip()
+    except httpx.HTTPError as exc:
+        _log.warning("policy generate: LLM error: %s", exc)
+        raise HTTPException(status_code=503, detail={"error": "llm_unavailable",
+                            "message": "Could not reach the policy-assistant LLM."})
+    # Strip markdown fences if the model wrapped the output.
+    rego = raw
+    if rego.startswith("```"):
+        parts = rego.split("\n")
+        if parts and parts[-1].strip().startswith("```"):
+            parts = parts[:-1]
+        rego = "\n".join(parts[1:])
+    rego = rego.strip()
+    if "package" not in rego:
+        rego = f"package clients.{name}\n\nimport rego.v1\n\n# NOTE: LLM omitted package — review carefully.\n\n" + rego
+    return {
+        "status": "ok",
+        "name": name,
+        "rego": rego,
+        "model": model,
+        "note": "AI-generated draft — review and edit before saving. Saving runs an OPA compile check.",
     }

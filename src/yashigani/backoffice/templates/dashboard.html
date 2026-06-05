@@ -427,6 +427,20 @@
                     <div id="policies-container"><span class="loading">Loading…</span></div>
                 </div>
             </div>
+            <div class="panel">
+                <div class="panel-header">Create a policy with AI</div>
+                <div class="panel-body">
+                    <p class="txt-note">Describe the policy in plain English; the internal LLM drafts the Rego. Review &amp; edit
+                        below, then save (which OPA‑validates it). e.g. <em>"allow openclaw to read and reply to all my emails but not delete them"</em>.</p>
+                    <textarea id="policy-gen-prompt" spellcheck="false" placeholder="Describe the policy…" style="width:100%;min-height:64px;box-sizing:border-box;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;"></textarea>
+                    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <label style="font-size:0.82rem;color:#475569;">Name <code>clients.</code></label>
+                        <input id="policy-gen-name" type="text" placeholder="email_guard" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:150px;">
+                        <button class="btn btn-sm btn-sm-save" data-action="policyGenerate">Generate</button>
+                        <span id="policy-gen-result" style="font-size:0.8rem;"></span>
+                    </div>
+                </div>
+            </div>
             <div class="panel" id="policy-view-panel" style="display:none;">
                 <div class="panel-header">
                     <span id="policy-view-title">Policy source</span>

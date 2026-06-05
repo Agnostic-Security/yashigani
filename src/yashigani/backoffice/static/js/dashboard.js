@@ -147,6 +147,49 @@ function closePolicyView() {
     if (panel) panel.style.display = 'none';
 }
 
+// Open the editor pre-loaded with an AI draft, in edit mode, ready to save.
+function viewPolicyDraft(name, rego) {
+    var panel = document.getElementById('policy-view-panel');
+    var ta = document.getElementById('policy-view-src');
+    var title = document.getElementById('policy-view-title');
+    var badge = document.getElementById('policy-view-badge');
+    var nm = document.getElementById('policy-copy-name');
+    if (!panel || !ta) return;
+    title.textContent = 'AI draft: clients.' + name;
+    badge.innerHTML = '<span class="badge" style="background:#ede9fe;color:#6d28d9;">AI draft — review before saving</span>';
+    ta.value = rego;
+    ta.readOnly = false;
+    if (nm) nm.value = name;
+    var sa = document.getElementById('policy-saveas'); if (sa) sa.style.display = 'inline-flex';
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.style.display = 'none';
+    var sr = document.getElementById('policy-save-result'); if (sr) sr.innerHTML = '';
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function generatePolicy() {
+    var promptEl = document.getElementById('policy-gen-prompt');
+    var nmEl = document.getElementById('policy-gen-name');
+    var res = document.getElementById('policy-gen-result');
+    if (!promptEl || !res) return;
+    var p = (promptEl.value || '').trim();
+    if (p.length < 4) { res.innerHTML = '<span class="badge badge-red">Error</span> describe the policy first'; return; }
+    var name = ((nmEl && nmEl.value) || 'generated').trim().toLowerCase().replace(/[^a-z0-9_]/g, '') || 'generated';
+    res.innerHTML = '<span class="loading">Asking the internal LLM… (can take ~20–60s)</span>';
+    var resp = await apiMutate('/admin/policies/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: p, name: name })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> request failed'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok' && d.rego) {
+        res.innerHTML = '<span class="badge badge-green">Drafted</span> review &amp; save below (model: ' + escapeHtml(d.model || '') + ')';
+        viewPolicyDraft(d.name || name, d.rego);
+    } else {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+    }
+}
+
 async function api(path) {
     try {
         var controller = new AbortController();
@@ -1365,6 +1408,9 @@ document.addEventListener('click', function(e) {
             break;
         case 'policySaveCopy':
             policySaveCopy();
+            break;
+        case 'policyGenerate':
+            generatePolicy();
             break;
         case 'policyClose':
             closePolicyView();
