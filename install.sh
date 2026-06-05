@@ -1095,6 +1095,28 @@ print_platform_summary() {
     printf "  %-22s %s\n" "GPU:"        "none detected"
   fi
   printf "\n"
+
+  # --- Optional services — DEPLOY-TIME choice (CLAUDE.md / Optional Services panel) ---
+  # Listed so the operator sees exactly what is (and is NOT) being installed, what
+  # each does, and that the choice is deploy-time — missing one means re-running
+  # the installer. Avoids the "I expected service X" surprise post-install.
+  local _ow=" " _wz=" " _ca=" " _lf=" " _le=" " _oc=" "
+  [[ "${INSTALL_OPENWEBUI:-false}" == true ]] && _ow="x"
+  [[ "${INSTALL_WAZUH:-false}" == true ]] && _wz="x"
+  [[ "${INSTALL_INTERNAL_CA:-false}" == true ]] && _ca="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx langflow && _lf="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx letta && _le="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw && _oc="x"
+  printf "  Optional services (deploy-time choice):\n"
+  printf "    [%s] %-12s %s\n" "$_ow" "Open WebUI"  "browser chat UI for end users"
+  printf "    [%s] %-12s %s\n" "$_wz" "Wazuh SIEM"  "security monitoring — SIEM (manager+indexer+dashboard)"
+  printf "    [%s] %-12s %s\n" "$_ca" "Internal CA" "Smallstep CA for service-to-service mTLS"
+  printf "    [%s] %-12s %s\n" "$_lf" "Langflow"    "visual multi-agent workflow builder"
+  printf "    [%s] %-12s %s\n" "$_le" "Letta"       "stateful agent with persistent memory"
+  printf "    [%s] %-12s %s\n" "$_oc" "OpenClaw"    "connected agent (web search + messaging)"
+  printf "    %s\n" "[x] = will be installed. This is a DEPLOY-TIME choice: to add or remove a"
+  printf "    %s\n" "service later you re-run the installer (an update/redeploy preserving data)."
+  printf "\n"
   _print_model_recommendations
 }
 
