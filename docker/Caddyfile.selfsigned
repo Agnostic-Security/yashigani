@@ -521,7 +521,10 @@ Hiring: https://agnosticsec.com/careers
 
 # Also serve on HTTP for local convenience (self-signed mode only)
 http://{$YASHIGANI_TLS_DOMAIN}:80 {
-    redir https://{$YASHIGANI_TLS_DOMAIN}{uri} permanent
+    # Redirect to HTTPS on the PUBLISHED port (not bare 443) — on a non-standard
+    # deploy (e.g. host :8456) bare https://host lands on :443 (dead). Include the
+    # published https port so the redirect actually reaches the running edge.
+    redir https://{$YASHIGANI_TLS_DOMAIN}:{$YASHIGANI_HTTPS_PORT:443}{uri} permanent
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
