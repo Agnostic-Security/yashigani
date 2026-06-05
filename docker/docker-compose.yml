@@ -442,6 +442,10 @@ services:
       REDIS_USE_TLS: "true"
       # v2.23.2: OPA serves mTLS; backoffice uses internal_httpx_client (EX-231-01).
       YASHIGANI_OPA_URL: https://policy:8181
+      # Optional-service profiles deployed at install time (deploy-time/IaC).
+      # The Optional Services panel reads this for accurate status — the hardened
+      # backoffice has no Docker access to probe live containers. install.sh writes it.
+      YASHIGANI_ENABLED_PROFILES: ${YASHIGANI_ENABLED_PROFILES:-}
       YASHIGANI_ADMIN_USERNAME: ${YASHIGANI_ADMIN_USERNAME:-admin@yashigani.local}
       YASHIGANI_ADMIN_MIN_TOTAL: "2"
       YASHIGANI_ADMIN_MIN_ACTIVE: "2"

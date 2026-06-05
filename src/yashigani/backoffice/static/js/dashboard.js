@@ -1326,13 +1326,17 @@ async function loadServices() {
     if (!el || !data || !data.services) return;
     var html = '';
     data.services.forEach(function(s) {
+        // Observational: optional services are a deploy-time/IaC choice. Status
+        // reflects what was enabled at install (YASHIGANI_ENABLED_PROFILES); there
+        // are no runtime enable/disable buttons (the admin plane doesn't drive the
+        // host engine). "Deployed" vs "Not deployed" instead of Running/Stopped.
         var badge = s.status === 'running'
-            ? '<span class="badge badge-green">Running</span>'
-            : '<span class="badge" style="background:#f1f5f9;color:#64748b;">Stopped</span>';
-        var btn = s.status === 'running'
-            ? '<button data-action="disableService" data-service="' + s.id + '" style="padding:2px 8px;background:#ef4444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.75rem">Disable</button>'
-            : '<button data-action="enableService" data-service="' + s.id + '" style="padding:2px 8px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.75rem">Enable</button>';
-        html += '<tr><td>' + s.name + '</td><td style="font-size:0.8rem;color:#64748b">' + s.description + '</td><td>' + badge + '</td><td>' + btn + '</td></tr>';
+            ? '<span class="badge badge-green">Deployed</span>'
+            : '<span class="badge" style="background:#f1f5f9;color:#64748b;">Not deployed</span>';
+        var note = s.status === 'running'
+            ? '<span style="font-size:0.75rem;color:#64748b">enabled at install</span>'
+            : '<span style="font-size:0.75rem;color:#94a3b8">re-run installer with --' + escapeHtml(s.profile || s.id) + ' to add</span>';
+        html += '<tr><td>' + escapeHtml(s.name) + '</td><td style="font-size:0.8rem;color:#64748b">' + escapeHtml(s.description) + '</td><td>' + badge + '</td><td>' + note + '</td></tr>';
     });
     el.innerHTML = html || '<tr><td colspan="4" class="empty">No optional services available</td></tr>';
 }

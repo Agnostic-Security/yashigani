@@ -5145,6 +5145,25 @@ compose_up() {
     fi
     export YASHIGANI_PUBLIC_URL="$_pub_url"
 
+    # Declared set of enabled optional-service profiles, for the backoffice
+    # Optional Services panel (observational; the hardened container can't probe
+    # Docker). Assemble from agent bundles + the per-flag opt-ins.
+    local _enabled_profiles=()
+    [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _enabled_profiles+=("${COMPOSE_PROFILES[@]}")
+    [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _enabled_profiles+=("openwebui")
+    [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _enabled_profiles+=("wazuh")
+    [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _enabled_profiles+=("internal-ca")
+    # de-dupe, comma-join
+    local _ep_csv; _ep_csv="$(printf '%s\n' "${_enabled_profiles[@]+"${_enabled_profiles[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
+    if grep -q "^YASHIGANI_ENABLED_PROFILES=" "$env_file" 2>/dev/null; then
+      local _tmp_env3; _tmp_env3="$(mktemp)"
+      sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv}|" "$env_file" > "$_tmp_env3"
+      mv "$_tmp_env3" "$env_file"
+    else
+      echo "YASHIGANI_ENABLED_PROFILES=${_ep_csv}" >> "$env_file"
+    fi
+    export YASHIGANI_ENABLED_PROFILES="$_ep_csv"
+
     # 3. Create Docker-compatible directories for promtail (best-effort).
     # On CI runners (GitHub Actions / Podman) /var/lib/docker does not exist and
     # is owned by root, so a plain mkdir fails with EPERM. The installer body
