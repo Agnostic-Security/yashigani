@@ -434,10 +434,20 @@
                     <button class="btn btn-sm" data-action="policyClose" style="float:right;font-size:0.75rem;">Close</button>
                 </div>
                 <div class="panel-body">
-                    <pre id="policy-view-src" style="background:#0f172a;color:#e2e8f0;padding:14px;border-radius:6px;overflow:auto;max-height:520px;font-size:0.8rem;line-height:1.45;white-space:pre;margin:0;"></pre>
-                    <p class="txt-note" style="margin-top:8px;">Example policies are <strong>immutable templates</strong>. Creating an
-                        editable client copy (saved in-app) and activating a policy across subjects (users, agents, MCP, API) on ingress
-                        and egress are in active development.</p>
+                    <textarea id="policy-view-src" readonly spellcheck="false" style="width:100%;min-height:380px;box-sizing:border-box;background:#0f172a;color:#e2e8f0;padding:14px;border:1px solid #1e293b;border-radius:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:0.8rem;line-height:1.45;white-space:pre;"></textarea>
+                    <div id="policy-edit-controls" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <button class="btn btn-sm" data-action="policyEditCopy">Create editable copy</button>
+                        <span id="policy-saveas" style="display:none;gap:6px;align-items:center;">
+                            <label style="font-size:0.82rem;color:#475569;">Save as <code>clients.</code></label>
+                            <input id="policy-copy-name" type="text" placeholder="my_org_gdpr" pattern="[a-z][a-z0-9_]*"
+                                   style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:160px;">
+                            <button class="btn btn-sm btn-sm-save" data-action="policySaveCopy">Save</button>
+                        </span>
+                        <span id="policy-save-result" style="font-size:0.8rem;"></span>
+                    </div>
+                    <p class="txt-note" style="margin-top:8px;">Examples are <strong>immutable templates</strong>. "Create editable copy"
+                        lets you edit and save under a new name (<code>clients.&lt;name&gt;</code>) — validated by OPA and loaded immediately.
+                        To persist across a full redeploy, add it to your policy bundle. (Activate + ingress/egress enforcement is the next phase.)</p>
                 </div>
             </div>
         </div>

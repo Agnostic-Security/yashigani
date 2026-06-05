@@ -18,15 +18,21 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
-from yashigani.backoffice.middleware import AdminSession
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.pki.client import internal_httpx_client
 
 router = APIRouter()
 _log = logging.getLogger("yashigani.policies")
+
+# Client policy names: lowercase, start with a letter, 2-41 chars.
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+_RESERVED = {"yashigani", "rbac", "mcp", "agents", "v1_routing"}
 
 
 def _opa_base() -> str:
@@ -38,9 +44,16 @@ def _categorize(policy_id: str) -> str:
     pid = policy_id.lower()
     if "examples/" in pid:
         return "example"
+    if pid.startswith("clients/") or "/clients/" in pid:
+        return "client"
     if pid.endswith("_test.rego") or "/test" in pid:
         return "test"
     return "core"
+
+
+class SavePolicyRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=41)
+    rego: str = Field(min_length=1, max_length=64_000)
 
 
 @router.get("")
@@ -115,4 +128,57 @@ async def get_policy(policy_id: str, session: AdminSession):  # noqa: ARG001 —
             if isinstance(seg.get("value"), str)
         ),
         "category": _categorize(policy_id),
+    }
+
+
+@router.post("/save")
+async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # noqa: ARG001
+    """
+    Create/update an editable CLIENT policy copy — loaded into OPA, usable now.
+
+    Templates (the examples) are immutable; the operator edits a copy and saves it
+    under a new name -> stored as clients/<name> in OPA. High-value mutation ->
+    step-up. OPA compiles on PUT, so invalid Rego is rejected with the compile
+    error (basic sanity; full loop / block-everything LLM checks are a follow-up).
+    """
+    name = body.name.strip().lower()
+    if not _NAME_RE.match(name) or name in _RESERVED:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_name",
+                    "message": "lowercase letters/digits/underscore, start with a letter; not a reserved core name"},
+        )
+    if "package" not in body.rego:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "missing_package",
+                    "message": f"policy must declare a package (e.g. 'package clients.{name}')"},
+        )
+    pol_id = f"clients/{name}"
+    url = _opa_base() + "/v1/policies/" + pol_id
+    try:
+        async with internal_httpx_client(timeout=10.0) as client:
+            resp = await client.put(
+                url, content=body.rego.encode("utf-8"),
+                headers={"Content-Type": "text/plain"},
+            )
+    except httpx.HTTPError as exc:
+        _log.warning("OPA save policy failed: %s", exc)
+        raise HTTPException(status_code=503, detail={"error": "opa_unreachable",
+                            "message": "Could not reach the policy service."})
+    if resp.status_code == 400:
+        try:
+            opa_err = resp.json()
+        except Exception:
+            opa_err = {"message": "Rego compile error"}
+        raise HTTPException(status_code=400, detail={"error": "invalid_rego", "opa": opa_err})
+    if resp.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail={"error": "opa_put_failed", "status": resp.status_code})
+    _log.info("Admin %s saved client policy %s", session.account_id, pol_id)
+    return {
+        "status": "ok",
+        "id": pol_id,
+        "name": name,
+        "category": "client",
+        "message": "Saved and loaded into OPA (usable now). To persist across a full redeploy, add it to your policy bundle.",
     }

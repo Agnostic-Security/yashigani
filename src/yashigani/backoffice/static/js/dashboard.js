@@ -82,20 +82,64 @@ async function loadPolicies() {
 
 async function viewPolicy(id, cat) {
     var panel = document.getElementById('policy-view-panel');
-    var pre = document.getElementById('policy-view-src');
+    var ta = document.getElementById('policy-view-src');
     var title = document.getElementById('policy-view-title');
     var badge = document.getElementById('policy-view-badge');
-    if (!panel || !pre) return;
+    if (!panel || !ta) return;
     title.textContent = id;
     badge.innerHTML = (cat === 'example')
-        ? '<span class="badge" style="background:#fef3c7;color:#92400e;">immutable template</span>' : '';
-    pre.textContent = 'Loading…';
+        ? '<span class="badge" style="background:#fef3c7;color:#92400e;">immutable template</span>'
+        : (cat === 'client' ? '<span class="badge badge-green">client copy</span>' : '');
+    // Reset to view (read-only) state each time.
+    ta.readOnly = true;
+    var sa = document.getElementById('policy-saveas'); if (sa) sa.style.display = 'none';
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.style.display = '';
+    var res = document.getElementById('policy-save-result'); if (res) res.innerHTML = '';
+    var nm = document.getElementById('policy-copy-name');
+    if (nm) nm.value = (id.split('/').pop().replace(/\.rego$/, '') + '_copy').toLowerCase().replace(/[^a-z0-9_]/g, '');
+    ta.value = 'Loading…';
     panel.style.display = 'block';
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     // {policy_id:path} — keep the slashes, encode each segment
     var encoded = id.split('/').map(encodeURIComponent).join('/');
     var data = await api('/admin/policies/' + encoded);
-    pre.textContent = (data && typeof data.raw === 'string' && data.raw) ? data.raw : 'Could not load policy source.';
+    ta.value = (data && typeof data.raw === 'string' && data.raw) ? data.raw : 'Could not load policy source.';
+}
+
+// Turn the read-only viewer into an editable "copy" (templates are immutable —
+// we edit a copy and save it under a new clients.<name>).
+function policyEditCopy() {
+    var ta = document.getElementById('policy-view-src');
+    var sa = document.getElementById('policy-saveas');
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]');
+    if (ta) { ta.readOnly = false; ta.focus(); }
+    if (sa) sa.style.display = 'inline-flex';
+    if (ec) ec.style.display = 'none';
+}
+
+async function policySaveCopy() {
+    var ta = document.getElementById('policy-view-src');
+    var nm = document.getElementById('policy-copy-name');
+    var res = document.getElementById('policy-save-result');
+    if (!ta || !nm || !res) return;
+    var name = (nm.value || '').trim().toLowerCase();
+    if (!/^[a-z][a-z0-9_]{1,40}$/.test(name)) {
+        res.innerHTML = '<span class="badge badge-red">Error</span> name: lowercase, start with a letter (a-z0-9_)';
+        return;
+    }
+    res.innerHTML = '<span class="loading">Saving…</span>';
+    var resp = await apiMutate('/admin/policies/save', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, rego: ta.value })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> request cancelled'; return; }
+    var data = await resp.json().catch(function() { return {}; });
+    if (resp.ok && data.status === 'ok') {
+        res.innerHTML = '<span class="badge badge-green">Saved</span> clients.' + escapeHtml(name) + ' — loaded into OPA';
+        loadPolicies();
+    } else {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(data, resp.status));
+    }
 }
 
 function closePolicyView() {
@@ -1312,9 +1356,15 @@ document.addEventListener('click', function(e) {
             cancelStepUp();
             break;
 
-        // Policies (OPA) viewer
+        // Policies (OPA) viewer + authoring
         case 'policyView':
             viewPolicy(actionEl.getAttribute('data-id'), actionEl.getAttribute('data-cat'));
+            break;
+        case 'policyEditCopy':
+            policyEditCopy();
+            break;
+        case 'policySaveCopy':
+            policySaveCopy();
             break;
         case 'policyClose':
             closePolicyView();
