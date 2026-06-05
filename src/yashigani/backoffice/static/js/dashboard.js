@@ -1266,6 +1266,9 @@ document.addEventListener('click', function(e) {
             toggleService(e.target.dataset.service, 'disable');
             break;
         // Backup
+        case 'createBackup':
+            createBackup();
+            break;
         case 'verifyBackup':
             verifyBackup();
             break;
@@ -1396,6 +1399,29 @@ async function loadBackup() {
     if (btn) {
         btn.disabled = false;
         btn.dataset.backupName = data.latest ? data.latest.name : '';
+    }
+}
+
+async function createBackup() {
+    var btn = document.getElementById('btn-create-backup');
+    var resultDiv = document.getElementById('backup-create-result');
+    if (!resultDiv) return;
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<span class="loading">Creating database backup…</span>';
+    if (btn) btn.disabled = true;
+    try {
+        var resp = await apiMutate('/admin/backup/create', { method: 'POST', headers: {'Content-Type': 'application/json'} });
+        if (!resp) { resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">Request failed or was cancelled</span>'; return; }
+        var data = await resp.json().catch(function() { return {}; });
+        if (resp.ok && data.status === 'ok') {
+            var kb = Math.round((data.size_bytes || 0) / 1024);
+            resultDiv.innerHTML = '<span class="badge badge-green">Created</span> <span style="font-size:0.8rem;color:#334155">' + escapeHtml(data.backup_name) + ' &mdash; ' + kb + ' KB</span>';
+            loadBackup();
+        } else {
+            resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">' + escapeHtml(errMsg(data, resp.status)) + '</span>';
+        }
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 

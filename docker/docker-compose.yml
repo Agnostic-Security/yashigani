@@ -559,7 +559,9 @@ services:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
       # v2.23.2 #47 — Backup directory mount (read-only — backoffice reads, never writes).
-      - ${INSTALL_DIR:-..}/backups:/data/backups:ro
+      # rw so the admin "Create backup" button can write on-demand DB snapshots
+      # (pg_dump) here; the installer also writes its backups to the same host dir.
+      - ${INSTALL_DIR:-..}/backups:/data/backups:rw
       # LIC-007 / LIC-012 (v2.24.0 DEFERRED): This mount is writable because
       # write_docker_secrets() writes admin credentials + license_key here during
       # bootstrap. After bootstrap, license_key should be chmod 0400. The trivial

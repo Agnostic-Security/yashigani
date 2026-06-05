@@ -495,8 +495,12 @@
                     <p class="txt-note">Backups created by the installer and update scripts. Verify integrity by re-hashing against the recorded checksum manifest.</p>
                     <div id="backup-status-container"><span class="loading">Loading...</span></div>
                     <div id="backup-actions" class="backup-actions">
+                        <button id="btn-create-backup" data-action="createBackup" class="btn-sm-save">Create backup</button>
                         <button id="btn-verify-latest" data-action="verifyBackup" class="btn-verify" disabled>Verify latest</button>
                     </div>
+                    <p class="txt-note" style="margin-top:6px;">"Create backup" takes an on-demand database snapshot (accounts, RBAC,
+                        agents, policies, budgets, audit). Full-system restore/recovery is an installer operation.</p>
+                    <div id="backup-create-result" class="backup-verify-result"></div>
                     <div id="backup-verify-result" class="backup-verify-result"></div>
                 </div>
             </div>

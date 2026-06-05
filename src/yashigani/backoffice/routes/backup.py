@@ -24,7 +24,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from yashigani.backoffice.middleware import AdminSession, require_admin_session
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession, require_admin_session
 
 router = APIRouter(prefix="/admin/backup", tags=["backup"])
 _log = logging.getLogger("yashigani.backup")
@@ -337,4 +337,78 @@ async def backup_verify(body: VerifyRequest, session: AdminSession):
             "Backup directory is not write-locked during verification. "
             "If a backup is in progress, checksums may not match."
         ),
+    }
+
+
+@router.post("/create")
+async def backup_create(session: StepUpAdminSession):
+    """
+    On-demand database backup — the "push-button" create action.
+
+    Snapshots the Postgres state (the crown jewels: admin/user accounts, RBAC,
+    agents, policies, budgets, audit) via pg_dump to a timestamped dir under the
+    backups volume, with a MANIFEST.sha256 the verify endpoint understands.
+
+    High-value mutation -> StepUpAdminSession. NOTE: this is a DB snapshot the
+    admin can take any time; full-system backups (volumes, secrets) and RESTORE
+    remain installer/recovery operations (install.sh), per the deploy-time model.
+    """
+    import shutil
+    import subprocess
+
+    dsn = os.getenv("YASHIGANI_DB_DSN_DIRECT") or os.getenv("YASHIGANI_DB_DSN")
+    if not dsn:
+        raise HTTPException(status_code=503, detail={"error": "db_dsn_unavailable"})
+    if shutil.which("pg_dump") is None:
+        raise HTTPException(status_code=503, detail={"error": "pg_dump_unavailable"})
+    try:
+        _BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise HTTPException(status_code=500, detail={"error": "backups_dir_unavailable"})
+
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    name = f"ondemand_{ts}"
+    dest = _BACKUPS_DIR / name
+    try:
+        dest.mkdir(exist_ok=False)
+    except OSError as exc:
+        _log.warning("backup create: cannot create dir %s: %s", name, type(exc).__name__)
+        raise HTTPException(status_code=500, detail={"error": "backup_dir_not_writable"})
+
+    dump_path = dest / "database.dump"
+    try:
+        result = subprocess.run(
+            ["pg_dump", "--format=custom", "--no-owner", "--no-privileges",
+             "--file", str(dump_path), dsn],
+            capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise HTTPException(status_code=504, detail={"error": "backup_timeout"})
+    if result.returncode != 0:
+        shutil.rmtree(dest, ignore_errors=True)
+        # CWE-200: never echo pg_dump stderr — it can contain the DSN/host.
+        _log.error("backup create: pg_dump failed rc=%s", result.returncode)
+        raise HTTPException(status_code=500, detail={"error": "pg_dump_failed"})
+
+    # MANIFEST.sha256 — same format the verify endpoint reads (unsigned record).
+    try:
+        h = hashlib.sha256()
+        with open(dump_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        (dest / _MANIFEST_FILE).write_text(f"{h.hexdigest()}  database.dump\n")
+        size = dump_path.stat().st_size
+    except OSError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise HTTPException(status_code=500, detail={"error": "manifest_write_failed"})
+
+    _log.info("Admin %s created on-demand DB backup: %s (%d bytes)", session.account_id, name, size)
+    return {
+        "status": "ok",
+        "backup_name": name,
+        "type": "ondemand",
+        "size_bytes": size,
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "message": "Database snapshot created. Full-system restore is an installer/recovery operation.",
     }
