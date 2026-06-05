@@ -928,25 +928,32 @@ async function searchAudit(cursor) {
     if (et) params.set('event_type', et);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
-    if (text) params.set('free_text', text);
+    // free_text is a substring match, not a glob — treat a lone '*' as "match all".
+    if (text && text !== '*') params.set('free_text', text);
     if (cursor) params.set('cursor', cursor);
     var data = await api('/admin/audit/search?' + params.toString());
     var tbody = document.getElementById('audit-tbody');
-    if (!data || !data.events || data.events.length === 0) {
+    // Backend returns {rows, count, cursor, has_more} — not {events, next_cursor}.
+    var rows = (data && data.rows) ? data.rows : null;
+    if (!rows || rows.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5" class="empty">No events found</td></tr>';
         document.getElementById('audit-count').textContent = 'Events (0)';
         document.getElementById('audit-pagination').innerHTML = '';
         return;
     }
-    document.getElementById('audit-count').textContent = 'Events (' + data.events.length + (data.has_more ? '+' : '') + ')';
-    tbody.innerHTML = data.events.map(function(e) {
+    document.getElementById('audit-count').textContent = 'Events (' + rows.length + (data.has_more ? '+' : '') + ')';
+    tbody.innerHTML = rows.map(function(e) {
+        var who = e.admin_account || e.user || e.user_handle || e.agent_id || '';
+        var outcome = e.verdict || e.outcome || '-';
+        var blocked = /block|deni|reject|fail/i.test(outcome);
+        var detail = e.detail || e.summary || e.client_ip_prefix || '';
         return '<tr><td style="font-size:0.75rem">' + escapeHtml(e.timestamp || e.created_at || '') + '</td>' +
             '<td>' + escapeHtml(e.event_type || '') + '</td>' +
-            '<td>' + escapeHtml(e.user || e.agent_id || '') + '</td>' +
-            '<td><span class="badge ' + (e.verdict === 'BLOCKED' ? 'badge-red' : 'badge-green') + '">' + escapeHtml(e.verdict || '-') + '</span></td>' +
-            '<td style="font-size:0.75rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(e.detail || e.summary || '') + '</td></tr>';
+            '<td>' + escapeHtml(who) + '</td>' +
+            '<td><span class="badge ' + (blocked ? 'badge-red' : 'badge-green') + '">' + escapeHtml(outcome) + '</span></td>' +
+            '<td style="font-size:0.75rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(detail) + '</td></tr>';
     }).join('');
-    auditCursor = data.next_cursor || '';
+    auditCursor = data.cursor || '';
     var pag = document.getElementById('audit-pagination');
     if (data.has_more) {
         pag.innerHTML = '<button data-action="searchAuditMore" data-cursor="' + auditCursor + '" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Load more</button>';
