@@ -154,6 +154,9 @@ services:
       - "8445"
     environment:
       YASHIGANI_TLS_DOMAIN: ${YASHIGANI_TLS_DOMAIN:?set YASHIGANI_TLS_DOMAIN}
+      # Published HTTPS port — so the Caddyfile HTTP->HTTPS redirect targets the
+      # real edge port (e.g. :8456), not bare :443 (dead on non-standard deploys).
+      YASHIGANI_HTTPS_PORT: ${YASHIGANI_HTTPS_PORT:-443}
       CADDY_ACME_EMAIL: ${YASHIGANI_ADMIN_USERNAME:-admin@yashigani.local}
       PROMETHEUS_BASICAUTH_USER: ${PROMETHEUS_BASICAUTH_USER:-prometheus}
       PROMETHEUS_BASICAUTH_HASH: ${PROMETHEUS_BASICAUTH_HASH:?run bootstrap to get this value}
