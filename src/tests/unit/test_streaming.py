@@ -70,22 +70,28 @@ def _make_classifier(
     Build a mock SensitivityClassifier.
 
     - ``_scan_regex``       returns ``_MockSensitivityLevel(regex_level)``
-    - ``_scan_fasttext``    returns ``_MockSensitivityLevel(fasttext_level)``
+    - ``_scan_classifier``  returns ``_MockSensitivityLevel(fasttext_level)``
     - ``classify``          returns ``_MockSensitivityResult(full_classify_level)``
+
+    ``_scan_fasttext`` is kept as a deprecated alias so tests that call it
+    directly still work (back-compat alias coverage).
     """
     clf = MagicMock()
 
     def _scan_regex(text, triggers):
         return _MockSensitivityLevel(regex_level)
 
-    def _scan_fasttext(text, triggers):
+    def _scan_classifier(text, triggers):
         return _MockSensitivityLevel(fasttext_level)
 
     def _classify(text):
         return _MockSensitivityResult(full_classify_level)
 
     clf._scan_regex = _scan_regex
-    clf._scan_fasttext = _scan_fasttext
+    clf._scan_classifier = _scan_classifier
+    # Deprecated alias — streaming.py no longer calls this directly, but kept
+    # for any test that still exercises the old name.
+    clf._scan_fasttext = _scan_classifier
     clf.classify = _classify
     # F-RT1: final_inspect now prefers classify_decoded (decode-before-classify).
     # The mock returns the same level either way (decode is a superset of classify).
@@ -162,13 +168,13 @@ class TestStreamingInspectorTermination:
         assert inspector.terminated is True
 
     def test_fasttext_hit_at_interval_terminates(self):
-        """FastText RESTRICTED hit at interval boundary terminates stream."""
+        """Classifier RESTRICTED hit at interval boundary terminates stream."""
         # interval=10 so we trip it after 10+ chars
         inspector = _make_inspector(fasttext_level="RESTRICTED", inspect_interval=10)
         result = inspector.feed("A" * 15)  # > interval=10
         assert result is False
         assert inspector.terminated is True
-        assert "fasttext" in inspector.termination_trigger
+        assert "classifier" in inspector.termination_trigger
 
     def test_final_inspect_blocked_level_terminates(self):
         """final_inspect returns False when full classify returns CONFIDENTIAL."""
@@ -325,7 +331,7 @@ async def test_stream_response_final_inspect_termination():
         _make_ollama_line("", done=True),
     ]
     upstream = _FakeUpstreamResponse(lines)
-    # All chunks clean at regex/fasttext level but full classify is CONFIDENTIAL
+    # All chunks clean at regex/classifier level but full classify is CONFIDENTIAL
     inspector = _make_inspector(
         regex_level="PUBLIC",
         fasttext_level="PUBLIC",

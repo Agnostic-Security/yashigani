@@ -1,7 +1,7 @@
 """
 sklearn first-pass content classifier — Phase 12 (v2.23.3 fasttext replacement).
 
-Model trained at image build time from data/fasttext/training_data.txt
+Model trained at image build time from data/classifier/training_data.txt
 and serialised as a joblib pipeline at /app/models/sensitivity_classifier.joblib.
 
 Replaces fasttext-wheel (last upload 2020-09-03, archived 2024-03-22, ABI-pins

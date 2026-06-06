@@ -1252,7 +1252,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                 action_taken=_af.get("action_taken", ""),
                                 content_type=_af.get("content_type", ""),
                                 response_content_hash=_af.get("response_content_hash", ""),
-                                fasttext_only_mode=bool(_af.get("fasttext_only_mode", False)),
+                                classifier_only_mode=bool(_af.get("classifier_only_mode", False)),
                             )
                         )
                     except Exception as _exc:

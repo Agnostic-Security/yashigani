@@ -15,7 +15,7 @@ Non-zero exit if F1 < 0.70.
 
 Usage:
     python scripts/train_sensitivity_classifier.py \
-        --data   data/fasttext/training_data.txt \
+        --data   data/classifier/training_data.txt \
         --output data/sensitivity_classifier.joblib
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--data",
-        default="data/fasttext/training_data.txt",
+        default="data/classifier/training_data.txt",
         help="Path to labelled training data in FastText format (__label__X text).",
     )
     p.add_argument(

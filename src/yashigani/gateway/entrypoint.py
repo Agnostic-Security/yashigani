@@ -85,11 +85,11 @@ def _build_app(mesh_mode: bool = False):
         logger.info("Response inspection pipeline enabled")
 
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
-    fasttext_backend = None  # legacy name retained; wired into SensitivityClassifier below
+    classifier_backend = None
     try:
         from yashigani.inspection.backends.sklearn_backend import SklearnBackend
-        fasttext_backend = SklearnBackend()
-        logger.info("sklearn sensitivity backend loaded: %s", fasttext_backend.model_path)
+        classifier_backend = SklearnBackend()
+        logger.info("sklearn sensitivity backend loaded: %s", classifier_backend.model_path)
     except Exception as exc:
         logger.warning("sklearn backend unavailable (%s) — LLM-only inspection", exc)
 
@@ -293,9 +293,9 @@ def _build_app(mesh_mode: bool = False):
     try:
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
         sensitivity_classifier = SensitivityClassifier(
-            enable_sklearn=fasttext_backend is not None,
+            enable_sklearn=classifier_backend is not None,
             enable_ollama=True,
-            sklearn_backend=fasttext_backend,
+            sklearn_backend=classifier_backend,
             ollama_url=ollama_url,
             ollama_model=model,
         )
@@ -694,7 +694,7 @@ def _build_app(mesh_mode: bool = False):
         jwt_inspector=jwt_inspector,
         endpoint_rate_limiter=endpoint_rate_limiter,
         response_cache=response_cache,
-        fasttext_backend=fasttext_backend,
+        classifier_backend=classifier_backend,
         inference_logger=inference_logger,
         anomaly_detector=anomaly_detector,
         response_inspection_pipeline=response_pipeline,

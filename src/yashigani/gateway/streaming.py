@@ -49,12 +49,12 @@ class StreamingInspector:
 
     Inspection layers per the v2.2 constraint matrix:
     - Regex: every chunk (in-band, <1 ms)
-    - FastText: at every inspect-interval boundary
+    - Classifier: at every inspect-interval boundary
     - LLM: once, after stream end (via ``final_inspect``)
 
     The ``sensitivity_classifier`` passed in is the same
     ``SensitivityClassifier`` instance used by the buffered path. We call its
-    ``_scan_regex`` and ``_scan_fasttext`` private helpers directly so that we
+    ``_scan_regex`` and ``_scan_classifier`` private helpers directly so that we
     can enforce the per-layer timing constraints without running the full
     three-layer pipeline (which would block on Ollama).
 
@@ -69,7 +69,7 @@ class StreamingInspector:
     def __init__(
         self,
         sensitivity_classifier,           # SensitivityClassifier | None
-        inspect_interval: int = 200,      # chars between FastText checks
+        inspect_interval: int = 200,      # chars between classifier checks
         request_id: str = "",
         session_id: str = "",
         agent_id: str = "",
@@ -86,7 +86,7 @@ class StreamingInspector:
         self._window: str = ""
         # Full accumulated text — for final LLM inspection after stream end
         self._full_text: str = ""
-        # Chars accumulated since the last FastText interval check
+        # Chars accumulated since the last classifier interval check
         self._chars_since_last_check: int = 0
         # Set True when a blocking level is detected
         self.terminated: bool = False
@@ -121,14 +121,14 @@ class StreamingInspector:
                 self._trigger_termination(f"regex:{regex_level}", chunk_text)
                 return False
 
-        # Layer 2: FastText — at interval boundary
+        # Layer 2: Classifier — at interval boundary
         if (
             self._classifier is not None
             and self._chars_since_last_check >= self._interval
         ):
-            ft_level = self._run_fasttext(self._window)
+            ft_level = self._run_classifier(self._window)
             if ft_level in self._BLOCKING_LEVELS:
-                self._trigger_termination(f"fasttext:{ft_level}", self._window)
+                self._trigger_termination(f"classifier:{ft_level}", self._window)
                 return False
 
             # Clear the window and reset the counter for the next interval
@@ -192,15 +192,20 @@ class StreamingInspector:
             logger.debug("StreamingInspector regex scan error: %s", exc)
             return "PUBLIC"
 
-    def _run_fasttext(self, text: str) -> str:
-        """Run Layer 2 FastText scan. Returns level string."""
+    def _run_classifier(self, text: str) -> str:
+        """Run Layer 2 classifier scan. Returns level string."""
         triggers: list[str] = []
         try:
-            level = self._classifier._scan_fasttext(text, triggers)
+            level = self._classifier._scan_classifier(text, triggers)
             return level.value
         except Exception as exc:
-            logger.debug("StreamingInspector fasttext scan error: %s", exc)
+            logger.debug("StreamingInspector classifier scan error: %s", exc)
             return "PUBLIC"
+
+    # Deprecated alias — kept for one release cycle (v2.26.0 removal).
+    def _run_fasttext(self, text: str) -> str:
+        """Deprecated alias for _run_classifier. Removed in v2.26.0."""
+        return self._run_classifier(text)
 
     def _trigger_termination(self, trigger: str, snippet: str) -> None:
         self.terminated = True

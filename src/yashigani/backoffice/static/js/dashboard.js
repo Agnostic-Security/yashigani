@@ -797,8 +797,9 @@ async function loadSensitivity() {
     // Pipeline status
     var data = await api('/admin/sensitivity/status');
     if (data) {
-        document.getElementById('fasttext-status').textContent = data.fasttext_available ? 'Active' : 'Unavailable';
-        document.getElementById('fasttext-status').className = 'badge ' + (data.fasttext_available ? 'badge-green' : 'badge-yellow');
+        var classifierAvailable = (data.classifier_available !== undefined) ? data.classifier_available : data.fasttext_available;
+        document.getElementById('classifier-status').textContent = classifierAvailable ? 'Active' : 'Unavailable';
+        document.getElementById('classifier-status').className = 'badge ' + (classifierAvailable ? 'badge-green' : 'badge-yellow');
         document.getElementById('ollama-status').textContent = data.ollama_available ? 'Active' : 'Unavailable';
         document.getElementById('ollama-status').className = 'badge ' + (data.ollama_available ? 'badge-green' : 'badge-yellow');
     }

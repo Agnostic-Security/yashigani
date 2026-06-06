@@ -126,7 +126,7 @@ def create_gateway_app(
     jwt_inspector=None,
     endpoint_rate_limiter=None,
     response_cache=None,
-    fasttext_backend=None,
+    classifier_backend=None,
     inference_logger=None,
     anomaly_detector=None,
     response_inspection_pipeline=None,  # v0.9.0 — ResponseInspectionPipeline | None
@@ -154,7 +154,7 @@ def create_gateway_app(
         "jwt_inspector": jwt_inspector,
         "endpoint_rate_limiter": endpoint_rate_limiter,
         "response_cache": response_cache,
-        "fasttext_backend": fasttext_backend,
+        "classifier_backend": classifier_backend,
         "inference_logger": inference_logger,
         "anomaly_detector": anomaly_detector,
         "ddos_protector": ddos_protector,  # v2.2

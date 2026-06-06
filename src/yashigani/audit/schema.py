@@ -1056,7 +1056,7 @@ class ResponseInjectionDetectedEvent(AuditEvent):
     action_taken: str = ""  # 502_returned | flagged_only
     content_type: str = ""  # Content-Type of the upstream response
     response_content_hash: str = ""  # SHA-256 of the raw response body
-    fasttext_only_mode: bool = False  # True when LLM fallback was skipped
+    classifier_only_mode: bool = False  # True when LLM fallback was skipped
 
 
 # ---------------------------------------------------------------------------
@@ -1696,7 +1696,7 @@ class StreamTerminatedEvent(AuditEvent):
     event_type: str = EventType.STREAM_TERMINATED
     account_tier: str = AccountTier.SYSTEM
     masking_applied: bool = True
-    trigger: str = ""          # e.g. "regex:CONFIDENTIAL" | "fasttext:RESTRICTED"
+    trigger: str = ""          # e.g. "regex:CONFIDENTIAL" | "classifier:RESTRICTED"
     request_id: str = ""
     session_id: str = ""
     agent_id: str = ""

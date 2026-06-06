@@ -377,7 +377,7 @@ class ResponseInspectionConfig:
 
     Fields:
         enabled             Toggle the pipeline entirely.
-        fasttext_only       Skip LLM fallback — classify with FastText only.
+        classifier_only     Skip LLM fallback — classify with the first-pass classifier only.
                             Faster but lower recall on novel injection patterns.
         blocked_action      HTTP status code to return when a response is BLOCKED.
                             Must be "502" (upstream tainted) per the security design.
@@ -390,7 +390,7 @@ class ResponseInspectionConfig:
                             Each addition is an explicit trust assumption; document the reason.
     """
     enabled: bool = True
-    fasttext_only: bool = False
+    classifier_only: bool = False
     blocked_action: str = "502"
     exempt_content_types: list[str] = field(
         default_factory=list
@@ -581,7 +581,7 @@ class ResponseInspectionPipeline:
             "action_taken": action_taken,
             "content_type": content_type,
             "response_content_hash": content_hash,
-            "fasttext_only_mode": cfg.fasttext_only,
+            "classifier_only_mode": cfg.classifier_only,
             "response_sensitivity": response_sensitivity_value,
         }
         self._on_audit("RESPONSE_INJECTION_DETECTED", audit)
