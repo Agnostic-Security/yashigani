@@ -16,19 +16,16 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.4 (2026-05-21) — cleanup-system architectural close (state file + container-fallback rm + cross-UID handlers across install/uninstall), `letta-pgbouncer` mTLS sidecar closing YSG-RISK-048, KMS-architectural posture documented for credentials, Open WebUI in-mesh path through gateway, `/me/api-key` self-service Bearer issuance, OPA fail-closed posture; see `CHANGELOG.md` for the release entry.
+**Latest Tagged Release:** v2.25.2 (2026-06-05) — Wazuh SIEM full-stack Linux/Docker fixes (mTLS auto-provisioning, convergence-gate improvements), audit DB least-privilege role split, PostgresSink audit wiring, OPA hardening (deny-override class fix, Helm bundle parity, depth-limit corrections), decode-before-classify PII inspection on encoded payloads; see `CHANGELOG.md` for the full release history.
 
-> **Upgrade notice:** v2.23.4 carries a behavioural change — OPA now fails-CLOSED on every exception path (timeout, 5xx, connection refused). Operators with intermittently-reachable OPA should alert on `yashigani_opa_response_check_failures_total`. Dev opt-in to prior fail-open behaviour: `YASHIGANI_OPA_OPTIONAL=true` (non-production only).
+> **Upgrade notice (v2.25.0+):** Backup format changed to dual-wrap AES-256-GCM with argon2id KEK; legacy age-encrypted archives are not forward-compatible — migrate before upgrading. TLS 1.2 is disabled on the internal mesh (TLS 1.3 minimum from v2.25.1); internal clients must support TLS 1.3.
 
-> **Notable behaviour changes in v2.23.4:**
-> - **OPA fails closed** on every exception path (was prior `allow:True` in some paths). New Prometheus counter `yashigani_opa_response_check_failures_total{outcome, reason}`.
-> - **letta postgres** now routes through dedicated `letta-pgbouncer` mTLS sidecar — clean pg_hba `clientcert=verify-ca` catch-all, no carveouts.
-> - **Cleanup system** — `docker/.yashigani-install-state` file written at install completion; uninstall reads it for cross-UID runtime selection. Required for correct dual-runtime / multi-user host behaviour.
+> **Upgrade notice (v2.23.4):** OPA now fails-CLOSED on every exception path (timeout, 5xx, connection refused). Operators with intermittently-reachable OPA should alert on `yashigani_opa_response_check_failures_total`. Dev opt-in to prior fail-open behaviour: `YASHIGANI_OPA_OPTIONAL=true` (non-production only).
 
 ---
 **Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
-**Document Date:** 2026-05-07
+**Document Date:** 2026-06-06
 ---
 **Classification:** ***Public — Product Overview***
 ---
@@ -177,17 +174,49 @@ For a more detailed explanation, see the [Compliance Reports](docs/compliance/RE
 
 ## 7. Current Release Highlights
 
-The v2.23 line currently ships five releases. v2.23.0 is the single-branch / API-first / strict-CSP foundation; v2.23.1 adds core-plane mTLS and the two-tier PKI; v2.23.2 delivers the security hardening batch, supply-chain controls, and N-1 upgrade validation; v2.23.3 adds DNS-rebinding defence, PKI admin UI + BYO-CA driver, air-gap deployment, API3 BOPLA, backup encryption, and password-history reuse rejection; v2.23.4 closes the cleanup-system architectural class, ships the pgbouncer mTLS sidecar (`letta-pgbouncer`), documents the KMS-architectural posture for credentials, adds Open WebUI in-mesh routing, `/me/api-key` self-service issuance, HUMAN identity registration on local-auth login, and OPA fail-closed posture. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+The current release is **v2.25.2**. The v2.23 line established the core security foundation (mTLS, OPA, PKI, audit chain, BOPLA, air-gap); the v2.24 series hardened the K8s/Helm path, shipped FIPS 140-3 alignment, signed+encrypted backups, and addressed pgbouncer auth cycles; the v2.25 series enforces TLS 1.3 on the internal mesh, ships the Wazuh SIEM full-stack integration, and closes the audit DB and OPA hardening backlog. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+
+### v2.25.2 — Wazuh Integration, Audit DB Least-Privilege, OPA Hardening, PII Decode-Before-Classify
+
+v2.25.2 closes the Wazuh SIEM full-stack integration for Linux/Docker deployments (mTLS certificate auto-provisioning in `install.sh`, tar-over-exec backup with SHA-256 integrity check, configurable convergence-gate timeout), splits the PostgreSQL audit DB into least-privilege roles (`yashigani_admin` for schema management and `yashigani_app` for runtime access), wires the `PostgresSink` audit event path, hardens OPA (deny-override class fix, `mcp.rego` added to the Helm policy bundle, depth-limit test corrections), and adds decode-before-classify so PII inspection correctly processes base64/URL-encoded payloads. Tag SSH-signed.
+
+### v2.25.1 — TLS 1.3 Minimum on Internal Mesh
+
+v2.25.1 enforces TLS 1.3 as the minimum protocol version across the Yashigani internal mTLS mesh, disabling TLS 1.2 on all internal service-to-service connections. External-facing listeners are unchanged. Tag SSH-signed.
+
+### v2.25.0 — Kubernetes/Helm Parity (Wave 1–3), Signed + Encrypted Install-Time Backup
+
+v2.25.0 completes three waves of Kubernetes/Helm parity with the Docker Compose deployment: container `securityContext` fields, resource limits, Helm chart `values.yaml` structure, and policy bundle consistency now match the compose reference across all three waves. The install-time backup is upgraded to dual-wrap AES-256-GCM encryption: argon2id-derived KEK1 from the operator passphrase, plus a per-install local key (KEK2) stored in a Docker named secret. This supersedes the prior `age` X25519 scheme. Tag SSH-signed.
+
+### v2.24.4 — FIPS 140-3 Deployment Posture
+
+v2.24.4 formally documents and enforces the FIPS 140-3 deployment posture (CMVP #4985). SHA-256 verification is handled via the OpenSSL FIPS Provider when `FIPS_MODE=1`. Algorithms and key sizes outside the FIPS-approved set are blocked at configuration load time. Operator guidance added at `docs/operations/fips-deployment.md`. Tag SSH-signed.
+
+### v2.24.3 — pgbouncer cert+pg_ident mTLS, Podman Seccomp Fix
+
+v2.24.3 closes the multi-cycle pgbouncer authentication hardening: `cert` auth method with `pg_ident` CN mapping (`pgb-auth-map`) gives the strongest posture — verify-full (chain + CN) with no SCRAM computation, resolving a platform-specific SCRAM client bug on ARM64/macOS Podman. Fixes the Podman `security_opt` override regression (relative seccomp path; `no-new-privileges` restored). Tag SSH-signed.
+
+### v2.24.2 — Security Hardening Batch (Audit Chain, SoD, OPA Gaps, TOTP Counter, Caddy Egress)
+
+v2.24.2 ships a batch of security hardening commits: audit chain cross-batch ordering stability (bigserial sequence column), admin/user separation-of-duties enforcement (collision checks on all auth creation paths), OPA conformance gap closures (GAP-001 `/v1/models` and GAP-002 `/v1/proxy` response leg), TOTP failure counter migrated to Redis (survives restarts, consistent across replicas), Caddy egress iptables OUTPUT allowlist with K8s NetworkPolicy equivalent, and runtime settings Phase 2 web UI. Tag SSH-signed.
+
+### v2.24.1 — DDoSProtector, Per-User Rate Limit, Runtime Settings Phase 1
+
+v2.24.1 instantiates `DDoSProtector` with per-IP defaults scaled to the installed licence tier, adds per-user 100 RPS rate limiting with Prometheus alerting and audit events, and ships Phase 1 of the runtime settings system (DB persistence, service layer, admin API, Redis pub/sub live-reload for three initial tunables). Tag SSH-signed.
+
+### v2.24.0 — Separation-of-Duties, API Docs Gate, Caddyfile Parity Gate
+
+v2.24.0 closes admin/user account-tier separation gaps, ships the OpenAPI schema drift gate (regenerates `docs/api/*.md` from live FastAPI schema and fails the build on drift), adds the Caddyfile family parity gate (caddy adapt across all compose + helm variants), and wires the Open WebUI → gateway in-mesh path through a dual-port gateway surface. Tag SSH-signed.
 
 ### v2.23.4 — Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, and KMS Posture Reframe
 
-v2.23.4 closes the v2.23.3 follow-up backlog and lands an architectural close of the install/uninstall cleanup-system class (state file + container-fallback rm + cross-UID handlers across the entire lifecycle). It ships the `letta-pgbouncer` mTLS sidecar (closing YSG-RISK-048), the Open WebUI in-mesh path through the gateway, `/me/api-key` self-service Bearer issuance, HUMAN identity registration on local-auth login, and the OPA fail-closed posture. Ava 13/13 E2E PASS at tag (Phase 1 + Phase 2 + crucible test of the `.env` cross-UID handler). Tag SSH-signed.
+v2.23.4 closes the v2.23.3 follow-up backlog and lands an architectural close of the install/uninstall cleanup-system class (state file + container-fallback rm + cross-UID handlers across the entire lifecycle). It ships the `letta-pgbouncer` mTLS sidecar, the Open WebUI in-mesh path through the gateway, `/me/api-key` self-service Bearer issuance, HUMAN identity registration on local-auth login, and the OPA fail-closed posture. Tag SSH-signed.
 
-**Cleanup-System Architectural Close** -- Install and uninstall now share a persisted state file (`docker/.yashigani-install-state`, mode 0644, key=value with `RUNTIME` / `INSTALL_UID` / `INSTALL_USER`), eliminating runtime-detection and ownership-assumption heuristics. uninstall.sh's container-fallback `rm` (Alpine-image based, sudo-free) handles cross-UID chown'd dirs (`docker/{data,certs,logs}`) and secrets (`docker/secrets/*`) without requiring `sudo` on non-PTY SSH sessions. Dotfile-aware wipe glob (`.[!.]* + ..?*`) prevents `.pki-status` from surviving the wipe. `.env` cross-UID handler skips-with-WARN when host-side read fails; `docker compose down` proceeds via Docker socket. `_do_chgrp` hoisted to script scope. Closes BACKLOG-V240-003 / -004 / -006 and the architectural root cause of five cascading uninstall blockers.
+**Cleanup-System Architectural Close** -- Install and uninstall now share a persisted state file (`docker/.yashigani-install-state`, mode 0644, key=value with `RUNTIME` / `INSTALL_UID` / `INSTALL_USER`), eliminating runtime-detection and ownership-assumption heuristics. uninstall.sh's container-fallback `rm` (Alpine-image based, sudo-free) handles cross-UID chown'd dirs (`docker/{data,certs,logs}`) and secrets (`docker/secrets/*`) without requiring `sudo` on non-PTY SSH sessions. Dotfile-aware wipe glob (`.[!.]* + ..?*`) prevents `.pki-status` from surviving the wipe. `.env` cross-UID handler skips-with-WARN when host-side read fails; `docker compose down` proceeds via Docker socket. `_do_chgrp` hoisted to script scope.
 
-**`letta-pgbouncer` mTLS Sidecar** -- Letta's postgres connection now routes through a dedicated session-mode pgbouncer sidecar (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, `read_only:true`, `cap_drop:[ALL]`, `no-new-privileges`). The sidecar presents `letta-pgbouncer_client.crt` to postgres over mTLS; postgres `pg_hba.conf` catch-all (`hostssl all all 0.0.0.0/0 scram-sha-256 clientcert=verify-ca`) applies uniformly with no letta carveout. Closes the asyncpg+pg8000 client-cert-URI-param limitation at the sidecar boundary. Closes YSG-RISK-048.
+**`letta-pgbouncer` mTLS Sidecar** -- Letta's postgres connection now routes through a dedicated session-mode pgbouncer sidecar (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, `read_only:true`, `cap_drop:[ALL]`, `no-new-privileges`). The sidecar presents `letta-pgbouncer_client.crt` to postgres over mTLS; postgres `pg_hba.conf` catch-all (`hostssl all all 0.0.0.0/0 scram-sha-256 clientcert=verify-ca`) applies uniformly with no letta carveout. Closes the asyncpg+pg8000 client-cert-URI-param limitation at the sidecar boundary.
 
-**KMS-Architectural Posture for Credentials** -- The cleartext `userlist.txt` is documented at `docs/yashigani_install_config.md` §6.1 as the non-KMS dev/standalone posture (YSG-RISK-049 ACCEPTED-LOW). Production deployments configure a KMS provider via `YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper`; the providers in `src/yashigani/kms/` fetch credentials at runtime, bypassing the cleartext-on-disk path entirely. The yashigani-internal Bearer is per-install (32-char charset-compliant token at `docker/secrets/yashigani_internal_bearer`, mode 0600) — the literal string `yashigani-internal` is gone from production source.
+**KMS-Architectural Posture for Credentials** -- The cleartext `userlist.txt` is documented at `docs/yashigani_install_config.md` §6.1 as the non-KMS dev/standalone posture. Production deployments configure a KMS provider via `YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper`; the providers in `src/yashigani/kms/` fetch credentials at runtime, bypassing the cleartext-on-disk path entirely. The yashigani-internal Bearer is per-install (32-char charset-compliant token at `docker/secrets/yashigani_internal_bearer`, mode 0600) — the literal string `yashigani-internal` is gone from production source.
 
 **Open WebUI → Gateway In-Mesh Path** -- The gateway exposes a dual-port surface: `:8080` for mTLS edge traffic and `:8081` for plain-HTTP in-mesh traffic carrying an `Authorization: Bearer yashigani-internal` token. Open WebUI joins the `caddy_internal` network and routes chat completions via the gateway rather than direct to Ollama, so OPA policy + identity-binding apply to UI traffic the same way they apply to API traffic. The Ollama default model `qwen2.5:3b` auto-pulls on first install with `--with-openwebui` so the chat UI works out of the box.
 
@@ -203,7 +232,6 @@ v2.23.4 closes the v2.23.3 follow-up backlog and lands an architectural close of
 
 **OPA + Helm Policy Bundle Alignment** -- The K8s helm chart previously shipped a stub OPA ConfigMap with package `yashigani.v1_routing` and no `decision` / `allow_v1` rules — the gateway read `result.get("allow", False)` against the empty result, returning 403 on every K8s chat request. Replaced with the verbatim compose `policy/{yashigani,v1_routing,rbac,agents}.rego` bundle so K8s and compose make the same policy decisions.
 
-**Iris+Laura Design-Review-First Sequencing** -- Every cross-component / security-touching / architectural change in the v2.23.4 close-out arc went through an Iris design review and a Laura threat-model before any implementer dispatch. 10+ review cycles persisted as design docs at `internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`. The pattern produced zero "ship-then-rework" cycles after adoption; cascading regressions in the pre-pattern era (5 layers of stunnel workarounds before the pgbouncer reframe) became the failure mode that the rule was designed to prevent.
 
 ### v2.23.3 — DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, and Password-History Reuse Rejection
 
@@ -221,7 +249,7 @@ v2.23.3 is a security and supply-chain hardening release on top of v2.23.2. It a
 
 **Password Reuse History (CMMC L2 IA.L2-3.5.8)** -- Self-service password changes check the new password against the last `PASSWORD_HISTORY_DEPTH` (default 12, range 1–24) Argon2id hashes in the new `password_history` table (migration 0010). Reuse rejected HTTP 422 `password_reuse`. Audit event `PASSWORD_REUSE_REJECTED` emits `user_id` and `history_depth_checked` only — no password or hash ever logged.
 
-**`fasttext-wheel` → scikit-learn Swap** -- The prompt-injection sensitivity classifier migrated from the abandoned `fasttext-wheel==0.9.2` (last upstream release Sep 2020) to `scikit-learn>=1.4` + `joblib>=1.3`. The trained model is now stored and loaded via joblib; equivalent classification quality with active upstream maintenance. Closes YSG-RISK-040.
+**`fasttext-wheel` → scikit-learn Swap** -- The prompt-injection sensitivity classifier migrated from the abandoned `fasttext-wheel==0.9.2` (last upstream release Sep 2020) to `scikit-learn>=1.4` + `joblib>=1.3`. The trained model is now stored and loaded via joblib; equivalent classification quality with active upstream maintenance.
 
 **N-1 Upgrade Validation (v2.23.2 → v2.23.3)** -- The install-and-upgrade smoke matrix (introduced in v2.23.2) now validates the v2.23.2 → v2.23.3 upgrade path on the same four platform combinations (macOS Podman / macOS Docker / Linux Podman / Linux Docker). Backup, upgrade, restore, and both-admin reachability verified at every CI run.
 
