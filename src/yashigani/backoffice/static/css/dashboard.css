@@ -126,7 +126,7 @@ tr:hover { background: #f8fafc; }
 .onboarding { display: none; margin-bottom: 20px; padding: 16px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; }
 .onboarding-title { margin: 0 0 12px; font-size: 1rem; color: #1e40af; }
 .onboarding-items { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; }
-.onboarding-lbl { color: #64748b; }
+.onboarding-lbl { color: #64748b; cursor: pointer; }
 
 /* ── Credentials / token panels ────────────────────────────── */
 /* hidden until shown once */
@@ -167,6 +167,22 @@ tr:hover { background: #f8fafc; }
 .txt-info { font-size: 0.8rem; color: #64748b; }
 .txt-version { font-size: 0.85rem; color: #64748b; }
 .txt-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+
+/* ── Policies page (moved off inline styles — strict CSP, v2.25.3) ── */
+.is-hidden { display: none; }
+.mt-sm { margin-top: 8px; }
+.mt-xs { margin-top: 6px; }
+.pol-row { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pol-lbl { font-size: 0.82rem; color: #475569; }
+.pol-result { font-size: 0.8rem; }
+.pol-badge { font-size: 0.7rem; margin-left: 8px; }
+.pol-close { float: right; font-size: 0.75rem; }
+.pol-input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 160px; }
+.pol-prompt { width: 100%; min-height: 64px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; }
+.pol-src { width: 100%; min-height: 380px; box-sizing: border-box; background: #0f172a; color: #e2e8f0; padding: 14px; border: 1px solid #1e293b; border-radius: 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem; line-height: 1.45; white-space: pre; }
+.pol-saveas { display: none; gap: 6px; align-items: center; }
+/* JS-injected policy-category badge */
+.badge-template { background: #fef3c7; color: #92400e; }
 .txt-mt8 { margin-top: 8px; }
 .txt-mt16 { margin-top: 16px; }
 /* panel body prose: PKI CA mode */

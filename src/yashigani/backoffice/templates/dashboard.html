@@ -41,10 +41,10 @@
             <div id="onboarding-checklist" class="onboarding">
                 <h3 class="onboarding-title">Getting Started</h3>
                 <div class="onboarding-items">
-                    <label id="ob-password" class="onboarding-lbl" data-action="showPage" data-param="accounts" style="cursor:pointer"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" class="onboarding-lbl" data-action="showPage" data-param="agents" style="cursor:pointer"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" class="onboarding-lbl" data-action="showPage" data-param="budgets" style="cursor:pointer"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" class="onboarding-lbl" data-action="showPage" data-param="alerts" style="cursor:pointer"><input type="checkbox" disabled> Set up alert webhooks</label>
+                    <label id="ob-password" class="onboarding-lbl" data-action="showPage" data-param="accounts"><input type="checkbox" disabled> Change default password</label>
+                    <label id="ob-agent" class="onboarding-lbl" data-action="showPage" data-param="agents"><input type="checkbox" disabled> Register your first agent</label>
+                    <label id="ob-budget" class="onboarding-lbl" data-action="showPage" data-param="budgets"><input type="checkbox" disabled> Configure budget allocation</label>
+                    <label id="ob-alerts" class="onboarding-lbl" data-action="showPage" data-param="alerts"><input type="checkbox" disabled> Set up alert webhooks</label>
                 </div>
                 <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
             </div>
@@ -432,34 +432,34 @@
                 <div class="panel-body">
                     <p class="txt-note">Describe the policy in plain English; the internal LLM drafts the Rego. Review &amp; edit
                         below, then save (which OPA‑validates it). e.g. <em>"allow openclaw to read and reply to all my emails but not delete them"</em>.</p>
-                    <textarea id="policy-gen-prompt" spellcheck="false" placeholder="Describe the policy…" style="width:100%;min-height:64px;box-sizing:border-box;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;"></textarea>
-                    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                        <label style="font-size:0.82rem;color:#475569;">Name <code>clients.</code></label>
-                        <input id="policy-gen-name" type="text" placeholder="email_guard" style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:150px;">
+                    <textarea id="policy-gen-prompt" spellcheck="false" placeholder="Describe the policy…" class="pol-prompt"></textarea>
+                    <div class="pol-row">
+                        <label class="pol-lbl">Name <code>clients.</code></label>
+                        <input id="policy-gen-name" type="text" placeholder="email_guard" class="pol-input">
                         <button class="btn btn-sm btn-sm-save" data-action="policyGenerate">Generate</button>
-                        <span id="policy-gen-result" style="font-size:0.8rem;"></span>
+                        <span id="policy-gen-result" class="pol-result"></span>
                     </div>
                 </div>
             </div>
-            <div class="panel" id="policy-view-panel" style="display:none;">
+            <div class="panel is-hidden" id="policy-view-panel">
                 <div class="panel-header">
                     <span id="policy-view-title">Policy source</span>
-                    <span id="policy-view-badge" style="font-size:0.7rem;margin-left:8px;"></span>
-                    <button class="btn btn-sm" data-action="policyClose" style="float:right;font-size:0.75rem;">Close</button>
+                    <span id="policy-view-badge" class="pol-badge"></span>
+                    <button class="btn btn-sm pol-close" data-action="policyClose">Close</button>
                 </div>
                 <div class="panel-body">
-                    <textarea id="policy-view-src" readonly spellcheck="false" style="width:100%;min-height:380px;box-sizing:border-box;background:#0f172a;color:#e2e8f0;padding:14px;border:1px solid #1e293b;border-radius:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:0.8rem;line-height:1.45;white-space:pre;"></textarea>
-                    <div id="policy-edit-controls" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <textarea id="policy-view-src" readonly spellcheck="false" class="pol-src"></textarea>
+                    <div id="policy-edit-controls" class="pol-row">
                         <button class="btn btn-sm" data-action="policyEditCopy">Create editable copy</button>
-                        <span id="policy-saveas" style="display:none;gap:6px;align-items:center;">
-                            <label style="font-size:0.82rem;color:#475569;">Save as <code>clients.</code></label>
+                        <span id="policy-saveas" class="pol-saveas">
+                            <label class="pol-lbl">Save as <code>clients.</code></label>
                             <input id="policy-copy-name" type="text" placeholder="my_org_gdpr" pattern="[a-z][a-z0-9_]*"
-                                   style="padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:0.85rem;width:160px;">
+                                   class="pol-input">
                             <button class="btn btn-sm btn-sm-save" data-action="policySaveCopy">Save</button>
                         </span>
-                        <span id="policy-save-result" style="font-size:0.8rem;"></span>
+                        <span id="policy-save-result" class="pol-result"></span>
                     </div>
-                    <p class="txt-note" style="margin-top:8px;">Examples are <strong>immutable templates</strong>. "Create editable copy"
+                    <p class="txt-note mt-sm">Examples are <strong>immutable templates</strong>. "Create editable copy"
                         lets you edit and save under a new name (<code>clients.&lt;name&gt;</code>) — validated by OPA and loaded immediately.
                         To persist across a full redeploy, add it to your policy bundle. (Activate + ingress/egress enforcement is the next phase.)</p>
                 </div>
@@ -522,7 +522,7 @@
                         <button id="btn-create-backup" data-action="createBackup" class="btn-sm-save">Create backup</button>
                         <button id="btn-verify-latest" data-action="verifyBackup" class="btn-verify" disabled>Verify latest</button>
                     </div>
-                    <p class="txt-note" style="margin-top:6px;">"Create backup" takes an on-demand database snapshot (accounts, RBAC,
+                    <p class="txt-note mt-xs">"Create backup" takes an on-demand database snapshot (accounts, RBAC,
                         agents, policies, budgets, audit). Full-system restore/recovery is an installer operation.</p>
                     <div id="backup-create-result" class="backup-verify-result"></div>
                     <div id="backup-verify-result" class="backup-verify-result"></div>

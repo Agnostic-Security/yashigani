@@ -88,7 +88,7 @@ async function viewPolicy(id, cat) {
     if (!panel || !ta) return;
     title.textContent = id;
     badge.innerHTML = (cat === 'example')
-        ? '<span class="badge" style="background:#fef3c7;color:#92400e;">immutable template</span>'
+        ? '<span class="badge badge-template">immutable template</span>'
         : (cat === 'client' ? '<span class="badge badge-green">client copy</span>' : '');
     // Reset to view (read-only) state each time.
     ta.readOnly = true;
