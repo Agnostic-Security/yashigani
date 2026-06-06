@@ -24,6 +24,23 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SANITIZE_THRESHOLD = 0.85
 
 
+def _record_classification(classification: str, severity: str) -> None:
+    """Emit the inspection-pipeline verdict metric (label = threat category,
+    severity = ''/HIGH/CRITICAL).
+
+    This is the metric the Security Overview / Agent Activity dashboards and the
+    CredentialExfil / PromptInjection alerts query. Lazy import avoids a
+    metrics<->pipeline import cycle; metrics must never break a request.
+    """
+    try:
+        from yashigani.metrics.registry import inspection_classifications_total
+        inspection_classifications_total.labels(
+            label=classification, severity=severity
+        ).inc()
+    except Exception:  # pragma: no cover — never fail a request on metrics
+        pass
+
+
 @dataclass
 class PipelineResult:
     request_id: str
@@ -100,18 +117,20 @@ class InspectionPipeline:
 
         # Step 3: Disposition
         if result.label == LABEL_CLEAN:
-            return self._pass_through(request_id, raw_query, session_id, agent_id)
-
-        if result.label == LABEL_CREDENTIAL_EXFIL:
-            return self._handle_credential_exfil(
+            pipeline_result = self._pass_through(request_id, raw_query, session_id, agent_id)
+        elif result.label == LABEL_CREDENTIAL_EXFIL:
+            pipeline_result = self._handle_credential_exfil(
                 request_id, raw_query, masked_query, result,
                 session_id, agent_id, user_id,
             )
+        else:  # PROMPT_INJECTION_ONLY
+            pipeline_result = self._handle_injection_only(
+                request_id, result, session_id, agent_id, user_id,
+            )
 
-        # PROMPT_INJECTION_ONLY
-        return self._handle_injection_only(
-            request_id, result, session_id, agent_id, user_id,
-        )
+        # Emit the designed pipeline-verdict metric for every disposition.
+        _record_classification(pipeline_result.classification, pipeline_result.severity)
+        return pipeline_result
 
     def update_threshold(self, threshold: float) -> None:
         """Admin-configurable sanitization confidence threshold."""

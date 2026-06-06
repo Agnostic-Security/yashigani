@@ -139,3 +139,43 @@ class TestClassificationPrompt:
         # the function contract does not guarantee a safe default for completely unparseable input.
         with pytest.raises(ValueError):
             parse_classification_response("this is not json at all")
+
+
+class TestClassificationMetricEmission:
+    """Regression guard (2.25.3): the pipeline MUST emit
+    yashigani_inspection_classifications_total{label, severity} at every verdict.
+
+    This is the metric the Security Overview / Agent Activity dashboards and the
+    CredentialExfil / PromptInjection alerts query. The emit was never wired
+    before 2.25.3, so those panels/alerts matched nothing despite a working
+    pipeline. If this test fails, the designed gate is no longer observable.
+    """
+
+    def _run(self, label, confidence, exfil):
+        from yashigani.inspection.pipeline import InspectionPipeline
+        from yashigani.inspection.classifier import ClassifierResult
+        mock_classifier = MagicMock()
+        mock_classifier.classify.return_value = ClassifierResult(
+            label=label, confidence=confidence,
+            exfil_indicators=exfil, detected_payload_spans=[],
+        )
+        pipeline = InspectionPipeline(classifier=mock_classifier, sanitize_threshold=0.85)
+        return pipeline.process(
+            "probe", session_id="s", agent_id="a", user_id="u",
+        )
+
+    @pytest.mark.parametrize("label,severity,exfil", [
+        ("CLEAN", "", False),
+        ("PROMPT_INJECTION_ONLY", "HIGH", False),
+        ("CREDENTIAL_EXFIL", "CRITICAL", True),
+    ])
+    def test_verdict_increments_classification_metric(self, label, severity, exfil):
+        from yashigani.metrics.registry import inspection_classifications_total
+        child = inspection_classifications_total.labels(label=label, severity=severity)
+        before = child._value.get()
+        self._run(label, confidence=0.99, exfil=exfil)
+        after = child._value.get()
+        assert after == before + 1, (
+            f"pipeline verdict {label}/{severity} did not increment "
+            "inspection_classifications_total — the designed metric is unwired"
+        )
