@@ -34,7 +34,16 @@ def run_migrations() -> None:
     migrations_dir = os.path.join(os.path.dirname(__file__), "migrations")
     alembic_cfg = Config()
     alembic_cfg.set_main_option("script_location", migrations_dir)
-    dsn = os.environ.get("YASHIGANI_DB_DSN", "")
+    # v2.25.2 (Lu wire-sink-gate P1 — least-privilege runtime role):
+    # DDL / migrations MUST run as the admin superuser (yashigani_admin), NOT as
+    # the demoted runtime role (yashigani_app, NOSUPERUSER + non-owner).  The
+    # admin DSN is provided via YASHIGANI_DB_DSN_ADMIN; we fall back to the
+    # runtime DSN only when the admin DSN is unset (legacy single-role installs /
+    # tests that have not split credentials).  ALTER ROLE / REASSIGN OWNED in
+    # migration 0015 require the admin identity.
+    dsn = os.environ.get("YASHIGANI_DB_DSN_ADMIN") or os.environ.get("YASHIGANI_DB_DSN", "")
+    if os.environ.get("YASHIGANI_DB_DSN_ADMIN"):
+        logger.info("run_migrations: using admin DSN (YASHIGANI_DB_DSN_ADMIN) for DDL")
     sync_dsn = dsn.replace("postgresql://", "postgresql+psycopg2://").replace(
         "postgresql+asyncpg://", "postgresql+psycopg2://"
     )
@@ -61,7 +70,14 @@ def run_migrations() -> None:
     # pointing at yashigani-postgres:5432, bypassing yashigani-pgbouncer:5432)
     # for the lock connection when it's set; compose runs single-replica so
     # falls back to YASHIGANI_DB_DSN where contention doesn't matter.
-    lock_dsn = os.environ.get("YASHIGANI_DB_DSN_DIRECT") or dsn
+    # v2.25.2: the advisory-lock connection runs the same DDL session, so it must
+    # use the admin direct DSN when available (admin identity, bypassing pgbouncer
+    # for session-scoped advisory locks).
+    lock_dsn = (
+        os.environ.get("YASHIGANI_DB_DSN_ADMIN_DIRECT")
+        or os.environ.get("YASHIGANI_DB_DSN_DIRECT")
+        or dsn
+    )
     # RETRO-R4-2: use connect_with_retry_sync instead of bare psycopg2.connect()
     # so a postgres restart mid-startup fails fast (connect_timeout=15s) and
     # retries rather than hanging the process indefinitely.

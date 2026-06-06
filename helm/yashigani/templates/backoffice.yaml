@@ -178,6 +178,25 @@ spec:
               # ca_bundle.crt: postgres also serves chain-bundle cert; libpq
               # requires bundle CA to verify (internal integration finding).
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key"
+            # v2.25.2 (Lu wire-sink-gate P1): DDL / Alembic run as the admin
+            # superuser yashigani_admin; runtime pool stays on yashigani_app.
+            - name: YASHIGANI_DB_DSN_ADMIN
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key"
+            - name: YASHIGANI_DB_DSN_ADMIN_DIRECT
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key"
+            {{- end }}
+            # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): the daily
+            # audit-chain checkpoint scheduler runs in backoffice. The ECDSA signing
+            # key is mounted RO via the audit-signing Secret (backoffice ONLY — NOT
+            # mounted into gateway/runtime), so a held yashigani_app credential
+            # cannot forge a signed checkpoint. Absent key => unsigned (still
+            # tamper-evident). Gated on a values flag so air-gapped/community
+            # deployments without the Secret still schedule (unsigned) checkpoints.
+            {{- if .Values.audit.signingKey.enabled }}
+            - name: YASHIGANI_AUDIT_SIGNING_KEY_PATH
+              value: "/run/audit-signing/audit_signing.key"
+            - name: YASHIGANI_AUDIT_SIGNING_SPIFFE_ID
+              value: "spiffe://yashigani.internal/audit/checkpoint-signer"
             {{- end }}
             - name: YASHIGANI_OPA_URL
               value: "https://yashigani-policy:8181"
@@ -364,6 +383,14 @@ spec:
               subPath: license_key
               readOnly: true
             {{- end }}
+            {{- if .Values.audit.signingKey.enabled }}
+            # v2.25.2 (Lu wire-sink-gate P2): audit-chain signing key — RO, backoffice
+            # ONLY. Distinct mountPath (/run/audit-signing) NOT under /run/secrets so
+            # the gateway (which mounts the PKI secret) never sees it.
+            - name: audit-signing
+              mountPath: /run/audit-signing
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -422,6 +449,20 @@ spec:
           secret:
             secretName: yashigani-license
             defaultMode: 0440
+        {{- end }}
+        {{- if .Values.audit.signingKey.enabled }}
+        # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): audit-chain
+        # checkpoint signing key Secret. Mounted RO into backoffice ONLY (the
+        # scheduler runs here) — never into gateway/runtime, so a held
+        # yashigani_app DB credential cannot read it / forge a signed checkpoint.
+        # Populate the Secret (key audit_signing.key) with the internal-CA ECDSA
+        # leaf; see install.sh _provision_audit_signing_key for the compose
+        # equivalent. defaultMode 0400 — owner-read only.
+        - name: audit-signing
+          secret:
+            secretName: {{ .Values.audit.signingKey.existingSecretName | default "yashigani-audit-signing" }}
+            defaultMode: 0400
+            optional: true
         {{- end }}
 ---
 apiVersion: v1

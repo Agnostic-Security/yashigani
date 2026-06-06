@@ -2431,7 +2431,9 @@ _backup_existing_data() {
   # K8s path: find the running postgres pod and exec pg_dump via kubectl.
   # The postgres pod runs as runAsUser: 70 (postgres on Alpine), so kubectl exec
   # arrives as UID 70 — the postgres superuser for this cluster. No root needed;
-  # pg_dump -U yashigani_app connects via the local Unix socket (trust auth).
+  # pg_dump -U yashigani_admin (v2.25.2: the DDL/admin superuser) connects via
+  # the local Unix socket (trust auth) — a full dump needs the superuser, the
+  # demoted runtime role yashigani_app cannot read every table.
   # Compose/Podman path: exec into the named container. Container name varies by
   # runtime and install order, so detect via docker/podman ps rather than
   # hardcoding 'docker-postgres-1'.
@@ -2442,7 +2444,7 @@ _backup_existing_data() {
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     if [[ -n "$_pg_pod" ]]; then
       if kubectl exec -i -n "${NAMESPACE}" "$_pg_pod" -- \
-           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+           pg_dump -U yashigani_admin yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
         log_info "  postgres_dump.sql backed up (K8s: pod ${_pg_pod})"
       else
         log_info "  Postgres K8s dump skipped (pod not ready or auth failed)"
@@ -2460,7 +2462,7 @@ _backup_existing_data() {
       | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
     if [[ -n "$_pg_container" ]]; then
       if $_runtime_cmd exec "$_pg_container" \
-           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+           pg_dump -U yashigani_admin yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
         log_info "  postgres_dump.sql backed up (${RUNTIME:-compose}: container ${_pg_container})"
       else
         log_info "  Postgres dump failed for container ${_pg_container} — dump skipped"
@@ -2632,7 +2634,7 @@ _backup_existing_data() {
     | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
   if [[ -n "$_pg_container_for_hash" ]]; then
     _admin_phc=$($_runtime_cmd_local exec "$_pg_container_for_hash" \
-      psql -U yashigani_app yashigani -t -A \
+      psql -U yashigani_admin yashigani -t -A \
       -c "SELECT password_hash FROM admin_accounts WHERE account_tier='admin' AND disabled=false ORDER BY created_at LIMIT 1;" \
       2>/dev/null | tr -d '[:space:]' || true)
     if [[ -z "$_admin_phc" ]]; then
@@ -4747,6 +4749,73 @@ PYEOF
   log_success "Wazuh full-mTLS material provisioned (docker/wazuh-mtls/, git-ignored)"
 }
 
+# =============================================================================
+# _provision_audit_signing_key — internal-CA leaf for audit-chain checkpoints
+# =============================================================================
+# Lu wire-sink-gate P2 (v2.25.2 — irrevocable signed chain):
+#   The daily audit-chain checkpoint (AuditChainService.run_daily_checkpoint)
+#   signs the merkle root with an ECDSA leaf private key.  This function mints a
+#   dedicated audit-signing leaf (EC P-256, PKCS#8) signed by the internal
+#   intermediate CA — mirroring the wazuh-admin pattern in _provision_wazuh_mtls.
+#
+# CRITICAL PLACEMENT (Tiago directive 2026-06-04):
+#   The signing key is written to docker/secrets/audit-signing/audit_signing.key
+#   and mounted RO into BACKOFFICE ONLY (compose: ./secrets/audit-signing →
+#   /run/audit-signing).  It is NOT mounted into the gateway/runtime path, so a
+#   held yashigani_app DB credential cannot read it and cannot forge a signed
+#   checkpoint.  The public cert (audit_signing.crt) is world-readable so an
+#   auditor / verification tool can validate signatures against the internal CA.
+#
+# Idempotent: skips when the key already exists (rotation is a separate concern;
+# the key is long-lived like the wazuh-admin cert — 825 days).  Fail-closed:
+# returns non-zero if the intermediate CA material is missing.
+_provision_audit_signing_key() {
+  local secrets="${WORK_DIR}/docker/secrets"
+  local asd="${secrets}/audit-signing"
+  local keyf="${asd}/audit_signing.key"
+  local crtf="${asd}/audit_signing.crt"
+
+  if [[ -f "$keyf" && -f "$crtf" ]]; then
+    log_info "Audit-chain signing key already provisioned — skipping"
+    return 0
+  fi
+  if [[ ! -f "${secrets}/ca_intermediate.crt" || ! -f "${secrets}/ca_intermediate.key" ]]; then
+    log_error "Audit signing-key provisioning: intermediate CA material missing — aborting (fail-closed)"
+    return 1
+  fi
+  require_cmd openssl
+  ( umask 077   # private key born owner-only
+    mkdir -p "$asd"
+    # EC P-256 key, converted to PKCS#8 (load_pem_private_key in chain.py expects PKCS#8).
+    openssl ecparam -genkey -name prime256v1 -out "${asd}/.audit-sec1.pem" 2>/dev/null
+    openssl pkcs8 -topk8 -nocrypt -in "${asd}/.audit-sec1.pem" -out "$keyf" 2>/dev/null
+    rm -f "${asd}/.audit-sec1.pem"
+    # CSR + leaf signed by the internal intermediate. CN encodes the SPIFFE-ish
+    # signing identity so an auditor can tie a signature to the issuing context.
+    openssl req -new -key "$keyf" -out "${asd}/.audit.csr" \
+      -subj "/O=Agnostic Security/CN=audit-checkpoint-signer" 2>/dev/null
+    openssl x509 -req -in "${asd}/.audit.csr" -CA "${secrets}/ca_intermediate.crt" \
+      -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "$crtf" \
+      -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+    rm -f "${asd}/.audit.csr" "${secrets}/ca_intermediate.srl"
+  )
+  if [[ ! -s "$keyf" || ! -s "$crtf" ]]; then
+    log_error "Audit signing-key provisioning: openssl produced empty key/cert — aborting"
+    return 1
+  fi
+  # Perms: key 0640 owned by the backoffice container UID (1001); cert 0644 (auditor-readable).
+  # cap_drop:[ALL] on backoffice strips DAC_OVERRIDE, so the key must be owner- or
+  # group-readable by the backoffice runtime UID. Backoffice runs as UID 1001 (see
+  # docker-compose backoffice user/_pki_chown_client_keys map). Chown best-effort
+  # (host may lack the UID on macOS virtiofs — the bind mount remaps on read).
+  chmod 0640 "$keyf" 2>/dev/null || true
+  chmod 0644 "$crtf" 2>/dev/null || true
+  chmod 0750 "$asd" 2>/dev/null || true
+  chown 1001:1001 "$keyf" 2>/dev/null || true
+  chown 1001:1001 "$asd"  2>/dev/null || true
+  log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -5343,7 +5412,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         for _ssl_i in $(seq 1 30); do
           local _ssl_check
           _ssl_check=$("${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
-              psql -U yashigani_app -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
+              psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
           if [[ "$_ssl_check" == "on" ]]; then
             log_success "  postgres SSL enabled (cp path, confirmed on retry ${_ssl_i})"
             _ssl_ok=1; break
@@ -5359,7 +5428,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         _pg_pass=$(cat "${WORK_DIR}/docker/secrets/postgres_password" 2>/dev/null || echo "")
         if [[ -n "$_pg_pass" ]]; then
           "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
-              psql -U yashigani_app -d yashigani -h 127.0.0.1 \
+              psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
               -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>/dev/null || true
           log_info "  SCRAM re-hash applied (cp path)"
         fi
@@ -6073,7 +6142,7 @@ _upgrade_postgres_ssl() {
   log_info "Checking postgres SSL state (upgrade path)..."
   local _ssl_state
   _ssl_state=$("${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
-      psql -U yashigani_app -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
+      psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
 
   if [[ "$_ssl_state" == "on" ]]; then
     log_info "Postgres SSL already enabled — skipping SSL upgrade injection"
@@ -6159,7 +6228,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   for _i in $(seq 1 $_retries); do
     local _ssl_check
     _ssl_check=$("${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
-        psql -U yashigani_app -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
+        psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
     if [[ "$_ssl_check" == "on" ]]; then
       log_success "postgres SSL enabled (confirmed on retry ${_i})"
       break
@@ -6182,7 +6251,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     log_warn "postgres SSL upgrade: could not read postgres_password — skipping SCRAM re-hash"
   else
     "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
-        psql -U yashigani_app -d yashigani -h 127.0.0.1 \
+        psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
         -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>&1 || {
       log_warn "postgres SSL upgrade: SCRAM re-hash failed — pgbouncer auth may fail"
     }
@@ -10215,9 +10284,16 @@ bootstrap_internal_pki() {
       # NOT sweep-chmod existing keys. Ownership is applied only when new key
       # material has actually been written. GATE5-BUG-01.
       _pki_chown_client_keys || return 1
+      # Lu wire-sink-gate P2 (v2.25.2): ensure the audit signing key exists after
+      # rotation (idempotent — does not rotate the long-lived signing leaf).
+      _provision_audit_signing_key || return 1
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
+      # Lu wire-sink-gate P2 (v2.25.2): provision the audit signing key on the
+      # upgrade path too (idempotent — skips if already present). Installs that
+      # predate this feature have a CA but no signing leaf; mint it now.
+      _provision_audit_signing_key || return 1
       # No new keys generated. Existing keys are already correctly owned from the
       # previous install/rotate step. Do NOT re-apply chown (upgrade no-touch rule).
       # maintainer directive 2026-05-10 / GATE5-BUG-01.
@@ -10257,6 +10333,10 @@ bootstrap_internal_pki() {
   _pki_persist_env
 
   _pki_chown_client_keys || return 1  # re-own service keys to container UIDs; fail-closed
+
+  # Lu wire-sink-gate P2 (v2.25.2): mint the audit-chain checkpoint signing leaf
+  # (internal-CA, backoffice-only) so daily checkpoints are SIGNED → non-repudiable.
+  _provision_audit_signing_key || return 1
 
   log_success "Internal CA + per-service leaf certs generated"
   log_info "  CA root:      docker/secrets/ca_root.crt"

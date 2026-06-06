@@ -91,11 +91,15 @@ spec:
                 # mTLS: connect direct to postgres (not pgbouncer) for DDL — same
                 # rationale as YASHIGANI_DB_DSN_DIRECT in gateway.yaml. ca_bundle.crt
                 # provides chain verification (libpq needs full chain, not just root).
+                # v2.25.2 (Lu wire-sink-gate P1): partition maintenance performs DDL
+                # (CREATE TABLE ... PARTITION OF audit_events). The demoted runtime
+                # role yashigani_app is NOSUPERUSER + non-owner and CANNOT create
+                # partitions — this job MUST connect as the admin superuser.
                 - name: DATABASE_URL
-                  value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@{{ include "yashigani.fullname" . }}-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
+                  value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@{{ include "yashigani.fullname" . }}-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
                 {{- else }}
                 - name: DATABASE_URL
-                  value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@{{ include "yashigani.fullname" . }}-postgres:5432/yashigani"
+                  value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@{{ include "yashigani.fullname" . }}-postgres:5432/yashigani"
                 {{- end }}
               resources:
                 {{- toYaml .Values.partitionCronjob.resources | nindent 16 }}
