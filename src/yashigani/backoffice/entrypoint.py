@@ -21,7 +21,7 @@ import time
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
-from yashigani.audit.writer import AuditLogWriter
+from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
 from yashigani.auth.bootstrap import (
     load_or_generate,
     print_credentials,
@@ -90,6 +90,7 @@ def _bootstrap():
     audit_writer = AuditLogWriter(
         config=audit_config,
         masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
     )
 
     # ── Session store (Redis db/1) ──────────────────────────────────────────

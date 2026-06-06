@@ -144,6 +144,51 @@ class SiemTarget:
     enabled: bool = True
 
 
+def siem_targets_from_env(env_var: str = "YASHIGANI_SIEM_TARGETS") -> list["SiemTarget"]:
+    """Load audit SIEM-forwarding targets from deployment config at startup.
+
+    The target set is owned by the deployment layer (install.sh / compose env),
+    NOT the running app's admin state — so forwarding survives restarts and is
+    populated when a SIEM (e.g. the bundled Wazuh) is selected at install time.
+
+    ``env_var`` holds a JSON array; each entry:
+        {"name","target_type","url","auth_value", ["auth_header"], ["enabled"]}
+    Unset / empty / malformed → ``[]`` (forward to none). Never raises — a bad
+    config must not stop the gateway from starting (audit still writes locally).
+    """
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("%s is not valid JSON — no SIEM targets loaded", env_var)
+        return []
+    if not isinstance(data, list):
+        logger.warning("%s must be a JSON array — no SIEM targets loaded", env_var)
+        return []
+    targets: list[SiemTarget] = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            logger.warning("%s[%d] is not an object — skipped", env_var, i)
+            continue
+        try:
+            targets.append(
+                SiemTarget(
+                    name=entry["name"],
+                    target_type=entry["target_type"],
+                    url=entry["url"],
+                    auth_header=entry.get("auth_header", "Authorization"),
+                    auth_value=entry["auth_value"],
+                    enabled=bool(entry.get("enabled", True)),
+                )
+            )
+        except (KeyError, TypeError) as exc:
+            logger.warning("%s[%d] missing/invalid field (%s) — skipped", env_var, i, exc)
+    logger.info("Loaded %d SIEM target(s) from %s", len(targets), env_var)
+    return targets
+
+
 # ---------------------------------------------------------------------------
 # Writer
 # ---------------------------------------------------------------------------

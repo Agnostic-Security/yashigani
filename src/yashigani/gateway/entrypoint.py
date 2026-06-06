@@ -14,7 +14,7 @@ from typing import Callable, Literal, cast
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
-from yashigani.audit.writer import AuditLogWriter
+from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
 from yashigani.chs.handle import CredentialHandleService
 from yashigani.chs.resource_monitor import ResourceMonitor
 from yashigani.inspection.classifier import PromptInjectionClassifier
@@ -54,6 +54,7 @@ def _build_app(mesh_mode: bool = False):
     audit_writer = AuditLogWriter(
         config=audit_config,
         masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
     )
 
     # Resource monitor (cgroup v2 for dynamic TTL)
