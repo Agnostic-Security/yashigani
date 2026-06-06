@@ -8,7 +8,7 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [v2.25.2] — 2026-06-05
+## [v2.25.2] — 2026-06-06
 
 Theme: **Wazuh SIEM hardening + install-path reliability + audit least-privilege + OPA durability**.
 
@@ -21,6 +21,8 @@ Theme: **Wazuh SIEM hardening + install-path reliability + audit least-privilege
 
 ### Fixed
 
+- **fix(gateway): generic-proxy forward path returned 500 on every upstream success** — the forward leg passed the inbound `Content-Length` header through while the HTTP client also derived one from the body, so the upstream connection failed with a header/body length conflict on every completed forward. `Content-Length` (and `Host`) are now stripped from forwarded headers, and the forward-leg telemetry calls (anomaly detection, inference logging) were corrected to the real synchronous APIs with defensive error handling. Regression test added.
+- **fix(backoffice): "Duplicated timeseries" errors on credential-exfiltration alerts** — the backoffice package eagerly imported its FastAPI app (and its module-level Prometheus metrics) into any process that only needed shared state, causing metric re-registration errors on every exfiltration detection in the gateway. Replaced with a lazy module re-export; alerts now record cleanly. Regression test added.
 - **fix(install): pre-upgrade backup works on read-only containers** — `docker cp` refuses `ReadonlyRootfs=true` containers in both directions (Docker 29). The backup step is replaced with tar-over-`exec` plus a sha256 integrity check on the streamed bundle. The LOCKED fail-closed crypto envelope is unchanged.
 - **fix(install): pre-upgrade secrets backup non-fatal on root-owned files** — root/UID-owned client keys unreadable by a non-root install user no longer abort the upgrade under `set -e`.
 - **fix(install): convergence-gate timeout raised from 60 s to 180 s** — 60 s was triggering false failures on first boot of healthy stacks. Configurable via `YSG_HEALTHZ_TIMEOUT_S`.

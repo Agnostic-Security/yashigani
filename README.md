@@ -16,7 +16,7 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.25.2 (2026-06-05) — Wazuh SIEM full-stack Linux/Docker fixes (mTLS auto-provisioning, convergence-gate improvements), audit DB least-privilege role split, PostgresSink audit wiring, OPA hardening (deny-override class fix, Helm bundle parity, depth-limit corrections), decode-before-classify PII inspection on encoded payloads; see `CHANGELOG.md` for the full release history.
+**Latest Tagged Release:** v2.25.2 (2026-06-06) — Wazuh SIEM full-stack Linux/Docker fixes (mTLS auto-provisioning, convergence-gate improvements), audit DB least-privilege role split, PostgresSink audit wiring, OPA hardening (deny-override class fix, Helm bundle parity, depth-limit corrections), decode-before-classify PII inspection on encoded payloads; see `CHANGELOG.md` for the full release history.
 
 > **Upgrade notice (v2.25.0+):** Backup format changed to dual-wrap AES-256-GCM with argon2id KEK; legacy age-encrypted archives are not forward-compatible — migrate before upgrading. TLS 1.2 is disabled on the internal mesh (TLS 1.3 minimum from v2.25.1); internal clients must support TLS 1.3.
 
@@ -178,7 +178,7 @@ The current release is **v2.25.2**. The v2.23 line established the core security
 
 ### v2.25.2 — Wazuh Integration, Audit DB Least-Privilege, OPA Hardening, PII Decode-Before-Classify
 
-v2.25.2 closes the Wazuh SIEM full-stack integration for Linux/Docker deployments (mTLS certificate auto-provisioning in `install.sh`, tar-over-exec backup with SHA-256 integrity check, configurable convergence-gate timeout), splits the PostgreSQL audit DB into least-privilege roles (`yashigani_admin` for schema management and `yashigani_app` for runtime access), wires the `PostgresSink` audit event path, hardens OPA (deny-override class fix, `mcp.rego` added to the Helm policy bundle, depth-limit test corrections), and adds decode-before-classify so PII inspection correctly processes base64/URL-encoded payloads. Tag SSH-signed.
+v2.25.2 closes the Wazuh SIEM full-stack integration for Linux/Docker deployments (mTLS certificate auto-provisioning in `install.sh`, tar-over-exec backup with SHA-256 integrity check, configurable convergence-gate timeout), splits the PostgreSQL audit DB into least-privilege roles (`yashigani_admin` for schema management and `yashigani_app` for runtime access), wires the `PostgresSink` audit event path, hardens OPA (deny-override class fix, `mcp.rego` added to the Helm policy bundle, depth-limit test corrections), and adds decode-before-classify so PII inspection correctly processes base64/URL-encoded payloads. It also repairs the generic-proxy forward path (forwarded `Content-Length` header conflict caused 500s on upstream responses; forward-leg telemetry corrected) and fixes a metrics re-registration error that fired on every credential-exfiltration alert. Tag SSH-signed.
 
 ### v2.25.1 — TLS 1.3 Minimum on Internal Mesh
 
