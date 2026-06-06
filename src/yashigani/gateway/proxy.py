@@ -939,22 +939,39 @@ async def _proxy_request_body(
         response_cache.set(tenant_id, forwarded_body, upstream_response.content, ttl=cache_ttl)
 
     # 5c. Inference payload logging + anomaly detection (Phases 1+2)
+    # NOTE: this success-path block was previously never exercised (the generic
+    # proxy forward only completes when an upstream actually answers). Both calls
+    # were broken: anomaly_detector has no async `record(payload_bytes=...)` — the
+    # API is the synchronous `detect(session_id=..., payload_size_bytes=...)`; and
+    # inference_logger.log() is synchronous and takes a single InferenceRecord.
+    # Fixed to the real signatures and made defensive so telemetry never breaks
+    # the response.
     inference_logger = state.get("inference_logger")
     if inference_logger is not None and forwarded_body:
         anomaly_detector = state.get("anomaly_detector")
         if anomaly_detector is not None:
-            asyncio.ensure_future(
-                anomaly_detector.record(tenant_id=tenant_id, payload_bytes=len(forwarded_body))
-            )
-        asyncio.ensure_future(
-            inference_logger.log(
+            try:
+                anomaly_detector.detect(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    payload_size_bytes=len(forwarded_body),
+                )
+            except Exception:
+                logger.debug("proxy: anomaly detect failed", exc_info=True)
+        try:
+            from yashigani.inference.payload_logger import InferenceRecord
+            inference_logger.log(InferenceRecord(
                 tenant_id=tenant_id,
                 session_id=session_id,
-                payload=forwarded_body,
-                upstream_status=upstream_response.status_code,
-                elapsed_ms=elapsed_ms,
-            )
-        )
+                agent_id=agent_id,
+                payload_content=_decode_body_safe(forwarded_body) or "",
+                classification_label=response_verdict or "CLEAN",
+                classification_confidence=proxy_inspection_confidence,
+                backend_used="generic_proxy",
+                latency_ms=elapsed_ms,
+            ))
+        except Exception:
+            logger.debug("proxy: inference log failed", exc_info=True)
 
     # 5d. Attach trace ID to response (Phase 9)
     # Use _upstream_content which may have been redacted by PII filtering above.
@@ -1280,11 +1297,16 @@ async def _forward(
     body: bytes,
     request_id: str,
 ) -> httpx.Response:
-    # Build forwarded headers — strip hop-by-hop, inject trace ID
+    # Build forwarded headers — strip hop-by-hop, inject trace ID.
+    # Also drop the inbound content-length: the body may be re-encoded
+    # (sanitised) and httpx recomputes content-length from ``content=body``.
+    # Forwarding a stale length makes h11 raise "Too little data for declared
+    # Content-Length" against the upstream. Host is dropped so httpx sets it
+    # from the upstream URL.
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP_HEADERS
-        and k.lower() != "host"
+        and k.lower() not in ("host", "content-length")
     }
     headers["X-Yashigani-Request-Id"] = request_id
     headers["X-Forwarded-For"] = _get_client_ip(request)
