@@ -130,15 +130,27 @@ def test_python_middleware_csp_no_unsafe_inline_style() -> None:
 
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=[c.name for c in CADDYFILES])
 def test_caddyfile_csp_no_unsafe_inline_style(caddyfile: Path) -> None:
-    """Each Caddyfile CSP header must not include 'unsafe-inline' in style-src."""
+    """The STRICT admin CSP in each Caddyfile must not include 'unsafe-inline'
+    in style-src.
+
+    Scope (YSG-RISK-071, accepted 2026-06-06): the `@subapp_ui` matcher
+    intentionally relaxes style-src/script-src for the embedded grafana/wazuh
+    SPAs, which cannot mount under strict CSP. That exception is scoped to the
+    proxied `/admin/grafana/*` + `/admin/wazuh/*` paths only (mTLS-authenticated,
+    admin-gated, first-party self-hosted tools) — Yashigani's own admin HTML
+    stays under `@strict_ui` (`style-src 'self'`). This guard protects the strict
+    admin CSP, so the documented `@subapp_ui` line is excluded from the check.
+    Forward hardening: nonce-based CSP for the subapps (not 2.25.3-blocking).
+    """
     content = _read(caddyfile)
     csp_lines = [
         ln.strip()
         for ln in content.splitlines()
         if "Content-Security-Policy" in ln and "style-src" in ln
+        and "@subapp_ui" not in ln  # YSG-RISK-071 — scoped grafana/wazuh exception
     ]
     assert csp_lines, (
-        f"{caddyfile.name}: Could not find a CSP line containing 'style-src'. "
+        f"{caddyfile.name}: Could not find a strict CSP line containing 'style-src'. "
         "Check that the Caddyfile still sets Content-Security-Policy."
     )
     for line in csp_lines:
