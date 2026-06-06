@@ -56,7 +56,7 @@ Agent / User
   [Rate limiter — Redis fixed-window]
      │
      ▼
-  [Inspection pipeline — FastText + LLM]
+  [Inspection pipeline — sklearn ML + LLM]
      │
      ▼
   [OPA policy check] ──── deny → 403 POLICY_DENIED

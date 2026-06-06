@@ -135,20 +135,20 @@ For deployment topology diagrams and the full per-runtime breakdown, see [Archit
 
 ## 5. Verifying a Release
 
-All Yashigani releases from v2.23.1 onward are cryptographically signed. Two signatures are provided for each release:
+All Yashigani releases from v2.23.3 onward are cryptographically signed. Two signatures are provided for each release:
 
-**Git tag signature (GPG)** — verifies the source commit is authentic and unchanged:
+**Git tag signature (SSH)** — verifies the source commit is authentic and unchanged. Release tags are SSH-signed (the signing scheme moved from GPG to SSH as of 2026-05-25; the SSH allowed-signers file is published in-repo):
 
 ```sh
-# Import the Agnostic Security release signing public key (once):
-gpg --import docs/release-signing-key.asc
+# Point git at the in-repo allowed-signers file (once):
+git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub
 
 # Fetch tags (in case a tag was updated):
 git fetch --tags --force origin
 
-# Verify:
-git tag -v v2.23.2
-# Expected: "Good signature from 'Agnostic Security Releases <releases@agnosticsec.com>'"
+# Verify (any release tag from v2.23.3 onward):
+git tag -v v2.24.4
+# Expected: 'Good "git" signature' from the Agnostic Security release signing key
 ```
 
 **Container image signature (cosign / Sigstore)** — verifies the published container images match the release tag:
@@ -166,9 +166,9 @@ For SBOM attestation, every release artifact carries a Sigstore-signed SBOM publ
 
 ## 6. Compliance and Security Posture
 
-Yashigani publishes per-control compliance evidence under `docs/compliance/`. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in the risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
+Yashigani publishes per-control compliance evidence under `docs/compliance-reports/`. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in an internal risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
 
-For a more detailed explanation, see the [Compliance Reports](docs/compliance/README.md).
+For a more detailed explanation, see the [Compliance Reports](docs/compliance-reports/README.md).
 
 ---
 
@@ -271,7 +271,7 @@ v2.23.2 is a security and quality hardening release on top of v2.23.1. It closes
 
 **Caddy Reverse Proxy Coverage: All 73 Blocks** -- The Caddy verified-secret header (`X-Caddy-Verified-Secret`) is now injected on all 73 `reverse_proxy` blocks across all Caddyfile variants (selfsigned, ACME, CA, WAF) and the Kubernetes ConfigMap. A contract test asserts this on every CI run; a missing injection causes a test failure with a precise diff identifying the missing block.
 
-**GPG Release Tag Signing** -- All releases from v2.23.1 onward are GPG-signed. The signing public key is published in-repo at `docs/release-signing-key.asc`. Verification: `git tag -v v2.23.2`.
+**Release Tag Signing** -- All releases from v2.23.3 onward are cryptographically signed. Tags are SSH-signed (scheme formally moved from GPG to SSH on 2026-05-25); the allowed-signers file is published in-repo at `docs/release-signing-key.pub`. Verification: see §5 "Verifying a Release".
 
 **Supply-Chain Hardening** -- GitHub Actions workflow steps are pinned to SHA digest (not just tag). The `pip` package manager is removed from runtime images to reduce the CVE surface. A CI job annotates every Trivy scan with the exact image digest that was scanned. SBOM generation includes a service-identity SHA gate.
 

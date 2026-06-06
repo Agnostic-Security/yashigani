@@ -929,7 +929,7 @@ The current agent lineup is: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 [ ] Budget-redis: port 6380 not exposed externally
 [ ] Optimization Engine: default priority level decided (default P5)
 [ ] Container Pool Manager: min warm containers and max containers planned
-[ ] Sensitivity pipeline: all three stages (regex + FastText + Ollama) enabled by default
+[ ] Sensitivity pipeline: all three stages (regex + sklearn ML + Ollama) enabled by default
 [ ] Identity model: existing agents migrated to unified model with kind field
 [ ] Multi-IdP: additional OIDC/SAML v2 providers identified (if applicable)
 [ ] OPA: policy/v1_routing.rego reviewed (identity, model access, routing safety, sensitivity ceiling)
