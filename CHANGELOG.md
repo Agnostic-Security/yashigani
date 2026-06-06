@@ -1,29 +1,3 @@
-<!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.3: fix(postgres): BUG-C7-001 — cert+pg_ident for pgbouncer_authenticator; YSG-RISK-073 cycle 7/8 FINAL CLOSE; YSG-RISK-077 CLOSED; contract tests updated 30/30 PASS) -->
-<!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.3: security(postgres): YSG-RISK-073 cycle 6 — scram-sha-256 clientcert=verify-ca; two-factor auth restored; closes YSG-RISK-075 lateral-pivot) -->
-<!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.3: fix(openclaw): BUG-V241-OPENCLAW-EXTENDED — openclaw.json baseUrl + helm OPENCLAW_UPSTREAM_URL :8080→:8081; YSG-RISK-076; contract test extended to cover JSON config surfaces) -->
-<!-- last-updated: 2026-05-25T23:30:00+00:00 (v2.24.3: fix(postgres): BUG-NEW-001 — pgbouncer SCRAM auth_user pg_hba trust+clientcert carveout — YSG-RISK-073 cycle 5; fix(podman): BUG-NEW-002 — seccomp relative path in override — YSG-RISK-074) -->
-<!-- last-updated: 2026-05-25T22:00:00+00:00 (v2.24.3: fix(caddy): Dockerfile.caddy COPY path correction — BUG-C838004-CADDY-COPY / YSG-RISK-072; contract test 9-test suite added) -->
-<!-- last-updated: 2026-05-25T21:00:00+00:00 (v2.24.3: fix(opa): fail-closed default on undefined OPA result + test parser fix — LAURA-V243-001 + LAURA-V243-002; commit 3d85ba3) -->
-<!-- last-updated: 2026-05-25T20:00:00+00:00 (v2.24.1: feat(pool): Kubernetes API backend for PoolManager — KubernetesBackend + RBAC Role + NetworkPolicy; YSG-RISK-070; closes Tom 7e653b1 option b) -->
-<!-- last-updated: 2026-05-25T19:00:00+00:00 (v2.24.1: fix(openwebui): remove @Help CHAINING_GUIDE half-implementation seed — drift #10; init-openwebui-agents.py) -->
-<!-- last-updated: 2026-05-20T16:30:00+00:00 (v2.23.4: backfill v2.23.3 fasttext→sklearn swap entry under [v2.23.3] § Changed; sweep current-tense FastText refs in Architecture.md / README.md / AI_ASSETS.md to scikit-learn) -->
-<!-- last-updated: 2026-05-17T00:00:00+01:00 (v2.23.4: openapi-reenable — auth-gated Swagger UI + API reference docs) -->
-<!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(audit): LU-AMEND-01 wave-3 — bigserial seq column on audit_events closes cross-batch ordering stability under timestamp collision; YSG-RISK-064) -->
-<!-- last-updated: 2026-05-25T16:00:00+00:00 (v2.24.1: security(opa): close OPA conformance gaps GAP-001 + GAP-002 — /v1/models OPA principal-aware listing + catch-all proxy response-leg OPA; YSG-RISK-066 + YSG-RISK-067) -->
-<!-- last-updated: 2026-05-25T18:00:00+00:00 (v2.24.1: docs(release-signing): formally declare SSH-only signing scheme; GPG path removed from .github/workflows/tag-sign.yml; release-signing.md documents verification recipe + key rotation; closes drift #3 fully; YSG-RISK-069) -->
-<!-- last-updated: 2026-05-25T14:00:00+00:00 (v2.24.1: security(opa): response-content sensitivity classification — GAP-3 + SEC-5 close) -->
-<!-- last-updated: 2026-05-25T12:00:00+00:00 (v2.24.1: fix(pgbouncer): restore compose-Helm admin_users + stats_users parity — drift #8 secondary, 859294a follow-up) -->
-<!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.1: YSG-RISK-061 — Caddy egress restrictions via iptables + K8s NetworkPolicy; NET_ADMIN cap added) -->
-<!-- last-updated: 2026-05-24T12:00:00+00:00 (v2.24.1: PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets removed; closes NICO-V241-001 + YSG-RISK-060) -->
-<!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: per-user 100 RPS rate limit + admin alert via Prometheus + audit event USER_RATE_LIMIT_EXCEEDED) -->
-<!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: DDoSProtector wire-up + license-scaled per-IP defaults) -->
-<!-- last-updated: 2026-05-24T00:00:00+00:00 (v2.24.1: BUG-V241-LANGFLOW-LETTA-BASE-URL: langflow+letta OPENAI_API_BASE :8080→:8081 in compose+helm) -->
-<!-- last-updated: 2026-05-25T00:00:00+00:00 (v2.24.3: feat(runtime-settings): Phase 2 web UI — admin panel for live gateway tunables) -->
-<!-- last-updated: 2026-05-16T18:30:00+01:00 (v2.23.4: draft [Unreleased] entry covering 62 commits since v2.23.3) -->
-<!-- last-updated: 2026-05-15T16:10:00+01:00 (docs: remove docs/release-notes/ cross-references — internal release-engineering tree moved out of repo — v2.23.4) -->
-<!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal claim from v0.6.0 entry — v2.23.4) -->
-<!-- last-updated: 2026-05-11T22:00:00+01:00 (v2.23.3 GA — flip [Unreleased] block to [v2.23.3]) -->
-
 # Changelog
 
 All notable changes to Yashigani are documented in this file.
@@ -34,423 +8,188 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [Unreleased] — v2.24.3
+## [v2.25.2] — 2026-06-05
 
-### Fixed
-- **fix(openclaw): correct openclaw.json baseUrl and Helm OPENCLAW_UPSTREAM_URL :8080→:8081 — BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076.** Same class as e4f38f8 (langflow + letta fix): `gateway:8080` is the mTLS-only listener (ssl.CERT_REQUIRED); openclaw runs with cap_drop:[ALL] and mounts no client cert (PROBE-AG1 hardening) — TLS handshake fails on every inference call when baseUrl targets :8080. Two config locations fixed: (1) `docker/openclaw/openclaw.json` line 18 `"baseUrl"` field — compose path, mounted read-only into container via `OPENCLAW_CONFIG_PATH`; (2) `helm/yashigani/values.yaml` `OPENCLAW_UPSTREAM_URL` — K8s path. Root cause of original miss: the BUG-V241 sweep (e4f38f8) only grepped env vars; openclaw's gateway URL lives in a JSON config file, not an env var. Contract test `tests/contracts/test_agent_base_url_port.py` extended with 4 new assertions covering JSON config surfaces (class `TestOpenclawJsonConfig`) and Helm OPENCLAW_UPSTREAM_URL (method `test_helm_openclaw_upstream_url_uses_mesh_port`), per [[feedback_brief_cue_adjacent_abstractions]] — the assertion scope is now "every gateway-URL reference in any agent config (env var, JSON, YAML) uses :8081, never :8080". Test suite: 12 PASS (was 7). Pre-fix simulation confirmed new tests FAIL against original `gateway:8080` value. Swept langflow + letta docker + helm: no JSON config files exist for those agents — only openclaw uses JSON config for gateway URL. Detected by Ava cycle 5.
-- **fix(postgres): cert auth + pg_ident CN map for pgbouncer_authenticator — BUG-NEW-001 / BUG-C7-001 / YSG-RISK-073 cycle 7/8 / YSG-RISK-077 (SHIP BLOCKER — FINAL CLOSE).** Cycle 6 (`scram-sha-256 clientcert=verify-ca`) broke on ARM64/Mac Podman: pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM client-side computation bug — it sends incorrect SCRAM proofs when authenticating outbound as auth_user (YSG-RISK-077). The cycle 6 "live test PASS" was on Linux VM only (Podman 10.89.7.x network); Mac Podman uses 10.89.0.x — same pgbouncer binary, different host runtime. Ava release gate cycle 7 confirmed FATAL error on Mac/Podman ARM64: pgbouncer cannot start because the SCRAM auth exchange with postgres always fails. **Cycle 7/8 fix (commit `542e800`):** `cert map=pgb-auth-map` — PG16 `cert` auth method (implies verify-full) + `pg_ident.conf` CN mapping. `10-pgbouncer-auth.sh` step 4a writes two pg_ident entries: `pgb-auth-map  pgbouncer-auth → pgbouncer_authenticator` (main pgbouncer) + `pgb-auth-map  letta-pgbouncer → pgbouncer_authenticator` (letta sidecar). Step 4c inserts `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0  cert  map=pgb-auth-map` before the catch-all. No SCRAM computation — cert method uses TLS handshake (OpenSSL, not pgbouncer SCRAM code) — platform-independent. **Security posture vs cycle 6:** STRONGER — verify-full (chain + CN checked) vs verify-ca (chain only); CN-specific pg_ident map restricts to two named certs vs any CA-cert holder; closes YSG-RISK-075 lateral-pivot definitively (all 11 other data-network cert holders have different CNs). Live test Mac/Podman ARM64 FULL PRODUCTION install 13/13 PASS: postgres log `"connection authenticated: identity=CN=pgbouncer-auth,O=Agnostic Security method=cert"`; backoffice /login 200 OK; yashigani_app method=scram-sha-256 (catch-all, unaffected). **Contract tests updated (cycle 8 — this commit):** `test_pghba_pgbouncer_cert_carveout.py` (14 tests, +3 new: scram-negative YSG-RISK-077 guard, pg_ident map write assertion, both-CN-bound assertion); `test_pghba_pgbouncer_auth_method_security.py` (16 tests, +8 new: scram-negative docker+helm, bare-cert-without-map docker+helm, cert+pg_ident positive docker+helm, pg_ident-entries docker+helm, YSG-RISK-077 documentation guards). Negative regression verified: each new pattern catches its intended bug class. 30 PASS 1 SKIP. YSG-RISK-073 FINAL CLOSED; YSG-RISK-075 CLOSED (cycle 7/8 stronger close added); YSG-RISK-077 CLOSED.
-- **security(postgres): restore two-factor auth for pgbouncer_authenticator — scram-sha-256 clientcert=verify-ca — YSG-RISK-073 cycle 6 / YSG-RISK-075 (SHIP BLOCKER).** Cycle 5 chose `trust clientcert=verify-ca` as a workaround when SCRAM appeared broken. Laura release gate cycle 5 confirmed a REAL HIGH lateral-pivot attack chain: any compromised container on the `data` network holding a CA-signed cert can connect to postgres claiming role `pgbouncer_authenticator` — `trust` requires no password, so cert alone suffices. Attack path: stolen cert → postgres → `ysg_pgbouncer_get_auth('yashigani_app')` → SCRAM verifier from `pg_shadow` → full DB compromise. 11 CA-cert holders on `data` network (gateway, backoffice, open-webui, otel-collector, letta-pgbouncer, etc.) → MEDIUM probability. Blast radius CRITICAL. **Cycle 6 fix:** `scram-sha-256 clientcert=verify-ca` — two-factor (cert + password). pgbouncer 1.25.1 (edoburu) DOES support SCRAM-SHA-256 as the auth initiator — the cycle 5 claim was incorrect; failure was a misconfiguration. Cycle 6 live test on Podman Mac: postgres log `"connection authenticated: identity=pgbouncer_authenticator method=scram-sha-256"`; `SELECT current_user` via pgbouncer = `yashigani_app` (PASS). Attacker must now compromise the pgbouncer_authenticator SCRAM password (Docker/K8s secret, pgbouncer containers only) in addition to any CA-signed cert. Lateral-pivot chain closed. `docker/postgres/10-pgbouncer-auth.sh` and `helm/yashigani/files/10-pgbouncer-auth.sh` both updated. New contract test `tests/contracts/test_pghba_pgbouncer_auth_method_security.py` (8 tests) asserts unmapped-trust never appears for `pgbouncer_authenticator`. Updated `test_pghba_pgbouncer_cert_carveout.py` (11 tests) asserts scram form present. Full contract suite: 200/200 PASS. YSG-RISK-073 re-closed with cycle 6 evidence; YSG-RISK-075 (trust-without-CN-binding class) added and closed.
-- **fix(postgres): restore pg_hba trust+clientcert carveout for pgbouncer_authenticator — BUG-NEW-001 / BUG-C4-001 / BUG-C4-002 / YSG-RISK-073 (BLOCKER, cycle 5 rework).** PgBouncer 1.25.1 (edoburu image) cannot perform SCRAM-SHA-256 as the client when postgres issues a SCRAM challenge for the auth_user connection. YSG-RISK-050 removed the A2 pg_hba carveout assuming pgbouncer could SCRAM — it cannot. All postgres-backed services degraded on clean install from v2.24.0. **Cycle 4 attempt (commit 7f296a1 — broken):** added `cert clientcert=verify-ca` carveout — broken on two layers: BUG-C4-001 Layer A: PG16 syntax rejection (`clientcert=verify-ca` invalid with `cert` auth method; only `verify-full` accepted; postgres crash-loops). BUG-C4-001 Layer B: CN mismatch (CN=pgbouncer-auth != role pgbouncer_authenticator; verify-full would also fail CN check). BUG-C4-002: both `05-enable-ssl.sh` heredoc AND `10-pgbouncer-auth.sh` step 4b wrote the carveout — duplicate entries on fresh install, both triggering PG16 syntax error. **Cycle 5 fix (this commit):** carveout form changed to `trust clientcert=verify-ca` — cert-equivalent and PG16-valid. The `clientcert=verify-ca` option enforces CA chain + private-key proof; `trust` removes the password challenge (no SCRAM, no md5 needed). md5 was also attempted in cycle 5 but failed in practice (pgbouncer 1.25.1 edoburu image cannot correctly perform server-side md5). Single source of truth: `10-pgbouncer-auth.sh` only (`05-enable-ssl.sh` no longer writes carveout — BUG-C4-002 fix). `awk` first-match insertion replaces `sed /i` (sed inserts before every match, creating duplicates). Helm `10-pgbouncer-auth.sh` sync'd to match docker version. All 4 pgbouncer INI files comment-updated. Contract test suite updated: 11 tests (previously 10), 1 skipped — trust+clientcert present, no bare-trust, no cert, no md5, single-source-of-truth guards. Live test: postgres healthy, pg_hba has exactly 2 trust+clientcert carveout lines (no duplicates), pgbouncer HEALTHY, auth_query confirmed working end-to-end (SELECT current_user = yashigani_app via pgbouncer on Podman Mac). Detected by Ava release gate v2.24.3 cycle 3/4/5.
-- **fix(podman): use relative seccomp path in Podman override — BUG-NEW-002 / YSG-RISK-074 (non-blocker).** `YASHIGANI_SECCOMP_PROFILE` env var set to an absolute path by install.sh caused "file name too long" in podman-compose 1.5.0 on Mac. Root issue: compose override files REPLACE security_opt lists (not merge). `docker-compose.podman-override.yml` previously replaced the gateway + backoffice security_opt with only `[label=disable]`, silently dropping `no-new-privileges:true`, `seccomp=...`, and `apparmor=...` on Podman. Fix: override entries for gateway + backoffice now include `no-new-privileges:true`, `seccomp=./seccomp/yashigani.json` (relative path from compose file dir, no env-var interpolation), `apparmor=unconfined`, and `label=disable`. Relative path resolves correctly when podman-compose is invoked from `WORK_DIR/docker/`. Base compose env-var form retained for Docker Engine path. Contract test suite `tests/contracts/test_podman_seccomp_override.py` (8 tests) added. Detected by Ava release gate v2.24.3 cycle 3.
-- **fix(tests): align `test_e2e_conftest_tls.py` parents depth with BUG-FIX-001 conftest correction.** `test_docker_secrets_path_used_when_exists` used `Path(__file__).parents[4]` (wrong — resolves to `~/Documents/Claude/`) matching the old conftest bug. Corrected to `parents[3]` (repo root) to match the Ava cycle 3 conftest fix. Pre-existing failure introduced when BUG-FIX-001 fixed conftest.py but not its unit test.
-- **fix(caddy): correct Dockerfile.caddy COPY path — BUG-C838004-CADDY-COPY / YSG-RISK-072.** `c838004` introduced a COPY directive with path `caddy/caddy-entrypoint.sh`, but `docker-compose.yml` sets `build.context: ..` (repo root, not `docker/`). COPY paths resolve relative to the build context, so the correct path is `docker/caddy/caddy-entrypoint.sh`. The file did not exist at `<repo-root>/caddy/caddy-entrypoint.sh`, causing `podman build` to exit 125 with "no such file or directory" on ALL Podman-based installs (Mac + Linux/VM). No containers started; full release gate was blocked. Fix: one-line COPY path correction in `docker/caddy/Dockerfile.caddy`. Contract test `tests/contracts/test_caddy_dockerfile_build_paths.py` (9 tests) added as regression guard — asserts every COPY source path resolves against the build context root, entrypoint uses correct prefix, compose context/dockerfile keys are consistent, and the broken pre-fix path does not exist (spurious `caddy/` directory at repo root would mask a revert). Tests PASS against fix, FAIL (2 failures) against the broken path. `podman build` succeeds against fixed file; build against broken path exits 125 identical to Ava gate evidence. Detected by Ava release gate v2.24.3.
-- **fix(opa): default OPA response_decision result to False (fail-closed) — closes Laura release-gate finding LAURA-V243-001 / YSG-RISK-071.** Two call sites in `openai_router.py` (lines 1274, 1804) had `result.get("allow", True)` — an absent "allow" key (OPA bundle mismatch / partial load returning `{"result": {}}`) resolved to ALLOW. Both defaults flipped to `False` (DENY). No operational impact when OPA is healthy; Rego always sets `allow` explicitly. Three unit tests added to `TestOpaUndefinedResultFailClosed` in `src/tests/unit/test_v2234_opa_fail_closed.py`. Aligns with v2.23.4 fail-closed posture (ASVS V14.5 / NIST SP 800-53 SC-7).
-- **fix(tests): correct comment-line parser bug in `test_uninstall_volume_cleanup.py::test_no_phantom_volumes_in_canonical_list` — closes Laura release-gate finding LAURA-V243-002.** The `_parse_canonical_volumes` helper split the `_CANONICAL_VOLUMES` bash array on whitespace before filtering `#` tokens, causing words from inline bash comments (e.g. `# docker-compose.wazuh.yml volumes — missing from original list`) to be mistakenly added as volume names and trigger a false-positive phantom-volume failure. Fix: process line-by-line, dropping whole-line comments before token extraction. No production impact; test now correctly PASS.
-
----
-
-## [v2.24.2] — 2026-05-25 — Security fix batch (post-v2.24.1)
-
-Captures session work between v2.24.1 (commit `a46ed5d`) and HEAD (`10e03d4`). Mustui-only release per [[feedback_yashigani_v240_repo_route]] §4; not published to public origin.
-
-**Headline closures:** BUG-V241-LANGFLOW-LETTA-BASE-URL (bundled-agent dispatch silently broken since added) · PROBE-AG1 openclaw HMAC perimeter bypass · SoD-001..005 admin/user separation (SoD-004 was live-exploitable) · SEC-4 TOTP counter → Redis (ASVS V6.3.5) · GAP-3 + SEC-5 response-content sensitivity (asymmetry between /v1/* and /agents/*) · GAP-001 + GAP-002 OPA conformance (/v1/models + proxy.py response-leg) · GAP-1 Rego sensitivity catch-all · MUST-4 Caddy admin off (unix socket migration) · NICO-V241-001 per-key Docker secrets · UA-10 per-agent compose bridge + Helm NetworkPolicy (YSG-RISK-055 closed).
-
-**Audit-chain hardening:** LU-AMEND-01 wave-1/2/3 (schema + service + bigserial seq column for cross-batch ordering stability) · LU-AMEND-02 multi-tenant manifest_registrations ledger + CLI · LU-AMEND-03 manifest signing ceremony record · LU-AMEND-04 operator identity attestation on `yashigani onboard` · LU-AMEND-05 risk-register.yml schema + CI release-gate.
-
-**Perimeter / supply chain:** Caddy egress restrictions via iptables OUTPUT allowlist (YSG-RISK-061; ~60-70% post-RCE impact reduction) · C-CAP-004 trivy-agent-images CI gate · N1 light-touch agent-image built-in component scan (bandit + opengrep) · N2 SHA-256 verification via OpenSSL FIPS Provider when `FIPS_MODE=1` (CMVP #4985) · drift #6 server-side `next=` redirect validator · drift #8 compose-Helm pgbouncer.ini auth_query parity · drift #1 KSM→KMS env-var rename (+ backward-compat shim) · drift #3 SSH-only signing scheme formally declared (release-signing.md + YSG-RISK-069) · drift #10 @Help half-implementation removed.
-
-**Throttling:** DDoSProtector instantiated with license-tier-scaled per-IP defaults (formula `max(5000, max_end_users * 25)`; 100000 for enterprise/academic; YSG-RISK-056) · per-user 100 RPS rate limit with admin alert via Prometheus + audit event + Grafana template (YSG-RISK-058).
-
-**Runtime admin layer:** API-first `runtime_settings` (Phase 1) — DB persistence + service + admin API + audit + Redis pub/sub live-reload · 3 settings retrofitted (per-user RPS, DDoS per-IP, DDoS window) · Phase 2 UI follow-up tracked.
-
-**Documentation:** `docs/operator-guide.md` created (OPA+inspection pairing recipe + XFF clarification + PASSWORD_MAX_AGE_DAYS fix + admin/user separation §5) · `docs/security/xff-trust-boundary.md` created · `docs/security/release-signing.md` created · `docs/release-signing-key.pub` (SSH allowed-signers, `namespaces=git`).
-
-**Memory rules (binding architectural principles, persistent across sessions, captured this session):** admin-surfaces-all-runtime-settings · ground-audit-in-docs-and-ops-before-flagging · ava-laura-both-on-final-test · security-boundary-probed-from-both-directions · security-severity-standing-orders · disk-secret-risks-are-kms-conditional · opa-inspects-all-traffic-both-legs (with admin-plane carve-out + product-promise reframe) · admin-user-account-separation.
-
-**Per [[feedback_ava_laura_both_on_final_test]]:** comprehensive Ava (functional E2E exercising real user flows) + Laura (adversarial re-probe + audit-gap reflection) release-gate RECOMMENDED against `v2.24.2` before broad customer rollout.
-
-### Previous in-flight entries (now formally part of v2.24.2)
+Theme: **Wazuh SIEM hardening + install-path reliability + audit least-privilege + OPA durability**.
 
 ### Added
-- **feat(runtime-settings): Phase 2 web UI — admin panel for live gateway tunables (admin-surfaces-all-runtime-settings rule / v2.24.3).**
 
-  Phase 1 (`1d2f31e`) shipped the DB + service + admin API for runtime settings. Phase 2 (this commit) ships the thin web UI consumer:
-
-  - `src/yashigani/backoffice/templates/dashboard.html` — "Runtime Settings" nav button + `#page-runtime-settings` SPA page div with settings table (Key / Value / Source / Last Changed By / Last Changed At / Actions) and inline edit form.
-  - `src/yashigani/backoffice/static/js/runtime-settings.js` — standalone defer-loaded module. `loadRuntimeSettings()` calls `GET /admin/runtime-settings` (read-only, `api()`). Edit → `PUT /admin/runtime-settings/{key}` via `apiMutate()` (triggers StepUp modal on 401). Reset → `POST /admin/runtime-settings/{key}/reset` via `apiMutate()`. Client-side type coercion for int/float/bool before the round-trip. Toast feedback on success/error. CSP-compliant: no inline JS, no CDN, event delegation via `data-action=`.
-  - `src/yashigani/backoffice/static/js/dashboard.js` — `showPage()` dispatches `loadRuntimeSettings()` with `typeof` guard (defer-safe). Event delegation handles `rsEditRow` and `rsResetRow` actions.
-  - `src/yashigani/backoffice/static/css/dashboard.css` — `.rs-*` CSS classes for table layout, inline edit form, and toast notification.
-  - `src/tests/unit/test_runtime_settings_ui_phase2.py` — 37 static-artefact tests (no server): HTML structure, JS contract, dashboard.js wiring, CSS classes. 37/37 PASS.
-
-  No new API endpoints. No StepUp bypass. Mustui only per [[feedback_yashigani_v240_repo_route]].
-
-### Documentation
-- **docs(release-signing): formally declare SSH-only signing scheme. GPG path removed from `.github/workflows/tag-sign.yml`; `docs/security/release-signing.md` documents the verification recipe + key rotation process. Closes drift #3 fully (correction landed in `be94e26`; formal declaration lands here). YSG-RISK-069.**
-
-  The originally planned GPG CI path (v2.23.2 CHANGELOG "aspirational") was confirmed non-viable: maintainer's signing key is hardware-backed (Yubikey); software GPG export is not possible. SSH signing via `gpg.format=ssh` (git 2.34+) is the correct approach and has been the actual scheme since v2.23.3. `tag-sign.yml` now contains only the verification recipe comment block; the 300-line GPG workflow is removed. `docs/release-signing-key.pub` is unchanged — it remains the operational artefact for `git tag -v` verification.
-
-### Security
-- **security(sod): admin/user separation-of-duties enforcement — cross-store collision checks on all auth creation paths + account_tier filter on /auth/verify + daily cross-store conflict audit cron. Closes Iris #96 SoD-001..005 (SoD-004 was live-exploitable). NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2. YSG-RISK-068.**
-
-  **Background:** Iris audit #96 surfaced 5 separation-of-duties gaps. The most critical (SoD-004) was live-exploitable: an admin completing an SSO flow silently created a HUMAN identity in the identity registry, and the admin's session then bridged to the data plane via `/auth/verify` (Caddy forward_auth). Tiago directive 2026-05-25: "admins cannot use the platform only administrate it; they need a second account as normal user with different username."
-
-  **SoD-001 — admin creation collision check** (`accounts.py`):
-  - `create_admin` now checks both `auth_service.get_account()` (username) and `auth_service.get_account_by_email()` (email) for any existing user-tier account before creating the admin.
-  - Collision → HTTP 409 `admin_user_collision` + `ADMIN_CREATE_REJECTED_USER_EXISTS` audit event.
-
-  **SoD-002a — direct user creation collision check** (`users.py`):
-  - `create_user` now checks for admin accounts with the same username AND email before creating.
-  - Collision → HTTP 409 `admin_user_collision` + `USER_CREATE_REJECTED_ADMIN_EXISTS` audit event.
-
-  **SoD-002b — SCIM provision collision check** (`scim.py`):
-  - `scim_provision_user` now checks for admin account by email before provisioning.
-  - Collision → SCIM 409 `uniqueness` error to the identity provider + `SCIM_PROVISION_REJECTED_ADMIN_EXISTS` audit event.
-
-  **SoD-002c + SoD-004 — SSO/SAML identity creation collision check** (`sso.py`):
-  - `oidc_callback` and `saml_acs` now call `_check_sod_admin_collision(email)` before `_resolve_or_create_identity()`.
-  - Collision → redirect `/login?error=admin_cannot_use_platform` + `SSO_PROVISION_REJECTED_ADMIN_EXISTS` audit event.
-  - This is layer 1 of the SoD-004 exploit chain closure.
-
-  **SoD-003 — `/auth/verify` admin session filter** (`auth.py`):
-  - `verify_session` (Caddy forward_auth target) now inspects `session.account_tier`.
-  - `tier == "admin"` → HTTP 403 `admin_session_not_allowed_data_plane` + `AUTH_VERIFY_REJECTED_ADMIN_SESSION` audit event.
-  - This is layer 2 of the SoD-004 exploit chain closure (defence in depth with SoD-002c).
-
-  **SoD-005 — cross-store conflict audit cron** (`sod_conflict_audit_task.py`):
-  - Daily cron (00:30 UTC) compares `admin_accounts` emails against `identity_registry` HUMAN slugs.
-  - Collisions emit `IDENTITY_STORE_CONFLICT` audit event + populate `GET /admin/dashboard/sod-conflicts`.
-  - Wired into `app.py` lifespan APScheduler alongside existing crons.
-
-  **Supporting changes:**
-  - `pg_auth.py`: `get_account_by_email()` method added — case-insensitive email lookup on `admin_accounts`.
-  - `audit/schema.py`: 6 new `EventType` values + 6 new dataclasses (`AdminCreateRejectedUserExistsEvent`, `UserCreateRejectedAdminExistsEvent`, `ScimProvisionRejectedAdminExistsEvent`, `SsoProvisionRejectedAdminExistsEvent`, `AuthVerifyRejectedAdminSessionEvent`, `IdentityStoreConflictEvent`).
-
-  **Tests:** 8 unit tests per gap (40 total) covering collision-reject + legitimate-pass paths. Integration: SSO exploit replay chain blocked end-to-end. Evidence: `/Users/max/Documents/Claude/testing_runs/tom_sod_admin_user_separation_20260525/`.
-
-- **security(opa): close OPA conformance gaps GAP-001 + GAP-002 — /v1/models OPA-evaluated for principal-aware listing; /v1/proxy catch-all gets response-leg OPA mirroring /v1/chat/completions pattern** (YSG-RISK-066 + YSG-RISK-067, Iris conformance audit Iris #94, Tiago 2026-05-25 universal OPA directive):
-
-  Per `docs/opa_manual.md:44` OPA-everywhere mandate. Both gaps were code-vs-docs drift — the manual mandated OPA on all traffic both legs; the code did not comply on these two surfaces.
-
-  **GAP-001 — GET /v1/models (MEDIUM, release-blocker):**
-  - Previous state: authenticated but not OPA-evaluated. Any authenticated principal (internal-bearer, API-key, SPIFFE workload) could enumerate the full agent topology + service-identity slugs + Ollama model list without OPA policy check.
-  - Fix: `_opa_models_check()` added to `openai_router.py`. Queries OPA `/v1/data/yashigani/v1/models_list_decision` after identity resolution. Fail-closed on OPA error. Human/admin principals receive full list; service-account principals receive RESTRICTED list (allowed_models only — agent and service-identity topology withheld). Operator can grant full listing via data bundle override (explicit opt-in).
-  - `v1_routing.rego`: `models_list_allowed` + `models_list_filter` + `models_list_decision` rules added.
-  - `audit/schema.py`: `MODELS_LIST_REQUESTED` EventType + `ModelsListRequestedEvent` (identity, filter, model count — no names logged).
-  - Open WebUI model dropdown: human admin (cookie-auth) still gets full list via filter=full — no regression.
-
-  **GAP-002 — /{path:path} catch-all proxy response leg (HIGH, release-blocker):**
-  - Previous state: request-leg OPA (`_opa_check`) present; response-leg OPA absent. After `_forward()` returns upstream MCP content, the response was delivered to caller without OPA evaluating whether the caller's sensitivity ceiling permits receiving the upstream content.
-  - Fix: `_opa_proxy_response_check()` added to `proxy.py`. Queries OPA `/v1/data/yashigani/v1/proxy_response_decision` after response inspection pipeline and PII detection. Fail-closed on OPA error (→ 503). OPA deny → 403 `MCP_RESPONSE_BLOCKED_BY_OPA`.
-  - `_proxy_response_sensitivity()` helper: derives response sensitivity from `ResponseInspectionPipeline.response_sensitivity` when pipeline is configured; falls back to `"PUBLIC"` (pipeline-off safe default per YSG-RISK-057).
-  - Streaming concern addressed: `_forward()` uses `httpx.AsyncClient.request()` (buffered) — `upstream_response.content` is available synchronously. No force-buffer needed.
-  - `v1_routing.rego`: `proxy_response_allowed` + `proxy_response_reason` + `proxy_response_decision` rules added.
-  - `audit/schema.py`: `MCP_RESPONSE_BLOCKED_BY_OPA` + `PROXY_OPA_RESPONSE_CHECK_FAILED` EventTypes + corresponding dataclasses.
-
-  **Tests:** 15 unit (GAP-001) + 13 unit (GAP-002) + 8 integration (combined suite). All PASS verified locally.
-
-  **Negative regression:** compromised internal-bearer cannot enumerate full agent topology (integration test H).
-
-  ASVS V4.1.1 / V4.1.3 / OWASP API9 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.2 / A.8.3 / YSG-RISK-066 / YSG-RISK-067.
-
-- **security(opa): response-content sensitivity classification — closes Ava GAP-3 + Iris SEC-5 asymmetry between /v1/* and /agents/* response checks** (YSG-RISK-065, Tiago directive 2026-05-25):
-
-  **Problem closed:**
-  - Ava GAP-3: `response_sensitivity` passed to the OPA response ceiling check for `/v1/*` was the prompt's sensitivity (request-leg scan), not the response body's. A model returning CONFIDENTIAL content to a PUBLIC prompt would not be blocked for a INTERNAL-ceiling identity.
-  - Iris SEC-5: `/agents/*` had no response-leg OPA check at all — agent-to-agent calls were evaluated for the request leg only; the response body was never gated.
-
-  **Fix — four coordinated changes:**
-  1. `src/yashigani/inspection/pipeline.py` — `ResponseInspectionPipeline` now accepts a `sensitivity_classifier` kwarg. When provided, `inspect()` classifies the response body and populates `ResponseInspectionResult.response_sensitivity` (PUBLIC|INTERNAL|CONFIDENTIAL|RESTRICTED). Existing verdict behaviour (CLEAN/FLAGGED/BLOCKED) is unchanged — additive only.
-  2. `src/yashigani/gateway/openai_router.py` — `_opa_response_check` accepts both `response_sensitivity` (content) and `prompt_sensitivity` (prompt). Passes both to OPA. Pipeline off (default, per YSG-RISK-057) → `response_sensitivity` falls back to `prompt_sensitivity` (backward-compatible explicit fallback, not silent).
-  3. `policy/v1_routing.rego` — `response_decision` evaluates `MAX(prompt_sensitivity, response_sensitivity)` via new `_effective_sensitivity_rank` helper. GAP-1 unknown-level catch-all (rank 4) applies to both inputs. Backward compat: old callers that only send `response_sensitivity` still work (prompt absent → effective = response only).
-  4. `src/yashigani/gateway/agent_router.py` — `route_agent_call()` gains a response-leg OPA check: classifies response sensitivity via pipeline (when configured), queries OPA at `/v1/data/yashigani/agent_response_decision`. Fail-closed on OPA error. Returns HTTP 403 + `AGENT_RESPONSE_BLOCKED_BY_OPA` audit event on deny.
-  5. `policy/agents.rego` — new `agent_response_allowed` + `agent_response_decision` rules with `sensitivity_rank` helper (duplicated from v1_routing.rego — OPA packages are scoped). Default deny. Symmetric to `/v1/*` response_decision shape.
-  6. `src/yashigani/audit/schema.py` — `AGENT_RESPONSE_BLOCKED_BY_OPA` EventType + `AgentResponseBlockedByOpaEvent` dataclass added (captures caller/target agent IDs, response_sensitivity, deny_reason, pii_detected).
-
-  **Default unchanged:** `YASHIGANI_INSPECT_RESPONSES=false` (per YSG-RISK-057 UX rationale). Sensitivity classification is part of the opt-in pipeline. `/agents/*` response OPA check runs regardless, defaulting to PUBLIC sensitivity when pipeline is off.
-
-  **Tests:** 20 unit tests (`test_v241_gap3_sec5_response_sensitivity.py`) + 4 integration tests (`test_v241_gap3_sec5_agent_response_opa.py`). All PASS.
-
-  **Pending:** Ava E2E + Laura adversarial gate required before release (per `feedback_ava_laura_both_on_final_test`).
-
-  ASVS V4.1.3 / ASVS V14.7.2 / CMMC SC.L2-3.13.10 / ISO 27001 A.8.3 / YSG-RISK-065.
-
-- **security(audit): LU-AMEND-01 wave-3 — bigserial sequence column on `audit_events` closes cross-batch ordering stability under timestamp collision** (YSG-RISK-064, Tom standing order 2026-05-25):
-
-  **Problem closed:** Wave-2 (migration 0011) established the hash chain but used `ORDER BY (created_at, id)` for chain-row ordering. Under timestamp collision (two events at the same microsecond), UUID v4 sort is non-deterministic — ordering could differ between replicas, silently weakening the tamper-evidence guarantee (ASVS V7.3.3, NIST AU-10).
-
-  **Fix:** Migration 0014 adds a `BIGSERIAL seq` column to `audit_events`. `seq` is assigned at INSERT time by a global sequence object (`audit_events_seq_seq`), giving strictly monotonic order regardless of timestamp ties. `run_daily_checkpoint` now uses `ORDER BY seq NULLS LAST` as the authoritative ordering key. `INSERT_AUDIT_EVENT` uses `RETURNING seq`; `PostgresSink._flush_batch` captures it via `fetchrow`.
-
-  **Backfill:** Existing rows are backfilled in a single `UPDATE` ordered by `(created_at, id)` — preserving wave-2 ordering so existing chain verification remains valid.
-
-  **Partitioned-table note:** `audit_events` is `PARTITION BY RANGE (created_at)`. PostgreSQL cannot enforce `UNIQUE(seq)` without including the partition key. A plain `NOT NULL` + two B-tree indexes (`idx_audit_events_seq`, `idx_audit_events_tenant_seq`) replace the UNIQUE constraint; uniqueness is guaranteed by the sequence mechanism. Documented in migration 0014.
-
-  **Files:** `src/yashigani/db/migrations/versions/0014_audit_events_bigserial_sequence.py`, `src/yashigani/db/models/__init__.py`, `src/yashigani/audit/chain.py`, `src/yashigani/audit/sinks.py`.
-
-  **Tests:** 21 new unit tests (`test_lu_amend_01_wave3_bigserial.py`) + 6 new integration tests (`test_lu_amend_01_wave3_integration.py`). Integration test covers 1000-event chain on live PG + timestamp-collision pair + chain integrity verification. All 78 tests PASS (new + pre-existing wave-2).
-
-- **security(auth): TOTP failure counter migrated to Redis** (closes SEC-4 / ASVS V6.3.5 — YSG-RISK-063):
-  Counter now survives process restart and is consistent across multi-replica deployments. Previously
-  a module-level Python dict (`_totp_failures`) reset on every process kill/restart, allowing an
-  attacker to bypass the 3-failure lockout by triggering a restart. Migrated to Redis key
-  `yashigani:totp_fail:<session_prefix>` with 1800 s TTL. Fail-closed: HTTP 503 when Redis
-  unavailable (no silent allow). Lockout now emits `AdminSessionTotpLockoutEvent` with
-  `consecutive_failures` + `endpoint` fields. 15 unit tests + 3 integration restart-persistence
-  tests added (CMMC IA.L2-3.5.7 / ISO 27001 A.5.17).
-
-- **security(perimeter): Caddy egress restrictions — iptables OUTPUT allowlist + K8s NetworkPolicy** (YSG-RISK-061, Tiago directive 2026-05-25):
-
-  **Attack chain reduced:** Post-Caddy-RCE attacker cannot reach arbitrary internet endpoints
-  for exfiltration, C2, or second-stage payload fetch. The allowlist permits only: loopback,
-  in-mesh Docker bridge subnets (caddy_internal + obs), Docker DNS (127.0.0.11:53), and
-  resolved IPs of ACME providers + Let's Encrypt OCSP responders. Every other egress
-  connection is dropped with a kernel LOG prefix (`CADDY_EGRESS_BLOCKED`). Probability of
-  Caddy RCE unchanged (~10⁻³/yr per LAURA-V241-RESIDUAL-001); this is impact reduction
-  (~60-70% post-RCE blast radius reduction). Cross-version effective (KMS-independent).
-
-  **Implementation:**
-  - `docker/caddy/Dockerfile.caddy` — derives from the digest-pinned `caddy:2.11.2-alpine`
-    base; bakes in `iptables=1.8.11-r1` and `iproute2-minimal` at image build time (not
-    runtime). Installs `caddy-entrypoint.sh` as the new container entrypoint.
-  - `docker/caddy/caddy-entrypoint.sh` — sets iptables OUTPUT default-DROP, then adds
-    ACCEPT rules: loopback, ESTABLISHED/RELATED, DNS (127.0.0.11), Docker bridge subnets
-    (enumerated from `ip route` at startup), ACME+OCSP IPs (resolved via Docker DNS). Logs
-    every allowed destination. Graceful fallback: if NET_ADMIN unavailable (Podman rootless),
-    logs WARN and starts Caddy without restrictions rather than crashing.
-  - `docker/docker-compose.yml` — `caddy` service gains `build:` block targeting
-    `docker/caddy/Dockerfile.caddy`; `cap_add: [NET_BIND_SERVICE, NET_ADMIN]` (NET_ADMIN
-    is required for iptables; scoped to the container's network namespace only);
-    `YASHIGANI_CADDY_EGRESS_ALLOWLIST` env var (operator can add extra host:port pairs).
-  - `helm/yashigani/templates/caddy.yaml` — `NET_ADMIN` added to container capabilities.
-    `YASHIGANI_CADDY_EGRESS_ALLOWLIST` env var wired via `caddy.egressAllowlist` value.
-  - `helm/yashigani/templates/networkpolicy-caddy-egress.yaml` (NEW) — K8s NetworkPolicy
-    restricting Caddy external egress to TCP:443 + TCP:80 to non-RFC1918 CIDRs (ACME
-    + OCSP). Complements iptables with kernel-enforced defence-in-depth.
-  - `helm/yashigani/templates/networkpolicy.yaml` — `allow-caddy-egress` gains missing
-    grafana:3443 + prometheus:9090 pod-selector entries (previously absent — would have
-    caused 502 on /admin/grafana/* and /admin/prometheus/* in K8s).
-
-  **Trade-off:** NET_ADMIN capability added to Caddy (previously NET_BIND_SERVICE only).
-  NET_ADMIN allows iptables manipulation within the container's Linux network namespace;
-  does not affect host networking. Accepted by Tiago 2026-05-25 (YSG-RISK-061).
-
-  **Portability notes:**
-  - Docker Desktop (macOS): iptables backed by nf_tables shim in Alpine 3.23. All rules
-    apply correctly. Verified: NET_ADMIN + OUTPUT DROP + subnet allow.
-  - Podman rootless: NET_ADMIN may be unavailable without `--privileged`. Entrypoint
-    gracefully skips iptables setup and logs WARN. K8s NetworkPolicy is the enforcement
-    mechanism in production K8s deployments.
-  - K8s: `networkpolicy-caddy-egress.yaml` provides kernel-level enforcement independent
-    of the in-container iptables rules.
-
-  **Operator override:** Set `YASHIGANI_CADDY_EGRESS_ALLOWLIST=host1:port,host2:port` to
-  allow additional egress destinations (e.g. custom ACME CA or internal OCSP responder).
-
-- **security(secrets): per-key Docker named-secrets on openclaw / langflow / letta / letta-pgbouncer**
-  (PROBE-AG1, Tiago directive 2026-05-24; closes NICO-V241-001 + YSG-RISK-060):
-
-  **Attack chain eliminated:** openclaw joins `edge` (internet-facing for Slack/Telegram
-  webhooks) AND previously had `./secrets:/run/secrets:ro` mounted wholesale. An openclaw
-  RCE via a malicious webhook payload could read `caddy_internal_hmac` from
-  `/run/secrets/caddy_internal_hmac`, forge `X-Caddy-Verified-Secret` HMAC tokens, and
-  bypass the entire Caddy auth perimeter at backoffice — full admin access without
-  credentials. Same root cause (wholesale mount) as NICO-V241-001 but escalated to
-  `high` due to the `edge`-network adjacency.
-
-  **Fixes applied:**
-  - **openclaw**: `./secrets:/run/secrets:ro` volume mount **removed entirely**. openclaw
-    reads `yashigani_internal_bearer` from `openclaw.json` (install.sh substitutes
-    `__YASHIGANI_INTERNAL_BEARER__` at install time — no runtime file read needed). No
-    `secrets:` block on the openclaw service at all. `caddy_internal_hmac` and ALL PKI
-    material are inaccessible from within the openclaw container.
-  - **langflow**: wholesale mount replaced with single Docker named-secret
-    (`yashigani_internal_bearer`, mode 0440). Entrypoint shim continues to read from
-    `/run/secrets/yashigani_internal_bearer` — path unchanged. No other secrets visible.
-  - **letta**: wholesale mount replaced with single Docker named-secret
-    (`yashigani_internal_bearer`, mode 0440). Same entrypoint shim pattern.
-  - **letta-pgbouncer**: wholesale mount + redundant extra bind-mount replaced with 4
-    named-secrets: `pgbouncer_authenticator_password` (0440), `ca_root.crt` (0444),
-    `letta-pgbouncer_client.crt` (0444), `letta-pgbouncer_client.key` (0400). These are
-    exactly the 4 files consumed by the wrapper command + pgbouncer-letta.ini.
-  - **Helm parity verified** (Iris BF-1): `agent-bundles.yaml` already uses
-    `valueFrom.secretKeyRef` env-var injection — no volume mount of any kind. No Helm drift.
-
-  **Kill criterion (negative — the fix proof):**
-  - `docker exec yashigani-openclaw cat /run/secrets/caddy_internal_hmac` → no such file
-    (no `/run/secrets` in openclaw at all)
-  - `docker exec yashigani-langflow ls /run/secrets/` → only `yashigani_internal_bearer`
-  - `docker exec yashigani-letta ls /run/secrets/` → only `yashigani_internal_bearer`
-  - `docker exec yashigani-letta-pgbouncer ls /run/secrets/` → only the 4 named keys
-
-  **Files changed:** `docker/docker-compose.yml` (top-level `secrets:` block added;
-  per-service `secrets:` blocks on langflow/letta/letta-pgbouncer; openclaw volume
-  and comment updated). `docs/risk-register.yml` (NICO-V241-001 → mitigated; new
-  YSG-RISK-060 mitigated).
-
-  **Risk register:** NICO-V241-001 closed (`deferred` → `mitigated`). YSG-RISK-060
-  added + closed (`mitigated`) in same commit.
-
-### Added
-- **feat(pool): Kubernetes API backend — PoolManager now supports in-cluster per-identity pod spawning via the K8s API** (YSG-RISK-070, Tiago directive 2026-05-25, Tom #56 option b from `7e653b1`).
-  Previously, `create_backend()` returned `None` in K8s deployments without a Docker/Podman socket projection, causing pool-managed agent dispatch to return 502. The new `KubernetesBackend` closes this gap.
-
-  **What changed:**
-  - `KubernetesBackend` class added to `src/yashigani/pool/backend.py`: uses `kubernetes.client.CoreV1Api.create_namespaced_pod()` with labels `yashigani.managed=true`, `yashigani.identity=<id>`, `yashigani.service=<slug>`. Pod naming follows the Docker/Podman pattern (`ysg-<service>-<short_id>-<random>`).
-  - Detection: `create_backend()` checks for `KUBERNETES_SERVICE_HOST` env + `/var/run/secrets/kubernetes.io/serviceaccount/token` file before trying Docker/Podman. In-cluster config loaded via `kubernetes.config.load_incluster_config()`.
-  - Pod startup grace: K8s pods take seconds to start. Backend polls up to `YASHIGANI_POOL_K8S_POD_READY_TIMEOUT` (default 120s) at 2s intervals. Pods stuck in Pending raise `PodStartupTimeout` — callers should emit 503 Retry-After rather than 502.
-  - `PoolManager._create_container()` detects `backend.name == "kubernetes"` and omits the `network` parameter (irrelevant in K8s — pod IP is resolved directly from pod status).
-  - `kubernetes>=30.1` added to core dependencies in `pyproject.toml`.
-  - `YASHIGANI_POOL_K8S_POD_READY_TIMEOUT` env var controls the pod startup grace period.
-
-  **Helm:**
-  - `helm/yashigani/templates/rbac-pool-manager.yaml` (NEW): namespace-scoped `Role` granting `pods` + `pods/log` create/get/list/delete to the `yashigani` ServiceAccount. Bound via `RoleBinding`. Guarded by `poolManager.k8sBackend.enabled` (default `false`).
-  - `helm/yashigani/templates/networkpolicy.yaml`: three new policies (within `poolManager.k8sBackend.enabled` guard):
-    - `allow-pool-managed-pod-ingress`: gateway ONLY may reach pool pods on `poolManager.k8sBackend.agentPort`.
-    - `allow-pool-managed-pod-egress`: pool pods may only reach gateway:8080 (all LLM calls through gateway — OPA inspects both legs, UA-10 isolation preserved).
-    - `allow-gateway-to-pool-pods-egress`: gateway egress to pool pods on `agentPort`.
-  - `helm/yashigani/values.yaml`: `poolManager.k8sBackend.{enabled, agentPort, podReadyTimeoutSeconds}` values added with defaults (`false`, `8080`, `120`).
-
-  **Tests:** 20 unit tests in `src/tests/unit/test_pool_k8s_backend.py` (all PASS). Existing 29 pool tests unaffected.
-
-  **Risk:** YSG-RISK-070 accepted — gateway SA gains `pods` CRUD in namespace. Mitigated by Kyverno admission policies (non-root + no-new-privileges + seccomp enforced on all spawned pods).
-
-- **Per-user rate limit — 100 RPS / 200 burst** (YSG-RISK-058, Tiago 2026-05-24):
-  new `user` dimension added to `RateLimiter.check()`. When an authenticated user
-  (identified via `x-yashigani-user-id` header set by Caddy `forward_auth`) exceeds
-  100 requests/second (burst 200), the gateway returns HTTP 429 + `Retry-After`
-  header. Configurable via `YASHIGANI_RATE_LIMIT_PER_USER_RPS` env var; burst is
-  automatically 2× the configured RPS.
-
-  On breach, two admin alert signals fire simultaneously:
-  1. **Prometheus metric** `yashigani_user_rate_limit_violations_total{user_id_hash="<sha256[:16]>"}`
-     — in-stack monitoring. Grafana alert rule at
-     `config/grafana/alerts/user-rate-limit-burst.json` fires when a user accumulates
-     more than 5 breaches in a 5-minute window (2-minute `for:` period).
-  2. **Audit event** `USER_RATE_LIMIT_EXCEEDED` — emitted to the audit chain with
-     the full (admin-only) user identifier. Wazuh customers can route this event type
-     to email/Slack/webhook via their configured ruleset.
-
-  `user_id` is hashed (SHA-256, 16-char hex prefix) in ALL metric labels and
-  external-facing surfaces. Full identifier only in the admin-only audit chain.
-
-  Distinct from DDoSProtector per-IP layer (YSG-RISK-056) — these are two
-  complementary mechanisms: DDoS = coarse flood protection at IP layer;
-  per-user = per-authenticated-identity throttle + operator observability.
-
-  Redis key: `yashigani:rl:user:<hashed_user_id>` (DB 2, same namespace as other RL buckets).
-
-- **feat(auth): server-side next= redirect validator** (CHANGELOG drift audit finding #6):
-  `GET /auth/post-login-redirect?next=<value>` closes the gap where the open-redirect
-  backslash bypass guard existed only in the JS layer (`login.js:safeNext()`).
-  The server-side validator enforces the same rules at the HTTP trust boundary:
-  - Relative path starting with `/` required
-  - `//` and `/\` blocked (protocol-relative / IE-Edge backslash normalisation)
-  - Any `\` anywhere blocked
-  - Absolute URL schemes (`https:`, `http:`, `javascript:`, etc.) blocked
-  - `@` blocked (URL-userinfo trick)
-  - Length capped at 2 048 characters
-  On rejection: redirects to `/` + emits `OPEN_REDIRECT_ATTEMPT_BLOCKED` audit event
-  with SHA-256-hashed source IP and truncated+sanitised attempted value.
-  `login.js` updated to route through the server-side endpoint after JS `safeNext()`
-  pre-flight (defence-in-depth — both guards stay).
-  New event type: `OPEN_REDIRECT_ATTEMPT_BLOCKED`.
-  Test suite: `src/tests/unit/test_next_redirect_validator.py` (25 cases).
-  ASVS V5.1.5 / CWE-601 / OWASP A01:2021.
+- **feat(audit): least-privilege runtime DB role split** — `yashigani_admin` (DDL / migrations, superuser) and `yashigani_app` (runtime request paths, NOSUPERUSER) are now distinct roles. On upgrade from pre-2.25.2, migration `0015` demotes `yashigani_app` and reassigns table ownership. Audit tables (`audit_events`, `inference_events`, `audit_chain_checkpoints`) grant `yashigani_app` SELECT + INSERT only; UPDATE/DELETE are revoked. FORCE ROW LEVEL SECURITY ensures RLS applies even to previous table owners. Closes the gap where a superuser runtime role bypassed declared REVOKE and RLS constraints.
+- **feat(audit): PostgresSink wired into the audit write path** — the PostgreSQL audit sink is now unconditionally instantiated and registered in the gateway write path. Previously the sink existed but was not wired, meaning audit events were only delivered to the file sink and in-memory sinks during normal operation.
+- **feat(install): automated Wazuh mTLS provisioning** — `install.sh` now generates an internal-CA admin certificate (EC P-256, PKCS#8), a CA bundle, a re-PKI'd indexer HTTP certificate, a re-PKI'd `opensearch.yml` (updated `admin_dn`), and `internal_users.yml` with bcrypt hashes of the real generated admin/kibanaserver passwords. The Wazuh image's demo PKI (`admin/admin`) is removed at install time. All generated material lands in git-ignored `docker/wazuh-mtls/`. No manual steps required.
+- **feat(install): `wazuh-security-init` one-shot sidecar** — runs `securityadmin` automatically once the indexer TLS listener is up. The Wazuh manager and dashboard gate on its completion. Previously this was a manual post-deploy step.
 
 ### Fixed
-- **fix(openwebui): remove @Help half-implementation seed (drift #10)** — The
-  `CHAINING_GUIDE` model (`id: "@Help"`, name: "Yashigani — How to use agents") was
-  seeded into Open WebUI's model table via `scripts/init-openwebui-agents.py`. The model
-  appeared in the UI @-mention picker but was never registered as a real agent in
-  `/admin/agents`; any user invocation routed to the gateway and received a 404. Removed
-  entirely — the three real agents (Lala/@Langflow, Julietta/@Letta, Scout/@OpenClaw)
-  remain unaffected. Grep confirms zero remaining `@Help` or `CHAINING_GUIDE` references
-  in any user-facing path.
 
-- **fix(agents): langflow + letta OPENAI_API_BASE port corrected :8080→:8081**
-  (BUG-V241-LANGFLOW-LETTA-BASE-URL — confirmed broken by Maxine + Iris fresh audits,
-  Tiago directive 2026-05-24):
-
-  **Bug:** `OPENAI_API_BASE: http://gateway:8080/v1` was set for both langflow and letta in
-  `docker/docker-compose.yml` and `helm/yashigani/values.yaml`. Port 8080 is the gateway's
-  mTLS listener (`ssl.CERT_REQUIRED`) — langflow and letta carry no client certificate, so
-  every LLM dispatch attempt hit an mTLS handshake failure and returned a connection error.
-
-  **Fix:** Changed to `http://gateway:8081/v1` (Compose) and
-  `http://yashigani-gateway:8081/v1` (Helm). Port 8081 is the gateway's internal mesh
-  listener (plain HTTP, data-network-only). Network isolation on the `data` bridge (Compose)
-  and K8s NetworkPolicy (Helm) are the transport guards; `AgentAuthMiddleware` enforces
-  token auth at the application layer on all requests arriving at `:8081`.
-
-  **Historical context:** open-webui received the identical fix at v2.23.4 BUG-2
-  (`docker-compose.yml` line 528-532, `values.yaml` line 1172-1175). Langflow and letta
-  were added after v2.23.4 and inherited `http://gateway:8080/v1` from the pre-fix pattern.
-
-  **Files changed:** `docker/docker-compose.yml` (langflow env line ~1581, letta env line
-  ~1772), `helm/yashigani/values.yaml` (langflow.env.OPENAI_API_BASE, letta.env.OPENAI_API_BASE),
-  `docs/risk-register.yml` (stale compensating-control note updated).
-
-- **fix(pgbouncer): restore compose-Helm admin_users + stats_users parity** (drift #8 secondary, 2026-05-25):
-  `helm/yashigani/files/pgbouncer.ini` was missing the `admin_users =` and `stats_users =`
-  directives that `docker/pgbouncer/pgbouncer.ini` has carried since the Laura F2 / ASVS V14.4.1
-  hardening (YSG-RISK-049 close). Without the explicit empty-string override the edoburu image
-  default sets `admin_users=$DB_USER` (yashigani_app), which would expose the pgbouncer admin
-  console to any client authenticated as yashigani_app reaching the pgbouncer TCP listener.
-  Both letta variants (`compose-letta` + `helm-letta`) already carried the directives and were
-  at parity — this fix closes the helm-main gap only. Empty string disables both consoles in
-  pgbouncer 1.21+. `tests/contracts/test_pgbouncer_auth_parity.py` extended with 8 new
-  parametrised assertions (tests 7 + 8: `admin_users` present + empty, `stats_users` present
-  + empty, across all four ini files). 28/28 PASS.
-
-- **fix(pgbouncer): restore compose-Helm auth_query parity** (CHANGELOG drift audit finding #8):
-  `docker/pgbouncer/pgbouncer.ini` had an explicit `auth_file = /etc/pgbouncer/userlist.txt`
-  directive that `helm/yashigani/files/pgbouncer.ini` did not (Iris §5 removed it in v2.24.0).
-  The directive was redundant — pgbouncer 1.25.1 defaults to `/etc/pgbouncer/userlist.txt` when
-  `auth_file` is absent, and the edoburu image pre-creates that path. Both INIT-003 wrapper paths
-  (compose + Helm) continue to write `userlist.txt` via `DATABASE_URL` so the `auth_user`
-  (pgbouncer_authenticator) credential is available for the `auth_query` postgres leg.
-  Verified: pgbouncer 1.25.1 starts cleanly without the directive (no auth_file-related
-  warnings in startup logs). New contract test `tests/contracts/test_pgbouncer_auth_parity.py`
-  (20 cases) asserts compose-Helm parity across all four ini files for `auth_query`, `auth_user`,
-  `auth_dbname`, `auth_type`, and `auth_file` presence/absence. 20/20 PASS.
-  YSG-RISK-049 compensating-controls note updated in risk-register.yml.
-
-- **DDoSProtector wire-up** (CHANGELOG drift audit finding #2): `DDoSProtector` was
-  instantiated in `entrypoint.py` and wired into both `configure_openai_router()` and
-  `create_gateway_app()`. Previously the class existed but was never instantiated, making
-  the v2.20 CHANGELOG entry ("per-IP `DDoSProtector` Redis-backed, 429 + `Retry-After`")
-  dead code. That claim is now true.
+- **fix(install): pre-upgrade backup works on read-only containers** — `docker cp` refuses `ReadonlyRootfs=true` containers in both directions (Docker 29). The backup step is replaced with tar-over-`exec` plus a sha256 integrity check on the streamed bundle. The LOCKED fail-closed crypto envelope is unchanged.
+- **fix(install): pre-upgrade secrets backup non-fatal on root-owned files** — root/UID-owned client keys unreadable by a non-root install user no longer abort the upgrade under `set -e`.
+- **fix(install): convergence-gate timeout raised from 60 s to 180 s** — 60 s was triggering false failures on first boot of healthy stacks. Configurable via `YSG_HEALTHZ_TIMEOUT_S`.
+- **fix(install): `UPSTREAM_MCP_URL` reused on upgrade** — when `--upstream-url` is omitted during `--upgrade`, the value is read from the existing `.env`. A blank export previously broke the `${UPSTREAM_MCP_URL:?}` compose interpolation.
+- **fix(install): CWE-732 secrets-perm guardrail self-heals** — the permission check tightens world-readable non-cert files rather than aborting the install.
+- **fix(install): runtime is explicit on dual-runtime hosts** — on a host with both Docker and Podman, `install.sh` requires `--runtime docker` (or `YSG_RUNTIME`) instead of auto-selecting Podman. Prevents silent runtime mis-selection on development machines.
+- **fix(opa): retire deny-override anti-pattern causing eval_conflict 500s** — OPA policies that combined `allow = true` and `allow = false` default rules in the same package produced `eval_conflict` errors (HTTP 500) on every policy evaluation. All affected policy files refactored to a single `allow` rule with explicit default-deny.
+- **fix(opa): fail-closed defaults on all v1 sub-decisions** — OPA sub-decision rules that lacked explicit defaults could return undefined, which the gateway treated as deny but did not audit. All sub-decision rules now carry `default = false` so behaviour is explicit and auditable.
+- **fix(opa): OPA response_decision defaults to false (fail-closed)** — two call sites in `openai_router.py` had `result.get("allow", True)`. An absent "allow" key (OPA bundle mismatch or partial load) resolved to ALLOW. Both defaults changed to `False`.
+- **fix(helm): mcp.rego added to Kubernetes OPA bundle** — the Helm chart OPA ConfigMap was missing `mcp.rego`, causing MCP-specific policy rules to be silently absent in Kubernetes deployments. Now mirrors the Docker Compose policy bundle.
+- **fix(opa): stale chain-depth test assertions corrected** — two tests asserted a maximum chain depth of 3 when the actual limit is 9. Corrected to match the implemented ceiling, preventing false passes.
+- **fix(inspection): decode-before-classify on the inference path** — base64-encoded or percent-encoded payloads were previously classified as CLEAN because the classifier operated on the encoded form. The pipeline now decodes before classification, so encoding does not bypass PII detection or sensitivity classification.
+- **fix(wazuh): HTTPS + healthcheck fixes for Linux / Docker 29.x** — the Wazuh compose overlay corrected manager and dashboard URLs from `http://` to `https://`, added filebeat certificate mounts, added a minimal `opensearch_dashboards.yml`, and fixed all three healthchecks to accept the HTTP 401/403 responses that a security-enabled indexer returns (the prior `-f` flag errored on ≥400 → permanent false-unhealthy → deadlock). Minimum capabilities for the Wazuh manager (`SYS_CHROOT`, `SETPCAP`) added to resolve Docker 29.x entrypoint failures.
+- **fix(caddy): Dockerfile.caddy COPY path corrected** — a COPY directive referenced `caddy/caddy-entrypoint.sh` but `docker-compose.yml` sets `build.context: ..` (repo root). The correct path is `docker/caddy/caddy-entrypoint.sh`. The broken path caused `podman build` to exit 125 on all Podman-based installs.
+- **fix(podman): relative seccomp path in Podman override** — `YASHIGANI_SECCOMP_PROFILE` set to an absolute path caused "file name too long" in podman-compose 1.5.0 on Mac. The Podman override file now uses a relative path `./seccomp/yashigani.json`, resolved from the compose file directory.
+- **fix(postgres): cert + pg_ident CN map for pgbouncer_authenticator** — multiple iterations of the pgbouncer authentication carveout culminated in a `cert map=pgb-auth-map` approach: PG16 `cert` auth method (verify-full) plus `pg_ident.conf` CN mapping. This eliminates platform-specific SCRAM computation bugs and restricts authentication to the two named pgbouncer CN values, closing the lateral-pivot risk class definitively.
+- **fix(openclaw): openclaw.json baseUrl and Helm OPENCLAW_UPSTREAM_URL corrected to :8081** — openclaw's gateway URL lived in a JSON config file, not an env var. The base-URL sweep that fixed langflow and letta in v2.24.x missed this path. Both the compose JSON config and the Helm value are now `:8081` (the in-mesh listener).
 
 ### Changed
-- **License-scaled DDoS defaults** (YSG-RISK-056, Tiago 2026-05-24): per-IP
-  connection limit now scales with `LicenseState.max_end_users` so large deployments
-  are not blocked by a fixed ceiling. Formula: `max(5000, max_end_users * 25)`.
-  The 25× multiplier assumes a worst-case corporate-NAT topology where many licensed
-  users share a single egress IP. Enterprise/academic (unlimited, `max_end_users == -1`)
-  → 100 000. Resulting per-tier defaults:
-  | Tier | max_end_users | per-IP limit |
-  |---|---|---|
-  | community / canary | 5 | 5 000 (floor) |
-  | igniter | 50 | 5 000 (floor) |
-  | starter | 100 | 5 000 (floor) |
-  | professional | 500 | 12 500 |
-  | professional_plus | 4 000 | 100 000 |
-  | enterprise / academic | -1 | 100 000 (sentinel) |
 
-  `YASHIGANI_DDOS_PER_IP_LIMIT` env var still overrides the computed default.
-  Startup log now emits:
-  `"DDoSProtector configured: max_end_users=N → per_ip_limit=M (source=license|env), window=60s"`
-- **Permissive DDoS floor** (from previous entry): floor of 5000 still applies.
-  Caddy timeouts remain the first-line flood defence; this second-line gate fires
-  only on extreme volume. Override env vars:
-  - `YASHIGANI_DDOS_PER_IP_LIMIT` — integer, requests per window per IP (wins over license-computed)
-  - `YASHIGANI_DDOS_WINDOW_SECONDS` — integer, window length in seconds
-  - `YASHIGANI_DDOS_EXEMPT_PATHS` — comma-separated extra paths to exempt
-- **Redis DB 5** dedicated to DDoS counters (DB 2 = rate-limit/anomaly,
-  DB 3 = RBAC/agents/identity, DB 4 = response-cache; DB 5 was free).
-- `/_yashigani/healthz` added to `_EXEMPT_PATHS` (was missing from class defaults).
+- **security(opa): OPA RBAC groups survive gateway restart** — the `RBACStore` already persists write-through to Redis, but the backoffice never re-pushed that state to OPA on startup. RBAC groups now vanished from OPA after any policy- or upgrade-restart. The backoffice lifespan now re-pushes the store to OPA at startup (best-effort, retried, never blocks startup).
+- **feat(runtime-settings): admin panel for live gateway tunables** — Phase 2 web UI ships the "Runtime Settings" admin panel, allowing operators to view and edit live gateway tunables (per-user RPS, DDoS per-IP limit, DDoS window) without a container restart. Phase 1 (DB persistence + admin API) shipped in v2.24.1.
 
 ---
 
+## [v2.25.1] — 2026-06-01
+
+Theme: **TLS 1.3 minimum on the internal mesh**.
+
+### Changed
+
+- **security(tls): TLS 1.3 minimum enforced on all internal mesh contexts** — `src/yashigani/pki/ssl_context.py` server, client, and CA-trust contexts updated to `minimum_version = TLSVersion.TLSv1_3`. Three operator scripts (`scripts/partition_maintenance.py`, `scripts/yashigani-manifest.py`, `scripts/yashigani-onboard.py`) pin `create_default_context` to TLS 1.3. All internal mesh peers support 1.3 (Postgres 16-alpine, Redis 7.4.9, pgbouncer 1.25.1, uvicorn/OpenSSL 3.x); there is no compatibility reason for a 1.2 floor. Surfaced by ACS v6 CBOM scan.
+
+**Note:** Python's `ssl`/OpenSSL negotiates a classical key exchange even at TLS 1.3. Post-quantum key exchange is terminated at the Caddy edge (X25519MLKEM768). Internal east-west post-quantum key exchange is tracked separately.
+
+---
+
+## [v2.25.0] — 2026-05-28
+
+Theme: **Kubernetes/Helm parity sweep + signed + encrypted install-time backup**.
+
+### Added
+
+- **feat(install): signed and encrypted install-time backup** — `install.sh` now produces a dual-wrap AES-256-GCM backup envelope before any upgrade or destructive operation. A random DEK encrypts the bundle; the DEK is wrapped under two independent KEKs so either can recover: KEK1 (admin password via argon2id + HKDF-SHA384) and KEK2 (license file or local DB key for community tier). An HMAC-SHA384 integrity tag is included. Under `FIPS_MODE=1` only wrap#2 is written (argon2id is not FIPS-approved). Closes CWE-311 (unencrypted backup) and CWE-345 (broken integrity control).
+- **feat(helm): K8s/Helm parity sweep (Wave 1 critical)** — PKI rotate HMAC carry-forward; Grafana `:3443`; gateway `:8081` Ingress + pod-level bundle label; observability NetworkPolicies (otel/jaeger/alertmanager/loki); OPA `.Files.Get`; audit-log PVC; state-file + `.env.helm`.
+- **feat(helm): K8s/Helm parity sweep (Wave 2 high/medium)** — image-digest guard; runtime FIPS attestation at `/admin/crypto/inventory`; nginx AND-semantics; Wazuh K8s not-supported guard; `OWUI_SECRET_KEY` injection; PSA baseline labels; ServiceAccount token gates (gateway conditional, Open WebUI hard-off); CMVP wiring; audit notes.
+- **feat(helm): K8s/Helm parity sweep (Wave 3 high/medium)** — `/api/v1/admin/*` Caddyfile in Helm; agent-bundle state in backup CronJob; compose Caddyfile SPIFFE strip.
+- **feat(fips): FIPS 140-3 deployment guide** — `docs/operations/fips-deployment.md` documents the FIPS 140-3 deployment posture, CMVP certificate reference, blocked algorithms (cosign/Sigstore, argon2id backup wrap), and a pre-deployment validation checklist.
+
+### Fixed
+
+- **fix(helm): NetworkPolicy port YAML strip bug** — a YAML rendering bug stripped port values from NetworkPolicy rules under certain value combinations. Fixed in chart templates.
+- **fix(compose): agent-volume backup compose-prefix** — agent volumes named with the project prefix were not captured by the backup CronJob's volume enumeration.
+- **fix(backup): CWE-732 backups/ world-readable** — backup output directory permissions tightened; `o+rX` bits pruned.
+- **fix(compose): Caddyfile SPIFFE strip** — compose Caddyfile now strips the SPIFFE URI from the `X-Forwarded-Client-Cert` header before forwarding to backoffice.
+
+---
+
+## [v2.24.4] — 2026-05-26
+
+Theme: **Post-v2.24.3 reliability and security fixes — IPv6, uninstall reliability, FIPS flag propagation, licensing on Kubernetes**.
+
+### Fixed
+
+- **fix(install): IPv6 egress parity** — iptables rules in the Caddy entrypoint now handle IPv6 addresses in the egress allowlist resolution; previously IPv6 addresses from DNS could be silently dropped from allow rules.
+- **fix(caddy): ACME egress allowlist gated on TLS mode** — the ACME egress allowlist was applied unconditionally; it is now applied only when `TLS_MODE=acme`.
+- **fix(caddy): IPv4+IPv6 parity** — Yashigani is IPv4-only by design on the internal mesh; external Caddy listener now correctly handles inbound IPv6 clients.
+- **fix(uninstall): canonical network cleanup and final assertion** — uninstall.sh now correctly removes compose networks and asserts cleanup completion, preventing phantom networks blocking re-installs.
+- **fix(uninstall): force-remove volumes and retry pass** — volume removal now includes a retry pass after container force-removal to handle the edge case where a container respawns during teardown.
+- **fix(helm): networking — NetworkPolicy IPv6 alignment** — K8s NetworkPolicy rules updated for IPv6 parity.
+- **fix(fips): FIPS_MODE propagation to gateway/backoffice/caddy** — `FIPS_MODE` env var was not forwarded to all container processes; now propagated consistently.
+- **fix(helm): licensing Secret + mount** — Kubernetes installs now correctly enrol a paid licence via the licensing Secret; previously the Secret was absent on fresh K8s installs.
+- **fix(tests): replace hardcoded developer-machine paths** — 7 unit tests contained paths from a specific developer's machine, causing failures on any other system.
+
+### Security
+
+- **fix(network): close IPv6 egress leak on OpenClaw NetworkPolicy** — a port-only IPv6 egress rule on the OpenClaw NetworkPolicy was overly permissive; corrected to match the intended IPv4-only internal mesh policy.
+
+---
+
+## [v2.24.3] — 2026-05-25
+
+Theme: **Post-v2.24.2 reliability fixes — pgbouncer auth stability, Caddy build fix, OPA fail-closed hardening**.
+
+### Fixed
+
+- **fix(postgres): pgbouncer authentication hardened to cert + CN map** — multiple iterations (cycles 4–8) of the pgbouncer `pg_hba.conf` carveout resolved to `cert map=pgb-auth-map`: PG16 `cert` auth with `pg_ident.conf` CN mapping to `pgbouncer_authenticator`. This avoids platform-specific SCRAM computation defects in pgbouncer 1.25.1 on ARM64 and is stronger than the prior `verify-ca` posture (verify-full + CN-restricted). Contract test suite: 30 PASS / 1 SKIP.
+- **fix(openclaw): openclaw.json baseUrl and Helm `OPENCLAW_UPSTREAM_URL` corrected to `:8081`** — openclaw's gateway URL was in a JSON config file, not an environment variable. The prior sweep fixed langflow and letta but missed this path. Contract test suite extended to cover JSON config surfaces and Helm value.
+- **fix(caddy): Dockerfile.caddy COPY path corrected** — COPY path was relative to `docker/` but the build context is the repo root. Caused `podman build` to exit 125 on all Podman-based installs. Regression test asserts every COPY source path resolves from the build context root.
+- **fix(podman): relative seccomp path in Podman compose override** — absolute `YASHIGANI_SECCOMP_PROFILE` path caused "file name too long" in podman-compose 1.5.0. Override now uses `./seccomp/yashigani.json` relative to the compose file directory. Contract test added.
+- **fix(opa): OPA response_decision defaults to false (fail-closed)** — two `result.get("allow", True)` call sites in `openai_router.py` changed to `False`. An OPA bundle mismatch or partial load no longer silently allows traffic. Three unit tests added.
+- **fix(tests): test comment-line parser strips whole-line comments** — a `_parse_canonical_volumes` helper in the uninstall test suite was treating words from inline bash comments as volume names, producing false-positive phantom-volume failures.
+
+---
+
+## [v2.24.2] — 2026-05-25
+
+Theme: **Security hardening batch — agent secrets isolation, admin/user separation, OPA conformance, audit chain, TOTP Redis, DDoS throttling**.
+
+### Added
+
+- **feat(pool): Kubernetes API backend for PoolManager** — `KubernetesBackend` closes the gap where pool-managed agent dispatch returned 502 in K8s deployments without a Docker/Podman socket projection. The backend uses `CoreV1Api.create_namespaced_pod()` with managed labels. Helm: `poolManager.k8sBackend.{enabled, agentPort, podReadyTimeoutSeconds}` values; namespace-scoped RBAC Role + RoleBinding + NetworkPolicies for pool-pod isolation.
+- **feat(gateway): per-user 100 RPS rate limit with admin alerting** — a per-authenticated-user rate limit (default 100 RPS, burst 200) is enforced at the gateway. Breach triggers a Prometheus metric (`yashigani_user_rate_limit_violations_total`) and an audit event (`USER_RATE_LIMIT_EXCEEDED`). Redis key `yashigani:rl:user:<hashed_user_id>` (DB 2). Configurable via `YASHIGANI_RATE_LIMIT_PER_USER_RPS`.
+- **feat(gateway): DDoSProtector licence-scaled per-IP defaults** — per-IP connection limit scales with `max_end_users` from the licence state. Formula: `max(5000, max_end_users * 25)`. Enterprise/academic tier: 100 000. Configurable via `YASHIGANI_DDOS_PER_IP_LIMIT`.
+- **feat(runtime-settings): Phase 1 admin API + DB persistence** — a new `runtime_settings` service provides DB-persisted, live-reloadable gateway tunables (per-user RPS, DDoS per-IP limit, DDoS window). Admin API: `GET/PUT /admin/runtime-settings/{key}` and `POST /admin/runtime-settings/{key}/reset`. Redis pub/sub for live reload without a container restart.
+- **feat(auth): server-side `next=` redirect validator** — `GET /auth/post-login-redirect?next=<value>` enforces the same redirect-safety rules as the client-side JS guard: relative paths only, no `//`, no `\`, no absolute URLs, `@` blocked, 2048-character cap. Rejection emits `OPEN_REDIRECT_ATTEMPT_BLOCKED` audit event. ASVS V5.1.5 / CWE-601.
+- **feat(audit): tamper-evident audit chain — bigserial sequence column** — migration `0014` adds a `BIGSERIAL seq` column to `audit_events` for strictly monotonic cross-batch ordering, independent of timestamp collisions. `run_daily_checkpoint` orders by `seq NULLS LAST`. Existing rows backfilled preserving wave-2 ordering. ASVS V7.3.3 / NIST AU-10.
+
+### Fixed
+
+- **fix(agents): Langflow and Letta `OPENAI_API_BASE` corrected to `:8081`** — both bundled agents had `gateway:8080` (the mTLS-only listener). Langflow and Letta carry no client certificate, so every LLM dispatch hit an mTLS handshake failure. Corrected to `gateway:8081` (the in-mesh plain-HTTP listener). Helm value updated in parallel.
+- **fix(openwebui): `@Help` CHAINING_GUIDE half-implementation removed** — a model seeded as `@Help` appeared in the UI @-mention picker but was never registered as a real agent; any invocation returned 404.
+- **fix(pgbouncer): compose-Helm `admin_users` / `stats_users` parity** — `helm/yashigani/files/pgbouncer.ini` was missing `admin_users =` and `stats_users =` directives, leaving the pgbouncer admin console accessible to any client authenticated as `yashigani_app`. Empty string disables both consoles in pgbouncer 1.21+.
+
+### Security
+
+- **security(secrets): per-key Docker named-secrets on agent containers** — the wholesale `./secrets:/run/secrets:ro` bind-mount removed from openclaw entirely (openclaw reads its bearer token from the JSON config; PKI material is inaccessible). Langflow and Letta use a single named Docker secret (`yashigani_internal_bearer`, mode 0440). `letta-pgbouncer` uses 4 named secrets covering exactly the files it consumes. Eliminates the class where a container RCE on an internet-adjacent agent could read the HMAC key and bypass the Caddy auth perimeter.
+- **security(sod): admin/user separation-of-duties enforcement** — collision checks on all account creation paths (local auth, SCIM provision, SSO/SAML callback) prevent the same email/username appearing as both admin and user. `/auth/verify` (the Caddy forward_auth target) now rejects admin sessions with HTTP 403. A daily cron audits cross-store conflicts and emits `IDENTITY_STORE_CONFLICT` events. NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4.
+- **security(opa): OPA conformance gaps closed** — `GET /v1/models` is now OPA-evaluated per principal (human/admin principals receive the full list; service-account principals receive a restricted list). The `/{path:path}` catch-all proxy response leg now has an OPA response-decision check mirroring the `/v1/chat/completions` pattern. Both gaps previously allowed traffic to bypass the OPA policy gate.
+- **security(opa): response-content sensitivity classification** — `ResponseInspectionPipeline` now classifies the response body for sensitivity when configured, and the OPA response ceiling check uses the actual response sensitivity rather than the prompt sensitivity. `/agents/*` gained a response-leg OPA check with the same sensitivity model.
+- **security(auth): TOTP failure counter migrated to Redis** — the in-process Python dict (`_totp_failures`) reset on every restart, allowing bypass of the 3-failure lockout by triggering a process kill. Migrated to Redis key `yashigani:totp_fail:<session_prefix>` with 1800 s TTL. Fail-closed: HTTP 503 when Redis is unavailable. ASVS V6.3.5 / CMMC IA.L2-3.5.7 / ISO 27001 A.5.17.
+- **security(perimeter): Caddy egress restricted via iptables OUTPUT allowlist** — post-Caddy-RCE, an attacker cannot reach arbitrary internet endpoints for exfiltration or C2. The allowlist permits loopback, in-mesh bridge subnets, Docker DNS, and resolved IPs of the configured ACME/OCSP providers. A Kubernetes NetworkPolicy provides equivalent enforcement in K8s. `NET_ADMIN` capability added to Caddy (scoped to the container's network namespace). Operator override: `YASHIGANI_CADDY_EGRESS_ALLOWLIST`.
+- **docs(release-signing): SSH-only signing scheme formally declared** — GPG CI path removed (hardware-backed key cannot sign in CI without the physical device). `docs/security/release-signing.md` documents the SSH verification recipe and key rotation procedure. `docs/release-signing-key.pub` is the operational verification artefact.
+
+---
+
+## [v2.24.1] — 2026-05-25
+
+Theme: **Audit chain, OPA coverage, multi-tenant manifest, runtime rate limiting**.
+
+### Added
+
+- **feat(audit): tamper-evident hash-chained audit events** — migration `0011` adds `prev_hash` and `event_hash` (SHA-384) columns to `audit_events`. Every production insert computes and stores the chain links; the daily `run_daily_checkpoint` job anchors the Merkle root. ASVS V7.3.3 / NIST AU-10.
+- **feat(audit): multi-tenant manifest registration ledger** — `manifest_registrations` table tracks the ceremony record for every agent manifest onboarding, providing an auditable chain of custody per agent identity.
+- **feat(audit): operator identity attestation on `yashigani onboard`** — the onboarding command now records the attesting operator's admin identity in the manifest ceremony record.
+- **feat(grc): machine-readable risk register + CI staleness gate** — `docs/risk-register.yml` schema formalised; a CI gate fails when the register has not been updated in the configured window.
+- **feat(caddy): admin API moved to Unix socket** — Caddy's admin API migrated from TCP `:2019` to a Unix socket, eliminating the in-container TCP listener that could be reached by other services on the bridge network.
+- **feat(fips): SHA-256 backup manifest routed through OpenSSL FIPS Provider** — when `FIPS_MODE=1`, the `MANIFEST.sha256` generation in `install.sh` routes through the OpenSSL FIPS Provider (`lib/yashigani-fips.sh`). Closes the route-integrity use case for FIPS 140-3 installations.
+
+### Security
+
+- **security(opa): GAP-1 fail-closed catch-all for unknown sensitivity ranks** — a Rego rule was added to treat any unrecognised `sensitivity_rank` string as RESTRICTED, preventing a crafted or unknown value from bypassing the sensitivity ceiling check.
+- **security(kms): `YASHIGANI_KSM_PROVIDER` renamed to `YASHIGANI_KMS_PROVIDER`** — backward-compat shim retained for existing deployments.
+
+---
+
+## [v2.24.0] — 2026-05-25
+
+Theme: **Audit chain foundation, agent secrets distribution, container supply-chain, RBAC/OPA depth**.
+
+### Added
+
+- **feat(pki): BYO intermediate RSA key acceptance** — `bootstrap()` now accepts a `byo_intermediate` CA source mode, allowing operators to provide an externally-generated RSA intermediate key.
+- **feat(ci): Trivy agent-image CI gate** — a CI job scans bundled agent images (Langflow, Letta, OpenClaw) and fails on HIGH/CRITICAL CVEs not present in the allowlist (`trivy-agent-allowlist.json`).
+- **feat(ci): agent image built-in component scan** — bandit and opengrep run against bundled agent image source at build time.
+
+### Fixed
+
+- **fix(postgres): pgbouncer_authenticator role + `pg_hba` auth carveout** — a dedicated `pgbouncer_authenticator` role with a `SECURITY DEFINER` auth-query function plus a targeted `pg_hba.conf` carveout allows pgbouncer to authenticate without requiring superuser privileges on the postgres user. Multiple iterations landed in this release; see v2.24.3 for the final stabilised form.
+- **fix(secrets): per-consumer secret ownership** — secret files written by `install.sh` now use per-consumer UID:GID and mode rather than a single shared GID, closing the cross-secret-read class.
+- **fix(install): VEB compose variable-expansion sanitisation** — variable-expansion bypass (`${PASS}` in compose files) and an installer strip-pattern that could mutate passwords containing special characters are both fixed.
+
+### Documentation
+
+- **docs**: `docs/operator-guide.md` created — OPA+inspection pairing recipe, XFF trust-boundary clarification, `PASSWORD_MAX_AGE_DAYS` fix, and admin/user separation guidance.
+- **docs**: `docs/security/xff-trust-boundary.md` — documents XFF trust model and `TRUSTED_PROXY_CIDRS` configuration.
+- **docs**: `docs/security/release-signing.md` and `docs/release-signing-key.pub` — SSH signing key and verification instructions.
+
+---
 ## [v2.23.4] — 2026-05-21
 
 > The v2.23.4 release closes the v2.23.3 follow-up backlog, ships the SAML BYOK
@@ -458,7 +197,7 @@ Captures session work between v2.24.1 (commit `a46ed5d`) and HEAD (`10e03d4`). M
 > new CI gate that prevents Caddyfile / service-identity drift between compose
 > and Helm, an architectural close of the cleanup-system class (state file +
 > container-fallback rm + cross-UID handlers across install/uninstall), the
-> pgbouncer mTLS sidecar (`letta-pgbouncer`) closing YSG-RISK-048, and the
+> pgbouncer mTLS sidecar (`letta-pgbouncer`), and the
 > KMS-architectural reframe for credential handling (non-KMS dev posture vs
 > KMS-configured production posture documented at
 > `docs/yashigani_install_config.md` §6.1).
@@ -671,7 +410,7 @@ Captures session work between v2.24.1 (commit `a46ed5d`) and HEAD (`10e03d4`). M
   images. Remaining 3 CVEs (CVE-2025-69720 ncurses, CVE-2026-41989
   libgcrypt, CVE-2026-6732 libxml2) are all NOT-EXPLOITABLE-CVA per
   pre-existing verdicts independent of package version. Trivy rescan
-  verdict: `testing_runs/yashigani_trivy_rescan_20260517/verdict.md`.
+  Post-fix Trivy rescan confirmed clean.
 - **Admin/user tier separation regression test** — covered with a real
   fakeredis-backed integration test exercising the production registration
   path (not a mock).
@@ -734,10 +473,7 @@ Captures session work between v2.24.1 (commit `a46ed5d`) and HEAD (`10e03d4`). M
   of production / staging to preserve the prior fail-open behaviour during
   local development.
 
-### Security (post-FINDING-002 addendum 2026-05-18)
-
-These entries were added after the Iris third-pass audit caught CHANGELOG
-drift on the rebased branch. They cover the post-FINDING-001 work:
+### Security (additional hardening)
 
 - **`yashigani-internal` Bearer rotated to per-install secret** (`514316d`
   gateway env-var read + `27d46ab` `install.sh` token generation +
@@ -748,8 +484,7 @@ drift on the rebased branch. They cover the post-FINDING-001 work:
   via the `yashigani-agent-bearer` Secret with upgrade-safe `lookup`.
   Compose entrypoint shims export the secret to `OPENAI_API_KEY` for Open
   WebUI + Langflow + Letta service consumers. Gateway compare uses
-  `hmac.compare_digest`. Closes the Captain gitleaks-baseline Bucket-C
-  finding from 2026-05-17.
+  `hmac.compare_digest`.
 - **`OPA_RESPONSE_CHECK_FAILED` audit-event type added** (`src/yashigani/audit/schema.py`,
   shipped in `318a3db`). New Prometheus counter
   `yashigani_opa_response_check_failures_total{outcome, reason}` registered
@@ -774,7 +509,7 @@ drift on the rebased branch. They cover the post-FINDING-001 work:
   Bearer presents `kind=service` identity and passes the upstream gate
   unaffected.
 
-### CI / Tooling — post-FINDING-002 addendum
+### CI / Tooling — additional
 
 - **`acs-v3-hardcoded-bearer-auth-bypass`** rule shipped on the ACS side
   (CWE-798, ASVS V6.3.2, OWASP A07:2021, OWASP API API2, NIST IA-5, CMMC
@@ -784,37 +519,16 @@ drift on the rebased branch. They cover the post-FINDING-001 work:
   auth-handling paths. Wired into 19 of 20 framework files (ACS rc2). New
   detection-lane that would have caught the `yashigani-internal` literal
   before it shipped.
-- **Laura red-team brief template** now includes a STANDING credential-audit
-  lane (Lane A — 10 hardcoded-credential pattern classes; Lane B — 5
-  JWT/session probes). Non-optional on every pre-release dispatch
-  henceforth. Template at
-  `Internal/Compliance/yashigani/templates/laura-pre-release-brief-template.md`.
 
-### Documentation — post-FINDING-002 addendum
+### Documentation — additional
 
 - **OPA fail-closed operator runbook** — `_opa_response_check` docstring
   in `openai_router.py` now describes the new fail-closed behaviour, the
   audit-event emission, the Prometheus counter, and the operator response
   when an OPA outage causes denials. Replaces the prior misleading
-  docstring that claimed audit coverage that did not actually fire (Iris
-  FINDING-001, closed in `9007e11`).
-- **CHANGELOG addendum trail** — Iris third-pass FINDING-005 caught that
-  the post-FINDING-002 addendum at `fa506e2` did not cover 10 subsequent
-  commits. This block closes that gap. Lesson saved to
-  `feedback_detection_lane_parity_audit.md` (one audit lane catches a
-  class — every other lane must demonstrate it would catch the same class
-  or document the gap).
+  docstring that claimed audit coverage that did not actually fire.
 
-### Security (tag close-out addendum 2026-05-21 — Batches 1+2+3 + cleanup-system architectural close)
-
-These entries cover the final pre-tag arc: 16 commits between `b03029f` and
-`03dd494` closing the v2.23.4 backlog. Iris+Laura review-first pattern
-executed across 10+ design+threat-model cycles (docs persisted at
-`internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`). Ava E2E
-13/13 PASS at tip `03dd494` (Phase 1 6/6 + Phase 2 6/6 + crucible test of
-the cross-UID `.env` class-of-bug close). All YSG-RISK entries triaged
-through Iris+Laura independent reviews; 7 register items confirmed CLOSED
-on triage; the cleanup-system architectural class fully closed.
+### Security (tag close-out addendum 2026-05-21)
 
 - **`letta-pgbouncer` mTLS sidecar** — letta's postgres connection now
   routes through a dedicated `letta-pgbouncer` session-mode sidecar
@@ -824,26 +538,13 @@ on triage; the cleanup-system architectural class fully closed.
   (`hostssl all all 0.0.0.0/0 scram-sha-256 clientcert=verify-ca`) applies
   uniformly with no letta carveout. asyncpg+pg8000 limitation (cannot
   present client certs via URI params) is closed at the sidecar boundary.
-  Closes YSG-RISK-048 (was MEDIUM open through Phase 3 arc).
-- **pgbouncer `auth_type=plain` posture documented as non-KMS-only**
-  (YSG-RISK-049 ACCEPTED-LOW). The cleartext userlist.txt is the expected
-  posture for the non-KMS dev/standalone deployment scenario. Production
-  deployments configure a KMS provider via `YASHIGANI_KMS_PROVIDER=vault|azure|
-  aws|gcp|keeper` which fetches credentials at runtime via the abstractions
-  in `src/yashigani/kms/` — the cleartext userlist.txt path is bypassed
-  entirely in KMS-configured deployments. Documented at
-  `docs/yashigani_install_config.md` §6.1.
-- **YSG-SECRETS-DIST-002 LOW filed** — GID 2002 (numeric, no `/etc/group`
-  entry) full-bind-mount cross-secret read. Compromised container with GID
-  2002 supplementary can read all three shared secrets, not just the one
-  it needs. Forward-close target v2.24.0 via per-consumer credentials.
-  No exploit chain in v2.23.4 (compensating control: cap_drop:ALL +
-  read_only:true rootfs + container-boundary trust posture).
+
+- **pgbouncer `auth_type=plain` posture documented as non-KMS-only** — the cleartext userlist.txt is the expected posture for non-KMS dev/standalone deployments. Production deployments configure a KMS provider via `YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper` which fetches credentials at runtime — the cleartext-on-disk path is bypassed entirely in KMS-configured deployments. Documented at `docs/yashigani_install_config.md` §6.1.
+- **GID 2002 cross-secret read (LOW)** — containers sharing GID 2002 can read all three shared secrets rather than only their own. No exploit chain in v2.23.4 (mitigated by cap_drop:ALL + read_only rootfs). Per-consumer credentials tracked for v2.24.0.
 - **pgbouncer admin console lockdown** — both yashigani-pgbouncer and
   letta-pgbouncer `pgbouncer.ini` now set `admin_users =` empty and
   `stats_users =` empty, disabling the admin console (was inadvertently
-  open to `yashigani_app` cred on yashigani-pgbouncer). Closes Laura F2
-  finding from the Batch 3 threat-model.
+  open to `yashigani_app` cred on yashigani-pgbouncer).
 
 ### Fixed (tag close-out addendum 2026-05-21)
 
@@ -866,7 +567,7 @@ on triage; the cleanup-system architectural class fully closed.
     `rm -rf` fails on chown'd dirs (cycle-3 install-side chown to 1001:1001),
     fall back to `podman unshare rm` → ephemeral runtime container `rm -rf
     /t/*`. No sudo required.
-  - **Sudo-free secrets wipe** (`BACKLOG-V240-006` closed) — `sudo rm -rf
+  - **Sudo-free secrets wipe** — `sudo rm -rf
     docker/secrets/*` silently failed on non-PTY SSH. Replaced with the
     same three-tier fallback (direct → `podman unshare` → container-root
     `rm` against `docker/secrets:/t:rw`). Hard WARN on all-fail (no silent
@@ -881,7 +582,7 @@ on triage; the cleanup-system architectural class fully closed.
   - **`uninstall.sh` `log_info` helper** — was missing from uninstall.sh,
     breaking the state-file detect block under `set -euo pipefail`. Helper
     restored.
-  - **`.env` cross-UID handler** — `BUG-UNINSTALL-PARTIAL-ENV` now
+  - **`.env` cross-UID handler** — now
     skip-with-WARN on unreadable `.env` (test-infra contamination scenario
     where a prior install ran as a different UID and wrote `docker/.env`
     as `root:root`). `docker compose down` proceeds via Docker socket
@@ -914,32 +615,32 @@ on triage; the cleanup-system architectural class fully closed.
   falls back to `.Id` (content-addressable SHA-256) when `RepoDigests` is
   empty. Backwards-compatible for pre-extension manifests (warn-and-skip;
   bundle SHA + helm/compose digest-pin remain primary integrity controls).
-  Closes YSG-RISK-038 / BUG-AG-003.
+
 - **`install.sh:5101` `|| true` guard on podman cp fallback** — the
   compose-cp/podman-cp fallback chain at lines 5100-5101 had `|| true`
   on the subsequent exec lines but not on the cp fallback itself. When
   open-webui is absent from `COMPOSE_PROFILES` (e.g.,
   `--agent-bundles letta,langflow` without `all`), the cp tried to copy
   into a non-existent container and hung indefinitely under
-  `set -euo pipefail`. Closes the Ava-found Phase 1 cp-hang.
+  `set -euo pipefail`. Closes the Phase 1 cp-hang.
 - **uninstall.sh runtime detection prefers Podman with liveness probe** —
   was misdetecting runtime as Docker on Podman-only VMs (and via
   symmetrical inversion on dual-runtime hosts), calling `docker volume rm`
   against Podman volumes which silently no-oped. Detection now uses
   `podman info` liveness probe first, `docker info` fallback. Operator
-  `--runtime=` override preserved. Closes BACKLOG-V240-004.
+  `--runtime=` override preserved.
 - **uninstall.sh chown container-fallback for `docker/{data,certs,logs}`** —
   mirror of install-side cycle-3 container-fallback pattern. Closes
-  BACKLOG-V240-003.
+
 
 ### Changed (tag close-out addendum 2026-05-21)
 
 - **Dead-code `fasttext_backend.py` removed** — `src/yashigani/inspection/backends/fasttext_backend.py`
   deleted; was a 130-line vestigial leftover from the v2.23.3 fasttext→sklearn
   swap (`e966e55`). Zero live imports verified before removal (collected
-  2511 tests collected with no import errors). Closes LU-YSG-009.
+  2511 tests collected with no import errors).
 - **Air-gap install docs (`docs/operations/air-gap-install.md`)** — `config/`
-  added to Step 2 transfer file list (closes YSG-RISK-039 / BUG-AG-004);
+  added to Step 2 transfer file list;
   v2.23.3 version refs swept to v2.23.4 in the same docs commit.
 
 ### Documentation — tag close-out addendum
@@ -948,32 +649,8 @@ on triage; the cleanup-system architectural class fully closed.
   that the cleartext userlist.txt is the non-KMS dev/standalone posture and
   that production deployments configure `YASHIGANI_KMS_PROVIDER=vault|azure|aws|
   gcp|keeper` to bypass the cleartext-on-disk path entirely. Captures the
-  YSG-RISK-049 architectural framing.
 
-### YSG-RISK register — tag close-out state
 
-- **CLOSED via tag close-out work:** YSG-RISK-048 (letta postgres mTLS via
-  pgbouncer sidecar), BACKLOG-V240-003 (uninstaller chown), BACKLOG-V240-004
-  (uninstaller runtime detect), BACKLOG-V240-006 (sudo secrets wipe), and
-  the cleanup-system class root cause (state file + cross-UID handlers).
-- **CLOSED via Iris+Laura triage:** YSG-RISK-013 (SPIFFE ACL TTL — closed
-  since April), YSG-RISK-014 (OIDC acr/amr — closed since April), YSG-RISK-036
-  (PR #71 CVE chain — Laura-validated CLOSED), YSG-RISK-040 (fasttext —
-  closed via v2.23.3 sklearn swap), YSG-RISK-044/045 (NOT-EXPLOITABLE-CVA
-  compensating controls active), YSG-RISK-046 (Podman host-reboot —
-  confirmed CLOSED), LU-YSG-012 (`apt-get -y upgrade` — already applied
-  in both Dockerfiles), YSG-RISK-007 (SSRF — register heading reconciled,
-  6 sites closed via 84aab78/64ec325/1209055).
-- **ACCEPTED-LOW non-customer-scenario in v2.23.4:** YSG-RISK-049 (pgbouncer
-  userlist.txt cleartext — non-KMS deployment posture; production KMS path
-  bypasses). YSG-SECRETS-DIST-002 (GID 2002 cross-secret-read — forward-close
-  v2.24.0 per-consumer creds).
-- **Forward-tracked to v2.24.0 backlog** (explicit Tiago sign-off + named
-  forward-close target per `feedback_debt_before_features` rule):
-  BACKLOG-V240-001 (uvicorn → granian/hypercorn ASGI swap, closes
-  YSG-RISK-012b + YSG-RISK-047 + YSG-RISK-013 partial; Iris+Laura
-  second-opinion validated 3-5 days realistic effort), BACKLOG-V240-002
-  (`_do_chown` top-level shared helper refactor).
 
 ---
 
@@ -1146,19 +823,19 @@ Theme: **Core-Plane mTLS + Two-Tier PKI + Release Hardening**.
 ### Security
 - PCI-compliant password expiry profile (≤90 days) selectable via `YASHIGANI_PROFILE=pci`. `YASHIGANI_PASSWORD_MAX_AGE_DAYS` is a separate integer override (e.g. `YASHIGANI_PASSWORD_MAX_AGE_DAYS=90`); setting it to the string `pci` raises `ValueError` at runtime — use `YASHIGANI_PROFILE=pci` instead. See `docs/operator-guide.md §4`.
 - Auth-throttle admin self-visibility — authenticated admins see own + all throttled/blocked IPs at `/admin → Security → Blocked IPs` (backed by `/auth/blocked-ips`). Unauthenticated locked-out operator path (RFC 6585 `Retry-After` on login) deferred to v2.23.2.
-- **YSG-RISK-001 (CWE-89, HIGH)** — replaced SQL f-string interpolation in `scripts/partition_maintenance.py` with safe identifier quoting (`_quote_ident()`, allowlist `[a-zA-Z_][a-zA-Z0-9_]*`). Date literals in the `PARTITION OF … FOR VALUES FROM … TO …` DDL clause are formatted via `date.isoformat()` (deterministic `YYYY-MM-DD`); asyncpg / PostgreSQL do not accept bind parameters in DDL parser positions. The date values are derived from Python `date` arithmetic, never from user input. ACS v3 dogfood scan finding `acs-v3-sql-string-concat-exec`. Closing commits `75536a5` (identifier quoting) + `af114f7` (DDL date-literal exception; internal re-audit YCS-20260502-v2.23.1-CWE89-reaudit-001 PASS).
-- **YSG-RISK-002 (CWE-89, MEDIUM)** — replaced `op.execute(f"DROP TABLE IF EXISTS {name}")` in Alembic migration `0003_prepartition_audit_2026_2027.py` with `op.drop_table()` native API. Closing commit `9d867be`.
-- **YSG-RISK-003 (CWE-601, MEDIUM)** — OIDC discovery validator now rejects `authorization_endpoint`, `token_endpoint`, and `jwks_uri` whose scheme is not `https` or whose host does not match the registered `discovery_url` host. Closes the post-admin-compromise open-redirect class (TA-3 insider). Closing commit `c5839e4`.
-- **YSG-RISK-004 (CWE-400, MEDIUM)** — Docker Compose `mem_limit` and `cpus` now set on every service across `docker-compose.yml` (21 services) + `docker-compose.wazuh.yml` (3 services). Defaults documented in `docker/.env.example`; env-overridable via `YASHIGANI_<SERVICE>_MEM_LIMIT` / `YASHIGANI_<SERVICE>_CPU_LIMIT`. Closing commit `0143fb4`.
-- **YSG-RISK-005 (CWE-400, MEDIUM)** — Helm chart `resources.limits.{memory,cpu}` AND `resources.requests.{memory,cpu}` set on every container in the chart; surfaced as tunables in `values.yaml`. Requests = 50% of limits to satisfy the K8s scheduler. Closing commit `6c35d28`.
-- **YSG-RISK-006 (CWE-668, MEDIUM)** — OpenClaw host port binding moved from `0.0.0.0:18789` to `127.0.0.1:18789`. OpenClaw remains reachable from the gateway over the internal Docker bridge by service name; the host-side binding is loopback-only. OTEL collector `0.0.0.0:*` listeners confirmed bridge-only (no host `ports:` mapping). Closing commit `33f7318`.
-- **YSG-RISK-007 (CWE-918, HIGH worst-case)** — SSRF allowlists added at every flagged call site:
+- **CWE-89, HIGH** — replaced SQL f-string interpolation in `scripts/partition_maintenance.py` with safe identifier quoting (`_quote_ident()`, allowlist `[a-zA-Z_][a-zA-Z0-9_]*`). Date literals in the `PARTITION OF … FOR VALUES FROM … TO …` DDL clause are formatted via `date.isoformat()` (deterministic `YYYY-MM-DD`); asyncpg / PostgreSQL do not accept bind parameters in DDL parser positions. The date values are derived from Python `date` arithmetic, never from user input. Closing commits `75536a5` (identifier quoting) + `af114f7` (DDL date-literal exception).
+- **CWE-89, MEDIUM** — replaced `op.execute(f"DROP TABLE IF EXISTS {name}")` in Alembic migration `0003_prepartition_audit_2026_2027.py` with `op.drop_table()` native API. Closing commit `9d867be`.
+- **CWE-601, MEDIUM** — OIDC discovery validator now rejects `authorization_endpoint`, `token_endpoint`, and `jwks_uri` whose scheme is not `https` or whose host does not match the registered `discovery_url` host. Closes the post-admin-compromise open-redirect class (TA-3 insider). Closing commit `c5839e4`.
+- **CWE-400, MEDIUM** — Docker Compose `mem_limit` and `cpus` now set on every service across `docker-compose.yml` (21 services) + `docker-compose.wazuh.yml` (3 services). Defaults documented in `docker/.env.example`; env-overridable via `YASHIGANI_<SERVICE>_MEM_LIMIT` / `YASHIGANI_<SERVICE>_CPU_LIMIT`. Closing commit `0143fb4`.
+- **CWE-400, MEDIUM** — Helm chart `resources.limits.{memory,cpu}` AND `resources.requests.{memory,cpu}` set on every container in the chart; surfaced as tunables in `values.yaml`. Requests = 50% of limits to satisfy the K8s scheduler. Closing commit `6c35d28`.
+- **CWE-668, MEDIUM** — OpenClaw host port binding moved from `0.0.0.0:18789` to `127.0.0.1:18789`. OpenClaw remains reachable from the gateway over the internal Docker bridge by service name; the host-side binding is loopback-only. OTEL collector `0.0.0.0:*` listeners confirmed bridge-only (no host `ports:` mapping). Closing commit `33f7318`.
+- **CWE-918, HIGH worst-case** — SSRF allowlists added at every flagged call site:
   - **7-A** `agents.py:218,245` — `OWUI_API_URL` validated against `YASHIGANI_OWUI_HOSTNAMES` allowlist (default `open-webui,127.0.0.1,localhost`). Commit `84aab78`.
   - **7-B** `oidc.py:160,169` — discovery URL validated against `YASHIGANI_OIDC_DISCOVERY_HOSTS` allowlist; `jwks_uri` host MUST equal `discovery_url` host (case-insensitive) and MUST be `https`; re-asserted in `_get_jwks()` as defence-in-depth. Commit `64ec325`.
   - **7-C** `audit/writer.py:285` + `backoffice/routes/audit.py:326` — Pydantic v2 `field_validator` on `SiemTargetRequest.url` enforces `https` scheme and rejects RFC 1918 / loopback / link-local / multicast hosts at register-time AND test-fire-time. `YASHIGANI_TEST_MODE=1` skips DNS resolution but keeps the HTTPS requirement. Commit `1209055`.
 
 ### Deferred (accepted-risk, carried to v2.23.2 P1)
-- **YSG-RISK-008 (CWE-732/CWE-250, LOW-MEDIUM batch)** — container-hardening absent-key gaps (no `read_only: true` in compose, no `readOnlyRootFilesystem: true` in Helm `securityContext`, no `security_opt: ["no-new-privileges:true"]`). Deferred (logged in risk register) with the rationale that adding YAML keys without OPA/Conftest/Kyverno admission control would be half-measure hardening; v2.23.2 ships both YAML keys AND admission policies together as proper end-to-end enforcement.
+- **CWE-732/CWE-250, LOW-MEDIUM batch** — container-hardening absent-key gaps (no `read_only: true` in compose, no `readOnlyRootFilesystem: true` in Helm `securityContext`, no `security_opt: ["no-new-privileges:true"]`). Deferred (logged in risk register) with the rationale that adding YAML keys without OPA/Conftest/Kyverno admission control would be half-measure hardening; v2.23.2 ships both YAML keys AND admission policies together as proper end-to-end enforcement.
 
 ---
 
