@@ -9,7 +9,7 @@ Yashigani release tags are **SSH-signed** using a hardware-backed (Yubikey) `ed2
 - `git tag -v` verifies SSH-signed tags using an `allowed_signers` file (per `man 5 allowed_signers`).
 - No additional infrastructure (GPG agent, software keyring) needed.
 
-The GPG path was confirmed non-viable during run 25682146979: the GPG import step completed but `private-keys-v1.d/` was empty because GnuPG detected a smartcard stub. Hardware-backed keys cannot sign in CI without the physical device. GPG CI path removed 2026-05-25 per Tiago directive.
+The GPG path was confirmed non-viable: the GPG import step completed but `private-keys-v1.d/` was empty because GnuPG detected a smartcard stub. Hardware-backed keys cannot sign in CI without the physical device. GPG CI path removed 2026-05-25.
 
 ## Verifying a release tag
 
