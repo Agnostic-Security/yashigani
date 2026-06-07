@@ -825,13 +825,25 @@ async def _proxy_request_body(
                     confidence=resp_result.confidence,
                     response_inspection_verdict=resp_result.verdict,
                 )
+                # #4 unified user alert: the threat came FROM THE TOOL/upstream
+                # (e.g. a compromised MCP server injecting an instruction back at
+                # the user/agent). Return the same plain-English envelope used at
+                # every enforcement point — educate + deter.
+                from yashigani.common.user_alert import (
+                    build_alert, ACTION_BLOCKED, DIRECTION_FROM_TOOL,
+                )
+                _resp_alert = build_alert(
+                    ACTION_BLOCKED,
+                    "The tool/assistant tried to send back content that looked like a "
+                    "hidden instruction or an attempt to extract your credentials, so "
+                    "Yashigani blocked the response before it reached you.",
+                    rule="Response inspection (from the tool)",
+                    direction=DIRECTION_FROM_TOOL,
+                    request_id=request_id,
+                )
                 return JSONResponse(
                     status_code=502,
-                    content={
-                        "error": "UPSTREAM_RESPONSE_BLOCKED",
-                        "detail": "The upstream response was blocked by Yashigani response inspection.",
-                        "request_id": request_id,
-                    },
+                    content=_resp_alert,
                     headers={
                         "X-Yashigani-Request-Id": request_id,
                         "X-Yashigani-Response-Verdict": resp_result.verdict,
@@ -999,6 +1011,17 @@ async def _proxy_request_body(
     # 5f. PII detection header (v2.2)
     _pii_any = pii_detected_on_request or pii_detected_on_response
     response.headers["X-Yashigani-PII-Detected"] = "true" if _pii_any else "false"
+    # #4 unified user alert (non-blocking REDACT): the result still flows, so the
+    # alert travels via headers rather than replacing the body — same taxonomy as
+    # the blocking alerts so the user learns what was masked and why.
+    if _pii_any:
+        from yashigani.common.user_alert import alert_headers, ACTION_REDACTED
+        for _k, _v in alert_headers(
+            ACTION_REDACTED,
+            rule="PII protection",
+            reason="Personal or sensitive data was detected and masked before continuing.",
+        ).items():
+            response.headers[_k] = _v
 
     return response
 
