@@ -65,6 +65,7 @@ class OptimizationEngine:
         default_cloud_model: str = "claude-sonnet-4-6",
         trusted_cloud_providers: dict[str, str] | None = None,
         model_aliases: dict[str, tuple[str, str, bool]] | None = None,
+        cloud_override_getter=None,
     ) -> None:
         """
         Args:
@@ -79,6 +80,11 @@ class OptimizationEngine:
         self._default_cloud_model = default_cloud_model
         self._trusted_cloud = trusted_cloud_providers or {}
         self._aliases = model_aliases or {}
+        # #25: zero-arg callable -> the ACTIVE dual-admin cloud-LLM override
+        # ({"provider","model",...}) or None. When active it lets the named cloud
+        # LLM serve P1 (CONFIDENTIAL/RESTRICTED) traffic the engine would otherwise
+        # pin local — the customer has a cloud agreement and accepts the P1-P9 risk.
+        self._cloud_override_getter = cloud_override_getter
         logger.info(
             "OptimizationEngine: default_local=%s, default_cloud=%s/%s, trusted_cloud=%d",
             default_model, default_cloud_provider, default_cloud_model, len(self._trusted_cloud),
@@ -114,6 +120,25 @@ class OptimizationEngine:
 
         # P1: CONFIDENTIAL/RESTRICTED -> LOCAL (IMMUTABLE)
         if sensitivity.level in (SensitivityLevel.CONFIDENTIAL, SensitivityLevel.RESTRICTED):
+            # #25 risk-accepted cloud override (dual-admin, justified, TTL'd): if an
+            # override is ACTIVE, the named cloud LLM may serve this sensitive request
+            # instead of being pinned local. The customer has a cloud agreement and
+            # has accepted the P1-P9 risk; the grant + justification are audited.
+            ov = self._cloud_override_getter() if self._cloud_override_getter else None
+            if ov and ov.get("provider") and ov.get("model"):
+                return self._decide(
+                    provider=ov["provider"],
+                    model=ov["model"],
+                    route="cloud",
+                    rule="P1-OVERRIDE",
+                    reason=(f"Sensitivity {sensitivity.level.value} routed to cloud "
+                            f"{ov['provider']}/{ov['model']} under dual-admin risk-accepted "
+                            f"override (justification: {ov.get('justification','')[:80]})"),
+                    sensitivity=sensitivity,
+                    complexity=complexity,
+                    budget=budget,
+                    start_ns=start,
+                )
             # Check if admin configured a trusted cloud provider for this level
             trusted = self._trusted_cloud.get(sensitivity.level.value)
             if trusted:
