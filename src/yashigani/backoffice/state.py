@@ -36,6 +36,7 @@ class BackofficeState:
     resource_monitor: Optional[ResourceMonitor] = None
     rate_limiter: Optional[RateLimiter] = None
     rbac_store: Optional[RBACStore] = None
+    binding_store: Optional[Any] = None    # #16 — client-policy BindingStore (Redis db/3)
     agent_registry: Optional[AgentRegistry] = None
     identity_broker: Optional[IdentityBroker] = None    # v2.1 — SSO
     identity_registry: Optional[Any] = None              # v2.1 — SSO identity resolution

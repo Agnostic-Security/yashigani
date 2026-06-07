@@ -287,3 +287,112 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
         "model": model,
         "note": "AI-generated draft — review and edit before saving. Saving runs an OPA compile check.",
     }
+
+
+# ---------------------------------------------------------------------------
+# #16 (OPA Phase 2) — client-policy activation + bindings (API).
+# Parity requirement: the WebUI Bindings panel mirrors these endpoints exactly.
+# ---------------------------------------------------------------------------
+
+class BindRequest(BaseModel):
+    policy_name: str = Field(min_length=2, max_length=41)
+    scope_kind: str = Field(min_length=1, max_length=20)
+    scope_id: str = Field(default="", max_length=200)
+    direction: str = Field(min_length=1, max_length=10)
+
+
+class ActivateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=41)
+
+
+async def _client_policy_loaded(name: str) -> bool:
+    """True if clients/<name> is loaded in OPA (GET /v1/policies/clients/<name>)."""
+    url = _opa_base() + "/v1/policies/clients/" + name
+    try:
+        async with internal_httpx_client(timeout=10.0) as client:
+            resp = await client.get(url)
+        return resp.status_code == 200
+    except httpx.HTTPError as exc:
+        _log.warning("OPA policy-exists check failed for %s: %s", name, exc)
+        raise HTTPException(status_code=503, detail={"error": "opa_unreachable",
+                            "message": "Could not reach the policy service."})
+
+
+async def _push_bindings() -> None:
+    """Push the binding document to OPA off the event loop (sync httpx client)."""
+    import asyncio
+    from yashigani.policy_bindings.opa_push import push_bindings_data
+    store = backoffice_state.binding_store
+    try:
+        await asyncio.to_thread(push_bindings_data, store, backoffice_state.opa_url)
+    except Exception as exc:  # noqa: BLE001 — surface as 503; the mutation already persisted
+        _log.warning("OPA bindings push failed: %s", exc)
+        raise HTTPException(status_code=503, detail={"error": "opa_push_failed",
+                            "message": "Binding saved but OPA sync failed; it will retry on next mutation/restart."})
+
+
+@router.post("/activate")
+async def activate_policy(body: ActivateRequest, session: StepUpAdminSession):  # noqa: ARG001
+    """Confirm a saved client policy is loaded in OPA and ready to bind. Idempotent."""
+    name = body.name.strip().lower()
+    if not _NAME_RE.match(name) or name in _RESERVED:
+        raise HTTPException(status_code=400, detail={"error": "invalid_name",
+                            "message": "not a valid client-policy name"})
+    if not await _client_policy_loaded(name):
+        raise HTTPException(status_code=404, detail={"error": "policy_not_loaded",
+                            "message": f"clients/{name} is not loaded in OPA — save it first."})
+    _log.info("Admin %s activated client policy clients/%s", session.account_id, name)
+    return {"status": "ok", "name": name, "loaded": True}
+
+
+@router.get("/bindings")
+async def list_bindings(session: AdminSession):  # noqa: ARG001 — auth gate
+    """List all client-policy bindings."""
+    store = backoffice_state.binding_store
+    if store is None:
+        raise HTTPException(status_code=503, detail={"error": "binding_store_unavailable"})
+    return {"bindings": [b.to_dict() for b in store.list()], "total": len(store.list())}
+
+
+@router.post("/bind")
+async def bind_policy(body: BindRequest, session: StepUpAdminSession):
+    """Bind an activated client policy to a subject scope + direction. Step-up gated."""
+    from yashigani.policy_bindings.store import PolicyBinding
+    store = backoffice_state.binding_store
+    if store is None:
+        raise HTTPException(status_code=503, detail={"error": "binding_store_unavailable"})
+    name = body.policy_name.strip().lower()
+    if not _NAME_RE.match(name) or name in _RESERVED:
+        raise HTTPException(status_code=400, detail={"error": "invalid_policy_name",
+                            "message": "bind a saved client policy, not a reserved core policy"})
+    # Fail-closed: never bind a policy that isn't loaded in OPA (would be a dangling
+    # binding -> the aggregator emits bound_policy_missing and denies).
+    if not await _client_policy_loaded(name):
+        raise HTTPException(status_code=404, detail={"error": "policy_not_loaded",
+                            "message": f"clients/{name} is not loaded in OPA — save+activate it first."})
+    try:
+        binding = store.add(PolicyBinding(
+            policy_name=name,
+            scope_kind=body.scope_kind.strip().lower(),
+            scope_id=body.scope_id.strip(),
+            direction=body.direction.strip().lower(),
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_binding", "message": str(exc)})
+    await _push_bindings()
+    _log.info("Admin %s bound clients/%s -> %s (%s)", session.account_id, name,
+              binding.scope_key(), binding.direction)
+    return {"status": "ok", "binding": binding.to_dict()}
+
+
+@router.delete("/bind/{binding_id}")
+async def unbind_policy(binding_id: str, session: StepUpAdminSession):
+    """Remove a client-policy binding. Step-up gated."""
+    store = backoffice_state.binding_store
+    if store is None:
+        raise HTTPException(status_code=503, detail={"error": "binding_store_unavailable"})
+    if not store.remove(binding_id):
+        raise HTTPException(status_code=404, detail={"error": "binding_not_found"})
+    await _push_bindings()
+    _log.info("Admin %s removed binding %s", session.account_id, binding_id)
+    return {"status": "ok", "removed": binding_id}

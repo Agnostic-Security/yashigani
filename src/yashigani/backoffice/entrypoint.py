@@ -191,6 +191,7 @@ def _bootstrap():
     # typical kube-dns propagation window without blocking readiness probes.
     rbac_store = None
     agent_registry = None
+    binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -208,6 +209,14 @@ def _bootstrap():
             logger.info(
                 "Agent registry initialised: %d agent(s) in index",
                 agent_registry.count("all"),
+            )
+            # #16 — client-policy BindingStore shares the same Redis db/3 instance
+            # (key prefix ysgbind:*, disjoint from rbac:* and the agent registry).
+            from yashigani.policy_bindings.store import BindingStore as _BindingStore
+            binding_store = _BindingStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Binding store initialised: %d client-policy binding(s) loaded",
+                len(binding_store.list()),
             )
             break  # success
         except Exception as exc:
@@ -372,6 +381,7 @@ def _bootstrap():
     backoffice_state.resource_monitor = resource_monitor
     backoffice_state.rate_limiter = rate_limiter
     backoffice_state.rbac_store = rbac_store
+    backoffice_state.binding_store = binding_store    # #16
     backoffice_state.agent_registry = agent_registry
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store

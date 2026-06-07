@@ -565,6 +565,37 @@ async def lifespan(app: FastAPI):
             "OPA-PERSIST: startup re-sync skipped (%s)", _outer_exc
         )
 
+    # #16 (OPA Phase 2): re-push client-policy bindings to OPA on startup (OPA holds
+    # data in memory only). SEPARATE /v1/data/client_bindings namespace — does not
+    # touch the rbac push above. Same retry pattern; failure is non-fatal (bindings
+    # stay durable in Redis and re-push on the next mutation).
+    try:
+        _binding_store = backoffice_state.binding_store
+        if _binding_store is not None:
+            from yashigani.policy_bindings.opa_push import push_bindings_data
+            _bsync_log = _logging.getLogger("yashigani.backoffice.lifespan")
+            _bind_n = len(_binding_store.list())
+            for _battempt in range(1, 4):
+                try:
+                    push_bindings_data(_binding_store, backoffice_state.opa_url)
+                    _bsync_log.info(
+                        "OPA-PERSIST: re-synced client-policy bindings on startup (%d binding(s))",
+                        _bind_n,
+                    )
+                    break
+                except Exception as _bpush_exc:
+                    if _battempt < 3:
+                        await asyncio.sleep(2)
+                    else:
+                        _bsync_log.warning(
+                            "OPA-PERSIST: binding re-sync failed after 3 attempts (%s) — bindings "
+                            "remain in Redis; OPA will sync on next mutation", _bpush_exc
+                        )
+    except Exception as _bouter_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").warning(
+            "OPA-PERSIST: binding re-sync skipped (%s)", _bouter_exc
+        )
+
     yield
 
     # Shutdown
