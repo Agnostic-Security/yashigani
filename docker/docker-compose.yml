@@ -1255,6 +1255,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      # start_period: a FRESH initdb runs the heavy /docker-entrypoint-initdb.d
+      # scripts (05-enable-ssl.sh, the 17 KB 10-pgbouncer-auth.sh that creates the
+      # auth role + SECURITY DEFINER function + pg_ident/cert wiring, init-agent-dbs)
+      # before postgres accepts connections. Without a start_period the default is
+      # 0s, so after retries×interval (~50s) the container flips to "unhealthy" and
+      # `docker compose up` ABORTS every dependent (backoffice/gateway/pgbouncer) to
+      # "Created" — they never start. On a loaded host that 50s window is routinely
+      # exceeded. During start_period a failing probe keeps the status "starting"
+      # (compose waits) and the first success marks it healthy immediately.
+      start_period: 180s
     # YSG-RISK-008 (v2.23.4): read_only skipped on compose path for postgres.
     # postgres needs writable /var/run/postgresql (unix-domain socket + PID lock file)
     # owned by uid 999 (postgres-in-container) with restrictive perms (e.g. 0755 or 0700).
