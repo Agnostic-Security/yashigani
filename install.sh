@@ -5336,6 +5336,43 @@ compose_up() {
     fi
   fi
 
+  # --- Runtime-agnostic .env writes (MUST run for docker AND podman) ----------
+  # BUGFIX (2026-06-08): YASHIGANI_PUBLIC_URL and YASHIGANI_ENABLED_PROFILES were
+  # only written inside the `if podman` branch above, so on Docker they were never
+  # set. Result: the backoffice Optional-Services panel read an empty
+  # YASHIGANI_ENABLED_PROFILES and showed EVERY deployed optional service + agent
+  # (openwebui, wazuh, langflow, letta, openclaw) as "Not deployed"; external
+  # sub-apps (Grafana/Wazuh) had no public-URL to self-reference. Recomputed here
+  # (the in-branch `local`s never execute on docker) and written unconditionally.
+  local _env_file_rt="${WORK_DIR}/docker/.env"
+  local _pub_suffix_rt=""
+  [[ -n "${YASHIGANI_HTTPS_PORT:-}" && "${YASHIGANI_HTTPS_PORT}" != "443" ]] && _pub_suffix_rt=":${YASHIGANI_HTTPS_PORT}"
+  local _pub_url_rt="https://${YASHIGANI_TLS_DOMAIN:-${DOMAIN:-localhost}}${_pub_suffix_rt}"
+  if grep -q "^YASHIGANI_PUBLIC_URL=" "$_env_file_rt" 2>/dev/null; then
+    local _t1_rt; _t1_rt="$(mktemp)"
+    sed "s|^YASHIGANI_PUBLIC_URL=.*|YASHIGANI_PUBLIC_URL=${_pub_url_rt}|" "$_env_file_rt" > "$_t1_rt"
+    mv "$_t1_rt" "$_env_file_rt"
+  else
+    echo "YASHIGANI_PUBLIC_URL=${_pub_url_rt}" >> "$_env_file_rt"
+  fi
+  export YASHIGANI_PUBLIC_URL="$_pub_url_rt"
+
+  local _ep_rt=()
+  [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _ep_rt+=("${COMPOSE_PROFILES[@]}")
+  [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _ep_rt+=("openwebui")
+  [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _ep_rt+=("wazuh")
+  [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _ep_rt+=("internal-ca")
+  local _ep_csv_rt; _ep_csv_rt="$(printf '%s\n' "${_ep_rt[@]+"${_ep_rt[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
+  if grep -q "^YASHIGANI_ENABLED_PROFILES=" "$_env_file_rt" 2>/dev/null; then
+    local _t2_rt; _t2_rt="$(mktemp)"
+    sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}|" "$_env_file_rt" > "$_t2_rt"
+    mv "$_t2_rt" "$_env_file_rt"
+  else
+    echo "YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}" >> "$_env_file_rt"
+  fi
+  export YASHIGANI_ENABLED_PROFILES="$_ep_csv_rt"
+  log_info "Enabled optional-service profiles: ${_ep_csv_rt:-<none>}"
+
   # Ensure all required directories and secret files exist (handles upgrades,
   # re-runs, and failed previous installs). Docker Desktop for Mac (VirtioFS)
   # does not reliably propagate files to the VM — verify all exist with content.
