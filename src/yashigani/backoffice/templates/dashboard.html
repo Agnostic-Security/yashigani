@@ -298,6 +298,12 @@
                     <thead><tr><th>Model</th><th>Size</th><th>Modified</th></tr></thead>
                     <tbody id="models-tbody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
                 </table>
+                <!-- #25: pull a model into the local Ollama store -->
+                <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+                    <input id="pull-model-name" type="text" placeholder="e.g. gemma3:4b" class="fi w-180">
+                    <button data-action="pullModel" class="btn-sm-save">Pull model</button>
+                    <span id="pull-model-status" class="txt-note"></span>
+                </div>
             </div>
             <div class="panel">
                 <div class="panel-header panel-header-flex">

@@ -811,6 +811,22 @@ async function addAlias() {
     else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
+async function pullModel() {
+    // #25: pull an Ollama model (step-up gated). Can take a while for large models.
+    var st = document.getElementById('pull-model-status');
+    var name = document.getElementById('pull-model-name').value.trim();
+    if (!name) { st.textContent = 'Enter a model name (e.g. gemma3:4b).'; return; }
+    st.textContent = 'Pulling ' + name + '… (this can take a while)';
+    var resp = await apiMutate('/admin/models/pull', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name })
+    });
+    if (!resp) { st.textContent = 'Request failed or was cancelled.'; return; }
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok) { st.innerHTML = '<span class="badge badge-green">Pulled</span> ' + escapeHtml(name); document.getElementById('pull-model-name').value = ''; loadModels(); }
+    else { st.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
+}
+
 async function deleteAlias(alias) {
     if (!confirm('Delete alias "' + alias + '"?')) return;
     var resp = await apiMutate('/admin/models/' + encodeURIComponent(alias), { method: 'DELETE' });
@@ -1341,6 +1357,9 @@ document.addEventListener('click', function(e) {
         // Model actions
         case 'addAlias':
             addAlias();
+            break;
+        case 'pullModel':
+            pullModel();
             break;
         case 'deleteAlias':
             deleteAlias(actionEl.getAttribute('data-alias'));
