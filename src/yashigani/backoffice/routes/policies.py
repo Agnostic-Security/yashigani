@@ -101,6 +101,17 @@ async def list_policies(session: AdminSession):  # noqa: ARG001 — auth gate
     return {"policies": policies, "count": len(policies), "opa_url": _opa_base()}
 
 
+# #16: MUST be registered BEFORE the GET /{policy_id:path} catch-all below, or the
+# catch-all matches "bindings" as a policy id and shadows this route (404).
+@router.get("/bindings")
+async def list_bindings(session: AdminSession):  # noqa: ARG001 — auth gate
+    """List all client-policy bindings."""
+    store = backoffice_state.binding_store
+    if store is None:
+        raise HTTPException(status_code=503, detail={"error": "binding_store_unavailable"})
+    return {"bindings": [b.to_dict() for b in store.list()], "total": len(store.list())}
+
+
 @router.get("/{policy_id:path}")
 async def get_policy(policy_id: str, session: AdminSession):  # noqa: ARG001 — auth gate
     """Return a single policy module's raw Rego source (read-only)."""
@@ -343,15 +354,6 @@ async def activate_policy(body: ActivateRequest, session: StepUpAdminSession):  
                             "message": f"clients/{name} is not loaded in OPA — save it first."})
     _log.info("Admin %s activated client policy clients/%s", session.account_id, name)
     return {"status": "ok", "name": name, "loaded": True}
-
-
-@router.get("/bindings")
-async def list_bindings(session: AdminSession):  # noqa: ARG001 — auth gate
-    """List all client-policy bindings."""
-    store = backoffice_state.binding_store
-    if store is None:
-        raise HTTPException(status_code=503, detail={"error": "binding_store_unavailable"})
-    return {"bindings": [b.to_dict() for b in store.list()], "total": len(store.list())}
 
 
 @router.post("/bind")
