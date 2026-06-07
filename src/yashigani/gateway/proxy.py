@@ -733,7 +733,12 @@ async def _proxy_request_body(
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)
-        return _error_response(request_id, 403, "POLICY_DENIED")
+        # #4 OPA decision contract: enrich the deny with the policy's self-description
+        # (policy_id + layman user_message + HTTP code). Best-effort; the gate above
+        # (_opa_check) is the authority and is left untouched.
+        return await _opa_denial_alert(
+            cfg, request, path, session_id, agent_id, user_id, request_id,
+        )
 
     # 4b. Response cache — only on CLEAN forwarded requests (Phase 6)
     tenant_id = request.headers.get("x-yashigani-tenant-id", "platform")
@@ -1077,6 +1082,68 @@ async def _opa_check(
             path, session_id, exc,
         )
         return False  # fail-closed
+
+
+async def _opa_denial_alert(
+    cfg, request, path: str, session_id: str, agent_id: str, user_id: str, request_id: str
+):
+    """#4: build the unified DENIED user alert for an OPA policy denial, enriched
+    with the policy's self-description (policy_id + layman user_message + HTTP code)
+    from `data.yashigani.decision.denials`. Best-effort — any OPA/parse error falls
+    back to a generic DENIED alert. Never raises (the request is already denied)."""
+    from yashigani.common.user_alert import build_alert, valid_http_code, ACTION_DENIED
+
+    denial = None
+    try:
+        input_doc = {
+            "method": request.method,
+            "path": path,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "session": {"email": user_id},
+            "request": {"method": request.method, "path": path},
+            "headers": {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ("authorization", "cookie")
+            },
+        }
+        # Derive the decision doc path from the configured allow path.
+        decision_path = cfg.opa_policy_path.rsplit("/", 1)[0] + "/decision"
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                cfg.opa_url + decision_path,
+                json={"input": input_doc},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            denials = (resp.json().get("result") or {}).get("denials") or []
+            if denials:
+                denial = denials[0]
+    except Exception as exc:  # noqa: BLE001 — enrichment only; deny stands regardless
+        logger.warning(
+            "OPA decision enrichment failed (request_id=%s): %s — generic deny alert", request_id, exc
+        )
+
+    if denial:
+        code = valid_http_code(denial.get("code"), 403)
+        alert = build_alert(
+            ACTION_DENIED,
+            denial.get("user_message", "Your request was blocked by an access policy."),
+            rule=denial.get("rule"),
+            policy_id=denial.get("policy_id"),
+            request_id=request_id,
+        )
+    else:
+        code = 403
+        alert = build_alert(
+            ACTION_DENIED,
+            "Your request was blocked by an access policy.",
+            request_id=request_id,
+        )
+    return JSONResponse(
+        status_code=code, content=alert, headers={"X-Yashigani-Request-Id": request_id}
+    )
 
 
 # ---------------------------------------------------------------------------

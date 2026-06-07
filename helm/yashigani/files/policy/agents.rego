@@ -2,6 +2,7 @@ package yashigani
 
 import future.keywords.if
 import future.keywords.in
+import future.keywords.contains
 
 # ---------------------------------------------------------------------------
 # sensitivity_rank — shared helper (duplicated from v1_routing.rego because
@@ -259,3 +260,13 @@ agent_response_deny_reason := "missing_agent_identity" if {
     not agent_response_allowed
     not input.target_agent.agent_id != ""
 }
+
+# #4 — self-describing denial for the agent-to-agent gate (same package
+# `yashigani`; deny_agent_call is defined in yashigani.rego).
+denials contains {
+    "policy_id": "yashigani.agents.agent-to-agent",
+    "rule": "Agent-to-agent authorisation",
+    "user_message": "Blocked: this agent is not authorised to call the target agent or path.",
+    "code": 403,
+    "action": "DENIED",
+} if { deny_agent_call }
