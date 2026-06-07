@@ -87,14 +87,86 @@ def run_migrations() -> None:
         with lock_conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(%s)", (_BOOTSTRAP_ADVISORY_LOCK_KEY,))
         logger.info("Acquired migration advisory lock %s", hex(_BOOTSTRAP_ADVISORY_LOCK_KEY))
+        # env.py (the alembic environment) resolves the connection from the
+        # YASHIGANI_DB_DSN env var, which points at pgbouncer as the RUNTIME role
+        # yashigani_app. On a FRESH install that role does not exist until migration
+        # 0001 creates it, so pgbouncer's auth_query (ysg_pgbouncer_get_auth) returns
+        # no row and the connection is rejected "no such user" — DDL can never
+        # bootstrap (only upgrades, where the role pre-exists, worked). DDL MUST run
+        # as the admin superuser DIRECT to postgres (see `dsn` above + the lock
+        # connection). Point env.py at the admin DSN for the duration of the upgrade,
+        # then restore so the lifespan's later create_pool() still uses the runtime
+        # DSN. Regression introduced with the 2.25.2 least-privilege role split.
+        _prev_runtime_dsn = os.environ.get("YASHIGANI_DB_DSN")
+        os.environ["YASHIGANI_DB_DSN"] = dsn
         try:
             command.upgrade(alembic_cfg, "head")
             logger.info("Database migrations applied successfully (replica-safe)")
+            # v2.25.3: replace the placeholder password that migration 0001 sets on
+            # the yashigani_app runtime role (CREATE ROLE ... IF NOT EXISTS ...
+            # PASSWORD 'PLACEHOLDER_REPLACED_BY_BOOTSTRAP') with the single
+            # install-generated credential (docker/secrets/postgres_password — the
+            # one and only password generator, install.sh _gen_password). This MUST
+            # run here: after migrations create the role and BEFORE the lifespan's
+            # create_pool() opens the yashigani_app connection. On a FRESH install
+            # the role is created with the placeholder, so without this swap the app
+            # crash-loops with "SASL authentication failed" (asyncpg→pgbouncer→
+            # postgres). Upgrades keep the existing password via IF NOT EXISTS, so
+            # this is a no-op-equivalent re-set there. Runs on the admin advisory-
+            # lock connection (multi-replica safe — only the lock holder re-sets).
+            # Replaces the lost install.sh bootstrap step dropped by commit e0e6f72.
+            _sync_app_role_password(lock_conn, logger)
         except Exception as exc:
             logger.warning("Database migration failed: %s", exc)
         finally:
+            # Restore the runtime DSN so the lifespan's create_pool() connects as
+            # yashigani_app via pgbouncer (not the admin DSN used for DDL above).
+            if _prev_runtime_dsn is None:
+                os.environ.pop("YASHIGANI_DB_DSN", None)
+            else:
+                os.environ["YASHIGANI_DB_DSN"] = _prev_runtime_dsn
             with lock_conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_unlock(%s)", (_BOOTSTRAP_ADVISORY_LOCK_KEY,))
             logger.info("Released migration advisory lock")
     finally:
         lock_conn.close()
+
+
+def _sync_app_role_password(conn, logger) -> None:
+    """Set the yashigani_app runtime role password to the single install-generated
+    credential, replacing migration 0001's placeholder.
+
+    `conn` is the admin (superuser) connection already held by run_migrations under
+    the bootstrap advisory lock; it is autocommit. Reads the raw password from the
+    install-written secret (docker/secrets/postgres_password — the same value the
+    backoffice DSN resolves ${POSTGRES_PASSWORD} from). Never generates a password.
+    Swallows+logs its own errors: a real failure surfaces clearly when create_pool()
+    next opens the yashigani_app connection, rather than being mislabelled a
+    migration failure by the caller's except handler.
+    """
+    import os
+    from psycopg2 import sql
+
+    secrets_dir = os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    pw_path = os.path.join(secrets_dir, "postgres_password")
+    try:
+        with open(pw_path, encoding="utf-8") as fh:
+            app_pw = fh.read().strip()
+    except OSError as exc:
+        logger.error("yashigani_app credential sync skipped — cannot read %s: %s", pw_path, exc)
+        return
+    if not app_pw:
+        logger.error("yashigani_app credential sync skipped — %s is empty", pw_path)
+        return
+    # ALTER ROLE ... PASSWORD does not accept bind parameters (utility statement);
+    # use psycopg2 sql.Literal for correct, injection-safe quoting of the literal.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("ALTER ROLE yashigani_app WITH PASSWORD {}").format(sql.Literal(app_pw))
+            )
+        logger.info(
+            "yashigani_app runtime credential synced (migration-0001 placeholder replaced)"
+        )
+    except Exception as exc:  # noqa: BLE001 — log + continue; create_pool surfaces real fault
+        logger.error("Failed to sync yashigani_app credential: %s", exc)
