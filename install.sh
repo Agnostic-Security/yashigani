@@ -1107,6 +1107,14 @@ print_platform_summary() {
   printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx langflow && _lf="x"
   printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx letta && _le="x"
   printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw && _oc="x"
+  # Non-interactive --agent-bundles is parsed into AGENT_BUNDLES but only pushed
+  # into COMPOSE_PROFILES at step 8 (after this summary), so read AGENT_BUNDLES too
+  # — otherwise the summary shows agents unticked even though they WILL install.
+  local _ab=",${AGENT_BUNDLES//[[:space:]]/},"
+  [[ "$_ab" == *",all,"* ]] && { _lf="x"; _le="x"; _oc="x"; }
+  [[ "$_ab" == *",langflow,"* ]] && _lf="x"
+  [[ "$_ab" == *",letta,"* ]] && _le="x"
+  [[ "$_ab" == *",openclaw,"* ]] && _oc="x"
   printf "  Optional services (deploy-time choice):\n"
   printf "    [%s] %-12s %s\n" "$_ow" "Open WebUI"  "browser chat UI for end users"
   printf "    [%s] %-12s %s\n" "$_wz" "Wazuh SIEM"  "security monitoring — SIEM (manager+indexer+dashboard)"
