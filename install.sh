@@ -12782,6 +12782,31 @@ main() {
       esac
     fi
 
+    # Step 8c-siem (#21): when Wazuh is selected, point the agnostic audit SIEM
+    # pipeline at the bundled indexer via deployment config (.env), loaded at
+    # startup by AuditLogWriter.siem_targets_from_env(). Identity = each service's
+    # OWN internal-mesh leaf cert (mesh_mtls → pki.client_ssl_context()): no
+    # password, NEVER the wazuh admin credential. wazuh-indexer is added to the
+    # SSRF allowlist (its name resolves to a private docker IP). If Wazuh is NOT
+    # selected, both stay unset → forward to none.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "wazuh"; then
+      local _siem_env_file="${WORK_DIR}/docker/.env"
+      local _siem_targets_json='[{"name":"wazuh-bundled","target_type":"elastic_opensearch","url":"https://wazuh-indexer:9200/_bulk","mesh_mtls":true}]'
+      _siem_set_env() {  # set-or-replace KEY=VALUE in docker/.env (value may contain |)
+        local _k="$1" _v="$2"
+        if grep -q "^${_k}=" "$_siem_env_file" 2>/dev/null; then
+          local _t; _t="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+          awk -v k="$_k" -v v="$_v" 'BEGIN{FS=OFS="="} $1==k{print k"="v;next} {print}' "$_siem_env_file" > "$_t"
+          mv "$_t" "$_siem_env_file"
+        else
+          printf '%s=%s\n' "$_k" "$_v" >> "$_siem_env_file"
+        fi
+      }
+      _siem_set_env "YASHIGANI_SIEM_TARGETS" "$_siem_targets_json"
+      _siem_set_env "YASHIGANI_SIEM_HOSTNAMES" "wazuh-indexer"
+      log_success "Audit SIEM forwarding pointed at bundled Wazuh indexer (mesh-mTLS leaf identity)"
+    fi
+
     # Step 8d: Write agent-bundle token placeholders NOW — while the installer
     # still owns docker/secrets/ (before _prepare_secrets_dir_for_pki chowns it
     # to UID 1001 for the PKI issuer container). INSTALLER-BUG-AGENT-TOKENS:
@@ -12956,27 +12981,13 @@ main() {
     # Step 11b: Register agent bundles (after backoffice is healthy)
     register_agent_bundles
 
-    # Step 11c: Auto-configure SIEM sink when Wazuh is installed
-    if [[ "$INSTALL_WAZUH" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; then
-      log_info "Configuring audit SIEM sink for Wazuh..."
-      # FIX-3: use --cacert to verify the local PKI root; never --insecure/-k.
-      # This call carries the admin session cookie + Wazuh API password —
-      # disabling TLS verification here allows a loopback MITM to harvest
-      # both (Laura F2 / HIGH — admin cookie replay + wazuh credential).
-      local _bo_url="https://localhost:${YASHIGANI_HTTPS_PORT:-443}"
-      local _siem_config='{"backend":"wazuh","wazuh_url":"https://wazuh-manager:55000","wazuh_username":"wazuh-wui","wazuh_password":"'"${GEN_WAZUH_API_PASSWORD:-}"'","enabled":true}'
-      if curl --silent --fail \
-              --cacert "${WORK_DIR}/docker/secrets/ca_root.crt" \
-              -X PUT "${_bo_url}/admin/alerts/sinks" \
-              -H "Content-Type: application/json" \
-              -d "$_siem_config" \
-              -b "$(cat "${WORK_DIR}/docker/secrets/admin1_session_cookie" 2>/dev/null || echo '')" \
-              >/dev/null 2>&1; then
-        log_success "Wazuh SIEM sink auto-configured"
-      else
-        log_warn "Wazuh SIEM sink auto-configuration failed — configure manually via admin UI"
-      fi
-    fi
+    # Step 11c (#21): audit SIEM forwarding is configured PRE-deploy at Step
+    # 8c-siem by writing YASHIGANI_SIEM_TARGETS + YASHIGANI_SIEM_HOSTNAMES into
+    # docker/.env, which AuditLogWriter loads at startup. The previous post-deploy
+    # auto-config here PUT to a non-existent endpoint (/admin/alerts/sinks) with a
+    # mismatched schema and a session cookie that couldn't satisfy the step-up
+    # gate — it silently failed every install, so nothing was ever forwarded.
+    # Removed; nothing to do post-deploy.
 
     # Step 12: Health check
     run_health_check

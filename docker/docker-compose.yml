@@ -78,6 +78,15 @@ x-common-env: &common-env
   YASHIGANI_AUDIT_LOG_PATH: /data/audit/audit.log
   YASHIGANI_AUDIT_MAX_FILE_SIZE_MB: ${YASHIGANI_AUDIT_MAX_FILE_SIZE_MB:-100}
   YASHIGANI_AUDIT_RETENTION_DAYS: ${YASHIGANI_AUDIT_RETENTION_DAYS:-90}
+  # Audit SIEM forwarding (#21) — JSON array of targets; empty → forward to none.
+  # install.sh populates this with the bundled-Wazuh target (mesh_mtls cert
+  # identity) when --wazuh is selected; otherwise unset → nothing forwarded.
+  # No cert paths needed: mesh_mtls targets present this service's own internal-CA
+  # leaf via pki.client_ssl_context() (resolved from the standard secret paths).
+  YASHIGANI_SIEM_TARGETS: ${YASHIGANI_SIEM_TARGETS:-}
+  # SSRF allowlist (CWE-918): hosts here bypass the private-IP block in
+  # validate_siem_url. install.sh sets wazuh-indexer when --wazuh is selected.
+  YASHIGANI_SIEM_HOSTNAMES: ${YASHIGANI_SIEM_HOSTNAMES:-}
   # Internal mTLS — every service reads its identity from this manifest + its
   # own bootstrap token. Path is mounted read-only on every Python service.
   YASHIGANI_SERVICE_MANIFEST_PATH: /etc/yashigani/service_identities.yaml
@@ -421,6 +430,10 @@ services:
     networks:
       - caddy_internal
       - data
+      # obs (#21): reach wazuh-indexer:9200 to forward audit events to the bundled
+      # SIEM. wazuh-indexer is obs-plane only; without this the SIEM target is
+      # unreachable. Outbound is mesh-mTLS (client_ssl_context); no inbound exposure.
+      - obs
       - langflow_isolated
       - letta_isolated
       - openclaw_isolated
@@ -614,10 +627,12 @@ services:
         condition: service_healthy
     # EX-231-10: backoffice joins caddy_internal (Caddy→backoffice:8443) AND
     # data (backoffice→redis, policy, ollama, pgbouncer outbound).
-    # Does NOT join obs or edge.
+    # obs (#21): also joins obs to forward audit events to wazuh-indexer:9200
+    # (obs-plane only). Outbound mesh-mTLS only; no inbound exposure. Does NOT join edge.
     networks:
       - caddy_internal
       - data
+      - obs
 
   # ---------------------------------------------------------------------------
   # Open WebUI — User-facing chat interface (v1.0)
