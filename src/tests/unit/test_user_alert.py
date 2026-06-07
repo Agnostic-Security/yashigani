@@ -54,3 +54,15 @@ def test_alert_headers_form_and_latin1_safety():
     # header value must be ascii/latin-1 safe + single line
     h["X-Yashigani-Alert-Reason"].encode("latin-1")
     assert "\n" not in h["X-Yashigani-Alert-Reason"]
+
+
+def test_alert_headers_strip_crlf_injection():
+    # LAURA-2253-ALERT-001: BOTH \r and \n stripped from every header value
+    # (response-splitting / header-injection defence), not just reason.
+    h = alert_headers(
+        "BLOCKED\r\nX-Injected: evil",
+        rule="r\rule\n2",
+        reason="line1\r\nline2\rmore",
+    )
+    for v in h.values():
+        assert "\r" not in v and "\n" not in v

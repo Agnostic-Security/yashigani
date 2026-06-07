@@ -67,14 +67,20 @@ def alert_headers(
     """Header form for NON-blocking actions (e.g. PII redaction) — the real
     result still reaches the caller, but the alert metadata travels alongside.
     """
-    headers = {"X-Yashigani-Alert-Action": action}
+    def _hdr_safe(v: str) -> str:
+        # Strip BOTH CR and LF (response-splitting / header-injection defence,
+        # LAURA-2253-ALERT-001) and force ascii single-line. Applied to every
+        # header value, not just reason, so future non-static call sites are safe.
+        return (
+            v.replace("\r", " ").replace("\n", " ")
+            .encode("ascii", "replace").decode("ascii")
+        )
+
+    headers = {"X-Yashigani-Alert-Action": _hdr_safe(action)}
     if rule:
-        headers["X-Yashigani-Alert-Rule"] = rule
+        headers["X-Yashigani-Alert-Rule"] = _hdr_safe(rule)
     if policy_id:
-        headers["X-Yashigani-Alert-Policy-Id"] = policy_id
+        headers["X-Yashigani-Alert-Policy-Id"] = _hdr_safe(policy_id)
     if reason:
-        # Header values must be latin-1 safe and single-line.
-        headers["X-Yashigani-Alert-Reason"] = reason.replace("\n", " ").encode(
-            "ascii", "replace"
-        ).decode("ascii")
+        headers["X-Yashigani-Alert-Reason"] = _hdr_safe(reason)
     return headers
