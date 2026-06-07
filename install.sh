@@ -1439,6 +1439,34 @@ check_installer_preflight() {
     fi
   fi
 
+  # --- Check 1d (#24): Ollama model-store free-space preflight ---------------
+  # The Ollama model store (compose: the dedicated ollama_data volume → /root/.ollama;
+  # K8s: a 100Gi PVC) grows with each model pull. The full local model set can
+  # exceed 80 GB; a "no space left on device" mid-pull leaves models half-written
+  # and inference broken. Warn (non-fatal) when the filesystem backing the
+  # container-volume store has less than YASHIGANI_OLLAMA_MIN_DISK_GB (default 80)
+  # GB free, so the operator can relocate the runtime data-root to a larger disk
+  # (or mount one) before pulling models.
+  local _min_gb="${YASHIGANI_OLLAMA_MIN_DISK_GB:-80}"
+  local _vol_root=""
+  if [[ "${YSG_RUNTIME:-}" == "docker" ]] && command -v docker >/dev/null 2>&1; then
+    _vol_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo "")"
+  elif command -v podman >/dev/null 2>&1; then
+    _vol_root="$(podman info -f '{{.Store.GraphRoot}}' 2>/dev/null || echo "")"
+  fi
+  [[ -z "$_vol_root" || ! -d "$_vol_root" ]] && _vol_root="/var/lib/docker"
+  [[ ! -d "$_vol_root" ]] && _vol_root="/"
+  local _avail_gb
+  _avail_gb="$(df -PBG "$_vol_root" 2>/dev/null | awk 'NR==2{gsub(/[A-Za-z]/,"",$4); print $4}')"
+  if [[ -n "$_avail_gb" ]] && awk "BEGIN { exit !($_avail_gb < $_min_gb) }"; then
+    printf "\n"
+    printf "${C_YELLOW}[WARN] Only %s GB free on %s (container-volume store).${C_RESET}\n" "$_avail_gb" "$_vol_root"
+    printf "       The dedicated Ollama model store needs >= %s GB for the local model set;\n" "$_min_gb"
+    printf "       a 'no space left on device' mid-pull breaks inference. Relocate the runtime\n"
+    printf "       data-root to a larger disk (or mount one) before continuing.\n"
+    printf "       Override the threshold with YASHIGANI_OLLAMA_MIN_DISK_GB.\n\n"
+  fi
+
   # --- Check 1c: rootless Podman linger pre-flight ---------------------------
   # loginctl linger must be enabled for the install user BEFORE install runs;
   # without it the user's systemd instance is killed on logout and the

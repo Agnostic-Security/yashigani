@@ -2300,6 +2300,10 @@ volumes:
   # secrets_volume removed — all services now bind-mount ./secrets directly
   redis_data:
     driver: local
+  # Dedicated Ollama model store (#24): grows dynamically with the host disk that
+  # backs the runtime data-root. The full local model set can exceed 80 GB —
+  # install.sh preflights free space (YASHIGANI_OLLAMA_MIN_DISK_GB, default 80).
+  # For a dedicated disk, relocate the Docker/Podman data-root onto it.
   ollama_data:
     driver: local
   prometheus_data:
