@@ -957,6 +957,9 @@ def create_backoffice_app() -> FastAPI:
     # OPA policy viewer (read-only) — lists/serves the Rego modules loaded in OPA
     from yashigani.backoffice.routes.policies import router as policies_router
     app.include_router(policies_router, prefix="/admin/policies", tags=["policies"])
+    # #25 — dual-admin cloud-LLM risk-accepted override (propose/approve/revoke/status)
+    from yashigani.backoffice.routes.cloud_override import router as cloud_override_router
+    app.include_router(cloud_override_router, prefix="/admin/cloud-override", tags=["cloud-override"])
     app.include_router(alerts_router, prefix="/admin/alerts", tags=["alerts"])
     app.include_router(agent_bundles_router, prefix="/admin/agent-bundles", tags=["agent-bundles"])
     # v1.0 — Budget admin API

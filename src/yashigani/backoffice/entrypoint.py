@@ -532,6 +532,13 @@ def _bootstrap():
         if _ping_ok:
             backoffice_state.break_glass_manager = init_break_glass(redis_bg, audit_writer)
             logger.info("Break glass manager initialized")
+            # #25: dual-admin cloud-LLM override shares the same db/0 Redis client.
+            try:
+                from yashigani.optimization.cloud_override import CloudLlmOverrideManager
+                backoffice_state.cloud_override_manager = CloudLlmOverrideManager(redis_bg, audit_writer)
+                logger.info("Cloud-LLM override manager initialized")
+            except Exception as _co_exc:
+                logger.warning("Cloud-override manager init failed (%s)", _co_exc)
         else:
             logger.warning("Break glass unavailable — Redis unreachable after %d attempts", _BG_MAX_ATTEMPTS)
     except Exception as exc:

@@ -337,6 +337,33 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("Token counter unavailable (%s)", exc)
 
+    # ── #25: dual-admin cloud-LLM override — engine reads the ACTIVE grant live ──
+    # (Redis db/0, same namespace home as break-glass). 5s in-process cache bounds
+    # Redis load to <=1 read / 5s instead of per-request. None when unavailable.
+    cloud_override_getter = None
+    try:
+        import redis as _redis_co_mod
+        from yashigani.optimization.cloud_override import CloudLlmOverrideManager
+        _redis_co = _redis_co_mod.from_url(_gw_redis_url(0), decode_responses=False)
+        _redis_co.ping()
+        _co_mgr = CloudLlmOverrideManager(_redis_co, audit_writer)
+        _co_cache = {"t": 0.0, "v": None}
+
+        def cloud_override_getter():  # noqa: F811 — assigned only on success
+            import time as _t
+            now = _t.monotonic()
+            if now - _co_cache["t"] > 5.0:
+                try:
+                    _co_cache["v"] = _co_mgr.get_active()
+                except Exception:
+                    _co_cache["v"] = None
+                _co_cache["t"] = now
+            return _co_cache["v"]
+        logger.info("Cloud-LLM override getter wired (engine honours dual-admin grants)")
+    except Exception as exc:
+        logger.warning("Cloud-override getter unavailable (%s) — engine override disabled", exc)
+        cloud_override_getter = None
+
     # ── v1.0: Optimization Engine ─────────────────────────────────────────
     optimization_engine = None
     try:
@@ -345,6 +372,7 @@ def _build_app(mesh_mode: bool = False):
             default_model=model,
             default_cloud_provider=os.getenv("YASHIGANI_DEFAULT_CLOUD_PROVIDER", "anthropic"),
             default_cloud_model=os.getenv("YASHIGANI_DEFAULT_CLOUD_MODEL", "claude-sonnet-4-6"),
+            cloud_override_getter=cloud_override_getter,
         )
     except Exception as exc:
         logger.warning("Optimization Engine unavailable (%s)", exc)
