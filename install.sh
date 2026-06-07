@@ -4901,6 +4901,48 @@ if 'kibanaserver' in d: d['kibanaserver']['hash']=kh
 yaml.safe_dump(d,open(p,'w'),default_flow_style=False,sort_keys=False)
 PYEOF
 
+  # 5b. (#21) least-privilege cert-identity for audit forwarding. The agnostic
+  #     audit pipeline (gateway + backoffice) forwards events to this indexer over
+  #     mesh mTLS, presenting each service's OWN internal-CA leaf (CN=gateway /
+  #     CN=backoffice). Map those CNs to a WRITE-ONLY role on yashigani-audit*
+  #     — never the wazuh admin. Three edits, applied by securityadmin (security-init):
+  #       - config.yml: enable the clientcert_auth_domain (cert CN → username).
+  #       - roles.yml: add yashigani_audit_writer (bulk + write/create on yashigani-audit* only).
+  #       - roles_mapping.yml: map backoffice + gateway → yashigani_audit_writer.
+  #     clientauth_mode is OPTIONAL (default), challenge:false — basic-auth clients
+  #     (dashboard/filebeat/securityadmin) are unaffected.
+  python3 - "${wp}/opensearch-security" <<'PYEOF'
+import sys,yaml,os
+sec=sys.argv[1]
+cfgp=os.path.join(sec,"config.yml")
+cfg=yaml.safe_load(open(cfgp))
+authc=cfg["config"]["dynamic"]["authc"]
+dom=authc.get("clientcert_auth_domain")
+if dom is None:
+    dom={"description":"Authenticate via SSL client certificates","transport_enabled":False,
+         "order":1,"http_authenticator":{"type":"clientcert",
+         "config":{"username_attribute":"cn"},"challenge":False},
+         "authentication_backend":{"type":"noop"}}
+    authc["clientcert_auth_domain"]=dom
+dom["http_enabled"]=True
+yaml.safe_dump(cfg,open(cfgp,"w"),default_flow_style=False,sort_keys=False)
+
+rp=os.path.join(sec,"roles.yml")
+roles=yaml.safe_load(open(rp))
+roles["yashigani_audit_writer"]={"reserved":False,
+  "cluster_permissions":["cluster_composite_ops"],
+  "index_permissions":[{"index_patterns":["yashigani-audit*"],
+    "allowed_actions":["indices:admin/create","indices:admin/mapping/put",
+      "indices:admin/mapping/auto_put","indices:data/write/index","indices:data/write/bulk*"]}]}
+yaml.safe_dump(roles,open(rp,"w"),default_flow_style=False,sort_keys=False)
+
+rmp=os.path.join(sec,"roles_mapping.yml")
+rm=yaml.safe_load(open(rmp))
+rm["yashigani_audit_writer"]={"reserved":False,"users":["backoffice","gateway"]}
+yaml.safe_dump(rm,open(rmp,"w"),default_flow_style=False,sort_keys=False)
+print("[wazuh-mtls] clientcert auth + yashigani_audit_writer (write-only) mapped to backoffice,gateway")
+PYEOF
+
   # 6. dashboard config: real indexer password + internal-CA bundle + full verification
   {
     printf 'server.host: "0.0.0.0"\nserver.port: 5601\nserver.ssl.enabled: false\n'
