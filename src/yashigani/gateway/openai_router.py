@@ -1525,6 +1525,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         headers["X-Yashigani-Budget-Total"] = str(budget_total)
         headers["X-Yashigani-Budget-Pct"] = str(budget_pct)
 
+    # ── #16 step 9. Client-policy obligations (allow-path directives) ──
+    # audit_* / redact_* obligations from bound client policies are surfaced here
+    # so they are NEVER silently ignored: logged + conveyed to the caller/operator
+    # UI via header. (Content-mutation redaction routing through the PII redactor
+    # is a tracked follow-up; the directive itself is always recorded.)
+    _client_obligations = sorted(set(
+        (_ce_in.get("obligations") or []) + (_ce_eg.get("obligations") or [])
+    ))
+    if _client_obligations:
+        headers["X-Yashigani-Client-Obligations"] = ",".join(_client_obligations).encode(
+            "ascii", "replace").decode("ascii")
+        logger.info("client-policy obligations for %s: %s", identity_id, _client_obligations)
+
     return JSONResponse(
         content=response.model_dump(),
         headers=headers,
