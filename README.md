@@ -55,9 +55,9 @@ The **Model Context Protocol** is an open standard that allows AI agents — sys
 
 Yashigani fills that gap. It provides the security layer that MCP does not: authentication, fine-grained authorization via Open Policy Agent (OPA), ML-assisted prompt injection detection, credential exfiltration prevention, per-endpoint rate limiting, full audit trails with multi-sink delivery, encrypted secrets management, SSO/SCIM identity integration, enterprise-grade observability, intelligent model routing via the Optimization Engine, and three-tier budget governance. From a single developer running a local model to a large organization deploying hundreds of AI agents across multiple business units, Yashigani is the enforcement point that makes agentic AI deployments safe to operate in production.
 
-### Coverage at a glance (verified April 2026)
+### Coverage at a glance
 
-Yashigani consolidates into a single Apache-2.0 stack the capabilities that would otherwise require integrating four or more separate open-source projects — and even that combined stack covers only around half of what Yashigani delivers out of the box, as of April 2026. Closing the remaining gap means deploying further products on top, plus custom-built modules for which there is no off-the-shelf substitute (multi-LLM prompt-injection adjudication, deterministic 4D sensitivity-aware routing, container-per-identity isolation with forensic post-mortem, and SHA-384 Merkle-chain audit tamper-evidence). The detailed coverage matrix vs. the top ten named competitors is maintained internally and reviewed every release.
+Yashigani consolidates into a single Apache-2.0 stack capabilities that would otherwise require integrating multiple separate open-source projects, alongside modules for which there is no off-the-shelf substitute: multi-LLM prompt-injection adjudication, deterministic 4D sensitivity-aware routing, container-per-identity isolation with forensic post-mortem, and SHA-384 Merkle-chain audit tamper-evidence.
 
 ---
 
