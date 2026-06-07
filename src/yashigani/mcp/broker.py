@@ -411,8 +411,8 @@ class McpBroker:
             {"identity": {"agent": ctx.agent_name},
              "request": {"action": ctx.action, "tool": ctx.tool_name or ""}},
         )
-        if not _ce.get("allow", True):
-            _ce_reason = "client_policy:" + ",".join(_ce.get("deny", []) or ["denied"])
+        if not _ce.get("allow", False):
+            _ce_reason = ("client_policy:" + ",".join(_ce.get("deny", []) or ["denied"])).encode("ascii", "replace").decode("ascii")
             _ce_elapsed = int((time.monotonic() - t0) * 1000)
             ce_decision = BrokerDecision(
                 call_id=call_id,

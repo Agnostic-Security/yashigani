@@ -250,8 +250,8 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
          "request": {"path": path, "method": request.method},
          "target_agent": {"agent_id": target_agent_id}},
     )
-    if not _ce_in.get("allow", True):
-        _ce_reason = ",".join(_ce_in.get("deny", []) or ["client_policy_denied"])
+    if not _ce_in.get("allow", False):
+        _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
         logger.warning("CLIENT-POLICY DENIED agent ingress: caller=%s target=%s deny=%s",
                        caller_agent_id, target_agent_id, _ce_reason)
         _agent_cp_deny(audit_writer, caller_agent_id, "ingress", _ce_in)
@@ -409,8 +409,8 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
          "target_agent": {"agent_id": target_agent_id},
          "response_sensitivity": response_sensitivity_value},
     )
-    if not _ce_eg.get("allow", True):
-        _ce_eg_reason = ",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])
+    if not _ce_eg.get("allow", False):
+        _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
         logger.warning("CLIENT-POLICY BLOCKED agent egress: caller=%s target=%s deny=%s",
                        caller_agent_id, target_agent_id, _ce_eg_reason)
         _agent_cp_deny(audit_writer, caller_agent_id, "egress", _ce_eg)

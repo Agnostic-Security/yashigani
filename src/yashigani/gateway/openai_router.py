@@ -810,8 +810,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
                               provider=selected_provider, model=selected_model),
     )
-    if not _ce_in.get("allow", True):
-        _ce_reason = ",".join(_ce_in.get("deny", []) or ["client_policy_denied"])
+    if not _ce_in.get("allow", False):
+        _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
         logger.warning("CLIENT-POLICY DENIED /v1 ingress: identity=%s scope=%s:%s deny=%s",
                        identity_id, _ce_scope_kind, identity_id, _ce_reason)
         _audit_client_policy("ingress", identity_id, _ce_scope_kind, identity_id, _ce_in)
@@ -1461,8 +1461,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _state, _ce_eg_kind, identity_id, "egress",
         _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
     )
-    if not _ce_eg.get("allow", True):
-        _ce_eg_reason = ",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])
+    if not _ce_eg.get("allow", False):
+        _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
         logger.warning("CLIENT-POLICY BLOCKED /v1 egress: identity=%s deny=%s", identity_id, _ce_eg_reason)
         _audit_client_policy("egress", identity_id, _ce_eg_kind, identity_id, _ce_eg)
         return JSONResponse(
