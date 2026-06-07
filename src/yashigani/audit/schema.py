@@ -238,6 +238,10 @@ class EventType(str, Enum):
     # gateway denied fail-closed (alert on sustained rate — like OPA_*_CHECK_FAILED).
     CLIENT_POLICY_DENIED = "CLIENT_POLICY_DENIED"
     CLIENT_POLICY_CHECK_FAILED = "CLIENT_POLICY_CHECK_FAILED"
+    # #25 cloud-LLM risk-accepted override (dual-admin break-glass): proposed /
+    # activated (2nd-admin approval) / revoked. Justification + which cloud LLM
+    # + both admin identities are recorded for the risk-acceptance audit trail.
+    CLOUD_OVERRIDE = "CLOUD_OVERRIDE"
     # v2.24.1 — Iris #96: Admin/User Separation-of-Duties (SoD-001..005)
     # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2
     # ADMIN_CREATE_REJECTED_USER_EXISTS: admin creation blocked because a user-tier
@@ -1620,6 +1624,24 @@ class ClientPolicyDeniedEvent(AuditEvent):
     deny_codes: list = field(default_factory=list)
     evaluated: list = field(default_factory=list)
     action: str = "denied"
+
+
+@dataclass
+class CloudOverrideEvent(AuditEvent):
+    """#25: dual-admin cloud-LLM risk-accepted override lifecycle. override_event is
+    CLOUD_OVERRIDE_PROPOSED | CLOUD_OVERRIDE_ACTIVATED | CLOUD_OVERRIDE_REVOKED.
+    Records the justification, the specific cloud LLM, and BOTH admin identities."""
+
+    event_type: str = EventType.CLOUD_OVERRIDE
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    override_event: str = ""
+    provider: str = ""
+    model: str = ""
+    justification: str = ""
+    initiated_by: str = ""
+    approver: str = ""
+    expires_at: str = ""
 
 
 @dataclass
