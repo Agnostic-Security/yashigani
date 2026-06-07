@@ -22,6 +22,7 @@ import re
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
@@ -55,6 +56,10 @@ def _categorize(policy_id: str) -> str:
 class SavePolicyRequest(BaseModel):
     name: str = Field(min_length=2, max_length=41)
     rego: str = Field(min_length=1, max_length=64_000)
+    # #17 (OPA Phase 3a) sanity check:
+    check_only: bool = False        # run sanity check, return warnings, do NOT save
+    confirm_warnings: bool = False  # save despite HIGH warnings (deny-all/never-allow)
+    run_llm_review: bool = False    # also run the advisory LLM review pass
 
 
 @router.get("")
@@ -166,6 +171,31 @@ async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # 
             detail={"error": "missing_package",
                     "message": f"policy must declare a package (e.g. 'package clients.{name}')"},
         )
+
+    # #17 (OPA Phase 3a): behavioural sanity check in a throwaway sandbox BEFORE
+    # the live PUT. Compile error -> 400 invalid_rego. HIGH warnings (deny-all /
+    # never-allow / undefined) -> 409 unless confirm_warnings. check_only -> return
+    # the warnings without mutating live state. Advisory LLM review on request.
+    from yashigani.opa_assistant.sanity import static_sanity_check, llm_review
+    sanity = await static_sanity_check(body.rego, name)
+    if not sanity["compiled"]:
+        raise HTTPException(status_code=400, detail={"error": "invalid_rego",
+                            "opa": sanity.get("compile_error") or "Rego compile error"})
+    warnings = list(sanity["warnings"])
+    if body.run_llm_review:
+        warnings += await llm_review(body.rego)
+    high = [w for w in warnings if w.get("severity") == "high"]
+    if body.check_only:
+        _log.info("Admin %s sanity-checked client policy clients/%s (%d warning(s))",
+                  session.account_id, name, len(warnings))
+        return {"status": "checked", "name": name, "warnings": warnings, "ok": not high}
+    if high and not body.confirm_warnings:
+        return JSONResponse(status_code=409, content={
+            "error": "sanity_warnings",
+            "message": "This policy has high-severity warnings. Re-submit with confirm_warnings=true to save anyway.",
+            "warnings": warnings,
+        })
+
     pol_id = f"clients/{name}"
     url = _opa_base() + "/v1/policies/" + pol_id
     try:
@@ -186,12 +216,14 @@ async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # 
         raise HTTPException(status_code=400, detail={"error": "invalid_rego", "opa": opa_err})
     if resp.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail={"error": "opa_put_failed", "status": resp.status_code})
-    _log.info("Admin %s saved client policy %s", session.account_id, pol_id)
+    _log.info("Admin %s saved client policy %s (%d warning(s), confirmed=%s)",
+              session.account_id, pol_id, len(warnings), body.confirm_warnings)
     return {
         "status": "ok",
         "id": pol_id,
         "name": name,
         "category": "client",
+        "warnings": warnings,  # #17: surfaced even on save (e.g. info-level LLM notes)
         "message": "Saved and loaded into OPA (usable now). To persist across a full redeploy, add it to your policy bundle.",
     }
 
@@ -291,12 +323,47 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
     rego = rego.strip()
     if "package" not in rego:
         rego = f"package clients.{name}\n\nimport rego.v1\n\n# NOTE: LLM omitted package — review carefully.\n\n" + rego
+
+    # #17 (OPA Phase 3a): one-shot compile-repair — if the draft fails to compile,
+    # feed OPA's error back to the LLM ONCE for a corrected draft. Then run the
+    # behavioural sanity check. Nothing is auto-applied; warnings are advisory.
+    from yashigani.opa_assistant.sanity import compile_repair_once, static_sanity_check
+
+    async def _regenerate(err_text: str) -> str:
+        rprompt = prompt + f"\n\nThe previous attempt failed to compile with this OPA error:\n{err_text}\nReturn ONLY corrected Rego.\n"
+        async with httpx.AsyncClient(timeout=90.0) as c:
+            rr = await c.post(ollama_url + "/api/generate", json={"model": model, "prompt": rprompt, "stream": False})
+            rr.raise_for_status()
+            fixed = (rr.json().get("response") or "").strip()
+        if fixed.startswith("```"):
+            ps = fixed.split("\n")
+            if ps and ps[-1].strip().startswith("```"): ps = ps[:-1]
+            fixed = "\n".join(ps[1:]).strip()
+        if "package" not in fixed:
+            fixed = f"package clients.{name}\n\nimport rego.v1\n\n" + fixed
+        return fixed
+
+    repaired = False
+    repair_error = None
+    warnings: list = []
+    try:
+        rep = await compile_repair_once(rego, name, _regenerate)
+        rego = rep["rego"]; repaired = rep["repaired"]; repair_error = rep["repair_error"]
+        if not repair_error:
+            sc = await static_sanity_check(rego, name)
+            warnings = sc.get("warnings", [])
+    except Exception as exc:  # noqa: BLE001 — generation already succeeded; repair/sanity advisory
+        _log.info("policy generate: repair/sanity skipped (%s)", exc)
+
     return {
         "status": "ok",
         "name": name,
         "rego": rego,
         "model": model,
-        "note": "AI-generated draft — review and edit before saving. Saving runs an OPA compile check.",
+        "repaired": repaired,
+        "repair_error": repair_error,
+        "warnings": warnings,
+        "note": "AI-generated draft — review and edit before saving. Saving runs an OPA compile + sanity check.",
     }
 
 
