@@ -132,7 +132,7 @@ Incoming bearer tokens identify the calling identity and the Optimization Engine
 
 ## 4. Security Features by Version
 
-The current release narrative (v2.23.0 + v2.23.1 + v2.23.2 + v2.23.3 + v2.23.4) is in the [README](README.md#current-release-highlights). This section preserves the full per-version history.
+The current release narrative (v2.24.0 through v2.25.2) is in the [README](README.md#current-release-highlights). This section preserves the full per-version history.
 
 ### 4.1 Version Progression Summary
 
