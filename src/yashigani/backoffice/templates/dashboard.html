@@ -428,6 +428,40 @@
                 </div>
             </div>
             <div class="panel">
+                <div class="panel-header">Client-policy bindings (#16 — enforcement)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Bind a saved client policy (clients/&lt;name&gt;) to a subject scope and a
+                        direction. Bound policies are enforced by the gateway on every matching request
+                        (ingress) and/or response (egress), in addition to the core gates — they can only add
+                        denials, never remove one. Wildcard = leave Subject ID empty (all subjects of that kind).</p>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:12px">
+                        <label style="font-size:0.8rem">Policy name<br>
+                            <input id="bind-policy-name" type="text" placeholder="e.g. secrets_egress"
+                                   style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px"></label>
+                        <label style="font-size:0.8rem">Subject kind<br>
+                            <select id="bind-scope-kind" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px">
+                                <option value="human">human</option>
+                                <option value="service">service</option>
+                                <option value="api_client">api_client</option>
+                                <option value="mcp_server">mcp_server</option>
+                                <option value="agent">agent</option>
+                            </select></label>
+                        <label style="font-size:0.8rem">Subject ID (blank = all)<br>
+                            <input id="bind-scope-id" type="text" placeholder="(wildcard)"
+                                   style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px"></label>
+                        <label style="font-size:0.8rem">Direction<br>
+                            <select id="bind-direction" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px">
+                                <option value="ingress">ingress</option>
+                                <option value="egress">egress</option>
+                                <option value="both">both</option>
+                            </select></label>
+                        <button data-action="bindPolicy"
+                                style="padding:6px 14px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer">Bind</button>
+                    </div>
+                    <div id="bindings-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+            <div class="panel">
                 <div class="panel-header">Create a policy with AI</div>
                 <div class="panel-body">
                     <p class="txt-note">Describe the policy in plain English; the internal LLM drafts the Rego. Review &amp; edit

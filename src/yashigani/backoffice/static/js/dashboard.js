@@ -35,7 +35,7 @@ function showPage(name, triggerEl) {
     if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
-    if (name === 'policies') loadPolicies();
+    if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +188,59 @@ async function generatePolicy() {
     } else {
         res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
     }
+}
+
+// ── #16 client-policy bindings (parity with the /admin/policies/bind* API) ──
+async function loadBindings() {
+    var c = document.getElementById('bindings-container');
+    if (!c) return;
+    c.innerHTML = '<span class="loading">Loading…</span>';
+    var data = await api('/admin/policies/bindings');
+    if (!data || !data.bindings) { c.innerHTML = '<p class="txt-note">No bindings (or failed to load).</p>'; return; }
+    if (data.bindings.length === 0) { c.innerHTML = '<p class="txt-note">No client-policy bindings yet.</p>'; return; }
+    var html = '<table><thead><tr><th>Policy</th><th>Scope</th><th>Direction</th><th>Enabled</th><th></th></tr></thead><tbody>';
+    data.bindings.forEach(function(b) {
+        var scope = escapeHtml(b.scope_kind) + ':' + escapeHtml(b.scope_id || '*');
+        html += '<tr>'
+            + '<td style="font-family:monospace;">' + escapeHtml(b.policy_name) + '</td>'
+            + '<td style="font-family:monospace;">' + scope + '</td>'
+            + '<td>' + escapeHtml(b.direction) + '</td>'
+            + '<td>' + (b.enabled ? 'yes' : 'no') + '</td>'
+            + '<td><button class="btn btn-sm" data-action="unbindBinding" data-binding-id="' + escapeHtml(b.id) + '" style="background:#dc2626;color:#fff;">Remove</button></td>'
+            + '</tr>';
+    });
+    c.innerHTML = html + '</tbody></table>';
+}
+
+async function bindPolicy() {
+    var name = (document.getElementById('bind-policy-name').value || '').trim();
+    var kind = document.getElementById('bind-scope-kind').value;
+    var sid = (document.getElementById('bind-scope-id').value || '').trim();
+    var dir = document.getElementById('bind-direction').value;
+    if (!name) { alert('Enter a client policy name (clients/<name>).'); return; }
+    var resp = await apiMutate('/admin/policies/bind', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ policy_name: name, scope_kind: kind, scope_id: sid, direction: dir })
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok') {
+        document.getElementById('bind-policy-name').value = '';
+        document.getElementById('bind-scope-id').value = '';
+        loadBindings();
+    } else {
+        alert('Bind failed: ' + errMsg(d, resp.status));
+    }
+}
+
+async function unbindBinding(id) {
+    if (!id || !confirm('Remove this client-policy binding?')) return;
+    var resp = await apiMutate('/admin/policies/bind/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!resp) return;
+    if (resp.ok) { loadBindings(); return; }
+    var d = await resp.json().catch(function() { return {}; });
+    alert('Remove failed: ' + errMsg(d, resp.status));
 }
 
 async function api(path) {
@@ -1403,6 +1456,12 @@ document.addEventListener('click', function(e) {
         // Policies (OPA) viewer + authoring
         case 'policyView':
             viewPolicy(actionEl.getAttribute('data-id'), actionEl.getAttribute('data-cat'));
+            break;
+        case 'bindPolicy':
+            bindPolicy();
+            break;
+        case 'unbindBinding':
+            unbindBinding(actionEl.getAttribute('data-binding-id'));
             break;
         case 'policyEditCopy':
             policyEditCopy();
