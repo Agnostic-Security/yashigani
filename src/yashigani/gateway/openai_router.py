@@ -69,6 +69,8 @@ from pydantic import BaseModel, Field
 from yashigani.pki.client import internal_httpx_client
 from yashigani.metrics.registry import _C as _metric_counter
 from yashigani.audit.schema import (
+    ClientPolicyCheckFailedEvent,
+    ClientPolicyDeniedEvent,
     EncodedPayloadDetectedEvent,
     OpaResponseCheckFailedEvent,
     PIIDetectedEvent,
@@ -76,8 +78,45 @@ from yashigani.audit.schema import (
     ResponseInjectionDetectedEvent,
     StreamTerminatedEvent,
 )
+from yashigani.gateway._client_enforce import evaluate_client_policies, scope_kind_for
 
 logger = logging.getLogger(__name__)
+
+
+def _client_enforce_input(identity, request_path, route_reason="", provider="", model=""):
+    """Build the clients-contract input doc shared by ingress + egress (#16)."""
+    ident = identity or {}
+    return {
+        "identity": {
+            "agent": ident.get("identity_id", ""),
+            "role": ident.get("kind", ""),
+            "clearance": ident.get("sensitivity_ceiling", ""),
+            "groups": ident.get("groups", []),
+        },
+        "request": {"path": request_path, "method": "POST"},
+        "routing_decision": {"route": route_reason, "provider": provider, "model": model},
+    }
+
+
+def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result):
+    """Audit a client-policy denial / fail-closed, mirroring the OPA-check events."""
+    aw = _state.audit_writer
+    if aw is None:
+        return
+    deny = ce_result.get("deny", []) or []
+    failclosed = {"client_enforce_unavailable", "client_enforce_undefined", "client_enforce_not_configured"}
+    try:
+        if set(deny) & failclosed:
+            aw.write(ClientPolicyCheckFailedEvent(
+                reason=next(iter(set(deny) & failclosed)), outcome="fail_closed", direction=direction,
+            ))
+        else:
+            aw.write(ClientPolicyDeniedEvent(
+                identity_id=identity_id, scope_kind=scope_kind, scope_id=scope_id,
+                direction=direction, deny_codes=list(deny),
+            ))
+    except Exception:  # pragma: no cover — audit must never break the request path
+        pass
 
 # ---------------------------------------------------------------------------
 # OPA fail-closed Prometheus counter (Path 1 + Path 3)
@@ -761,6 +800,28 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             headers={"X-Yashigani-OPA-Reason": opa_reason},
         )
 
+    # ── 6a-bind. Client-policy enforcement — INGRESS (#16, OPA Phase 2) ──
+    # Runs STRICTLY AFTER the core _opa_v1_check gate above so it can only ADD
+    # denials, never remove one. Fail-closed (evaluate_client_policies denies on
+    # any OPA error/undefined). No-op for callers with no bound policies.
+    _ce_scope_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_in = await evaluate_client_policies(
+        _state, _ce_scope_kind, identity_id, "ingress",
+        _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
+                              provider=selected_provider, model=selected_model),
+    )
+    if not _ce_in.get("allow", True):
+        _ce_reason = ",".join(_ce_in.get("deny", []) or ["client_policy_denied"])
+        logger.warning("CLIENT-POLICY DENIED /v1 ingress: identity=%s scope=%s:%s deny=%s",
+                       identity_id, _ce_scope_kind, identity_id, _ce_reason)
+        _audit_client_policy("ingress", identity_id, _ce_scope_kind, identity_id, _ce_in)
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"Request denied by client policy: {_ce_reason}",
+                               "type": "client_policy_denied", "code": _ce_reason}},
+            headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
+        )
+
     # ── 6b. PII detection on request ──────────────────────────────────
     #
     # Runs AFTER routing so we know the destination (local vs cloud).
@@ -1391,6 +1452,26 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
                 },
             )
+
+    # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
+    # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
+    # the caller has no bound egress policies.
+    _ce_eg_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_eg = await evaluate_client_policies(
+        _state, _ce_eg_kind, identity_id, "egress",
+        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
+    )
+    if not _ce_eg.get("allow", True):
+        _ce_eg_reason = ",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])
+        logger.warning("CLIENT-POLICY BLOCKED /v1 egress: identity=%s deny=%s", identity_id, _ce_eg_reason)
+        _audit_client_policy("egress", identity_id, _ce_eg_kind, identity_id, _ce_eg)
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"Response blocked by client policy: {_ce_eg_reason}",
+                               "type": "client_policy_denied", "code": _ce_eg_reason}},
+            headers={"X-Yashigani-Request-Id": request_id,
+                     "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
+        )
 
     # ── 9. Build response ─────────────────────────────────────────────
     elapsed_ms = int((time.time() - start_time) * 1000)
