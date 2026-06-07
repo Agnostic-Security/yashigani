@@ -392,6 +392,14 @@ parse_args() {
         ;;
       --domain)
         DOMAIN="${2:?'--domain requires a value'}"
+        # LAURA-V2253-001: reject anything but an RFC-1123 hostname charset so a
+        # value with newlines can't inject extra lines into docker/.env (which is
+        # later written via these flags and fed to every container). Operator-
+        # supplied, but cheap to harden and closes the class for all DOMAIN writes.
+        if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+          log_error "--domain must be a valid hostname (letters, digits, dot, hyphen), got: ${DOMAIN}"
+          exit 1
+        fi
         shift 2
         ;;
       --tls-mode)
