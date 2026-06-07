@@ -232,6 +232,12 @@ class EventType(str, Enum):
     # response leg errors or is unreachable; gateway returns HTTP 503.
     # Alert on sustained rate — mirrors OPA_RESPONSE_CHECK_FAILED for /v1/*.
     PROXY_OPA_RESPONSE_CHECK_FAILED = "PROXY_OPA_RESPONSE_CHECK_FAILED"
+    # #16 (OPA Phase 2) — client-policy enforcement.
+    # CLIENT_POLICY_DENIED: a bound clients.<name> policy denied on ingress/egress.
+    # CLIENT_POLICY_CHECK_FAILED: the aggregate query errored/was undefined and the
+    # gateway denied fail-closed (alert on sustained rate — like OPA_*_CHECK_FAILED).
+    CLIENT_POLICY_DENIED = "CLIENT_POLICY_DENIED"
+    CLIENT_POLICY_CHECK_FAILED = "CLIENT_POLICY_CHECK_FAILED"
     # v2.24.1 — Iris #96: Admin/User Separation-of-Duties (SoD-001..005)
     # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2
     # ADMIN_CREATE_REJECTED_USER_EXISTS: admin creation blocked because a user-tier
@@ -1595,6 +1601,41 @@ class OpaResponseCheckFailedEvent(AuditEvent):
     exc_str: str = ""         # str(exc)[:256] (empty for not_configured)
     identity_id: str = ""
     response_sensitivity: str = ""
+    action: str = "denied_fail_closed"
+
+
+@dataclass
+class ClientPolicyDeniedEvent(AuditEvent):
+    """#16: a bound client policy (data.clients.<name>) denied the request on
+    ingress or egress. No request/response body or user content is stored —
+    only the scope, direction, and the policy-emitted deny codes."""
+
+    event_type: str = EventType.CLIENT_POLICY_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    identity_id: str = ""
+    scope_kind: str = ""      # human|service|api_client|mcp_server|agent
+    scope_id: str = ""
+    direction: str = ""       # ingress|egress
+    deny_codes: list = field(default_factory=list)
+    evaluated: list = field(default_factory=list)
+    action: str = "denied"
+
+
+@dataclass
+class ClientPolicyCheckFailedEvent(AuditEvent):
+    """#16: the client-policy aggregate query errored/was undefined and the
+    gateway denied fail-closed. Alert on sustained rate (OPA outage). Mirrors
+    OpaResponseCheckFailedEvent invariants (no body; exc_str truncated)."""
+
+    event_type: str = EventType.CLIENT_POLICY_CHECK_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""          # "client_enforce_unavailable" | "client_enforce_undefined" | "not_configured"
+    outcome: str = ""         # "exception" | "undefined" | "not_configured"
+    exc_class: str = ""
+    exc_str: str = ""         # str(exc)[:256]
+    direction: str = ""
     action: str = "denied_fail_closed"
 
 

@@ -85,6 +85,14 @@ inspection_classifications_total = _C(
     ["label", "severity"],
 )
 
+# #16 (OPA Phase 2): client-policy aggregate query failures (fail-closed denies).
+# Alert on sustained rate — like the OPA *_CHECK_FAILED audit events.
+client_enforce_failures_total = _C(
+    "yashigani_client_enforce_failures_total",
+    "Client-policy aggregate query failures by direction and outcome (fail-closed).",
+    ["direction", "outcome"],
+)
+
 inspection_duration_seconds = _H(
     "yashigani_inspection_duration_seconds",
     "Inspection pipeline latency (classify + sanitise).",
