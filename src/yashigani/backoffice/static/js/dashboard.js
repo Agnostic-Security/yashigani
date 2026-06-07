@@ -24,7 +24,7 @@ function showPage(name, triggerEl) {
     if (name === 'agents') loadAgents();
     if (name === 'accounts') loadAccounts();
     if (name === 'budgets') loadBudgets();
-    if (name === 'models') loadModels();
+    if (name === 'models') { loadModels(); loadCloudOverride(); }
     if (name === 'sensitivity') loadSensitivity();
     if (name === 'policies') loadPolicies();
     if (name === 'settings') loadSettings();
@@ -827,6 +827,60 @@ async function pullModel() {
     else { st.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
 }
 
+// ── #25 dual-admin cloud-LLM override (parity with /admin/cloud-override API) ──
+async function loadCloudOverride() {
+    var el = document.getElementById('cloud-override-status');
+    if (!el) return;
+    var d = await api('/admin/cloud-override/status');
+    if (!d) { el.textContent = 'Status unavailable.'; return; }
+    var s = d.status || 'INACTIVE';
+    if (s === 'ACTIVE') {
+        el.innerHTML = '<span class="badge badge-red">ACTIVE</span> ' + escapeHtml(d.provider + '/' + d.model)
+            + ' — proposed by ' + escapeHtml(d.initiated_by || '?') + ', approved by ' + escapeHtml(d.approver || '?')
+            + ', expires ' + escapeHtml(d.expires_at || '') + '<br><span class="txt-note">Justification: ' + escapeHtml(d.justification || '') + '</span>';
+    } else if (s === 'PENDING_APPROVAL') {
+        el.innerHTML = '<span class="badge" style="background:#fef3c7;color:#92400e">PENDING</span> '
+            + escapeHtml(d.provider + '/' + d.model) + ' — proposed by ' + escapeHtml(d.initiated_by || '?')
+            + ' awaiting a SECOND admin to Approve (within 5 min).';
+    } else {
+        el.innerHTML = '<span class="badge badge-green">INACTIVE</span> No cloud-LLM override in effect.';
+    }
+}
+
+async function cloudOverridePropose() {
+    var el = document.getElementById('cloud-override-status');
+    var body = {
+        provider: (document.getElementById('co-provider').value || '').trim(),
+        model: (document.getElementById('co-model').value || '').trim(),
+        justification: (document.getElementById('co-justification').value || '').trim(),
+        ttl_hours: parseInt(document.getElementById('co-ttl').value || '4', 10)
+    };
+    if (!body.provider || !body.model) { el.textContent = 'Provider and model are required.'; return; }
+    if (body.justification.length < 4) { el.textContent = 'A justification is required (ticket/contract/CEO email).'; return; }
+    var resp = await apiMutate('/admin/cloud-override/propose', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok) { document.getElementById('co-justification').value = ''; loadCloudOverride(); }
+    else { el.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
+}
+
+async function cloudOverrideApprove() {
+    var el = document.getElementById('cloud-override-status');
+    var resp = await apiMutate('/admin/cloud-override/approve', { method: 'POST' });
+    if (!resp) return;
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok) { loadCloudOverride(); }
+    else { el.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
+}
+
+async function cloudOverrideRevoke() {
+    if (!confirm('Revoke the cloud-LLM override now?')) return;
+    var resp = await apiMutate('/admin/cloud-override/revoke', { method: 'POST' });
+    if (resp && resp.ok) loadCloudOverride();
+}
+
 async function deleteAlias(alias) {
     if (!confirm('Delete alias "' + alias + '"?')) return;
     var resp = await apiMutate('/admin/models/' + encodeURIComponent(alias), { method: 'DELETE' });
@@ -1360,6 +1414,15 @@ document.addEventListener('click', function(e) {
             break;
         case 'pullModel':
             pullModel();
+            break;
+        case 'cloudOverridePropose':
+            cloudOverridePropose();
+            break;
+        case 'cloudOverrideApprove':
+            cloudOverrideApprove();
+            break;
+        case 'cloudOverrideRevoke':
+            cloudOverrideRevoke();
             break;
         case 'deleteAlias':
             deleteAlias(actionEl.getAttribute('data-alias'));

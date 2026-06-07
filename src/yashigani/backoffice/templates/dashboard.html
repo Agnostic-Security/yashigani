@@ -344,6 +344,32 @@
                     <tbody id="allocs-tbody"><tr><td colspan="4" class="empty">No allocations configured</td></tr></tbody>
                 </table>
             </div>
+            <!-- #25: dual-admin cloud-LLM risk-accepted override (break-glass) -->
+            <div class="panel">
+                <div class="panel-header">Cloud-LLM Override (dual-admin, risk-accepted)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Emergency/contractual override: allow a <b>specific cloud LLM</b> to serve
+                        even CONFIDENTIAL/RESTRICTED traffic the optimization engine would normally keep on-prem —
+                        for a customer who has signed a cloud-provider agreement and accepts the P1–P9 risk. Requires
+                        <b>two admins</b> (a second, different admin must approve within 5 min) and a written
+                        justification. Auto-expires. Does NOT affect auth, RBAC, or threat inspection.</p>
+                    <div id="cloud-override-status" class="form-result">Loading…</div>
+                    <div class="form-row" style="margin-top:10px">
+                        <div><label class="lbl">Cloud provider</label><br><input id="co-provider" type="text" placeholder="openai" class="fi w-120"></div>
+                        <div><label class="lbl">Cloud model</label><br><input id="co-model" type="text" placeholder="gpt-4o" class="fi w-160"></div>
+                        <div><label class="lbl">TTL (hours, 1–72)</label><br><input id="co-ttl" type="number" min="1" max="72" value="4" class="fi w-80"></div>
+                    </div>
+                    <div class="form-row">
+                        <div style="flex:1"><label class="lbl">Justification (ticket #, contract #, CEO email — required)</label><br>
+                            <input id="co-justification" type="text" placeholder="e.g. CONTRACT-ACME-2026 / approved by CEO 2026-06-07" class="fi" style="width:100%"></div>
+                    </div>
+                    <div style="display:flex;gap:8px;margin-top:8px">
+                        <button data-action="cloudOverridePropose" class="btn-sm-save">Propose (admin 1)</button>
+                        <button data-action="cloudOverrideApprove" style="padding:6px 12px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer">Approve (admin 2)</button>
+                        <button data-action="cloudOverrideRevoke" style="padding:6px 12px;background:#dc2626;color:#fff;border:none;border-radius:4px;cursor:pointer">Revoke</button>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- Sensitivity Page -->
