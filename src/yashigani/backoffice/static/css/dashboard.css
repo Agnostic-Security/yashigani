@@ -70,6 +70,7 @@ tr:hover { background: #f8fafc; }
 .fi-url { padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 100%; }
 .fi-hibp { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 340px; max-width: 100%; }
 /* width variants */
+.w-80 { width: 80px; }
 .w-120 { width: 120px; }
 .w-140 { width: 140px; }
 .w-150 { width: 150px; }
@@ -263,3 +264,11 @@ tr:hover { background: #f8fafc; }
 .rs-toast-visible { opacity: 1; }
 .rs-toast-ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
 .rs-toast-err { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }
+
+/* ── Layout utilities (CSP-INLINE-STYLE-SPA, #16/#25 panels) ─── */
+.flex-1 { flex: 1; }
+.w-full { width: 100%; }
+/* center-aligned button/control row (pull-model, cloud-override actions) */
+.form-row--mt-center { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+/* wrapping control row with bottom margin (client-policy bindings) */
+.form-row--wrap-mb { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 12px; }

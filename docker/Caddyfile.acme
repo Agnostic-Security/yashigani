@@ -129,7 +129,8 @@
         X-Content-Type-Options     "nosniff"
         X-Frame-Options            "DENY"
         Referrer-Policy            "no-referrer"
-        Content-Security-Policy    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+        # CSP is set per-path below (NOT here) — a global SET would shadow the
+        # per-path override and break the proxied sub-apps + Open WebUI.
         Cross-Origin-Opener-Policy "same-origin"
         # Product / fingerprint hygiene (QA Wave 2 observations 5 + 6):
         # strip Server, Via (reveals reverse-proxy product to Shodan) and
@@ -139,6 +140,33 @@
         -Via
         -Alt-Svc
     }
+
+    # CSP, set per-path so exactly one policy applies per request.
+    #
+    # STRICT (script-src 'self', style-src 'self', no inline) applies to the
+    # Yashigani-native admin plane ONLY — the backoffice SPA (/admin/*), auth
+    # (/auth/*, /login), and the other first-party backoffice routes. These were
+    # deliberately made strict-CSP-compliant (inline styles moved to CSS classes,
+    # f7a3228); do NOT weaken them.
+    #
+    # LENIENT (unsafe-eval + unsafe-inline) applies to everything else:
+    #  - the proxied observability sub-apps (Grafana, Wazuh/OSD, Prometheus),
+    #    which ship nonce-less inline bootstrap scripts + eval()/inline styles;
+    #  - the Open WebUI end-user chat surface served at the root catch-all
+    #    (--with-openwebui), whose SvelteKit build emits inline hydration scripts —
+    #    strict CSP blocks them and the page renders blank (YSG-2253 blocker).
+    #
+    # The boundary is a single path set used in both matchers so exactly one
+    # policy applies per request.
+    @strict_ui {
+        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    }
+    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     # Hard ceiling at Caddy layer — prevents large-body DoS before the request

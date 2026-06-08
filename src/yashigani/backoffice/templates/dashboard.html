@@ -299,7 +299,7 @@
                     <tbody id="models-tbody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
                 </table>
                 <!-- #25: pull a model into the local Ollama store -->
-                <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+                <div class="form-row--mt-center">
                     <input id="pull-model-name" type="text" placeholder="e.g. gemma3:4b" class="fi w-180">
                     <button data-action="pullModel" class="btn-sm-save">Pull model</button>
                     <span id="pull-model-status" class="txt-note"></span>
@@ -354,19 +354,19 @@
                         <b>two admins</b> (a second, different admin must approve within 5 min) and a written
                         justification. Auto-expires. Does NOT affect auth, RBAC, or threat inspection.</p>
                     <div id="cloud-override-status" class="form-result">Loading…</div>
-                    <div class="form-row" style="margin-top:10px">
+                    <div class="form-row form-row--mt">
                         <div><label class="lbl">Cloud provider</label><br><input id="co-provider" type="text" placeholder="openai" class="fi w-120"></div>
                         <div><label class="lbl">Cloud model</label><br><input id="co-model" type="text" placeholder="gpt-4o" class="fi w-160"></div>
                         <div><label class="lbl">TTL (hours, 1–72)</label><br><input id="co-ttl" type="number" min="1" max="72" value="4" class="fi w-80"></div>
                     </div>
                     <div class="form-row">
-                        <div style="flex:1"><label class="lbl">Justification (ticket #, contract #, CEO email — required)</label><br>
-                            <input id="co-justification" type="text" placeholder="e.g. CONTRACT-ACME-2026 / approved by CEO 2026-06-07" class="fi" style="width:100%"></div>
+                        <div class="flex-1"><label class="lbl">Justification (ticket #, contract #, CEO email — required)</label><br>
+                            <input id="co-justification" type="text" placeholder="e.g. CONTRACT-ACME-2026 / approved by CEO 2026-06-07" class="fi w-full"></div>
                     </div>
-                    <div style="display:flex;gap:8px;margin-top:8px">
+                    <div class="form-row--gap12">
                         <button data-action="cloudOverridePropose" class="btn-sm-save">Propose (admin 1)</button>
-                        <button data-action="cloudOverrideApprove" style="padding:6px 12px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer">Approve (admin 2)</button>
-                        <button data-action="cloudOverrideRevoke" style="padding:6px 12px;background:#dc2626;color:#fff;border:none;border-radius:4px;cursor:pointer">Revoke</button>
+                        <button data-action="cloudOverrideApprove" class="btn-sm-save">Approve (admin 2)</button>
+                        <button data-action="cloudOverrideRevoke" class="btn-sm-danger">Revoke</button>
                     </div>
                 </div>
             </div>
@@ -466,29 +466,28 @@
                         direction. Bound policies are enforced by the gateway on every matching request
                         (ingress) and/or response (egress), in addition to the core gates — they can only add
                         denials, never remove one. Wildcard = leave Subject ID empty (all subjects of that kind).</p>
-                    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:12px">
-                        <label style="font-size:0.8rem">Policy name<br>
+                    <div class="form-row--wrap-mb">
+                        <label class="lbl">Policy name<br>
                             <input id="bind-policy-name" type="text" placeholder="e.g. secrets_egress"
-                                   style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px"></label>
-                        <label style="font-size:0.8rem">Subject kind<br>
-                            <select id="bind-scope-kind" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px">
+                                   class="fi-sm"></label>
+                        <label class="lbl">Subject kind<br>
+                            <select id="bind-scope-kind" class="fi-sm">
                                 <option value="human">human</option>
                                 <option value="service">service</option>
                                 <option value="api_client">api_client</option>
                                 <option value="mcp_server">mcp_server</option>
                                 <option value="agent">agent</option>
                             </select></label>
-                        <label style="font-size:0.8rem">Subject ID (blank = all)<br>
+                        <label class="lbl">Subject ID (blank = all)<br>
                             <input id="bind-scope-id" type="text" placeholder="(wildcard)"
-                                   style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px"></label>
-                        <label style="font-size:0.8rem">Direction<br>
-                            <select id="bind-direction" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px">
+                                   class="fi-sm"></label>
+                        <label class="lbl">Direction<br>
+                            <select id="bind-direction" class="fi-sm">
                                 <option value="ingress">ingress</option>
                                 <option value="egress">egress</option>
                                 <option value="both">both</option>
                             </select></label>
-                        <button data-action="bindPolicy"
-                                style="padding:6px 14px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer">Bind</button>
+                        <button data-action="bindPolicy" class="btn-sm-primary">Bind</button>
                     </div>
                     <div id="bindings-container"><span class="loading">Loading…</span></div>
                 </div>
