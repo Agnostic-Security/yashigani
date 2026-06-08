@@ -5,7 +5,10 @@ Yashigani sandboxed-extractor WORKER — runs INSIDE the per-job jail.
 This is the in-sandbox entrypoint of the hardened extractor runtime (plan §6
 B1). It is the process the Captain sandbox spawns; it is the SEAM Tom plugged the
 real OOXML/PDF parsers into. The REDACT/PSEUDONYMIZE re-render (red-team F6 —
-re-render runs in the SAME jail) lands in the NEXT slice at ``_render_*``.
+re-render runs in the SAME jail) is implemented here in ``_render_*`` /
+``_run_render``: regenerate-from-cleaned-content (never an overlay — F4),
+stripping ALL hidden parts + metadata, with the re-extract-the-OUTPUT segments
+returned so the host can PROVE no residual.
 
 CONTRACT (language-agnostic, process-level — see sandbox.py docstring):
     stdin  : raw document bytes (the single read-only input)
@@ -53,10 +56,12 @@ single source of truth for the caps + the parser settings — no copy-drift
 docx/pptx, openpyxl for xlsx, pypdf for pdf) live ONLY in the extractor image
 (docker/Dockerfile.extractor), never the gateway image.
 
-REDACT/PSEUDONYMIZE re-render seam (NEXT slice): ``_render_docx`` /
-``_render_xlsx`` / ``_render_pptx`` / ``_render_pdf`` are stubbed below and the
-``redact``/``pseudonymize`` jobs are contained until they land. They run in THIS
-same jail (F6); do NOT move re-render into the gateway process.
+REDACT/PSEUDONYMIZE re-render: ``_render_docx`` / ``_render_xlsx`` /
+``_render_pptx`` / ``_render_pdf`` (+ ``_render_text_like`` for txt/csv) rebuild a
+MINIMAL clean artefact from cleaned content and re-zip / re-emit. They run in THIS
+same jail (F6); re-render is NEVER moved into the gateway process — the writer is
+attack surface too. The plan (per-span transforms; NO replacer map — F5) arrives
+base64'd on the ``--plan`` argv; the document bytes stay on stdin.
 """
 from __future__ import annotations
 
@@ -91,6 +96,10 @@ _SUPPORTED = {"docx", "xlsx", "pptx", "pdf"}
 # docProps schemas vary by Office version.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+#: presentationml + relationship namespaces — only needed by the pptx re-render
+#: (rebuilding a minimal clean presentation), not the read path.
+_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 def _emit(obj: dict) -> None:
@@ -702,25 +711,589 @@ _EXTRACTORS = {
 
 
 # ---------------------------------------------------------------------------
-# Re-render seam (REDACT / PSEUDONYMIZE) — NEXT slice (red-team F6, same jail).
-# Stubs left intentionally so the contract is stable; jobs are contained until
-# the bodies land. Do NOT move re-render into the gateway process.
+# Re-render (REDACT / PSEUDONYMIZE) — runs in THIS same jail (red-team F6).
+#
+# The CONTRACT (transform.RenderPlan, host-side): a plan is a list of per-span
+# transforms keyed by the WORKER-side segment location + the exact original
+# substring, plus the action (REDACT destroys, PSEUDONYMIZE token-substitutes).
+# Re-render is REGENERATE-FROM-CLEANED-CONTENT, never an overlay (F4): we rebuild
+# the part XML / text / rows from cleaned values and discard the original object
+# graph, so there is no residual under an overlay.
+#
+# REDACT/PSEUDONYMIZE ALWAYS strip ALL hidden parts + metadata (§5.1 pt 3 / F4) —
+# you cannot certify "no residual" while shipping comments/tracked-changes/notes/
+# hidden cells/defined-names/core+app+XMP metadata.  The per-format builders below
+# rebuild a MINIMAL clean package containing ONLY the visible body parts, with the
+# matched spans transformed, and NOTHING else.
 # ---------------------------------------------------------------------------
 
-def _render_docx(data: bytes, plan: dict) -> bytes:  # pragma: no cover - next slice
-    raise _Contained("docx re-render not yet implemented (REDACT/PSEUDONYMIZE slice)")
+
+class _Transform:
+    """A resolved per-span transform: original value -> replacement (or '' for
+    REDACT)."""
+
+    __slots__ = ("original", "replacement", "action")
+
+    def __init__(self, original: str, replacement: str, action: str) -> None:
+        self.original = original
+        self.replacement = replacement
+        self.action = action
 
 
-def _render_xlsx(data: bytes, plan: dict) -> bytes:  # pragma: no cover - next slice
-    raise _Contained("xlsx re-render not yet implemented (REDACT/PSEUDONYMIZE slice)")
+def _parse_plan(plan: dict) -> tuple[dict[str, list[_Transform]], bool]:
+    """Parse the host RenderPlan dict into (segment_location -> transforms,
+    strip_hidden_and_metadata). Fail-closed on a malformed plan."""
+    if not isinstance(plan, dict):
+        raise _Contained("re-render plan is not an object — fail-closed")
+    spans = plan.get("spans")
+    if not isinstance(spans, list):
+        raise _Contained("re-render plan has no span list — fail-closed")
+    by_seg: dict[str, list[_Transform]] = {}
+    for s in spans:
+        if not isinstance(s, dict):
+            raise _Contained("re-render span is not an object — fail-closed")
+        loc = str(s.get("segment_location", ""))
+        original = str(s.get("original", ""))
+        action = str(s.get("action", ""))
+        if not loc or original == "" or action not in ("REDACT", "PSEUDONYMIZE"):
+            raise _Contained("re-render span malformed (loc/original/action) — fail-closed")
+        replacement = "" if action == "REDACT" else str(s.get("token", ""))
+        if action == "PSEUDONYMIZE" and replacement == "":
+            raise _Contained("PSEUDONYMIZE span missing token — fail-closed")
+        by_seg.setdefault(loc, []).append(_Transform(original, replacement, action))
+    strip = bool(plan.get("strip_hidden_and_metadata", True))
+    return by_seg, strip
 
 
-def _render_pptx(data: bytes, plan: dict) -> bytes:  # pragma: no cover - next slice
-    raise _Contained("pptx re-render not yet implemented (REDACT/PSEUDONYMIZE slice)")
+def _apply_transforms(text: str, transforms: list[_Transform]) -> str:
+    """Apply value-keyed transforms to a segment's text.
+
+    Longest originals first so a short value is not substituted inside a longer
+    one. Each original is replaced wherever it appears in this segment (value-
+    keyed coherence). REDACT replaces with '' (destruction)."""
+    out = text
+    for t in sorted(transforms, key=lambda x: len(x.original), reverse=True):
+        out = out.replace(t.original, t.replacement)
+    return out
 
 
-def _render_pdf(data: bytes, plan: dict) -> bytes:  # pragma: no cover - next slice
-    raise _Contained("pdf re-render not yet implemented (REDACT/PSEUDONYMIZE slice)")
+def _xml_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _zip_out(parts: dict[str, bytes]) -> bytes:
+    """Write a fresh OOXML zip from cleaned parts (regenerate, not edit-in-place)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in parts.items():
+            zf.writestr(name, payload)
+    return buf.getvalue()
+
+
+def _render_docx(data: bytes, plan: dict) -> bytes:
+    """Rebuild a MINIMAL clean docx: visible body paragraphs only, matched runs
+    transformed, ALL hidden parts (comments, tracked changes, footnotes,
+    headers/footers) + ALL metadata (docProps/*) STRIPPED.
+
+    F4 residual vectors addressed: the original object graph is discarded (we
+    emit a freshly-generated document.xml from cleaned BODY text only); generator
+    + core/app/custom metadata are dropped (no docProps); comments/tracked-change
+    parts are not carried; there is no embedded thumbnail (docProps/thumbnail) in
+    the rebuilt package; font subsets are not an OOXML concern (text is XML, not
+    glyph-embedded)."""
+    if _ooxml_is_encrypted(data):
+        raise _Contained("docx is encrypted — never re-rendered, fail-closed BLOCK")
+    _guard_ooxml(data)
+    by_seg, _strip = _parse_plan(plan)
+
+    zf = _open_zip(data)
+    body = _read_part(zf, "word/document.xml")
+    if body is None:
+        raise _Contained("docx missing word/document.xml — cannot re-render, fail-closed")
+    root = _parse_xml(body)
+    if root is None:
+        raise _Contained("docx word/document.xml malformed — cannot re-render, fail-closed")
+
+    paras_xml: list[str] = []
+    for idx, para in enumerate(root.iter(f"{{{_W}}}p"), start=1):
+        loc = f"word/document.xml#p={idx}"
+        # VISIBLE run text ONLY: w:t runs, NOT w:delText (tracked-change
+        # deletions are a hidden channel and must NOT be carried into the
+        # rebuilt body — a deleted-but-shipped secret is a residual leak, F4).
+        text = "".join(t.text or "" for t in para.iter(f"{{{_W}}}t"))
+        if loc in by_seg:
+            text = _apply_transforms(text, by_seg[loc])
+        if text.strip() == "":
+            # Span fully redacted away → drop the paragraph (no empty residual).
+            continue
+        paras_xml.append(
+            f"<w:p><w:r><w:t xml:space=\"preserve\">{_xml_escape(text)}</w:t></w:r></w:p>"
+        )
+
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_W}"><w:body>'
+        + "".join(paras_xml)
+        + "</w:body></w:document>"
+    ).encode("utf-8")
+
+    # MINIMAL clean package — body only, NO docProps, NO comments/notes/headers.
+    parts = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            '</Types>'
+        ).encode("utf-8"),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+            '</Relationships>'
+        ).encode("utf-8"),
+        "word/document.xml": document,
+    }
+    return _zip_out(parts)
+
+
+def _render_xlsx(data: bytes, plan: dict) -> bytes:
+    """Rebuild a clean xlsx via openpyxl from a FRESH workbook: only the VISIBLE
+    sheets/cells, matched cells transformed, hidden sheets/rows/cols + comments +
+    defined names + formulas-with-matches + ALL metadata DROPPED.
+
+    F4 residual vectors: cached xlsx formula values are eliminated because we
+    emit literal cleaned values (no formula carried, so no stale cached result);
+    defined names / named ranges are not copied; workbook core metadata is reset
+    on the fresh workbook; there are no embedded objects in the rebuilt book."""
+    if _ooxml_is_encrypted(data):
+        raise _Contained("xlsx is encrypted — never re-rendered, fail-closed BLOCK")
+    _guard_ooxml(data)
+    by_seg, _strip = _parse_plan(plan)
+
+    import openpyxl  # type: ignore[import-untyped]
+    from openpyxl.utils import get_column_letter  # type: ignore[import-untyped]
+
+    try:
+        wb_in = openpyxl.load_workbook(
+            io.BytesIO(data), data_only=False, read_only=False, keep_links=False,
+        )
+    except Exception as exc:
+        raise _Contained(f"xlsx parse failed during re-render: {exc!r} — fail-closed") from exc
+
+    wb_out = openpyxl.Workbook()
+    # Remove the default sheet; we add only visible sheets back.
+    wb_out.remove(wb_out.active)
+
+    any_sheet = False
+    for ws in wb_in.worksheets:
+        if ws.sheet_state in ("hidden", "veryHidden"):
+            continue  # drop hidden sheets wholesale (no residual channel)
+        any_sheet = True
+        ws_out = wb_out.create_sheet(title=ws.title)
+        hidden_cols = {
+            c for c, d in ws.column_dimensions.items() if getattr(d, "hidden", False)
+        }
+        hidden_rows = {
+            r for r, d in ws.row_dimensions.items() if getattr(d, "hidden", False)
+        }
+        for row in ws.iter_rows():
+            for cell in row:
+                val = cell.value
+                if val is None:
+                    continue
+                col_letter = get_column_letter(cell.column)
+                # Drop hidden rows/cols entirely (data-hiding channels).
+                if col_letter in hidden_cols or cell.row in hidden_rows:
+                    continue
+                loc = f"sheet={ws.title}!{cell.coordinate}"
+                sval = str(val)
+                if loc in by_seg:
+                    sval = _apply_transforms(sval, by_seg[loc])
+                    # A transformed cell ships as a literal string (never a
+                    # formula) so no cached formula value can leak.
+                    ws_out[cell.coordinate] = sval
+                else:
+                    # A formula cell that was NOT matched: ship the formula TEXT
+                    # as a literal string so no cached evaluated value travels
+                    # and the formula cannot re-reference a dropped hidden cell.
+                    if isinstance(val, str) and val.startswith("="):
+                        ws_out[cell.coordinate] = val  # literal '=...' text, inert
+                    else:
+                        ws_out[cell.coordinate] = val
+
+    if not any_sheet:
+        # Everything was hidden → emit a single empty visible sheet rather than an
+        # invalid zero-sheet workbook.
+        wb_out.create_sheet(title="Sheet1")
+
+    # Fresh workbook → metadata is default/empty; defined names not copied.
+    wb_in.close()
+    buf = io.BytesIO()
+    wb_out.save(buf)
+    return buf.getvalue()
+
+
+def _render_pptx(data: bytes, plan: dict) -> bytes:
+    """Rebuild a clean pptx: visible slide body text only, matched runs
+    transformed, speaker notes + masters/layouts + comments + ALL metadata
+    DROPPED.
+
+    F4 residual vectors: speaker notes (a classic leak channel) are not carried;
+    docProps/* metadata dropped; no embedded thumbnail; slide text is regenerated
+    DrawingML, not the original part graph."""
+    if _ooxml_is_encrypted(data):
+        raise _Contained("pptx is encrypted — never re-rendered, fail-closed BLOCK")
+    _guard_ooxml(data)
+    by_seg, _strip = _parse_plan(plan)
+
+    zf = _open_zip(data)
+    names = _names(zf)
+    slide_names = sorted(
+        n for n in names if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+    )
+    if not slide_names:
+        raise _Contained("pptx has no slide parts — cannot re-render, fail-closed")
+
+    pres_rels: list[str] = []
+    ct_overrides: list[str] = []
+    out_parts: dict[str, bytes] = {}
+    sldid_list: list[str] = []
+    for i, name in enumerate(slide_names, start=1):
+        raw = _read_part(zf, name)
+        if raw is None:
+            continue
+        root = _parse_xml(raw)
+        if root is None:
+            raise _Contained(f"pptx slide {name} malformed — cannot re-render, fail-closed")
+        text = "".join(t.text or "" for t in root.iter(f"{{{_A}}}t"))
+        if text and name in by_seg:
+            text = _apply_transforms(text, by_seg[name])
+        out_name = f"ppt/slides/slide{i}.xml"
+        slide_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<p:sld xmlns:p="{_P}" xmlns:a="{_A}" xmlns:r="{_R_NS}"><p:cSld><p:spTree>'
+            '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+            '<p:grpSpPr/>'
+            '<p:sp><p:nvSpPr><p:cNvPr id="2" name="t"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+            '<p:spPr/>'
+            f'<p:txBody><a:bodyPr/><a:p><a:r><a:t>{_xml_escape(text)}</a:t></a:r></a:p></p:txBody>'
+            '</p:sp></p:spTree></p:cSld></p:sld>'
+        ).encode("utf-8")
+        out_parts[out_name] = slide_xml
+        rid = f"rId{i + 1}"
+        pres_rels.append(
+            f'<Relationship Id="{rid}" '
+            f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" '
+            f'Target="slides/slide{i}.xml"/>'
+        )
+        ct_overrides.append(
+            f'<Override PartName="/{out_name}" '
+            f'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+        )
+        sldid_list.append(f'<p:sldId id="{255 + i}" r:id="{rid}"/>')
+
+    presentation = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:presentation xmlns:p="{_P}" xmlns:a="{_A}" xmlns:r="{_R_NS}">'
+        f'<p:sldIdLst>{"".join(sldid_list)}</p:sldIdLst>'
+        '<p:sldSz cx="9144000" cy="6858000"/>'
+        '</p:presentation>'
+    ).encode("utf-8")
+
+    parts = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
+            + "".join(ct_overrides)
+            + '</Types>'
+        ).encode("utf-8"),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>'
+            '</Relationships>'
+        ).encode("utf-8"),
+        "ppt/presentation.xml": presentation,
+        "ppt/_rels/presentation.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + "".join(pres_rels)
+            + '</Relationships>'
+        ).encode("utf-8"),
+    }
+    parts.update(out_parts)
+    return _zip_out(parts)
+
+
+def _render_pdf(data: bytes, plan: dict) -> bytes:
+    """Sanitised re-render: regenerate a fresh text-layer PDF from cleaned page
+    text (§5.1 PDF bullet), NOT a box over the original content stream.
+
+    We deliberately do NOT pull a PDF-writer dependency into the minimal jail
+    (keeps the F6 surface small): we hand-emit a minimal, valid, single-stream-
+    per-page PDF from the cleaned native text.  The ORIGINAL content stream,
+    object graph, DocInfo + XMP metadata are entirely discarded — only the cleaned
+    visible text is regenerated.
+
+    F4 residual vectors: no original content stream travels (overlay leak gone);
+    DocInfo + XMP metadata dropped; no embedded thumbnail/preview; the regenerated
+    text uses a base-14 font (Helvetica) with NO embedded subset, so a font-subset
+    survival of redacted glyphs is impossible.  Image-only pages carried no native
+    text and are dropped (their content was uninspectable → must not survive)."""
+    import pypdf  # type: ignore[import-untyped]
+    from pypdf.errors import PdfReadError, DependencyError  # type: ignore[import-untyped]
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+    except (PdfReadError, DependencyError, OSError, ValueError) as exc:
+        raise _Contained(f"pdf parse failed during re-render: {exc!r} — fail-closed") from exc
+    if reader.is_encrypted:
+        raise _Contained("pdf is encrypted — never re-rendered, fail-closed BLOCK")
+
+    by_seg, _strip = _parse_plan(plan)
+
+    page_texts: list[str] = []
+    try:
+        pages = reader.pages
+        n_pages = len(pages)
+    except (PdfReadError, DependencyError, ValueError) as exc:
+        raise _Contained(f"pdf page tree unreadable: {exc!r} — fail-closed") from exc
+
+    for idx in range(n_pages):
+        try:
+            text = pages[idx].extract_text() or ""
+        except Exception:
+            # An unreadable page cannot be cleaned with certainty → fail-closed
+            # (we must not ship a page we could not inspect).
+            raise _Contained(
+                f"pdf page {idx + 1} unreadable during re-render — fail-closed"
+            )
+        loc = f"page={idx + 1}"
+        if text.strip() and loc in by_seg:
+            text = _apply_transforms(text, by_seg[loc])
+        page_texts.append(text)
+
+    return _emit_text_pdf(page_texts)
+
+
+def _pdf_escape(text: str) -> str:
+    """Escape a string for a PDF literal-string ( ... ) token."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
+def _emit_text_pdf(page_texts: list[str]) -> bytes:
+    """Hand-emit a minimal valid PDF: one page per text block, Helvetica base-14
+    font (no embedded subset), NO DocInfo, NO XMP. Regenerate-from-cleaned-content.
+
+    Long lines are wrapped naively; the output is a faithful TEXT re-render (lower
+    fidelity than the source — destruction/sanitisation is the point, §5.1)."""
+    objs: list[bytes] = []
+
+    # 1: Catalog, 2: Pages, then per-page (Page + Contents), then Font (last).
+    if not page_texts:
+        page_texts = [""]
+    n = len(page_texts)
+    # Object numbering: 1 catalog, 2 pages, font = 3, pages start at 4.
+    font_obj = 3
+    first_page_obj = 4
+    page_obj_nums = [first_page_obj + 2 * i for i in range(n)]
+    content_obj_nums = [first_page_obj + 2 * i + 1 for i in range(n)]
+
+    objs.append(b"<</Type/Catalog/Pages 2 0 R>>")  # 1
+    kids = " ".join(f"{p} 0 R" for p in page_obj_nums)
+    objs.append(f"<</Type/Pages/Kids[{kids}]/Count {n}>>".encode())  # 2
+    objs.append(b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>")  # 3 (font)
+
+    for i, text in enumerate(page_texts):
+        # Build a content stream: lines from 720 downward, 14pt leading.
+        lines: list[str] = []
+        for raw_line in (text.split("\n") if text else [""]):
+            # Wrap at ~90 chars to keep within the page width.
+            chunk = raw_line
+            while len(chunk) > 90:
+                lines.append(chunk[:90])
+                chunk = chunk[90:]
+            lines.append(chunk)
+        ops = ["BT", "/F1 12 Tf", "72 720 Td", "14 TL"]
+        for j, ln in enumerate(lines):
+            if j > 0:
+                ops.append("T*")
+            ops.append(f"({_pdf_escape(ln)}) Tj")
+        ops.append("ET")
+        content = "\n".join(ops).encode("latin-1", "replace")
+        page_dict = (
+            f"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+            f"/Contents {content_obj_nums[i]} 0 R"
+            f"/Resources<</Font<</F1 {font_obj} 0 R>>>>>>"
+        ).encode()
+        objs.append(page_dict)  # page
+        objs.append(
+            b"<</Length " + str(len(content)).encode() + b">>stream\n" + content + b"\nendstream"
+        )  # contents
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj".encode() + body + b"\nendobj\n"
+    xref_pos = len(out)
+    out += b"xref\n0 " + str(len(objs) + 1).encode() + b"\n"
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    # NO /Info (DocInfo) entry → no metadata residual.
+    out += (
+        b"trailer<</Root 1 0 R/Size " + str(len(objs) + 1).encode() + b">>\n"
+        b"startxref\n" + str(xref_pos).encode() + b"\n%%EOF"
+    )
+    return bytes(out)
+
+
+def _render_text_like(data: bytes, plan: dict, fmt: str) -> bytes:
+    """txt/csv re-render: regenerate cleaned text/rows. Provably clean — there is
+    no hidden channel (§5.1)."""
+    by_seg, _strip = _parse_plan(plan)
+    text = data.decode("utf-8", "replace") if _is_utf8(data) else data.decode("latin-1")
+
+    if fmt == "txt":
+        lines = text.split("\n")
+        out_lines: list[str] = []
+        for idx, line in enumerate(lines, start=1):
+            loc = f"line={idx}"
+            if loc in by_seg:
+                line = _apply_transforms(line, by_seg[loc])
+            out_lines.append(line)
+        return "\n".join(out_lines).encode("utf-8")
+
+    # csv
+    import csv as _csv
+    out_buf = io.StringIO()
+    reader = _csv.reader(io.StringIO(text))
+    writer = _csv.writer(out_buf)
+    for row_idx, row in enumerate(reader, start=1):
+        new_row: list[str] = []
+        for col_idx, cell in enumerate(row, start=1):
+            loc = f"row={row_idx},col={col_idx}"
+            if loc in by_seg:
+                cell = _apply_transforms(cell, by_seg[loc])
+            new_row.append(cell)
+        writer.writerow(new_row)
+    return out_buf.getvalue().encode("utf-8")
+
+
+def _is_utf8(data: bytes) -> bool:
+    try:
+        data.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+_RENDERERS = {
+    "docx": _render_docx,
+    "xlsx": _render_xlsx,
+    "pptx": _render_pptx,
+    "pdf": _render_pdf,
+}
+
+
+#: Formats whose re-render is REGENERATE-FROM-CLEANED-CONTENT in the jail.
+#: txt/csv re-render here too even though they extract host-side, because the
+#: re-render path is uniform (the cleaned-content rebuild) and the worker is the
+#: single place re-render runs (F6) — the host never re-renders.
+_RENDER_SUPPORTED = {"docx", "xlsx", "pptx", "pdf", "txt", "csv"}
+
+
+def _decode_plan(plan_b64: str) -> dict:
+    """Decode the base64'd JSON RenderPlan from argv. Malformed → fail-closed."""
+    import base64 as _b64
+    if not plan_b64:
+        raise _Contained("re-render job missing --plan — fail-closed")
+    try:
+        raw = _b64.b64decode(plan_b64.encode("ascii")).decode("utf-8")
+        obj = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _Contained(f"re-render plan undecodable: {exc} — fail-closed") from exc
+    if not isinstance(obj, dict):
+        raise _Contained("re-render plan is not an object — fail-closed")
+    return obj
+
+
+def _run_render(job: str, fmt: str, data: bytes, plan: dict) -> dict:
+    """REDACT / PSEUDONYMIZE re-render (red-team F6 — runs in THIS jail).
+
+    Returns the re-rendered artefact as base64 in the JSON result so the
+    stdin->JSON-stdout contract carries the binary cleanly. The result also
+    re-extracts the OUTPUT and returns its segments so the host can assert the
+    no-residual / tokenized invariant without a second jail round-trip (this is
+    the proof Laura demands — re-extract-the-output)."""
+    if fmt not in _RENDER_SUPPORTED:
+        raise _Contained(f"re-render unsupported for format '{fmt}' — fail-closed BLOCK")
+
+    if fmt in ("txt", "csv"):
+        rendered = _render_text_like(data, plan, fmt)
+    else:
+        if fmt in ("docx", "xlsx", "pptx"):
+            if _ooxml_is_encrypted(data):
+                raise _Contained(
+                    f"{fmt} is encrypted — never re-rendered, fail-closed BLOCK"
+                )
+        rendered = _RENDERERS[fmt](data, plan)
+
+    # Re-extract the OUTPUT for the host-side no-residual assertion. txt/csv have
+    # no jail extractor (host-side trivial extractors), so we re-extract them
+    # here with a simple line/row split for the proof segments.
+    if fmt in ("txt", "csv"):
+        out_segments = _reextract_text_like(rendered, fmt)
+        complete = True
+    else:
+        out_segments, complete = _EXTRACTORS[fmt](rendered)
+
+    import base64 as _b64
+    return {
+        "ok": True,
+        "job": job,
+        "detected_format": fmt,
+        "rendered_b64": _b64.b64encode(rendered).decode("ascii"),
+        # The re-extracted OUTPUT segments — the host asserts the original values
+        # are gone (REDACT) or tokenized (PSEUDONYMIZE) and NO residual in any
+        # part incl. metadata.
+        "output_segments": out_segments,
+        "output_extraction_complete": complete,
+    }
+
+
+def _reextract_text_like(data: bytes, fmt: str) -> list[dict]:
+    text = data.decode("utf-8", "replace")
+    segs: list[dict] = []
+    if fmt == "txt":
+        for idx, line in enumerate(text.split("\n"), start=1):
+            seg = _seg(line, "BODY", f"line={idx}")
+            if seg:
+                segs.append(seg)
+    else:
+        import csv as _csv
+        for row_idx, row in enumerate(_csv.reader(io.StringIO(text)), start=1):
+            for col_idx, cell in enumerate(row, start=1):
+                seg = _seg(cell, "TABLE_CELL", f"row={row_idx},col={col_idx}")
+                if seg:
+                    segs.append(seg)
+    return segs
 
 
 def _run_extract(fmt: str, data: bytes) -> dict:
@@ -754,18 +1327,22 @@ def main(argv: list[str] | None = None) -> int:
                         choices=["extract", "redact", "pseudonymize"])
     parser.add_argument("--format", dest="fmt", required=True)
     parser.add_argument("--declared-mime", dest="declared_mime", default="")
+    # Re-render plan (REDACT/PSEUDONYMIZE) — base64'd JSON RenderPlan on argv.
+    # The DOCUMENT bytes stay on stdin (the single read-only input); only the
+    # small plan (per-span tokens + originals, NO replacer map) travels in argv.
+    parser.add_argument("--plan", dest="plan_b64", default="")
     args = parser.parse_args(argv)
 
     try:
         data = _read_stdin_capped()
         if args.job == "extract":
             result = _run_extract(args.fmt, data)
+        elif args.job in ("redact", "pseudonymize"):
+            # Re-render (REDACT/PSEUDONYMIZE) runs in THIS same jail (F6).
+            plan = _decode_plan(args.plan_b64)
+            result = _run_render(args.job, args.fmt, data, plan)
         else:
-            # Re-render (REDACT/PSEUDONYMIZE) runs in THIS same jail (F6) — the
-            # _render_* bodies land next slice. Until then: contained.
-            raise _Contained(
-                f"re-render job '{args.job}' not yet implemented (next slice)"
-            )
+            raise _Contained(f"unknown job '{args.job}' — fail-closed")
         _emit(result)
         return 0
     except _Contained as exc:

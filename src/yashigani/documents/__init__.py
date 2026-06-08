@@ -55,10 +55,23 @@ from yashigani.documents.pipeline import (
     DocumentInspectionPipeline,
     DocumentInspectionResult,
 )
+from yashigani.documents.pseudonymize import (
+    CorrespondenceTable,
+    PositionBinder,
+    ReplacerMap,
+    ReplacerMapExpiredError,
+    TokenAssigner,
+    local_remerge,
+)
 from yashigani.documents.segment import (
     ExtractionResult,
     Segment,
     SegmentKind,
+)
+from yashigani.documents.transform import (
+    RenderPlan,
+    RenderSpan,
+    SpanAction,
 )
 
 __all__ = [
@@ -90,6 +103,17 @@ __all__ = [
     "DISPOSITION_REDACT",
     "DISPOSITION_PSEUDONYMIZE",
     "DISPOSITION_BLOCK",
+    # re-render plan contract (host <-> jail)
+    "RenderPlan",
+    "RenderSpan",
+    "SpanAction",
+    # PSEUDONYMIZE engine (host-side; crown-jewel custody)
+    "TokenAssigner",
+    "ReplacerMap",
+    "ReplacerMapExpiredError",
+    "CorrespondenceTable",
+    "PositionBinder",
+    "local_remerge",
     # config / feature flag
     "DocumentEnforcementConfig",
     "is_document_enforcement_enabled",

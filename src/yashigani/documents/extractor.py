@@ -310,6 +310,11 @@ class ExtractorRegistry:
         sandbox_runner=None,
     ) -> None:
         self._max_document_bytes = max_document_bytes
+        # The sandbox runner is shared across the OOXML/PDF extractors AND the
+        # re-render path (REDACT/PSEUDONYMIZE). Re-render runs in the SAME jail as
+        # extraction (red-team F6) — the gateway never re-renders in-process, for
+        # ANY format (incl. txt/csv): the writer is attack surface too.
+        self._sandbox_runner = sandbox_runner
         self._registry: dict[DetectedType, DocumentExtractor] = {
             DetectedType.TXT: TxtExtractor(max_segments=max_segments),
             DetectedType.CSV: CsvExtractor(max_segments=max_segments),
@@ -350,6 +355,70 @@ class ExtractorRegistry:
                 f"no extractor registered for '{detection.detected_type.value}'"
             )
         return extractor.extract(data, declared_mime)
+
+    def _get_render_runner(self):
+        """Resolve the sandbox runner used for ALL re-render jobs (F6).
+
+        Re-render (REDACT/PSEUDONYMIZE) is a WRITER over attacker content — equal
+        attack surface to the parser — so it runs in the SAME per-job jail, never
+        in the gateway process (red-team F6).  Lazily built so importing the
+        registry never needs a container daemon."""
+        if self._sandbox_runner is None:
+            from yashigani.documents.sandbox import SandboxedExtractorRunner
+            self._sandbox_runner = SandboxedExtractorRunner()
+        return self._sandbox_runner
+
+    def render(
+        self,
+        data: bytes,
+        fmt: str,
+        *,
+        job: str,
+        plan_b64: str,
+        declared_mime: str = "",
+    ):
+        """Dispatch a REDACT/PSEUDONYMIZE re-render into the jail (F6).
+
+        Returns the :class:`~yashigani.documents.sandbox.SandboxJobResult` so the
+        caller can read ``rendered_bytes`` + the re-extracted ``output_segments``
+        (the no-residual proof).  Fail-closed on every sandbox error/containment
+        → caller maps to BLOCK (never ships an un-proven artefact).
+        """
+        from yashigani.documents.sandbox import (
+            SandboxJobError,
+            SandboxUnavailableError,
+        )
+
+        if len(data) > self._max_document_bytes:
+            raise DocumentTooLargeError(
+                f"document is {len(data)} bytes (cap {self._max_document_bytes})"
+            )
+        try:
+            runner = self._get_render_runner()
+            result = runner.run_job(
+                data, job=job, fmt=fmt, declared_mime=declared_mime, plan_b64=plan_b64,
+            )
+        except SandboxUnavailableError as exc:
+            raise ExtractorNotAvailableError(
+                f"re-render of '{fmt}' requires the sandbox, which is unavailable "
+                f"({exc}) — failing closed to BLOCK"
+            ) from exc
+        except SandboxJobError as exc:
+            raise DocumentExtractionError(
+                f"sandboxed re-render failed for '{fmt}': {exc.reason} "
+                f"— failing closed to BLOCK"
+            ) from exc
+        if not result.ok:
+            raise DocumentExtractionError(
+                f"sandboxed re-render contained '{fmt}': {result.reason} "
+                f"— failing closed to BLOCK"
+            )
+        if result.rendered_bytes is None:
+            raise DocumentExtractionError(
+                f"sandboxed re-render of '{fmt}' returned no artefact "
+                f"— failing closed to BLOCK"
+            )
+        return result
 
 
 # ---------------------------------------------------------------------------

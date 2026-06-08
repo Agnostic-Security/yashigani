@@ -406,13 +406,27 @@ def test_pipeline_incomplete_extraction_fails_closed():
     assert "incomplete" in res.block_reason
 
 
-def test_pipeline_redact_pseudonymize_stubbed_fail_closed():
-    pipe = DocumentInspectionPipeline()
+def test_pipeline_redact_pseudonymize_fail_closed_without_sandbox():
+    """REDACT/PSEUDONYMIZE re-render runs ONLY in the jail (red-team F6). With NO
+    sandbox backend available the re-render cannot run, so both actions fail
+    closed to BLOCK — never an in-process re-render, never a partial allow."""
+    from yashigani.documents.sandbox import (
+        SandboxedExtractorRunner,
+        SandboxUnavailableError,
+    )
+
+    class _NoBackend:
+        def run_extractor_job(self, *, stdin, timeout_s, **kwargs):
+            raise SandboxUnavailableError("no backend in test")
+
+    runner = SandboxedExtractorRunner(backend=_NoBackend())
+    reg = ExtractorRegistry(sandbox_runner=runner)
+    pipe = DocumentInspectionPipeline(registry=reg)
     data = b"email,alice@example.com\n"
     for action in (DISPOSITION_REDACT, DISPOSITION_PSEUDONYMIZE):
         res = pipe.inspect(data, "text/csv", "req-stub", requested_action=action)
         assert res.disposition == DISPOSITION_BLOCK
-        assert "not yet available" in res.block_reason
+        assert "fail-closed" in (res.block_reason or "")
         assert res.forward_bytes is None
 
 

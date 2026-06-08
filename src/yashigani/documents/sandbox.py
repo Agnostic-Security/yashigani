@@ -202,6 +202,13 @@ class SandboxJobResult:
     segments: list[dict] = field(default_factory=list)
     extraction_complete: bool = False
     detected_format: str = ""
+    # Re-render (REDACT/PSEUDONYMIZE) outputs — empty for an extract job.
+    #: The freshly re-rendered artefact bytes (decoded from the worker's base64).
+    rendered_bytes: Optional[bytes] = None
+    #: The re-extracted OUTPUT segments — the host asserts no-residual / tokenized
+    #: over these (the proof Laura demands: re-extract-the-output).
+    output_segments: list[dict] = field(default_factory=list)
+    output_extraction_complete: bool = False
 
     @classmethod
     def from_stdout(cls, raw: bytes, max_bytes: int) -> "SandboxJobResult":
@@ -219,12 +226,25 @@ class SandboxJobResult:
             ) from exc
         if not isinstance(obj, dict):
             raise SandboxJobError("worker result was not a JSON object — fail-closed")
+        rendered_bytes: Optional[bytes] = None
+        rb64 = obj.get("rendered_b64")
+        if rb64:
+            import base64
+            try:
+                rendered_bytes = base64.b64decode(str(rb64).encode("ascii"))
+            except (ValueError, TypeError) as exc:
+                raise SandboxJobError(
+                    f"worker rendered_b64 undecodable: {exc} — fail-closed"
+                ) from exc
         return cls(
             ok=bool(obj.get("ok", False)),
             reason=str(obj.get("reason", "")),
             segments=list(obj.get("segments", [])),
             extraction_complete=bool(obj.get("extraction_complete", False)),
             detected_format=str(obj.get("detected_format", "")),
+            rendered_bytes=rendered_bytes,
+            output_segments=list(obj.get("output_segments", [])),
+            output_extraction_complete=bool(obj.get("output_extraction_complete", False)),
         )
 
 
@@ -280,6 +300,7 @@ class SandboxedExtractorRunner:
         job: str,
         fmt: str,
         declared_mime: str,
+        plan_b64: str = "",
     ) -> SandboxJobResult:
         """Run one sandboxed job and return its structured result.
 
@@ -289,12 +310,16 @@ class SandboxedExtractorRunner:
             Raw document bytes — passed to the worker on **stdin** (no host
             mount; the container has no path to traverse).
         job:
-            ``"extract"`` (this slice's target) | ``"redact"`` | ``"pseudonymize"``
-            (Tom's re-render, runs in the SAME sandbox — F6).
+            ``"extract"`` | ``"redact"`` | ``"pseudonymize"`` — the re-render jobs
+            run in the SAME sandbox as extraction (red-team F6).
         fmt:
-            Detected format hint (``docx``/``xlsx``/``pptx``/``pdf``).
+            Detected format hint (``docx``/``xlsx``/``pptx``/``pdf``/``txt``/``csv``).
         declared_mime:
             The declared MIME (for the worker's own cross-check).
+        plan_b64:
+            For ``redact``/``pseudonymize`` only — the base64'd JSON RenderPlan
+            (per-span transforms; NO replacer map — F5).  Passed on argv; the
+            document bytes stay on stdin.
 
         Raises
         ------
@@ -309,6 +334,10 @@ class SandboxedExtractorRunner:
             "--format", fmt,
             "--declared-mime", declared_mime or "",
         ]
+        if job in ("redact", "pseudonymize"):
+            # The plan is required for a re-render job; an empty plan fails closed
+            # in the worker. We never log the plan (it carries originals — F5).
+            argv += ["--plan", plan_b64]
 
         run_kwargs = self._hardened_run_kwargs(name, argv, cfg)
 
