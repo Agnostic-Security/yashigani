@@ -238,8 +238,23 @@ def test_segment_count_cap_fails_closed_csv():
         (b"%PDF-1.7\n...", "application/pdf"),
     ],
 )
-def test_untrusted_parser_format_registered_but_unavailable(magic, mime):
-    reg = ExtractorRegistry()
+def test_untrusted_parser_format_unavailable_when_no_sandbox(magic, mime):
+    """When NO sandbox backend is available, an untrusted-parser format fails
+    closed with ExtractorNotAvailableError (the precise "sandbox not provisioned"
+    reason).  We inject a no-backend runner so this is deterministic regardless
+    of whether an extractor image happens to be built on the host — the contract
+    is "no isolation → never parse in-process → BLOCK" (Captain's sandbox seam).
+    """
+    from yashigani.documents.sandbox import (
+        SandboxUnavailableError,
+        SandboxedExtractorRunner,
+    )
+
+    class _NoBackend(SandboxedExtractorRunner):
+        def _resolve_backend(self):
+            raise SandboxUnavailableError("no backend (test)")
+
+    reg = ExtractorRegistry(sandbox_runner=_NoBackend(backend=None))
     with pytest.raises(ExtractorNotAvailableError):
         reg.extract(magic, mime)
 

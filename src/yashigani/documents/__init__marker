@@ -1,0 +1,8 @@
+# Minimal package marker for the sandbox image.
+#
+# The extractor image bakes ONLY yashigani.documents.bomb_guard (+ this marker
+# as the package __init__) so the worker can `import yashigani.documents.bomb_guard`
+# WITHOUT importing the full documents package (which pulls the PII detector and
+# its heavier deps that are not needed in — and should not be in — the jail).
+#
+# Do not add imports here: keeping it empty keeps the in-jail surface minimal.

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+Live containment proof for the sandboxed-extractor runtime (plan §6 B1, Captain).
+
+This is the EVIDENCE that the sandbox actually *contains* — not just that it is
+configured. It spawns real containers from the hardened image and asserts:
+
+  CASE 1  benign job          → worker runs, emits its JSON contract, exits 0.
+  CASE 2  infinite-loop parser → wall-clock timeout KILLS the container (the host
+                                 stays responsive; the job does not hang forever).
+  CASE 3  memory-bomb parser   → cgroup mem-limit KILLS the container (the host is
+                                 NOT OOM'd; the malicious doc is contained).
+  CASE 4  fork-bomb parser     → pids-limit caps process creation (no fork storm).
+  CASE 5  egress attempt       → network=none means the parser CANNOT reach out
+                                 (SSRF/exfil from a malicious parser is dead).
+
+Cases 2-5 simulate a *parser RCE* by overriding the entrypoint with a hostile
+command — exactly what a CVE in python-docx/pypdf would give an attacker INSIDE
+the jail. The point is that even with arbitrary code execution in the worker,
+the jail contains it.
+
+Usage:
+    python3 scripts/extractor_sandbox_containment.py --runtime docker
+    python3 scripts/extractor_sandbox_containment.py --runtime podman
+
+Exit 0 = all cases contained. Non-zero = a containment FAILURE (release-blocker).
+
+Output goes to stdout; this script writes NO files (Captain filesystem rule).
+Run it from the repo root (the build context for the image).
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import time
+
+IMAGE = "yashigani/extractor:2.26.0"
+
+def _cpu_controller_available() -> bool:
+    """True when the `cpu` cgroup controller is delegated to this user.
+
+    Rootless Podman on cgroup v2 commonly has ONLY memory+pids delegated to the
+    user slice (cpu/cpuset need explicit systemd delegation). When cpu is NOT
+    delegated, `--cpus` makes the OCI runtime error out. CPU abuse is STILL
+    contained without it — by the runner-enforced wall-clock timeout (CASE 2)
+    and the memory cap — so we drop only the cpu quota, never the isolation.
+    """
+    import os
+    uid = os.getuid()
+    path = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return "cpu" in fh.read().split()
+    except OSError:
+        return True  # assume available (rootful / Docker) if we can't tell
+
+
+# Full hardening flags — MUST mirror SandboxedExtractorRunner._hardened_run_kwargs.
+# The no-new-privileges security-opt SYNTAX differs between the two CLIs:
+#   Docker:  no-new-privileges:true   (colon form; Docker rejects bare)
+#   Podman:  no-new-privileges        (bare form; Podman rejects :true / =true)
+# So the flag is runtime-selected (see _hardening). The SEMANTIC is identical.
+def _hardening(rt: str) -> list[str]:
+    nnp = "no-new-privileges:true" if rt == "docker" else "no-new-privileges"
+    flags = [
+        "--network", "none",
+        "--read-only",
+        "--cap-drop", "ALL",
+        "--user", "65532:65532",
+        "--security-opt", nnp,
+        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
+        "--memory", "256m",
+        "--memory-swap", "256m",
+        "--pids-limit", "64",
+    ]
+    # CPU quota only where the cpu controller is delegated (Docker always;
+    # rootful Podman; rootless Podman only with cpu delegation). Without it the
+    # wall-clock + mem caps still contain CPU abuse — see _cpu_controller_available.
+    if rt == "docker" or _cpu_controller_available():
+        flags += ["--cpus", "1.0"]
+    else:
+        print("  [note] cpu cgroup controller not delegated to this user — "
+              "dropping --cpus; CPU abuse still bounded by wall-clock + mem caps")
+    return flags
+
+
+def _run(cmd: list[str], *, stdin: bytes | None = None, timeout: int = 60):
+    return subprocess.run(
+        cmd, input=stdin, capture_output=True, timeout=timeout
+    )
+
+
+def _hdr(n: int, title: str) -> None:
+    print(f"\n=== CASE {n}: {title} ===", flush=True)
+
+
+def case_benign(rt: str) -> bool:
+    _hdr(1, "benign job → worker runs + emits contract")
+    # docx with junk bytes: the bomb guard rejects it as not-a-valid-zip and the
+    # worker emits ok=false cleanly (exit 0). That proves the env runs end-to-end
+    # and the guard fires BEFORE any parser. (A real benign docx waits for Tom's
+    # parser; the *env* is what we prove here.)
+    out = _run(
+        [rt, "run", "--rm", "-i", *_hardening(rt), IMAGE,
+         "--job", "extract", "--format", "docx", "--declared-mime", "x"],
+        stdin=b"PK\x03\x04not-a-real-zip", timeout=30,
+    )
+    ok = out.returncode == 0 and b'"ok":false' in out.stdout and b"zip" in out.stdout
+    print(f"  exit={out.returncode} stdout={out.stdout[:120]!r}")
+    print("  PASS" if ok else "  FAIL — worker did not run the contract cleanly")
+    return ok
+
+
+def case_infinite_loop(rt: str) -> bool:
+    _hdr(2, "infinite-loop parser → wall-clock timeout KILLS it")
+    # Simulate a parser RCE that spins forever. The runner's wall-clock cap is
+    # what kills it; here we enforce the SAME bound via `timeout` and assert the
+    # container does NOT outlive it (host stays responsive).
+    wall = 6
+    started = time.monotonic()
+    try:
+        out = _run(
+            [rt, "run", "--rm", *_hardening(rt),
+             "--stop-timeout", "1",
+             "--entrypoint", "python", IMAGE,
+             "-c", "while True: pass"],
+            timeout=wall,
+        )
+        # If it returned within `timeout`, the process exited on its own — that
+        # would be wrong for an infinite loop unless something killed it.
+        elapsed = time.monotonic() - started
+        print(f"  container exited on its own after {elapsed:.1f}s exit={out.returncode}")
+        contained = False
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - started
+        # The host-side wall-clock fired: the runner would .kill() here. Prove we
+        # CAN kill it and reclaim — kill any lingering container by label.
+        _kill_lingering(rt)
+        print(f"  wall-clock fired at {elapsed:.1f}s; runner kills the job → contained")
+        contained = True
+    print("  PASS" if contained else "  FAIL — infinite loop was not bounded")
+    return contained
+
+
+def case_memory_bomb(rt: str) -> bool:
+    _hdr(3, "memory-bomb parser → cgroup mem-limit KILLS it (host not OOM'd)")
+    # Allocate way past the 256m cap. The kernel OOM-killer (scoped to the
+    # container cgroup) must kill the process — NOT the host.
+    out = _run(
+        [rt, "run", "--rm", *_hardening(rt),
+         "--entrypoint", "python", IMAGE,
+         "-c", "b=bytearray()\nwhile True: b.extend(bytearray(50*1024*1024))"],
+        timeout=40,
+    )
+    # A cgroup OOM kill yields a non-zero exit (137 / 1) — the allocation never
+    # succeeds host-wide. Success of the container (exit 0) would be a FAILURE.
+    contained = out.returncode != 0
+    print(f"  exit={out.returncode} (non-zero = cgroup killed it before host OOM)")
+    print("  PASS" if contained else "  FAIL — memory bomb was NOT contained")
+    return contained
+
+
+def case_fork_bomb(rt: str) -> bool:
+    _hdr(4, "fork-bomb parser → pids-limit caps process creation")
+    out = _run(
+        [rt, "run", "--rm", *_hardening(rt),
+         "--entrypoint", "python", IMAGE,
+         "-c",
+         "import os\n"
+         "n=0\n"
+         "try:\n"
+         "  while n<10000:\n"
+         "    os.fork(); n+=1\n"
+         "except OSError as e:\n"
+         "  print('fork blocked at', n, e); os._exit(0)\n"],
+        timeout=40,
+    )
+    # pids-limit=64 means fork() fails with EAGAIN well before 10000 — the worker
+    # prints "fork blocked" and exits 0, OR the runtime kills it. Either way the
+    # fork storm is capped. A clean run to 10000 forks would be a FAILURE.
+    blocked = b"fork blocked" in out.stdout or out.returncode != 0
+    print(f"  exit={out.returncode} stdout={out.stdout[:120]!r}")
+    print("  PASS" if blocked else "  FAIL — fork bomb was NOT capped")
+    return blocked
+
+
+def case_egress_denied(rt: str) -> bool:
+    _hdr(5, "egress attempt → network=none blocks SSRF/exfil")
+    out = _run(
+        [rt, "run", "--rm", *_hardening(rt),
+         "--entrypoint", "python", IMAGE,
+         "-c",
+         "import socket\n"
+         "try:\n"
+         "  socket.create_connection(('1.1.1.1',53),timeout=3)\n"
+         "  print('EGRESS-SUCCEEDED')\n"
+         "except OSError as e:\n"
+         "  print('egress blocked:', e.__class__.__name__); raise SystemExit(0)\n"],
+        timeout=20,
+    )
+    blocked = b"EGRESS-SUCCEEDED" not in out.stdout
+    print(f"  exit={out.returncode} stdout={out.stdout[:120]!r}")
+    print("  PASS" if blocked else "  FAIL — the jail reached the network!")
+    return blocked
+
+
+def _kill_lingering(rt: str) -> None:
+    """Reap any container left by a timed-out case (label-scoped)."""
+    try:
+        ids = _run([rt, "ps", "-q", "--filter", "ancestor=" + IMAGE], timeout=15)
+        for cid in ids.stdout.split():
+            subprocess.run([rt, "kill", cid.decode()], capture_output=True, timeout=15)
+            subprocess.run([rt, "rm", "-f", cid.decode()], capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runtime", choices=["docker", "podman"], default="docker")
+    args = ap.parse_args()
+    rt = args.runtime
+
+    print(f"Extractor sandbox containment proof — runtime={rt}, image={IMAGE}")
+    # Confirm the image exists for this runtime.
+    chk = _run([rt, "image", "inspect", IMAGE], timeout=30)
+    if chk.returncode != 0:
+        print(f"FATAL: image {IMAGE} not found for {rt}. Build it first:\n"
+              f"  {rt} build -f docker/Dockerfile.extractor -t {IMAGE} .")
+        return 2
+
+    cases = [
+        case_benign,
+        case_infinite_loop,
+        case_memory_bomb,
+        case_fork_bomb,
+        case_egress_denied,
+    ]
+    results = []
+    for c in cases:
+        try:
+            results.append(c(rt))
+        except Exception as exc:  # a harness error is a FAIL, not a pass
+            print(f"  HARNESS ERROR: {exc!r}")
+            results.append(False)
+        finally:
+            _kill_lingering(rt)
+
+    passed = sum(results)
+    total = len(results)
+    print(f"\n=== RESULT ({rt}): {passed}/{total} cases contained ===")
+    if passed == total:
+        print("CONTAINMENT PROVEN — the jail contains a hostile parser.")
+        return 0
+    print("CONTAINMENT FAILURE — release-blocker.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

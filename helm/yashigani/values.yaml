@@ -1609,3 +1609,20 @@ licensing:
   # Leave empty to run in COMMUNITY tier.
   # Example: licenseKey: "$(cat /path/to/my.ysg)"
   licenseKey: ""
+
+# ---------------------------------------------------------------------------
+# Document-OPA enforcement (2.26 feature) — sandboxed extractor (B1, Captain).
+# Ships DARK: enabled=false means no extractor RBAC/NetworkPolicy is rendered
+# and the gateway never invokes the document path. Set enabled=true to opt in.
+# ---------------------------------------------------------------------------
+documentEnforcement:
+  enabled: false
+  # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
+  # Pin a digest in production (Verification Protocol §7).
+  image:
+    repository: yashigani/extractor
+    tag: ""            # defaults to .Chart.AppVersion when empty
+  # Per-job resource caps for the ephemeral extractor pods (fail-closed defaults).
+  timeoutSeconds: 20   # activeDeadlineSeconds — wall-clock kill
+  memLimit: "512Mi"    # cgroup memory limit — host never OOM'd
+  cpuLimit: "1"        # cpu quota

@@ -201,30 +201,93 @@ class CsvExtractor(DocumentExtractor):
 # Untrusted-parser placeholder — registered, intentionally fail-closed.
 # ---------------------------------------------------------------------------
 
-class _UnavailableExtractor(DocumentExtractor):
-    """Registered placeholder for a committed format whose parser is NOT yet
-    safe to run in-process.
+class SandboxedExtractor(DocumentExtractor):
+    """Extractor for an untrusted-parser format (docx/xlsx/pptx/pdf).
 
-    docx/xlsx/pptx run OOXML/zip+XML parsers and pdf runs a PDF object-graph
-    parser — both are untrusted-parser RCE surface (red-team F1/F6) and MUST
-    wait for Su's per-job sandbox container.  Registering them here (rather
-    than leaving a gap) makes the routing explicit and the BLOCK reason precise.
+    These formats run OOXML/zip+XML parsers or a PDF object-graph parser — both
+    are untrusted-parser RCE surface (red-team F1/F6) and MUST NOT run in the
+    gateway process.  This extractor dispatches the parse job into Captain's
+    **per-job ephemeral sandbox container** (no-egress, ro-rootfs, all-caps-
+    dropped, non-root, seccomp/AppArmor, mem/cpu/pids/wall-clock caps, killed
+    per job — plan §6 B1).  See :mod:`yashigani.documents.sandbox`.
 
-    TODO(Su): provide the sandboxed extractor container (no-egress, dropped
-              caps, seccomp, ro-rootfs, killed-per-job — plan §6 B1).
-    TODO(Captain): container isolation parity (Docker/Podman rootful+rootless/
-              K8s-Helm) for the sandbox.
-    TODO(Tom, next slice): implement OOXMLExtractor + PdfNativeExtractor to run
-              INSIDE that sandbox, then replace this placeholder in the registry.
+    Fail-closed (plan §6.1):
+      - No container backend available           → BLOCK (we NEVER fall back to
+        in-process parsing — that is the RCE surface the sandbox removes).
+      - Worker crash / timeout / limit-hit / bomb → BLOCK with a precise reason.
+      - Worker reports ``ok=False`` (a guard caught it) → BLOCK with the reason.
+
+    THE SEAM FOR TOM (next slice): the actual OOXML/PDF parsing happens INSIDE
+    the sandbox, in ``docker/extractor/worker.py`` (the ``_extract_<fmt>``
+    dispatch).  When Tom implements those, this extractor needs NO change — the
+    worker starts returning ``ok=True`` with segments and this class maps them
+    straight to an :class:`ExtractionResult`.  Captain owns the runner + the
+    container hardening; Tom owns the parser bodies; the contract between them is
+    the process-level stdin→JSON-stdout in :mod:`yashigani.documents.sandbox`.
     """
 
-    def __init__(self, handles: DetectedType) -> None:
+    def __init__(self, handles: DetectedType, runner=None) -> None:
         self.handles = handles
+        # Lazy: a runner is only built when a job actually runs, so importing
+        # the registry never requires a container daemon (dark flag, tests).
+        self._runner = runner
+
+    def _get_runner(self):
+        if self._runner is None:
+            from yashigani.documents.sandbox import SandboxedExtractorRunner
+            self._runner = SandboxedExtractorRunner()
+        return self._runner
 
     def extract(self, data: bytes, declared_mime: str) -> ExtractionResult:
-        raise ExtractorNotAvailableError(
-            f"format '{self.handles.value}' requires the sandboxed extractor "
-            f"(not yet available) — failing closed to BLOCK"
+        from yashigani.documents.sandbox import (
+            SandboxJobError,
+            SandboxUnavailableError,
+        )
+
+        try:
+            runner = self._get_runner()
+            result = runner.run_job(
+                data,
+                job="extract",
+                fmt=self.handles.value,
+                declared_mime=declared_mime,
+            )
+        except SandboxUnavailableError as exc:
+            # No isolation available → refuse to parse in-process (fail-closed).
+            raise ExtractorNotAvailableError(
+                f"format '{self.handles.value}' requires the sandbox, which is "
+                f"unavailable ({exc}) — failing closed to BLOCK"
+            ) from exc
+        except SandboxJobError as exc:
+            # Crash / timeout / bomb / over-cap — containment held, fail-closed.
+            raise DocumentExtractionError(
+                f"sandboxed extraction failed for '{self.handles.value}': "
+                f"{exc.reason} — failing closed to BLOCK"
+            ) from exc
+
+        if not result.ok:
+            # The worker cleanly contained the document (a guard fired). This is
+            # a fail-closed BLOCK with a precise reason, not a partial result.
+            raise DocumentExtractionError(
+                f"sandboxed extraction contained '{self.handles.value}': "
+                f"{result.reason} — failing closed to BLOCK"
+            )
+
+        # Worker returned segments (Tom's parser slice). Map to ExtractionResult.
+        segments = [
+            Segment(
+                text=str(s.get("text", "")),
+                kind=SegmentKind(str(s.get("kind", "BODY"))),
+                location=str(s.get("location") or f"sandbox={self.handles.value}"),
+                confidence=float(s.get("confidence", 1.0)),
+                needs_ocr=bool(s.get("needs_ocr", False)),
+            )
+            for s in result.segments
+        ]
+        return ExtractionResult(
+            segments=segments,
+            extraction_complete=result.extraction_complete,
+            detected_format=result.detected_format or self.handles.value,
         )
 
 
@@ -244,16 +307,21 @@ class ExtractorRegistry:
         self,
         max_document_bytes: int = DEFAULT_MAX_DOCUMENT_BYTES,
         max_segments: int = DEFAULT_MAX_SEGMENTS,
+        sandbox_runner=None,
     ) -> None:
         self._max_document_bytes = max_document_bytes
         self._registry: dict[DetectedType, DocumentExtractor] = {
             DetectedType.TXT: TxtExtractor(max_segments=max_segments),
             DetectedType.CSV: CsvExtractor(max_segments=max_segments),
-            # Committed formats, registered-but-unimplemented (fail-closed):
-            DetectedType.DOCX: _UnavailableExtractor(DetectedType.DOCX),
-            DetectedType.XLSX: _UnavailableExtractor(DetectedType.XLSX),
-            DetectedType.PPTX: _UnavailableExtractor(DetectedType.PPTX),
-            DetectedType.PDF: _UnavailableExtractor(DetectedType.PDF),
+            # Untrusted-parser formats — dispatched into Captain's per-job
+            # sandbox (plan §6 B1).  Until a backend is wired AND Tom's parsers
+            # land inside the jail, these fail closed to BLOCK (no in-process
+            # parsing, ever).  ``sandbox_runner`` is injectable for testing the
+            # dispatch path without a live daemon.
+            DetectedType.DOCX: SandboxedExtractor(DetectedType.DOCX, sandbox_runner),
+            DetectedType.XLSX: SandboxedExtractor(DetectedType.XLSX, sandbox_runner),
+            DetectedType.PPTX: SandboxedExtractor(DetectedType.PPTX, sandbox_runner),
+            DetectedType.PDF: SandboxedExtractor(DetectedType.PDF, sandbox_runner),
         }
 
     def detect(self, data: bytes, declared_mime: str) -> DetectionResult:

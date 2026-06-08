@@ -1,0 +1,78 @@
+{
+  "_comment": "Yashigani SANDBOXED-EXTRACTOR seccomp profile (plan §6 B1, Captain). SU SECURITY-REVIEW TARGET. defaultAction SCMP_ACT_ERRNO => every syscall NOT listed is blocked (fail-closed). This jail runs UNTRUSTED document parsers with egress=none, ro-rootfs, all-caps-dropped, non-root. The worker only needs to: read stdin, decompress a zip (CPU+mem), parse XML via lxml/libxml2, write one JSON object to stdout, and exit. It performs NO network I/O (network is also disabled at the runtime layer — this profile is defence-in-depth, NOT the sole egress control). REVIEW NOTES FOR SU are inline in _su_review_* keys below. This is INTENTIONALLY tighter than the gateway profile (yashigani-gateway.json): NO socket/bind/connect/listen/accept (the worker never networks), NO ptrace/process_vm_* (no introspection), NO mount/pivot_root/chroot/unshare/setns (no namespace fiddling), NO bpf/perf_event_open, NO clone3 with new namespaces.",
+  "_su_review_scope": "Confirm: (1) the allowlist below is the MINIMUM for stdin-read + zipfile-decompress + lxml-parse + stdout-write under CPython 3.14 on amd64/arm64; (2) NO networking syscalls are present (socket/connect/bind/listen/accept/sendto/recvfrom etc. are ABSENT — verify); (3) clone is allowed ONLY for thread creation (CLONE_THREAD), and that the absence of CLONE_NEWNS/NEWUSER/etc. flags is enforced by the absence of unshare/setns rather than a flag-arg filter (Su: decide if a clone arg-filter on flags is warranted vs the pids_limit=64 + no-new-privileges backstop); (4) whether to drop execve/execveat entirely once Tom's parser slice confirms no liblib subprocess is spawned (currently retained so CPython can re-exec on some start paths; flag if removable).",
+  "_su_review_clone": "clone/clone3 are allowed for CPython thread creation (lxml/zlib release the GIL but the interpreter still spins threads). Namespace creation is blocked by the ABSENCE of unshare/setns and by no-new-privileges + cap_drop ALL at the runtime layer. Su: consider an arg-index filter pinning clone flags to exclude CLONE_NEW* if belt-and-suspenders is wanted.",
+  "_su_review_removable_candidates": "execve, execveat — retained for CPython startup robustness; candidate for removal after Tom's parsers confirm no subprocess. fork/vfork are NOT listed (the worker is single-process; pids_limit=64 caps any escape).",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "_group": "memory + interpreter runtime",
+      "names": [
+        "arch_prctl", "brk", "mmap", "mprotect", "munmap", "madvise",
+        "mremap", "membarrier", "memfd_create", "rseq",
+        "prctl", "set_robust_list", "set_tid_address", "get_robust_list",
+        "getrandom", "sysinfo", "uname"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "file IO on stdin/stdout/tmpfs only (no network fds — see review)",
+      "names": [
+        "read", "readv", "pread64", "preadv", "preadv2",
+        "write", "writev", "pwrite64", "pwritev", "pwritev2",
+        "close", "close_range", "lseek", "dup", "dup2", "dup3",
+        "fcntl", "ioctl", "fstat", "newfstatat", "fstatfs", "statx",
+        "open", "openat", "openat2", "stat", "lstat", "access",
+        "faccessat", "faccessat2", "readlink", "readlinkat", "getcwd",
+        "getdents", "getdents64", "ftruncate", "fsync", "fdatasync",
+        "unlink", "unlinkat", "rename", "renameat", "renameat2",
+        "mkdir", "mkdirat", "rmdir", "pipe", "pipe2", "fadvise64",
+        "fchmod", "fchmodat", "fchdir", "chdir"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "threading + scheduling (CPython threads; NO new namespaces)",
+      "names": [
+        "clone", "clone3", "futex", "futex_waitv",
+        "sched_yield", "sched_getaffinity", "sched_setaffinity",
+        "sched_getparam", "sched_getscheduler", "nanosleep",
+        "clock_nanosleep", "clock_gettime", "clock_getres", "gettimeofday",
+        "getpid", "gettid", "getppid", "getuid", "geteuid", "getgid",
+        "getegid", "getrlimit", "prlimit64", "getrusage"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "signals + clean exit",
+      "names": [
+        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "rt_sigtimedwait",
+        "rt_sigpending", "rt_sigsuspend", "sigaltstack",
+        "kill", "tgkill", "tkill", "restart_syscall",
+        "exit", "exit_group", "wait4", "waitid",
+        "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait",
+        "epoll_pwait", "poll", "ppoll", "select", "pselect6", "eventfd",
+        "eventfd2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "process startup (execve retained for CPython re-exec; see _su_review_removable_candidates)",
+      "names": [
+        "execve", "execveat"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

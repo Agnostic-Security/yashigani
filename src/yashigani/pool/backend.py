@@ -170,6 +170,143 @@ class ContainerBackend:
         except Exception:
             return False
 
+    def run_extractor_job(
+        self,
+        *,
+        stdin: bytes,
+        timeout_s: int,
+        image: str,
+        name: str,
+        command: list,
+        network_disabled: bool,
+        read_only: bool,
+        cap_drop: list,
+        cap_add: list,
+        user: str,
+        security_opt: list,
+        seccomp_path: str,
+        apparmor_profile: str,
+        tmpfs: dict,
+        mem_limit: str,
+        memswap_limit: str,
+        nano_cpus: int,
+        pids_limit: int,
+        labels: dict,
+        auto_remove: bool,
+    ) -> tuple:
+        """Run one hardened, ephemeral extractor job. Returns (stdout, exit_code, killed).
+
+        This is the per-job sandbox primitive (plan §6 B1, Captain). It:
+          - creates a container with egress=none, ro-rootfs, all-caps-dropped,
+            non-root, seccomp, AppArmor, mem/cpu/pids caps and a small noexec tmpfs;
+          - feeds the document on STDIN (no host mount — nothing to traverse);
+          - enforces a WALL-CLOCK timeout the runner-side; over time → kill;
+          - collects stdout (the output channel), then force-removes the container.
+
+        Fail-closed: any spawn error propagates; the caller (SandboxedExtractorRunner)
+        maps non-zero exit / killed / error to BLOCK. The container is ALWAYS
+        removed in a finally block — a throwaway jail never lingers.
+
+        Works on Docker SDK and Podman SDK (both expose containers.create with
+        host_config kwargs). seccomp is passed as the profile JSON string so the
+        same call works regardless of node-side profile installation.
+        """
+        # Read the seccomp profile JSON so we can pass it inline (works for both
+        # Docker and Podman without requiring a node-side install path).
+        seccomp_opt = None
+        try:
+            with open(seccomp_path, "r", encoding="utf-8") as fh:
+                seccomp_opt = "seccomp=" + fh.read()
+        except OSError as exc:
+            logger.warning(
+                "extractor sandbox: seccomp profile %s unreadable (%s) — "
+                "falling back to runtime default seccomp (still confined: "
+                "egress=none, ro-rootfs, caps dropped, non-root)",
+                seccomp_path, exc,
+            )
+
+        full_security_opt = list(security_opt)
+        if seccomp_opt:
+            full_security_opt.append(seccomp_opt)
+        if apparmor_profile:
+            # AppArmor is a no-op where unconfined/unsupported (rootless Podman,
+            # non-AppArmor hosts); harmless to request.
+            full_security_opt.append("apparmor=" + apparmor_profile)
+
+        create_kwargs = dict(
+            image=image,
+            name=name,
+            command=command,
+            stdin_open=True,
+            detach=True,
+            user=user,
+            read_only=read_only,
+            network_disabled=network_disabled,
+            cap_drop=cap_drop,
+            security_opt=full_security_opt,
+            tmpfs=tmpfs,
+            mem_limit=mem_limit,
+            memswap_limit=memswap_limit,
+            nano_cpus=nano_cpus,
+            pids_limit=pids_limit,
+            labels=labels,
+            environment={
+                # Belt-and-suspenders caps the worker reads for its in-process
+                # bomb guard (bomb_guard.py). The cgroup limits above are the
+                # hard backstop; these make the failure precise and fast.
+                "YASHIGANI_EXTRACTOR_IN_SANDBOX": "1",
+            },
+        )
+        if cap_add:
+            create_kwargs["cap_add"] = cap_add
+
+        container = None
+        killed = False
+        try:
+            try:
+                container = self._client.containers.create(**create_kwargs)
+            except Exception as exc:
+                # A missing sandbox image means the sandbox is NOT PROVISIONED
+                # (vs a job that failed). Surface it as "sandbox unavailable" so
+                # the caller maps it to ExtractorNotAvailableError (fail-closed
+                # BLOCK either way, but the audit reason is precise). docker-py
+                # raises ImageNotFound; podman-py raises ImageNotFound/NotFound.
+                if exc.__class__.__name__ in ("ImageNotFound", "NotFound") or \
+                        "no such image" in str(exc).lower() or \
+                        "not found" in str(exc).lower() and "image" in str(exc).lower():
+                    from yashigani.documents.sandbox import SandboxUnavailableError
+                    raise SandboxUnavailableError(
+                        f"extractor image '{image}' not found — sandbox not "
+                        f"provisioned (fail-closed BLOCK)"
+                    ) from exc
+                raise
+            # Attach a stdin socket, start, write the doc, close stdin.
+            sock = container.attach_socket(
+                params={"stdin": 1, "stream": 1, "stdout": 0, "stderr": 0}
+            )
+            container.start()
+            _write_stdin(sock, stdin)
+
+            exit_code = _wait_with_timeout(container, timeout_s)
+            if exit_code is None:
+                killed = True
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+                exit_code = 137  # 128 + SIGKILL(9)
+            stdout = container.logs(stdout=True, stderr=False) or b""
+            return (stdout, exit_code, killed)
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception as exc:
+                    logger.warning(
+                        "extractor sandbox: failed to remove ephemeral %s: %s",
+                        name, exc,
+                    )
+
 
 class KubernetesBackend:
     """
@@ -266,6 +403,120 @@ class KubernetesBackend:
             return True
         except Exception:
             return False
+
+    def run_extractor_job(
+        self,
+        *,
+        stdin: bytes,
+        timeout_s: int,
+        image: str,
+        name: str,
+        command: list,
+        network_disabled: bool,
+        read_only: bool,
+        cap_drop: list,
+        cap_add: list,
+        user: str,
+        security_opt: list,
+        seccomp_path: str,
+        apparmor_profile: str,
+        tmpfs: dict,
+        mem_limit: str,
+        memswap_limit: str,
+        nano_cpus: int,
+        pids_limit: int,
+        labels: dict,
+        auto_remove: bool,
+    ) -> tuple:
+        """Run one hardened, ephemeral extractor job as a K8s Pod.
+
+        The declarative source of truth for the hardened pod spec is
+        helm/yashigani/templates/extractor-job-template.yaml. This method builds
+        the SAME spec programmatically (runAsNonRoot, readOnlyRootFilesystem,
+        allowPrivilegeEscalation=false, drop ALL caps, RuntimeDefault/Localhost
+        seccomp, no service-account token, no network via a deny-all
+        NetworkPolicy applied by the chart, emptyDir tmpfs, resource limits).
+
+        Stdin is delivered by mounting the bytes as a projected secret/volume is
+        avoided (it would persist the doc); instead the gateway passes the doc on
+        the pod's stdin via the attach API. Returns (stdout, exit_code, killed).
+
+        NOTE: egress=NONE in K8s is enforced by a deny-all egress NetworkPolicy
+        on the extractor pods' label (chart), NOT by the pod spec alone — see the
+        template. This method sets the labels the NetworkPolicy selects.
+        """
+        from kubernetes import client as k8s_client  # type: ignore[import-untyped]
+
+        uid = int(user.split(":", 1)[0]) if ":" in user else int(user)
+        cpu_limit = f"{nano_cpus / 1_000_000_000:.2f}" if nano_cpus else None
+        resources = k8s_client.V1ResourceRequirements(
+            limits={
+                k: v for k, v in {
+                    "memory": mem_limit,
+                    "cpu": cpu_limit,
+                }.items() if v is not None
+            }
+        )
+        sec_ctx = k8s_client.V1SecurityContext(
+            run_as_non_root=True,
+            run_as_user=uid,
+            read_only_root_filesystem=read_only,
+            allow_privilege_escalation=False,
+            capabilities=k8s_client.V1Capabilities(drop=cap_drop or ["ALL"]),
+            seccomp_profile=k8s_client.V1SeccompProfile(type="RuntimeDefault"),
+        )
+        pod = k8s_client.V1Pod(
+            metadata=k8s_client.V1ObjectMeta(
+                name=name, namespace=self._namespace, labels=labels,
+            ),
+            spec=k8s_client.V1PodSpec(
+                restart_policy="Never",
+                automount_service_account_token=False,
+                active_deadline_seconds=timeout_s,  # wall-clock kill
+                containers=[
+                    k8s_client.V1Container(
+                        name="extractor",
+                        image=image,
+                        args=command,
+                        stdin=True,
+                        stdin_once=True,
+                        resources=resources,
+                        security_context=sec_ctx,
+                        volume_mounts=[
+                            k8s_client.V1VolumeMount(name="scratch", mount_path="/tmp"),
+                        ],
+                    ),
+                ],
+                volumes=[
+                    k8s_client.V1Volume(
+                        name="scratch",
+                        empty_dir=k8s_client.V1EmptyDirVolumeSource(
+                            medium="Memory", size_limit="64Mi",
+                        ),
+                    ),
+                ],
+            ),
+        )
+        self._core.create_namespaced_pod(namespace=self._namespace, body=pod)
+        # Stream stdin + collect stdout via the attach/exec API, wait for the
+        # active_deadline to bound the job, then delete the pod.
+        killed = False
+        try:
+            stdout, exit_code = _k8s_attach_collect(
+                self._core, name, self._namespace, stdin, timeout_s,
+            )
+            if exit_code is None:
+                killed = True
+                exit_code = 137
+            return (stdout, exit_code, killed)
+        finally:
+            try:
+                self._core.delete_namespaced_pod(
+                    name=name, namespace=self._namespace,
+                    body=k8s_client.V1DeleteOptions(grace_period_seconds=0),
+                )
+            except Exception as exc:
+                logger.warning("extractor sandbox (k8s): delete failed for %s: %s", name, exc)
 
     def _wait_for_running(self, pod_name: str) -> str:
         """
@@ -483,3 +734,106 @@ def create_backend() -> Optional["ContainerBackend | KubernetesBackend"]:
 def _get_uid() -> int:
     """Get current user ID for Podman rootless socket path."""
     return os.getuid()
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral-job helpers (extractor sandbox, plan §6 B1).
+# ---------------------------------------------------------------------------
+
+def _write_stdin(sock, data: bytes) -> None:
+    """Write the document bytes to the container's stdin, then close it.
+
+    docker-py / podman-py return a SocketIO-ish object from attach_socket();
+    the underlying socket is at ``sock._sock`` (docker-py) or the object is
+    itself writable (podman-py). We handle both, and ALWAYS shut down the write
+    side so the worker's stdin reaches EOF (otherwise it blocks forever and the
+    timeout fires — still safe, just slower)."""
+    raw = getattr(sock, "_sock", sock)
+    try:
+        raw.sendall(data)
+    except Exception:
+        # Fallback for file-like wrappers.
+        try:
+            sock.write(data)  # type: ignore[attr-defined]
+            sock.flush()  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.warning("extractor sandbox: stdin write failed: %s", exc)
+    finally:
+        # Signal EOF on the write half so the worker can stop reading stdin.
+        for closer in (
+            lambda: raw.shutdown(1),       # socket.SHUT_WR
+            lambda: sock.close(),          # file-like
+        ):
+            try:
+                closer()
+                break
+            except Exception:
+                continue
+
+
+def _k8s_attach_collect(core, name: str, namespace: str, stdin: bytes, timeout_s: int):
+    """Attach to a K8s extractor pod: write stdin, collect stdout, return
+    (stdout_bytes, exit_code_or_None). None exit means the deadline elapsed
+    (caller treats as killed). The pod's active_deadline_seconds is the hard
+    wall-clock backstop; this poll bounds the attach loop."""
+    from kubernetes.stream import stream  # type: ignore[import-untyped]
+
+    # Wait for the container to be ready to attach (very short for a one-shot).
+    deadline = time.monotonic() + timeout_s
+    resp = stream(
+        core.connect_get_namespaced_pod_attach,
+        name, namespace,
+        container="extractor",
+        stdin=True, stdout=True, stderr=False, tty=False,
+        _preload_content=False,
+    )
+    try:
+        resp.write_stdin(stdin.decode("latin-1"))
+    except Exception:
+        pass
+    out = bytearray()
+    while resp.is_open() and time.monotonic() < deadline:
+        resp.update(timeout=1)
+        if resp.peek_stdout():
+            out.extend(resp.read_stdout().encode("latin-1"))
+    resp.close()
+
+    # Read the terminated container's exit code from the pod status.
+    exit_code = None
+    try:
+        pod = core.read_namespaced_pod(name=name, namespace=namespace)
+        for cs in (pod.status.container_statuses or []):
+            term = getattr(cs.state, "terminated", None)
+            if term is not None:
+                exit_code = int(term.exit_code)
+    except Exception:
+        pass
+    return (bytes(out), exit_code)
+
+
+def _wait_with_timeout(container, timeout_s: int):
+    """Wait up to ``timeout_s`` for the container to exit.
+
+    Returns the integer exit code, or ``None`` if the wall-clock cap elapsed
+    (the caller then kills the container — containment). Uses the SDK's native
+    timeout where available; falls back to a poll loop for podman-py builds that
+    raise on the ``timeout`` kwarg."""
+    try:
+        result = container.wait(timeout=timeout_s)
+        if isinstance(result, dict):
+            return int(result.get("StatusCode", result.get("Status", 0)) or 0)
+        return int(result)
+    except Exception:
+        # Either a real timeout (SDK raised ReadTimeout) or no-timeout-kwarg
+        # support. Disambiguate with a bounded poll loop.
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                container.reload()
+                state = getattr(container, "attrs", {}).get("State", {})
+                if state.get("Status") in ("exited", "dead"):
+                    return int(state.get("ExitCode", 0) or 0)
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return None  # timed out → caller kills
