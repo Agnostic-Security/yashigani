@@ -353,7 +353,7 @@ def _extract_docx(data: bytes) -> tuple[list[dict], bool]:
             if seg:
                 segments.append(seg)
 
-    # --- document metadata (core + app properties) ---
+    # --- document metadata (core + app + CUSTOM properties) ---
     segments.extend(_ooxml_metadata(zf))
 
     _cap_segments(segments)
@@ -448,6 +448,15 @@ def _extract_xlsx(data: bytes) -> tuple[list[dict], bool]:
 
     # --- workbook metadata (core properties) ---
     segments.extend(_ooxml_metadata_from_props(wb.properties))
+
+    # --- CUSTOM workbook properties (docProps/custom.xml via openpyxl) -------
+    # openpyxl parses docProps/custom.xml into wb.custom_doc_props; a sensitive
+    # value (or a sensitive property NAME) sitting ONLY here is otherwise a
+    # metadata-only leak the core-property sweep misses (plan §3.1).
+    try:
+        segments.extend(_xlsx_custom_props(wb))
+    except Exception:
+        complete = False  # malformed custom-props → don't claim complete
 
     wb.close()
     _cap_segments(segments)
@@ -654,11 +663,15 @@ def _extract_pdf(data: bytes) -> tuple[list[dict], bool]:
 # ---------------------------------------------------------------------------
 
 def _ooxml_metadata(zf: zipfile.ZipFile) -> list[dict]:
-    """Extract core + extended document properties from an OOXML package.
+    """Extract core + extended + CUSTOM document properties from an OOXML package.
 
     docProps/core.xml carries author/title/subject/keywords/lastModifiedBy;
-    docProps/app.xml carries company/manager/template. Both are frequent leak
-    spots (the 'lastModifiedBy' on a 'cleaned' doc, the internal company name)."""
+    docProps/app.xml carries company/manager/template; docProps/custom.xml carries
+    ARBITRARY user-defined name/value pairs (classification labels, client names,
+    matter numbers — a frequent metadata-only leak that the obvious core/app sweep
+    misses). All three are surfaced so a sensitive value sitting ONLY in any of
+    them is detected and drives a verdict (plan §3.1 — 'identify ALL data' includes
+    metadata, and that includes CUSTOM metadata, not just the obvious core props)."""
     out: list[dict] = []
 
     core = _read_part(zf, "docProps/core.xml")
@@ -685,6 +698,29 @@ def _ooxml_metadata(zf: zipfile.ZipFile) -> list[dict]:
                 if seg:
                     out.append(seg)
 
+    # --- CUSTOM document properties (docProps/custom.xml) --------------------
+    # Each <property name="..."> wraps a typed value element (vt:lpwstr, vt:i4,
+    # vt:filetime, ...). We surface BOTH the property NAME and its VALUE text —
+    # the name itself can be sensitive (e.g. a property literally named after a
+    # client) and the value certainly can be. Provenance carries the prop name.
+    custom = _read_part(zf, "docProps/custom.xml")
+    if custom is not None:
+        root = _parse_xml(custom)
+        if root is not None:
+            for el in root.iter():
+                if _local(el.tag) != "property":
+                    continue
+                pname = el.get("name") or ""
+                # The typed value lives in a child element's text (vt:* schema).
+                vtext = "".join(c.text or "" for c in el).strip() or (el.text or "")
+                loc = f"docProps/custom.xml#name={pname or '?'}"
+                # Surface the name as part of the segment text too, so a sensitive
+                # PROPERTY NAME (not just its value) is classified.
+                payload = f"{pname}={vtext}" if pname else vtext
+                seg = _seg(payload, "METADATA", loc)
+                if seg:
+                    out.append(seg)
+
     return out
 
 
@@ -697,6 +733,35 @@ def _ooxml_metadata_from_props(props) -> list[dict]:
                 "lastModifiedBy", "category", "company", "manager"):
         val = getattr(props, key, None)
         seg = _seg(val, "METADATA", f"metadata={key}")
+        if seg:
+            out.append(seg)
+    return out
+
+
+def _xlsx_custom_props(wb) -> list[dict]:
+    """xlsx CUSTOM document properties via openpyxl's ``wb.custom_doc_props``.
+
+    Each entry is a name/value pair from docProps/custom.xml. We surface BOTH the
+    name and the value text (the name itself can be sensitive). Defensive: a
+    malformed custom-props part must not crash the whole extraction — but it must
+    NOT be silently swallowed either, so the caller marks extraction incomplete on
+    failure (see _extract_xlsx)."""
+    out: list[dict] = []
+    cdp = getattr(wb, "custom_doc_props", None)
+    if cdp is None:
+        return out
+    props = getattr(cdp, "props", None) or list(cdp)
+    for p in props:
+        name = getattr(p, "name", "") or ""
+        value = getattr(p, "value", None)
+        if value is None:
+            # Some property types expose the value under a typed attribute.
+            for attr in ("lpwstr", "i4", "filetime", "bool", "r8"):
+                value = getattr(p, attr, None)
+                if value is not None:
+                    break
+        payload = f"{name}={value}" if name else str(value)
+        seg = _seg(payload, "METADATA", f"custom-property={name or '?'}")
         if seg:
             out.append(seg)
     return out

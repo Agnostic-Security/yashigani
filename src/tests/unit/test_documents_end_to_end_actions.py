@@ -203,6 +203,65 @@ def test_pseudonymize_all_six(fmt, builder, mime):
     assert r.correspondence_table.rows["[EMAIL_1]"] == _PII_EMAIL
 
 
+def _docx_custom_meta_only_doc() -> bytes:
+    """A docx whose BODY is clean but whose CUSTOM property (docProps/custom.xml)
+    carries a DETECTABLE PII email. Proves a metadata-ONLY match drives a verdict
+    (concern #2) — it is NOT silently passed because the body is clean."""
+    import io
+    import zipfile
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    CUSTOM = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+    VT = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+    document = (
+        f'<?xml version="1.0"?><w:document xmlns:w="{W}"><w:body>'
+        f'<w:p><w:r><w:t>nothing sensitive in the body</w:t></w:r></w:p>'
+        f'</w:body></w:document>'
+    )
+    custom = (
+        f'<?xml version="1.0"?><Properties xmlns="{CUSTOM}" xmlns:vt="{VT}">'
+        f'<property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="2" '
+        f'name="ClientContact"><vt:lpwstr>{_PII_EMAIL}</vt:lpwstr></property>'
+        f'</Properties>'
+    )
+    parts = {
+        "[Content_Types].xml": fx._CONTENT_TYPES,
+        "_rels/.rels": fx._RELS,
+        "word/document.xml": document.encode(),
+        "docProps/custom.xml": custom.encode(),
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for n, p in parts.items():
+            zf.writestr(n, p)
+    return buf.getvalue()
+
+
+def test_metadata_only_match_drives_verdict_and_is_stripped():
+    """Concern #2/#3: a PII value present ONLY in a custom document property is
+    DETECTED (drives matches → a real REDACT verdict) and does NOT survive in the
+    re-rendered output — proving metadata-only data is identified, acted on, and
+    left no residual."""
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    pipe = _pipeline()
+    doc = _docx_custom_meta_only_doc()
+    # The body is clean; the ONLY PII is in the custom property.
+    r = pipe.inspect(doc, mime, request_id="req-meta", requested_action="REDACT")
+    # A metadata-only match must produce a match (not be silently passed).
+    assert any(m.data_class == "PII.EMAIL" for m in r.matches), (
+        "metadata-only PII was NOT detected — silent pass (concern #2)"
+    )
+    assert r.disposition == DISPOSITION_REDACT, r.block_reason
+    # And the re-rendered output carries no residual of the metadata value.
+    runner = SandboxedExtractorRunner(backend=_WorkerSubprocessBackend())
+    reg = ExtractorRegistry(sandbox_runner=runner)
+    re_extract = reg.extract(r.forward_bytes, mime)
+    text = "\n".join(s.text for s in re_extract.segments)
+    assert _PII_EMAIL not in text, "metadata-only PII survived REDACT output"
+    assert _PII_EMAIL.encode() not in r.forward_bytes, (
+        "metadata-only PII survived in raw REDACT bytes"
+    )
+
+
 def test_csv_pseudonymize_coherent_across_rows():
     """Same value in two rows → same token in both (coherence, §5.3a)."""
     pipe = _pipeline()

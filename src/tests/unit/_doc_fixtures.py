@@ -26,6 +26,10 @@ import zipfile
 VISIBLE = "visible-body-alice@example.com"
 HIDDENVAL = "hidden-secret-123-45-6789"
 METAVAL = "metadata-leaker-SecretAuthor"
+#: A sensitive value that lives ONLY in a CUSTOM document property
+#: (docProps/custom.xml) — the metadata-only leak the obvious core/app sweep
+#: misses. Tests assert it is surfaced (detection) AND absent from any re-render.
+CUSTOMVAL = "custom-prop-secret-bob@example.com"
 
 _CONTENT_TYPES = (
     b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -47,6 +51,10 @@ _CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 _DC = "http://purl.org/dc/elements/1.1/"
 
 
+_CUSTOM_NS = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+_VT_NS = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+
+
 def _core_props() -> bytes:
     return (
         f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -54,6 +62,19 @@ def _core_props() -> bytes:
         f'<dc:creator>{METAVAL}</dc:creator>'
         f'<dc:title>Quarterly</dc:title>'
         f'</cp:coreProperties>'
+    ).encode()
+
+
+def _custom_props() -> bytes:
+    """docProps/custom.xml carrying a sensitive value in a user-defined property
+    (the metadata-only-in-CUSTOM leak the core/app sweep misses)."""
+    return (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Properties xmlns="{_CUSTOM_NS}" xmlns:vt="{_VT_NS}">'
+        f'<property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" '
+        f'pid="2" name="ClientContact">'
+        f'<vt:lpwstr>{CUSTOMVAL}</vt:lpwstr></property>'
+        f'</Properties>'
     ).encode()
 
 
@@ -77,6 +98,8 @@ def make_docx(*, with_hidden: bool = True) -> bytes:
         "_rels/.rels": _RELS,
         "word/document.xml": document.encode(),
         "docProps/core.xml": _core_props(),
+        # CUSTOM property carrying a metadata-only secret (custom.xml leak vector).
+        "docProps/custom.xml": _custom_props(),
     }
     if with_hidden:
         # A comment carrying the same secret class — a distinct hidden channel.
@@ -112,6 +135,15 @@ def make_xlsx(*, with_hidden: bool = True) -> bytes:
             )
         )
     wb.properties.creator = METAVAL
+    # CUSTOM workbook property carrying a metadata-only secret (custom.xml leak).
+    try:
+        from openpyxl.packaging.custom import StringProperty
+
+        wb.custom_doc_props.append(
+            StringProperty(name="ClientContact", value=CUSTOMVAL)
+        )
+    except Exception:
+        pass
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -130,6 +162,8 @@ def make_pptx(*, with_hidden: bool = True) -> bytes:
         "_rels/.rels": _RELS,
         "ppt/slides/slide1.xml": slide.encode(),
         "docProps/core.xml": _core_props(),
+        # CUSTOM property carrying a metadata-only secret (custom.xml leak vector).
+        "docProps/custom.xml": _custom_props(),
     }
     if with_hidden:
         notes = (

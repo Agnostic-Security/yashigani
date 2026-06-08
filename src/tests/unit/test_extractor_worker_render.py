@@ -106,6 +106,11 @@ OOXML_PDF = [
 ]
 
 
+# OOXML fixtures carry a custom-property metadata leak (docProps/custom.xml);
+# pdf has no custom-property analogue, so CUSTOMVAL is OOXML-only.
+_HAS_CUSTOM_META = {"docx", "xlsx", "pptx"}
+
+
 @pytest.mark.parametrize("fmt,builder", OOXML_PDF)
 def test_redact_destroys_secret_and_strips_metadata(fmt, builder):
     data = builder()
@@ -114,11 +119,21 @@ def test_redact_destroys_secret_and_strips_metadata(fmt, builder):
     rendered, out = _render(fmt, data, "redact", plan)
 
     # Re-extract the OUTPUT (worker's own + an independent pass): NO original
-    # value of any kind survives — not the secret, not the metadata leaker.
+    # value of any kind survives — not the secret, not the CORE metadata leaker,
+    # not the CUSTOM-property metadata leaker (docProps/custom.xml).
     for text in (_output_text(out), _reextract_text(fmt, rendered)):
         assert fx.HIDDENVAL not in text, f"{fmt}: secret survived REDACT"
-        assert fx.METAVAL not in text, f"{fmt}: metadata survived REDACT (F4)"
+        assert fx.METAVAL not in text, f"{fmt}: core metadata survived REDACT (F4)"
         assert fx.VISIBLE not in text, f"{fmt}: redacted visible value survived"
+        if fmt in _HAS_CUSTOM_META:
+            assert fx.CUSTOMVAL not in text, (
+                f"{fmt}: CUSTOM-property metadata survived REDACT (F4 — custom.xml)"
+            )
+    # Belt + suspenders: the raw output bytes carry no custom-prop value either.
+    if fmt in _HAS_CUSTOM_META:
+        assert fx.CUSTOMVAL.encode() not in rendered, (
+            f"{fmt}: CUSTOM-property value survived in raw REDACT bytes"
+        )
 
 
 @pytest.mark.parametrize("fmt,builder", OOXML_PDF)
@@ -135,9 +150,67 @@ def test_pseudonymize_tokenizes_without_original_residual(fmt, builder):
     for text in (_output_text(out), _reextract_text(fmt, rendered)):
         assert fx.VISIBLE not in text, f"{fmt}: original survived PSEUDONYMIZE (§5.5)"
         assert fx.HIDDENVAL not in text, f"{fmt}: secret survived PSEUDONYMIZE"
-        assert fx.METAVAL not in text, f"{fmt}: metadata survived PSEUDONYMIZE (F4)"
+        assert fx.METAVAL not in text, f"{fmt}: core metadata survived PSEUDONYMIZE (F4)"
+        if fmt in _HAS_CUSTOM_META:
+            assert fx.CUSTOMVAL not in text, (
+                f"{fmt}: CUSTOM-property metadata survived PSEUDONYMIZE (F4 — custom.xml)"
+            )
+    # Belt + suspenders: a PSEUDONYMIZED artefact is worthless if metadata still
+    # carries the original — assert the raw output bytes carry no custom-prop value.
+    if fmt in _HAS_CUSTOM_META:
+        assert fx.CUSTOMVAL.encode() not in rendered, (
+            f"{fmt}: CUSTOM-property value survived in raw PSEUDONYMIZE bytes"
+        )
     # At least the visible value's token landed in the output body.
     assert "[PERSON_1]" in _output_text(out), f"{fmt}: token not in output body"
+
+
+@pytest.mark.parametrize("fmt,builder", [
+    ("docx", fx.make_docx), ("xlsx", fx.make_xlsx), ("pptx", fx.make_pptx),
+])
+def test_custom_property_metadata_is_detected(fmt, builder):
+    """Metadata-only detection (concern #2/#3): a sensitive value sitting ONLY in
+    a CUSTOM document property (docProps/custom.xml) MUST surface as a segment so
+    it drives a verdict — it must NOT be silently passed because the body is clean.
+    """
+    data = builder()
+    res = worker._run_extract(fmt, data)
+    blob = "\n".join(s["text"] for s in res["segments"])
+    assert fx.CUSTOMVAL in blob, (
+        f"{fmt}: CUSTOM-property value NOT surfaced — metadata-only leak undetected"
+    )
+    # It is surfaced AS metadata (right provenance class), not mislabelled body.
+    hits = [s for s in res["segments"] if fx.CUSTOMVAL in s["text"]]
+    assert all(s["kind"] == "METADATA" for s in hits), (
+        f"{fmt}: custom-property hit not labelled METADATA: {[s['kind'] for s in hits]}"
+    )
+
+
+@pytest.mark.parametrize("fmt,builder,action,job", [
+    ("docx", fx.make_docx, "REDACT", "redact"),
+    ("docx", fx.make_docx, "PSEUDONYMIZE", "pseudonymize"),
+    ("xlsx", fx.make_xlsx, "REDACT", "redact"),
+    ("xlsx", fx.make_xlsx, "PSEUDONYMIZE", "pseudonymize"),
+    ("pptx", fx.make_pptx, "REDACT", "redact"),
+    ("pptx", fx.make_pptx, "PSEUDONYMIZE", "pseudonymize"),
+])
+def test_custom_property_metadata_does_not_survive_render(fmt, builder, action, job):
+    """A value matched ONLY in a custom property must NOT survive in the rendered
+    output of EITHER action — for PSEUDONYMIZE it is either tokenized OR (as here,
+    since render rebuilds a minimal package) stripped; for REDACT it is destroyed.
+    NEVER ship output whose metadata still contains the original matched value."""
+    data = builder()
+    plan = _plan_targeting(fmt, data, [fx.CUSTOMVAL], action, token_prefix="CUSTOM")
+    # The custom value IS detected, so the plan targets it.
+    assert plan["spans"], f"{fmt}: custom-property value was not in the extract plan"
+    rendered, out = _render(fmt, data, job, plan)
+    for text in (_output_text(out), _reextract_text(fmt, rendered)):
+        assert fx.CUSTOMVAL not in text, (
+            f"{fmt}/{action}: custom-property value survived in re-extracted output"
+        )
+    assert fx.CUSTOMVAL.encode() not in rendered, (
+        f"{fmt}/{action}: custom-property value survived in raw rendered bytes"
+    )
 
 
 # ---------------------------------------------------------------------------

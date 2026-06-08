@@ -106,6 +106,7 @@ def test_docx_visible_and_hidden_and_metadata():
     assert fx.VISIBLE in body            # visible body
     assert fx.HIDDENVAL in body          # comment + tracked-change deletion
     assert fx.METAVAL in body            # core metadata creator
+    assert fx.CUSTOMVAL in body          # CUSTOM property (docProps/custom.xml)
     kinds = _kinds(res)
     assert "BODY" in kinds
     assert "COMMENT" in kinds            # hidden part LABELLED
@@ -150,6 +151,7 @@ def test_xlsx_visible_hidden_sheet_column_formula_metadata():
     assert "formula-" in body                          # FORMULA TEXT surfaced
     assert "SecretRange" in body                       # defined name
     assert fx.METAVAL in body                          # workbook creator
+    assert fx.CUSTOMVAL in body                         # CUSTOM workbook property
     kinds = _kinds(res)
     assert "TABLE_CELL" in kinds
     assert "HIDDEN" in kinds                            # hidden cells LABELLED
@@ -186,6 +188,7 @@ def test_pptx_visible_speaker_notes_metadata():
     assert fx.VISIBLE in body                  # visible slide
     assert fx.HIDDENVAL in body                # SPEAKER NOTE
     assert fx.METAVAL in body                  # metadata
+    assert fx.CUSTOMVAL in body                # CUSTOM property (docProps/custom.xml)
     kinds = _kinds(res)
     assert "BODY" in kinds
     assert "SPEAKER_NOTE" in kinds             # hidden part LABELLED
