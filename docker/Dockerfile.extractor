@@ -33,11 +33,37 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Parser/guard deps. lxml ships manylinux wheels (no compiler). The OOXML/PDF
-# parser libs (python-docx/openpyxl/python-pptx/pypdf) are added in Tom's slice;
-# this slice needs only lxml (hardened XML parser) + the guard (stdlib zipfile).
+# Parser/guard deps — EXTRACTOR IMAGE ONLY (never the gateway image; these
+# untrusted-format parsers run isolated in the per-job jail). All are pure-Python
+# py3-none-any wheels (no compiler) so the image stays minimal and arch-agnostic:
+#   - lxml         : the hardened XML parser (XXE/billion-laughs safe) used for
+#                    docx/pptx direct-part parsing + openpyxl's safe XML path.
+#   - openpyxl     : xlsx — surfaces hidden sheets/rows/cols, cell comments,
+#                    defined names, formula text, workbook metadata. Its only
+#                    runtime dep is et-xmlfile; it parses untrusted XML with
+#                    resolve_entities=False and prefers defusedxml when present.
+#   - defusedxml   : forces openpyxl onto the hardened ElementTree path.
+#   - pypdf[crypto]: pdf — native text + DocInfo/XMP metadata; the [crypto] extra
+#                    (cryptography) lets it DETECT encrypted PDFs so we fail-closed
+#                    BLOCK instead of crashing. pypdf is pure-Python (no native pdf
+#                    lib) → smaller in-jail attack surface than pdfminer's C bits.
+# docx + pptx are parsed via direct hardened-lxml (NOT python-docx/python-pptx) so
+# the heavyweight object models — and python-pptx's Pillow + XlsxWriter deps —
+# stay OUT of the jail; the hidden parts (comments, tracked changes, speaker
+# notes, masters) are read straight from the zip's XML parts.
+# lxml is pinned to the 6.0.x line: it is the FIRST series shipping prebuilt
+# cp314 manylinux wheels (the base is python:3.14-slim). 5.x has NO 3.14 wheel and
+# would compile from source against libxml2 dev headers we deliberately do not
+# install — keeping the jail minimal. The hardened-parser settings in
+# bomb_guard.harden_xml_parser() (resolve_entities/no_network/load_dtd/
+# dtd_validation/huge_tree) are all stable across the lxml 5→6 API.
 RUN pip install --no-cache-dir --upgrade "pip==26.0.1" \
- && pip install --no-cache-dir "lxml>=5.2" \
+ && pip install --no-cache-dir \
+        "lxml>=6.0.1,<6.2" \
+        "openpyxl==3.1.5" \
+        "et-xmlfile>=2.0.0" \
+        "defusedxml>=0.7.1" \
+        "pypdf[crypto]==6.13.1" \
  && pip uninstall -y pip
 
 # Bake the bomb-guard module as the SINGLE source of truth (no copy-drift). We
