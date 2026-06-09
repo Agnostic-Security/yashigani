@@ -31,6 +31,21 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# CIS Docker 4.8 — strip ALL setuid/setgid bits from the base image (Su 2026-06-09).
+# python:3.14-slim ships 11 setuid/setgid binaries (su, mount, umount, passwd,
+# gpasswd, newgrp, chfn, chsh, chage, expiry, unix_chkpwd). The one-shot worker is
+# a single non-root python process that needs NONE of them. In the jail they are
+# already neutered by no-new-privileges + cap_drop ALL + the seccomp mount-block,
+# but they are pure attack surface a parser-RCE should not find — so remove the
+# elevation bits outright. We clear the bits (not delete the files) so package
+# metadata stays consistent; the result is asserted below at build time.
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true \
+ && remaining="$(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null)" \
+ && if [ -n "$remaining" ]; then \
+        echo "CIS 4.8 FAIL: setuid/setgid binaries remain:" >&2; \
+        echo "$remaining" >&2; exit 1; \
+    fi
+
 WORKDIR /app
 
 # Parser/guard deps — EXTRACTOR IMAGE ONLY (never the gateway image; these

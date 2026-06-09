@@ -38,12 +38,21 @@ import argparse
 import base64
 import io
 import json
+import os
 import subprocess
 import sys
 import time
 import zipfile
 
 IMAGE = "yashigani/extractor:2.26.0"
+
+# The COMMITTED extractor seccomp profile — the harness MUST exercise the real
+# profile that ships (not the runtime default), otherwise a green run proves
+# nothing about our allowlist. Resolved repo-root-relative (run from repo root).
+_SECCOMP_PROFILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "docker", "seccomp", "yashigani-extractor.json",
+)
 
 # A sentinel matched value that lives ONLY in metadata (core creator + a CUSTOM
 # document property). CASE 6 proves a real in-jail pseudonymize re-render strips
@@ -89,6 +98,15 @@ def _hardening(rt: str) -> list[str]:
         "--memory-swap", "256m",
         "--pids-limit", "64",
     ]
+    # Exercise the COMMITTED seccomp profile (Su 2026-06-09) — the gate must prove
+    # OUR allowlist confines, not the runtime default. If the file is missing the
+    # harness fails the run rather than silently testing the default profile.
+    if os.path.exists(_SECCOMP_PROFILE):
+        flags += ["--security-opt", "seccomp=" + _SECCOMP_PROFILE]
+    else:
+        print(f"  FATAL: committed seccomp profile not found at {_SECCOMP_PROFILE} "
+              f"— refusing to test the runtime-default profile", file=sys.stderr)
+        raise SystemExit(2)
     # CPU quota only where the cpu controller is delegated (Docker always;
     # rootful Podman; rootless Podman only with cpu delegation). Without it the
     # wall-clock + mem caps still contain CPU abuse — see _cpu_controller_available.
@@ -329,6 +347,39 @@ def case_metadata_no_residual(rt: str) -> bool:
     return contained
 
 
+def case_seccomp_ns_denied(rt: str) -> bool:
+    """CASE 7: the committed seccomp profile's clone flag-filter blocks namespace
+    creation (Su 2026-06-09). Even with arbitrary code execution in the worker, an
+    attempt to clone(CLONE_NEWUSER) — the first step of a user-namespace escape /
+    privilege-confusion — is denied by seccomp (EPERM), and clone3 is forced to
+    ENOSYS so glibc cannot route around the filter. Thread creation (the legitimate
+    clone the parsers need) is unaffected — CASES 1/6 already prove parsers run.
+
+    This is the regression test for the clone arg-filter hardening: it re-fails if
+    the masked-clone rule is dropped or the CLONE_NEW* mask is weakened."""
+    _hdr(7, "seccomp clone filter → namespace creation DENIED (no ns-escape)")
+    out = _run(
+        [rt, "run", "--rm", *_hardening(rt),
+         "--entrypoint", "python", IMAGE,
+         "-c",
+         "import ctypes\n"
+         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n"
+         "CLONE_NEWUSER = 0x10000000\n"
+         "# SIGCHLD(17) | CLONE_NEWUSER — a real namespace-creating clone.\n"
+         "rc = libc.syscall(56, CLONE_NEWUSER | 17, 0, 0, 0, 0)\n"
+         "import os\n"
+         "print('NEWUSER-CLONE-SUCCEEDED' if rc >= 0 else "
+         "f'clone(CLONE_NEWUSER) denied rc={rc} errno={ctypes.get_errno()}')\n"],
+        timeout=20,
+    )
+    # The filter must DENY it (rc<0). A success (rc>=0, child pid) is a FAILURE:
+    # the jail let a parser create a user namespace.
+    denied = b"NEWUSER-CLONE-SUCCEEDED" not in out.stdout
+    print(f"  exit={out.returncode} stdout={out.stdout[:120]!r}")
+    print("  PASS" if denied else "  FAIL — clone(CLONE_NEWUSER) was permitted!")
+    return denied
+
+
 def _kill_lingering(rt: str) -> None:
     """Reap any container left by a timed-out case (label-scoped)."""
     try:
@@ -361,6 +412,7 @@ def main() -> int:
         case_fork_bomb,
         case_egress_denied,
         case_metadata_no_residual,
+        case_seccomp_ns_denied,
     ]
     results = []
     for c in cases:

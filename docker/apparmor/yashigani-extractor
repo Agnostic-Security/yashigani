@@ -52,14 +52,15 @@ profile yashigani-extractor flags=(attach_disconnected,mediate_deleted) {
   @{PROC}/@{pid}/fd/ r,
 
   # Deny ALL networking — the jail has no egress (kills SSRF/exfil from a
-  # malicious parser, plan §6 / red-team F1).
-  deny network inet,
-  deny network inet6,
-  deny network raw,
-  deny network packet,
-  deny network netlink,
-  deny network unix,
-  deny network bluetooth,
+  # malicious parser, plan §6 / red-team F1). Su 2026-06-09: use the BARE
+  # `deny network,` rule, which denies EVERY address family. The previous
+  # enumerated list (inet, inet6, raw, packet, netlink, unix, bluetooth) was NOT
+  # exhaustive — it missed vsock, xdp, qipcrtr, can, tipc, smc, kcm, mctp and
+  # others a hostile parser could try. The bare rule is future-proof and cannot
+  # be bypassed via an unlisted family. (Defence-in-depth: network=none at the
+  # runtime layer + the seccomp profile's absence of socket() are the primary
+  # egress controls; this is the AppArmor backstop.)
+  deny network,
 
   # Deny every dangerous capability + kernel/hardware surface.
   deny capability sys_admin,
