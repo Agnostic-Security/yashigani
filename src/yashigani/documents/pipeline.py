@@ -50,8 +50,11 @@ from yashigani.documents.extractor import (
 from yashigani.documents.pseudonymize import (
     DEFAULT_MAP_TTL_S,
     CorrespondenceTable,
+    EchoEgressError,
+    ModeBRoundTrip,
     ReplacerMap,
     TokenAssigner,
+    build_modeb_roundtrip,
     build_pseudonymize_plan,
     build_redact_plan,
 )
@@ -108,6 +111,32 @@ class DocumentInspectionResult:
     correspondence_table: Optional["CorrespondenceTable"] = None
     #: The PSEUDONYMIZE delivery mode actually applied ("A" | "B").
     pseudonymize_mode: Optional[str] = None
+    #: Mode-B artefact (F3 / L-02): the request-scoped round-trip holder — the
+    #: PositionBinder primed with the egress frame + provenance, wrapping the
+    #: encrypted/TTL'd ReplacerMap.  The gateway holds it keyed by the map handle
+    #: and calls :meth:`DocumentInspectionPipeline.restore_modeb_response` on the
+    #: response path.  None for mode A / non-PSEUDONYMIZE.  The map is never
+    #: surfaced; only the binder's cleared restorations ever yield cleartext.
+    mode_b_roundtrip: Optional["ModeBRoundTrip"] = None
+
+
+@dataclass
+class ModeBRestoreResult:
+    """Outcome of restoring an untrusted mode-B cloud/upstream response (F3 / L-02).
+
+    ``restored`` is True only on a clean restore (no flags, no echo).  When
+    ``echo_rejected`` is True the response was a verbatim echo of the egress frame
+    and NOTHING was restored (``restored_text`` is the unchanged tokenized
+    response).  When ``flags`` is non-empty the binder refused some tokens
+    (foreign position / over-restore / namespace-harvest) — the caller treats the
+    round-trip as tainted and alerts."""
+
+    request_id: str
+    restored_text: str
+    restored: bool
+    echo_rejected: bool
+    flags: list[str] = field(default_factory=list)
+    audit_fields: dict = field(default_factory=dict)
 
 
 class DocumentInspectionPipeline:
@@ -688,6 +717,21 @@ class DocumentInspectionPipeline:
             else None
         )
 
+        # Mode B (F3 / L-02): prime the round-trip holder from the EGRESS FRAME —
+        # the text of the tokenized artefact exactly as the untrusted cloud will
+        # see it (the re-extracted output segments).  The binder records each
+        # token's egress provenance + the frame itself, so the response path can
+        # restore only count/position-consistent tokens, reject a verbatim echo of
+        # the frame, and bound how much of the namespace any one response restores.
+        # The replacer map is wrapped in the holder and NEVER surfaced to the
+        # cloud, the plan, or any log line.
+        mode_b: Optional[ModeBRoundTrip] = None
+        if mode == "B":
+            egress_frame = "\n".join(
+                str(s.get("text", "")) for s in result.output_segments
+            )
+            mode_b = build_modeb_roundtrip(assigner, replacer_map, egress_frame)
+
         audit = {
             "event_type": "DOCUMENT_PSEUDONYMIZED",
             "request_id": request_id,
@@ -718,6 +762,79 @@ class DocumentInspectionPipeline:
             replacer_map=replacer_map,
             correspondence_table=table,
             pseudonymize_mode=mode,
+            mode_b_roundtrip=mode_b,
+        )
+
+    # ------------------------------------------------------------------
+    # Mode-B response path — restore the untrusted cloud response (F3 / L-02).
+    # ------------------------------------------------------------------
+
+    def restore_modeb_response(
+        self,
+        request_id: str,
+        response_text: str,
+        round_trip: ModeBRoundTrip,
+    ) -> "ModeBRestoreResult":
+        """Restore tokens in an untrusted mode-B cloud/upstream response.
+
+        This is the RESPONSE-PATH seam of the mode-B round-trip (the egress→
+        response path the gateway already runs for request→upstream→response
+        inspection — see ``proxy.py``).  Called once on the way back, AFTER the
+        tokenized payload was sent out and the cloud answered.
+
+        The restore is fail-closed on the cloud-egress security boundary:
+
+          * **verbatim-echo (L-02)** — if the response is structurally an echo of
+            the egress frame (the harvest attack: bounce the frame back to
+            recover cleartext), restoration is REFUSED wholesale, an alert audit
+            event is written, and the ORIGINAL (still-tokenized) response is
+            returned.  No real value is restored.
+          * **anomalous restore** — any token left un-restored by the binder
+            (foreign position, over-restore, namespace-harvest beyond the cap) is
+            reported in ``flags``; the caller treats a flagged round-trip as
+            tainted (forward the partially-/non-restored text + alert), never as a
+            clean success.
+
+        The :class:`ReplacerMap` is NEVER surfaced — only the binder's cleared
+        restorations yield cleartext, and only here on the trusted host.
+        """
+        try:
+            restored, flags = round_trip.restore(response_text)
+        except EchoEgressError as exc:
+            audit: dict = {
+                "event_type": "DOCUMENT_MODEB_ECHO_REJECTED",
+                "request_id": request_id,
+                "disposition": "RESTORE_REFUSED",
+                "reason": str(exc),
+                # The handle is the capability — NEVER audited (F5).
+            }
+            self._on_audit("DOCUMENT_MODEB_ECHO_REJECTED", audit)
+            return ModeBRestoreResult(
+                request_id=request_id,
+                restored_text=response_text,  # unchanged — nothing restored
+                restored=False,
+                echo_rejected=True,
+                flags=[],
+                audit_fields=audit,
+            )
+
+        ok = not flags
+        event_name = "DOCUMENT_MODEB_RESTORED" if ok else "DOCUMENT_MODEB_RESTORE_FLAGGED"
+        audit = {
+            "event_type": event_name,
+            "request_id": request_id,
+            "disposition": "RESTORED" if ok else "RESTORE_FLAGGED",
+            # Flags are token IDs only (e.g. "[PERSON_3]") — never the originals.
+            "flagged_tokens": list(flags),
+        }
+        self._on_audit(event_name, audit)
+        return ModeBRestoreResult(
+            request_id=request_id,
+            restored_text=restored,
+            restored=ok,
+            echo_rejected=False,
+            flags=list(flags),
+            audit_fields=audit,
         )
 
     def _block(

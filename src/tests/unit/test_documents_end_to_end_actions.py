@@ -356,3 +356,173 @@ def test_small_set_escalation_disabled_allows_pseudonymize():
     r = pipe.inspect(csv, "text/csv", request_id="req-f2-off",
                      requested_action="PSEUDONYMIZE")
     assert r.disposition == DISPOSITION_PSEUDONYMIZE
+
+
+# ---------------------------------------------------------------------------
+# F3 / L-02 — PSEUDONYMIZE mode-B round-trip WIRED into the pipeline, with the
+# verbatim-egress-echo residual CLOSED.  These exercise the real render path
+# (worker subprocess) end-to-end: outbound tokenized -> response restored, the
+# replacer map never surfaced, and Laura's verbatim-echo attack blocked.
+# ---------------------------------------------------------------------------
+
+# A NON-QI email-only set large enough to clear the small-set gate (>20 rows),
+# so PSEUDONYMIZE proceeds rather than escalating to BLOCK on the demo path.
+# Single email column only (no name column → no header-driven PERSON_NAME QI),
+# so the set carries no quasi-identifier and the small-set gate does not fire.
+def _modeb_csv(n: int = 25) -> bytes:
+    rows = "\n".join(f"user{i}@example.com" for i in range(1, n + 1))
+    return (f"email\n{rows}\n").encode()
+
+
+def _modeb_pipeline(audit_sink=None):
+    from yashigani.pii.detector import PiiDetector, PiiMode, PiiType
+    runner = SandboxedExtractorRunner(backend=_WorkerSubprocessBackend())
+    reg = ExtractorRegistry(sandbox_runner=runner)
+    # Email-only so no quasi-identifier is present → small-set gate does not fire
+    # even though we keep the set modest; we also clear the threshold by row count.
+    det = PiiDetector(mode=PiiMode.LOG, enabled_types={PiiType.EMAIL})
+    return DocumentInspectionPipeline(
+        registry=reg, pii_detector=det, on_audit=audit_sink,
+        small_set_threshold=20,
+    )
+
+
+def _modeb_prose_doc() -> bytes:
+    """A prose document carrying a handful of distinct emails in DISTINCT
+    sentences.  A genuine mode-B answer quotes one record at its issued context
+    WITHOUT reproducing the whole frame's structure — so it restores cleanly,
+    while a verbatim echo of the frame is still rejected.  (A degenerate pure-
+    token-list frame — e.g. a one-column CSV of emails — cannot be safely
+    round-tripped because any faithful response is structurally an echo; that is
+    correct fail-closed behaviour and is asserted separately.)"""
+    return (
+        "Finance team contacts.\n"
+        "The accounts lead is reachable at alice@example.com for invoices.\n"
+        "For payroll questions, write to bob@example.com any weekday.\n"
+        "Vendor onboarding goes through carol@example.com only.\n"
+        "Escalations should copy dave@example.com on the thread.\n"
+        "The audit liaison is erin@example.com this quarter.\n"
+    ).encode()
+
+
+def test_modeb_roundtrip_wired_happy_path():
+    """Mode-B end-to-end: outbound tokenized (cloud sees placeholders), then a
+    GENUINE cloud answer referencing one record at its issued context is restored
+    to the real value via the wired PositionBinder. Map never surfaced."""
+    pipe = _modeb_pipeline()
+    r = pipe.inspect(_modeb_prose_doc(), "text/plain", request_id="req-mb",
+                     requested_action="PSEUDONYMIZE", pseudonymize_mode="B")
+    assert r.disposition == DISPOSITION_PSEUDONYMIZE, r.block_reason
+    assert r.pseudonymize_mode == "B"
+    # Mode B does NOT hand the user a correspondence table (internal round-trip).
+    assert r.correspondence_table is None
+    # The round-trip holder is wired, primed with the egress frame + map.
+    assert r.mode_b_roundtrip is not None
+    # The tokenized artefact (what the cloud sees) carries tokens, not originals.
+    out_text = r.forward_bytes.decode()
+    assert "alice@example.com" not in out_text
+    assert "[EMAIL_1]" in out_text
+
+    # A GENUINE cloud answer: it answers about ONE record, reproducing the issued
+    # ±24-char context of that token but NOT the whole frame's structure.
+    rt = r.mode_b_roundtrip
+    frame = "\n".join(s for s in out_text.splitlines())
+    idx = frame.find("[EMAIL_1]")
+    answer = "You can reach them: " + frame[max(0, idx - 24): idx + len("[EMAIL_1]") + 24]
+    restore = pipe.restore_modeb_response("req-mb", answer, rt)
+    assert restore.echo_rejected is False, restore
+    assert restore.restored is True, restore.flags
+    assert restore.flags == []
+    assert "alice@example.com" in restore.restored_text
+
+
+def test_modeb_verbatim_echo_attack_blocked():
+    """Laura's L-02 verbatim-egress-echo: a malicious/poisoned cloud echoes the
+    egress frame back verbatim to harvest cleartext. The wired response path must
+    REFUSE restoration wholesale and restore NOTHING (fail-closed)."""
+    events: list[tuple[str, dict]] = []
+    pipe = _modeb_pipeline(audit_sink=lambda name, data: events.append((name, data)))
+    r = pipe.inspect(_modeb_csv(), "text/csv", request_id="req-echo",
+                     requested_action="PSEUDONYMIZE", pseudonymize_mode="B")
+    assert r.mode_b_roundtrip is not None
+
+    # The attacker echoes the EXACT egress frame (the tokenized payload we sent).
+    egress_frame = r.forward_bytes.decode()
+    restore = pipe.restore_modeb_response("req-echo", egress_frame, r.mode_b_roundtrip)
+
+    # Fail-closed: echo rejected, NOTHING restored, response returned unchanged.
+    assert restore.echo_rejected is True
+    assert restore.restored is False
+    assert "@example.com" not in restore.restored_text  # no email cleartext at all
+    assert restore.restored_text == egress_frame  # unchanged tokenized response
+    # An alert audit event was written for the rejected echo.
+    assert any(name == "DOCUMENT_MODEB_ECHO_REJECTED" for name, _ in events)
+
+
+def test_modeb_echo_with_prose_wrapper_blocked():
+    """The attacker wraps the echoed frame in prose to look like an answer; the
+    token-tag sequence still reproduces the frame verbatim → rejected."""
+    pipe = _modeb_pipeline()
+    r = pipe.inspect(_modeb_csv(), "text/csv", request_id="req-echo2",
+                     requested_action="PSEUDONYMIZE", pseudonymize_mode="B")
+    egress_frame = r.forward_bytes.decode()
+    crafted = "Here is the data you asked about:\n\n" + egress_frame + "\n\nThanks!"
+    restore = pipe.restore_modeb_response("req-echo2", crafted, r.mode_b_roundtrip)
+    assert restore.echo_rejected is True
+    assert "@example.com" not in restore.restored_text
+
+
+def test_modeb_namespace_dump_flagged_not_restored():
+    """A non-echo namespace dump (replay tokens in an attacker frame) is NOT a
+    verbatim echo but is still refused by position binding → flagged, not
+    restored (the round-trip is tainted)."""
+    pipe = _modeb_pipeline()
+    r = pipe.inspect(_modeb_csv(), "text/csv", request_id="req-dump",
+                     requested_action="PSEUDONYMIZE", pseudonymize_mode="B")
+    # Attacker frames a few tokens in a sentence they were never issued in.
+    attack = "Exfil dump: [EMAIL_1] then [EMAIL_2] then [EMAIL_3]."
+    restore = pipe.restore_modeb_response("req-dump", attack, r.mode_b_roundtrip)
+    assert restore.echo_rejected is False
+    # Position binding refused them: nothing restored, tokens flagged.
+    assert "@example.com" not in restore.restored_text
+    assert restore.flags, "foreign-position replays must be flagged"
+    assert restore.restored is False
+
+
+def test_modeb_map_never_surfaced_in_audit_or_holder_text():
+    """The replacer map / handle is never surfaced: not in audit, and the
+    round-trip restore output only contains cleared cleartext (no map dump)."""
+    import json
+    events: list[tuple[str, dict]] = []
+    pipe = _modeb_pipeline(audit_sink=lambda name, data: events.append((name, data)))
+    r = pipe.inspect(_modeb_csv(), "text/csv", request_id="req-mb-map",
+                     requested_action="PSEUDONYMIZE", pseudonymize_mode="B")
+    handle = r.mode_b_roundtrip.handle
+    # Drive a genuine restore + an echo rejection so both audit shapes are emitted.
+    egress_frame = r.forward_bytes.decode()
+    pipe.restore_modeb_response("req-mb-map", egress_frame, r.mode_b_roundtrip)
+    audit_blob = json.dumps([d for _, d in events], default=str)
+    assert handle not in audit_blob, "map handle leaked into audit (F5)"
+    assert "@example.com" not in audit_blob, "original leaked into audit (F12)"
+
+
+def test_modeb_ttl_expiry_fails_closed_on_response_path():
+    """TTL/handle properties hold on the RESPONSE path: an expired replacer map
+    fails closed (no partial restore) even if the response is otherwise genuine."""
+    from yashigani.documents.pseudonymize import ReplacerMapExpiredError
+    pipe = _modeb_pipeline()
+    r = pipe.inspect(_modeb_csv(), "text/csv", request_id="req-mb-ttl",
+                     requested_action="PSEUDONYMIZE", pseudonymize_mode="B",
+                     map_ttl_s=1)
+    rt = r.mode_b_roundtrip
+    # Reveal-after-expiry on the wrapped map fails closed (the map is the custody
+    # boundary; its TTL governs every reveal, including the response path).
+    handle = rt.handle
+    import time as _t
+    # Force expiry by revealing with a now far in the future.
+    with pytest.raises(ReplacerMapExpiredError):
+        rt.replacer_map.reveal(handle, now=_t.monotonic() + 10_000)
+    # Destroy is idempotent and also fails closed on subsequent reveal.
+    rt.destroy()
+    with pytest.raises(ReplacerMapExpiredError):
+        rt.replacer_map.reveal(handle)

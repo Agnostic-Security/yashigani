@@ -14,6 +14,7 @@ import pytest
 
 from yashigani.documents.pseudonymize import (
     CorrespondenceTable,
+    EchoEgressError,
     PositionBinder,
     ReplacerMap,
     ReplacerMapExpiredError,
@@ -212,18 +213,108 @@ def test_position_binder_blocks_namespace_dump_attack():
 
 
 def test_position_binder_restores_at_consistent_position():
-    """The legitimate round-trip: the model echoes a token in the SAME context it
-    was sent in → restored. (Position binding must not break the happy path.)"""
+    """The legitimate round-trip: a genuine answer references a SMALL number of
+    tokens at the context they were issued in → restored.
+
+    A genuine mode-B answer is a *transformation* of the egress frame (an
+    extracted field, a decision about one record), not a reproduction of the
+    whole frame — so it references a handful of tokens, well under the
+    bounded-restoration cap, each in its issued context.
+    """
     names = ["Alice", "Bob", "Carol"]
     b = PositionBinder()
     tokenized = _egress_directory(b, names)
-    # The model returns the egress payload essentially unchanged (it reasoned
-    # over it and handed it back in the same frame).
-    restored, flags = b.restore(tokenized)
-    assert restored.count("Alice") == 1
+    # A genuine answer: the cloud answered about one record, reproducing the SAME
+    # ±24-char surrounding context the token was issued in (a quoted snippet of
+    # the record), but NOT the whole frame.  Take the issued window of PERSON_2.
+    idx = tokenized.find("[PERSON_2]")
+    answer = tokenized[max(0, idx - 24): idx + len("[PERSON_2]") + 24]
+    restored, flags = b.restore(answer)
     assert restored.count("Bob") == 1
-    assert restored.count("Carol") == 1
+    assert "Alice" not in restored  # not referenced by this answer
     assert flags == []
+
+
+def test_position_binder_rejects_verbatim_egress_echo():
+    """L-02 verbatim-echo CLOSE: when the egress frame is recorded, a response
+    that echoes the whole tokenized frame back verbatim is rejected — restore
+    NOTHING — even though every token lands in its issued context.
+
+    This is the residual Laura flagged: the egress frame is known to the
+    untrusted cloud, so an echo of it passes pure context binding.  The
+    structural echo guard fails the round-trip closed."""
+    names = ["Alice", "Bob", "Carol", "Dave", "Erin"]
+    b = PositionBinder()
+    tokenized = _egress_directory(b, names)
+    # Pipeline records the egress frame on egress (the verbatim-echo close).
+    b.record_egress_frame(tokenized)
+
+    # Malicious/poisoned cloud echoes the egress frame back to harvest cleartext.
+    with pytest.raises(EchoEgressError):
+        b.restore(tokenized)
+
+
+def test_position_binder_echo_with_prose_wrapper_still_rejected():
+    """The attacker wraps the echoed frame in a little prose to look like an
+    answer.  The token-tag sequence still reproduces the frame verbatim →
+    rejected."""
+    names = ["Alice", "Bob", "Carol", "Dave"]
+    b = PositionBinder()
+    tokenized = _egress_directory(b, names)
+    b.record_egress_frame(tokenized)
+    crafted = "Sure, here is the document you sent:\n\n" + tokenized + "\n\nHope that helps!"
+    with pytest.raises(EchoEgressError):
+        b.restore(crafted)
+
+
+def test_position_binder_bounded_restoration_caps_namespace_harvest():
+    """Bounded restoration: even below the echo threshold, a single response may
+    not restore more than the cap fraction of the namespace.  A response trying
+    to harvest most of the namespace fails closed on the surplus tokens."""
+    # 10 names; cap = ceil(0.5 * 10) = 5 distinct restorations max.
+    names = [f"Person{chr(64 + i)}" for i in range(1, 11)]
+    b = PositionBinder()
+    tokenized = _egress_directory(b, names)
+    # Do NOT record the egress frame here, so the echo guard does not pre-empt —
+    # we want to prove the cap independently.  Re-issue each token in its issued
+    # context (so context binding alone would allow ALL of them).
+    restored, flags = b.restore(tokenized)
+    restored_names = [n for n in names if n in restored]
+    assert len(restored_names) <= 5, "bounded restoration cap exceeded"
+    assert flags, "surplus namespace-harvest tokens must be flagged"
+
+
+def test_position_binder_genuine_small_answer_under_cap_unaffected():
+    """A genuine small answer (one or two tokens) is never penalised by the cap."""
+    names = [f"Person{chr(64 + i)}" for i in range(1, 11)]
+    b = PositionBinder()
+    tokenized = _egress_directory(b, names)
+    idx = tokenized.find("[PERSON_2]")
+    answer = tokenized[max(0, idx - 24): idx + len("[PERSON_2]") + 24]
+    restored, flags = b.restore(answer)
+    assert restored.count("PersonB") == 1
+    assert flags == []
+
+
+def test_position_binder_partial_slice_residual_is_bounded():
+    """Documented residual: a partial-slice echo that stays under the echo
+    threshold + the per-response cap CAN restore up to ~max_restore_fraction of
+    the namespace — but NO MORE.  This locks in the bound (the residual is a
+    bounded slice, never the whole namespace) so a regression that widens it is
+    caught."""
+    names = [f"Person{chr(64 + i)}" for i in range(1, 21)]  # 20 → cap 10
+    b = PositionBinder()
+    tokenized = _egress_directory(b, names)
+    # Frame recorded → echo guard active.  An attacker echoing the WHOLE frame is
+    # rejected (proven elsewhere); here we feed the frame WITHOUT recording it to
+    # isolate the cap, then assert at most the cap fraction is ever restored.
+    b2 = PositionBinder()
+    tokenized2 = _egress_directory(b2, names)
+    restored, flags = b2.restore(tokenized2)
+    restored_count = sum(1 for n in names if n in restored)
+    assert restored_count <= 10, "bounded-restoration cap breached (residual widened)"
+    assert restored_count < len(names), "whole namespace must never restore in one response"
+    assert flags, "surplus tokens beyond the cap must be flagged"
 
 
 def test_position_binder_rejects_moved_token_even_within_count():

@@ -54,13 +54,17 @@ from yashigani.documents.pipeline import (
     DISPOSITION_REDACT,
     DocumentInspectionPipeline,
     DocumentInspectionResult,
+    ModeBRestoreResult,
 )
 from yashigani.documents.pseudonymize import (
     CorrespondenceTable,
+    EchoEgressError,
+    ModeBRoundTrip,
     PositionBinder,
     ReplacerMap,
     ReplacerMapExpiredError,
     TokenAssigner,
+    build_modeb_roundtrip,
     local_remerge,
 )
 from yashigani.documents.segment import (
@@ -107,6 +111,7 @@ __all__ = [
     # pipeline
     "DocumentInspectionPipeline",
     "DocumentInspectionResult",
+    "ModeBRestoreResult",
     "DISPOSITION_LOG",
     "DISPOSITION_REDACT",
     "DISPOSITION_PSEUDONYMIZE",
@@ -121,6 +126,9 @@ __all__ = [
     "ReplacerMapExpiredError",
     "CorrespondenceTable",
     "PositionBinder",
+    "EchoEgressError",
+    "ModeBRoundTrip",
+    "build_modeb_roundtrip",
     "local_remerge",
     # column-semantic identifying-class detection (L-01 / F2 QI breadth)
     "ContextMatch",

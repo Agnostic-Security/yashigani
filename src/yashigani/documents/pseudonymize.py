@@ -313,6 +313,20 @@ class _EgressOccurrence:
 _TOKEN_RE_SRC = r"\[[A-Z0-9]+_\d+\]"
 
 
+class EchoEgressError(Exception):
+    """The cloud response is structurally an ECHO of the egress frame (L-02
+    verbatim-echo) — fail-closed: restore NOTHING, flag, alert.
+
+    The egress frame (the tokenized payload we sent to the untrusted cloud) is
+    KNOWN to the adversary by construction.  Pure position/context binding cannot
+    distinguish a legitimate answer (a *transformation* of the input) from a
+    crafted verbatim/near-verbatim echo of the egress frame (whose every token
+    lands in exactly the context it was issued in, so every context check
+    passes).  A response that reproduces the egress frame's token layout/
+    structure is therefore treated as anomalous and the whole round-trip fails
+    closed — the namespace is NOT restored into attacker-shaped output."""
+
+
 @dataclass
 class PositionBinder:
     """Mode-B re-substitution guard (red-team F3 / L-02).
@@ -340,12 +354,66 @@ class PositionBinder:
     once in a "Full staff directory: …" sentence — therefore restores NOTHING:
     every replay lands in an attacker context the token was never issued in.
 
+    **Verbatim-egress-echo close (L-02 residual).** Context binding alone cannot
+    distinguish a legitimate answer from an echo of the egress frame, because the
+    frame is known to the adversary and every token in the echo lands in exactly
+    the context it was issued in.  Two complementary structural controls close
+    this, evaluated in :meth:`restore` BEFORE any per-token restoration:
+
+      1. **Echo-shaped-response rejection** — when the egress frame text is
+         recorded (:meth:`record_egress_frame`), a response whose token layout /
+         structure is suspiciously similar to the egress frame (Jaccard overlap
+         of the inter-token "skeleton" ≥ ``echo_similarity_threshold``, or the
+         response reproduces the egress token *sequence* near-verbatim) is
+         rejected as an echo → :class:`EchoEgressError`, restore nothing.  A
+         genuine answer is a *transformation* (a summary, an extracted field, a
+         decision) — not a reproduction of the frame's structure.
+
+      2. **Bounded restoration** — even below the echo threshold, no single
+         response may restore more than ``max_restore_fraction`` of the distinct
+         egress namespace.  A response trying to restore most/all of the
+         namespace (the harvest goal) is anomalous and fails closed; a genuine
+         answer references a small handful of tokens.
+
+    **Documented residual + blast-radius (for Lu / Petra / threat model).**
+    The echo guard + bounded restoration close Laura's *verbatim*-echo (the whole
+    frame bounced back) and bound any single response to ``max_restore_fraction``
+    of the namespace.  A *partial*-slice echo that stays both below the echo
+    threshold AND under the per-response cap can still restore up to that fraction
+    of the namespace into an attacker-shaped response.  The blast radius is
+    bounded three ways: (a) at most ~``max_restore_fraction`` of ONE request's
+    namespace per response; (b) every request mints a FRESH, independent token
+    namespace + a fresh, TTL'd :class:`ReplacerMap` (the assigner + map are
+    request-scoped in the pipeline), so an attacker cannot accumulate restorations
+    across requests against a stable namespace; (c) position binding still
+    requires each restored token to land in its issued ±24-char context, so the
+    slice must reproduce genuine egress context (not arbitrary attacker framing).
+    A full namespace harvest from a single tokenized payload is therefore NOT
+    achievable; the residual is a partial, single-request, context-faithful slice
+    — materially weaker than the original whole-namespace dump.  Operators handling
+    extreme-sensitivity sets should keep mode B for non-token-list documents (a
+    degenerate pure-token-list frame fails closed — see below) and may lower
+    ``max_restore_fraction`` to tighten the per-response cap further.
+
     (Per-request namespace salting + injection-classify-before-restore remain
-    pipeline/Ogen concerns; this object owns the count + position mechanics — the
-    ``bind_restore_to_egress_positions`` obligation the rego surfaces.)
+    pipeline/Ogen concerns; this object owns the count + position + echo/anomaly
+    mechanics — the ``bind_restore_to_egress_positions`` obligation the rego
+    surfaces.)
     """
 
     _egress: dict[str, _EgressOccurrence] = field(default_factory=dict)
+    #: The recorded egress-frame text (the tokenized payload sent to the cloud)
+    #: used for echo-shaped-response detection.  Set via
+    #: :meth:`record_egress_frame`; when unset, echo detection degrades to the
+    #: token-sequence check over the egress map only.
+    _egress_frame: str = ""
+    #: Reject a response whose inter-token structural skeleton overlaps the
+    #: egress frame at or above this Jaccard ratio (verbatim/near-verbatim echo).
+    echo_similarity_threshold: float = 0.6
+    #: A single response may restore at most this fraction of the DISTINCT egress
+    #: namespace.  Above this, the response is treated as a namespace harvest and
+    #: fails closed.  (1.0 only when there is a single token — see _restore_cap.)
+    max_restore_fraction: float = 0.5
 
     def record_egress(
         self,
@@ -389,24 +457,143 @@ class PositionBinder:
             occ.contexts[key] = occ.contexts.get(key, 0) + 1
             idx = egress_text.find(token, idx + len(token))
 
+    def record_egress_frame(self, egress_text: str) -> None:
+        """Record the full egress-frame text (the tokenized payload sent to the
+        untrusted cloud) for verbatim-echo detection (L-02).
+
+        Called once per request as the tokenized artefact leaves the gateway.
+        The response path compares the cloud response against this frame; a
+        response that structurally reproduces it is rejected as an echo."""
+        self._egress_frame = egress_text or ""
+
+    @staticmethod
+    def _structural_skeleton(text: str) -> list[str]:
+        """The inter-token structural skeleton of ``text``: the ordered list of
+        normalised non-token fragments BETWEEN the placeholder tokens, plus the
+        token *tags* (type, not index) in order.
+
+        Two texts with the same skeleton say the same thing around the same kinds
+        of tokens in the same order — i.e. one is an echo of the other's frame.
+        A genuine answer rearranges / drops / summarises the frame and so has a
+        very different skeleton.  Token *indices* are elided (``[PERSON_1]`` and
+        ``[PERSON_2]`` both become ``PERSON``) so that simply permuting which
+        person lands where does not evade the check."""
+        import re as _re
+
+        parts: list[str] = []
+        last = 0
+        for m in _re.finditer(_TOKEN_RE_SRC, text):
+            between = text[last:m.start()]
+            norm = _re.sub(r"\s+", " ", between).strip().casefold()
+            if norm:
+                parts.append(norm)
+            tag = m.group(0).strip("[]").rsplit("_", 1)[0]
+            parts.append(f"\x00{tag}")
+            last = m.end()
+        tail = _re.sub(r"\s+", " ", text[last:]).strip().casefold()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _is_echo_shaped(self, response_text: str) -> bool:
+        """True iff ``response_text`` is a verbatim/near-verbatim echo of the
+        recorded egress frame (L-02 verbatim-echo).
+
+        Two structural signals, EITHER of which trips the guard:
+
+          * **skeleton Jaccard** — the inter-token skeletons of the response and
+            the egress frame overlap at or above ``echo_similarity_threshold``;
+          * **token-sequence reproduction** — the ordered sequence of token
+            *tags* in the response reproduces the egress frame's token-tag
+            sequence as a contiguous run (the attacker simply pasted the frame
+            back, possibly wrapped in a little prose).
+        """
+        frame = self._egress_frame
+        if not frame:
+            return False
+        resp_skel = self._structural_skeleton(response_text)
+        frame_skel = self._structural_skeleton(frame)
+        if not frame_skel:
+            return False
+
+        # Signal 1 — skeleton Jaccard overlap.
+        rs, fs = set(resp_skel), set(frame_skel)
+        if fs:
+            jaccard = len(rs & fs) / len(rs | fs)
+            if jaccard >= self.echo_similarity_threshold:
+                return True
+
+        # Signal 2 — the egress token-tag sequence appears verbatim in the
+        # response (the frame pasted back, optionally wrapped).
+        import re as _re
+
+        def _tag_seq(t: str) -> list[str]:
+            return [
+                m.group(0).strip("[]").rsplit("_", 1)[0]
+                for m in _re.finditer(_TOKEN_RE_SRC, t)
+            ]
+
+        frame_tags = _tag_seq(frame)
+        resp_tags = _tag_seq(response_text)
+        if frame_tags and len(frame_tags) >= 2 and len(resp_tags) >= len(frame_tags):
+            n = len(frame_tags)
+            for i in range(0, len(resp_tags) - n + 1):
+                if resp_tags[i:i + n] == frame_tags:
+                    return True
+        return False
+
+    def _restore_cap(self) -> int:
+        """Max distinct tokens a single response may restore (bounded restoration).
+
+        ``ceil(max_restore_fraction * namespace_size)`` with a floor of 1 so a
+        single-token namespace still round-trips, and so a small answer that
+        references one or two tokens is never penalised."""
+        import math
+
+        size = len(self._egress)
+        if size <= 1:
+            return size
+        return max(1, math.ceil(self.max_restore_fraction * size))
+
     def restore(self, response_text: str) -> tuple[str, list[str]]:
-        """Restore tokens in an untrusted cloud response — count- AND position-bound.
+        """Restore tokens in an untrusted cloud response — count- AND position-bound,
+        with verbatim-echo rejection + bounded restoration (L-02 close).
 
         Returns ``(restored_text, flags)`` where ``flags`` lists tokens that were
         partially or wholly REFUSED restoration (over-restore beyond count budget,
         OR replay in a position inconsistent with egress provenance — L-02).  A
         non-empty ``flags`` list fails the round-trip closed in the pipeline.
 
-        Each token instance in the response is examined IN PLACE: it is restored
-        only if (a) the token's count budget is not yet exhausted AND (b) a
-        position-binding context for this occurrence is still available (when the
-        token was egress-bound to contexts).  Replays in attacker-chosen
-        positions consume no budget and are LEFT AS THE TOKEN — so the
+        Before any per-token restoration:
+
+          * if the response is structurally an ECHO of the egress frame
+            (:meth:`_is_echo_shaped`) the whole round-trip fails closed with
+            :class:`EchoEgressError` — restore NOTHING (the verbatim-echo close);
+          * restoration is BOUNDED to :meth:`_restore_cap` distinct tokens; a
+            response trying to harvest more of the namespace than that is treated
+            as anomalous and every further distinct token is left as a token +
+            flagged.
+
+        Each token instance in the response is then examined IN PLACE: it is
+        restored only if (a) the token's count budget is not yet exhausted AND
+        (b) a position-binding context for this occurrence is still available
+        (when the token was egress-bound to contexts).  Replays in attacker-
+        chosen positions consume no budget and are LEFT AS THE TOKEN — so the
         namespace-dump attack restores nothing.
         """
         import re
 
+        # --- Verbatim-echo close (L-02): reject an echo of the egress frame ----
+        if self._is_echo_shaped(response_text):
+            raise EchoEgressError(
+                "cloud response is structurally an echo of the egress frame — "
+                "refusing to restore the namespace (verbatim-echo, fail-closed)"
+            )
+
         flags: list[str] = []
+        # Bounded restoration: distinct tokens already restored this response.
+        cap = self._restore_cap()
+        restored_distinct: set[str] = set()
         # Remaining count budget + per-context budget for each token.
         count_left = {tok: occ.egress_count for tok, occ in self._egress.items()}
         ctx_left = {
@@ -426,6 +613,14 @@ class PositionBinder:
                 if tok not in flags:
                     flags.append(tok)
                 return tok
+            # Bounded restoration: a single response may restore at most ``cap``
+            # DISTINCT tokens.  A new distinct token beyond the cap is a namespace
+            # harvest → leave as token + flag.  (Already-restored tokens within
+            # budget are unaffected — this bounds breadth, not depth.)
+            if tok not in restored_distinct and len(restored_distinct) >= cap:
+                if tok not in flags:
+                    flags.append(tok)
+                return tok
             # Position binding (L-02): if the token was egress-bound to specific
             # contexts, the replay's context MUST match one with budget left.
             ctxs = ctx_left.get(tok)
@@ -439,10 +634,86 @@ class PositionBinder:
                 ctxs[key] -= 1
             # Authorised: consume count budget, restore.
             count_left[tok] -= 1
+            restored_distinct.add(tok)
             return occ.original
 
         result = token_re.sub(_replace, response_text)
         return result, flags
+
+
+# ---------------------------------------------------------------------------
+# Mode B — request-scoped round-trip holder (pipeline seam, F3 / L-02).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModeBRoundTrip:
+    """The request-scoped state the gateway holds for a PSEUDONYMIZE mode-B
+    round-trip: the encrypted/TTL'd :class:`ReplacerMap` (crown jewel) + the
+    :class:`PositionBinder` primed with the egress provenance + egress frame.
+
+    The gateway tokenizes the document on egress (the cloud sees only the
+    placeholders), holds THIS object request-scoped keyed by the map's unguessable
+    handle, and on the response path calls :meth:`restore` — which restores ONLY
+    tokens that satisfy count + position binding, rejects a verbatim echo of the
+    egress frame, and bounds how much of the namespace any one response may
+    restore.  The :class:`ReplacerMap` itself is never surfaced to the cloud, the
+    plan, or any log line; only ``restore`` ever touches the real values, and only
+    on the trusted host after the binder has cleared the response."""
+
+    binder: "PositionBinder"
+    replacer_map: "ReplacerMap"
+    #: The token->original map, decrypted ONCE from the ReplacerMap at restore
+    #: time via the handle.  Held on the binder's _egress already (originals), so
+    #: this field is not stored; restoration uses the binder's recorded originals.
+
+    @property
+    def handle(self) -> str:
+        """The unguessable capability handle of the replacer map (NEVER logged)."""
+        return self.replacer_map.handle
+
+    def restore(self, response_text: str) -> tuple[str, list[str]]:
+        """Restore an untrusted cloud response on the trusted host.
+
+        Fail-closed: a verbatim-echo of the egress frame raises
+        :class:`EchoEgressError` (restore nothing); any token left un-restored
+        (foreign position, over-restore, or namespace-harvest beyond the cap) is
+        returned in ``flags`` so the pipeline can fail the round-trip closed and
+        alert.  The replacer map is never surfaced — only restored cleartext for
+        the cleared tokens appears in the returned text."""
+        return self.binder.restore(response_text)
+
+    def destroy(self) -> None:
+        """End-of-request teardown: destroy the replacer map (fail-closed)."""
+        self.replacer_map.destroy()
+
+
+def build_modeb_roundtrip(
+    assigner: "TokenAssigner",
+    replacer_map: "ReplacerMap",
+    egress_frame: str,
+) -> "ModeBRoundTrip":
+    """Prime a :class:`PositionBinder` from the tokenized egress frame and wrap it
+    with the replacer map as a request-scoped :class:`ModeBRoundTrip`.
+
+    ``egress_frame`` is the text of the tokenized artefact AS THE CLOUD WILL SEE
+    IT (the re-extracted output segments joined) — the binder records, for every
+    token, the egress context(s) it was emitted in within that frame, and records
+    the frame itself for verbatim-echo detection.
+    """
+    binder = PositionBinder()
+    # Bind each distinct token to the contexts it occupies in the egress frame.
+    for token, original in assigner.reverse_map.items():
+        # count = number of times this token appears in the egress frame.
+        n = egress_frame.count(token)
+        if n <= 0:
+            # Token was assigned but did not survive into the rendered frame
+            # (e.g. only present in a stripped hidden part) — record count 0 so a
+            # response referencing it cannot restore (no budget).
+            binder.record_egress(token, original, count=0)
+            continue
+        binder.record_egress(token, original, count=n, egress_text=egress_frame)
+    binder.record_egress_frame(egress_frame)
+    return ModeBRoundTrip(binder=binder, replacer_map=replacer_map)
 
 
 # ---------------------------------------------------------------------------
