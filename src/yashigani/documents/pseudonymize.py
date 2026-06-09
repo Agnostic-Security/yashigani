@@ -23,9 +23,11 @@ module owns the HOST-side machinery — the parts that must NEVER enter the jail
     LOCAL re-merge primitive (:func:`local_remerge`) that restores real values
     from the user's table, keyed on the identifier — the §5.3.1 capability.
 
-  - :class:`PositionBinder` — mode-B (F3): binds each token to its egress
-    provenance + occurrence count and only restores at consistent positions,
-    rejecting replays of in-map tokens in attacker-chosen positions.
+  - :class:`PositionBinder` — mode-B (F3 / L-02): binds each token to its egress
+    provenance (the textual CONTEXT it was emitted in) AND occurrence count, and
+    only restores at positions consistent with where it was issued — rejecting
+    replays of in-map tokens in attacker-chosen positions (the namespace-dump
+    attack), not merely when a count budget is exceeded.
 
 The replacer map is the GDPR Art. 4(5) "additional information kept separately"
 (§5.6) — it is exactly the data we just protected, keyed by token.  Everything in
@@ -276,71 +278,171 @@ def local_remerge(tokenized_text: str, table: dict[str, str]) -> str:
 # Mode B — position/count binding on the response path (plan §5.4, red-team F3).
 # ---------------------------------------------------------------------------
 
+def _context_key(text: str, start: int, end: int, *, radius: int = 24) -> str:
+    """Provenance fingerprint of the context a token was emitted in.
+
+    The key is the normalised surrounding window (``radius`` chars either side of
+    the token span, the token itself elided, whitespace collapsed, casefolded).
+    Two emissions of the same token in the same egress neighbourhood produce the
+    same key; the same token replayed in a different (attacker-framed) sentence
+    produces a different key.  This is the position/provenance the response path
+    binds restoration to — not a raw character offset (which the cloud reflows),
+    but the *textual context* the token legitimately stood in on egress.
+    """
+    import re as _re
+
+    left = text[max(0, start - radius):start]
+    right = text[end:end + radius]
+    ctx = f"{left}\x00{right}"
+    return _re.sub(r"\s+", " ", ctx).strip().casefold()
+
+
 @dataclass
-class _EgressToken:
+class _EgressOccurrence:
+    """One egress emission of a token: the value it stood for, and the set of
+    context fingerprints it was legitimately emitted in."""
+
     original: str
-    egress_count: int
+    egress_count: int = 0
+    #: context-key -> remaining restore budget for THAT context.  Restoration is
+    #: only permitted at a context consistent with where the token was issued.
+    contexts: dict[str, int] = field(default_factory=dict)
+
+
+# Token-shaped fragments the response path scans for: ``[TAG_n]``.
+_TOKEN_RE_SRC = r"\[[A-Z0-9]+_\d+\]"
 
 
 @dataclass
 class PositionBinder:
-    """Mode-B re-substitution guard (red-team F3).
+    """Mode-B re-substitution guard (red-team F3 / L-02).
 
-    Binds each token to its **egress occurrence count** and only restores up to
-    that count.  The cloud response is UNTRUSTED: an attacker who learned the
-    token namespace can replay in-map tokens in attacker-chosen positions to make
-    the gateway leak.  So restoration is **bound, not blind**:
+    The cloud response is UNTRUSTED.  An attacker who learned the token namespace
+    (we sent ``[PERSON_1..N]``) can replay each in-map token **once**, within the
+    per-token count budget, in an attacker-chosen sentence — a "namespace dump" —
+    and a count-only cap restores the entire real-value set into exfil-shaped
+    output with zero over-restore flags (Laura, PROVEN).  The count-cap is the
+    WRONG invariant: it stops amplification, not namespace exfiltration.
 
-      - cap restoration of each token to the number of times it was SENT
-        (a response with more instances than egress is an over-restore attack ->
-        fail-closed for the surplus);
-      - an unknown token (not in the egress set) is left as-is (never guessed,
-        §5.4 fail-closed corner).
+    This binder restores a token only when BOTH hold:
 
-    (The injection-classify-before-restore step and per-request namespace salting
-    are pipeline/Ogen concerns; this object owns the count/position mechanics —
-    the ``bind_restore_to_egress_positions`` obligation the rego surfaces.)
+      - **count budget** — the token is restored at most the number of times it
+        was SENT (surplus instances are left as tokens + flagged over-restore);
+      - **position / provenance binding (L-02)** — the token is restored only at
+        a response position whose surrounding context is CONSISTENT with an
+        egress context the token was issued in (:func:`_context_key`).  A token
+        that reappears in a new / attacker-chosen position is NOT restored — it
+        is left as the token and reported in ``rejected_positions`` so the
+        pipeline fails the round-trip closed.
+
+    An unknown token (never in the egress set) is left as-is (never guessed,
+    §5.4 fail-closed corner).  The namespace-dump attack — replay every token
+    once in a "Full staff directory: …" sentence — therefore restores NOTHING:
+    every replay lands in an attacker context the token was never issued in.
+
+    (Per-request namespace salting + injection-classify-before-restore remain
+    pipeline/Ogen concerns; this object owns the count + position mechanics — the
+    ``bind_restore_to_egress_positions`` obligation the rego surfaces.)
     """
 
-    _egress: dict[str, _EgressToken] = field(default_factory=dict)
+    _egress: dict[str, _EgressOccurrence] = field(default_factory=dict)
 
-    def record_egress(self, token: str, original: str, count: int = 1) -> None:
-        """Register that ``token`` (standing for ``original``) was sent ``count``
-        times.  Called as the tokenized payload leaves the gateway."""
-        if token in self._egress:
-            self._egress[token].egress_count += count
-        else:
-            self._egress[token] = _EgressToken(original=original, egress_count=count)
+    def record_egress(
+        self,
+        token: str,
+        original: str,
+        count: int = 1,
+        *,
+        egress_text: Optional[str] = None,
+        span: Optional[tuple[int, int]] = None,
+    ) -> None:
+        """Register that ``token`` (standing for ``original``) was sent.
+
+        Called as the tokenized payload leaves the gateway.  When the egress
+        ``egress_text`` and the token's ``span`` are supplied, the binder records
+        the **context fingerprint** the token was emitted in (L-02 position
+        binding) so the response path can reject replays in foreign positions.
+
+        If no context is supplied the binder degrades to count-only binding for
+        that emission (back-compat); callers wanting the L-02 guarantee MUST
+        supply the egress text + span — which the pipeline does for every span it
+        emits.  When the same egress text is supplied without an explicit span,
+        every occurrence of the token in that text is recorded as a valid
+        context (the common "I tokenized this whole payload" call shape)."""
+        occ = self._egress.get(token)
+        if occ is None:
+            occ = _EgressOccurrence(original=original)
+            self._egress[token] = occ
+        occ.egress_count += count
+
+        if egress_text is None:
+            return
+        if span is not None:
+            key = _context_key(egress_text, span[0], span[1])
+            occ.contexts[key] = occ.contexts.get(key, 0) + 1
+            return
+        # No explicit span: record EVERY occurrence of the token in egress_text
+        # as a legitimate context.
+        idx = egress_text.find(token)
+        while idx != -1:
+            key = _context_key(egress_text, idx, idx + len(token))
+            occ.contexts[key] = occ.contexts.get(key, 0) + 1
+            idx = egress_text.find(token, idx + len(token))
 
     def restore(self, response_text: str) -> tuple[str, list[str]]:
-        """Restore tokens in an untrusted cloud response, count-bound.
+        """Restore tokens in an untrusted cloud response — count- AND position-bound.
 
-        Returns ``(restored_text, over_restore_tokens)``.  Each token is restored
-        at most its egress count; instances beyond that are LEFT AS THE TOKEN and
-        the token is reported in ``over_restore_tokens`` (the pipeline fails the
-        round-trip closed on a non-empty over-restore list).  Unknown tokens are
-        left untouched.
+        Returns ``(restored_text, flags)`` where ``flags`` lists tokens that were
+        partially or wholly REFUSED restoration (over-restore beyond count budget,
+        OR replay in a position inconsistent with egress provenance — L-02).  A
+        non-empty ``flags`` list fails the round-trip closed in the pipeline.
+
+        Each token instance in the response is examined IN PLACE: it is restored
+        only if (a) the token's count budget is not yet exhausted AND (b) a
+        position-binding context for this occurrence is still available (when the
+        token was egress-bound to contexts).  Replays in attacker-chosen
+        positions consume no budget and are LEFT AS THE TOKEN — so the
+        namespace-dump attack restores nothing.
         """
         import re
 
-        over: list[str] = []
-        remaining = {tok: et.egress_count for tok, et in self._egress.items()}
+        flags: list[str] = []
+        # Remaining count budget + per-context budget for each token.
+        count_left = {tok: occ.egress_count for tok, occ in self._egress.items()}
+        ctx_left = {
+            tok: dict(occ.contexts) for tok, occ in self._egress.items()
+        }
 
-        # Replace token-by-token, longest first (so [X_10] isn't shadowed by
-        # [X_1]); for each token, restore up to its remaining budget.
-        result = response_text
-        for tok in sorted(self._egress, key=len, reverse=True):
-            original = self._egress[tok].original
-            budget = remaining[tok]
-            seen = result.count(tok)
-            if seen > budget:
-                over.append(tok)
-            # Restore at most `budget` occurrences (left to right).
-            count_to_do = min(seen, budget)
-            if count_to_do:
-                result = result.replace(tok, original, count_to_do)
-            remaining[tok] = max(0, budget - count_to_do)
-        return result, over
+        token_re = re.compile(_TOKEN_RE_SRC)
+
+        def _replace(m: "re.Match[str]") -> str:
+            tok = m.group(0)
+            occ = self._egress.get(tok)
+            if occ is None:
+                # Unknown token — never guessed (§5.4 fail-closed).
+                return tok
+            # Count budget exhausted → over-restore; leave as token.
+            if count_left.get(tok, 0) <= 0:
+                if tok not in flags:
+                    flags.append(tok)
+                return tok
+            # Position binding (L-02): if the token was egress-bound to specific
+            # contexts, the replay's context MUST match one with budget left.
+            ctxs = ctx_left.get(tok)
+            if ctxs:  # token has recorded egress provenance
+                key = _context_key(response_text, m.start(), m.end())
+                if ctxs.get(key, 0) <= 0:
+                    # Replay in a position the token was NOT issued in — refuse.
+                    if tok not in flags:
+                        flags.append(tok)
+                    return tok
+                ctxs[key] -= 1
+            # Authorised: consume count budget, restore.
+            count_left[tok] -= 1
+            return occ.original
+
+        result = token_re.sub(_replace, response_text)
+        return result, flags
 
 
 # ---------------------------------------------------------------------------

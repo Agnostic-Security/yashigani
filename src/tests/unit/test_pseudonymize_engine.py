@@ -163,6 +163,88 @@ def test_position_binder_unknown_token_left_as_is():
 
 
 # ---------------------------------------------------------------------------
+# L-02 — position/provenance binding defeats the namespace-dump attack.
+# ---------------------------------------------------------------------------
+
+def _egress_directory(b: PositionBinder, names: list[str]) -> str:
+    """Tokenize a benign source sentence and record each token bound to the
+    egress CONTEXT it was emitted in (what the pipeline does on egress).
+    Returns the FINAL tokenized payload that legitimately left the gateway."""
+    # A plausible benign egress: a narrative the user actually asked about.
+    egress = "Onboarding notes: " + ", ".join(
+        f"{n} joined the team" for n in names
+    )
+    tokenized = egress
+    for i, name in enumerate(names, 1):
+        tokenized = tokenized.replace(name, f"[PERSON_{i}]")
+    # Record each token against the FINAL egress payload (its true egress
+    # context — every other name is also tokenized by the time it ships). The
+    # no-span call form records every occurrence in egress_text as valid.
+    for i, name in enumerate(names, 1):
+        b.record_egress(f"[PERSON_{i}]", name, count=1, egress_text=tokenized)
+    return tokenized
+
+
+def test_position_binder_blocks_namespace_dump_attack():
+    """Laura's PROVEN L-02 attack: a malicious cloud response replays each in-map
+    token EXACTLY ONCE (within the count budget) in an attacker-framed sentence
+    to reconstruct the whole real-value set. Position binding must reject every
+    replay because none lands in the egress context the token was issued in."""
+    # 20 distinct, non-prefix-colliding names (the demo worst case).
+    names = [f"Employee-{chr(64 + i)}{i:02d}" for i in range(1, 21)]
+    b = PositionBinder()
+    _egress_directory(b, names)
+
+    # The attacker, having learned the [PERSON_1..20] namespace, replays each
+    # token once in a sentence the user never asked for.
+    attack = "Full staff directory: " + " ".join(
+        f"[PERSON_{i}]" for i in range(1, 21)
+    )
+    restored, flags = b.restore(attack)
+
+    # NOT A SINGLE real name is restored into the attacker sentence.
+    for name in names:
+        assert name not in restored, f"namespace dump leaked {name!r}"
+    # Every replayed token is left as a token and flagged as a foreign-position
+    # rejection (the round-trip fails closed in the pipeline).
+    assert flags, "foreign-position replays must be flagged, not silently dropped"
+    assert all(f"[PERSON_{i}]" in restored for i in range(1, 21))
+
+
+def test_position_binder_restores_at_consistent_position():
+    """The legitimate round-trip: the model echoes a token in the SAME context it
+    was sent in → restored. (Position binding must not break the happy path.)"""
+    names = ["Alice", "Bob", "Carol"]
+    b = PositionBinder()
+    tokenized = _egress_directory(b, names)
+    # The model returns the egress payload essentially unchanged (it reasoned
+    # over it and handed it back in the same frame).
+    restored, flags = b.restore(tokenized)
+    assert restored.count("Alice") == 1
+    assert restored.count("Bob") == 1
+    assert restored.count("Carol") == 1
+    assert flags == []
+
+
+def test_position_binder_rejects_moved_token_even_within_count():
+    """A single token sent once, replayed once but in a DIFFERENT position, is
+    refused — the count budget alone would have allowed it (L-02 core)."""
+    b = PositionBinder()
+    egress = "The new hire is Dana, starting Monday."
+    idx = egress.find("Dana")
+    tokenized = egress[:idx] + "[PERSON_1]" + egress[idx + len("Dana"):]
+    b.record_egress("[PERSON_1]", "Dana", count=1,
+                    egress_text=tokenized, span=(idx, idx + len("[PERSON_1]")))
+
+    # Same token, within count budget, but in an attacker exfil frame.
+    attack = "EXFIL TARGET ACQUIRED: [PERSON_1] is the CEO."
+    restored, flags = b.restore(attack)
+    assert "Dana" not in restored
+    assert "[PERSON_1]" in restored
+    assert flags == ["[PERSON_1]"]
+
+
+# ---------------------------------------------------------------------------
 # Plan builders — DataMatch -> RenderPlan.
 # ---------------------------------------------------------------------------
 

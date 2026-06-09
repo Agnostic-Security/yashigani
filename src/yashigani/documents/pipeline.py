@@ -56,7 +56,8 @@ from yashigani.documents.pseudonymize import (
     build_redact_plan,
 )
 from yashigani.documents.qi_context import header_driven_matches
-from yashigani.documents.segment import ExtractionResult
+from yashigani.documents.residual_proof import residual_substring_hit
+from yashigani.documents.segment import ExtractionResult, Segment, SegmentKind
 from yashigani.pii.detector import PiiDetector, PiiMode, _mask
 
 logger = logging.getLogger(__name__)
@@ -433,19 +434,97 @@ class DocumentInspectionPipeline:
         value survives anywhere in the re-rendered artefact — body, hidden part,
         or metadata.  Returns a BLOCK result if ANY original leaked, else None.
 
-        This is the no-residual assertion the brief mandates: we scan EVERY
-        output segment's text (the worker re-extracted the output incl. metadata)
-        for every raw original value.  A single hit fails the whole document
-        closed — we never ship an artefact we could not prove clean."""
+        Two complementary checks; a hit on EITHER fails the document closed
+        (L-03).  The original implementation used a raw byte-exact substring scan
+        which Laura proved has false negatives under the normalisation the
+        re-render + re-extract round-trip introduces (PDF newline-collapse /
+        90-char wrap, homoglyph / Unicode normal form).  Both checks below are
+        normalisation-resistant:
+
+          1. **Normalised substring scan** — fold both the re-extracted output
+             and each raw original to a canonical form (NFKC + homoglyph
+             skeleton + whitespace/wrap collapse + casefold) before comparing, so
+             a reformatted survivor of a KNOWN original is still found
+             (:func:`residual_proof.residual_substring_hit`).
+
+          2. **Detector re-pass over the OUTPUT** — re-run the same PII / QI
+             detector over the output segments (not merely substring-match the
+             known originals) and BLOCK if any data class we redacted/pseudonymised
+             reappears.  This catches a value that survives in a form the literal
+             scan can never reach — a different but still-recognised rendering of
+             the same class.
+
+        We never ship an artefact we could not prove clean."""
         output_text = "\n".join(str(s.get("text", "")) for s in output_segments)
+
+        # --- Check 1: normalisation-resistant substring scan of known originals.
         for loc, original in originals.items():
-            if original and original in output_text:
+            if original and residual_substring_hit(output_text, original):
                 return self._block(
                     request_id,
                     f"re-render residual check FAILED: a matched value survived in "
-                    f"the output artefact ({loc}) — refusing to ship, fail-closed",
+                    f"the output artefact ({loc}, normalised) — refusing to ship, "
+                    f"fail-closed",
                     detected=fmt, matches=matches, opa_input=opa_input,
                 )
+
+        # --- Check 2: re-run the detector over the OUTPUT and reject any data
+        # class we acted on that reappears (surviving-but-reformatted value).
+        # The classes we redacted/pseudonymised are exactly those in ``matches``;
+        # a re-detected match of one of those classes in the output is a residual.
+        acted_classes = {m.data_class for m in matches}
+        if acted_classes:
+            residual_loc = self._detect_residual_classes(
+                output_segments, acted_classes
+            )
+            if residual_loc is not None:
+                data_class, where = residual_loc
+                return self._block(
+                    request_id,
+                    f"re-render residual check FAILED: a {data_class} value was "
+                    f"re-detected in the output artefact ({where}) — the value "
+                    f"survived in a reformatted form; refusing to ship, fail-closed",
+                    detected=fmt, matches=matches, opa_input=opa_input,
+                )
+        return None
+
+    def _detect_residual_classes(
+        self, output_segments: list[dict], acted_classes: set[str]
+    ) -> Optional[tuple[str, str]]:
+        """Re-run the PII + QI detector over output segments; return the first
+        ``(data_class, location)`` of an acted-on class that reappears, else None.
+
+        L-03 detector-pass: a residual is not only a literal survivor of a known
+        original — it is ANY value the detector still recognises as one of the
+        classes we were supposed to strip.  We rebuild lightweight Segments from
+        the worker's output dicts and run both detection passes (regex PII +
+        header-driven column-semantic QI) the same way :meth:`_enumerate` does,
+        so a QI class (DOB column, cardholder name) surviving by reflow is caught
+        even though the lone-cell regex would not flag it."""
+        out_segments: list[Segment] = []
+        for s in output_segments:
+            text = str(s.get("text", ""))
+            if not text:
+                continue
+            kind_raw = str(s.get("kind", SegmentKind.BODY.value))
+            try:
+                kind = SegmentKind(kind_raw)
+            except ValueError:
+                kind = SegmentKind.BODY
+            loc = str(s.get("location") or "output")
+            out_segments.append(Segment(text=text, kind=kind, location=loc))
+
+        # Pass A: header-driven column-semantic classes (QI breadth).
+        for cm in header_driven_matches(out_segments):
+            if cm.data_class in acted_classes:
+                return cm.data_class, cm.segment.location
+
+        # Pass B: regex PII detector per segment.
+        for seg in out_segments:
+            for f in self._pii.detect(seg.text).findings:
+                data_class = f"PII.{f.pii_type.value}"
+                if data_class in acted_classes:
+                    return data_class, seg.location
         return None
 
     def _redact(
