@@ -56,6 +56,7 @@ class BackofficeState:
     response_inspection_pipeline: Optional[Any] = None   # ResponseInspectionPipeline (v1.0)
     model_alias_store: Optional[Any] = None               # ModelAliasStore (v2.3)
     auth_settings_store: Optional[Any] = None             # AuthSettingsStore (v2.23.3)
+    document_policy_store: Optional[Any] = None           # DocumentPolicyStore (2.26)
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None

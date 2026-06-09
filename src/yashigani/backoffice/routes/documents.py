@@ -90,45 +90,52 @@ ROUTES = ["ingress-upload", "egress-mcp-result", "json-attachment", "any"]
 PSEUDONYMIZE_MODES = ["A", "B"]  # A = give-user-table (default), B = internal round-trip
 
 
-# ── In-memory stores (demo-grade; the OPA-backed store is Ogen/Rhea's prod path) ──
+# ── Persistent policy store (2.26-prod) ─────────────────────────────────────
 #
-# Policy store: mirrors the in-memory pattern used by routes/sensitivity.py for
-# detection patterns.  TODO(2.26-prod): persist policies to the OPA-backed RBAC
-# store + re-push the document rego bundle (Ogen/Rhea own production rego).  The
-# UX + contract are correct now; the persistence backend is the follow-up.
-_policies: list[dict] = [
-    {
-        "id": "1",
-        "data_class": "PCI",
-        "format": "any",
-        "route": "any",
-        "action": "BLOCK",
-        "pseudonymize_mode": "A",
-        "small_set_escalation": True,
-        "description": "Cardholder data anywhere → BLOCK (fail-closed).",
-    },
-    {
-        "id": "2",
-        "data_class": "PII",
-        "format": "xlsx",
-        "route": "egress-mcp-result",
-        "action": "PSEUDONYMIZE",
-        "pseudonymize_mode": "A",
-        "small_set_escalation": True,
-        "description": "Names/IBANs leaving to cloud → PSEUDONYMIZE (mode A, give user the table).",
-    },
-    {
-        "id": "3",
-        "data_class": "PII",
-        "format": "any",
-        "route": "any",
-        "action": "LOG",
-        "pseudonymize_mode": "A",
-        "small_set_escalation": False,
-        "description": "Internal PII → LOG (passthrough + full audit).",
-    },
-]
-_policy_counter = 3
+# The document-enforcement policy MATRIX (data_class × format × route → action)
+# is persisted in :class:`DocumentPolicyStore` (Redis db/3) and pushed to OPA so
+# the production rego (policy/document.rego) evaluates the operator's live
+# configuration.  This REPLACES the prior in-memory stub: the routes below read
+# and mutate the durable store on ``backoffice_state.document_policy_store`` and
+# re-push to OPA after every mutation (same pattern as the RBAC routes).
+#
+# Fail-closed: when the store is not wired (dev/test without Redis) mutation
+# routes 503 rather than silently mutating a phantom store.
+
+
+def _policy_store():
+    """Return the wired DocumentPolicyStore or raise 503 (fail-closed).
+
+    A mutation must never appear to succeed against a store that does not exist
+    — that would leave OPA and the operator's view diverged."""
+    store = backoffice_state.document_policy_store
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "policy_store_unavailable",
+                "message": "Document policy store not initialised (Redis db/3 unavailable).",
+            },
+        )
+    return store
+
+
+def _push_document_policies() -> None:
+    """Re-push the document policy matrix to OPA after a mutation.
+
+    Best-effort like the RBAC routes' _push_opa(): the store mutation already
+    persisted to Redis; an OPA push failure is logged (and recovered by the
+    startup re-sync) but does not roll back the persisted change."""
+    store = backoffice_state.document_policy_store
+    if store is None:
+        logger.warning("_push_document_policies: store not available — skipping OPA push")
+        return
+    try:
+        from yashigani.documents.opa_push import push_document_data
+        push_document_data(store, backoffice_state.opa_url)
+    except Exception as exc:
+        logger.error("_push_document_policies: OPA push failed after policy mutation: %s", exc)
+
 
 # Processed-document results, keyed by request_id.  Holds the full
 # DocumentInspectionResult so the verdict viewer + RBAC'd table retrieval can
@@ -159,6 +166,12 @@ class InspectRequest(BaseModel):
     requested_action: str = Field(default="LOG", pattern=r"^(LOG|REDACT|PSEUDONYMIZE|BLOCK)$")
     pseudonymize_mode: str = Field(default="A", pattern=r"^(A|B)$")
     detokenize_rbac_role: str = Field(default="doc-pseudonymize-reverser", max_length=128)
+    # The routing context (matched against each policy's ``route`` in the rego).
+    # 2.26: the action is decided by OPA over the matrix, so the route the
+    # document is travelling on is a first-class decision input.
+    route: str = Field(
+        default="any", pattern=r"^(ingress-upload|egress-mcp-result|json-attachment|any)$"
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -279,11 +292,11 @@ async def document_status(session: AdminSession):
     }
 
 
-# ── Policy configuration (in-memory; OPA-backed store is the prod follow-up) ──
+# ── Policy configuration (Redis-backed DocumentPolicyStore + OPA re-push) ─────
 
 @router.get("/policies")
 async def list_policies(session: AdminSession):
-    return {"policies": _policies}
+    return {"policies": _policy_store().list_policies()}
 
 
 @router.post("/policies", status_code=201)
@@ -292,32 +305,33 @@ async def create_policy(body: PolicyRequest, session: StepUpAdminSession):
 
     Step-up gated: mutating enforcement policy is policy-sensitive (mirrors the
     sensitivity-pattern step-up gate — a hijacked session must not silently
-    neutralise document enforcement)."""
+    neutralise document enforcement).  Persists to Redis and re-pushes the
+    matrix to OPA so the production rego sees it immediately."""
     _require_enabled()
-    global _policy_counter
-    _policy_counter += 1
-    policy = {
-        "id": str(_policy_counter),
-        "data_class": body.data_class,
-        "format": body.format,
-        "route": body.route,
-        "action": body.action,
-        "pseudonymize_mode": body.pseudonymize_mode,
-        "small_set_escalation": body.small_set_escalation,
-        "description": body.description,
-    }
-    _policies.append(policy)
+    store = _policy_store()
+    try:
+        policy = store.add_policy(
+            data_class=body.data_class,
+            format=body.format,
+            route=body.route,
+            action=body.action,
+            pseudonymize_mode=body.pseudonymize_mode,
+            small_set_escalation=body.small_set_escalation,
+            description=body.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_policy", "message": str(exc)})
+    _push_document_policies()
     return {"status": "ok", "policy": policy}
 
 
 @router.delete("/policies/{policy_id}")
 async def delete_policy(policy_id: str, session: StepUpAdminSession):
     _require_enabled()
-    global _policies
-    before = len(_policies)
-    _policies = [p for p in _policies if p["id"] != policy_id]
-    if len(_policies) == before:
+    store = _policy_store()
+    if not store.remove_policy(policy_id):
         raise HTTPException(status_code=404, detail={"error": "policy_not_found"})
+    _push_document_policies()
     return {"status": "ok"}
 
 
@@ -325,20 +339,37 @@ async def delete_policy(policy_id: str, session: StepUpAdminSession):
 
 @router.post("/inspect")
 async def inspect_document(body: InspectRequest, session: AdminSession):
-    """Process a sample document through the REAL DocumentInspectionPipeline and
-    store the verdict for the viewer + (mode-A) table retrieval.
+    """Process a sample document END-TO-END THROUGH REAL OPA.
 
-    Returns the verdict summary + the per-match viewer rows.  Never returns raw
-    values or the replacer-map handle."""
+    Flow (the production decision path, not a Python stub):
+      1. Extract + enumerate DataMatch[] via the REAL DocumentInspectionPipeline
+         (LOG mode — enumeration only; no action applied yet).
+      2. Build ``DocumentDecisionInput.to_opa_input()`` and POST it to OPA, which
+         evaluates ``policy/document.rego`` against the operator's persisted
+         policy matrix → returns the ``action`` (LOG/REDACT/PSEUDONYMIZE/BLOCK)
+         with strongest-action precedence + small-set escalation enforced IN REGO.
+      3. Apply the OPA-decided action via the pipeline (re-render etc.).
+
+    The action is therefore computed by the ACTUAL OPA engine over the live
+    matrix — not by a Python branch.  Returns the verdict summary + per-match
+    viewer rows + the self-describing user alert carried from the OPA decision.
+    Never returns raw values or the replacer-map handle."""
     _require_enabled()
     pipeline = _build_pipeline()
     request_id = f"doc-{len(_results) + 1}-{body.filename}"
+    data_bytes = body.content.encode("utf-8", errors="replace")
+
+    # --- Step 1+2: enumerate, then ask REAL OPA for the action ---------------
+    from yashigani.documents.opa_decision import evaluate_document_decision
+
     try:
-        result = pipeline.inspect(
-            data=body.content.encode("utf-8", errors="replace"),
+        # First pass: LOG mode to enumerate matches + build the OPA input without
+        # applying any transform yet (the action decision is OPA's job).
+        enum_result = pipeline.inspect(
+            data=data_bytes,
             declared_mime=body.declared_mime,
             request_id=request_id,
-            requested_action=body.requested_action,
+            requested_action=DISPOSITION_LOG,
             pseudonymize_mode=body.pseudonymize_mode,
             detokenize_rbac_role=body.detokenize_rbac_role,
         )
@@ -346,20 +377,69 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
         envelope, _ = safe_error_envelope(exc, public_message="document inspection failed")
         raise HTTPException(status_code=500, detail=envelope)
 
+    opa_input = enum_result.opa_input
+    decision: dict
+    if opa_input is None:
+        # Enumeration already fail-closed (e.g. extraction incomplete) — honour it
+        # as a synthetic BLOCK decision so the contract stays uniform.
+        decision = {
+            "action": DISPOSITION_BLOCK,
+            "policy_id": "DOC-ENFORCE-001",
+            "code": "DOCUMENT_BLOCKED",
+            "user_message": (
+                "This file was held because it could not be safely cleared: "
+                + (enum_result.block_reason or "policy block")
+            ),
+        }
+    else:
+        decision = await evaluate_document_decision(
+            backoffice_state.opa_url,
+            opa_input,
+            route=body.route,
+            pseudonymize_mode=body.pseudonymize_mode,
+        )
+
+    opa_action = decision.get("action", DISPOSITION_BLOCK)
+
+    # --- Step 3: apply the OPA-decided action --------------------------------
+    if opa_action == DISPOSITION_LOG or opa_input is None:
+        # LOG (or already fail-closed at enumeration): the first pass IS the result.
+        result = enum_result
+    else:
+        try:
+            result = pipeline.inspect(
+                data=data_bytes,
+                declared_mime=body.declared_mime,
+                request_id=request_id,
+                requested_action=opa_action,
+                pseudonymize_mode=decision.get("pseudonymize_mode", body.pseudonymize_mode),
+                detokenize_rbac_role=decision.get("detokenize_rbac_role", body.detokenize_rbac_role),
+            )
+        except Exception as exc:
+            envelope, _ = safe_error_envelope(exc, public_message="document action failed")
+            raise HTTPException(status_code=500, detail=envelope)
+
     _results[request_id] = result
     return {
         "summary": _result_summary(result),
         "matches": _match_view(result),
-        # Layman alert surface for BLOCK/HOLD (unified user-alert contract:
-        # policy_id + user_message + code).  Populated for BLOCK from the
-        # block_reason; the production OPA decision carries the policy_id.
+        # The OPA decision drives the layman alert (unified user-alert contract:
+        # policy_id + user_message + code), carried straight from the rego.
+        "opa_decision": {
+            "action": opa_action,
+            "policy_id": decision.get("policy_id"),
+            "code": decision.get("code"),
+            "deny": decision.get("deny", []),
+            "obligations": decision.get("obligations", []),
+        },
         "user_alert": (
             {
-                "code": "DOCUMENT_BLOCKED",
-                "policy_id": "document.fail_closed",
-                "user_message": (
+                "code": decision.get("code", "DOCUMENT_BLOCKED"),
+                "policy_id": decision.get("policy_id", "DOC-ENFORCE-001"),
+                "user_message": decision.get(
+                    "user_message",
                     "This file was held because it could not be safely cleared: "
-                    + (result.block_reason or "policy block")
+                    + (result.block_reason or "policy block"),
                 ),
             }
             if result.disposition == DISPOSITION_BLOCK

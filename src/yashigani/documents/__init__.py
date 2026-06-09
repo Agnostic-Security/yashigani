@@ -73,6 +73,9 @@ from yashigani.documents.transform import (
     RenderSpan,
     SpanAction,
 )
+from yashigani.documents.policy_store import DocumentPolicyStore
+from yashigani.documents.opa_push import push_document_data
+from yashigani.documents.opa_decision import evaluate_document_decision
 
 __all__ = [
     # segment model
@@ -117,4 +120,8 @@ __all__ = [
     # config / feature flag
     "DocumentEnforcementConfig",
     "is_document_enforcement_enabled",
+    # 2.26 productionised policy layer: persistent matrix store + real-OPA path
+    "DocumentPolicyStore",
+    "push_document_data",
+    "evaluate_document_decision",
 ]

@@ -365,3 +365,144 @@ def test_doc_rt_11_policy_add_uses_stepup_dep():
     assert "StepUpAdminSession" in src
     # Both mutating routes carry the step-up session dependency.
     assert src.count("session: StepUpAdminSession") >= 2
+
+
+# ===========================================================================
+# 2.26 PRODUCTIONISED POLICY LAYER — persistent store + real-OPA decision path
+# ===========================================================================
+
+@pytest.fixture
+def store_client(monkeypatch):
+    """documents router wired to a REAL DocumentPolicyStore (fakeredis) + an
+    injectable OPA decision, so we can assert the route honours OPA's action."""
+    import fakeredis
+    from yashigani.documents.policy_store import DocumentPolicyStore
+
+    monkeypatch.setenv("YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED", "true")
+
+    app = FastAPI()
+    app.include_router(docroutes.router, prefix="/admin/documents")
+
+    store = DocumentPolicyStore(fakeredis.FakeStrictRedis())
+    store.seed_defaults()
+    backoffice_state.document_policy_store = store
+    backoffice_state.rbac_store = _FakeRBACStore({})
+    backoffice_state.audit_writer = None
+    backoffice_state.opa_url = "https://policy:8181"
+
+    app.dependency_overrides[require_admin_session] = lambda: _session(AUTHORISED_ADMIN)
+    app.dependency_overrides[require_stepup_admin_session] = lambda: _session(AUTHORISED_ADMIN)
+
+    # Make the OPA push a no-op (no live OPA in unit tests) but record it fired.
+    pushes = []
+    monkeypatch.setattr(
+        "yashigani.documents.opa_push.push_document_data",
+        lambda s, url: pushes.append((s, url)),
+    )
+
+    docroutes._results.clear()
+    yield TestClient(app), app, store, pushes
+    backoffice_state.document_policy_store = None
+    backoffice_state.rbac_store = None
+    docroutes._results.clear()
+
+
+def test_doc_prod_01_list_reads_persistent_store(store_client):
+    """GET /policies reads the seeded persistent matrix (not the old stub)."""
+    tc, app, store, _ = store_client
+    r = tc.get("/admin/documents/policies")
+    assert r.status_code == 200
+    policies = r.json()["policies"]
+    assert len(policies) == 3
+    assert any(p["action"] == "BLOCK" and p["data_class"] == "PCI" for p in policies)
+
+
+def test_doc_prod_02_create_persists_and_pushes(store_client):
+    """POST /policies writes through to Redis AND re-pushes to OPA."""
+    tc, app, store, pushes = store_client
+    r = tc.post("/admin/documents/policies", json={
+        "data_class": "SECRET", "format": "any", "route": "any",
+        "action": "BLOCK", "description": "secrets never leave",
+    })
+    assert r.status_code == 201, r.text
+    assert len(store.list_policies()) == 4
+    assert len(pushes) == 1  # OPA re-push fired
+
+
+def test_doc_prod_03_delete_persists_and_pushes(store_client):
+    tc, app, store, pushes = store_client
+    r = tc.delete("/admin/documents/policies/1")
+    assert r.status_code == 200
+    assert all(p["id"] != "1" for p in store.list_policies())
+    assert len(pushes) == 1
+
+
+def test_doc_prod_04_create_503_when_store_unwired(store_client, monkeypatch):
+    """Fail-closed: a mutation against a missing store 503s, never phantom-writes."""
+    tc, app, store, _ = store_client
+    backoffice_state.document_policy_store = None
+    r = tc.post("/admin/documents/policies", json={
+        "data_class": "PII", "format": "any", "route": "any",
+        "action": "LOG", "description": "x",
+    })
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "policy_store_unavailable"
+
+
+def test_doc_prod_05_inspect_applies_opa_action(store_client, monkeypatch):
+    """The route applies the action the REAL-OPA client returns (here mocked to
+    LOG) — proving the disposition flows from the OPA decision, not a Python
+    branch in the route."""
+    tc, app, store, _ = store_client
+
+    async def _fake_decision(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+        return {
+            "action": "LOG",
+            "policy_id": "DOC-ENFORCE-001",
+            "code": "DOCUMENT_LOGGED",
+            "user_message": "logged",
+            "deny": [],
+            "obligations": ["audit_document_decision"],
+        }
+
+    monkeypatch.setattr(
+        "yashigani.documents.opa_decision.evaluate_document_decision", _fake_decision
+    )
+    r = tc.post("/admin/documents/inspect", json={
+        "content": "name,email\nJane,jane@example.com\n",
+        "filename": "p.csv", "declared_mime": "text/csv", "route": "ingress-upload",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["opa_decision"]["action"] == "LOG"
+    assert body["opa_decision"]["policy_id"] == "DOC-ENFORCE-001"
+    assert body["summary"]["disposition"] == "LOG"
+
+
+def test_doc_prod_06_inspect_block_carries_user_alert(store_client, monkeypatch):
+    """When OPA decides BLOCK, the route surfaces the self-describing user_alert
+    (policy_id + user_message + code) straight from the decision."""
+    tc, app, store, _ = store_client
+
+    async def _fake_block(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+        return {
+            "action": "BLOCK",
+            "policy_id": "DOC-ENFORCE-001",
+            "code": "DOCUMENT_BLOCKED",
+            "user_message": "blocked for safety",
+            "deny": ["unpoliced_sensitive_class"],
+            "obligations": [],
+        }
+
+    monkeypatch.setattr(
+        "yashigani.documents.opa_decision.evaluate_document_decision", _fake_block
+    )
+    r = tc.post("/admin/documents/inspect", json={
+        "content": "card 4111111111111111\n", "filename": "c.txt", "route": "egress-mcp-result",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["opa_decision"]["action"] == "BLOCK"
+    assert body["user_alert"]["code"] == "DOCUMENT_BLOCKED"
+    assert body["user_alert"]["policy_id"] == "DOC-ENFORCE-001"
+    assert body["user_alert"]["user_message"] == "blocked for safety"

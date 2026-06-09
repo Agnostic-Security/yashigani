@@ -190,6 +190,7 @@ def _bootstrap():
     # typical kube-dns propagation window without blocking readiness probes.
     rbac_store = None
     agent_registry = None
+    document_policy_store = None
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -207,6 +208,16 @@ def _bootstrap():
             logger.info(
                 "Agent registry initialised: %d agent(s) in index",
                 agent_registry.count("all"),
+            )
+            # Document-enforcement policy store (2.26) shares Redis db/3
+            # (key namespace "document:"); same persistence + startup-OPA-re-push
+            # pattern as the RBAC store. Seed the demo matrix on first boot only.
+            from yashigani.documents.policy_store import DocumentPolicyStore
+            document_policy_store = DocumentPolicyStore(redis_client=redis_rbac_client)
+            document_policy_store.seed_defaults()
+            logger.info(
+                "Document policy store initialised: %d policy(ies) loaded from Redis",
+                len(document_policy_store.list_policies()),
             )
             break  # success
         except Exception as exc:
@@ -372,6 +383,7 @@ def _bootstrap():
     backoffice_state.rate_limiter = rate_limiter
     backoffice_state.rbac_store = rbac_store
     backoffice_state.agent_registry = agent_registry
+    backoffice_state.document_policy_store = document_policy_store
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
     backoffice_state.opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")
