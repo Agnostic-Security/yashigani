@@ -164,6 +164,61 @@ def _load_internal_bearer() -> str:
 # Cached at module load — fails fast if env-var is absent.
 _INTERNAL_BEARER: str = _load_internal_bearer()
 
+
+# ---------------------------------------------------------------------------
+# Admin-configurable: GET /v1/models visibility for service accounts.
+#
+# OPA classifies service-account principals (e.g. Open WebUI, which calls with
+# the shared internal bearer) as RESTRICTED — they see only their allowed_models
+# allowlist, empty by default (FINDING-59-01 topology-disclosure hardening).
+# Without a way to relax that, the OWUI model picker is empty in simple
+# deployments. This runtime setting (gateway.models.service_account_full_list,
+# editable in the admin Runtime Settings panel; default OFF) lets an operator
+# grant service accounts the FULL list (models + agents + service identities).
+# Read live from the DB-backed runtime_settings table, cached 30s. Fail-secure:
+# any error -> False (restricted).
+# ---------------------------------------------------------------------------
+_SA_FULL_LIST_CACHE: dict = {"value": False, "ts": 0.0}
+_SA_FULL_LIST_TTL = 30.0
+
+
+def _service_account_full_list_enabled() -> bool:
+    """True iff the operator has enabled the full /v1/models list for service
+    accounts via the gateway.models.service_account_full_list runtime setting."""
+    import time as _t
+    now = _t.monotonic()
+    if now - _SA_FULL_LIST_CACHE["ts"] < _SA_FULL_LIST_TTL:
+        return _SA_FULL_LIST_CACHE["value"]
+    value = False
+    try:
+        import psycopg2, json as _json
+        from yashigani.runtime_settings.keys import KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST as _K
+        dsn = os.getenv("YASHIGANI_DB_DSN", "")
+        if dsn and "${POSTGRES_PASSWORD}" not in dsn:
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            conn.autocommit = True
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM runtime_settings WHERE key = %s", (_K,))
+                    row = cur.fetchone()
+                if row:
+                    raw = row[0]
+                    # value is jsonb: psycopg2 may hand back a native python type
+                    # (bool/int/str) OR a json string depending on adapters — handle both.
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode()
+                    if isinstance(raw, str):
+                        raw = _json.loads(raw)
+                    value = bool(raw)
+            finally:
+                conn.close()
+    except Exception as _exc:  # fail-secure: restricted on any error
+        logger.debug("service_account_full_list read failed (%s) — restricted", _exc)
+        value = False
+    _SA_FULL_LIST_CACHE["value"] = value
+    _SA_FULL_LIST_CACHE["ts"] = now
+    return value
+
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
 
@@ -1613,6 +1668,14 @@ async def list_models(request: Request):
         )
 
     opa_filter = opa_result.get("filter", "restricted")
+    # Admin override: operators can grant service accounts the FULL list (so the
+    # Open WebUI model picker populates) via the gateway.models.service_account_full_list
+    # runtime setting (admin Runtime Settings panel; default OFF). Only ever
+    # WIDENS a restricted service-account listing — never affects human/admin
+    # (already full) or a hard deny. Restores the FINDING-59-01 "picker populates
+    # after login" behaviour for OWUI deployments.
+    if opa_filter == "restricted" and _service_account_full_list_enabled():
+        opa_filter = "full"
     # Identify allowed_models for service-account RESTRICTED filter.
     # Three states:
     #   opa_filter == "full"         → no restriction (None sentinel OK)
