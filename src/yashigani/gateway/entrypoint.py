@@ -376,6 +376,36 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("PII detector unavailable (%s) — PII filtering disabled", exc)
 
+    # ── v2.26: Document PSEUDONYMIZE mode-B egress pipeline (gap #1).
+    # Built ONLY when the operator opts into mode-B-via-proxy (both the
+    # document-enforcement flag AND the dedicated mode-B-proxy flag).  Default
+    # OFF (dark): when not opted in, document_pipeline stays None and the proxy
+    # hot path is completely untouched.  A construction failure here disables the
+    # OPTIONAL feature (document_pipeline=None) — it does NOT crash startup, since
+    # mode-B-proxy is opt-in and its absence simply means documents are not
+    # tokenized on egress (the proxy's existing PII/OPA controls still apply).
+    document_pipeline = None
+    try:
+        from yashigani.documents.proxy_modeb import is_modeb_proxy_active
+        if is_modeb_proxy_active():
+            from yashigani.documents.config import DocumentEnforcementConfig
+            from yashigani.documents.pipeline import DocumentInspectionPipeline
+            _doc_cfg = DocumentEnforcementConfig.from_env()
+            document_pipeline = DocumentInspectionPipeline(
+                registry=_doc_cfg.build_registry(),
+            )
+            logger.info(
+                "Document mode-B egress pipeline ready (max_bytes=%d, max_segments=%d)",
+                _doc_cfg.max_document_bytes, _doc_cfg.max_segments,
+            )
+        else:
+            logger.info("Document mode-B egress pipeline disabled (flag off — dark)")
+    except Exception as exc:
+        logger.warning(
+            "Document mode-B egress pipeline unavailable (%s) — mode-B egress disabled",
+            exc,
+        )
+
     # ── v2.4.1: Pool Manager — create early so it can be wired into the
     # OpenAI router before create_gateway_app().  Health monitor is started
     # after the app is created (background daemon thread).
@@ -655,6 +685,7 @@ def _build_app(mesh_mode: bool = False):
         extra_routers=[openai_router],
         pii_detector=pii_detector,
         ddos_protector=ddos_protector,
+        document_pipeline=document_pipeline,
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 

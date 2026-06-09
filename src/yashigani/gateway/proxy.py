@@ -133,6 +133,7 @@ def create_gateway_app(
     extra_routers=None,  # v2.0 — additional routers to mount BEFORE catch-all
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,   # v2.2 — PiiDetector | None
+    document_pipeline=None,  # v2.26 — DocumentInspectionPipeline | None (mode-B egress)
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -157,6 +158,7 @@ def create_gateway_app(
         "anomaly_detector": anomaly_detector,
         "ddos_protector": ddos_protector,  # v2.2
         "pii_detector": pii_detector,      # v2.2
+        "document_pipeline": document_pipeline,  # v2.26 — mode-B egress round-trip
         "http_client": None,
     }
 
@@ -697,6 +699,54 @@ async def _proxy_request_body(
                 media_type="application/json",
             )
 
+    # 4c. Document PSEUDONYMIZE mode-B egress (v2.26) — tokenize a document leaving
+    # via the proxy and hold the request-scoped round-trip for the response leg.
+    # Hooked into the EXISTING request→upstream→response seam (no parallel path).
+    # Hard-guarded: both flags must be ON and the body must look like a supported
+    # document, else this is a no-op and normal traffic is untouched.  Fail-closed-
+    # but-non-fatal: an unexpected fault forwards the ORIGINAL bytes (mode-B
+    # disengages); a real BLOCK holds the document.  See documents/proxy_modeb.py.
+    _modeb_round_trip = None  # type: ignore[var-annotated]
+    _document_pipeline = state.get("document_pipeline")
+    if _document_pipeline is not None and forwarded_body:
+        from yashigani.documents.proxy_modeb import (
+            egress_tokenize,
+            is_modeb_proxy_active,
+            looks_like_document_egress,
+        )
+        _req_content_type = request.headers.get("content-type", "")
+        if is_modeb_proxy_active() and looks_like_document_egress(
+            _req_content_type, forwarded_body
+        ):
+            _egress = egress_tokenize(
+                _document_pipeline,
+                body=forwarded_body,
+                content_type=_req_content_type,
+                request_id=request_id,
+            )
+            if _egress.blocked:
+                _audit_request(
+                    audit_writer, request_id, "BLOCKED", "document_modeb_block",
+                    request, path,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "DOCUMENT_BLOCKED",
+                        "detail": (
+                            "The document was held by Yashigani document enforcement "
+                            "and not forwarded."
+                        ),
+                        "reason": _egress.block_reason or "document_blocked",
+                        "request_id": request_id,
+                    },
+                    headers={"X-Yashigani-Request-Id": request_id},
+                )
+            if _egress.engaged and _egress.forward_bytes is not None:
+                # Send the TOKENIZED artefact to the upstream; hold the round-trip.
+                forwarded_body = _egress.forward_bytes
+                _modeb_round_trip = _egress.round_trip
+
     # 5. Forward to upstream MCP server
     client: httpx.AsyncClient = state["http_client"]
     with (_tracer.start_as_current_span("upstream-llm-call") if _tracer else _NullSpan()) as _up_span:
@@ -753,9 +803,33 @@ async def _proxy_request_body(
                     },
                 )
 
+    # 5a-modeB. Document PSEUDONYMIZE mode-B INGRESS restore (v2.26).
+    # Restore the untrusted upstream/cloud response on the trusted host through the
+    # binder (verbatim-echo rejection + position binding + namespace-harvest cap),
+    # AFTER response-injection inspection (5a) has already cleared the tokenized
+    # response.  Fail-closed-but-non-fatal: any fault forwards the STILL-TOKENIZED
+    # response (never cleartext that failed the binder, never a crash).  The
+    # crown-jewel map is destroyed inside ingress_restore on every path.
+    _modeb_tainted = False
+    _upstream_content = upstream_response.content
+    if _modeb_round_trip is not None and _document_pipeline is not None:
+        from yashigani.documents.proxy_modeb import ingress_restore
+        _ingress = ingress_restore(
+            _document_pipeline,
+            _modeb_round_trip,
+            response_bytes=_upstream_content,
+            request_id=request_id,
+        )
+        _upstream_content = _ingress.restored_bytes
+        _modeb_tainted = _ingress.tainted
+        # A tainted round-trip (echo or flagged) MUST NOT be cached — the cached
+        # body would be the tokenized/echo response, bypassing the binder on a
+        # later hit.  A clean restore carries cleartext that likewise must not be
+        # cached against the tokenized request key.  Either way, skip the cache.
+        response_cache = None
+
     # 5b_pii. PII detection on response body
     pii_detected_on_response = False
-    _upstream_content = upstream_response.content
     if pii_detector is not None and _upstream_content:
         _resp_body_text = _decode_body_safe(_upstream_content)
         if _resp_body_text:
@@ -878,6 +952,13 @@ async def _proxy_request_body(
     # 5e. Attach response inspection verdict header when present (v0.9.0)
     if response_verdict is not None:
         response.headers["X-Yashigani-Response-Verdict"] = response_verdict
+
+    # 5e-modeB. Surface a tainted mode-B round-trip (echo rejected / flagged) so a
+    # downstream consumer treats the body as not-cleanly-restored (still tokenized).
+    if _modeb_round_trip is not None:
+        response.headers["X-Yashigani-Document-ModeB"] = (
+            "tainted" if _modeb_tainted else "restored"
+        )
 
     # 5e-T10. F-T10-001: Generated-content disclaimer + inspection confidence.
     # X-Yashigani-Generated-Content is always true for proxy responses — the

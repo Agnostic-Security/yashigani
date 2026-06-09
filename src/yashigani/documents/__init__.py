@@ -30,6 +30,15 @@ Public surface:
 from yashigani.documents.config import (
     DocumentEnforcementConfig,
     is_document_enforcement_enabled,
+    is_modeb_proxy_enabled,
+)
+from yashigani.documents.proxy_modeb import (
+    EgressOutcome,
+    IngressOutcome,
+    egress_tokenize,
+    ingress_restore,
+    is_modeb_proxy_active,
+    looks_like_document_egress,
 )
 from yashigani.documents.datamatch import DataMatch, DocumentDecisionInput
 from yashigani.documents.detection import (
@@ -137,6 +146,14 @@ __all__ = [
     # config / feature flag
     "DocumentEnforcementConfig",
     "is_document_enforcement_enabled",
+    "is_modeb_proxy_enabled",
+    # 2.26 mode-B-via-proxy egress round-trip (gap #1)
+    "EgressOutcome",
+    "IngressOutcome",
+    "egress_tokenize",
+    "ingress_restore",
+    "is_modeb_proxy_active",
+    "looks_like_document_egress",
     # 2.26 productionised policy layer: persistent matrix store + real-OPA path
     "DocumentPolicyStore",
     "push_document_data",
