@@ -28,6 +28,8 @@ function showPage(name, triggerEl) {
     if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
+    // Document Enforcement panel — loadDocuments is defined in documents.js (loaded defer).
+    if (name === 'documents' && typeof window.loadDocuments === 'function') window.loadDocuments();
 }
 
 async function api(path) {

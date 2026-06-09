@@ -246,3 +246,13 @@ tr:hover { background: #f8fafc; }
 .rs-toast-visible { opacity: 1; }
 .rs-toast-ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
 .rs-toast-err { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }
+
+/* Document Enforcement panel — v2.26 */
+.badge-amber { background: #fffbeb; color: #b45309; }
+.doc-hidden { display: none; }
+.doc-row-hidden { background: #fff7ed; }
+.doc-verdict-summary { margin-bottom: 10px; font-size: 0.9rem; line-height: 1.6; }
+.doc-block-reason { color: #b91c1c; font-size: 0.8rem; }
+.doc-user-alert { margin: 8px 0; }
+.doc-alert-box { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 10px 14px; font-size: 0.85rem; color: #7f1d1d; }
+.doc-alert-pol { color: #9ca3af; font-size: 0.75rem; font-family: monospace; }
