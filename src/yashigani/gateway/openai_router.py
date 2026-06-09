@@ -50,7 +50,7 @@ Streaming limitations
   response-path inspection. This adds ~2-3s latency but ensures PII
   cannot leak through streamed responses.
 """
-# Last updated: 2026-05-18T00:00:00+00:00
+# Last updated: 2026-06-09T00:00:00+00:00
 from __future__ import annotations
 
 import hmac
@@ -540,6 +540,72 @@ def _encoded_payload_audit(
         )
     except Exception as exc:
         logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
+
+
+def _sse_from_completion(completion: dict, headers: dict) -> StreamingResponse:
+    """Wrap a buffered OpenAI chat-completion dict as a single-chunk SSE stream.
+
+    F-STREAM (2026-06-09): Open WebUI (and any OpenAI-compatible client) sends
+    ``stream:true``.  When OPA policies are active (always, in real deployments)
+    or PII block/redact is on, the gateway force-disables streaming and buffers
+    the full response for inspection — but it must still answer a ``stream:true``
+    request with ``text/event-stream``, or OWUI's SSE reader renders nothing
+    ("perpetual thinking" → "Failed to fetch").
+
+    OpenAI semantics: a stream:true request ALWAYS returns SSE, even if the body
+    was produced via a single buffered upstream call.  To match the canonical
+    OpenAI streaming framing that browser SSE clients (incl. Open WebUI) expect,
+    we emit THREE ``chat.completion.chunk`` frames:
+      1. ``delta={"role":"assistant"}``  — opens the message (no content yet)
+      2. ``delta={"content": <full text>}`` — the full assistant text
+      3. ``delta={}, finish_reason=<reason>`` — closes the message
+    followed by the ``data: [DONE]`` sentinel.  Splitting role/content/finish
+    into separate frames (rather than one fat frame) is what real OpenAI does and
+    avoids frontend SSE parsers that reject a role+content+finish_reason combined
+    in a single opening delta.  The buffered inspection (OPA / PII) has already
+    run before we reach here, so no content escapes un-inspected.
+    """
+    choice = (completion.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    cid = completion.get("id", "")
+    created = completion.get("created", 0)
+    model = completion.get("model", "")
+    index = choice.get("index", 0)
+    content = message.get("content", "")
+    role = message.get("role", "assistant")
+    finish_reason = choice.get("finish_reason", "stop")
+
+    def _frame(delta: dict, finish):
+        return {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": index, "delta": delta, "finish_reason": finish}
+            ],
+        }
+
+    def _gen():
+        # 1) open with role
+        yield f"data: {json.dumps(_frame({'role': role}, None))}\n\n"
+        # 2) full content in a single content delta
+        yield f"data: {json.dumps(_frame({'content': content}, None))}\n\n"
+        # 3) close with finish_reason and empty delta
+        yield f"data: {json.dumps(_frame({}, finish_reason))}\n\n"
+        yield "data: [DONE]\n\n"
+
+    # SSE-specific headers; merge the caller's X-Yashigani-* headers on top.
+    sse_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
+    }
+    sse_headers.update(headers)
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers=sse_headers,
+    )
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -1593,8 +1659,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             "ascii", "replace").decode("ascii")
         logger.info("client-policy obligations for %s: %s", identity_id, _client_obligations)
 
+    # F-STREAM: a stream:true request must always be answered as SSE, even when
+    # streaming was force-disabled (OPA active / PII block|redact) and the body
+    # was produced via the buffered path.  This single return point covers clean
+    # success, PII-redacted success, and agent-call success — all funnel here.
+    _completion = response.model_dump()
+    if body.stream:
+        return _sse_from_completion(_completion, headers)
+
     return JSONResponse(
-        content=response.model_dump(),
+        content=_completion,
         headers=headers,
     )
 

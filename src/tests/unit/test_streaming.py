@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import AsyncIterator
@@ -428,6 +429,12 @@ def _import_router_fresh(streaming_enabled: bool):
     mod._state.pii_detector = None
     mod._state.pii_cloud_bypass = False
     mod._state.opa_url = ""  # Disable OPA in unit tests
+    # OPA is fail-closed by default: an unconfigured opa_url denies unless the
+    # explicit dev opt-in is set (non-production + YASHIGANI_OPA_OPTIONAL=true).
+    # These unit tests exercise the streaming/buffered branching with OPA off, so
+    # opt in to the dev bypass. Production behaviour (fail-closed) is unchanged.
+    os.environ["YASHIGANI_OPA_OPTIONAL"] = "true"
+    os.environ.setdefault("YASHIGANI_ENV", "test")
     return mod
 
 
@@ -438,14 +445,11 @@ class TestStreamingRouterFallback:
     body.stream=True and calls the buffered Ollama path; and vice-versa.
     """
 
-    @pytest.mark.asyncio
-    async def test_streaming_disabled_uses_buffered_body(self):
+    async def _run_buffered(self, mod, *, stream: bool):
         """
-        When streaming is disabled, body.stream=True is ignored and the
-        buffered Ollama endpoint is called (stream=False).
+        Drive chat_completions with streaming force-disabled at the upstream
+        level, capturing the Ollama request bodies.  Returns (result, captured).
         """
-        mod = _import_router_fresh(streaming_enabled=False)
-
         captured_bodies = []
 
         async def _fake_post(url, json=None, **kwargs):
@@ -484,11 +488,21 @@ class TestStreamingRouterFallback:
             body = ChatCompletionRequest(
                 model="test-model",
                 messages=[ChatMessage(role="user", content="hello")],
-                stream=True,  # requested streaming
+                stream=stream,
             )
             result = await mod.chat_completions(body, mock_request)
+        return result, captured_bodies
 
-        # Must not be a StreamingResponse — should be a plain JSONResponse
+    @pytest.mark.asyncio
+    async def test_streaming_disabled_uses_buffered_upstream(self):
+        """
+        When streaming is disabled, the buffered Ollama endpoint is called
+        (upstream stream=False), regardless of the client's stream flag.
+        """
+        mod = _import_router_fresh(streaming_enabled=False)
+        result, captured_bodies = await self._run_buffered(mod, stream=False)
+
+        # stream=False client request → plain JSONResponse
         from fastapi.responses import StreamingResponse as _SR
         assert not isinstance(result, _SR), (
             "Expected buffered JSONResponse but got StreamingResponse"
@@ -497,6 +511,58 @@ class TestStreamingRouterFallback:
         # The Ollama call must have used stream=False
         assert len(captured_bodies) == 1
         assert captured_bodies[0].get("stream") is False
+
+    @pytest.mark.asyncio
+    async def test_streaming_disabled_but_client_stream_true_returns_sse(self):
+        """
+        F-STREAM (2026-06-09): when streaming is force-disabled (OPA / PII) the
+        upstream is still buffered (stream=False), but a client that requested
+        ``stream:true`` MUST receive ``text/event-stream`` with a single
+        chat.completion.chunk carrying the full assistant text + a [DONE]
+        sentinel.  Otherwise Open WebUI's SSE reader renders nothing.
+        """
+        mod = _import_router_fresh(streaming_enabled=False)
+        result, captured_bodies = await self._run_buffered(mod, stream=True)
+
+        from fastapi.responses import StreamingResponse as _SR
+        assert isinstance(result, _SR), (
+            "Expected SSE StreamingResponse for a stream:true buffered request"
+        )
+        assert result.media_type == "text/event-stream"
+
+        # Upstream Ollama was still called buffered (stream=False) — inspection
+        # ran on the full body before SSE-wrapping.
+        assert len(captured_bodies) == 1
+        assert captured_bodies[0].get("stream") is False
+
+        # Drain the SSE body and verify it carries a data chunk + [DONE].
+        body_parts = []
+        async for part in result.body_iterator:
+            body_parts.append(part if isinstance(part, str) else part.decode())
+        body_text = "".join(body_parts)
+        assert "data: " in body_text
+        assert "data: [DONE]\n\n" in body_text
+
+        # The frames must be OpenAI chat.completion.chunk objects. We emit the
+        # canonical role → content → finish framing (multiple frames).
+        data_lines = [
+            ln[len("data: "):]
+            for ln in body_text.split("\n\n")
+            if ln.startswith("data: ") and not ln.endswith("[DONE]")
+        ]
+        assert len(data_lines) >= 1
+        chunks = [json.loads(d) for d in data_lines]
+        for c in chunks:
+            assert c["object"] == "chat.completion.chunk"
+
+        # Across the frames: an assistant role opener, the full content, and a
+        # stop finish_reason must all be present.
+        roles = [c["choices"][0]["delta"].get("role") for c in chunks]
+        contents = [c["choices"][0]["delta"].get("content") for c in chunks]
+        finishes = [c["choices"][0].get("finish_reason") for c in chunks]
+        assert "assistant" in roles
+        assert "buffered reply" in [x for x in contents if x]
+        assert "stop" in finishes
 
     @pytest.mark.asyncio
     async def test_streaming_enabled_uses_streaming_response(self):
