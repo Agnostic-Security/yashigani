@@ -437,6 +437,9 @@ services:
       - langflow_isolated
       - letta_isolated
       - openclaw_isolated
+      # demo-mcp upstream dispatch path (demo opt-in). Harmless when the
+      # demo-mcp profile is not active: the bridge exists, the service does not.
+      - demo_mcp_isolated
 
   # ---------------------------------------------------------------------------
   # Backoffice — Admin control plane (generates first-run credentials)
@@ -2122,6 +2125,57 @@ services:
       - openclaw
 
   # ---------------------------------------------------------------------------
+  # demo-mcp — purpose-built demo MCP upstream (v2.25.3 journey, demo opt-in)
+  # ---------------------------------------------------------------------------
+  # A tiny stdlib-only JSON-RPC 2.0 MCP server (tools/list, tools/call) exposing
+  # echo/add/uppercase/word_count/current_time. It exists so the demo stack has a
+  # GENUINE upstream behind the gateway's MCP broker instead of the
+  # https://mcp.example.com placeholder.
+  #
+  # Demo "rogue server" trigger: when an incoming tool-call argument contains the
+  # digit "9", this upstream returns a credential-exfil prompt-injection payload
+  # (inert canned string) so the gateway's ResponseInspectionPipeline classifies
+  # it non-CLEAN and BLOCKS it (502) before it reaches the calling agent. Benign
+  # calls (no "9") flow through and return a real result.
+  #
+  # This is a DEMO OPT-IN, exactly like YASHIGANI_INSPECT_RESPONSES: production
+  # deployments leave UPSTREAM_MCP_URL pointed at the operator's real MCP server.
+  # To activate the demo upstream set in .env:
+  #   UPSTREAM_MCP_URL=http://demo-mcp:8000
+  #
+  # Network: its own isolated bridge (demo_mcp_isolated), mirroring the per-agent
+  # UA-10 isolation pattern. The gateway joins demo_mcp_isolated for the
+  # broker→upstream dispatch path. demo-mcp cannot reach any other agent.
+  demo-mcp:
+    dns_search: ["."]
+    image: yashigani/demo-mcp:${YASHIGANI_DEMO_MCP_VERSION:-2.25.3}
+    restart: unless-stopped
+    mem_limit: ${YASHIGANI_DEMO_MCP_MEM_LIMIT:-128m}
+    cpus: ${YASHIGANI_DEMO_MCP_CPU_LIMIT:-0.5}
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+    # GET / returns a liveness page (200) — used by the image's own HEALTHCHECK.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/',timeout=2).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    # Non-root (Dockerfile USER 10001); binds non-privileged 8000.
+    cap_drop: [ALL]
+    networks:
+      - demo_mcp_isolated
+    profiles:
+      - demo-mcp
+
+  # ---------------------------------------------------------------------------
   # Wazuh SIEM — Open source security monitoring (opt-in)
   # Full stack: manager (receives events) + indexer (OpenSearch) + dashboard
   # All Yashigani audit events are forwarded via the SIEM sink (audit/sinks.py)
@@ -2529,6 +2583,13 @@ networks:
     enable_ipv6: false
     internal: true
   openclaw_isolated:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  # demo-mcp upstream bridge (v2.25.3 demo opt-in). Same UA-10 isolation
+  # posture: gateway joins for broker→upstream dispatch; demo-mcp reaches
+  # nothing else. internal:true — no host-external egress.
+  demo_mcp_isolated:
     driver: bridge
     enable_ipv6: false
     internal: true
