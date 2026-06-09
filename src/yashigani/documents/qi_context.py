@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from yashigani.documents.pseudonymize import is_pseudonymization_token
 from yashigani.documents.segment import Segment, SegmentKind
 
 
@@ -122,6 +123,14 @@ def _value_plausible(data_class: str, value: str) -> bool:
     mis-tagging a stray non-conforming cell under a classified header)."""
     v = value.strip()
     if not v:
+        return False
+    # Never re-classify one of OUR OWN emitted pseudonymization tokens
+    # (``[PERSON_NAME_1]``, ``[DOB_2]`` …).  When the residual re-detect
+    # re-classifies the TOKENIZED output, a name-shaped token under a still-present
+    # ``name`` header would otherwise be re-flagged as a surviving PERSON_NAME and
+    # BLOCK a clean artefact (csv name-column false positive).  A real input cell
+    # literally equal to ``[PERSON_NAME_1]`` is not a plausible class value either.
+    if is_pseudonymization_token(v):
         return False
     if data_class == "PII.DATE_OF_BIRTH":
         return bool(_DATE_SHAPED.match(v))

@@ -37,6 +37,7 @@ and never serialised into the jail plan or any log line.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,29 @@ from yashigani.documents.transform import RenderPlan, RenderSpan, SpanAction
 # ---------------------------------------------------------------------------
 # Token assignment — consistent, type-tagged, value-keyed (plan §5.3a, F2).
 # ---------------------------------------------------------------------------
+
+#: Canonical pseudonymization token shape — ``[<TAG>_<N>]`` as minted by
+#: :meth:`TokenAssigner.token_for` (e.g. ``[PERSON_NAME_1]``, ``[EMAIL_2]``).
+#: SINGLE source of truth for the token shape so the residual re-detect can
+#: recognise (and never re-flag) our OWN emitted tokens — a name-shaped token
+#: like ``[PERSON_NAME_1]`` would otherwise trip the header-driven name
+#: classifier on the tokenized output and BLOCK a perfectly clean artefact
+#: (csv name-column false positive, L-01-adjacent).  Anchored so it matches a
+#: whole cell value, not a token embedded in surrounding prose.
+_TOKEN_SHAPE = re.compile(r"^\s*\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_\d+\]\s*$")
+
+
+def is_pseudonymization_token(value: str) -> bool:
+    """Whether ``value`` is one of OUR emitted pseudonymization tokens.
+
+    Used by the residual re-detect (``qi_context._value_plausible``) to avoid
+    re-flagging our own ``[CLASS_N]`` substitutions as surviving PII when the
+    re-render output is re-classified.  A real input cell containing a literal
+    ``[PERSON_NAME_1]`` is not a plausible person name anyway, so excluding the
+    token shape from the input-side classifier is correct, not just convenient.
+    """
+    return bool(_TOKEN_SHAPE.match(value))
+
 
 def _type_tag(data_class: str) -> str:
     """Map a (possibly namespaced) data_class to a token type tag.
