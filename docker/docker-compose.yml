@@ -678,6 +678,16 @@ services:
       OPENAI_API_BASE_URL: http://gateway:8081/v1
       # OPENAI_API_KEY is injected by the entrypoint shim from
       # /run/secrets/yashigani_internal_bearer — do NOT set it here.
+      # F-OWUI-MODELS (v2.25.3): OWUI v0.9.x get_filtered_models() hides any
+      # connection-sourced model that has NO row in OWUI's `model` DB table
+      # from non-admin users ("No DB entry means no access control configured
+      # yet; only admins can see unconfigured models"). All gateway models are
+      # connection-sourced (no DB rows), so the non-admin picker was EMPTY while
+      # admin saw all 8. In this deployment Yashigani's gateway + OPA is the
+      # real per-user/per-model access-control plane; OWUI's redundant per-model
+      # RBAC must be bypassed so every authenticated user sees the full model
+      # list and enforcement happens downstream at the gateway.
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
       # Disable direct Ollama access — everything through gateway
       OLLAMA_BASE_URL: ""
       ENABLE_OLLAMA_API: "false"
