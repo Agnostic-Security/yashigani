@@ -413,8 +413,11 @@ def test_doc_prod_01_list_reads_persistent_store(store_client):
     r = tc.get("/admin/documents/policies")
     assert r.status_code == 200
     policies = r.json()["policies"]
-    assert len(policies) == 3
+    # Seeded matrix = default rows + the 4 example OPAs (PII/PCI × pseudonymise/redact).
+    assert len(policies) == 5
     assert any(p["action"] == "BLOCK" and p["data_class"] == "PCI" for p in policies)
+    ids = {p["id"] for p in policies}
+    assert {"PII-1", "PII-2", "PCI-1", "PCI-2"} <= ids
 
 
 def test_doc_prod_02_create_persists_and_pushes(store_client):
@@ -425,7 +428,7 @@ def test_doc_prod_02_create_persists_and_pushes(store_client):
         "action": "BLOCK", "description": "secrets never leave",
     })
     assert r.status_code == 201, r.text
-    assert len(store.list_policies()) == 4
+    assert len(store.list_policies()) == 6  # 5 seeded + 1 created
     assert len(pushes) == 1  # OPA re-push fired
 
 
