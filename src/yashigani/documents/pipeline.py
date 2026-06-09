@@ -55,8 +55,9 @@ from yashigani.documents.pseudonymize import (
     build_pseudonymize_plan,
     build_redact_plan,
 )
+from yashigani.documents.qi_context import header_driven_matches
 from yashigani.documents.segment import ExtractionResult
-from yashigani.pii.detector import PiiDetector, PiiMode
+from yashigani.pii.detector import PiiDetector, PiiMode, _mask
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,7 @@ class DocumentInspectionPipeline:
         pii_detector: Optional[PiiDetector] = None,
         on_audit: Optional[Callable[[str, dict], None]] = None,
         small_set_threshold: int = 20,
+        small_set_escalation: bool = True,
     ) -> None:
         self._registry = registry or ExtractorRegistry()
         # LOG mode: enumerate only; never mutate text in the detector — the
@@ -138,6 +140,9 @@ class DocumentInspectionPipeline:
         self._on_audit = on_audit or (lambda name, data: None)
         # F2 small-set re-identification threshold (mirrors the rego default).
         self._small_set_threshold = small_set_threshold
+        # F2 small-set escalation toggle (mirrors a policy's small_set_escalation
+        # flag; default ON — fail-closed for re-identifiable small sets, L-01).
+        self._small_set_escalation_enabled = small_set_escalation
 
     # ------------------------------------------------------------------
     # Public API
@@ -245,23 +250,70 @@ class DocumentInspectionPipeline:
     # ------------------------------------------------------------------
 
     #: PII types that are quasi-identifiers (re-identify in combination — F2).
-    #: A QI match left un-tokenized on a small record set escalates (§5.3c).
-    _QI_TYPES = frozenset({"DATE_OF_BIRTH", "PHONE", "IP_ADDRESS"})
+    #: A QI match on a small record set escalates the disposition (§5.3c).
+    #: Broadened (L-01): DOB, phone, IP, National Insurance and postal address
+    #: all re-identify a small structured set when they co-occur per row.
+    _QI_TYPES = frozenset({
+        "DATE_OF_BIRTH", "PHONE", "IP_ADDRESS",
+        "NATIONAL_INSURANCE", "POSTAL_ADDRESS",
+    })
 
     def _enumerate(
         self, extraction: ExtractionResult
     ) -> tuple[list[DataMatch], dict[str, str]]:
-        """Run the EXISTING PII detector per segment incl. hidden/metadata.
+        """Run the EXISTING PII detector per segment incl. hidden/metadata, then
+        augment with header-driven column-semantic identifying classes (L-01/F2).
 
         Returns ``(matches, originals)`` where ``originals`` maps
         ``match.location -> raw matched substring``.  The raw substring is needed
         ONLY to drive the re-render (find-and-transform in the jail) and never
         appears in an audit/log line — the :class:`DataMatch` carries only the
         masked instance (F12).  ``qi`` is set for quasi-identifier classes (F2).
+
+        Two passes, de-duplicated by ``(location, char-span)``:
+
+          1. **value-only** — the existing regex PII detector, per segment
+             (email/phone/PAN/IBAN/NHS/NI/postcode etc.);
+          2. **header-driven** — column-semantic classes whose value has no
+             distinctive lone-cell form (DOB column, CVV, expiry,
+             cardholder/full-name) recovered from the spreadsheet header
+             (:mod:`yashigani.documents.qi_context`).  This is the QI breadth
+             that makes PSEUDONYMIZE tokenize EVERY identifying column, not just
+             name+email, and that feeds the small-set re-identification gate.
         """
         matches: list[DataMatch] = []
         originals: dict[str, str] = {}
+
+        # --- Pass 2 FIRST: header-driven column-semantic detection --------
+        # These cover the WHOLE cell (span 0..len) for columns whose value has
+        # no distinctive lone-cell form (DOB column, CVV, expiry, cardholder/
+        # full-name) — and supersede any value-only sub-match inside the same
+        # cell (e.g. the inner postcode inside a classified address cell).
+        header_matches = header_driven_matches(extraction.segments)
+        covered_cells: set[str] = set()
+        for cm in header_matches:
+            seg = cm.segment
+            covered_cells.add(seg.location)
+            loc = location_for(seg, cm.char_start, cm.char_end)
+            matches.append(
+                DataMatch(
+                    data_class=cm.data_class,
+                    qi=cm.qi,
+                    instance=_mask(seg.text[cm.char_start:cm.char_end]),
+                    location=loc,
+                    char_start=cm.char_start,
+                    char_end=cm.char_end,
+                )
+            )
+            originals[loc] = seg.text[cm.char_start:cm.char_end]
+
+        # --- Pass 1: value-only regex detection (per segment) -------------
+        # Skip cells fully covered by a header-driven whole-cell match so we do
+        # not double-count (a header-classified address cell is one match, not
+        # an address match plus an inner-postcode match).
         for seg in extraction.segments:
+            if seg.location in covered_cells:
+                continue
             result = self._pii.detect(seg.text)
             for f in result.findings:
                 loc = location_for(seg, f.start, f.end)
@@ -284,16 +336,46 @@ class DocumentInspectionPipeline:
     def _record_count(extraction: ExtractionResult) -> int:
         """Population size of the record set (F2 small-set gate).
 
-        For CSV/table content the record count is the number of distinct rows
-        seen; for flat text it is 0 (not a record set).  Parsed from segment
-        provenance without re-reading the document.
+        The record count is the number of distinct DATA rows in the table
+        (header row excluded), across BOTH provenance schemes:
+
+          * CSV  → ``row=R,col=C``      → distinct ``R``;
+          * xlsx → ``sheet=Title!B12``  → distinct ``(sheet, row-number)``.
+
+        (L-06: counting only ``row=`` provenance left ``record_count == 0`` for
+        the canonical xlsx spreadsheet, so the small-set gate was blind to the
+        exact format the demo uses.  Both schemes are now counted.)  For flat
+        text the count is 0 (not a record set).  Parsed from segment provenance
+        without re-reading the document; the lowest row per sheet is treated as
+        the header and excluded so a 30-data-row sheet counts as 30, not 31.
         """
-        rows: set[str] = set()
+        import re as _re
+
+        csv_rows: set[str] = set()
+        xlsx_rows: set[tuple[str, int]] = set()
+        xlsx_min: dict[str, int] = {}
+        cell_re = _re.compile(r"sheet=(?P<sheet>[^!]+)!(?P<col>[A-Z]+)(?P<row>\d+)")
         for seg in extraction.segments:
-            # TABLE_CELL provenance is "row=R,col=C"
             if seg.location.startswith("row="):
-                rows.add(seg.location.split(",", 1)[0])
-        return len(rows)
+                csv_rows.add(seg.location.split(",", 1)[0])
+                continue
+            m = cell_re.search(seg.location)
+            if m:
+                sheet = m.group("sheet")
+                row = int(m.group("row"))
+                xlsx_rows.add((sheet, row))
+                if sheet not in xlsx_min or row < xlsx_min[sheet]:
+                    xlsx_min[sheet] = row
+
+        # CSV: rows are "row=1".."row=N"; drop the header row ("row=1") if present.
+        csv_count = len(csv_rows)
+        if "row=1" in csv_rows:
+            csv_count -= 1
+        # xlsx: drop the header (lowest) row of each sheet.
+        xlsx_count = sum(
+            1 for (sheet, row) in xlsx_rows if row != xlsx_min.get(sheet)
+        )
+        return csv_count + xlsx_count
 
     # ------------------------------------------------------------------
     # Action handlers
@@ -425,18 +507,32 @@ class DocumentInspectionPipeline:
             forward_bytes=result.rendered_bytes,
         )
 
-    def _small_set_escalation(
-        self, matches: list[DataMatch], record_count: int, pseudonymized_classes: set,
-    ) -> bool:
-        """F2 small-set / residual-QI gate: escalate to BLOCK when the record set
-        is small AND a quasi-identifier remains un-tokenized (re-identifiable by
-        inference even after tokenization)."""
+    def _small_set_escalation(self, matches: list[DataMatch], record_count: int) -> bool:
+        """F2 small-set re-identification gate: escalate (→ BLOCK) when the record
+        set is small AND quasi-identifiers are present.
+
+        L-01 fix.  The previous gate only fired when a QI class was left
+        **un-tokenized** — but the wired PSEUDONYMIZE path tokenizes EVERY
+        detected class, so that residual set was always empty and the gate was
+        structurally dead code (Laura, PROVEN).  The honest invariant, matching
+        the production rego (``policy/document.rego`` ``_reid_escalation``: small
+        set + a QI match present + escalation enabled), is that **consistent
+        tokenization of a small structured record set is still re-identifiable by
+        row co-occurrence** — tokenizing the name column while every row still
+        carries DOB + postcode + NI re-identifies the subject by inference.  So
+        the gate fires on a small set that carries quasi-identifiers at all, and
+        the disposition escalates to BLOCK rather than ship false-assurance
+        "pseudonymized" rows the cloud can trivially re-identify.
+
+        Disabled when ``small_set_escalation`` is off (parity with a policy that
+        opted out, mirroring the rego ``small_set_escalation == false`` path).
+        """
+        if not self._small_set_escalation_enabled:
+            return False
         if record_count <= 0 or record_count > self._small_set_threshold:
             return False
-        residual_qi = [
-            m for m in matches if m.qi and m.data_class not in pseudonymized_classes
-        ]
-        return bool(matches) and bool(residual_qi)
+        has_qi = any(m.qi for m in matches)
+        return bool(matches) and has_qi
 
     def _pseudonymize(
         self,
@@ -461,19 +557,18 @@ class DocumentInspectionPipeline:
         if not matches:
             return self._log(request_id, data, extraction, matches, opa_input)
 
-        # F2 small-set gate: all detected matches are pseudonymized here (we
-        # tokenize every detected class), so residual-QI is only non-empty if an
-        # un-tokenized QI class exists. We tokenize ALL detected classes, so the
-        # residual set is the QI matches NOT in the pseudonymized set = empty
-        # here; the gate still fires if record_count is tiny AND a QI is present
-        # that the policy chose to leave (future per-class policy). We compute
-        # the pseudonymized set as every class we are about to tokenize.
-        pseudonymized_classes = {m.data_class for m in matches}
+        # F2 small-set gate (L-01): consistent tokenization of a SMALL structured
+        # record set is still re-identifiable by row co-occurrence — tokenizing
+        # the name column while every row still carries DOB/postcode/NI
+        # re-identifies the subject by inference.  So a small set carrying
+        # quasi-identifiers escalates to BLOCK rather than ship false-assurance
+        # "pseudonymized" rows.  (Was dead code: the old gate required an
+        # un-tokenized QI, which the wired path never produces.)
         record_count = self._record_count(extraction)
-        if self._small_set_escalation(matches, record_count, pseudonymized_classes):
+        if self._small_set_escalation(matches, record_count):
             return self._block(
                 request_id,
-                "re-identifiable small set with residual quasi-identifiers — "
+                "re-identifiable small record set with quasi-identifiers — "
                 "escalated to BLOCK (F2), fail-closed",
                 detected=fmt, matches=matches, opa_input=opa_input,
             )

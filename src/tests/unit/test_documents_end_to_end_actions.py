@@ -40,12 +40,21 @@ from yashigani.documents.pipeline import (  # noqa: E402
 from yashigani.documents.sandbox import SandboxedExtractorRunner  # noqa: E402
 
 
-def _pipeline(audit_sink=None):
+def _pipeline(audit_sink=None, small_set_escalation=True):
     """A pipeline whose registry routes BOTH extraction and re-render through the
-    real worker subprocess (the jail's stdin->JSON->exit contract)."""
+    real worker subprocess (the jail's stdin->JSON->exit contract).
+
+    ``small_set_escalation`` defaults ON (the fail-closed production default,
+    L-01).  Tests that exercise PSEUDONYMIZE mechanics on a tiny fixture (which
+    is itself a re-identifiable small set and would now escalate) pass
+    ``small_set_escalation=False`` to isolate the mechanic under test from the
+    gate; the gate has its own dedicated tests."""
     runner = SandboxedExtractorRunner(backend=_WorkerSubprocessBackend())
     registry = ExtractorRegistry(sandbox_runner=runner)
-    return DocumentInspectionPipeline(registry=registry, on_audit=audit_sink)
+    return DocumentInspectionPipeline(
+        registry=registry, on_audit=audit_sink,
+        small_set_escalation=small_set_escalation,
+    )
 
 
 # Builders that embed a DETECTABLE PII value (so the existing PII detector flags
@@ -181,7 +190,10 @@ def test_redact_all_six_no_residual(fmt, builder, mime):
 
 @pytest.mark.parametrize("fmt,builder,mime", ALL_FORMATS)
 def test_pseudonymize_all_six(fmt, builder, mime):
-    pipe = _pipeline()
+    # Mechanics test (token coherence + no-residual + F5 map): the csv fixture is
+    # a tiny re-identifiable set with a name column, which now escalates (L-01),
+    # so disable the gate here to isolate the PSEUDONYMIZE mechanic under test.
+    pipe = _pipeline(small_set_escalation=False)
     r = pipe.inspect(builder(), mime, request_id="req-pseudo",
                      requested_action="PSEUDONYMIZE", pseudonymize_mode="A")
     assert r.disposition == DISPOSITION_PSEUDONYMIZE, (fmt, r.block_reason)
@@ -264,7 +276,8 @@ def test_metadata_only_match_drives_verdict_and_is_stripped():
 
 def test_csv_pseudonymize_coherent_across_rows():
     """Same value in two rows → same token in both (coherence, §5.3a)."""
-    pipe = _pipeline()
+    # Coherence mechanic on a tiny set with a name column → disable the gate.
+    pipe = _pipeline(small_set_escalation=False)
     r = pipe.inspect(_csv_doc(), "text/csv", request_id="req",
                      requested_action="PSEUDONYMIZE")
     assert r.disposition == DISPOSITION_PSEUDONYMIZE
@@ -296,45 +309,50 @@ def test_replacer_map_and_original_never_in_audit_or_logs(caplog):
 
 
 # ---------------------------------------------------------------------------
-# F2 — small-set residual-QI escalation → BLOCK.
+# F2 / L-01 — small-set re-identification escalation → BLOCK (NO monkey-patch).
 # ---------------------------------------------------------------------------
+# Regression for Laura's L-01 (the gate was dead code: it only fired when a QI
+# class was left UN-tokenized, which the wired PSEUDONYMIZE path — tokenizing
+# every detected class — never produced).  The fixed gate fires on the WIRED
+# path: a small structured set carrying quasi-identifiers escalates, because
+# consistent tokenization of a small set is still re-identifiable by row
+# co-occurrence.  No monkey-patching — this exercises the real disposition path.
 
-def test_small_set_residual_qi_escalates_to_block():
-    # A 2-row CSV with an email (tokenized) + a phone (QI) left un-tokenized.
-    # Construct a pipeline whose PII detector tokenizes EMAIL only, leaving the
-    # phone QI residual on a tiny record set → F2 escalation to BLOCK.
+def test_small_set_qi_escalates_to_block_wired_path():
     from yashigani.pii.detector import PiiDetector, PiiMode, PiiType
     runner = SandboxedExtractorRunner(backend=_WorkerSubprocessBackend())
     reg = ExtractorRegistry(sandbox_runner=runner)
-    # Detector that flags BOTH email and phone; phone is a QI (_QI_TYPES).
+    # Detector flags email + phone; phone is a quasi-identifier (_QI_TYPES).
     det = PiiDetector(mode=PiiMode.LOG,
                       enabled_types={PiiType.EMAIL, PiiType.PHONE})
     pipe = DocumentInspectionPipeline(registry=reg, pii_detector=det,
                                       small_set_threshold=20)
-    # Monkey-patch: pseudonymize EMAIL only so PHONE is a residual QI.
-    orig = pipe._pseudonymize
-
     csv = (f"email,phone\n"
            f"{_PII_EMAIL},+14155550100\n"
            f"bob@example.com,+14155550101\n").encode()
-    # The default _pseudonymize tokenizes ALL detected classes, so to exercise
-    # the gate we restrict the pseudonymized set via a thin subclass override.
-    import yashigani.documents.pipeline as P
-
-    def _restricted(self, request_id, data, extraction, matches, originals,
-                    opa_input, *, mode, detokenize_rbac_role, map_ttl_s):
-        pseudonymized = {"PII.EMAIL"}  # policy chose to tokenize EMAIL only
-        rc = self._record_count(extraction)
-        if self._small_set_escalation(matches, rc, pseudonymized):
-            return self._block(request_id, "F2 small-set escalation",
-                               detected=extraction.detected_format,
-                               matches=matches, opa_input=opa_input)
-        return orig(request_id, data, extraction, matches, originals, opa_input,
-                    mode=mode, detokenize_rbac_role=detokenize_rbac_role,
-                    map_ttl_s=map_ttl_s)
-
-    pipe._pseudonymize = _restricted.__get__(pipe, P.DocumentInspectionPipeline)
+    # 2 data rows ≤ threshold 20, a QI (phone) is present → the WIRED path
+    # escalates to BLOCK (no monkey-patch). Before L-01 this returned
+    # PSEUDONYMIZE (the gate was structurally incapable of firing).
     r = pipe.inspect(csv, "text/csv", request_id="req-f2",
                      requested_action="PSEUDONYMIZE")
     assert r.disposition == DISPOSITION_BLOCK
-    assert "small-set" in (r.block_reason or "")
+    assert "small" in (r.block_reason or "").lower()
+
+
+def test_small_set_escalation_disabled_allows_pseudonymize():
+    # Parity with a policy that opted OUT (small_set_escalation=false): the same
+    # small QI-bearing set is PSEUDONYMIZEd, not blocked.
+    from yashigani.pii.detector import PiiDetector, PiiMode, PiiType
+    runner = SandboxedExtractorRunner(backend=_WorkerSubprocessBackend())
+    reg = ExtractorRegistry(sandbox_runner=runner)
+    det = PiiDetector(mode=PiiMode.LOG,
+                      enabled_types={PiiType.EMAIL, PiiType.PHONE})
+    pipe = DocumentInspectionPipeline(registry=reg, pii_detector=det,
+                                      small_set_threshold=20,
+                                      small_set_escalation=False)
+    csv = (f"email,phone\n"
+           f"{_PII_EMAIL},+14155550100\n"
+           f"bob@example.com,+14155550101\n").encode()
+    r = pipe.inspect(csv, "text/csv", request_id="req-f2-off",
+                     requested_action="PSEUDONYMIZE")
+    assert r.disposition == DISPOSITION_PSEUDONYMIZE

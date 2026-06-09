@@ -32,9 +32,30 @@ def test_dps_01_seed_defaults(redis_client):
     store = DocumentPolicyStore(redis_client)
     store.seed_defaults()
     policies = store.list_policies()
-    assert len(policies) == 3
+    # 4 ready-to-use example policies (PII-1/2, PCI-1/2) + 1 baseline LOG row.
+    assert len(policies) == 5
     actions = {p["action"] for p in policies}
-    assert actions == {"BLOCK", "PSEUDONYMIZE", "LOG"}
+    assert actions == {"PSEUDONYMIZE", "REDACT", "LOG"}
+
+
+def test_dps_01b_four_examples_available_and_self_describing(redis_client):
+    """The four example OPAs are seeded as AVAILABLE policies and are
+    self-describing (policy_id + layman user_message + code) — exactly what the
+    admin UI lists as selectable, ready-to-use examples."""
+    store = DocumentPolicyStore(redis_client)
+    store.seed_defaults()
+    examples = [p for p in store.list_policies() if p.get("example")]
+    assert len(examples) == 4
+    by_pid = {p["policy_id"]: p for p in examples}
+    assert set(by_pid) == {"DOC-EX-PII-1", "DOC-EX-PII-2", "DOC-EX-PCI-1", "DOC-EX-PCI-2"}
+    # Explicit data-class → action mapping.
+    assert (by_pid["DOC-EX-PII-1"]["data_class"], by_pid["DOC-EX-PII-1"]["action"]) == ("PII", "PSEUDONYMIZE")
+    assert (by_pid["DOC-EX-PII-2"]["data_class"], by_pid["DOC-EX-PII-2"]["action"]) == ("PII", "REDACT")
+    assert (by_pid["DOC-EX-PCI-1"]["data_class"], by_pid["DOC-EX-PCI-1"]["action"]) == ("PCI", "PSEUDONYMIZE")
+    assert (by_pid["DOC-EX-PCI-2"]["data_class"], by_pid["DOC-EX-PCI-2"]["action"]) == ("PCI", "REDACT")
+    # Self-describing: every example carries a name + layman message + code.
+    for p in examples:
+        assert p["name"] and p["user_message"] and p["code"]
 
 
 def test_dps_02_seed_idempotent(redis_client):
@@ -48,7 +69,8 @@ def test_dps_02_seed_idempotent(redis_client):
     store.seed_defaults()
     ids = {p["id"] for p in store.list_policies()}
     assert added["id"] in ids
-    assert len(store.list_policies()) == 4
+    # 5 seeded defaults + 1 operator rule.
+    assert len(store.list_policies()) == 6
 
 
 def test_dps_03_add_write_through_fresh_id(redis_client):
@@ -96,7 +118,7 @@ def test_dps_07_to_opa_document_shape(redis_client):
     store.seed_defaults()
     doc = store.to_opa_document()
     assert set(doc.keys()) == {"policies", "config"}
-    assert isinstance(doc["policies"], list) and len(doc["policies"]) == 3
+    assert isinstance(doc["policies"], list) and len(doc["policies"]) == 5
     row = doc["policies"][0]
     assert set(row.keys()) == {
         "data_class", "format", "route", "action",

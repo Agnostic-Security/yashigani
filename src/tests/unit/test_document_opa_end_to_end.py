@@ -95,11 +95,27 @@ def _card():
     return DataMatch("PCI.CARD", False, "****-1234", "BODY:p1:span=0-9", 0, 9)
 
 
-def test_e2e_pci_block_through_real_opa(store, tmp_path):
-    """Seeded matrix: PCI anywhere -> BLOCK. Decided by the actual engine."""
+def test_e2e_pci_pseudonymize_through_real_opa(store, tmp_path):
+    """Seeded example matrix: PCI on egress -> PSEUDONYMIZE (PCI-1). Engine-decided."""
+    d = _decide(store, _doc([_card()]), route="egress-mcp-result", tmp_path=tmp_path)
+    assert d["action"] == "PSEUDONYMIZE"
+    assert d["policy_id"] == "DOC-ENFORCE-001"
+    assert d["allow"] is True
+
+
+def test_e2e_pci_redact_through_real_opa(store, tmp_path):
+    """Seeded example matrix: PCI on json-attachment -> REDACT (PCI-2). Engine-decided."""
+    d = _decide(store, _doc([_card()]), route="json-attachment", tmp_path=tmp_path)
+    assert d["action"] == "REDACT"
+    assert d["allow"] is True
+
+
+def test_e2e_pci_block_via_operator_precedence(store, tmp_path):
+    """An operator BLOCK row added over the PCI example wins by precedence
+    (BLOCK > REDACT > PSEUDONYMIZE) — decided in the rego."""
+    store.add_policy(data_class="PCI", format="any", route="any", action="BLOCK")
     d = _decide(store, _doc([_card()]), route="egress-mcp-result", tmp_path=tmp_path)
     assert d["action"] == "BLOCK"
-    assert d["policy_id"] == "DOC-ENFORCE-001"
     assert d["allow"] is False
     assert d["code"] == "DOCUMENT_BLOCKED"
 

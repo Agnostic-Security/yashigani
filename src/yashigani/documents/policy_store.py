@@ -49,40 +49,126 @@ _DEFAULT_CONFIG = {
     "small_set_threshold": 20,
 }
 
-# Seeded on first boot when the namespace is empty.  Mirrors the demo matrix the
-# UI shipped (routes/documents.py stub) so the UX is identical on the real store.
-_DEFAULT_POLICIES: list[dict] = [
+# Seeded on first boot when the namespace is empty.  These are the four
+# ready-to-use EXAMPLE policies (Tiago, 2026-06-09: "4 OPAs, set as examples and
+# as OPAs available") plus the baseline demo matrix, so the operator sees
+# selectable, self-describing policies in the admin UI from first boot.
+#
+# Each row is self-describing: it carries ``name`` + ``policy_id`` + a layman
+# ``user_message`` + ``code`` (the same self-describing contract the rego
+# decision emits) so the UI can show a friendly label and the audit/alert stays
+# uniform.  ``example: True`` marks the four ready-to-use illustrative policies.
+#
+# Data-class → action mapping (explicit, demo-friendly).  Each example is scoped
+# to a distinct ROUTE so the four coexist as independently-demonstrable rows
+# WITHOUT colliding under strongest-action precedence (two any/any rows for the
+# same class would always resolve to the stronger action and mask the other).
+# The route makes the demo intent explicit:
+#   PII-1  PII (identifying/QI)        on egress-mcp-result → PSEUDONYMIZE (mode A)
+#   PII-2  PII (identifying/QI)        on json-attachment    → REDACT
+#   PCI-1  PCI (cardholder: PAN/CVV/…) on egress-mcp-result → PSEUDONYMIZE (mode A)
+#   PCI-2  PCI (cardholder: PAN/CVV/…) on json-attachment    → REDACT
+_EXAMPLE_POLICIES: list[dict] = [
     {
         "id": "1",
-        "data_class": "PCI",
-        "format": "any",
-        "route": "any",
-        "action": "BLOCK",
-        "pseudonymize_mode": "A",
-        "small_set_escalation": True,
-        "description": "Cardholder data anywhere -> BLOCK (fail-closed).",
-    },
-    {
-        "id": "2",
+        "name": "PII-1 — Pseudonymise PII",
+        "policy_id": "DOC-EX-PII-1",
         "data_class": "PII",
-        "format": "xlsx",
+        "format": "any",
         "route": "egress-mcp-result",
         "action": "PSEUDONYMIZE",
         "pseudonymize_mode": "A",
         "small_set_escalation": True,
-        "description": "Names/IBANs leaving to cloud -> PSEUDONYMIZE (mode A, give user the table).",
+        "code": "DOCUMENT_PII_PSEUDONYMIZED",
+        "user_message": (
+            "Identifying details in this file (names, email, phone, date of "
+            "birth, address, National Insurance) were replaced with placeholders "
+            "before it left your environment. You have a private table to turn "
+            "the placeholders back into the real values yourself."
+        ),
+        "description": "Detected PII / identifying classes -> PSEUDONYMIZE (mode A, give the user the table).",
+        "example": True,
+    },
+    {
+        "id": "2",
+        "name": "PII-2 — Redact PII",
+        "policy_id": "DOC-EX-PII-2",
+        "data_class": "PII",
+        "format": "any",
+        "route": "json-attachment",
+        "action": "REDACT",
+        "pseudonymize_mode": "A",
+        "small_set_escalation": True,
+        "code": "DOCUMENT_REDACTED",
+        "user_message": (
+            "Identifying details in this file (including any hidden parts and "
+            "metadata) were permanently removed before it left your environment."
+        ),
+        "description": "Detected PII / identifying classes -> REDACT (irreversible removal + strip metadata).",
+        "example": True,
     },
     {
         "id": "3",
+        "name": "PCI-1 — Pseudonymise PCI",
+        "policy_id": "DOC-EX-PCI-1",
+        "data_class": "PCI",
+        "format": "any",
+        "route": "egress-mcp-result",
+        "action": "PSEUDONYMIZE",
+        "pseudonymize_mode": "A",
+        "small_set_escalation": True,
+        "code": "DOCUMENT_PII_PSEUDONYMIZED",
+        "user_message": (
+            "Cardholder data in this file (card number, CVV, cardholder name, "
+            "expiry) was replaced with placeholders before it left your "
+            "environment. You have a private table to turn the placeholders back "
+            "into the real values yourself."
+        ),
+        "description": "Detected cardholder / PCI classes (PAN, CVV, cardholder name, expiry) -> PSEUDONYMIZE (mode A).",
+        "example": True,
+    },
+    {
+        "id": "4",
+        "name": "PCI-2 — Redact PCI",
+        "policy_id": "DOC-EX-PCI-2",
+        "data_class": "PCI",
+        "format": "any",
+        "route": "json-attachment",
+        "action": "REDACT",
+        "pseudonymize_mode": "A",
+        "small_set_escalation": True,
+        "code": "DOCUMENT_REDACTED",
+        "user_message": (
+            "Cardholder data in this file (card number, CVV, cardholder name, "
+            "expiry, including any hidden parts and metadata) was permanently "
+            "removed before it left your environment."
+        ),
+        "description": "Detected cardholder / PCI classes -> REDACT (irreversible removal + strip metadata).",
+        "example": True,
+    },
+]
+
+# Baseline demo matrix (kept after the four examples) so an internal-PII LOG row
+# is present out of the box for the passthrough+audit demo.
+_BASELINE_POLICIES: list[dict] = [
+    {
+        "id": "5",
+        "name": "Internal PII — Log only",
+        "policy_id": "DOC-EX-PII-LOG",
         "data_class": "PII",
         "format": "any",
-        "route": "any",
+        "route": "ingress-upload",
         "action": "LOG",
         "pseudonymize_mode": "A",
         "small_set_escalation": False,
-        "description": "Internal PII -> LOG (passthrough + full audit).",
+        "code": "DOCUMENT_LOGGED",
+        "user_message": "This file was allowed through; any identifying information in it has been recorded for audit.",
+        "description": "Internal PII on upload -> LOG (passthrough + full audit).",
+        "example": False,
     },
 ]
+
+_DEFAULT_POLICIES: list[dict] = _EXAMPLE_POLICIES + _BASELINE_POLICIES
 
 
 class DocumentPolicyStore:
@@ -179,8 +265,17 @@ class DocumentPolicyStore:
         pseudonymize_mode: str = "A",
         small_set_escalation: bool = True,
         description: str = "",
+        name: str = "",
+        policy_id: str = "",
+        user_message: str = "",
+        code: str = "",
     ) -> dict:
-        """Add a policy row with a fresh id (write-through).  Returns the row."""
+        """Add a policy row with a fresh id (write-through).  Returns the row.
+
+        ``name`` / ``policy_id`` / ``user_message`` / ``code`` are the
+        self-describing display fields (mirrors the rego decision contract) the
+        admin UI shows and the audit/alert reuse; optional for operator-created
+        rows."""
         try:
             new_id = str(self._redis.incr(_KEY_SEQ))
         except Exception as exc:
@@ -188,13 +283,18 @@ class DocumentPolicyStore:
             raise RuntimeError(f"DocumentPolicyStore: id allocation failed: {exc}") from exc
         policy = {
             "id": new_id,
+            "name": name,
+            "policy_id": policy_id,
             "data_class": data_class,
             "format": format,
             "route": route,
             "action": action,
             "pseudonymize_mode": pseudonymize_mode,
             "small_set_escalation": bool(small_set_escalation),
+            "code": code,
+            "user_message": user_message,
             "description": description,
+            "example": False,
         }
         self._validate(policy)
         self._policies[new_id] = policy

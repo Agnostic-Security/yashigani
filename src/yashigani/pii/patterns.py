@@ -195,19 +195,57 @@ DATE_OF_BIRTH_PATTERNS: list[re.Pattern[str]] = [
 
 
 # ---------------------------------------------------------------------------
+# UK National Insurance number (NINO)
+# ---------------------------------------------------------------------------
+# Format: two prefix letters + six digits + one suffix letter (A–D), printed
+# with or without single spaces between the groups (e.g. "AA 10 10 10 A" or
+# "AA101010A").  The prefix excludes the invalid first/second letters per
+# HMRC rules (D, F, I, Q, U, V never as either prefix letter; O never second);
+# the suffix is A–D.  Distinctive enough to match on a lone cell without a
+# proximity keyword.
+
+NATIONAL_INSURANCE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?!BG|GB|NK|KN|TN|NT|ZZ)"
+        r"[ABCEGHJ-PRSTW-Z][ABCEGHJ-NPRSTW-Z]"  # 2 valid prefix letters
+        r"[\s]?\d{2}[\s]?\d{2}[\s]?\d{2}[\s]?"   # 6 digits (optional spaces)
+        r"[A-D]\b",                               # suffix A-D
+        re.IGNORECASE,
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# UK postal address — anchored on the postcode (the address's identifying core)
+# ---------------------------------------------------------------------------
+# A UK postcode (e.g. "SW1A 1AA", "M1 2WD", "BS1 4ST") is the re-identifying
+# core of a postal address; flagging it catches the whole address cell.  The
+# outward code is 2–4 chars (letter(s)+digit(s), optional trailing letter), a
+# space (optional in storage), then the inward code (digit + 2 letters).
+
+POSTAL_ADDRESS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b[A-Z]{1,2}\d[A-Z\d]?[\s]?\d[A-Z]{2}\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # Registry — maps PiiType string key to its pattern list
 # (imported by detector.py to keep coupling explicit)
 # ---------------------------------------------------------------------------
 
 PATTERN_REGISTRY: dict[str, list[re.Pattern[str]]] = {
-    "SSN":              SSN_PATTERNS,
-    "CREDIT_CARD":      CREDIT_CARD_PATTERNS,
-    "EMAIL":            EMAIL_PATTERNS,
-    "PHONE":            PHONE_PATTERNS,
-    "IBAN":             IBAN_PATTERNS,
-    "PASSPORT":         PASSPORT_PATTERNS,
-    "NHS_NUMBER":       NHS_PATTERNS,
-    "DRIVERS_LICENCE":  DRIVERS_LICENCE_PATTERNS,
-    "IP_ADDRESS":       IP_ADDRESS_PATTERNS,
-    "DATE_OF_BIRTH":    DATE_OF_BIRTH_PATTERNS,
+    "SSN":                  SSN_PATTERNS,
+    "CREDIT_CARD":          CREDIT_CARD_PATTERNS,
+    "EMAIL":                EMAIL_PATTERNS,
+    "PHONE":                PHONE_PATTERNS,
+    "IBAN":                 IBAN_PATTERNS,
+    "PASSPORT":             PASSPORT_PATTERNS,
+    "NHS_NUMBER":           NHS_PATTERNS,
+    "DRIVERS_LICENCE":      DRIVERS_LICENCE_PATTERNS,
+    "IP_ADDRESS":           IP_ADDRESS_PATTERNS,
+    "DATE_OF_BIRTH":        DATE_OF_BIRTH_PATTERNS,
+    "NATIONAL_INSURANCE":   NATIONAL_INSURANCE_PATTERNS,
+    "POSTAL_ADDRESS":       POSTAL_ADDRESS_PATTERNS,
 }

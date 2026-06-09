@@ -335,7 +335,9 @@ def test_log_action_end_to_end_audits_every_match():
     # OPA-ready input is populated
     assert res.opa_input["format"] == "csv"
     assert res.opa_input["extraction_complete"] is True
-    assert res.opa_input["record_count"] == 2  # header row + Alice row
+    # record_count is the DATA-row population (header excluded, L-01/L-06 fix):
+    # "name,email,card" header + one "Alice" data row → 1 record.
+    assert res.opa_input["record_count"] == 1
 
 
 def test_log_clean_document_passes_with_no_matches():

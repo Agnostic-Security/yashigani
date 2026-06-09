@@ -73,6 +73,11 @@ from yashigani.documents.transform import (
     RenderSpan,
     SpanAction,
 )
+from yashigani.documents.qi_context import (
+    ContextMatch,
+    classify_columns,
+    header_driven_matches,
+)
 from yashigani.documents.policy_store import DocumentPolicyStore
 from yashigani.documents.opa_push import push_document_data
 from yashigani.documents.opa_decision import evaluate_document_decision
@@ -117,6 +122,10 @@ __all__ = [
     "CorrespondenceTable",
     "PositionBinder",
     "local_remerge",
+    # column-semantic identifying-class detection (L-01 / F2 QI breadth)
+    "ContextMatch",
+    "classify_columns",
+    "header_driven_matches",
     # config / feature flag
     "DocumentEnforcementConfig",
     "is_document_enforcement_enabled",

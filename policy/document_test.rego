@@ -264,6 +264,66 @@ test_namespace_prefix_class_match if {
 		with data.yashigani.document.policies as policies
 }
 
+# ---------------------------------------------------------------------------
+# 14. The four example policies drive the right action on representative matches.
+#     (PII-1 PSEUDONYMIZE, PII-2 REDACT, PCI-1 PSEUDONYMIZE, PCI-2 REDACT.)
+# ---------------------------------------------------------------------------
+
+_match_pci_pan := {"data_class": "PCI.PAN", "qi": false, "instance": "41****11", "location": "TABLE_CELL:sheet=S!B2:span=0-19"}
+
+_match_ni_qi := {"data_class": "PII.NATIONAL_INSURANCE", "qi": true, "instance": "AA****0A", "location": "TABLE_CELL:sheet=S!F2:span=0-13"}
+
+# PII-1 — PII detected → PSEUDONYMIZE (mode A).
+test_example_pii_1_pseudonymize if {
+	policies := [{"data_class": "PII", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false}]
+	document.action == "PSEUDONYMIZE" with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as policies
+}
+
+# PII-2 — PII detected → REDACT.
+test_example_pii_2_redact if {
+	policies := [{"data_class": "PII", "format": "any", "route": "any", "action": "REDACT", "pseudonymize_mode": "A", "small_set_escalation": false}]
+	document.action == "REDACT" with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as policies
+}
+
+# PCI-1 — PCI cardholder data (PAN) detected → PSEUDONYMIZE.
+test_example_pci_1_pseudonymize if {
+	policies := [{"data_class": "PCI", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false}]
+	document.action == "PSEUDONYMIZE" with input as {"document": _doc([_match_pci_pan], true, true)}
+		with data.yashigani.document.policies as policies
+}
+
+# PCI-2 — PCI cardholder data (PAN) detected → REDACT.
+test_example_pci_2_redact if {
+	policies := [{"data_class": "PCI", "format": "any", "route": "any", "action": "REDACT", "pseudonymize_mode": "A", "small_set_escalation": false}]
+	document.action == "REDACT" with input as {"document": _doc([_match_pci_pan], true, true)}
+		with data.yashigani.document.policies as policies
+}
+
+# ---------------------------------------------------------------------------
+# 15. L-01 — broadened QI (NATIONAL_INSURANCE) escalates a small PSEUDONYMIZE set.
+#     A small set carrying a National-Insurance quasi-identifier escalates to
+#     BLOCK under PII-1 (PSEUDONYMIZE + small_set_escalation) — the gate the
+#     pipeline now fires on the wired path is mirrored in the rego.
+# ---------------------------------------------------------------------------
+test_example_pii_1_small_set_ni_escalates if {
+	doc := {
+		"format": "xlsx",
+		"extraction_complete": true,
+		"segment_kinds": ["TABLE_CELL"],
+		"matches": [_match_email, _match_ni_qi],
+		"record_count": 30, # ≤ threshold (raised below)
+		"reid_handle": "cap-xyz",
+		"pseudonymize_supported": true,
+		"redaction_supported": true,
+	}
+	policies := [{"data_class": "PII", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": true}]
+	document.action == "BLOCK" with input as {"document": doc}
+		with data.yashigani.document.policies as policies
+		with data.yashigani.document.config as {"small_set_threshold": 50}
+}
+
 # format/route scoping — a policy scoped to a different format does NOT apply,
 # leaving the match unpoliced ⇒ BLOCK.
 test_format_scoping_unmatched_blocks if {

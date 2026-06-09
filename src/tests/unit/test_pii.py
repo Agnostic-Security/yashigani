@@ -45,6 +45,8 @@ class TestEnums:
         expected = {
             "SSN", "CREDIT_CARD", "EMAIL", "PHONE", "IBAN",
             "PASSPORT", "NHS_NUMBER", "DRIVERS_LICENCE", "IP_ADDRESS", "DATE_OF_BIRTH",
+            # L-01 / red-team F2 breadth: identifying/QI classes for documents.
+            "NATIONAL_INSURANCE", "POSTAL_ADDRESS",
         }
         assert {t.value for t in PiiType} == expected
 
