@@ -103,9 +103,34 @@ def _request(body: bytes, content_type: str = _DOC_MIME):
     return req
 
 
-def _patch_common(monkeypatch, captured: dict, upstream: httpx.Response):
-    """Patch the proxy's request/identity/OPA seams + capture the forwarded body."""
+def _pseudonymize_modeb_decision() -> dict:
+    """The OPA decision a policy-driven egress yields for a PII document on the
+    egress-mcp-result route with a PSEUDONYMIZE mode-B policy.  This is what the
+    REAL rego returns; the egress applies it.  (The egress decision now reuses
+    evaluate_document_decision — the SAME source the backoffice /inspect uses — so
+    these tests pin the OPA decision rather than letting it fail-closed without a
+    live OPA server.)"""
+    return {
+        "allow": True,
+        "deny": [],
+        "action": "PSEUDONYMIZE",
+        "pseudonymize_mode": "B",
+        "policy_id": "DOC-EX-PII-1",
+        "code": "DOCUMENT_PII_PSEUDONYMIZED",
+        "obligations": ["apply_pseudonymize_tokens", "vault_replacer_map_round_trip"],
+        "detokenize_rbac_role": "doc-pseudonymize-reverser",
+    }
+
+
+def _patch_common(monkeypatch, captured: dict, upstream: httpx.Response,
+                  *, egress_decision: dict | None = None):
+    """Patch the proxy's request/identity/OPA seams + capture the forwarded body.
+
+    ``egress_decision`` pins the OPA document decision the policy-driven egress
+    consumes (default: PSEUDONYMIZE mode B).  Pass an alternate dict to drive the
+    egress through a different OPA action (LOG/REDACT/BLOCK)."""
     from yashigani.gateway import proxy as _proxy
+    from yashigani.documents import proxy_modeb as _pm
 
     monkeypatch.setattr(_proxy, "_opa_check", AsyncMock(return_value=True))
     monkeypatch.setattr(
@@ -115,6 +140,14 @@ def _patch_common(monkeypatch, captured: dict, upstream: httpx.Response):
     monkeypatch.setattr(_proxy, "_proxy_response_sensitivity", lambda *a, **kw: "PUBLIC")
     monkeypatch.setattr(_proxy, "_extract_identity", lambda r: ("sess-1", "", "alice"))
     monkeypatch.setattr(_proxy, "_get_client_ip", lambda r: "127.0.0.1")
+
+    # Pin the policy-driven egress decision (real OPA call seam).  egress_decide
+    # imports evaluate_document_decision into proxy_modeb's namespace, so patch it
+    # there.
+    _decision = egress_decision if egress_decision is not None else _pseudonymize_modeb_decision()
+    monkeypatch.setattr(
+        _pm, "evaluate_document_decision", AsyncMock(return_value=_decision)
+    )
 
     async def _fake_forward(client, request, path, forwarded_body, request_id):
         captured["forwarded_body"] = forwarded_body

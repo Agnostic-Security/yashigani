@@ -33,9 +33,10 @@ from yashigani.documents.config import (
     is_modeb_proxy_enabled,
 )
 from yashigani.documents.proxy_modeb import (
+    PROXY_EGRESS_ROUTE,
     EgressOutcome,
     IngressOutcome,
-    egress_tokenize,
+    egress_decide,
     ingress_restore,
     is_modeb_proxy_active,
     looks_like_document_egress,
@@ -150,7 +151,8 @@ __all__ = [
     # 2.26 mode-B-via-proxy egress round-trip (gap #1)
     "EgressOutcome",
     "IngressOutcome",
-    "egress_tokenize",
+    "egress_decide",
+    "PROXY_EGRESS_ROUTE",
     "ingress_restore",
     "is_modeb_proxy_active",
     "looks_like_document_egress",

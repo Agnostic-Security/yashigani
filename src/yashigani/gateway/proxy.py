@@ -699,18 +699,25 @@ async def _proxy_request_body(
                 media_type="application/json",
             )
 
-    # 4c. Document PSEUDONYMIZE mode-B egress (v2.26) — tokenize a document leaving
-    # via the proxy and hold the request-scoped round-trip for the response leg.
+    # 4c. Document enforcement on PROXY EGRESS (v2.26) — POLICY-driven, not
+    # flag-driven.  A document leaving via the proxy is run through the SAME
+    # decision source the backoffice /inspect path uses (evaluate_document_decision
+    # over the REAL OPA + the operator's persisted matrix): OPA decides the action
+    # + mode per route / data-class / sensitivity — LOG (forward unchanged), REDACT
+    # (forward the stripped artefact), PSEUDONYMIZE mode A (forward tokens, user
+    # holds the table), PSEUDONYMIZE mode B (forward tokens AND hold a request-
+    # scoped round-trip for the response-leg restore), or BLOCK (held).  ONE
+    # decision source of truth for UI + proxy.
     # Hooked into the EXISTING request→upstream→response seam (no parallel path).
     # Hard-guarded: both flags must be ON and the body must look like a supported
     # document, else this is a no-op and normal traffic is untouched.  Fail-closed-
-    # but-non-fatal: an unexpected fault forwards the ORIGINAL bytes (mode-B
-    # disengages); a real BLOCK holds the document.  See documents/proxy_modeb.py.
+    # but-non-fatal: an unexpected fault forwards the ORIGINAL bytes (egress
+    # disengages); a real OPA BLOCK holds the document.  See documents/proxy_modeb.py.
     _modeb_round_trip = None  # type: ignore[var-annotated]
     _document_pipeline = state.get("document_pipeline")
     if _document_pipeline is not None and forwarded_body:
         from yashigani.documents.proxy_modeb import (
-            egress_tokenize,
+            egress_decide,
             is_modeb_proxy_active,
             looks_like_document_egress,
         )
@@ -718,15 +725,16 @@ async def _proxy_request_body(
         if is_modeb_proxy_active() and looks_like_document_egress(
             _req_content_type, forwarded_body
         ):
-            _egress = egress_tokenize(
+            _egress = await egress_decide(
                 _document_pipeline,
+                opa_url=cfg.opa_url,
                 body=forwarded_body,
                 content_type=_req_content_type,
                 request_id=request_id,
             )
             if _egress.blocked:
                 _audit_request(
-                    audit_writer, request_id, "BLOCKED", "document_modeb_block",
+                    audit_writer, request_id, "BLOCKED", "document_opa_block",
                     request, path,
                 )
                 return JSONResponse(
@@ -742,10 +750,15 @@ async def _proxy_request_body(
                     },
                     headers={"X-Yashigani-Request-Id": request_id},
                 )
-            if _egress.engaged and _egress.forward_bytes is not None:
-                # Send the TOKENIZED artefact to the upstream; hold the round-trip.
+            if _egress.transformed and _egress.forward_bytes is not None:
+                # OPA decided REDACT or PSEUDONYMIZE — send the transformed
+                # (stripped/tokenized) artefact to the upstream, never the original.
                 forwarded_body = _egress.forward_bytes
-                _modeb_round_trip = _egress.round_trip
+                # mode B also holds the round-trip for the response-leg restore;
+                # REDACT / mode A do not (round_trip is None).
+                if _egress.engaged:
+                    _modeb_round_trip = _egress.round_trip
+            # LOG / non-engaged: forward the ORIGINAL bytes unchanged (no transform).
 
     # 5. Forward to upstream MCP server
     client: httpx.AsyncClient = state["http_client"]

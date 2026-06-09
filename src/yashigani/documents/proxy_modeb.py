@@ -6,13 +6,26 @@ existing request→upstream→response proxy seam (``gateway/proxy.py``).  Mode-
 already wired at the pipeline API (``DocumentInspectionPipeline.restore_modeb_
 response``); this module makes it a real egress feature:
 
-  * OUTBOUND — a PSEUDONYMIZE mode-B document leaving via the proxy is tokenized
-    by the pipeline (the untrusted upstream/cloud sees only ``[CLASS_N]``
-    placeholders) and a request-scoped :class:`ModeBRoundTrip` is held.
-  * INBOUND — the upstream response is restored through the SAME response seam the
-    proxy already runs for response inspection, via
+  * OUTBOUND — a document leaving via the proxy is run through the SAME decision
+    source the backoffice ``/inspect`` path uses: enumerate (LOG) →
+    ``evaluate_document_decision`` (REAL OPA over ``policy/document.rego`` + the
+    operator's persisted matrix) → apply the OPA-decided action.  OPA — not a
+    hardcoded branch — decides per route / data-class / sensitivity whether the
+    document is LOGged (forward unchanged), REDACTed (forward the stripped
+    artefact), PSEUDONYMIZEd mode A (forward tokens, user holds the table),
+    PSEUDONYMIZEd mode B (forward tokens AND hold a request-scoped
+    :class:`ModeBRoundTrip` for the response-leg restore), or BLOCKed (held).
+  * INBOUND — for a mode-B egress only, the upstream response is restored through
+    the SAME response seam the proxy already runs for response inspection, via
     ``DocumentInspectionPipeline.restore_modeb_response`` + the binder's echo /
     position / namespace-harvest rejections.
+
+Decision source of truth (2.26 gap #2 close): the egress action + mode are no
+longer flag-driven (the old "blanket mode-B when the flag is on").  They are
+POLICY-driven — the proxy egress reuses ``evaluate_document_decision`` exactly as
+the backoffice ``/inspect`` route does, so there is ONE decision source for both
+the UI and the proxy.  The egress route is ``egress-mcp-result`` (matched against
+each policy's ``route`` in the rego).
 
 Two non-negotiable disciplines this module enforces, because it runs on the HOT
 request path AND straddles the cloud-egress security boundary:
@@ -44,14 +57,24 @@ from yashigani.documents.config import (
     is_modeb_proxy_enabled,
 )
 from yashigani.documents.detection import _MIME_TO_TYPE
+from yashigani.documents.opa_decision import evaluate_document_decision
 from yashigani.documents.pipeline import (
     DISPOSITION_BLOCK,
+    DISPOSITION_LOG,
     DISPOSITION_PSEUDONYMIZE,
     DocumentInspectionPipeline,
 )
 from yashigani.documents.pseudonymize import ModeBRoundTrip
 
 logger = logging.getLogger(__name__)
+
+#: The routing decision the proxy egress travels on — matched against each
+#: policy's ``route`` in the rego (policy/document.rego ``_route_matches``).  A
+#: document leaving the gateway towards an upstream/cloud MCP server is an
+#: ``egress-mcp-result`` egress.  This is the SAME route vocabulary the backoffice
+#: surfaces and the seeded example policies key on (PII-1/PCI-1 → PSEUDONYMIZE on
+#: egress-mcp-result; PII-2/PCI-2 → REDACT on json-attachment).
+PROXY_EGRESS_ROUTE = "egress-mcp-result"
 
 #: Content-Type values that mark a request body as a supported document egress.
 #: A cheap pre-filter ONLY — the pipeline still sniffs magic bytes and fails
@@ -82,20 +105,37 @@ def looks_like_document_egress(content_type: str, body: bytes) -> bool:
 
 @dataclass
 class EgressOutcome:
-    """Result of the OUTBOUND mode-B tokenization attempt.
+    """Result of the OUTBOUND policy-driven egress decision.
 
-    ``engaged`` is True only when the proxy should send ``forward_bytes`` (the
-    tokenized artefact) AND hold ``round_trip`` for the response leg.  When
-    ``blocked`` is True the document was held by the pipeline (BLOCK disposition)
-    and ``forward_bytes`` is None — the proxy must NOT forward.  When neither is
-    set, mode-B did not engage (not a document, not mode-B disposition, or a
-    fail-closed degrade) and the proxy forwards the ORIGINAL bytes unchanged."""
+    The OPA-decided ``action`` (LOG/REDACT/PSEUDONYMIZE/BLOCK) drives which of
+    these fields are set:
+
+      * ``blocked`` True  — OPA decided BLOCK (or a fail-closed degrade of a real
+        document); ``forward_bytes`` is None and the proxy MUST NOT forward.
+      * ``transformed`` True with ``forward_bytes`` set — OPA decided a transform
+        (REDACT, or PSEUDONYMIZE mode A/B): the proxy forwards ``forward_bytes``
+        (the re-rendered/tokenized artefact) instead of the original.  When the
+        action is PSEUDONYMIZE **mode B**, ``round_trip`` is also set and
+        ``engaged`` is True — the proxy holds it for the response-leg restore.
+      * neither set — the egress did not transform the body (OPA decided LOG, or
+        this was not a document, or a non-fatal degrade): the proxy forwards the
+        ORIGINAL bytes unchanged.  The proxy's existing PII/OPA request-path
+        controls still govern those bytes.
+
+    ``action`` carries the OPA disposition for the proxy's audit line so the
+    proxy records the SAME action the rego decided (one decision, audited once).
+
+    ``engaged`` stays the mode-B-specific signal (forward tokens AND hold the
+    round-trip) so the response-leg restore + the ``X-Yashigani-Document-ModeB``
+    header only fire for a genuine mode-B egress, never for LOG/REDACT/mode-A."""
 
     engaged: bool = False
     blocked: bool = False
+    transformed: bool = False
     forward_bytes: Optional[bytes] = None
     round_trip: Optional[ModeBRoundTrip] = None
     block_reason: Optional[str] = None
+    action: str = DISPOSITION_LOG
 
 
 @dataclass
@@ -119,76 +159,153 @@ class IngressOutcome:
         return self.echo_rejected or self.flagged
 
 
-def egress_tokenize(
+async def egress_decide(
     pipeline: DocumentInspectionPipeline,
     *,
+    opa_url: str,
     body: bytes,
     content_type: str,
     request_id: str,
+    route: str = PROXY_EGRESS_ROUTE,
     detokenize_rbac_role: Optional[str] = None,
 ) -> EgressOutcome:
-    """OUTBOUND: tokenize a mode-B document for cloud egress, holding the
-    round-trip for the response leg.
+    """OUTBOUND: ask REAL OPA what to do with a document leaving via the proxy,
+    then apply the OPA-decided action.
 
-    Fail-closed-but-non-fatal: any unexpected error returns a non-engaged
-    :class:`EgressOutcome` so the proxy forwards the ORIGINAL bytes — mode-B
-    simply did not engage.  A real pipeline BLOCK (oversize, mismatch, residual,
-    small-set escalation) is honoured as ``blocked=True`` (the proxy must hold the
-    document), NOT degraded to a forward — that distinction is the whole point of
-    the fail-closed document gate."""
+    This is the policy-driven egress (2.26 gap #2): the action + mode are decided
+    by OPA over ``policy/document.rego`` + the operator's persisted matrix — NOT a
+    hardcoded "blanket mode-B".  It reuses the EXACT decision source the backoffice
+    ``/inspect`` route uses (:func:`evaluate_document_decision`), so there is ONE
+    decision source of truth for the UI and the proxy.
+
+    Two passes, mirroring ``/inspect``:
+      1. enumerate (LOG mode) to build the OPA input WITHOUT applying any
+         transform — the action decision is OPA's job;
+      2. ``evaluate_document_decision`` over the live matrix → the action + mode;
+      3. apply the OPA-decided action via the pipeline.
+
+    Mapping of the OPA action onto the egress:
+      * BLOCK         → ``blocked=True`` (the proxy holds the document);
+      * LOG           → forward the ORIGINAL bytes unchanged (allow + audit);
+      * REDACT        → forward the stripped artefact (``transformed=True``);
+      * PSEUDONYMIZE mode A → forward the tokenized artefact, NO round-trip (the
+        user holds the correspondence table; the cloud only ever sees tokens);
+      * PSEUDONYMIZE mode B → forward the tokenized artefact AND hold the
+        round-trip (``engaged=True``) for the response-leg restore.
+
+    Fail-closed-but-non-fatal: an *unexpected* fault (not a disposition) degrades
+    to forwarding the ORIGINAL bytes (the egress decision simply did not engage),
+    never a crash and never a half-transformed body.  A real BLOCK (OPA deny,
+    oversize, mismatch, residual, small-set escalation, OPA-unreachable →
+    synthetic BLOCK) is honoured as ``blocked=True`` — the proxy MUST hold the
+    document.  That distinction is the whole point of the fail-closed gate."""
     try:
-        if detokenize_rbac_role is not None:
-            result = pipeline.inspect(
-                data=body,
-                declared_mime=content_type,
-                request_id=request_id,
-                requested_action=DISPOSITION_PSEUDONYMIZE,
-                pseudonymize_mode="B",
-                detokenize_rbac_role=detokenize_rbac_role,
-            )
-        else:
-            result = pipeline.inspect(
-                data=body,
-                declared_mime=content_type,
-                request_id=request_id,
-                requested_action=DISPOSITION_PSEUDONYMIZE,
-                pseudonymize_mode="B",
-            )
+        # --- Pass 1: enumerate (LOG) — build the OPA input, apply no transform.
+        enum_result = pipeline.inspect(
+            data=body,
+            declared_mime=content_type,
+            request_id=request_id,
+            requested_action=DISPOSITION_LOG,
+        )
     except Exception:
-        # An *unexpected* pipeline fault (not a disposition) must not break
-        # traffic — forward the original bytes, mode-B disengaged.  We never leak
-        # a half-tokenized body: the pipeline only returns forward_bytes on a
-        # clean re-render + no-residual proof, so on exception we have nothing
-        # partial to surface.
         logger.exception(
-            "doc-modeB egress: pipeline raised — disengaging mode-B, forwarding "
-            "original (request_id=%s)", request_id,
+            "doc egress: enumeration raised — disengaging, forwarding original "
+            "(request_id=%s)", request_id,
+        )
+        return EgressOutcome(engaged=False)
+
+    opa_input = enum_result.opa_input
+    if opa_input is None:
+        # Enumeration already fail-closed (e.g. extraction incomplete / oversize /
+        # mismatch) → HOLD the document.  This is a real document that could not be
+        # cleared, never "not a document"; the pipeline's _block carries the reason.
+        return EgressOutcome(
+            engaged=False, blocked=True, forward_bytes=None,
+            block_reason=enum_result.block_reason, action=DISPOSITION_BLOCK,
+        )
+
+    # --- Pass 2: ask REAL OPA (the SAME decision source as /inspect). ----------
+    # evaluate_document_decision NEVER raises and NEVER fails open: any OPA error /
+    # timeout / unreachable → a synthetic fail-closed BLOCK decision.
+    decision = await evaluate_document_decision(
+        opa_url,
+        opa_input,
+        route=route,
+    )
+    opa_action = decision.get("action", DISPOSITION_BLOCK)
+    opa_mode = decision.get("pseudonymize_mode", "A")
+
+    if opa_action == DISPOSITION_BLOCK:
+        return EgressOutcome(
+            engaged=False, blocked=True, forward_bytes=None,
+            block_reason="; ".join(decision.get("deny", []) or ["document_blocked"]),
+            action=DISPOSITION_BLOCK,
+        )
+
+    if opa_action == DISPOSITION_LOG:
+        # Allow + audit — forward the original bytes unchanged (the enum pass
+        # already wrote the LOG audit event).  Not a transform, not a round-trip.
+        return EgressOutcome(engaged=False, action=DISPOSITION_LOG)
+
+    # --- Pass 3: apply the OPA-decided transform (REDACT / PSEUDONYMIZE). ------
+    detok = decision.get("detokenize_rbac_role") or detokenize_rbac_role
+    try:
+        kwargs: dict = {}
+        if detok is not None:
+            kwargs["detokenize_rbac_role"] = detok
+        result = pipeline.inspect(
+            data=body,
+            declared_mime=content_type,
+            request_id=request_id,
+            requested_action=opa_action,
+            pseudonymize_mode=opa_mode,
+            **kwargs,
+        )
+    except Exception:
+        # An *unexpected* transform fault must not break traffic — forward the
+        # original.  The pipeline only returns forward_bytes on a clean re-render +
+        # no-residual proof, so on exception we have nothing partial to surface.
+        logger.exception(
+            "doc egress: transform (%s) raised — disengaging, forwarding original "
+            "(request_id=%s)", opa_action, request_id,
         )
         return EgressOutcome(engaged=False)
 
     if result.disposition == DISPOSITION_BLOCK:
-        # The document failed the fail-closed gate — HOLD it (do not forward).
+        # The transform itself fail-closed (e.g. residual leak, small-set
+        # escalation, unsupported re-render) — HOLD the document.
         return EgressOutcome(
             engaged=False, blocked=True, forward_bytes=None,
-            block_reason=result.block_reason,
+            block_reason=result.block_reason, action=DISPOSITION_BLOCK,
         )
 
+    if result.forward_bytes is None:
+        # No bytes to forward but not a BLOCK — degrade safely to forwarding the
+        # original (never ship a None/half body).
+        return EgressOutcome(engaged=False, action=result.disposition)
+
+    # PSEUDONYMIZE mode B → forward tokens AND hold the round-trip for the restore.
     if (
         result.disposition == DISPOSITION_PSEUDONYMIZE
         and result.mode_b_roundtrip is not None
-        and result.forward_bytes is not None
     ):
         return EgressOutcome(
             engaged=True,
+            transformed=True,
             forward_bytes=result.forward_bytes,
             round_trip=result.mode_b_roundtrip,
+            action=DISPOSITION_PSEUDONYMIZE,
         )
 
-    # Any other disposition (LOG with no matches, REDACT, mode-A, or a
-    # PSEUDONYMIZE that produced no round-trip) is NOT a mode-B egress: do not
-    # engage the restore path.  Forward the original bytes unchanged — the proxy's
-    # existing request-path inspection (PII/OPA) already governs those.
-    return EgressOutcome(engaged=False)
+    # REDACT or PSEUDONYMIZE mode A → forward the transformed artefact, NO
+    # round-trip (the cloud only ever sees the stripped/tokenized bytes; mode A's
+    # correspondence table is delivered out-of-band, not restored on the response).
+    return EgressOutcome(
+        engaged=False,
+        transformed=True,
+        forward_bytes=result.forward_bytes,
+        action=result.disposition,
+    )
 
 
 def ingress_restore(
