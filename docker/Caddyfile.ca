@@ -418,29 +418,63 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-Forwarded-Name
         request_header -X-Forwarded-Groups
 
-        forward_auth https://backoffice:8443 {
-        import internal-mtls
-        import inject-caddy-verified
-            uri /auth/verify
-            copy_headers X-Forwarded-User X-Forwarded-Name
+        # ── Open WebUI socket.io WebSocket — F-WS fix (YSG-2253) ───────────
+        # See Caddyfile.selfsigned for the full rationale. forward_auth copies
+        # the upgrade headers into the /auth/verify subrequest and wraps the
+        # main proxy in handle_response, breaking the 101 upgrade (logged-in
+        # browser saw a 302; chat tokens never rendered). Fix: strip the
+        # upgrade headers from the AUTH subrequest only so /auth/verify returns
+        # a clean status; the main reverse_proxy keeps the original upgrade and
+        # performs the real 101. Still gated by the same session cookie — NOT
+        # an auth bypass.
+        @owui_ws {
+            header Connection *Upgrade*
+            header Upgrade websocket
+            path /ws/*
+        }
+        handle @owui_ws {
+            forward_auth https://backoffice:8443 {
+            import internal-mtls
+            import inject-caddy-verified
+                uri /auth/verify
+                copy_headers X-Forwarded-User X-Forwarded-Name
+                header_up -Connection
+                header_up -Upgrade
 
-            @unauthorized status 401
-            handle_response @unauthorized {
-                redir * /login?next={http.request.uri} 302
+                @unauthorized status 401
+                handle_response @unauthorized {
+                    respond 401
+                }
+            }
+            reverse_proxy open-webui:8080 {
+                import inject-caddy-verified
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
             }
         }
 
-        # inject-caddy-verified: open-webui does not validate the header but
-
-        # we inject it uniformly across all reverse_proxy blocks. Auth is
-
-        # enforced by the forward_auth block above. Closes LU-231-10-A.
-
-        reverse_proxy open-webui:8080 {
-
+        # ── Open WebUI HTTP (non-WS) — forward_auth + proxy ────────────────
+        handle {
+            forward_auth https://backoffice:8443 {
+            import internal-mtls
             import inject-caddy-verified
-            header_up X-Forwarded-Proto https
-            header_up X-Real-IP {remote_host}
+                uri /auth/verify
+                copy_headers X-Forwarded-User X-Forwarded-Name
+
+                @unauthorized status 401
+                handle_response @unauthorized {
+                    redir * /login?next={http.request.uri} 302
+                }
+            }
+
+            # inject-caddy-verified: open-webui does not validate the header but
+            # we inject it uniformly across all reverse_proxy blocks. Auth is
+            # enforced by the forward_auth block above. Closes LU-231-10-A.
+            reverse_proxy open-webui:8080 {
+                import inject-caddy-verified
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+            }
         }
     }
 }
