@@ -415,9 +415,9 @@ def test_doc_prod_01_list_reads_persistent_store(store_client):
     policies = r.json()["policies"]
     # Seeded matrix = default rows + the 4 example OPAs (PII/PCI × pseudonymise/redact).
     assert len(policies) == 5
-    assert any(p["action"] == "BLOCK" and p["data_class"] == "PCI" for p in policies)
-    ids = {p["id"] for p in policies}
-    assert {"PII-1", "PII-2", "PCI-1", "PCI-2"} <= ids
+    pids = {p.get("policy_id") for p in policies}
+    assert {"DOC-EX-PII-1", "DOC-EX-PII-2", "DOC-EX-PCI-1", "DOC-EX-PCI-2"} <= pids
+    assert any(p["action"] == "PSEUDONYMIZE" and p["data_class"] == "PCI" for p in policies)
 
 
 def test_doc_prod_02_create_persists_and_pushes(store_client):
