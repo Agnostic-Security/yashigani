@@ -283,8 +283,14 @@ class SandboxedExtractorRunner:
 
     def _resolve_backend(self):
         if not self._backend_resolved:
-            from yashigani.pool.backend import create_backend
-            self._backend = create_backend()
+            # Use the EXTRACTOR-specific backend selector — NOT the per-identity
+            # Pool Manager create_backend(). On this host the SDK path cannot
+            # spawn the jail (docker-py absent; Podman 3.4.4 SDK rejects
+            # network_disabled/tmpfs), so the selector resolves a CLI backend
+            # (the path the containment harness proved 5/5) for Docker/Podman, or
+            # the K8s hardened-Pod backend in-cluster. Fail-closed if none.
+            from yashigani.pool.backend import create_extractor_backend
+            self._backend = create_extractor_backend()
             self._backend_resolved = True
         if self._backend is None:
             raise SandboxUnavailableError(

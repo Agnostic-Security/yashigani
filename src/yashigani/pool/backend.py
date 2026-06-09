@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
 import time
-import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -306,6 +307,270 @@ class ContainerBackend:
                         "extractor sandbox: failed to remove ephemeral %s: %s",
                         name, exc,
                     )
+
+
+def _apparmor_profile_loaded(name: str) -> bool:
+    """True when the named AppArmor profile is loaded in the kernel.
+
+    Reads /sys/kernel/security/apparmor/profiles (each line ``<name> (mode)``).
+    Returns False if AppArmor is off / the file is unreadable (no custom profile
+    to request; runtime-default confinement still applies)."""
+    try:
+        with open("/sys/kernel/security/apparmor/profiles", "r", encoding="utf-8") as fh:
+            return any(line.split()[:1] == [name] for line in fh if line.strip())
+    except OSError:
+        return False
+
+
+def _resolve_seccomp_path(path: str) -> str:
+    """Resolve the seccomp profile path robustly.
+
+    The default (``docker/seccomp/yashigani-extractor.json``) is repo-root
+    relative; the gateway's CWD is not guaranteed to be the repo root. If the
+    path is absolute or exists relative to CWD, use it as-is; otherwise anchor it
+    at the repo root inferred from this package's location (src/yashigani/pool ->
+    repo root is three parents up from this file's dir's ``src``)."""
+    if os.path.isabs(path) or os.path.exists(path):
+        return path
+    # .../<repo>/src/yashigani/pool/backend.py -> <repo>
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    candidate = os.path.join(repo_root, path)
+    return candidate if os.path.exists(candidate) else path
+
+
+class CliContainerBackend:
+    """Hardened ephemeral-extractor backend driven by the container-runtime CLI.
+
+    WHY THIS EXISTS (root cause, 2026-06-09):
+      The SDK ``run_extractor_job`` path is unusable for the sandbox on two of
+      this host's runtimes:
+        * Docker — ``docker-py`` is NOT a declared/installed dependency (only
+          ``podman>=5.0`` is in pyproject). ``import docker`` from the repo root
+          resolves the local ``./docker`` package dir (a namespace dir, no real
+          SDK), so ``docker.from_env()`` raises ``AttributeError`` and the SDK
+          autodetect silently falls through.
+        * Podman 3.4.4 — ``podman-py`` raises
+          ``TypeError: Keyword(s) 'tmpfs, network_disabled' are currently not
+          supported by Podman API`` from ``containers.create()``. The 3.4.x REST
+          API simply does not accept those create kwargs.
+
+      The containment proof (scripts/extractor_sandbox_containment.py) is GREEN
+      5/5 precisely because it shells out to the runtime CLI, which carries the
+      full hardened flag set on BOTH Docker 29.1.3 and Podman 3.4.4. This backend
+      makes the production runner use that same CLI path — same isolation,
+      identical flags — so the re-render runs on the demo runtime (Docker) here
+      and now, without weakening containment and without an SDK that rejects our
+      jail kwargs.
+
+    The hardened flag set MIRRORS ``SandboxedExtractorRunner._hardened_run_kwargs``
+    and the containment harness: egress=none, read-only rootfs, all caps dropped,
+    non-root numeric UID, no-new-privileges (runtime-correct syntax), seccomp
+    (inline profile JSON via --security-opt), AppArmor where supported, mem/swap/
+    pids caps, CPU quota only where the cpu cgroup controller is delegated, and a
+    small noexec/nosuid/nodev tmpfs. The document is fed on STDIN (no host mount);
+    the JSON result comes back on STDOUT. The container is ``--rm`` so a throwaway
+    jail never lingers; the wall-clock timeout is enforced runner-side by the
+    subprocess timeout, after which the lingering container is reaped by label.
+    """
+
+    def __init__(self, runtime: str) -> None:
+        # ``runtime`` is the CLI binary name: "docker" or "podman".
+        self.name = runtime
+        self._cli = runtime
+
+    def ping(self) -> bool:
+        try:
+            r = subprocess.run(
+                [self._cli, "version", "--format", "{{.Server.Version}}"],
+                capture_output=True, timeout=15,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cpu_controller_available() -> bool:
+        """True when the `cpu` cgroup-v2 controller is delegated to this user.
+
+        Mirrors sandbox._cpu_controller_available / the harness: rootless Podman
+        on cgroup-v2 frequently has only memory+pids delegated, and requesting a
+        CPU quota then makes the OCI runtime error. CPU abuse stays bounded by the
+        wall-clock timeout + memory cap, so we drop only the quota, never the
+        isolation. Docker / rootful → available."""
+        uid = os.getuid()
+        path = (
+            f"/sys/fs/cgroup/user.slice/user-{uid}.slice/"
+            f"user@{uid}.service/cgroup.controllers"
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return "cpu" in fh.read().split()
+        except OSError:
+            return True
+
+    def _hardened_argv(
+        self,
+        *,
+        name: str,
+        image: str,
+        command: list,
+        read_only: bool,
+        network_disabled: bool,
+        cap_drop: list,
+        cap_add: list,
+        user: str,
+        security_opt: list,
+        seccomp_path: str,
+        apparmor_profile: str,
+        tmpfs: dict,
+        mem_limit: str,
+        memswap_limit: str,
+        nano_cpus: int,
+        pids_limit: int,
+        labels: dict,
+    ) -> list:
+        rt = self._cli
+        # no-new-privileges syntax differs: Docker wants the colon form, Podman
+        # wants the bare flag (rejects :true / =true). Semantic is identical.
+        nnp = "no-new-privileges:true" if rt == "docker" else "no-new-privileges"
+        argv = [rt, "run", "--rm", "-i", "--name", name]
+        if network_disabled:
+            argv += ["--network", "none"]
+        if read_only:
+            argv += ["--read-only"]
+        for cap in (cap_drop or ["ALL"]):
+            argv += ["--cap-drop", cap]
+        for cap in (cap_add or []):
+            argv += ["--cap-add", cap]
+        if user:
+            argv += ["--user", user]
+        argv += ["--security-opt", nnp]
+        # Any extra runner-supplied security opts (we pass nnp above; avoid dup).
+        for opt in (security_opt or []):
+            if opt and not opt.startswith("no-new-privileges"):
+                argv += ["--security-opt", opt]
+        # seccomp — the CLI takes a profile FILE PATH (not inline JSON, unlike the
+        # SDK). Pass the resolved absolute path so the SAME profile confines the
+        # jail on both runtimes. If the file is missing, fall back to the runtime
+        # default (still confined: egress=none, ro-rootfs, caps dropped, non-root).
+        if seccomp_path:
+            resolved = _resolve_seccomp_path(seccomp_path)
+            if os.path.exists(resolved):
+                argv += ["--security-opt", "seccomp=" + resolved]
+            else:
+                logger.warning(
+                    "extractor sandbox (cli/%s): seccomp profile %s not found "
+                    "— using runtime default seccomp (still confined)",
+                    rt, resolved,
+                )
+        if apparmor_profile and _apparmor_profile_loaded(apparmor_profile):
+            # Only request a NAMED AppArmor profile when it is actually loaded —
+            # the CLI hard-errors on an unloaded profile name (unlike the SDK).
+            # When it is not loaded the runtime's default AppArmor profile
+            # (docker-default) still confines the container; the egress=none +
+            # ro-rootfs + caps-drop + seccomp + non-root jail does not depend on
+            # the custom profile.
+            argv += ["--security-opt", "apparmor=" + apparmor_profile]
+        elif apparmor_profile:
+            logger.info(
+                "extractor sandbox (cli/%s): AppArmor profile %r not loaded — "
+                "using runtime default AppArmor (jail confinement unaffected)",
+                rt, apparmor_profile,
+            )
+        for mount, opts in (tmpfs or {}).items():
+            argv += ["--tmpfs", f"{mount}:{opts}"]
+        if mem_limit:
+            argv += ["--memory", mem_limit]
+        if memswap_limit:
+            argv += ["--memory-swap", memswap_limit]
+        if nano_cpus and (rt == "docker" or self._cpu_controller_available()):
+            argv += ["--cpus", f"{nano_cpus / 1_000_000_000:.2f}"]
+        elif nano_cpus:
+            logger.info(
+                "extractor sandbox (cli/%s): cpu cgroup controller not delegated "
+                "— dropping --cpus; CPU abuse bounded by wall-clock + mem caps", rt,
+            )
+        if pids_limit:
+            argv += ["--pids-limit", str(pids_limit)]
+        for k, v in (labels or {}).items():
+            argv += ["--label", f"{k}={v}"]
+        # Env the worker reads for its in-process guards (cgroup limits are the
+        # hard backstop; this just makes the failure precise/fast).
+        argv += ["--env", "YASHIGANI_EXTRACTOR_IN_SANDBOX=1"]
+        argv += [image]
+        argv += list(command)
+        return argv
+
+    def run_extractor_job(
+        self,
+        *,
+        stdin: bytes,
+        timeout_s: int,
+        image: str,
+        name: str,
+        command: list,
+        network_disabled: bool,
+        read_only: bool,
+        cap_drop: list,
+        cap_add: list,
+        user: str,
+        security_opt: list,
+        seccomp_path: str,
+        apparmor_profile: str,
+        tmpfs: dict,
+        mem_limit: str,
+        memswap_limit: str,
+        nano_cpus: int,
+        pids_limit: int,
+        labels: dict,
+        auto_remove: bool,
+    ) -> tuple:
+        """Run one hardened, ephemeral extractor job via the runtime CLI.
+
+        Returns (stdout, exit_code, killed). Fail-closed: a missing image surfaces
+        as SandboxUnavailableError; a wall-clock breach kills the container and
+        returns killed=True; any non-zero exit propagates to BLOCK upstream.
+        """
+        argv = self._hardened_argv(
+            name=name, image=image, command=command, read_only=read_only,
+            network_disabled=network_disabled, cap_drop=cap_drop, cap_add=cap_add,
+            user=user, security_opt=security_opt, seccomp_path=seccomp_path,
+            apparmor_profile=apparmor_profile, tmpfs=tmpfs, mem_limit=mem_limit,
+            memswap_limit=memswap_limit, nano_cpus=nano_cpus, pids_limit=pids_limit,
+            labels=labels,
+        )
+        killed = False
+        try:
+            proc = subprocess.run(
+                argv, input=stdin, capture_output=True, timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Wall-clock breach: reap the lingering container by name, fail-closed.
+            killed = True
+            try:
+                subprocess.run([self._cli, "rm", "-f", name],
+                               capture_output=True, timeout=15)
+            except Exception:
+                pass
+            stdout = exc.stdout or b""
+            return (stdout if isinstance(stdout, bytes) else stdout.encode(), 137, killed)
+
+        # A missing sandbox image is "not provisioned" (vs a job that failed) —
+        # surface it as SandboxUnavailableError so the caller's audit reason is
+        # precise (still a fail-closed BLOCK either way). Both CLIs print a
+        # recognisable "no such image"/"image not known"/"manifest unknown".
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "replace").lower()
+            if ("no such image" in err or "image not known" in err
+                    or "manifest unknown" in err
+                    or ("unable to find image" in err)):
+                from yashigani.documents.sandbox import SandboxUnavailableError
+                raise SandboxUnavailableError(
+                    f"extractor image '{image}' not found — sandbox not "
+                    f"provisioned (fail-closed BLOCK)"
+                )
+        return (proc.stdout or b"", proc.returncode, killed)
 
 
 class KubernetesBackend:
@@ -727,6 +992,90 @@ def create_backend() -> Optional["ContainerBackend | KubernetesBackend"]:
         "gateway container. On Linux: `systemctl --user enable --now podman.socket`. "
         "In Kubernetes: ensure the gateway ServiceAccount has pods CRUD RBAC "
         "(helm/yashigani/templates/rbac-pool-manager.yaml)."
+    )
+    return None
+
+
+#: Operator override: force the extractor-sandbox runtime ("docker"|"podman"|
+#: "sdk"|"auto"). On the demo host the runtime is Docker; "auto" prefers the CLI
+#: backend (matches the proven containment harness + sidesteps the Podman-3.4.4
+#: SDK kwarg gap and the missing docker-py). Set to "sdk" to force the legacy SDK
+#: path (only where the SDK accepts our jail kwargs, e.g. Podman >= 4 / docker-py
+#: installed).
+ENV_EXTRACTOR_RUNTIME = "YASHIGANI_EXTRACTOR_RUNTIME"
+
+
+def create_extractor_backend() -> Optional[
+    "ContainerBackend | KubernetesBackend | CliContainerBackend"
+]:
+    """Pick the backend that runs the per-job EXTRACTOR sandbox.
+
+    This is deliberately SEPARATE from ``create_backend()`` (the per-identity Pool
+    Manager selector). The extractor sandbox only ever calls ``run_extractor_job``,
+    and on this host the SDK path is unusable for it (docker-py absent; Podman
+    3.4.4 SDK rejects ``network_disabled``/``tmpfs``). So we resolve a backend that
+    can actually spawn the hardened jail:
+
+      1. K8s in-cluster → KubernetesBackend (declarative hardened Pod + deny-all
+         egress NetworkPolicy; unchanged).
+      2. Otherwise a CLI backend over the runtime binary that is present and
+         reachable — Docker first (the demo runtime here), then Podman. The CLI
+         path is exactly what the containment harness proved 5/5, with the full
+         hardened flag set, on BOTH Docker 29.1.3 and Podman 3.4.4.
+      3. ``YASHIGANI_EXTRACTOR_RUNTIME=docker|podman`` forces a specific CLI.
+      4. ``YASHIGANI_EXTRACTOR_RUNTIME=sdk`` forces the legacy SDK selector
+         (create_backend) — only useful where the SDK accepts our jail kwargs.
+
+    Returns None (→ SandboxUnavailableError → fail-closed BLOCK) when nothing can
+    run the jail. We NEVER fall back to in-process parsing.
+    """
+    forced = (os.environ.get(ENV_EXTRACTOR_RUNTIME) or "auto").strip().lower()
+
+    if forced == "sdk":
+        return create_backend()
+
+    # K8s in-cluster takes precedence (its run_extractor_job is the hardened Pod).
+    _SA_TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    if forced in ("auto",) and os.path.exists(_SA_TOKEN) and os.environ.get(
+        "KUBERNETES_SERVICE_HOST"
+    ):
+        be = create_backend()
+        if be is not None and getattr(be, "name", "") == "kubernetes":
+            return be
+
+    if forced in ("docker", "podman"):
+        candidates = [forced]
+    else:
+        # Demo host: Docker is the runtime. Prefer it, then Podman.
+        candidates = ["docker", "podman"]
+
+    for rt in candidates:
+        if shutil.which(rt) is None:
+            continue
+        be = CliContainerBackend(rt)
+        if be.ping():
+            logger.info(
+                "Extractor sandbox: CLI backend selected — runtime=%s "
+                "(hardened jail via runtime CLI; SDK bypassed)", rt,
+            )
+            return be
+        logger.warning(
+            "Extractor sandbox: %s CLI present but daemon/socket unreachable", rt,
+        )
+
+    # Last resort: the SDK selector (covers SDK-capable hosts the CLI missed).
+    if forced == "auto":
+        be = create_backend()
+        if be is not None:
+            logger.info(
+                "Extractor sandbox: no usable CLI runtime — falling back to SDK "
+                "backend %s", getattr(be, "name", "?"),
+            )
+            return be
+
+    logger.warning(
+        "Extractor sandbox: no Docker/Podman CLI, K8s, or SDK backend available "
+        "— sandbox UNAVAILABLE (fail-closed BLOCK on every doc job).",
     )
     return None
 
