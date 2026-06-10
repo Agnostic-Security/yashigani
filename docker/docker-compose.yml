@@ -361,6 +361,34 @@ services:
       #   docker compose -f docker/docker-compose.yml up --no-deps -d gateway
       # P3 broker E2E gate (2026-05-30): must be declared here so compose passes it into container.
       YASHIGANI_MCP_SERVERS: ${YASHIGANI_MCP_SERVERS:-[]}
+      # ----------------------------------------------------------------------
+      # Orchestration caps (build-sheet §9 — operator-tunable, read by
+      # gateway/orchestrator.py + configure_openai_router). Defaults mirror the
+      # code defaults; written to docker/.env by install.sh so an operator can
+      # tune them without editing source.
+      #   MAX_DEPTH=9 is the §0.1 9-level hop invariant — do NOT lower below 9.
+      #   MAX_ITERS is floored at 9 in code so a 9-deep chain isn't truncated.
+      #   DEADLINE_S is the orchestration wall-clock budget (seconds).
+      #   MAX_FANOUT caps parallel sub-calls per level.
+      YASHIGANI_ORCH_MAX_DEPTH: ${YASHIGANI_ORCH_MAX_DEPTH:-9}
+      YASHIGANI_ORCH_MAX_ITERS: ${YASHIGANI_ORCH_MAX_ITERS:-9}
+      YASHIGANI_ORCH_DEADLINE_S: ${YASHIGANI_ORCH_DEADLINE_S:-300}
+      YASHIGANI_ORCH_MAX_FANOUT: ${YASHIGANI_ORCH_MAX_FANOUT:-4}
+      # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
+      # derives from prior tool-RESULT content (injection-originated hops). An
+      # over-budget result-steered hop is REFUSED so a result-steering injection
+      # loop cannot amplify. Keep low (default 2); raise only with care.
+      YASHIGANI_ORCH_INJECTION_BUDGET: ${YASHIGANI_ORCH_INJECTION_BUDGET:-2}
+      # Optional orchestration overrides.
+      #   SELFCALL_BASE — internal mesh self-call target (port 8081, no Caddy,
+      #     internal bearer, network-isolated). Default mirrors the code default;
+      #     orchestrator._mesh_base() reads the key directly (empty string would
+      #     NOT fall through to the code default), so we set the real value here.
+      #   MCP_SERVERS — JSON {name: url}. Empty default lets tool_catalog fall
+      #     back to the UPSTREAM_MCP_URL demo-mcp path (the headline "cloud 9"
+      #     demo upstream); _resolve_mcp_servers() treats unset/empty as fallback.
+      YASHIGANI_ORCH_SELFCALL_BASE: ${YASHIGANI_ORCH_SELFCALL_BASE:-http://127.0.0.1:8081}
+      YASHIGANI_ORCH_MCP_SERVERS: ${YASHIGANI_ORCH_MCP_SERVERS:-}
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
