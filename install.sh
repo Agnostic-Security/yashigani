@@ -1028,14 +1028,56 @@ _apply_trust_domain_to_runtime_manifest() {
 # path enforces a fresh TOTP step-up and passes the resulting token via
 # --stepup-token / YASHIGANI_STEPUP_TOKEN. Host-shell path requires the token, an
 # interactive --i-have-stepped-up ack, or an inline interactive confirmation; an
-# unattended run with no proof fails closed. Presence is enforced now; cryptographic
-# verification is DEFERRED to Tom's named `privileged_mutation` gate (flagged — wire
-# token verification here when it lands; do NOT duplicate the gate).
+# unattended run with no proof fails closed. When a token is supplied it is now
+# CRYPTOGRAPHICALLY VERIFIED end-to-end against the shared privileged_mutation gate
+# (src/yashigani/auth/stepup.py verify_stepup_proof, via the `--verify-proof` shim)
+# — signature + freshness + purpose + op-binding. A forged/stale/wrong-op token is
+# rejected fail-closed (the gate is the single source of truth; we do NOT duplicate it).
+# _verify_stepup_proof_token <token> <op-label> — cryptographically verify a
+# privileged-mutation step-up proof against the shared gate. The verifier lives
+# in the yashigani package (src/yashigani/auth/stepup.py) and needs the per-install
+# signing key (caddy_internal_hmac); both are present INSIDE the backoffice
+# container, so we exec the shim there. Runtime-agnostic: uses $COMPOSE_CMD which
+# is already resolved to docker/podman compose. Returns 0 iff the shim prints OK
+# and exits 0; fail-closed (non-zero) on any verifier error, missing container,
+# or DENY.
+_verify_stepup_proof_token() {
+  local _tok="$1" _op_label="$2"
+  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
+
+  if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+    resolve_compose_cmd 2>/dev/null || true
+  fi
+  if [[ ${#COMPOSE_CMD[@]} -eq 0 || ! -f "$compose_file" ]]; then
+    log_error "MI-4: cannot verify step-up proof — no compose runtime / compose file."
+    return 1
+  fi
+
+  # Pass the token via env (YASHIGANI_STEPUP_TOKEN) so it never lands in the
+  # container's argv / process table. -T disables TTY alloc (non-interactive exec).
+  if "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T \
+        -e "YASHIGANI_STEPUP_TOKEN=${_tok}" \
+        backoffice \
+        python3 -m yashigani.auth.stepup --verify-proof --op "${_op_label}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 _require_stepup_mi4() {
   local _op="${1:-privileged mutation}"
-  if [[ -n "${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}" ]]; then
-    log_info "MI-4: step-up token supplied — ${_op} authorised."
-    return 0
+  local _op_label="${2:-${_op}}"   # machine op label bound into the proof (e.g. add-component)
+  local _tok="${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}"
+  if [[ -n "${_tok}" ]]; then
+    # Cryptographically verify the proof against the shared gate. The verifier
+    # runs inside the backoffice container (where the signing key + yashigani
+    # package live); fail-closed if it cannot run or returns non-zero.
+    if _verify_stepup_proof_token "${_tok}" "${_op_label}"; then
+      log_info "MI-4: step-up proof VERIFIED (op=${_op_label}) — ${_op} authorised."
+      return 0
+    fi
+    log_error "MI-4: step-up proof FAILED verification (op=${_op_label}) — refusing ${_op}."
+    exit 1
   fi
   if [[ "${STEPUP_ACK:-false}" == "true" && -t 0 ]]; then
     log_info "MI-4: interactive operator step-up acknowledgement accepted (${_op})."
@@ -4090,7 +4132,7 @@ check_existing_installation() {
       # MI-4: add-component on a RUNNING stack mutates a live instance — gate it
       # with the shared step-up (auth/stepup.py via the API path; token/ack on the
       # host-shell path). Fail-closed if unattended without a step-up proof.
-      _require_stepup_mi4 "add-component on running instance"
+      _require_stepup_mi4 "add-component on running instance" "add-component"
       log_info "Existing PKI CA and volumes preserved — skipping contamination check (BUG-B+-002)"
       REUSE_VOLUMES=true
     fi

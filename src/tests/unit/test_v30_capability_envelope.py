@@ -633,6 +633,140 @@ class TestPrivilegedMutationGate:
 
 
 # ===========================================================================
+# MI-4 — step-up PROOF token contract (headless / install.sh path)
+# ===========================================================================
+
+_MI4_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def _mi4_signing_key(monkeypatch):
+    """Provide a deterministic HMAC signing key for the MI-4 token tests."""
+    monkeypatch.setenv("YASHIGANI_STEPUP_SIGNING_KEY", _MI4_KEY)
+
+
+class TestStepUpProofToken:
+    def test_mint_then_verify_roundtrip(self):
+        from yashigani.auth import mint_stepup_proof, verify_stepup_proof
+        tok, jti = mint_stepup_proof(subject="admin1", op="add-component")
+        claims = verify_stepup_proof(tok, expected_op="add-component")
+        assert claims["sub"] == "admin1"
+        assert claims["op"] == "add-component"
+        assert claims["purpose"] == "privileged-mutation"
+        assert claims["iss"] == "yashigani.backoffice"
+        assert claims["jti"] == jti
+
+    def test_verify_rejects_forged_signature(self):
+        from yashigani.auth import (
+            mint_stepup_proof, verify_stepup_proof, StepUpProofInvalid)
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component")
+        forged = tok[:-4] + ("A" if tok[-1] != "A" else "B") * 4
+        with pytest.raises(StepUpProofInvalid) as ei:
+            verify_stepup_proof(forged, expected_op="add-component")
+        assert ei.value.reason in ("bad_signature", "malformed")
+
+    def test_verify_rejects_wrong_signing_key(self, monkeypatch):
+        from yashigani.auth import (
+            mint_stepup_proof, verify_stepup_proof, StepUpProofInvalid)
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component")
+        # An attacker who does not hold caddy_internal_hmac cannot verify-true.
+        monkeypatch.setenv("YASHIGANI_STEPUP_SIGNING_KEY", "deadbeef" * 4)
+        with pytest.raises(StepUpProofInvalid) as ei:
+            verify_stepup_proof(tok, expected_op="add-component")
+        assert ei.value.reason == "bad_signature"
+
+    def test_verify_rejects_expired(self):
+        from yashigani.auth import (
+            mint_stepup_proof, verify_stepup_proof, StepUpProofInvalid)
+        # ttl=-1 mints an already-expired token (exp = iat - 1).
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component", ttl_seconds=-1)
+        with pytest.raises(StepUpProofInvalid) as ei:
+            verify_stepup_proof(tok, expected_op="add-component")
+        assert ei.value.reason == "expired"
+
+    def test_verify_rejects_op_mismatch(self):
+        from yashigani.auth import (
+            mint_stepup_proof, verify_stepup_proof, StepUpProofInvalid)
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component")
+        with pytest.raises(StepUpProofInvalid) as ei:
+            verify_stepup_proof(tok, expected_op="uninstall")
+        assert ei.value.reason == "op_mismatch"
+
+    def test_verify_rejects_wrong_purpose_token(self):
+        """An operator-onboard token (LU-AMEND-04) is NOT a mutation proof."""
+        import jwt as _pyjwt
+        import time as _t
+        from yashigani.auth import verify_stepup_proof, StepUpProofInvalid
+        onboard = _pyjwt.encode(
+            {
+                "sub": "admin1", "jti": "x", "iat": int(_t.time()),
+                "exp": int(_t.time()) + 300, "iss": "yashigani.backoffice",
+                "purpose": "operator-onboard",
+            },
+            _MI4_KEY, algorithm="HS256",
+        )
+        with pytest.raises(StepUpProofInvalid) as ei:
+            verify_stepup_proof(onboard, expected_op="add-component")
+        assert ei.value.reason == "wrong_purpose"
+
+    def test_verify_rejects_alg_none(self):
+        """alg:none bypass is rejected (PyJWT requires HS256)."""
+        import jwt as _pyjwt
+        import time as _t
+        from yashigani.auth import verify_stepup_proof, StepUpProofInvalid
+        forged = _pyjwt.encode(
+            {
+                "sub": "attacker", "jti": "x", "iat": int(_t.time()),
+                "exp": int(_t.time()) + 300, "iss": "yashigani.backoffice",
+                "purpose": "privileged-mutation", "op": "add-component",
+            },
+            key="", algorithm="none",
+        )
+        with pytest.raises(StepUpProofInvalid):
+            verify_stepup_proof(forged, expected_op="add-component")
+
+    def test_verify_rejects_empty_token(self):
+        from yashigani.auth import verify_stepup_proof, StepUpProofInvalid
+        with pytest.raises(StepUpProofInvalid) as ei:
+            verify_stepup_proof("", expected_op="add-component")
+        assert ei.value.reason == "empty_token"
+
+    def test_assert_token_gate_emits_audit_on_valid_proof(self):
+        from yashigani.auth import mint_stepup_proof, assert_privileged_mutation_token
+        writer = MagicMock()
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component")
+        claims = assert_privileged_mutation_token(
+            tok, expected_op="add-component", audit_writer=writer, target="prov-1")
+        assert claims["sub"] == "admin1"
+        assert writer.write.call_count == 1
+        ev = writer.write.call_args[0][0]
+        assert ev.principal == "admin1"
+        assert ev.reason == "lifecycle.add-component"
+
+    def test_assert_token_gate_rejects_stale_proof_no_audit(self):
+        from yashigani.auth import (
+            mint_stepup_proof, assert_privileged_mutation_token, StepUpProofInvalid)
+        writer = MagicMock()
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component", ttl_seconds=-1)
+        with pytest.raises(StepUpProofInvalid):
+            assert_privileged_mutation_token(
+                tok, expected_op="add-component", audit_writer=writer)
+        # Fail-closed: no audit event for a rejected (stale) proof.
+        assert writer.write.call_count == 0
+
+    def test_cli_shim_ok_and_deny(self, monkeypatch, capsys):
+        from yashigani.auth.stepup import _verify_proof_cli, mint_stepup_proof
+        tok, _ = mint_stepup_proof(subject="admin1", op="add-component")
+        rc = _verify_proof_cli(["--verify-proof", "--op", "add-component", "--token", tok])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out.startswith("OK sub=admin1")
+        # Wrong op => DENY, non-zero exit.
+        rc2 = _verify_proof_cli(["--verify-proof", "--op", "uninstall", "--token", tok])
+        assert rc2 == 1
+
+
+# ===========================================================================
 # Invocation hard gate (broker) — fail-closed
 # ===========================================================================
 

@@ -1317,6 +1317,101 @@ async def verify_operator_token(
 
 
 # ---------------------------------------------------------------------------
+# MI-4 (YSG-RISK-061): privileged-mutation step-up PROOF token mint
+#
+# The headless counterpart of the in-session step-up gate.  After a fresh TOTP
+# step-up, an operator mints a short-lived proof token bound to a specific
+# destructive lifecycle op (e.g. "add-component"), then hands it to install.sh
+# (--stepup-token).  install.sh verifies it against the SAME shared gate
+# (auth.stepup.verify_stepup_proof) before mutating a running stack.
+#
+# Prereqs: AdminSession + fresh step-up (assert_fresh_stepup) — a hijacked
+# session that has not re-proven TOTP cannot mint a proof.
+# ---------------------------------------------------------------------------
+
+
+class StepUpProofRequest(BaseModel):
+    """Request body for POST /auth/stepup-proof."""
+
+    op: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+        description="Lifecycle op the proof authorises, e.g. 'add-component'.",
+    )
+
+
+@router.post("/stepup-proof")
+async def issue_stepup_proof(
+    body: StepUpProofRequest,
+    session: AdminSession,
+):
+    """
+    Mint a privileged-mutation step-up proof token (MI-4 / YSG-RISK-061).
+
+    Prerequisites:
+      - Active admin session (AdminSession dependency — cookie auth).
+      - Fresh step-up TOTP (assert_fresh_stepup — within YASHIGANI_STEPUP_TTL_SECONDS).
+
+    The proof is an HS256 JWT (signed with caddy_internal_hmac, the same per-install
+    key the gate verifies with) carrying purpose="privileged-mutation" and the
+    bound op label.  TTL = YASHIGANI_STEPUP_PROOF_TTL_SECONDS (default 300 s).
+
+    The token is NEVER written to the audit log — only the jti + op + TTL.
+    """
+    from yashigani.auth.stepup import (
+        assert_fresh_stepup,
+        mint_stepup_proof,
+        STEPUP_PROOF_TTL_SECONDS,
+    )
+
+    assert_fresh_stepup(session)
+
+    state = backoffice_state
+    assert state.auth_service is not None
+    assert state.audit_writer is not None
+
+    admin_record = await state.auth_service.get_account_by_id(session.account_id)
+    if admin_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        token, jti = mint_stepup_proof(subject=admin_record.username, op=body.op)
+    except Exception as exc:  # StepUpProofInvalid(signing_key_unavailable) etc.
+        _log.error("MI-4: step-up proof mint failed for %s: %s", admin_record.username, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "signing_key_unavailable"},
+        )
+
+    from yashigani.audit.schema import PrivilegedMutationEvent
+
+    state.audit_writer.write(
+        PrivilegedMutationEvent(
+            reason=f"stepup_proof.mint.{body.op}",
+            principal=admin_record.username,
+            target=body.op,
+            justification=f"jti={jti} ttl={STEPUP_PROOF_TTL_SECONDS}",
+        )
+    )
+
+    _log.info(
+        "MI-4: step-up proof minted by %s op=%s jti=%s ttl=%ds",
+        admin_record.username, body.op, jti, STEPUP_PROOF_TTL_SECONDS,
+    )
+
+    return {
+        "token": token,
+        "jti": jti,
+        "op": body.op,
+        "expires_in": STEPUP_PROOF_TTL_SECONDS,
+        "token_type": "Bearer",
+        "purpose": "privileged-mutation",
+    }
+
+
+# ---------------------------------------------------------------------------
 # LU-AMEND-04: Internal onboard audit endpoint
 #
 # Called by the yashigani-onboard CLI to emit an ONBOARD_ATTEMPTED event after

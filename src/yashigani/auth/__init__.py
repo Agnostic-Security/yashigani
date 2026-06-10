@@ -18,6 +18,10 @@ from yashigani.auth.stepup import (
     has_fresh_stepup, assert_fresh_stepup, StepUpRequired, STEPUP_TTL_SECONDS,
     assert_privileged_mutation, PrivilegedMutationContext,
     NotAuthorisedForPrivilegedMutation,
+    # MI-4 step-up proof token contract (headless / install.sh path)
+    mint_stepup_proof, verify_stepup_proof, assert_privileged_mutation_token,
+    StepUpProofInvalid, STEPUP_PROOF_TTL_SECONDS,
+    STEPUP_PROOF_PURPOSE, STEPUP_PROOF_ISSUER,
 )
 from yashigani.auth.caddy_verified import load_caddy_secret, CaddyVerifiedMiddleware
 # v2.23.3 (#59)
@@ -41,6 +45,9 @@ __all__ = [
     "has_fresh_stepup", "assert_fresh_stepup", "StepUpRequired", "STEPUP_TTL_SECONDS",
     "assert_privileged_mutation", "PrivilegedMutationContext",
     "NotAuthorisedForPrivilegedMutation",
+    "mint_stepup_proof", "verify_stepup_proof",
+    "assert_privileged_mutation_token", "StepUpProofInvalid",
+    "STEPUP_PROOF_TTL_SECONDS", "STEPUP_PROOF_PURPOSE", "STEPUP_PROOF_ISSUER",
     "load_caddy_secret", "CaddyVerifiedMiddleware",
     # v2.23.3 (#59)
     "AuthSettingsStore",
