@@ -156,6 +156,16 @@ spec:
               mountPath: /policies/mcp.rego
               subPath: mcp.rego
               readOnly: true
+            # 3.0 convergence (Iris): document.rego must be subPath-mounted too,
+            # same class as LAURA-OPA-002 above. doc-OPA added document.rego to the
+            # ConfigMap (configmaps.yaml) + the compose whole-dir mount, but not to
+            # this K8s Deployment — without it OPA loads /policies/ without the
+            # document package and every data.yashigani.document.* decision is
+            # undefined on K8s (document egress-OPA would fail to find its rules).
+            - name: policies
+              mountPath: /policies/document.rego
+              subPath: document.rego
+              readOnly: true
             {{- if .Values.mtls.enabled }}
             - name: pki-certs
               mountPath: /run/secrets
