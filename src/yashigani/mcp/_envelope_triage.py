@@ -54,12 +54,20 @@ from typing import Any, Optional
 
 from yashigani.mcp._envelope import (
     DiffFinding,
+    EffectClass,
     ServerEnvelope,
     StructuralDiffResult,
     diff_envelope,
 )
 
 _log = logging.getLogger("yashigani.mcp.envelope.triage")
+
+# Laura Δ4 — network-class envelope dimensions.  For an external-relay MCP (no
+# ring-fence backstop) a CHANGE that touches any of these auto-allows ONLY in
+# the ring-fenced topology; under external_relay it is force-blocked even when
+# structurally within-envelope, because rung-four (egress=NONE containment) is
+# absent for that topology (see laura-30-...-v2 §6 / Δ4).
+_NETWORK_CLASS_DIMENSIONS = frozenset({"egress", "effect_class", "data_scope"})
 
 
 class TriageClass(str, Enum):
@@ -131,6 +139,82 @@ def _evaluate_sidecar_escalation(
     return any_escalation, None
 
 
+def _candidate_touches_network(envelope: ServerEnvelope) -> bool:
+    """
+    True iff the candidate surface carries ANY network-reach capability:
+    a non-NONE server egress posture, or any tool with the NETWORK effect class
+    (a url/host/webhook-shaped arg projects to NETWORK in ``_envelope``), or any
+    tool with a host/url-shaped data scope.
+
+    Used by the external-relay topology gate (Laura Δ4): for an external-relay
+    MCP there is no ring-fence to contain a mis-triaged egress/network change,
+    so a within-envelope *change* on a network-touching surface must NOT
+    auto-allow — it is force-blocked for human review.
+    """
+    if envelope.egress_posture and envelope.egress_posture.upper() != "NONE":
+        return True
+    for tool in envelope.tools.values():
+        if EffectClass.NETWORK in tool.effect_classes:
+            return True
+    return False
+
+
+def apply_topology_gate(
+    *,
+    topology: str,
+    approved_baseline: ServerEnvelope,
+    current_envelope: ServerEnvelope,
+    structural_expanded: bool,
+) -> Optional[DiffFinding]:
+    """
+    Laura Δ4 conservative-tiering gate, deterministic (no LLM).
+
+    Ring-fenced topology (the 3.0 imported-MCP default): full tiering — a
+    within-envelope change auto-allows; the ring-fence (egress=NONE /
+    internal:true container network policy) is the containment backstop for a
+    mis-triaged network change.  Returns None (no extra gate).
+
+    External-relay topology (YSG-RISK-058, pre-GA): NO ring-fence backstop, so
+    the auto-allow path is unsafe for any network-class dimension.  When the
+    candidate surface *touches* a network-reach capability AND the surface
+    changed (a structural expansion already blocks; this catches the
+    within-envelope network *change* the structural diff alone would
+    auto-allow), force a block.  Returns a DiffFinding to surface on the block.
+
+    This makes the envelope's declared egress-posture ``≤`` what the network
+    topology actually enforces: an external-relay MCP can never auto-allow a
+    network/egress/host capability change, regardless of how the structural
+    diff scores it against the (possibly already network-bearing) baseline.
+
+    The gate is one-directional: it can only *add* a block, never grant — so it
+    composes with the structural authority (which already blocks expansions)
+    and the escalate-only sidecar without weakening either.
+    """
+    if topology != "external_relay":
+        return None
+    if structural_expanded:
+        return None  # already blocked by the structural authority
+    # The structural diff said within-envelope.  But if the network-class
+    # surface is involved at all, an external-relay MCP has no containment for a
+    # silent network re-pin — so any change here blocks.  We treat "candidate
+    # carries network reach" conservatively: if either the baseline OR the
+    # candidate touches network, and the surface changed (caller only invokes
+    # this on a byte-hash mismatch), the network-class change must be reviewed.
+    if _candidate_touches_network(current_envelope) or _candidate_touches_network(
+        approved_baseline
+    ):
+        return DiffFinding(
+            dimension="egress",
+            tool_key="",
+            detail=(
+                "external-relay topology: network/egress/host-touching surface "
+                "change cannot auto-allow (no ring-fence backstop) — operator "
+                "re-approval required (Laura Δ4 / YSG-RISK-058)"
+            ),
+        )
+    return None
+
+
 def _changed_text_fragments(
     approved: ServerEnvelope,
     current_raw_tools: list,
@@ -189,11 +273,11 @@ def triage_refresh(
         'ring_fenced' | 'external_relay'.  Laura Δ4: for external-relay MCPs
         there is no ring-fence backstop, so egress/network/host-scope
         EXPANSIONS must always block (they already do — they are structural
-        expansions); additionally a benign egress/network *change* must not
-        auto-allow.  Since any egress posture *raise* is already a structural
-        expansion, the structural gate covers this; topology is recorded on the
-        outcome for the caller to apply the conservative auto-allow gate
-        (Captain wires the full topology policy in the next slice).
+        expansions); additionally a within-envelope egress/network *change*
+        must not auto-allow.  The conservative gate is enforced by
+        ``apply_topology_gate`` (Step 1b below): a network-touching surface
+        change under external_relay force-blocks (EXPANDING) even when
+        structurally within-envelope.  Ring-fenced topology keeps full tiering.
 
     Returns a TriageOutcome whose ``triage_class`` is authoritative.
     """
@@ -214,6 +298,32 @@ def triage_refresh(
             new_surface_hash=new_surface_hash,
             findings=diff.findings,
             detail="capability expansion vs approved envelope",
+        )
+
+    # Step 1b — Δ4 topology gate (deterministic, before the sidecar).  For an
+    # external-relay MCP a within-envelope network/egress/host change cannot
+    # auto-allow (no ring-fence backstop).  This is asymmetric like the
+    # structural gate: it only ever adds a block.  EXPANDING (operator step-up),
+    # not UNCERTAIN — it is a genuine capability-review requirement, not sidecar
+    # ambiguity.
+    topo_finding = apply_topology_gate(
+        topology=topology,
+        approved_baseline=approved_baseline,
+        current_envelope=current_envelope,
+        structural_expanded=diff.expanded,
+    )
+    if topo_finding is not None:
+        _log.warning(
+            "envelope-triage: EXPANDING (topology gate) provenance=%.12s "
+            "external-relay network change blocked",
+            current_envelope.provenance_id,
+        )
+        return TriageOutcome(
+            triage_class=TriageClass.EXPANDING,
+            should_block=True,
+            new_surface_hash=new_surface_hash,
+            findings=[topo_finding],
+            detail="external-relay topology gate: network-class change blocked",
         )
 
     # Step 2 — structurally benign.  Run the escalate-only sidecar over the

@@ -409,6 +409,87 @@ class TestSalamiBoilingFrog:
 
 
 # ===========================================================================
+# Δ4 — topology-gated conservative tiering (Captain)
+# ===========================================================================
+
+# A network-touching tool: a url/webhook-shaped arg projects to NETWORK.
+_NET_TOOL = _tool("post_status",
+                  props={"webhook_url": {"type": "string"}}, required=["webhook_url"])
+_NET_BASE = [_NET_TOOL]
+
+
+def _triage(current_raw, *, baseline_raw, topology, sidecar=None):
+    baseline = _env(baseline_raw)
+    current = _env(current_raw)
+    return triage_refresh(
+        approved_baseline=baseline,
+        current_envelope=current,
+        current_raw_tools=current_raw,
+        new_surface_hash=surface_set_hash(current_raw),
+        sidecar=sidecar,
+        topology=topology,
+    )
+
+
+class TestTopologyGate:
+    """
+    Laura Δ4 / YSG-RISK-058: external-relay MCPs have no ring-fence backstop, so
+    a within-envelope network/egress/host change cannot auto-allow.  Ring-fenced
+    MCPs keep full tiering (the ring-fence contains a mis-triaged network change).
+    """
+
+    def test_ring_fenced_network_reword_auto_allows(self):
+        # A network tool with a reworded description, ring-fenced → BENIGN.
+        rew = [{**_NET_TOOL, "description": "Posts status (reworded)"}]
+        o = _triage(rew, baseline_raw=_NET_BASE, topology="ring_fenced",
+                    sidecar=_CleanSidecar())
+        assert o.triage_class is TriageClass.BENIGN
+        assert o.auto_allow
+
+    def test_external_relay_network_reword_force_blocks(self):
+        # Same within-envelope reword, external-relay → EXPANDING (no backstop).
+        rew = [{**_NET_TOOL, "description": "Posts status (reworded)"}]
+        o = _triage(rew, baseline_raw=_NET_BASE, topology="external_relay",
+                    sidecar=_CleanSidecar())
+        assert o.triage_class is TriageClass.EXPANDING
+        assert o.should_block
+        assert any(f.dimension == "egress" for f in o.findings)
+
+    def test_external_relay_non_network_reword_still_auto_allows(self):
+        # A NON-network tool reworded under external-relay → still BENIGN: the
+        # gate only force-blocks network-class surfaces.
+        rew = [{**BASE_TOOLS[0], "description": "Reads a file (reworded)"}]
+        o = _triage(rew, baseline_raw=BASE_TOOLS, topology="external_relay",
+                    sidecar=_CleanSidecar())
+        assert o.triage_class is TriageClass.BENIGN
+
+    def test_external_relay_egress_posture_change_blocks(self):
+        # Baseline already INTERNAL egress; a within-envelope reword under
+        # external-relay still blocks because the surface carries egress.
+        baseline = _env(BASE_TOOLS, egress="INTERNAL")
+        rew = [{**BASE_TOOLS[0], "description": "reworded"}]
+        current = _env(rew, egress="INTERNAL")
+        o = triage_refresh(
+            approved_baseline=baseline,
+            current_envelope=current,
+            current_raw_tools=rew,
+            new_surface_hash=surface_set_hash(rew),
+            sidecar=_CleanSidecar(),
+            topology="external_relay",
+        )
+        assert o.triage_class is TriageClass.EXPANDING
+
+    def test_external_relay_structural_expand_still_blocks(self):
+        # An actual structural expansion under external-relay blocks via the
+        # structural authority (not the topology gate) — both paths block.
+        addtool = _NET_BASE + [_tool("delete_all", props={})]
+        o = _triage(addtool, baseline_raw=_NET_BASE, topology="external_relay",
+                    sidecar=_CleanSidecar())
+        assert o.triage_class is TriageClass.EXPANDING
+        assert o.should_block
+
+
+# ===========================================================================
 # Service — mock asyncpg pool
 # ===========================================================================
 
