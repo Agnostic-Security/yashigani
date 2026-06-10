@@ -36,6 +36,10 @@ COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
 REMOVE_VOLUMES="false"
 RUNTIME="${RUNTIME:-}"
 YES="false"
+# Multi-instance (3.0 — scoping-draft §4a): explicit --project=<name> override to
+# target a specific named instance. When empty, the project is read from the install
+# state file's PROJECT field (which falls back to "docker" for legacy installs).
+PROJECT_FLAG="${PROJECT_FLAG:-}"
 
 # ---------------------------------------------------------------------------
 # Canonical named volumes declared in docker/docker-compose.yml top-level
@@ -610,6 +614,7 @@ for arg in "$@"; do
     case "$arg" in
         --remove-volumes) REMOVE_VOLUMES="true" ;;
         --runtime=*)      RUNTIME="${arg#*=}" ;;
+        --project=*)      PROJECT_FLAG="${arg#*=}" ;;
         --yes|-y)         YES="true" ;;
         --help|-h)
             cat <<'EOF'
@@ -622,6 +627,9 @@ Options:
                       (Redis, audit logs, Ollama models, metrics history)
   --runtime=RUNTIME   Force a specific container runtime
                       (docker|podman|k8s — normally auto-detected)
+  --project=NAME      Target a specific named instance (multi-instance hosts).
+                      Normally read from the install state file's PROJECT field;
+                      use this to uninstall one of several side-by-side instances.
   --yes, -y           Skip confirmation prompts (for unattended/CI use).
                       Safety note: when combined with --remove-volumes this
                       will DELETE ALL DATA without prompting. Pass both flags
@@ -660,11 +668,19 @@ done
 _STATE_FILE="${SCRIPT_DIR}/docker/.yashigani-install-state"
 _INSTALL_UID=""
 _INSTALL_USER=""
+# Multi-instance (3.0): the compose project read from the state file. Empty until
+# the state file is parsed; feeds _PROJECT_PREFIX below. `|| true` guards the
+# no-match case (legacy state files have no PROJECT= line) under set -euo pipefail.
+_state_project=""
 
 if [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
     _state_runtime="$(grep -E '^RUNTIME=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
     _INSTALL_UID="$(grep -E '^INSTALL_UID=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
     _INSTALL_USER="$(grep -E '^INSTALL_USER=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
+    # Multi-instance (3.0): the project name to tear down. cut -d= -f2- preserves
+    # any '=' (project names never contain it, but be defensive). || true: legacy
+    # state files predate this field — absent line leaves _state_project empty.
+    _state_project="$(grep -E '^PROJECT=' "$_STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
     # #21 FIX: grep exits 1 when the pattern is absent (compose state files have
     # no NAMESPACE= or HELM_RELEASE= lines).  Under `set -euo pipefail` the
     # command substitution propagates the non-zero exit and the script aborts
@@ -935,8 +951,31 @@ fi
 
 # ===========================================================================
 # Project prefix for container/volume enumeration
+# ---------------------------------------------------------------------------
+# Multi-instance (3.0 — scoping-draft §4a): the compose project that scopes the
+# container/volume/network names to tear down. Precedence:
+#   1. --project=<name> flag (operator explicitly targets one instance)
+#   2. PROJECT from the install state file (the install recorded its own name)
+#   3. "docker" (legacy single-instance default — pre-3.0 installs had no PROJECT)
+# This makes `uninstall.sh --project apac` tear down exactly that named instance
+# while leaving every other instance on a shared host untouched.
 # ===========================================================================
-_PROJECT_PREFIX="docker"
+if [ -n "${PROJECT_FLAG:-}" ]; then
+    _PROJECT_PREFIX="$PROJECT_FLAG"
+    log_info "Targeting instance project: ${_PROJECT_PREFIX} (from --project flag)"
+elif [ -n "${_state_project:-}" ]; then
+    _PROJECT_PREFIX="$_state_project"
+    log_info "Targeting instance project: ${_PROJECT_PREFIX} (from install state file)"
+else
+    _PROJECT_PREFIX="docker"
+fi
+# Export COMPOSE_PROJECT_NAME so the graceful `compose down` in the teardown
+# functions targets THIS project (compose otherwise derives the project from the
+# compose-file directory name, "docker", and would skip a renamed instance —
+# the label-based belt-and-braces passes would then do all the work). Both Docker
+# and Podman compose honour COMPOSE_PROJECT_NAME. Only meaningful for compose
+# runtimes; harmless on k8s (helm/kubectl ignore it).
+export COMPOSE_PROJECT_NAME="$_PROJECT_PREFIX"
 
 # ===========================================================================
 # Step 3: Runtime-specific teardown
