@@ -41,6 +41,23 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import SECP384R1
 
 
+@pytest.fixture(autouse=True)
+def _noop_client_enforce(monkeypatch):
+    """No-op the #16 client-policy enforce gate (Step 2d of broker.enforce).
+
+    Broker allow-path tests carry a non-empty opa_url so the mcp_decision/fs
+    gates can be mocked; the deny-only client-policy gate added in 59c8004 then
+    takes the real-OPA branch and fail-closes on a missing mTLS service identity
+    in the unit env.  These are filesystem-gate logic tests; patch the additive
+    gate to its no-op allow shape so the broker allow-path is what is under test.
+    """
+    async def _allow(*_a, **_kw):
+        return {"allow": True, "deny": [], "obligations": []}
+    monkeypatch.setattr(
+        "yashigani.gateway._client_enforce.evaluate_client_policies", _allow,
+        raising=True)
+
+
 # ===========================================================================
 # A. Path normalisation (unit — no I/O)
 # ===========================================================================

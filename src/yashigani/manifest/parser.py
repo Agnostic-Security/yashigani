@@ -4,6 +4,9 @@ Yashigani Manifest — Safe YAML parser (M1, M2, M3).
 M1 — safe-parse: yaml.safe_load only (no ruamel); 512 KB pre-parse cap;
      sandboxed subprocess via resource.setrlimit (AS 256 MB, CPU 5 s);
      object-graph nesting depth cap 100; & / * count cap ≈ 100 combined.
+     The sandbox uses a fork-deadlock-safe start method (forkserver > spawn >
+     fork) so parse_manifest is correct even from a multi-threaded parent —
+     see _select_start_method / _neutralise_main_module_spec.
 
 M2 — tenant_id regex ``^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`` + post-interp
      KMS-prefix assertion ``/tenant/<id>/`` for every kms_path field.
@@ -11,13 +14,14 @@ M2 — tenant_id regex ``^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`` + post-interp
 M3 — NUL-strip-and-reject; multi-line shell-bound field rejection;
      parser-side constraint enforcement (codegen shell quoting is W4 Su).
 
-Last updated: 2026-05-28T00:00:00+00:00
+Last updated: 2026-06-10T00:00:00+00:00
 """
 from __future__ import annotations
 
 import logging
 import multiprocessing
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -328,31 +332,77 @@ def _sandbox_worker_entry(text: str, result_queue: multiprocessing.Queue) -> Non
         result_queue.put({"ok": False, "rule": "M1_unexpected", "detail": str(exc)[:512], "field": ""})
 
 
+def _neutralise_main_module_spec() -> None:
+    """Make ``__main__`` re-import a no-op for spawn/forkserver children.
+
+    multiprocessing's ``spawn``/``forkserver`` start methods rebuild the child
+    by re-importing the parent's ``__main__`` from its ``__file__``/``__spec__``.
+    When the parent was launched as ``python3 - <<'HEREDOC'`` (install.sh codegen,
+    Bug J4-B1), ``__main__.__file__`` is ``<stdin>`` — a path that does not exist
+    — so the child raises ``FileNotFoundError: .../<stdin>``.  Dropping
+    ``__file__`` and setting ``__spec__ = None`` on the live ``__main__`` makes
+    multiprocessing treat it as an interactive/REPL main and SKIP the re-import,
+    which is exactly correct for our worker (the target lives in this importable
+    module, never in ``__main__``).  Idempotent and harmless when ``__main__``
+    already has no file (normal ``-m pytest`` / module invocation)."""
+    main = sys.modules.get("__main__")
+    if main is None:
+        return
+    if getattr(main, "__file__", None) in (None, "<stdin>", "<string>") or \
+            getattr(main, "__spec__", "unset") is None:
+        # Already interactive/HEREDOC-shaped (or previously neutralised).
+        main.__spec__ = None  # type: ignore[attr-defined]
+        if getattr(main, "__file__", None) in ("<stdin>", "<string>"):
+            try:
+                del main.__file__  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+
+
+def _select_start_method() -> str:
+    """Pick a multiprocessing start method that is safe in a MULTI-THREADED
+    parent AND survives the HEREDOC (``<stdin>``) codegen invocation.
+
+    ``fork`` is UNSAFE here: forking a multi-threaded process (any long-lived
+    gateway worker, or a pytest process that previously ran httpx/asyncio) copies
+    thread locks in indeterminate states, so the forked YAML parse can DEADLOCK
+    (CPython emits "use of fork() may lead to deadlocks in the child"), which
+    surfaces as a spurious ``M1_sandbox_timeout``.  Proven against the full unit
+    suite where test_v250_p1_mcp_broker (async/threaded) running before the
+    manifest-parser tests turned a 1 s file into a 183 s timeout cascade.
+
+    ``forkserver`` forks children from a clean, SINGLE-THREADED server process,
+    eliminating the multi-threaded-fork hazard while staying cheap.  ``spawn`` is
+    the portable fallback.  Both need ``__main__`` neutralised (above) so the
+    HEREDOC ``<stdin>`` re-import that originally forced ``fork`` (Bug J4-B1) no
+    longer applies.  ``fork`` remains the last-resort fallback for exotic
+    platforms exposing neither — there it is single-process by construction.
+
+    SECURITY (Laura ruling 2026-05-29) is preserved: the worker still applies the
+    RLIMIT_AS/RLIMIT_CPU sandbox and returns only a JSON-serialisable result over
+    the queue; forkserver/spawn inherit FEWER parent fds than fork, strictly
+    tightening the original ruling, never loosening it."""
+    available = multiprocessing.get_all_start_methods()
+    if "forkserver" in available:
+        return "forkserver"
+    if "spawn" in available:
+        return "spawn"
+    return "fork"
+
+
 def _parse_sandboxed(text: str) -> dict:
     """
     Run the YAML parse in a sandboxed subprocess with resource limits.
 
     On macOS (no RLIMIT_AS support) the subprocess still runs in a separate
     process for isolation; the resource limits silently no-op.
+
+    Uses a fork-deadlock-safe start method (forkserver > spawn > fork) so the
+    parser is correct even when called from a multi-threaded parent — see
+    ``_select_start_method`` / ``_neutralise_main_module_spec``.
     """
-    # Use "fork" on Linux to avoid multiprocessing.spawn's requirement to
-    # re-import __main__ from a file path.  When install.sh calls the codegen
-    # as `python3 - <<'HEREDOC'`, __main__ has no importable file path
-    # (<stdin>), which causes spawn to raise FileNotFoundError.  fork() copies
-    # the process image directly without needing to reload __main__.
-    # On macOS "fork" is also available; resource-limit sandbox still applies.
-    # Resolves Bug J4-B1 found in P1 first live E2E run (2026-05-29).
-    #
-    # SECURITY (Laura ruling 2026-05-29): fork is acceptable HERE because at the
-    # fork point the parent (a throwaway `python3` codegen invocation) holds NO
-    # secrets — the W6 password/TOTP are shell-only and zeroed before this runs;
-    # only YSG_OPERATOR_IDENTITY (a username) + runtime env are inherited; open
-    # fds are stdin/stdout/stderr only (no socket/secrets-dir/CA-key); heap holds
-    # only the manifest bytes + imports. The untrusted-YAML sandbox thus has
-    # nothing sensitive to read, and the RLIMIT sandbox + JSON-only queue still
-    # apply. REVISIT (switch to temp-file + spawn) if codegen ever loads secret
-    # material into this process's heap/fds before parse_manifest().
-    _ctx_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    _neutralise_main_module_spec()
+    _ctx_method = _select_start_method()
     ctx = multiprocessing.get_context(_ctx_method)
     q: multiprocessing.Queue = ctx.Queue()  # type: ignore[type-arg]
     proc = ctx.Process(target=_sandbox_worker_entry, args=(text, q), daemon=True)

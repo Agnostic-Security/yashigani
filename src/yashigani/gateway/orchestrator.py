@@ -859,13 +859,273 @@ def _seed_denied(request_id: str, reason: str, sensitivity_level: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-async def run_orchestration(*, body, identity, request, request_id: str):
+def _letta_upstream(identity) -> str:
+    """Resolve the @letta agent's upstream URL from the registry (fail-closed)."""
+    from yashigani.gateway.openai_router import _state
+    reg = _state.agent_registry
+    if reg is None:
+        return ""
+    try:
+        for agent in reg.list_all():
+            if agent.get("name", "").lower() == "letta":
+                return agent.get("upstream_url") or agent.get("upstream") or ""
+    except Exception as exc:
+        logger.warning("letta-brain: registry lookup failed: %s", exc)
+    return ""
+
+
+async def _safe_next_letta_decision(next_letta_decision, state, tool_name, wrapped):
+    """Call next_letta_decision; on a brain-turn failure return None (do NOT raise).
+
+    A brain reasoning turn can fail for two in-scope reasons: (1) the gateway's own
+    A→L EGRESS gate denies the brain's completion (response-inspection BLOCKED →
+    OPA response deny → 403 → letta 500), or (2) a transient letta/LLM error.
+    Either way the orchestration must finalize gracefully with the evidence already
+    gathered — never propagate a 500 to the caller (SOP 1 fail-closed-to-finalize).
+    The caller treats None as "brain stopped" and breaks to _finalize.
+    """
+    try:
+        return await next_letta_decision(
+            state, tool_name=tool_name, wrapped_result=wrapped)
+    except Exception as exc:
+        logger.warning("letta-brain: next reasoning turn failed (%s) — finalizing "
+                       "with best-effort transcript", exc)
+        return None
+
+
+async def _run_letta_brain_loop(*, body, identity, request, request_id, catalog,
+                                nonce, root_rid, entry_depth):
+    """PHASE 2 (Design A) — @letta is the brain; the gateway is the executor.
+
+    Letta plans + emits ONE tool decision per turn (structured JSON via the letta
+    REST API).  The gateway runs every named tool through the SAME _execute_tool_call
+    gated path as the qwen loop — OPA ingress+egress, ResponseInspection, quarantine
+    framing, provenance cap, exfil-via-args guard, depth counting — so the §0.1
+    invariant holds identically for letta's hops.  Letta has no network route to any
+    upstream (UA-10 bridges); the only path is back through the gateway.
+
+    Caps (deadline / max_iters / fan-out=1-per-turn / depth-9 ceiling / injection
+    budget) are applied exactly as the qwen loop.  On the headline "cloud 9" MCP
+    hop, the demo-MCP injection result is BLOCKED at egress and a neutral notice
+    (never the raw payload) is fed back to letta — the injection never reaches
+    letta's reasoning context.
+    """
+    from yashigani.gateway.openai_router import _sse_from_completion
+    from yashigani.gateway.letta_brain import (
+        open_letta_brain, next_letta_decision, close_letta_brain,
+    )
+    from yashigani.audit.schema import (
+        OrchestrationCapEvent, OrchestrationDepthCeilingEvent,
+        OrchestrationInjectionHopEvent,
+    )
+
+    upstream = _letta_upstream(identity)
+    if not upstream:
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": "letta orchestrator brain unavailable "
+                                          "(no @letta upstream registered).",
+                               "type": "agent_error", "code": "letta_unreachable"}},
+            headers={"X-Yashigani-Orchestration": "brain-unavailable"})
+
+    # The letta brain must not be offered ITSELF as a callee (no self-delegation
+    # loop).  Drop agent__letta from the projected catalog before letta sees it.
+    if "agent__letta" in catalog.name_map:
+        catalog = _intersect_catalog(
+            catalog, set(catalog.name_map.keys()) - {"agent__letta"})
+
+    pid = _principal_id(identity)
+    user_prompt = "\n".join((m.content or "") for m in body.messages if m.content)
+    transcript: list[dict] = []
+    deadline = time.monotonic() + _deadline_s()
+    max_iters, max_depth = _max_iters(), _max_depth()
+    injection_budget_max = _injection_budget()
+    injection_hops_used = 0
+    saw_tool_result = False
+    hop_depth = entry_depth + 1
+    final_text = ""
+    blocked_any = False
+    model_label = "@letta"
+
+    # Open the letta-brain session and get its first decision.
+    try:
+        state, decision = await open_letta_brain(
+            agent_upstream=upstream, catalog=catalog, user_prompt=user_prompt,
+            nonce=nonce)
+    except Exception:
+        logger.exception("letta-brain: session open failed")
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": "letta orchestrator brain failed to start.",
+                               "type": "agent_error", "code": "letta_brain_error"}},
+            headers={"X-Yashigani-Orchestration": "brain-error"})
+
+    try:
+        for iteration in range(max_iters):
+            if time.monotonic() > deadline:
+                _audit(OrchestrationCapEvent(
+                    root_request_id=root_rid, identity_id=pid, session_id=pid,
+                    agent_id="letta-brain", cap_kind="deadline", cap_value=_deadline_s(),
+                    iterations_run=iteration))
+                final_text = ("[Orchestration deadline reached] " + (final_text or
+                              "Partial result; the wall-clock budget was exhausted."))
+                break
+
+            if decision.get("kind") == "final":
+                candidate = decision.get("answer", "") or final_text
+                # ── G-ORCH-OPA-3 condition 4 (THE leak guard) ───────────────
+                # EVERY brain `final` is re-adjudicated at DELIVERY TIME through
+                # the STANDARD (non-relaxed) response egress gate before it can
+                # reach the user — exactly like the chat path.  This is
+                # UNCONDITIONAL (it does NOT depend on `decision["relaxed"]`):
+                # generation-time inspection on the reasoning leg is
+                # non-deterministic, so a secret the generation-time inspector
+                # MISSED would parse to a `final` with relaxed=False and, under a
+                # `if relaxed:` guard, skip every egress check and reach the user
+                # verbatim (LAURA-ORCH leak, live-proven 2–3/10).  Gating every
+                # final at delivery time closes that path: a would-have-blocked
+                # final is SUPPRESSED + substituted; only a cleared final is
+                # delivered.  Relaxation still works — the brain REASONING leg may
+                # be relaxed; the FINAL answer is always gated.  A turn that
+                # resolved to a call_tool never reaches here — it ran through the
+                # full gated executor like any other hop.
+                from yashigani.gateway.openai_router import gate_relaxed_final
+                allow, gated = await gate_relaxed_final(
+                    identity=identity, final_text=candidate,
+                    prompt_sensitivity=_classify_sensitivity(user_prompt))
+                if not allow:
+                    blocked_any = True
+                final_text = gated
+                break
+
+            # Depth ceiling (§0.1.2): a hop at depth > MAX_DEPTH is a hard stop.
+            if hop_depth > max_depth:
+                _audit(OrchestrationDepthCeilingEvent(
+                    root_request_id=root_rid, identity_id=pid, session_id=pid,
+                    agent_id="letta-brain", tool_name="(nested)",
+                    attempted_depth=hop_depth, max_depth=max_depth))
+                final_text = (f"[Orchestration depth ceiling {max_depth} reached] further "
+                              "nesting was hard-stopped by policy.")
+                blocked_any = True
+                break
+
+            tool_name = decision.get("tool", "")
+            args = decision.get("arguments", {})
+            if not isinstance(args, dict):
+                args = {}
+            entry = catalog.name_map.get(tool_name)
+            tool_kind = entry.kind if entry else "unknown"
+
+            # ── Provenance cap on injection-originated hops (LAURA-ORCH-001(b)) ──
+            # A hop letta emits AFTER consuming any prior tool result is
+            # provenance="tool_result": at least partly result-influenced.  Flag
+            # every such hop, count it against a strict budget, REFUSE over budget
+            # so a result-steering injection cannot amplify through letta either.
+            if saw_tool_result:
+                over_budget = injection_hops_used >= injection_budget_max
+                _audit(OrchestrationInjectionHopEvent(
+                    root_request_id=root_rid, request_id=request_id, identity_id=pid,
+                    session_id=pid, agent_id="letta-brain",
+                    tool_name=tool_name, tool_kind=tool_kind, depth=hop_depth,
+                    iteration=iteration, injection_budget_used=injection_hops_used,
+                    injection_budget_max=injection_budget_max, capped=over_budget))
+                if over_budget:
+                    logger.warning(
+                        "letta-brain: injection-budget exhausted (used=%d max=%d) — "
+                        "refusing provenance=tool_result hop %s (root=%s)",
+                        injection_hops_used, injection_budget_max, tool_name, root_rid)
+                    notice = (f"[BLOCKED BY YASHIGANI PROVENANCE CAP] {tool_name} was refused: "
+                              "the strict budget for tool calls driven by prior tool-result "
+                              "content was exhausted. A tool result cannot direct further tool use.")
+                    blocked_any = True
+                    transcript.append({"type": "step", "tool": tool_name, "status": "blocked",
+                                       "depth": hop_depth, "ingress_opa": "deny:injection_budget",
+                                       "egress_opa": "not_reached", "inspection": "not_reached"})
+                    decision = await _safe_next_letta_decision(
+                        next_letta_decision, state, tool_name,
+                        _wrap_untrusted(notice, nonce))
+                    if decision is None:
+                        final_text = (final_text or
+                                      "Orchestration stopped after the provenance cap: the "
+                                      "orchestrator brain's next reasoning step was withheld "
+                                      "by the gateway's egress inspection.")
+                        blocked_any = True
+                        break
+                    continue
+                injection_hops_used += 1
+
+            # Execute the hop through the SAME gated path as the qwen loop.
+            result = await _execute_tool_call(
+                tool_name=tool_name, args=args, catalog=catalog, identity=identity,
+                depth=hop_depth, root_rid=root_rid, iteration=iteration)
+
+            _audit_step(root_rid=root_rid, request_id=request_id, identity=identity,
+                        tool_name=tool_name, tool_kind=tool_kind, args=args,
+                        depth=hop_depth, iteration=iteration, result=result)
+
+            transcript.append({"type": "step", "tool": tool_name,
+                               "status": "blocked" if result.blocked else "ok",
+                               "depth": hop_depth, "ingress_opa": result.ingress_opa,
+                               "egress_opa": result.egress_opa,
+                               "inspection": result.inspection_verdict})
+            if result.blocked:
+                blocked_any = True
+
+            # Feed the (possibly-substituted) result back to letta, quarantine-
+            # wrapped so letta treats it as untrusted DATA (LAURA-ORCH-001(a)).  On
+            # the cloud-9 MCP block this is the neutral notice — the raw injection
+            # never reaches letta's reasoning context.
+            saw_tool_result = True
+            decision = await _safe_next_letta_decision(
+                next_letta_decision, state, tool_name,
+                _wrap_untrusted(result.text, nonce))
+            if decision is None:
+                # The brain reasoning turn itself was blocked/failed at the gateway
+                # (e.g. its A→L egress was denied by response-inspection — see the
+                # BRAIN-EGRESS note below).  Fail-closed-to-FINALIZE: do NOT 500;
+                # return the best-effort transcript + a note so the per-hop evidence
+                # already gathered is still delivered.
+                final_text = (final_text or
+                              "Orchestration stopped: the orchestrator brain's next "
+                              "reasoning step was withheld by the gateway's egress "
+                              "inspection. The steps completed so far are listed below.")
+                blocked_any = True
+                break
+        else:
+            _audit(OrchestrationCapEvent(
+                root_request_id=root_rid, identity_id=pid, session_id=pid,
+                agent_id="letta-brain", cap_kind="max_iters", cap_value=max_iters,
+                iterations_run=max_iters))
+            if not final_text:
+                final_text = "[Orchestration iteration cap reached] best-effort result returned."
+    finally:
+        # Tear down the ephemeral brain agent (best-effort; never masks the result).
+        await close_letta_brain(state)
+
+    if not final_text:
+        final_text = "Orchestration completed."
+
+    return _finalize(body, identity, request_id, final_text, transcript, blocked_any,
+                     model_label, _sse_from_completion)
+
+
+async def run_orchestration(*, body, identity, request, request_id: str,
+                            brain: str = "qwen"):
     """Gateway-side ReAct executor.  Returns JSONResponse | StreamingResponse.
 
     body is the inbound ChatCompletionRequest (with `tools`).  identity is the
     resolved real caller.  Every tool hop is a gateway self-call that re-enters the
     full pipeline (§3.1) so OPA ingress + egress + ResponseInspection fire on every
     hop, at every depth ≤ 9, in both directions (§0.1).
+
+    ``brain`` selects the orchestrating reasoning engine:
+      • "qwen"  — Phase-1 Design B: qwen2.5:3b native tool-calling (deterministic).
+      • "letta" — Phase-2 Design A: @letta is the brain (memory/planning); the
+                  gateway is STILL the executor — every tool letta names runs
+                  through the IDENTICAL gated path (OPA ingress+egress, inspection,
+                  quarantine framing, provenance cap, exfil-args guard, depth).
+    Both brains share this function's setup (catalog projection, seed adjudication,
+    nonce, caps) so the §0.1 invariant holds identically regardless of brain.
     """
     from yashigani.gateway.openai_router import _state, _sse_from_completion
     from yashigani.gateway.tool_catalog import build_tool_catalog
@@ -930,6 +1190,17 @@ async def run_orchestration(*, body, identity, request, request_id: str):
     if seed_denial is not None:
         return seed_denial
 
+    # ── PHASE 2 (Design A): letta drives the loop, the gateway executes ──────────
+    # When @letta is the named brain, hand off to the letta-brain driver.  It
+    # REUSES the exact same _execute_tool_call gated path, audit triple, provenance
+    # cap, depth counter, and _finalize as the qwen loop below — only the brain
+    # call differs (letta REST round-trip instead of qwen native tool-calling).
+    if brain == "letta":
+        return await _run_letta_brain_loop(
+            body=body, identity=identity, request=request, request_id=request_id,
+            catalog=catalog, nonce=nonce, root_rid=root_rid, entry_depth=entry_depth,
+        )
+
     transcript: list[dict] = []   # coarse step records for the SSE/summary surface
     deadline = time.monotonic() + _deadline_s()
     max_iters, max_fanout, max_depth = _max_iters(), _max_fanout(), _max_depth()
@@ -977,7 +1248,28 @@ async def run_orchestration(*, body, identity, request, request_id: str):
             break
 
         if not assistant.get("tool_calls"):
-            final_text = assistant.get("content", "") or final_text
+            candidate = assistant.get("content", "") or final_text
+            # ── G-ORCH-OPA-3 condition 4 (THE leak guard) ───────────────────
+            # The qwen brain's final answer is `assistant.content` with no tool
+            # calls.  It was generated by the orchestrator brain on a leg whose
+            # generation-time inspection is non-deterministic; if that inspection
+            # MISSED a secret, the raw content would otherwise be delivered to
+            # the user verbatim (the same LAURA-ORCH leak shape as the letta
+            # path).  So EVERY qwen brain final is re-adjudicated at DELIVERY
+            # TIME through the STANDARD (non-relaxed) response egress gate —
+            # UNCONDITIONALLY — exactly like the chat path and the letta path.  A
+            # would-have-blocked final is SUPPRESSED + substituted; only a
+            # cleared final is delivered.  Fail-closed (gate denies on
+            # inspection-raise / absent-allow).
+            from yashigani.gateway.openai_router import gate_relaxed_final
+            user_prompt = "\n".join(
+                (m.content or "") for m in body.messages if m.content)
+            allow, gated = await gate_relaxed_final(
+                identity=identity, final_text=candidate,
+                prompt_sensitivity=_classify_sensitivity(user_prompt))
+            if not allow:
+                blocked_any = True
+            final_text = gated
             break
 
         messages.append(assistant)
@@ -1114,8 +1406,29 @@ def _finalize(body, identity, request_id, final_text, transcript, blocked_any,
               model, sse_from_completion):
     """Build the buffered ChatCompletionResponse (+ SSE wrap if stream requested).
 
-    No un-inspected content crosses the boundary: every tool result that fed the
-    final answer was already inspected + OPA-egress-checked (§5 F-STREAM).
+    INVARIANT — stated precisely (Lu Finding #1).  This function adds NO new model
+    content and re-inspects NONE: it assembles ``final_text`` + a transcript
+    summary into the response envelope.  Two distinct guarantees back the bytes it
+    emits:
+
+      • TOOL RESULTS that fed the answer were each inspected + OPA-egress-checked
+        at the hop (suppress-and-substitute on BLOCKED), so no un-inspected tool
+        content reaches here (§5 F-STREAM).
+
+      • The FINAL ANSWER text was egress-adjudicated AT DELIVERY TIME.  Every
+        brain final (qwen and letta, RELAXED or not) is re-routed through the
+        STANDARD non-relaxed response egress gate (``gate_relaxed_final``) BEFORE
+        it is handed to this function — UNCONDITIONALLY, not only when the
+        generation-time leg flagged itself relaxed.  Generation-time inspection on
+        the reasoning leg is non-deterministic; gating the final at delivery time
+        closes the path where a missed secret (verdict clean → relaxed=False)
+        would otherwise reach the user verbatim (LAURA-ORCH leak).  A
+        would-have-blocked final is suppressed + substituted upstream.
+
+    So ``_finalize`` itself performs no leak guard; it relies on those upstream
+    adjudications.  The G-ORCH-OPA-3 reasoning-leg relaxation is NOT a licence to
+    skip them — it relaxes ONLY the brain's internal cognition leg, never the
+    tool-result or final-answer egress that this envelope carries.
     """
     # Append a compact transcript so the customer "record all outputs" requirement
     # is met inline; full per-hop evidence is in the audit sink.

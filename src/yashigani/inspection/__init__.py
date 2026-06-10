@@ -1,6 +1,11 @@
 """Yashigani Inspection — prompt injection detection pipeline."""
 from yashigani.inspection.classifier import PromptInjectionClassifier, ClassifierResult
 from yashigani.inspection.sanitizer import sanitize, SanitizationResult
+from yashigani.inspection.secret_detector import (
+    SecretVerdict,
+    scan as scan_secrets,
+    is_secret,
+)
 from yashigani.inspection.pipeline import (
     InspectionPipeline,
     PipelineResult,
@@ -15,6 +20,8 @@ from yashigani.inspection.pipeline import (
 __all__ = [
     "PromptInjectionClassifier", "ClassifierResult",
     "sanitize", "SanitizationResult",
+    # Deterministic secret/credential detector (LAURA-ORCH leakfix)
+    "SecretVerdict", "scan_secrets", "is_secret",
     "InspectionPipeline", "PipelineResult",
     # v0.9.0 — response-path inspection
     "ResponseInspectionPipeline",

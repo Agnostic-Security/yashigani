@@ -53,11 +53,13 @@ Streaming limitations
 # Last updated: 2026-06-09T00:00:00+00:00
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from typing import Optional
@@ -73,6 +75,7 @@ from yashigani.audit.schema import (
     ClientPolicyDeniedEvent,
     EncodedPayloadDetectedEvent,
     OpaResponseCheckFailedEvent,
+    OrchestrationBrainReasoningRelaxedEvent,
     PIIDetectedEvent,
     PoolBackendUnavailableEvent,
     ResponseInjectionDetectedEvent,
@@ -229,6 +232,112 @@ def is_orchestration_self_call(request) -> bool:
     guard that makes the self-call loop terminate (build sheet §3.1/§6).
     """
     return bool(request.headers.get("x-yashigani-orchestration-depth"))
+
+
+# ---------------------------------------------------------------------------
+# G-ORCH-OPA-3 — brain-REASONING-leg marker (server-minted, UNFORGEABLE).
+#
+# Problem: when @letta is the orchestrating brain, its OWN reasoning *about* a
+# security task ("test the boundaries / threat-model / cloud 9") trips the
+# response classifier (0.95–1.0) → the response-leg OPA gate 403s → the loop
+# finalizes gracefully and the requested threat-model cognition is SUPPRESSED.
+# But the brain→LLM (A→L) leg is the orchestrator's OWN cognition — it is
+# consumed ONLY by the gateway loop to pick the next GATED hop, never delivered
+# to a human and never used as a tool result.  We therefore "evaluate-not-
+# suppress" that ONE leg: compute the verdict + OPA decision and AUDIT them
+# (relaxation_applied=true), but relax only the 403/substitute ACTION.
+#
+# THE MARKER IS NOT A HEADER.  letta calls the gateway's LLM endpoint
+# autonomously via OPENAI_API_BASE with a static internal bearer + static model;
+# it adds no per-request headers and cannot be trusted to.  So the marker is
+# PROCESS-LOCAL gateway state: the executor brackets each brain round-trip
+# (`_letta_send`) with begin()/end() on a counter held in THIS module.  letta
+# cannot read, set, clear, or forge that counter — it is not derived from model
+# name, content, or any letta-controllable input.  The inbound LLM call that
+# arrives WHILE a brain round-trip is open, from the internal-bearer identity,
+# on the brain model, IS the brain-reasoning leg.
+#
+# CONCURRENCY / MISLABEL SAFETY: a concurrent NON-brain letta chat whose LLM
+# call happens to overlap an open brain round-trip could be mislabelled as a
+# reasoning leg and have its 403-action relaxed.  This is NOT exploitable: the
+# load-bearing leak guard (condition 4) routes ANY relaxed completion that
+# parses to a final/prose answer back through the STANDARD (non-relaxed) egress
+# gate before it can reach a human.  A relaxed completion may only ever resolve
+# to a `call_tool` decision re-entering the full gate.  Mislabelling can at most
+# let an INTERNAL reasoning turn through to the brain loop — never to a user.
+# ---------------------------------------------------------------------------
+# Brain model id letta uses for its own reasoning (compose: LETTA_LLM_MODEL).
+# The marker requires BOTH an open round-trip AND this model, so an unrelated
+# internal-bearer caller on a different model is never relaxed.
+_BRAIN_REASONING_MODEL = os.environ.get("LETTA_LLM_MODEL", "qwen2.5:3b").strip()
+_brain_reasoning_lock = threading.Lock()
+_brain_reasoning_active = 0  # count of open brain round-trips (supports nesting)
+# Set True when a would-have-blocked verdict was RELAXED while a round-trip was
+# open; read+reset by brain_reasoning_leg_end so the executor learns the brain
+# turn it just ran was relaxed (condition 4 — route a relaxed final through the
+# NON-relaxed gate before it can reach the user).
+_brain_reasoning_relaxed_pending = False
+
+
+def brain_reasoning_leg_begin() -> None:
+    """Open a brain-reasoning round-trip (called by the executor around _letta_send).
+
+    Increments the process-local active counter.  letta cannot reach this state;
+    it is the SERVER minting the scope marker, never inferred from letta input.
+    """
+    global _brain_reasoning_active, _brain_reasoning_relaxed_pending
+    with _brain_reasoning_lock:
+        _brain_reasoning_active += 1
+        # Clear any stale relaxation flag at the start of a fresh round-trip.
+        if _brain_reasoning_active == 1:
+            _brain_reasoning_relaxed_pending = False
+
+
+def brain_reasoning_leg_end() -> bool:
+    """Close a brain-reasoning round-trip; return True iff it was RELAXED.
+
+    Always called (even on error).  The boolean lets the executor route a relaxed
+    final/prose answer back through the NON-relaxed egress gate (condition 4).
+    """
+    global _brain_reasoning_active, _brain_reasoning_relaxed_pending
+    with _brain_reasoning_lock:
+        if _brain_reasoning_active > 0:
+            _brain_reasoning_active -= 1
+        relaxed = _brain_reasoning_relaxed_pending
+        if _brain_reasoning_active == 0:
+            _brain_reasoning_relaxed_pending = False
+        return relaxed
+
+
+def _mark_brain_reasoning_relaxed() -> None:
+    """Record that a would-have-blocked verdict was relaxed on the current leg."""
+    global _brain_reasoning_relaxed_pending
+    with _brain_reasoning_lock:
+        _brain_reasoning_relaxed_pending = True
+
+
+def _brain_reasoning_active_now() -> bool:
+    with _brain_reasoning_lock:
+        return _brain_reasoning_active > 0
+
+
+def is_brain_reasoning_leg(identity, model: str) -> bool:
+    """True iff this inbound /v1 call is letta's OWN reasoning (A→L) leg.
+
+    ALL of the following must hold — every condition is SERVER-determined, none
+    is letta-controllable:
+      • a brain round-trip is currently open (process-local counter > 0), AND
+      • the caller is the internal-bearer service identity (mesh-port only), AND
+      • the requested model is the configured brain model.
+
+    A normal chat caller, an external caller, or any call when no brain round-trip
+    is open returns False → the response gate runs BYTE-FOR-BYTE unchanged.
+    """
+    if not _brain_reasoning_active_now():
+        return False
+    if not identity or identity.get("identity_id") != "internal":
+        return False
+    return (model or "").strip() == _BRAIN_REASONING_MODEL
 
 
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
@@ -557,6 +666,41 @@ def _pii_audit(request_id: str, direction: str, pii_result, action: str, destina
         logger.warning("PII audit write failed (request_id=%s): %s", request_id, exc)
 
 
+def _audit_brain_reasoning_relaxation(
+    *, request_id: str, identity_id: str, verdict: str, confidence: float,
+    content: str, opa_reason: str, sensitivity: str,
+) -> None:
+    """G-ORCH-OPA-3 — record a RELAXED brain-reasoning-leg response-OPA block.
+
+    Writes an OrchestrationBrainReasoningRelaxedEvent with relaxation_applied=True
+    so a would-have-blocked reasoning turn is ALWAYS greppable.  Raw content is
+    never stored — only its SHA-256 hash.  Never raises (audit must not break the
+    relaxation path).
+    """
+    if _state.audit_writer is None:
+        return
+    try:
+        content_hash = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+        _state.audit_writer.write(
+            OrchestrationBrainReasoningRelaxedEvent(
+                request_id=request_id,
+                identity_id=identity_id,
+                session_id=identity_id,
+                verdict=verdict,
+                confidence=float(confidence),
+                content_hash=content_hash,
+                opa_reason=opa_reason,
+                sensitivity=sensitivity,
+                relaxation_applied=True,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "G-ORCH-OPA-3 relaxation audit write failed (request_id=%s): %s",
+            request_id, exc,
+        )
+
+
 def _encoded_payload_audit(
     request_id: str, direction: str, destination: str, pii_result
 ) -> None:
@@ -747,14 +891,48 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # re-enters THIS full pipeline (OPA ingress + egress + ResponseInspection per
     # hop, §0.1 invariant).  Orchestration self-calls do NOT carry `tools`, so
     # they take the normal path below — there is no recursion through this branch.
-    if (body.tools or body.orchestrate) and not is_orchestration_self_call(request):
-        from yashigani.gateway.orchestrator import run_orchestration
-        return await run_orchestration(
-            body=body,
-            identity=identity,
-            request=request,
-            request_id=request_id,
-        )
+    #
+    # PHASE 2 (Design A, build sheet §4.2): when the user names @letta as the
+    # ORCHESTRATING BRAIN with orchestration intent (it names other @agents/@models
+    # or the MCP), letta drives the loop but the gateway is STILL the executor —
+    # every tool letta names runs through the SAME gated self-call path.  Letta has
+    # no network route to upstreams (UA-10 bridge isolation), so the gateway is the
+    # only path.  is_letta_orchestration() promotes the call to the executor with
+    # brain="letta"; a bare "@letta hello" stays a normal single-hop agent chat.
+    # IMPORTANT: orchestration must NOT fire on the mere PRESENCE of `tools`.  An
+    # agent framework whose LLM backend IS this gateway (e.g. letta:
+    # OPENAI_API_BASE=http://gateway:8081/v1) sends its own `tools` on every plain
+    # completion call — those are normal chat completions, not user-initiated
+    # orchestration.  So the qwen-brain executor fires only on the EXPLICIT
+    # `orchestrate=true` opt-in (build-sheet §3.5; all Phase-1 callers set it), and
+    # the letta-brain executor fires only when @letta is named as the orchestrating
+    # brain with orchestration intent.  A letta LLM-backend call carries neither,
+    # so it correctly takes the normal chat path below.
+    if not is_orchestration_self_call(request):
+        from yashigani.gateway.letta_brain import is_letta_orchestration
+        letta_brain = is_letta_orchestration(body.model, body)
+        if body.orchestrate or letta_brain:
+            from yashigani.gateway.orchestrator import run_orchestration
+            return await run_orchestration(
+                body=body,
+                identity=identity,
+                request=request,
+                request_id=request_id,
+                brain="letta" if letta_brain else "qwen",
+            )
+
+    # ── 1d. Brain-REASONING-leg detection (G-ORCH-OPA-3, server-minted) ──
+    # Computed ONCE here from server-only state (the process-local brain
+    # round-trip counter + the internal-bearer identity + the brain model).  It
+    # is NOT derived from any letta-controllable input.  When False, every gate
+    # below behaves BYTE-FOR-BYTE as before; the marker is consulted at exactly
+    # ONE place — the response-leg OPA action (step 8c) — to relax the 403/
+    # substitute ACTION while STILL evaluating + auditing the verdict.
+    brain_reasoning_leg = is_brain_reasoning_leg(identity, body.model)
+    # Set True ONLY when a would-have-blocked verdict was relaxed on this leg —
+    # surfaced as a response header so the brain loop can route a relaxed
+    # final/prose answer back through the NON-relaxed gate (condition 4).
+    brain_reasoning_relaxed = False
 
     # ── 2. Extract prompt text for classification ─────────────────────
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
@@ -1622,24 +1800,56 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         # v2.23.4 fail-closed posture — closes LAURA-V243-001 / YSG-RISK-071.
         if not resp_opa.get("allow", False):
             resp_opa_reason = resp_opa.get("reason", "response_policy_denied")
-            logger.warning(
-                "OPA BLOCKED response delivery: identity=%s sensitivity=%s reason=%s",
-                identity_id, sensitivity_level, resp_opa_reason,
-            )
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": {
-                        "message": f"Response blocked by policy: {resp_opa_reason}",
-                        "type": "response_policy_denied",
-                        "code": resp_opa_reason,
-                    }
-                },
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
-                },
-            )
+            # ── G-ORCH-OPA-3: evaluate-AND-LOG on the brain-REASONING leg ───
+            # When (and ONLY when) this is the server-minted brain-reasoning
+            # leg, the would-have-blocked verdict is STILL computed (above) and
+            # AUDITED here with relaxation_applied=true, but the 403/substitute
+            # ACTION is relaxed so the brain can complete its OWN cognition.
+            # The completion never reaches a human directly: it returns to the
+            # gateway loop, which re-gates the next hop, and (condition 4) any
+            # final/prose answer the brain emits goes back through THIS gate
+            # NON-relaxed before delivery.  For NON-marked traffic this branch
+            # is never taken and the gate is byte-for-byte unchanged.
+            if brain_reasoning_leg:
+                brain_reasoning_relaxed = True
+                _mark_brain_reasoning_relaxed()
+                _audit_brain_reasoning_relaxation(
+                    request_id=request_id,
+                    identity_id=identity_id,
+                    verdict=response_verdict,
+                    confidence=response_inspection_confidence,
+                    content=assistant_content,
+                    opa_reason=resp_opa_reason,
+                    sensitivity=sensitivity_level,
+                )
+                logger.warning(
+                    "G-ORCH-OPA-3: response-leg OPA would-block RELAXED for brain-"
+                    "reasoning leg (evaluate-and-log): identity=%s verdict=%s "
+                    "reason=%s relaxation_applied=true request_id=%s",
+                    identity_id, response_verdict, resp_opa_reason, request_id,
+                )
+                # Fall through: deliver the reasoning completion to the brain
+                # loop (NOT to a human).  Stamp a header so the leg is greppable
+                # in transport too.  Do NOT 403.
+            else:
+                logger.warning(
+                    "OPA BLOCKED response delivery: identity=%s sensitivity=%s reason=%s",
+                    identity_id, sensitivity_level, resp_opa_reason,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": f"Response blocked by policy: {resp_opa_reason}",
+                            "type": "response_policy_denied",
+                            "code": resp_opa_reason,
+                        }
+                    },
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
+                    },
+                )
 
     # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
     # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
@@ -1698,6 +1908,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         "X-Yashigani-Generated-Content": "true",
         "X-Yashigani-Response-Inspection-Confidence": f"{response_inspection_confidence:.4f}",
     }
+    # G-ORCH-OPA-3: signal a relaxed brain-reasoning turn so the orchestration
+    # loop routes any relaxed final/prose answer through the NON-relaxed egress
+    # gate (the load-bearing leak guard, condition 4).  Present ONLY on a leg
+    # that was actually relaxed; absent on all normal traffic.
+    if brain_reasoning_relaxed:
+        headers["X-Yashigani-Brain-Reasoning-Relaxed"] = "true"
     # F-T10-001: low-confidence step-up signal.
     # Emitted when inspection confidence is below threshold AND the prompt
     # sensitivity is CONFIDENTIAL or RESTRICTED — the combination that most
@@ -2114,6 +2330,173 @@ async def _opa_v1_check(
     except Exception as exc:
         logger.error("OPA v1 check failed: %s — denying (fail-closed)", exc)
         return {"allow": False, "reason": "opa_unreachable"}
+
+
+_SENSITIVITY_RANK = {"PUBLIC": 0, "INTERNAL": 1, "CONFIDENTIAL": 2, "RESTRICTED": 3}
+
+
+def _stricter_sensitivity(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """Return the higher-ranked (stricter) of two sensitivity labels.
+
+    Used to combine the LLM inspector's response sensitivity with the
+    deterministic classifier's verdict so the OPA ceiling check sees the
+    strictest signal (LAURA-ORCH leakfix).  None is treated as the lowest rank
+    (absence of signal never lowers the floor below the other input).
+    """
+    ra = _SENSITIVITY_RANK.get((a or "").upper(), -1)
+    rb = _SENSITIVITY_RANK.get((b or "").upper(), -1)
+    if ra < 0 and rb < 0:
+        return a if a is not None else b
+    return a if ra >= rb else b
+
+
+async def gate_relaxed_final(
+    *, identity: dict | None, final_text: str, prompt_sensitivity: str,
+) -> tuple[bool, str]:
+    """G-ORCH-OPA-3 condition 4 — re-gate a RELAXED brain final through the
+    STANDARD (NON-relaxed) response egress gate before it can reach the user.
+
+    A relaxed brain-reasoning turn may have parsed to a ``final`` answer.  That
+    answer must NOT be delivered to the human on the relaxed verdict — it must be
+    re-adjudicated by the same response inspection + OPA response gate that normal
+    chat traffic faces, with NO relaxation.  This is THE leak guard.
+
+    Returns ``(allow, text)``:
+      • allow=True  → the final passed the non-relaxed gate; deliver ``text``.
+      • allow=False → the gate would block; ``text`` is a neutral substitute
+        notice (the raw reasoning is SUPPRESSED, never delivered).
+
+    Runs entirely outside any open brain round-trip (the executor calls this AFTER
+    the round-trip closed), so ``is_brain_reasoning_leg`` is False here and the
+    gate behaves exactly as for external traffic — fail-closed.
+    """
+    request_id = f"relaxed-final-{uuid.uuid4().hex[:12]}"
+    # 1) Response inspection on the candidate final text (non-relaxed).
+    response_verdict = "clean"
+    response_content_sensitivity: Optional[str] = None
+    if _state.response_inspection_pipeline is not None and final_text:
+        try:
+            rid = identity.get("identity_id", request_id) if identity else request_id
+            aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
+            resp_result = _state.response_inspection_pipeline.inspect(
+                response_body=final_text, content_type="text/plain",
+                request_id=request_id, session_id=rid, agent_id=aid,
+            )
+            if not resp_result.skipped:
+                response_verdict = resp_result.verdict.lower()
+                response_content_sensitivity = resp_result.response_sensitivity
+        except Exception as exc:
+            # Fail-closed: an inspection error on a relaxed final must NOT pass.
+            logger.warning("gate_relaxed_final: inspection raised (%s) — denying", exc)
+            return False, (
+                "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's final "
+                "answer could not be cleared for delivery and was withheld.")
+    # 1a) DETERMINISTIC secret/credential PRE-FLOOR (LAURA-ORCH leakfix).
+    #     The classifier floor below (1b) catches sensitivity by CLASS (SSN,
+    #     credit card, sk- keys) but MISSED a verbatim AWS_SECRET_ACCESS_KEY
+    #     (no 40-char AWS pattern in its regex set; the suspicious-blob guard
+    #     misses because trailing "KEY=" breaks the bare 40-char token) and is
+    #     entirely defeated by a SPLIT-TOKEN payload ("First wJalr... then a
+    #     slash then K7MDENG ..."), which classifies PUBLIC on every layer
+    #     including ollama.  Both were live-proven by Laura.  The deterministic
+    #     secret detector (pure-python, no LLM, fail-closed) normalises +
+    #     de-obfuscates split forms, reassembles, and tests known key formats +
+    #     an entropy floor.  A hit FORCES response_verdict="blocked" REGARDLESS
+    #     of the LLM inspector verdict AND regardless of the caller's ceiling —
+    #     deterministic, not ceiling-gated.  This is the headline leak-closure.
+    if final_text:
+        try:
+            from yashigani.inspection import scan_secrets
+            secret_verdict = scan_secrets(final_text)
+        except Exception as exc:
+            # Fail-closed: a scan error on a candidate final must NOT pass.
+            logger.warning(
+                "gate_relaxed_final: secret detector raised (%s) — denying "
+                "(fail-closed)", exc)
+            return False, (
+                "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's "
+                "final answer could not be cleared for delivery and was withheld.")
+        if secret_verdict.is_secret:
+            logger.warning(
+                "gate_relaxed_final: DETERMINISTIC secret detector BLOCKED egress "
+                "— detector=%s reassembled=%s span_hash=%s (ollama-inspector "
+                "verdict was '%s'; deterministic block overrides it)",
+                secret_verdict.detector, secret_verdict.reassembled,
+                secret_verdict.span_hash, response_verdict)
+            try:
+                _metric_counter(
+                    "yashigani_orchestration_secret_blocks_total",
+                    "Deterministic secret-detector blocks on orchestration finals "
+                    "(distinct from the ollama inspector). detector labels which "
+                    "format/heuristic fired; reassembled=1 for split-token defeats.",
+                    ["detector", "reassembled"],
+                ).labels(
+                    detector=secret_verdict.detector or "unknown",
+                    reassembled=str(secret_verdict.reassembled).lower(),
+                ).inc()
+            except Exception:  # noqa: BLE001 — metric must never break the gate
+                pass
+            return False, (
+                "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's "
+                "final answer contained credential material and was withheld; "
+                "the raw content was not delivered.")
+    # 1b) DETERMINISTIC content-sensitivity floor (LAURA-ORCH leakfix, N2 pattern).
+    #     The ResponseInspectionPipeline above is an LLM inspector — it is
+    #     NON-deterministic and MISSES a secret on ~10-15% of finals, which is
+    #     precisely how a verbatim AWS_SECRET_ACCESS_KEY reached the user even with
+    #     the gate running.  So in ADDITION we run the SAME deterministic
+    #     sensitivity classifier the chat INGRESS leg uses (classify_decoded, which
+    #     fail-closes to RESTRICTED) over the final text, and feed OPA the STRICTER
+    #     of {inspection-sensitivity, deterministic-classified-sensitivity}.  A
+    #     final carrying a credential classifies CONFIDENTIAL/RESTRICTED every time
+    #     → OPA denies on the sensitivity ceiling → suppressed deterministically,
+    #     independent of the inspector's verdict.  This mirrors the chat path, whose
+    #     403 on the same secret comes from the deterministic classifier, not the
+    #     LLM inspector.
+    if final_text and _state.sensitivity_classifier is not None:
+        try:
+            classified = _state.sensitivity_classifier.classify_decoded(
+                final_text).level.value
+        except Exception as exc:
+            # Fail-closed: an unclassifiable final must NOT pass on a clean verdict.
+            logger.warning(
+                "gate_relaxed_final: content classify raised (%s) — treating "
+                "final as RESTRICTED (fail-closed)", exc)
+            classified = "RESTRICTED"
+        response_content_sensitivity = _stricter_sensitivity(
+            response_content_sensitivity, classified)
+        # A brain final that deterministically classifies CONFIDENTIAL/RESTRICTED
+        # carries sensitive content (a secret, key, credential).  Such content must
+        # NOT egress in an orchestration final REGARDLESS of the caller's ceiling —
+        # the privileged internal-bearer service identity has a RESTRICTED ceiling,
+        # so the ceiling check alone would admit it.  Force a BLOCKED verdict so the
+        # response gate denies deterministically (the OPA response_decision denies
+        # on response_verdict=="blocked").  This is the deterministic leak-closure:
+        # it does not depend on the non-deterministic LLM inspector agreeing.
+        if classified in ("CONFIDENTIAL", "RESTRICTED"):
+            logger.warning(
+                "gate_relaxed_final: final classifies %s (deterministic) — "
+                "BLOCKING egress of sensitive orchestration final", classified)
+            response_verdict = "blocked"
+    # 2) OPA response-leg gate (non-relaxed) — fail-closed on absent allow.
+    if _state.opa_url:
+        resp_opa = await _opa_response_check(
+            identity=identity,
+            response_sensitivity=response_content_sensitivity,
+            prompt_sensitivity=prompt_sensitivity,
+            response_verdict=response_verdict,
+            pii_detected=False,
+        )
+        if not resp_opa.get("allow", False):
+            reason = resp_opa.get("reason", "response_policy_denied")
+            logger.warning(
+                "gate_relaxed_final: relaxed brain final BLOCKED by non-relaxed "
+                "response gate reason=%s — substituting neutral notice", reason)
+            return False, (
+                "[BLOCKED BY YASHIGANI POLICY] The orchestrator's final answer was "
+                f"withheld by the response policy ({reason}); the raw content was "
+                "not delivered.")
+    return True, final_text
 
 
 async def _opa_response_check(

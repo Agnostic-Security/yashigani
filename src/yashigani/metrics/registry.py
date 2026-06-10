@@ -34,15 +34,51 @@ except ImportError:
     REGISTRY = None  # type: ignore[assignment]
 
 
+def _existing_collector(name):
+    """Return an already-registered collector for *name*, or None.
+
+    TEST-1 (Lu) — a module that defines metrics at import time raises
+    ``Duplicated timeseries in CollectorRegistry`` on a SECOND import, which is
+    common in the full unit suite (pytest re-imports modules across files /
+    importlib.reload in fixtures).  The default ``REGISTRY`` exposes a private
+    ``_names_to_collectors`` map; we look the metric up there and hand back the
+    existing collector so re-registration is idempotent instead of fatal.
+    """
+    if not _AVAILABLE or REGISTRY is None:
+        return None
+    try:
+        # prometheus_client maps BOTH the base name and the suffixed series
+        # (e.g. _total / _created / _bucket) to the same collector object.
+        return REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
+def _register(factory, name, *args, **kwargs):
+    """Construct a metric, returning the EXISTING collector on duplicate
+    registration (idempotent).  Fail-closed only on genuinely unexpected
+    errors — a ValueError whose message is the duplicate-timeseries error is
+    resolved by returning the live collector; any other ValueError re-raises."""
+    try:
+        return factory(name, *args, **kwargs)
+    except ValueError as exc:
+        if "Duplicated timeseries" not in str(exc) and "Duplicate" not in str(exc):
+            raise
+        existing = _existing_collector(name)
+        if existing is not None:
+            return existing
+        raise
+
+
 def _C(name, doc, labelnames=()):
-    return Counter(name, doc, labelnames) if _AVAILABLE else Counter(name, doc, labelnames)
+    return _register(Counter, name, doc, labelnames)
 
 def _G(name, doc, labelnames=()):
-    return Gauge(name, doc, labelnames) if _AVAILABLE else Gauge(name, doc, labelnames)
+    return _register(Gauge, name, doc, labelnames)
 
 def _H(name, doc, labelnames=(), buckets=None):
     kwargs = {"buckets": buckets} if buckets else {}
-    return Histogram(name, doc, labelnames, **kwargs) if _AVAILABLE else Histogram(name, doc, labelnames)
+    return _register(Histogram, name, doc, labelnames, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -548,91 +584,91 @@ audit_partition_missing = _G(
 # ---------------------------------------------------------------------------
 
 # OPA routing safety net
-yashigani_opa_safety_blocks_total = Counter(
+yashigani_opa_safety_blocks_total = _C(
     "yashigani_opa_safety_blocks_total",
     "OPA routing safety net blocks — sensitive data heading to cloud",
 )
 
 # Sensitivity classification
-yashigani_sensitivity_detections_total = Counter(
+yashigani_sensitivity_detections_total = _C(
     "yashigani_sensitivity_detections_total",
     "Sensitivity detections by classification level",
     ["level"],
 )
 
-yashigani_sensitivity_conflicts_total = Counter(
+yashigani_sensitivity_conflicts_total = _C(
     "yashigani_sensitivity_conflicts_total",
     "Sensitivity classification conflicts between scanner layers",
 )
 
-yashigani_sensitivity_ceiling_breaches_total = Counter(
+yashigani_sensitivity_ceiling_breaches_total = _C(
     "yashigani_sensitivity_ceiling_breaches_total",
     "Identity accessed data above their sensitivity ceiling",
 )
 
 # Routing decisions
-yashigani_routing_decisions_total = Counter(
+yashigani_routing_decisions_total = _C(
     "yashigani_routing_decisions_total",
     "Optimization Engine routing decisions by rule and route",
     ["rule", "route"],
 )
 
-yashigani_oe_decision_duration_seconds = Histogram(
+yashigani_oe_decision_duration_seconds = _H(
     "yashigani_oe_decision_duration_seconds",
     "Optimization Engine decision latency",
     buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1],
 )
 
 # Budget
-yashigani_budget_tokens_total = Counter(
+yashigani_budget_tokens_total = _C(
     "yashigani_budget_tokens_total",
     "Cloud tokens consumed by provider and identity kind",
     ["provider", "kind", "route"],
 )
 
-yashigani_budget_exhausted_total = Counter(
+yashigani_budget_exhausted_total = _C(
     "yashigani_budget_exhausted_total",
     "Budget exhaustion events — identity auto-switched to local",
 )
 
-yashigani_budget_utilisation_pct = Gauge(
+yashigani_budget_utilisation_pct = _G(
     "yashigani_budget_utilisation_pct",
     "Budget utilisation percentage by identity",
     ["identity_id"],
 )
 
 # Pool Manager
-yashigani_pool_containers_active = Gauge(
+yashigani_pool_containers_active = _G(
     "yashigani_pool_containers_active",
     "Currently active managed containers",
 )
 
-yashigani_pool_containers_created_total = Counter(
+yashigani_pool_containers_created_total = _C(
     "yashigani_pool_containers_created_total",
     "Containers created by Pool Manager",
 )
 
-yashigani_pool_containers_replaced_total = Counter(
+yashigani_pool_containers_replaced_total = _C(
     "yashigani_pool_containers_replaced_total",
     "Containers replaced due to health failures",
 )
 
-yashigani_pool_containers_idle_teardown_total = Counter(
+yashigani_pool_containers_idle_teardown_total = _C(
     "yashigani_pool_containers_idle_teardown_total",
     "Containers torn down due to idle timeout",
 )
 
-yashigani_pool_scale_failures_total = Counter(
+yashigani_pool_scale_failures_total = _C(
     "yashigani_pool_scale_failures_total",
     "Failed scaling attempts — resources exhausted",
 )
 
-yashigani_pool_postmortems_total = Counter(
+yashigani_pool_postmortems_total = _C(
     "yashigani_pool_postmortems_total",
     "Postmortem forensic reports collected",
 )
 
-yashigani_pool_limit_exceeded_total = Counter(
+yashigani_pool_limit_exceeded_total = _C(
     "yashigani_pool_limit_exceeded_total",
     "Container creation blocked by license tier limit",
 )

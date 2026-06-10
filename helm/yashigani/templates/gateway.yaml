@@ -132,6 +132,12 @@ spec:
             # refused (fail-closed).
             - name: YASHIGANI_ORCH_INJECTION_BUDGET
               value: {{ $gwEnv.orchInjectionBudget | quote }}
+            # ORCH-PHASE2 (Design A, letta-as-brain): per-letta-turn HTTP timeout
+            # (seconds). A letta agentic turn does multi-step reasoning + its own
+            # gateway LLM call (~2 min on the 3B brain); must sit above per-turn
+            # latency and below DEADLINE_S so the whole-loop deadline governs.
+            - name: YASHIGANI_ORCH_LETTA_TURN_TIMEOUT_S
+              value: {{ $gwEnv.orchLettaTurnTimeoutS | quote }}
             # SELFCALL_BASE — internal mesh self-call target (http-mesh port 8081,
             # same-pod loopback, internal bearer, NetworkPolicy-isolated).
             - name: YASHIGANI_ORCH_SELFCALL_BASE

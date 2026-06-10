@@ -76,6 +76,28 @@ from cryptography.hazmat.primitives import serialization
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _noop_client_enforce(monkeypatch):
+    """No-op the #16 client-policy enforce gate (Step 2d of broker.enforce).
+
+    The broker config used by these tests carries a non-empty opa_url
+    (http://localhost:8181) so the global mcp_decision gate can be MOCKED.  The
+    deny-only client-policy gate added in 59c8004 runs AFTER that mock and takes
+    the real-OPA branch of evaluate_client_policies, which constructs an mTLS
+    internal_httpx_client that fail-closes ('YASHIGANI_SERVICE_NAME is not set')
+    in the unit environment.  These are broker-LOGIC tests; the client-policy
+    aggregator is exercised by its own (rego/integration) coverage.  Patch the
+    gate to its no-op allow shape so the broker's allow-path logic is what is
+    under test.  Deny-path tests mock upstream gates and return before Step 2d,
+    so this fixture does not affect them.
+    """
+    async def _allow(*_a, **_kw):
+        return {"allow": True, "deny": [], "obligations": []}
+    monkeypatch.setattr(
+        "yashigani.gateway._client_enforce.evaluate_client_policies", _allow,
+        raising=True)
+
+
 def _make_p384_key_pem_b64() -> str:
     """Generate a P-384 key and return it as base64-encoded PEM for env injection."""
     key = ec.generate_private_key(SECP384R1())

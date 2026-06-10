@@ -374,6 +374,10 @@ gateway:
     # over-budget result-steered hop is REFUSED so a result-steering injection
     # loop cannot amplify. Keep low (default 2); raise only with care.
     orchInjectionBudget: "2"
+    # ORCH-PHASE2 (Design A, letta-as-brain): per-letta-turn HTTP timeout (s). A
+    # letta agentic turn does multi-step reasoning + its own gateway LLM call
+    # (~2 min on the 3B brain); keep above per-turn latency and below orchDeadlineS.
+    orchLettaTurnTimeoutS: "240"
     # SELFCALL_BASE — internal mesh self-call target. Same-pod loopback to the
     # http-mesh container port (8081, no Caddy, internal bearer, NetworkPolicy-
     # isolated). orchestrator._mesh_base() reads the key directly (empty string
@@ -1143,6 +1147,15 @@ agentBundles:
       # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LETTA_LLM_MODEL: "qwen2.5:3b"
       LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
+    # ORCH-PHASE2-REDIS (K8s parity with the docker-compose letta entrypoint):
+    # pre-launch letta's bundled redis on the writable /root/.letta PVC with
+    # bgsave-errors non-fatal, then run the normal startup.sh. Without this, the
+    # default redis dir (/app) is read-only under readOnlyRootFilesystem:true →
+    # bgsave fails → writes disabled → 500 on every messages call → the
+    # letta-as-orchestrating-brain (Design A) path cannot take a turn.
+    command: ["/bin/sh", "-c"]
+    args:
+      - 'mkdir -p /root/.letta/redis && redis-server --daemonize yes --bind 127.0.0.1 --dir /root/.letta/redis --stop-writes-on-bgsave-error no && export LETTA_REDIS_HOST=localhost && export LETTA_REDIS_PORT=6379 && exec /app/letta/server/startup.sh'
     # Letta connects to Postgres via the letta-pgbouncer sidecar (pod loopback).
     # The URI is assembled from the postgres secret by agent-bundles.yaml:
     #   LETTA_PG_URI=postgresql://yashigani_app:<pw>@127.0.0.1:5432/letta

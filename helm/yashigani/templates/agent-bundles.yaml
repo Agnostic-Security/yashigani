@@ -88,6 +88,24 @@ spec:
         - name: {{ $bundleID }}
           image: "{{ $bundle.image.repository }}:{{ $bundle.image.tag | default "latest" }}"
           imagePullPolicy: {{ $bundle.image.pullPolicy | default "IfNotPresent" }}
+          {{- /*
+            ORCH-PHASE2-REDIS (K8s parity with docker-compose letta entrypoint):
+            letta 0.16.7 startup.sh launches its bundled redis with the DEFAULT dir
+            (/app), a read-only layer under readOnlyRootFilesystem:true → bgsave
+            fails → stop-writes → 500 on every messages call → blocks the
+            letta-as-brain Design-A path. A bundle MAY override command/args to
+            pre-launch redis on a writable path (the /root/.letta PVC) and export
+            LETTA_REDIS_HOST so startup.sh skips relaunching its own. See
+            values.yaml agentBundles[].command/args for letta.
+          */}}
+          {{- if $bundle.command }}
+          command:
+            {{- toYaml $bundle.command | nindent 12 }}
+          {{- end }}
+          {{- if $bundle.args }}
+          args:
+            {{- toYaml $bundle.args | nindent 12 }}
+          {{- end }}
           securityContext:
             {{- if hasKey $bundle "containerSecurityContext" }}
             {{- toYaml $bundle.containerSecurityContext | nindent 12 }}

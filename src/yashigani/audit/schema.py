@@ -132,6 +132,12 @@ class EventType(str, Enum):
     # RESTRICTED-sensitivity tool result into the ARGS of an outbound tool call
     # (data-exfil-via-tool-args).  The hop is denied on egress before dispatch.
     ORCHESTRATION_EXFIL_BLOCKED = "ORCHESTRATION_EXFIL_BLOCKED"
+    # v2.25.5 — G-ORCH-OPA-3: a brain-REASONING (A→L) leg whose response-leg OPA
+    # decision would have BLOCKED was RELAXED (evaluate-and-log) so the
+    # orchestrator's own cognition can complete.  The verdict is still computed +
+    # recorded here; only the 403/substitute ACTION was relaxed.  A would-have-
+    # blocked reasoning turn is greppable via this event (relaxation_applied=true).
+    ORCHESTRATION_BRAIN_REASONING_RELAXED = "ORCHESTRATION_BRAIN_REASONING_RELAXED"
     # v0.9.0 — Break-glass (S-04)
     BREAK_GLASS_ACTIVATED = "BREAK_GLASS_ACTIVATED"
     BREAK_GLASS_EXPIRED = "BREAK_GLASS_EXPIRED"
@@ -1232,6 +1238,38 @@ class OrchestrationExfilBlockedEvent(AuditEvent):
     args_hash: str = ""
     args_sensitivity: str = ""       # detected sensitivity of the outbound args
     deny_reason: str = ""            # sensitivity_exceeds_egress_ceiling
+
+
+@dataclass
+class OrchestrationBrainReasoningRelaxedEvent(AuditEvent):
+    """G-ORCH-OPA-3 — a brain-REASONING-leg response-OPA block was RELAXED.
+
+    The brain→LLM (A→L) leg is the orchestrator's OWN cognition: consumed only by
+    the gateway loop to pick the next GATED hop, never delivered to a human and
+    never used as a tool result.  When that leg's response-OPA decision WOULD have
+    blocked (e.g. the brain reasons *about* "test the boundaries / threat model /
+    cloud 9" and trips the classifier 0.95–1.0), we still COMPUTE the verdict + OPA
+    decision and record them here with ``relaxation_applied=True`` — only the
+    403/substitute ACTION is relaxed.  A would-have-blocked reasoning turn is
+    therefore ALWAYS greppable in the audit trail.  Raw content is never stored —
+    only the SHA-256 content hash.  The leak guard (a relaxed completion may only
+    resolve to a re-gated call_tool, never a final answer to the user) keeps this
+    relaxation non-exfiltrating; this event makes it observable.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_BRAIN_REASONING_RELAXED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (queryable principal)
+    agent_id: str = "letta-brain"
+    verdict: str = ""                # CLEAN | FLAGGED | BLOCKED (response inspection)
+    confidence: float = 0.0          # inspection confidence at relaxation time
+    content_hash: str = ""           # SHA-256 of the relaxed completion (raw never stored)
+    opa_reason: str = ""             # the response-OPA deny reason that was relaxed
+    sensitivity: str = ""            # prompt sensitivity at relaxation time
+    relaxation_applied: bool = True  # always True for this event (greppable flag)
 
 
 # ---------------------------------------------------------------------------

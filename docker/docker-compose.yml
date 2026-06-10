@@ -379,6 +379,12 @@ services:
       # over-budget result-steered hop is REFUSED so a result-steering injection
       # loop cannot amplify. Keep low (default 2); raise only with care.
       YASHIGANI_ORCH_INJECTION_BUDGET: ${YASHIGANI_ORCH_INJECTION_BUDGET:-2}
+      # ORCH-PHASE2 (Design A, letta-as-brain): a single letta agentic turn does
+      # multi-step reasoning + its own LLM call back through the gateway and takes
+      # ~2 min on the 3B brain. Per-turn HTTP timeout for the letta brain round-trip
+      # (seconds); must sit above the per-turn latency and below DEADLINE_S so the
+      # whole-loop deadline, not the per-turn timeout, governs the overall bound.
+      YASHIGANI_ORCH_LETTA_TURN_TIMEOUT_S: ${YASHIGANI_ORCH_LETTA_TURN_TIMEOUT_S:-240}
       # Optional orchestration overrides.
       #   SELFCALL_BASE — internal mesh self-call target (port 8081, no Caddy,
       #     internal bearer, network-isolated). Default mirrors the code default;
@@ -1995,7 +2001,17 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec /app/letta/server/startup.sh'
+      # ORCH-PHASE2-REDIS (2026-06-10): letta 0.16.7 startup.sh launches its
+      # bundled redis with the DEFAULT dir, which resolves to /app — a read-only
+      # rootfs layer (read_only:true is load-bearing for the openapi write-path
+      # fix above). bgsave then fails and redis sets stop-writes-on-bgsave-error,
+      # which DISABLES writes and 500s every /v1/agents/.../messages call. That is
+      # what blocks letta-as-orchestrating-brain (Design A): the brain cannot take
+      # a turn. Fix (codified, fail-safe): pre-launch redis OURSELVES on a writable
+      # persistent path (the letta_data volume at /root/.letta) with bgsave-errors
+      # made non-fatal, then export LETTA_REDIS_HOST=localhost so startup.sh sees
+      # "external redis" and does NOT relaunch its own with the bad dir.
+      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && mkdir -p /root/.letta/redis && redis-server --daemonize yes --bind 127.0.0.1 --dir /root/.letta/redis --stop-writes-on-bgsave-error no && export LETTA_REDIS_HOST=localhost && export LETTA_REDIS_PORT=6379 && exec /app/letta/server/startup.sh'
     environment:
       # Route LLM calls through Yashigani gateway (OpenAI-compatible)
       # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route letta
