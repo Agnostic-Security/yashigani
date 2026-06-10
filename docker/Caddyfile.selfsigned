@@ -315,7 +315,7 @@ Hiring: https://agnosticsec.com/careers
     # service_identities.yaml endpoint_acls["/admin/agents"].
     handle /admin/* {
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "{$YASHIGANI_CADDY_SPIFFE_ID}"
         reverse_proxy https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
@@ -373,7 +373,7 @@ Hiring: https://agnosticsec.com/careers
         # compose was missing SIDE-001 on this block (added v2.23.3, predates
         # SIDE-001 hardening).
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "{$YASHIGANI_CADDY_SPIFFE_ID}"
         reverse_proxy https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified

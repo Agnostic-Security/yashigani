@@ -499,11 +499,12 @@ data:
         # Caddy presents caddy_client.crt to backoffice via internal-mtls.
         # require_spiffe_id trusts x-spiffe-id when x-spiffe-id-peer-cert is
         # absent (uvicorn does not expose the ASGI TLS peer_cert extension).
-        # The hardcoded "spiffe://yashigani.internal/caddy" matches the ACL
+        # MI-6: the per-instance "spiffe://<trust-domain>/caddy" matches the ACL
         # entry in service_identities.yaml endpoint_acls["/admin/agents"].
+        # trust-domain = .Values.global.spiffeTrustDomain (default yashigani.internal).
         # Parity with docker/Caddyfile.{selfsigned,ca,acme} (commit 8a1dbf5).
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/caddy"
         {{- end }}
         reverse_proxy https://yashigani-backoffice:8443 {
           {{- if .Values.mtls.enabled }}
@@ -523,7 +524,7 @@ data:
       handle /api/v1/admin/* {
         {{- if .Values.mtls.enabled }}
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/caddy"
         {{- end }}
         reverse_proxy https://yashigani-backoffice:8443 {
           {{- if .Values.mtls.enabled }}

@@ -107,6 +107,11 @@ spec:
               value: "/etc/yashigani/service_identities.yaml"
             - name: YASHIGANI_INTERNAL_CA_DIR
               value: "/run/secrets"
+            # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust domain
+            # for the app-layer validators. Default yashigani.internal (single
+            # instance). Compose parity: x-common-env YASHIGANI_SPIFFE_TRUST_DOMAIN.
+            - name: YASHIGANI_SPIFFE_TRUST_DOMAIN
+              value: {{ .Values.global.spiffeTrustDomain | default "yashigani.internal" | quote }}
             {{- end }}
             - name: YASHIGANI_AGENT_ROUTING_ENABLED
               value: {{ $gwEnv.agentRoutingEnabled | quote }}

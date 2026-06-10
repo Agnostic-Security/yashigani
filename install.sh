@@ -95,6 +95,15 @@ fi
 YASHIGANI_VERSION="2.25.3.1"
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
+# MI-1: record whether the operator pinned YSG_INSTALL_DIR explicitly in the
+# environment BEFORE the default is applied. An explicit pin always wins over the
+# per-instance keying in _resolve_instance_install_dir() (operator intent is
+# authoritative). Must be evaluated before the ":-default" assignment below.
+if [[ -n "${YSG_INSTALL_DIR:-}" ]]; then
+  _YSG_INSTALL_DIR_EXPLICIT=1
+else
+  _YSG_INSTALL_DIR_EXPLICIT=0
+fi
 YSG_INSTALL_DIR="${YSG_INSTALL_DIR:-$HOME/.yashigani}"
 
 # -----------------------------------------------------------------------------
@@ -146,6 +155,11 @@ PROJECT=""
 PROJECT_EXPLICIT=0
 LIST_INSTANCES=false          # --list: enumerate instances on the host then exit
 MULTI_INSTANCE_TIER_ACK=false # --i-understand-tier: acknowledge advisory Pro+/Enterprise gate
+# MI-4 (step-up on destructive lifecycle ops / YSG-RISK-061): step-up proof for the
+# add-component path. Token minted by the admin API after a fresh TOTP step-up
+# (auth/stepup.py); also accepted from YASHIGANI_STEPUP_TOKEN. See _require_stepup_mi4.
+STEPUP_TOKEN="${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}"
+STEPUP_ACK=false              # --i-have-stepped-up: interactive operator ack
 TLS_MODE="acme"
 # FIPS_MODE — operator opt-in to FIPS-mode crypto (CMVP #4985 when a FIPS-
 # configured base image is in use). Default 0 = standard OpenSSL. Set to 1
@@ -443,6 +457,20 @@ parse_args() {
         # Multi-instance (3.0): enumerate Yashigani instances on this host
         # (project + domain) so the operator can pick one for upgrade/uninstall.
         LIST_INSTANCES=true
+        shift
+        ;;
+      --stepup-token)
+        # MI-4: step-up proof for a destructive lifecycle op (add-component).
+        STEPUP_TOKEN="${2:?'--stepup-token requires a value'}"
+        shift 2
+        ;;
+      --stepup-token=*)
+        STEPUP_TOKEN="${1#*=}"
+        shift
+        ;;
+      --i-have-stepped-up)
+        # MI-4: interactive-operator step-up acknowledgement (host-shell path).
+        STEPUP_ACK=true
         shift
         ;;
       --i-understand-tier)
@@ -799,6 +827,237 @@ _read_state_project() {
     _p="docker"
   fi
   printf '%s' "$_p"
+}
+
+# _read_state_trust_domain <state_file> — echo the SPIFFE_TRUST_DOMAIN recorded in
+# a state file, or "yashigani.internal" if absent (legacy single-instance / pre-3.0
+# state files). Used by the host-side onboard/codegen path so a BYO agent gets the
+# instance's per-instance trust domain on its spiffe_id, not the shared default.
+_read_state_trust_domain() {
+  local _sf="${1:-${WORK_DIR}/docker/.yashigani-install-state}"
+  local _td=""
+  if [[ -f "$_sf" && -r "$_sf" ]]; then
+    _td="$(grep -E '^SPIFFE_TRUST_DOMAIN=' "$_sf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  if [[ -z "$_td" ]]; then
+    _td="yashigani.internal"
+  fi
+  printf '%s' "$_td"
+}
+
+# =============================================================================
+# Multi-instance tenancy isolation (3.0 / YSG-RISK-061) — MI-1 / MI-2 / MI-6
+# -----------------------------------------------------------------------------
+# Root cause the 3.0 work left open: PROJECT namespaced the *runtime* objects
+# (per-project compose, networks, volumes) but the on-disk secrets/state and the
+# crypto identity (PKI/SPIFFE) stayed at single-instance granularity, anchored at
+# a single shared WORK_DIR (default $HOME/.yashigani). Result: a second install
+# clobbered the first instance's secrets+state, and `uninstall --project A` wiped
+# the shared tree out from under B. These helpers move the *disk* and *identity*
+# boundary to per-instance granularity, keyed by PROJECT, while preserving the
+# legacy single-instance layout byte-for-byte (PROJECT=docker => no change).
+# =============================================================================
+
+# _early_project — best-effort PROJECT resolution from argv ALONE, before the
+# wizard runs. Used only to decide the per-instance install dir + trust domain
+# early in main(), when --project / --domain are already on the command line.
+# Mirrors _resolve_project precedence (explicit --project > --domain > legacy
+# "docker") but is side-effect-free: it does NOT export COMPOSE_PROJECT_NAME and
+# does NOT log (the authoritative resolution still happens later via
+# _resolve_project / _read_state_project once DOMAIN is finalised). Echoes the
+# sanitised project on stdout.
+_early_project() {
+  local _candidate=""
+  if [[ "${PROJECT_EXPLICIT:-0}" -eq 1 && -n "${PROJECT:-}" ]]; then
+    _candidate="$PROJECT"
+  elif [[ -n "${DOMAIN:-}" ]]; then
+    _candidate="$DOMAIN"
+  fi
+  if [[ -z "$_candidate" ]]; then
+    printf 'docker'
+  else
+    _sanitise_project "$_candidate"
+  fi
+}
+
+# _resolve_instance_install_dir — MI-1: key the bootstrap install dir (and hence
+# WORK_DIR, and hence docker/secrets + docker/.env + docker/.yashigani-install-state)
+# to the instance PROJECT, so two instances on one host get fully isolated trees.
+#
+# Backward-compat (NON-NEGOTIABLE): legacy single-instance installs keep the exact
+# default path. The keyed path is ONLY used when ALL of:
+#   * PROJECT is non-legacy (not "docker"), AND
+#   * the operator did NOT pin YSG_INSTALL_DIR explicitly (env override always wins),
+#   * AND we are on the bootstrap (curl / non-repo) code path — an in-repo checkout
+#     is a fixed tree we must not silently relocate (handled by the guard below).
+#
+# Idempotent + side-effect-free except for assigning YSG_INSTALL_DIR. Safe to call
+# once, right after parse_args, before detect_working_directory.
+_resolve_instance_install_dir() {
+  # Operator pinned the dir explicitly (env was set before invocation) — honour it
+  # verbatim. _YSG_INSTALL_DIR_EXPLICIT is set in parse_args when the env var was
+  # present at startup. Never override an explicit operator choice.
+  if [[ "${_YSG_INSTALL_DIR_EXPLICIT:-0}" -eq 1 ]]; then
+    return 0
+  fi
+
+  local _proj
+  _proj="$(_early_project)"
+
+  # Legacy / single-instance: leave the default ($HOME/.yashigani) untouched so
+  # every pre-3.0 install and every demo/localhost install is byte-for-byte stable.
+  if [[ "$_proj" == "docker" ]]; then
+    return 0
+  fi
+
+  # Non-legacy instance with no explicit dir: key the install dir by project so a
+  # second instance does not bootstrap on top of the first. base derived from the
+  # default so YSG_INSTALL_DIR overrides (handled above) are never reached here.
+  YSG_INSTALL_DIR="${HOME}/.yashigani-${_proj}"
+  log_info "Multi-instance: per-instance install dir for project '${_proj}': ${YSG_INSTALL_DIR}"
+}
+
+# _instance_identity_token <state_file> — MI-2: read the per-instance identity
+# token recorded in a state file. The token is a host-random nonce written once at
+# install time; it binds a lifecycle operation to the instance it claims to target.
+# A lifecycle op (upgrade / add-component / uninstall) must present a target whose
+# resolved state file carries a token that matches the running instance's labels —
+# a bare --project string is NOT sufficient to act on a sibling. Echoes the token
+# (empty if absent: pre-3.0 / legacy state files have none — handled by callers as
+# the backward-compat single-instance case).
+_instance_identity_token() {
+  local _sf="${1:-${WORK_DIR}/docker/.yashigani-install-state}"
+  local _t=""
+  if [[ -f "$_sf" && -r "$_sf" ]]; then
+    _t="$(grep -E '^INSTANCE_ID=' "$_sf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  printf '%s' "$_t"
+}
+
+# _gen_instance_id — MI-2: mint a fresh per-instance identity token (128-bit hex,
+# CSPRNG). Written into the state file at install time and embedded as a container
+# label so a lifecycle op can prove it is operating on the instance it named rather
+# than a free-form sibling. Pure CSPRNG read; no I/O beyond /dev/urandom.
+_gen_instance_id() {
+  # openssl preferred; /dev/urandom fallback keeps this dependency-light + portable
+  # across Docker/Podman/k8s install hosts (busybox included).
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+  else
+    LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32
+  fi
+}
+
+# _spiffe_trust_domain — MI-6: the per-instance SPIFFE trust domain. Each instance
+# gets its OWN trust domain so a leaf cert minted in instance A (URI SAN
+# spiffe://<A>.yashigani.internal/<svc>) does NOT satisfy instance B's validators,
+# which pin spiffe://<B>.yashigani.internal/. Combined with MI-1's per-instance CA
+# key (distinct signing key per tree), cross-instance identity fails BOTH on the CA
+# trust anchor AND on the trust-domain authority — belt-and-braces (neither alone is
+# sufficient: same-domain+distinct-CA still cross-validates against a verifier that
+# only string-matches the SAN under a shared root; distinct-domain+shared-CA still
+# cross-validates against a verifier that trusts the CA without pinning the domain).
+#
+# Backward-compat: legacy PROJECT=docker keeps the canonical "yashigani.internal"
+# byte-for-byte, so existing certs + app-side validators (which historically
+# hardcoded "yashigani.internal") keep working with NO rotation required.
+#
+# Echoes the trust-domain authority (no scheme/path) on stdout. Arg: project name.
+_spiffe_trust_domain() {
+  local _proj="${1:-docker}"
+  if [[ -z "$_proj" || "$_proj" == "docker" ]]; then
+    printf 'yashigani.internal'
+  else
+    # <project>.yashigani.internal — the instance label is the leftmost DNS label
+    # of the SPIFFE trust-domain authority. _proj is already sanitised to
+    # [a-z0-9][a-z0-9_-]* by _sanitise_project; '_' is not DNS-legal, so map any
+    # underscore to '-' for the authority component only (cert URI SAN must parse
+    # as a URI authority).
+    printf '%s.yashigani.internal' "$(printf '%s' "$_proj" | tr '_' '-')"
+  fi
+}
+
+# _apply_trust_domain_to_runtime_manifest <runtime_manifest> <trust_domain>
+# MI-6: rewrite every `spiffe_id: spiffe://yashigani.internal/<svc>` line in the
+# RUNTIME service-identity manifest to the per-instance trust domain so the PKI
+# issuer bakes per-instance URI SANs into each leaf cert. Operates on the runtime
+# (gitignored) copy ONLY — the canonical git-tracked manifest is never touched, so
+# git status stays clean (two-copies discipline: canonical = schema/legacy domain,
+# runtime = per-install populated copy).
+#
+# Backward-compat: when trust_domain is the legacy "yashigani.internal" this is a
+# no-op rewrite (byte-identical), so legacy installs are unaffected.
+# Idempotent: re-running on an already-rewritten manifest replaces the authority
+# again to the same value (anchored to the canonical authority via the fixed
+# match). Pure text op via sed on the gitignored file; fail-closed (return 1).
+_apply_trust_domain_to_runtime_manifest() {
+  local _mf="${1:?manifest path required}"
+  local _td="${2:?trust domain required}"
+
+  # Legacy / default authority — nothing to do (the canonical manifest already
+  # carries spiffe://yashigani.internal/<svc>).
+  if [[ "$_td" == "yashigani.internal" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$_mf" ]]; then
+    log_error "_apply_trust_domain_to_runtime_manifest: runtime manifest not found at ${_mf}"
+    return 1
+  fi
+
+  # Replace the trust-domain authority in every spiffe_id value. Anchor on the
+  # canonical authority "yashigani.internal" immediately after the scheme so we
+  # rewrite the authority and nothing else (the /<svc> path is preserved). This is
+  # idempotent because we always anchor on the canonical authority and a previously
+  # rewritten file no longer contains it; to stay safe under re-issue we re-seed
+  # the runtime manifest from canonical on every _pki_run_issuer call (above), so
+  # this rewrite always starts from the canonical authority.
+  local _tmp="${_mf}.td.new"
+  if sed -E "s#(spiffe://)yashigani\.internal(/)#\1${_td}\2#g" "$_mf" > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$_mf" || { rm -f "$_tmp"; log_error "_apply_trust_domain_to_runtime_manifest: atomic move failed"; return 1; }
+    log_info "MI-6: runtime manifest SPIFFE trust domain set to '${_td}' (${_mf})"
+    return 0
+  fi
+  rm -f "$_tmp" 2>/dev/null || true
+  log_error "_apply_trust_domain_to_runtime_manifest: sed rewrite failed on ${_mf}"
+  return 1
+}
+
+# _require_stepup_mi4 <op-label> — MI-4: step-up gate for a destructive lifecycle
+# mutation on the install.sh side (add-component on a running stack). The shared
+# step-up gate is src/yashigani/auth/stepup.py (Tom's surface); the admin API/WebUI
+# path enforces a fresh TOTP step-up and passes the resulting token via
+# --stepup-token / YASHIGANI_STEPUP_TOKEN. Host-shell path requires the token, an
+# interactive --i-have-stepped-up ack, or an inline interactive confirmation; an
+# unattended run with no proof fails closed. Presence is enforced now; cryptographic
+# verification is DEFERRED to Tom's named `privileged_mutation` gate (flagged — wire
+# token verification here when it lands; do NOT duplicate the gate).
+_require_stepup_mi4() {
+  local _op="${1:-privileged mutation}"
+  if [[ -n "${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}" ]]; then
+    log_info "MI-4: step-up token supplied — ${_op} authorised."
+    return 0
+  fi
+  if [[ "${STEPUP_ACK:-false}" == "true" && -t 0 ]]; then
+    log_info "MI-4: interactive operator step-up acknowledgement accepted (${_op})."
+    return 0
+  fi
+  if [[ -t 0 && "${NON_INTERACTIVE:-false}" != "true" ]]; then
+    printf 'MI-4 step-up: confirm a fresh TOTP step-up for this destructive action (%s).\n' "$_op"
+    printf 'Type STEPPED-UP to proceed: '
+    local _su_ack=""
+    read -r _su_ack || _su_ack=""
+    if [[ "$_su_ack" == "STEPPED-UP" ]]; then
+      log_info "MI-4: interactive step-up confirmation accepted (${_op})."
+      return 0
+    fi
+    log_error "MI-4: step-up not confirmed — aborting ${_op}."
+    exit 1
+  fi
+  log_error "MI-4 safety stop: ${_op} requires step-up proof."
+  log_error "  Supply --stepup-token=<value> (or YASHIGANI_STEPUP_TOKEN) minted by the"
+  log_error "  admin API after a fresh TOTP step-up, or run interactively with"
+  log_error "  --i-have-stepped-up. Refusing to proceed unattended without step-up."
+  exit 1
 }
 
 # _list_instances — enumerate Yashigani compose instances on this host as
@@ -2559,6 +2818,33 @@ _write_aes_key_to_env() {
   # --- Domain ---
   _env_set "YASHIGANI_TLS_DOMAIN" "${DOMAIN}"
 
+  # --- Multi-instance identity token (3.0 — MI-2 / YSG-RISK-061) ---
+  # Mint-or-preserve a per-instance CSPRNG identity token NOW (at .env generation,
+  # before compose up) so compose can stamp it as a container label on every
+  # service. A destructive lifecycle op (uninstall) then proves it is operating on
+  # the instance it claims by matching the label on the running containers against
+  # the INSTANCE_ID recorded in THIS tree's state file — a bare --project string
+  # can no longer act on a sibling.
+  # Preservation order (idempotent across re-runs/upgrades): existing .env value >
+  # existing state-file value > fresh CSPRNG mint. Stored in docker/.env as
+  # YASHIGANI_INSTANCE_ID (compose label source) and echoed into the state file by
+  # the Step 12b writer (which reads it back from .env via _instance_identity_token
+  # of the SAME value).
+  local _env_file="${WORK_DIR}/docker/.env"
+  local _existing_iid=""
+  if [[ -f "$_env_file" ]]; then
+    _existing_iid="$(grep -E '^YASHIGANI_INSTANCE_ID=' "$_env_file" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  if [[ -z "$_existing_iid" ]]; then
+    _existing_iid="$(_instance_identity_token "${WORK_DIR}/docker/.yashigani-install-state")"
+  fi
+  if [[ -z "$_existing_iid" ]]; then
+    _existing_iid="$(_gen_instance_id)"
+  fi
+  YASHIGANI_INSTANCE_ID="$_existing_iid"
+  export YASHIGANI_INSTANCE_ID
+  _env_set "YASHIGANI_INSTANCE_ID" "${YASHIGANI_INSTANCE_ID}"
+
   # --- Multi-instance compose project (3.0 — scoping-draft §4a) ---
   # COMPOSE_PROJECT_NAME in docker/.env is the single source of truth for the
   # project name on BOTH Docker and Podman compose (each reads the project-dir
@@ -2569,6 +2855,21 @@ _write_aes_key_to_env() {
   if [[ -n "${PROJECT:-}" && "${PROJECT}" != "docker" ]]; then
     _env_set "COMPOSE_PROJECT_NAME" "${PROJECT}"
   fi
+
+  # --- Multi-instance SPIFFE trust domain (3.0 — MI-6 / YSG-RISK-061) ---
+  # Each instance gets its OWN SPIFFE trust-domain authority so a leaf cert minted
+  # in instance A does not satisfy instance B's validators. This is the SINGLE
+  # SOURCE OF TRUTH consumed by:
+  #   * the install-time cert issuer (per-instance URI SANs baked into leaf certs —
+  #     see _apply_trust_domain_to_runtime_manifest, called from enroll path),
+  #   * Caddy edge (X-SPIFFE-ID injection + peer-cert ACL match), and
+  #   * the app-layer validators (Tom's surface: linter/pool/principal_token/audit
+  #     read YASHIGANI_SPIFFE_TRUST_DOMAIN; default "yashigani.internal" preserves
+  #     legacy single-instance behaviour with no rotation).
+  # Legacy PROJECT=docker keeps "yashigani.internal" byte-for-byte (no env churn).
+  YASHIGANI_SPIFFE_TRUST_DOMAIN="$(_spiffe_trust_domain "${PROJECT:-docker}")"
+  export YASHIGANI_SPIFFE_TRUST_DOMAIN
+  _env_set "YASHIGANI_SPIFFE_TRUST_DOMAIN" "${YASHIGANI_SPIFFE_TRUST_DOMAIN}"
 
   # --- TLS mode ---
   _env_set "YASHIGANI_TLS_MODE" "${TLS_MODE}"
@@ -3707,6 +4008,29 @@ PYEOF
 check_existing_installation() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
 
+  # MI-1 (in-repo collision guard): a fresh install whose resolved PROJECT differs
+  # from the PROJECT already recorded in THIS tree's state file would clobber the
+  # existing instance's secrets + state in place. _resolve_instance_install_dir()
+  # relocates bootstrap (curl) installs to a per-project tree, but an in-repo
+  # checkout (WORK_DIR = the repo, fixed) cannot be relocated. Fail closed and tell
+  # the operator to use a separate install dir, rather than silently overwriting a
+  # sibling instance's crypto material. Only fires on a genuine mismatch for a fresh
+  # install — upgrade/add-component targets the SAME project by design.
+  local _state_file="${WORK_DIR}/docker/.yashigani-install-state"
+  if [[ "${UPGRADE:-false}" != "true" && -f "$_state_file" ]]; then
+    local _existing_proj _wanted_proj
+    _existing_proj="$(_read_state_project "$_state_file")"
+    _wanted_proj="${COMPOSE_PROJECT_NAME:-${PROJECT:-docker}}"
+    if [[ -n "$_existing_proj" && "$_existing_proj" != "$_wanted_proj" ]]; then
+      log_error "Multi-instance safety stop (MI-1): this install tree already hosts instance '${_existing_proj}'."
+      log_error "  Installing project '${_wanted_proj}' here would overwrite '${_existing_proj}' secrets + state in place."
+      log_error "  Install the new instance into its OWN directory, e.g.:"
+      log_error "    YSG_INSTALL_DIR=\"\$HOME/.yashigani-${_wanted_proj}\" ./install.sh --project ${_wanted_proj} ..."
+      log_error "  Or target the existing instance with --upgrade --project ${_existing_proj}."
+      exit 1
+    fi
+  fi
+
   if [[ ! -d "$secrets_dir" ]]; then
     return 0
   fi
@@ -3763,6 +4087,10 @@ check_existing_installation() {
     # The live project volumes belong to the running install (same PKI CA) — not contamination.
     if [[ "$INSTALL_OPENWEBUI" == "true" || -n "$AGENT_BUNDLES" ]]; then
       log_info "Additive re-run detected (--with-openwebui / --agent-bundles on running stack)"
+      # MI-4: add-component on a RUNNING stack mutates a live instance — gate it
+      # with the shared step-up (auth/stepup.py via the API path; token/ack on the
+      # host-shell path). Fail-closed if unattended without a step-up proof.
+      _require_stepup_mi4 "add-component on running instance"
       log_info "Existing PKI CA and volumes preserved — skipping contamination check (BUG-B+-002)"
       REUSE_VOLUMES=true
     fi
@@ -7134,6 +7462,12 @@ register_agent_bundles() {
 import json, os, ssl, sys, time, urllib.request
 
 secrets = "/run/secrets"
+# MI-6: per-instance SPIFFE trust domain. This Python runs INSIDE the backoffice
+# container (compose exec), so it inherits YASHIGANI_SPIFFE_TRUST_DOMAIN from
+# x-common-env. The self-call below must assert the per-instance backoffice
+# identity, or the app-side SPIFFE validator (which pins this instance trust
+# domain) will reject it. Legacy default preserves yashigani.internal.
+_trust_domain = os.environ.get("YASHIGANI_SPIFFE_TRUST_DOMAIN", "yashigani.internal")
 def read_secret(name):
     try:
         return open(os.path.join(secrets, name)).read().strip()
@@ -7290,7 +7624,7 @@ for agent in agents:
     req = urllib.request.Request("https://localhost:8443/admin/agents", data=reg_data,
                                  headers={"Content-Type": "application/json",
                                           "X-Caddy-Verified-Secret": caddy_hmac,
-                                          "X-SPIFFE-ID": "spiffe://yashigani.internal/backoffice",
+                                          "X-SPIFFE-ID": "spiffe://%s/backoffice" % _trust_domain,
                                           "Cookie": f"__Host-yashigani_admin_session={session}"})
     try:
         resp = urllib.request.urlopen(req, context=_ctx)
@@ -10291,6 +10625,28 @@ PYMERGE
     fi
   fi
 
+  # MI-6: stamp the per-instance SPIFFE trust domain onto the runtime manifest
+  # BEFORE the issuer reads it, so per-instance URI SANs are baked into every leaf
+  # cert. Trust domain resolves from the state file (authoritative once written)
+  # then from PROJECT; legacy "yashigani.internal" => no-op. Runs after the manifest
+  # is seeded/merged and before the issuer dispatch. Under rootless Podman the
+  # runtime manifest may be owned by the subuid-mapped issuer UID, so reuse the
+  # same `podman unshare` gate the merge used.
+  local _td_for_manifest
+  _td_for_manifest="$(grep -E '^SPIFFE_TRUST_DOMAIN=' "${WORK_DIR}/docker/.yashigani-install-state" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  if [[ -z "$_td_for_manifest" ]]; then
+    _td_for_manifest="$(_spiffe_trust_domain "${COMPOSE_PROJECT_NAME:-${PROJECT:-docker}}")"
+  fi
+  if [[ "$_td_for_manifest" != "yashigani.internal" ]]; then
+    if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]]; then
+      podman unshare bash -c "$(declare -f _apply_trust_domain_to_runtime_manifest log_info log_error); _apply_trust_domain_to_runtime_manifest \"\$1\" \"\$2\"" _ "$manifest_in" "$_td_for_manifest" \
+        || { log_error "_pki_run_issuer: MI-6 trust-domain rewrite failed (podman unshare) — refusing to issue certs with wrong trust domain"; return 1; }
+    else
+      _apply_trust_domain_to_runtime_manifest "$manifest_in" "$_td_for_manifest" \
+        || { log_error "_pki_run_issuer: MI-6 trust-domain rewrite failed — refusing to issue certs with wrong trust domain"; return 1; }
+    fi
+  fi
+
   case "$runtime" in
     docker)
       _pki_run_issuer_docker "$subcmd" "$image" "$manifest_in" "$secrets_in" "$@"
@@ -12091,14 +12447,21 @@ handle_onboard_subcommand() {
   log_info "Running Python codegen for manifest: ${_manifest}"
   local _codegen_rc=0
 
+  # MI-6: per-instance SPIFFE trust domain for the onboarded agent's spiffe_id.
+  # Read from the target instance's state file (authoritative); legacy default
+  # yashigani.internal preserved.
+  local _onboard_trust_domain
+  _onboard_trust_domain="$(_read_state_trust_domain "${WORK_DIR}/docker/.yashigani-install-state")"
   python3 - "$_manifest" "$WORK_DIR" "${YSG_RUNTIME_4WAY}" \
-      "${YSG_REQUIRE_SIGNED_MANIFEST:-warn}" <<'PYEOF' || _codegen_rc=$?
+      "${YSG_REQUIRE_SIGNED_MANIFEST:-warn}" "${_onboard_trust_domain}" <<'PYEOF' || _codegen_rc=$?
 import sys, os
 
 manifest_path = sys.argv[1]
 output_root   = sys.argv[2]
 runtime       = sys.argv[3]
 sig_level     = sys.argv[4]
+# MI-6: per-instance SPIFFE trust-domain authority (legacy => yashigani.internal).
+trust_domain  = sys.argv[5] if len(sys.argv) > 5 else "yashigani.internal"
 
 # Extend sys.path to find the yashigani package in the repo src/ tree.
 src_dir = os.path.join(output_root, 'src')
@@ -12209,7 +12572,7 @@ else:
         # agents have already been inserted (prior runs), `begin_marker` check
         # above would have caught the duplicate; this path only runs when the
         # entry is absent.
-        spiffe_id = 'spiffe://yashigani.internal/agents/%s/%s' % (tenant_id, agent_name)
+        spiffe_id = 'spiffe://%s/agents/%s/%s' % (trust_domain, tenant_id, agent_name)
         entry_block = (
             '  # BEGIN YSG-ONBOARD-{name}\n'
             '  # Onboarded agent — managed by yashigani onboard/offboard\n'
@@ -13050,6 +13413,16 @@ handle_pki_subcommand() {
 main() {
   parse_args "$@"
 
+  # Multi-instance (3.0 / MI-1): key the bootstrap install dir to the instance
+  # PROJECT BEFORE detect_working_directory runs, so a second --project/--domain
+  # install on the same host bootstraps into its OWN tree
+  # ($HOME/.yashigani-<project>) — isolated secrets, .env, state file and CA —
+  # instead of clobbering the first instance's shared $HOME/.yashigani. Legacy /
+  # single-instance (no --project, no --domain) is untouched. An explicit
+  # YSG_INSTALL_DIR env override always wins. Side-effect-free except assigning
+  # YSG_INSTALL_DIR; safe before --list / PKI / onboard short-circuits below.
+  _resolve_instance_install_dir
+
   # Multi-instance (3.0): --list enumerates instances on the host, then exits.
   # No working-directory / wizard needed — it only reads the runtime's container
   # labels. Placed before all other short-circuits so it works on any host state.
@@ -13171,6 +13544,25 @@ main() {
     # git-ignored via docker/.yashigani-install-state entry in .gitignore.
     if [[ "$DRY_RUN" != "true" ]]; then
       mkdir -p "${WORK_DIR}/docker"
+      # MI-2/MI-6 parity with the compose path: mint-or-preserve the instance
+      # identity token and record the per-instance trust domain. On k8s the
+      # instance label is the namespace (already the tenancy boundary), so the
+      # trust domain derives from NAMESPACE; legacy "yashigani" namespace keeps
+      # the canonical yashigani.internal authority byte-for-byte.
+      local _k8s_state_path="${WORK_DIR}/docker/.yashigani-install-state"
+      local _k8s_instance_id _k8s_trust_domain _k8s_proj
+      _k8s_proj="${NAMESPACE:-yashigani}"
+      _k8s_instance_id="$(_instance_identity_token "$_k8s_state_path")"
+      if [[ -z "$_k8s_instance_id" ]]; then
+        _k8s_instance_id="$(_gen_instance_id)"
+      fi
+      # On k8s the legacy default namespace is "yashigani"; map it to the legacy
+      # trust domain. Any other namespace gets <namespace>.yashigani.internal.
+      if [[ "$_k8s_proj" == "yashigani" ]]; then
+        _k8s_trust_domain="yashigani.internal"
+      else
+        _k8s_trust_domain="$(_spiffe_trust_domain "$(_sanitise_project "$_k8s_proj")")"
+      fi
       {
         printf 'RUNTIME=%s\n'            "k8s"
         printf 'NAMESPACE=%s\n'          "${NAMESPACE}"
@@ -13180,14 +13572,16 @@ main() {
         # with the compose path and for `--list`. PROJECT defaults to NAMESPACE here.
         printf 'PROJECT=%s\n'            "${NAMESPACE:-yashigani}"
         printf 'DOMAIN=%s\n'             "${DOMAIN:-}"
+        printf 'INSTANCE_ID=%s\n'        "${_k8s_instance_id}"
+        printf 'SPIFFE_TRUST_DOMAIN=%s\n' "${_k8s_trust_domain}"
         printf 'INSTALL_UID=%s\n'        "$(id -u)"
         printf 'INSTALL_USER=%s\n'       "$(id -un)"
         printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
-      } > "${WORK_DIR}/docker/.yashigani-install-state"
-      chmod 0644 "${WORK_DIR}/docker/.yashigani-install-state"
-      log_info "Install state written: ${WORK_DIR}/docker/.yashigani-install-state"
-      log_info "  RUNTIME=k8s  NAMESPACE=${NAMESPACE}  HELM_RELEASE=yashigani"
+      } > "$_k8s_state_path"
+      chmod 0644 "$_k8s_state_path"
+      log_info "Install state written: ${_k8s_state_path}"
+      log_info "  RUNTIME=k8s  NAMESPACE=${NAMESPACE}  HELM_RELEASE=yashigani  TRUST_DOMAIN=${_k8s_trust_domain}"
     fi
 
   else
@@ -13707,6 +14101,26 @@ main() {
     # Mode 0644: intentional — uninstall.sh may run as a different OS user (cross-UID
     # clean-slate scenario). Contents are not sensitive (see Laura TM-1 verdict).
     # git-ignored via docker/.yashigani-install-state entry in .gitignore.
+    # MI-2: mint-or-preserve the per-instance identity token. It binds lifecycle
+    # ops to THIS instance (see _instance_identity_token). Preserve an existing
+    # token across upgrade/add-component re-runs so the binding is stable; mint a
+    # fresh CSPRNG token only on first install. MI-6: record the per-instance
+    # SPIFFE trust domain so uninstall/upgrade and audits read the same authority.
+    local _state_path="${WORK_DIR}/docker/.yashigani-install-state"
+    local _instance_id _trust_domain _env_path
+    # MI-2: the authoritative INSTANCE_ID was minted/preserved in generate_env_file()
+    # and written to docker/.env (it is ALSO the compose container-label source).
+    # Read it back from .env so the state file and the running-container label carry
+    # the SAME token. Fall back to the existing state-file value, then a fresh mint
+    # (defensive — .env should always have it on the compose path).
+    _env_path="${WORK_DIR}/docker/.env"
+    _instance_id=""
+    if [[ -f "$_env_path" ]]; then
+      _instance_id="$(grep -E '^YASHIGANI_INSTANCE_ID=' "$_env_path" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+    fi
+    [[ -z "$_instance_id" ]] && _instance_id="$(_instance_identity_token "$_state_path")"
+    [[ -z "$_instance_id" ]] && _instance_id="$(_gen_instance_id)"
+    _trust_domain="$(_spiffe_trust_domain "${PROJECT:-docker}")"
     {
       printf 'RUNTIME=%s\n'            "${RUNTIME:-${YSG_RUNTIME:-docker}}"
       # Multi-instance (3.0): record the compose project + domain so upgrade /
@@ -13714,14 +14128,20 @@ main() {
       # PROJECT falls back to "docker" (legacy single-instance default).
       printf 'PROJECT=%s\n'            "${PROJECT:-docker}"
       printf 'DOMAIN=%s\n'             "${DOMAIN:-}"
+      # MI-2: authenticated lifecycle target. INSTANCE_ID is a host-random nonce;
+      # a lifecycle op must match it (state file <-> running container label) to
+      # act on this instance — a bare --project string is not enough.
+      printf 'INSTANCE_ID=%s\n'        "${_instance_id}"
+      # MI-6: per-instance SPIFFE trust-domain authority (legacy => yashigani.internal).
+      printf 'SPIFFE_TRUST_DOMAIN=%s\n' "${_trust_domain}"
       printf 'INSTALL_UID=%s\n'        "$(id -u)"
       printf 'INSTALL_USER=%s\n'       "$(id -un)"
       printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
-    } > "${WORK_DIR}/docker/.yashigani-install-state"
-    chmod 0644 "${WORK_DIR}/docker/.yashigani-install-state"
-    log_info "Install state written: ${WORK_DIR}/docker/.yashigani-install-state"
-    log_info "  PROJECT=${PROJECT:-docker}  DOMAIN=${DOMAIN:-(none)}"
+    } > "$_state_path"
+    chmod 0644 "$_state_path"
+    log_info "Install state written: ${_state_path}"
+    log_info "  PROJECT=${PROJECT:-docker}  DOMAIN=${DOMAIN:-(none)}  TRUST_DOMAIN=${_trust_domain}"
 
     # Step 13: Completion summary
     print_completion_summary

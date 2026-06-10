@@ -20,6 +20,13 @@ global:
   acmeEmail: "admin@example.com"
   environment: "production"
   useExternalSecrets: false
+  # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust-domain
+  # authority. On K8s the tenancy boundary is the namespace/release, so a
+  # second instance is a separate namespace + a distinct trust domain (e.g.
+  # "apac.yashigani.internal"). Set this per release so a sibling instance's
+  # SPIFFE identity does not validate. Leave at the default for a single
+  # instance — preserves "yashigani.internal" byte-for-byte (no rotation).
+  spiffeTrustDomain: "yashigani.internal"
 
   keda:
     enabled: true
