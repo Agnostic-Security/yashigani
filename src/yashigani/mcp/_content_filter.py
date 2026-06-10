@@ -312,6 +312,14 @@ class FilterResult:
     reject_reason: str
     safe_text: str
     matched_pattern: Optional[str] = None
+    # v2.26 / YSG-RISK-057 — populated only when the semantic-intent sidecar
+    # ran and contributed to the verdict.  None when the sidecar was OFF or not
+    # supplied (v1 heuristic-only behaviour is byte-identical to before).
+    semantic_intent_score: Optional[float] = None
+    semantic_intent_view: Optional[str] = None
+    # MASKED encoded token (pii.decode._mask_token: first4…last4 + length) of the
+    # decoded view that drove the verdict — audit-safe, never raw content.
+    semantic_intent_segment: Optional[str] = None
 
 
 def filter_description(text: str) -> FilterResult:
@@ -416,6 +424,92 @@ def filter_description(text: str) -> FilterResult:
         reject_reason="",
         safe_text=normalised,
     )
+
+
+# ---------------------------------------------------------------------------
+# v2.26 / YSG-RISK-057 — content-filter v2: heuristic + semantic-intent sidecar
+#
+# Defence-in-depth composition.  The v1 heuristic (filter_description) is the
+# fast, always-on stage.  filter_description_v2 runs it first, and ONLY if the
+# heuristic passed AND a sidecar is supplied AND the feature flag is ON, it asks
+# the semantic-intent sidecar for a second, encoding-aware opinion (the sidecar
+# decodes base64/hex/url/rot13 before classifying — the YSG-RISK-057 residual).
+#
+# The sidecar can only ESCALATE (clean -> rejected), never downgrade a heuristic
+# rejection.  When the sidecar is OFF / not supplied, behaviour is byte-identical
+# to filter_description (the v1 path is untouched).
+# ---------------------------------------------------------------------------
+
+
+def filter_description_v2(
+    text: str,
+    sidecar=None,  # Optional[SemanticIntentSidecar]
+) -> FilterResult:
+    """
+    Content-filter v2: v1 heuristic + optional semantic-intent sidecar.
+
+    Stage 1 (always): the v1 heuristic ``filter_description``.  If it rejects,
+    return immediately — no need to spend a GPU inference on already-blocked
+    content.
+
+    Stage 2 (flag-gated, defence-in-depth): if a ``sidecar`` is supplied and the
+    feature flag is ON, evaluate the ORIGINAL text for semantic injection intent
+    across decoded views.  An injection verdict ESCALATES a clean heuristic
+    result to rejected (reject_reason="semantic_intent").  Fail-closed semantics
+    live in the sidecar; here we simply honour ``verdict.is_injection``.
+
+    The sidecar is hostile-input-aware (it quotes content as a literal) and
+    fail-closed; see ``inspection.semantic_intent``.
+    """
+    base = filter_description(text)
+
+    # Heuristic already rejected, or no sidecar wired — return v1 result as-is.
+    if base.rejected or sidecar is None:
+        return base
+
+    try:
+        verdict = sidecar.evaluate(text)
+    except Exception as exc:  # sidecar must not break the filter path
+        # A crashing sidecar (not just an unreachable backend — the sidecar
+        # already fail-closes that internally) is a code fault.  Be honest in
+        # the audit trail but do not weaken the heuristic verdict that passed.
+        import logging
+        logging.getLogger(__name__).error(
+            "filter_description_v2: sidecar.evaluate raised %s — heuristic verdict stands",
+            type(exc).__name__,
+        )
+        return base
+
+    if verdict.skipped:
+        # Flag OFF — v1 behaviour.
+        return base
+
+    # Masked encoded token of the view that drove the verdict (audit-safe).
+    # ViewVerdict.segment is already masked by pii.decode._mask_token.
+    flagged_segment = ""
+    for vv in verdict.view_verdicts:
+        if vv.view_name == verdict.flagged_view:
+            flagged_segment = vv.segment or ""
+            break
+
+    # Annotate for audit regardless of disposition.
+    base.semantic_intent_score = verdict.score
+    base.semantic_intent_view = verdict.flagged_view
+    base.semantic_intent_segment = flagged_segment
+
+    if verdict.is_injection:
+        return FilterResult(
+            original_length=base.original_length,
+            normalised_length=base.normalised_length,
+            rejected=True,
+            reject_reason="semantic_intent",
+            safe_text=_REPLACEMENT_TEXT,
+            matched_pattern=f"semantic_intent:{verdict.flagged_view}",
+            semantic_intent_score=verdict.score,
+            semantic_intent_view=verdict.flagged_view,
+            semantic_intent_segment=flagged_segment,
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -544,10 +638,17 @@ def build_catalogue(
     server_id: str,
     raw_tools: list[dict],
     raw_prompts: Optional[list[dict]] = None,
+    sidecar=None,  # Optional[SemanticIntentSidecar]
 ) -> TenantCatalogue:
     """
     Build a TenantCatalogue from raw tools/list and optional prompts/list
-    responses by running each description through filter_description().
+    responses by running each description through the content filter.
+
+    Filtering uses ``filter_description_v2`` so that — when a ``sidecar`` is
+    supplied AND the YSG-RISK-057 feature flag is ON — each clean-heuristic
+    description gets a second, encoding-aware look (decode-before-classify).
+    When ``sidecar`` is None or the flag is OFF, behaviour is byte-identical to
+    the v1 ``filter_description`` path.
 
     Parameters
     ----------
@@ -562,12 +663,15 @@ def build_catalogue(
     raw_prompts:
         List of prompt dicts from prompts/list or prompts/get.  Expected
         keys: ``name`` (str) and ``description``/``content`` (str).
+    sidecar:
+        Optional semantic-intent sidecar (content-filter v2).  Escalate-only,
+        flag-gated, fail-closed — see ``filter_description_v2``.
     """
     tools: list[ToolDescriptor] = []
     for raw in raw_tools:
         name = str(raw.get("name") or "")
         desc = str(raw.get("description") or "")
-        result = filter_description(desc)
+        result = filter_description_v2(desc, sidecar=sidecar)
         tools.append(ToolDescriptor(
             tool_name=name,
             safe_description=result.safe_text,
@@ -579,7 +683,7 @@ def build_catalogue(
         name = str(raw.get("name") or "")
         # MCP prompts/get response uses "content" or "description"
         content = str(raw.get("content") or raw.get("description") or "")
-        result = filter_description(content)
+        result = filter_description_v2(content, sidecar=sidecar)
         prompts.append(PromptDescriptor(
             prompt_name=name,
             safe_content=result.safe_text,
