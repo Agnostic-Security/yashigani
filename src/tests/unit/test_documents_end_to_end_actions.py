@@ -204,15 +204,21 @@ def test_pseudonymize_all_six(fmt, builder, mime):
     re_extract = reg.extract(r.forward_bytes, mime)
     text = "\n".join(s.text for s in re_extract.segments)
     assert _PII_EMAIL not in text, f"{fmt}: original survived PSEUDONYMIZE (§5.5)"
-    assert "[EMAIL_1]" in text, f"{fmt}: token not present in tokenized artefact"
+    # Opaque token (DECIDED 2026-06-10): recover the actual token from the map
+    # (no fixed [EMAIL_1] shape) and assert it is present in the tokenized output.
+    email_tok = next(t for t, v in r.correspondence_table.rows.items() if v == _PII_EMAIL)
+    assert email_tok in text, f"{fmt}: token not present in tokenized artefact"
 
     # F5: the replacer map is held (handle present, encrypted, TTL'd), and the
     # mode-A correspondence table was emitted, recoverable via the map.
     assert r.replacer_map is not None and len(r.replacer_map.handle) >= 40
     assert r.pseudonymize_mode == "A"
     assert r.correspondence_table is not None
-    assert "[EMAIL_1]" in r.correspondence_table.rows
-    assert r.correspondence_table.rows["[EMAIL_1]"] == _PII_EMAIL
+    assert r.correspondence_table.rows[email_tok] == _PII_EMAIL
+    # The token is opaque: no class tag, no count.
+    assert "[" not in email_tok and "EMAIL" not in email_tok.upper()
+    # The mapping file carries the per-file salt header (integrity binding).
+    assert r.doc_hash and f"# doc_hash={r.doc_hash}" in r.correspondence_table.to_csv()
 
 
 def _docx_custom_meta_only_doc() -> bytes:
@@ -283,7 +289,9 @@ def test_csv_pseudonymize_coherent_across_rows():
     assert r.disposition == DISPOSITION_PSEUDONYMIZE
     text = r.forward_bytes.decode()
     assert _PII_EMAIL not in text
-    assert text.count("[EMAIL_1]") == 2  # both rows collapsed to one token
+    # Same value in two rows → the SAME opaque token in both (coherence, §5.3a).
+    email_tok = next(t for t, v in r.correspondence_table.rows.items() if v == _PII_EMAIL)
+    assert text.count(email_tok) == 2  # both rows collapsed to one token
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +429,19 @@ def test_modeb_roundtrip_wired_happy_path():
     # The tokenized artefact (what the cloud sees) carries tokens, not originals.
     out_text = r.forward_bytes.decode()
     assert "alice@example.com" not in out_text
-    assert "[EMAIL_1]" in out_text
+    # Opaque token (DECIDED 2026-06-10): recover alice's actual token from the
+    # round-trip binder's recorded egress (token -> original), no [EMAIL_1] shape.
+    rt = r.mode_b_roundtrip
+    alice_tok = next(
+        tok for tok, occ in rt.binder._egress.items() if occ.original == "alice@example.com"
+    )
+    assert alice_tok in out_text
 
     # A GENUINE cloud answer: it answers about ONE record, reproducing the issued
     # ±24-char context of that token but NOT the whole frame's structure.
-    rt = r.mode_b_roundtrip
     frame = "\n".join(s for s in out_text.splitlines())
-    idx = frame.find("[EMAIL_1]")
-    answer = "You can reach them: " + frame[max(0, idx - 24): idx + len("[EMAIL_1]") + 24]
+    idx = frame.find(alice_tok)
+    answer = "You can reach them: " + frame[max(0, idx - 24): idx + len(alice_tok) + 24]
     restore = pipe.restore_modeb_response("req-mb", answer, rt)
     assert restore.echo_rejected is False, restore
     assert restore.restored is True, restore.flags
@@ -479,8 +492,10 @@ def test_modeb_namespace_dump_flagged_not_restored():
     pipe = _modeb_pipeline()
     r = pipe.inspect(_modeb_csv(), "text/csv", request_id="req-dump",
                      requested_action="PSEUDONYMIZE", pseudonymize_mode="B")
-    # Attacker frames a few tokens in a sentence they were never issued in.
-    attack = "Exfil dump: [EMAIL_1] then [EMAIL_2] then [EMAIL_3]."
+    # Attacker frames a few (real, opaque) tokens in a sentence they were never
+    # issued in — recover the actual tokens from the binder's egress set.
+    toks = list(r.mode_b_roundtrip.binder._egress.keys())[:3]
+    attack = "Exfil dump: " + " then ".join(toks) + "."
     restore = pipe.restore_modeb_response("req-dump", attack, r.mode_b_roundtrip)
     assert restore.echo_rejected is False
     # Position binding refused them: nothing restored, tokens flagged.

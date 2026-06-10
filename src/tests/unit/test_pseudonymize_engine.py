@@ -1,61 +1,156 @@
 """
-Host-side PSEUDONYMIZE engine tests (plan §5.3, red-team F2/F3/F5).
+Host-side PSEUDONYMIZE engine tests (plan §5.3, opaque token scheme DECIDED 2026-06-10).
 
 Covers the crown-jewel machinery that NEVER enters the jail:
-  - TokenAssigner consistency/coherence (same value -> same token; type-tagged);
+  - OpaqueTokenAssigner: opaque, per-file-salted, value-keyed tokens — same value
+    -> same token WITHIN a doc (coherence); same value in two docs -> DIFFERENT
+    tokens (per-file uniqueness); tokens leak NO class / count (Laura's finding);
   - ReplacerMap (F5): unguessable handle, AES-256-GCM encryption, TTL fail-close,
     handle-mismatch rejection, and the map NEVER appearing in a serialised form;
-  - CorrespondenceTable + local_remerge (mode A, §5.3.1);
-  - PositionBinder (mode B, F3): egress-count binding + over-restore fail-closed.
+  - CorrespondenceTable + local_remerge (mode A, §5.3.1) + doc_hash header;
+  - PositionBinder (mode B, F3/L-02): egress-count + position binding, echo guard.
 """
 from __future__ import annotations
+
+import re
 
 import pytest
 
 from yashigani.documents.pseudonymize import (
     CorrespondenceTable,
     EchoEgressError,
+    OpaqueTokenAssigner,
     PositionBinder,
     ReplacerMap,
     ReplacerMapExpiredError,
     TokenAssigner,
     build_pseudonymize_plan,
     build_redact_plan,
+    is_pseudonymization_token,
     local_remerge,
 )
 from yashigani.documents.datamatch import DataMatch
+from yashigani.documents.token_scheme import (
+    TOKEN_CHARS,
+    compute_doc_hash,
+    derive_token,
+    token_matches_doc,
+)
 from yashigani.documents.transform import SpanAction
 
 
+# A fixed per-file salt for deterministic tests (a SHA-256 hex of some bytes).
+_SALT_A = compute_doc_hash(b"document-A-original-bytes")
+_SALT_B = compute_doc_hash(b"document-B-original-bytes")
+_SECRET = b"deployment-secret-0123456789abcdef"
+_OPAQUE_RE = re.compile(rf"^[a-z2-7]{{{TOKEN_CHARS}}}$")
+
+
+def _assigner(salt: str = _SALT_A, secret: bytes | None = _SECRET) -> OpaqueTokenAssigner:
+    return OpaqueTokenAssigner(salt, secret=secret)
+
+
 # ---------------------------------------------------------------------------
-# TokenAssigner — consistency, coherence, type-tagging (§5.3a, F2).
+# OpaqueTokenAssigner — opacity, coherence, per-file uniqueness (DECIDED 2026-06-10).
 # ---------------------------------------------------------------------------
 
-def test_same_value_same_token_distinct_values_distinct():
-    a = TokenAssigner()
-    t1 = a.token_for("Alice Smith", "PII.PERSON")
-    t2 = a.token_for("Alice Smith", "PII.PERSON")   # repeat → same token
-    t3 = a.token_for("Bob Jones", "PII.PERSON")     # distinct → distinct token
+def test_token_is_opaque_no_class_or_count_leak():
+    """Laura's finding: the token must reveal neither the data class nor a count.
+    Opaque token = 12 lowercase base32 chars, no [TAG_N] structure."""
+    a = _assigner()
+    t_email = a.token_for("x@y.com", "PII.EMAIL")
+    t_person = a.token_for("Alice Smith", "PII.PERSON_NAME")
+    t_card = a.token_for("4111111111111111", "PII.CREDIT_CARD")
+    for t in (t_email, t_person, t_card):
+        assert _OPAQUE_RE.match(t), f"token {t!r} is not opaque base32"
+        # No class tag, no counter, no brackets.
+        assert "[" not in t and "_" not in t and "EMAIL" not in t.upper()
+    # The three tokens for different values/classes are unrelated strings.
+    assert len({t_email, t_person, t_card}) == 3
+
+
+def test_same_value_same_token_within_doc_distinct_values_distinct():
+    """Coherence (§5.3a): same value -> same token in the SAME doc; distinct -> distinct."""
+    a = _assigner()
+    t1 = a.token_for("Alice Smith", "PII.PERSON_NAME")
+    t2 = a.token_for("Alice Smith", "PII.PERSON_NAME")  # repeat → same token
+    t3 = a.token_for("Bob Jones", "PII.PERSON_NAME")    # distinct → distinct token
     assert t1 == t2
     assert t1 != t3
-    assert t1 == "[PERSON_1]" and t3 == "[PERSON_2]"
 
 
-def test_tokens_are_type_tagged_per_class():
-    a = TokenAssigner()
-    assert a.token_for("x@y.com", "PII.EMAIL") == "[EMAIL_1]"
-    assert a.token_for("GB29NWBK", "PII.IBAN") == "[IBAN_1]"
-    # Long class names normalise to short tags.
-    assert a.token_for("4111111111111111", "PII.CREDIT_CARD") == "[CARD_1]"
-    assert a.token_for("1990-01-01", "PII.DATE_OF_BIRTH") == "[DOB_1]"
+def test_same_value_two_docs_different_tokens():
+    """Per-file uniqueness: the SAME value in two documents (different salts)
+    derives DIFFERENT tokens — defeats cross-file correlation / dictionary."""
+    a = _assigner(salt=_SALT_A)
+    b = _assigner(salt=_SALT_B)
+    ta = a.token_for("alice@corp.com", "PII.EMAIL")
+    tb = b.token_for("alice@corp.com", "PII.EMAIL")
+    assert ta != tb, "same value in two docs must derive different tokens"
+
+
+def test_token_is_deterministic_for_same_salt_value_secret():
+    """Stable derivation on retry (same doc tokenizes identically)."""
+    a1 = _assigner()
+    a2 = _assigner()
+    assert a1.token_for("alice@corp.com", "PII.EMAIL") == a2.token_for(
+        "alice@corp.com", "PII.EMAIL"
+    )
+
+
+def test_salt_only_fallback_when_no_secret_still_per_file_unique_and_opaque():
+    """No deployment secret → salt-only keying: still opaque + per-file-unique."""
+    a = OpaqueTokenAssigner(_SALT_A, secret=None)
+    b = OpaqueTokenAssigner(_SALT_B, secret=None)
+    ta = a.token_for("alice@corp.com", "PII.EMAIL")
+    tb = b.token_for("alice@corp.com", "PII.EMAIL")
+    assert _OPAQUE_RE.match(ta)
+    assert ta != tb  # per-file unique even without a secret
+
+
+def test_secret_changes_token_unlinkability_across_deployments():
+    """Different deployment secrets over the same salt+value → different tokens
+    (cross-deployment unlinkability the keyed form adds over salt-only)."""
+    a = OpaqueTokenAssigner(_SALT_A, secret=b"secret-one")
+    b = OpaqueTokenAssigner(_SALT_A, secret=b"secret-two")
+    assert a.token_for("v", "PII.EMAIL") != b.token_for("v", "PII.EMAIL")
 
 
 def test_reverse_map_is_a_copy_not_a_live_ref():
-    a = TokenAssigner()
-    a.token_for("secret", "PII.EMAIL")
+    a = _assigner()
+    tok = a.token_for("secret", "PII.EMAIL")
     m = a.reverse_map
-    m["[EMAIL_1]"] = "tampered"
-    assert a.reverse_map["[EMAIL_1]"] == "secret"
+    m[tok] = "tampered"
+    assert a.reverse_map[tok] == "secret"
+
+
+def test_is_pseudonymization_token_matches_opaque_shape():
+    a = _assigner()
+    tok = a.token_for("Alice", "PII.PERSON_NAME")
+    assert is_pseudonymization_token(tok)
+    assert not is_pseudonymization_token("Alice Smith")
+    assert not is_pseudonymization_token("[PERSON_1]")  # old shape is NOT ours now
+
+
+def test_backcompat_alias_resolves_to_opaque():
+    assert TokenAssigner is OpaqueTokenAssigner
+
+
+# ---------------------------------------------------------------------------
+# token_scheme primitives — derivation + integrity.
+# ---------------------------------------------------------------------------
+
+def test_derive_token_length_and_alphabet():
+    t = derive_token(_SALT_A, "value", secret=_SECRET)
+    assert _OPAQUE_RE.match(t)
+
+
+def test_token_matches_doc_accepts_own_salt_rejects_foreign():
+    """Integrity / cross-file splice: a token derived under salt A validates under
+    salt A but NOT under salt B (foreign-salt rejection)."""
+    tok = derive_token(_SALT_A, "alice@corp.com", secret=_SECRET)
+    assert token_matches_doc(tok, "alice@corp.com", _SALT_A, secret=_SECRET)
+    assert not token_matches_doc(tok, "alice@corp.com", _SALT_B, secret=_SECRET)
 
 
 # ---------------------------------------------------------------------------
@@ -67,200 +162,149 @@ def _map_with(reverse: dict, **kw) -> ReplacerMap:
 
 
 def test_handle_is_unguessable_and_not_request_id():
-    m1 = _map_with({"[PERSON_1]": "Alice"})
-    m2 = _map_with({"[PERSON_1]": "Alice"})
-    # Two maps over identical content get DIFFERENT high-entropy handles.
+    m1 = _map_with({"aaaaaaaaaaaa": "Alice"})
+    m2 = _map_with({"aaaaaaaaaaaa": "Alice"})
     assert m1.handle != m2.handle
     assert len(m1.handle) >= 40  # token_urlsafe(32) ~ 43 chars
-    # Definitely not a request-id shaped value.
     assert "req" not in m1.handle.lower()
 
 
 def test_reveal_requires_exact_handle():
-    m = _map_with({"[PERSON_1]": "Alice"})
-    assert m.reveal(m.handle) == {"[PERSON_1]": "Alice"}
+    m = _map_with({"aaaaaaaaaaaa": "Alice"})
+    assert m.reveal(m.handle) == {"aaaaaaaaaaaa": "Alice"}
     with pytest.raises(ReplacerMapExpiredError):
         m.reveal("wrong-handle")
 
 
 def test_ttl_expiry_fails_closed():
-    # now-injection: created at t=0, ttl=10, reveal at t=15 → expired.
     m = ReplacerMap.create(
-        {"[PERSON_1]": "Alice"}, detokenize_rbac_role="reverser", ttl_s=10, now=0.0,
+        {"aaaaaaaaaaaa": "Alice"}, detokenize_rbac_role="reverser", ttl_s=10, now=0.0,
     )
-    assert m.reveal(m.handle, now=5.0) == {"[PERSON_1]": "Alice"}
+    assert m.reveal(m.handle, now=5.0) == {"aaaaaaaaaaaa": "Alice"}
     with pytest.raises(ReplacerMapExpiredError):
         m.reveal(m.handle, now=15.0)
 
 
 def test_destroy_fails_closed_and_zeroes():
-    m = _map_with({"[PERSON_1]": "Alice"})
+    m = _map_with({"aaaaaaaaaaaa": "Alice"})
     m.destroy()
     with pytest.raises(ReplacerMapExpiredError):
         m.reveal(m.handle)
 
 
 def test_map_plaintext_never_in_object_repr():
-    # F5/F12: the cleartext original must not be reconstructable from the at-rest
-    # object state (only ciphertext + nonce are held). repr() must not leak it.
-    m = _map_with({"[PERSON_1]": "Alice-Cleartext-Secret"})
-    blob = repr(m) + str(m.__dict__.get("_ciphertext", b""))
+    m = _map_with({"aaaaaaaaaaaa": "Alice-Cleartext-Secret"})
     assert "Alice-Cleartext-Secret" not in repr(m)
-    # The ciphertext bytes must not contain the plaintext.
     assert b"Alice-Cleartext-Secret" not in m._ciphertext
 
 
 # ---------------------------------------------------------------------------
-# Mode A — correspondence table + local re-merge (§5.3.1).
+# Mode A — correspondence table (+ doc_hash header) + local re-merge (§5.3.1).
 # ---------------------------------------------------------------------------
 
-def test_correspondence_table_and_local_remerge():
-    a = TokenAssigner()
-    a.token_for("Alice", "PII.PERSON")
-    a.token_for("Bob", "PII.PERSON")
+def test_correspondence_table_carries_doc_hash_and_local_remerge():
+    a = _assigner()
+    t_alice = a.token_for("Alice", "PII.PERSON_NAME")
+    t_bob = a.token_for("Bob", "PII.PERSON_NAME")
     table = CorrespondenceTable.from_assigner(a, detokenize_rbac_role="reverser")
-    assert table.rows == {"[PERSON_1]": "Alice", "[PERSON_2]": "Bob"}
+    assert table.doc_hash == _SALT_A
+    assert table.rows == {t_alice: "Alice", t_bob: "Bob"}
+    # The mapping-file CSV header binds the table to its source document.
+    assert f"# doc_hash={_SALT_A}" in table.to_csv()
 
-    tokenized = "Email [PERSON_1] and [PERSON_2]; cc [PERSON_1]."
+    tokenized = f"Email {t_alice} and {t_bob}; cc {t_alice}."
     restored = local_remerge(tokenized, table.rows)
     assert restored == "Email Alice and Bob; cc Alice."
 
 
-def test_local_remerge_longest_token_first():
-    # [PERSON_10] must not be partially matched by [PERSON_1].
-    table = {"[PERSON_1]": "Alice", "[PERSON_10]": "Zoe"}
-    out = local_remerge("[PERSON_10] and [PERSON_1]", table)
-    assert out == "Zoe and Alice"
-
-
 # ---------------------------------------------------------------------------
-# Mode B — position/count binding (F3).
+# Mode B — position/count binding (F3/L-02) with OPAQUE tokens.
 # ---------------------------------------------------------------------------
+
+def _tok(name: str, salt: str = _SALT_A) -> str:
+    return derive_token(salt, name, secret=_SECRET)
+
 
 def test_position_binder_count_bound_restore():
     b = PositionBinder()
-    b.record_egress("[PERSON_1]", "Alice", count=1)
-    # Legit response references the token once → restored.
-    out, over = b.restore("The CFO is [PERSON_1].")
+    tok = _tok("Alice")
+    b.record_egress(tok, "Alice", count=1)
+    out, over = b.restore(f"The CFO is {tok}.")
     assert out == "The CFO is Alice." and over == []
 
 
 def test_position_binder_over_restore_fails_closed():
     b = PositionBinder()
-    b.record_egress("[PERSON_1]", "Alice", count=1)  # sent ONCE
-    # Attacker echoes it 3× to exfil → only 1 restored, token flagged over-restore.
-    out, over = b.restore("[PERSON_1] [PERSON_1] [PERSON_1]")
-    assert over == ["[PERSON_1]"]
-    assert out.count("Alice") == 1  # capped at egress count
-    assert out.count("[PERSON_1]") == 2  # surplus left as tokens (not leaked)
+    tok = _tok("Alice")
+    b.record_egress(tok, "Alice", count=1)  # sent ONCE
+    out, over = b.restore(f"{tok} {tok} {tok}")
+    assert over == [tok]
+    assert out.count("Alice") == 1
+    assert out.count(tok) == 2  # surplus left as tokens (not leaked)
 
 
 def test_position_binder_unknown_token_left_as_is():
     b = PositionBinder()
-    b.record_egress("[PERSON_1]", "Alice", count=1)
-    out, over = b.restore("hallucinated [PERSON_99]")
-    assert "[PERSON_99]" in out  # unknown token never guessed (§5.4)
+    b.record_egress(_tok("Alice"), "Alice", count=1)
+    fake = "zzzzzzzzzzzz"  # opaque-shaped but never issued
+    out, over = b.restore(f"hallucinated {fake}")
+    assert fake in out  # unknown token never guessed (§5.4)
     assert over == []
 
 
-# ---------------------------------------------------------------------------
-# L-02 — position/provenance binding defeats the namespace-dump attack.
-# ---------------------------------------------------------------------------
-
-def _egress_directory(b: PositionBinder, names: list[str]) -> str:
-    """Tokenize a benign source sentence and record each token bound to the
-    egress CONTEXT it was emitted in (what the pipeline does on egress).
-    Returns the FINAL tokenized payload that legitimately left the gateway."""
-    # A plausible benign egress: a narrative the user actually asked about.
-    egress = "Onboarding notes: " + ", ".join(
-        f"{n} joined the team" for n in names
-    )
+def _egress_directory(b: PositionBinder, names: list[str]) -> tuple[str, dict[str, str]]:
+    """Tokenize a benign source sentence with OPAQUE tokens and record each token
+    bound to the egress CONTEXT it was emitted in.  Returns (tokenized, name->tok)."""
+    name_to_tok = {n: _tok(n) for n in names}
+    egress = "Onboarding notes: " + ", ".join(f"{n} joined the team" for n in names)
     tokenized = egress
-    for i, name in enumerate(names, 1):
-        tokenized = tokenized.replace(name, f"[PERSON_{i}]")
-    # Record each token against the FINAL egress payload (its true egress
-    # context — every other name is also tokenized by the time it ships). The
-    # no-span call form records every occurrence in egress_text as valid.
-    for i, name in enumerate(names, 1):
-        b.record_egress(f"[PERSON_{i}]", name, count=1, egress_text=tokenized)
-    return tokenized
+    for n in names:
+        tokenized = tokenized.replace(n, name_to_tok[n])
+    for n in names:
+        b.record_egress(name_to_tok[n], n, count=1, egress_text=tokenized)
+    return tokenized, name_to_tok
 
 
 def test_position_binder_blocks_namespace_dump_attack():
-    """Laura's PROVEN L-02 attack: a malicious cloud response replays each in-map
-    token EXACTLY ONCE (within the count budget) in an attacker-framed sentence
-    to reconstruct the whole real-value set. Position binding must reject every
-    replay because none lands in the egress context the token was issued in."""
-    # 20 distinct, non-prefix-colliding names (the demo worst case).
+    """L-02: a malicious response replays each in-map token once in an attacker
+    sentence — position binding rejects every replay (foreign context)."""
     names = [f"Employee-{chr(64 + i)}{i:02d}" for i in range(1, 21)]
     b = PositionBinder()
-    _egress_directory(b, names)
-
-    # The attacker, having learned the [PERSON_1..20] namespace, replays each
-    # token once in a sentence the user never asked for.
-    attack = "Full staff directory: " + " ".join(
-        f"[PERSON_{i}]" for i in range(1, 21)
-    )
+    _, name_to_tok = _egress_directory(b, names)
+    attack = "Full staff directory: " + " ".join(name_to_tok[n] for n in names)
     restored, flags = b.restore(attack)
-
-    # NOT A SINGLE real name is restored into the attacker sentence.
     for name in names:
         assert name not in restored, f"namespace dump leaked {name!r}"
-    # Every replayed token is left as a token and flagged as a foreign-position
-    # rejection (the round-trip fails closed in the pipeline).
-    assert flags, "foreign-position replays must be flagged, not silently dropped"
-    assert all(f"[PERSON_{i}]" in restored for i in range(1, 21))
+    assert flags
+    assert all(name_to_tok[n] in restored for n in names)
 
 
 def test_position_binder_restores_at_consistent_position():
-    """The legitimate round-trip: a genuine answer references a SMALL number of
-    tokens at the context they were issued in → restored.
-
-    A genuine mode-B answer is a *transformation* of the egress frame (an
-    extracted field, a decision about one record), not a reproduction of the
-    whole frame — so it references a handful of tokens, well under the
-    bounded-restoration cap, each in its issued context.
-    """
     names = ["Alice", "Bob", "Carol"]
     b = PositionBinder()
-    tokenized = _egress_directory(b, names)
-    # A genuine answer: the cloud answered about one record, reproducing the SAME
-    # ±24-char surrounding context the token was issued in (a quoted snippet of
-    # the record), but NOT the whole frame.  Take the issued window of PERSON_2.
-    idx = tokenized.find("[PERSON_2]")
-    answer = tokenized[max(0, idx - 24): idx + len("[PERSON_2]") + 24]
+    tokenized, name_to_tok = _egress_directory(b, names)
+    bob_tok = name_to_tok["Bob"]
+    idx = tokenized.find(bob_tok)
+    answer = tokenized[max(0, idx - 24): idx + len(bob_tok) + 24]
     restored, flags = b.restore(answer)
     assert restored.count("Bob") == 1
-    assert "Alice" not in restored  # not referenced by this answer
+    assert "Alice" not in restored
     assert flags == []
 
 
 def test_position_binder_rejects_verbatim_egress_echo():
-    """L-02 verbatim-echo CLOSE: when the egress frame is recorded, a response
-    that echoes the whole tokenized frame back verbatim is rejected — restore
-    NOTHING — even though every token lands in its issued context.
-
-    This is the residual Laura flagged: the egress frame is known to the
-    untrusted cloud, so an echo of it passes pure context binding.  The
-    structural echo guard fails the round-trip closed."""
     names = ["Alice", "Bob", "Carol", "Dave", "Erin"]
     b = PositionBinder()
-    tokenized = _egress_directory(b, names)
-    # Pipeline records the egress frame on egress (the verbatim-echo close).
+    tokenized, _ = _egress_directory(b, names)
     b.record_egress_frame(tokenized)
-
-    # Malicious/poisoned cloud echoes the egress frame back to harvest cleartext.
     with pytest.raises(EchoEgressError):
         b.restore(tokenized)
 
 
 def test_position_binder_echo_with_prose_wrapper_still_rejected():
-    """The attacker wraps the echoed frame in a little prose to look like an
-    answer.  The token-tag sequence still reproduces the frame verbatim →
-    rejected."""
     names = ["Alice", "Bob", "Carol", "Dave"]
     b = PositionBinder()
-    tokenized = _egress_directory(b, names)
+    tokenized, _ = _egress_directory(b, names)
     b.record_egress_frame(tokenized)
     crafted = "Sure, here is the document you sent:\n\n" + tokenized + "\n\nHope that helps!"
     with pytest.raises(EchoEgressError):
@@ -268,71 +312,40 @@ def test_position_binder_echo_with_prose_wrapper_still_rejected():
 
 
 def test_position_binder_bounded_restoration_caps_namespace_harvest():
-    """Bounded restoration: even below the echo threshold, a single response may
-    not restore more than the cap fraction of the namespace.  A response trying
-    to harvest most of the namespace fails closed on the surplus tokens."""
-    # 10 names; cap = ceil(0.5 * 10) = 5 distinct restorations max.
     names = [f"Person{chr(64 + i)}" for i in range(1, 11)]
     b = PositionBinder()
-    tokenized = _egress_directory(b, names)
-    # Do NOT record the egress frame here, so the echo guard does not pre-empt —
-    # we want to prove the cap independently.  Re-issue each token in its issued
-    # context (so context binding alone would allow ALL of them).
+    tokenized, _ = _egress_directory(b, names)
     restored, flags = b.restore(tokenized)
     restored_names = [n for n in names if n in restored]
     assert len(restored_names) <= 5, "bounded restoration cap exceeded"
-    assert flags, "surplus namespace-harvest tokens must be flagged"
+    assert flags
 
 
 def test_position_binder_genuine_small_answer_under_cap_unaffected():
-    """A genuine small answer (one or two tokens) is never penalised by the cap."""
     names = [f"Person{chr(64 + i)}" for i in range(1, 11)]
     b = PositionBinder()
-    tokenized = _egress_directory(b, names)
-    idx = tokenized.find("[PERSON_2]")
-    answer = tokenized[max(0, idx - 24): idx + len("[PERSON_2]") + 24]
+    tokenized, name_to_tok = _egress_directory(b, names)
+    btok = name_to_tok["PersonB"]
+    idx = tokenized.find(btok)
+    answer = tokenized[max(0, idx - 24): idx + len(btok) + 24]
     restored, flags = b.restore(answer)
     assert restored.count("PersonB") == 1
     assert flags == []
 
 
-def test_position_binder_partial_slice_residual_is_bounded():
-    """Documented residual: a partial-slice echo that stays under the echo
-    threshold + the per-response cap CAN restore up to ~max_restore_fraction of
-    the namespace — but NO MORE.  This locks in the bound (the residual is a
-    bounded slice, never the whole namespace) so a regression that widens it is
-    caught."""
-    names = [f"Person{chr(64 + i)}" for i in range(1, 21)]  # 20 → cap 10
-    b = PositionBinder()
-    tokenized = _egress_directory(b, names)
-    # Frame recorded → echo guard active.  An attacker echoing the WHOLE frame is
-    # rejected (proven elsewhere); here we feed the frame WITHOUT recording it to
-    # isolate the cap, then assert at most the cap fraction is ever restored.
-    b2 = PositionBinder()
-    tokenized2 = _egress_directory(b2, names)
-    restored, flags = b2.restore(tokenized2)
-    restored_count = sum(1 for n in names if n in restored)
-    assert restored_count <= 10, "bounded-restoration cap breached (residual widened)"
-    assert restored_count < len(names), "whole namespace must never restore in one response"
-    assert flags, "surplus tokens beyond the cap must be flagged"
-
-
 def test_position_binder_rejects_moved_token_even_within_count():
-    """A single token sent once, replayed once but in a DIFFERENT position, is
-    refused — the count budget alone would have allowed it (L-02 core)."""
     b = PositionBinder()
+    tok = _tok("Dana")
     egress = "The new hire is Dana, starting Monday."
     idx = egress.find("Dana")
-    tokenized = egress[:idx] + "[PERSON_1]" + egress[idx + len("Dana"):]
-    b.record_egress("[PERSON_1]", "Dana", count=1,
-                    egress_text=tokenized, span=(idx, idx + len("[PERSON_1]")))
-
-    # Same token, within count budget, but in an attacker exfil frame.
-    attack = "EXFIL TARGET ACQUIRED: [PERSON_1] is the CEO."
+    tokenized = egress[:idx] + tok + egress[idx + len("Dana"):]
+    b.record_egress(tok, "Dana", count=1, egress_text=tokenized,
+                    span=(idx, idx + len(tok)))
+    attack = f"EXFIL TARGET ACQUIRED: {tok} is the CEO."
     restored, flags = b.restore(attack)
     assert "Dana" not in restored
-    assert "[PERSON_1]" in restored
-    assert flags == ["[PERSON_1]"]
+    assert tok in restored
+    assert flags == [tok]
 
 
 # ---------------------------------------------------------------------------
@@ -349,19 +362,20 @@ def test_build_redact_plan_strips_segment_location_and_span():
     plan = build_redact_plan([m], {m.location: "a@b.com"})
     assert len(plan.spans) == 1
     s = plan.spans[0]
-    assert s.segment_location == "row=1,col=2"  # kind + span stripped
+    assert s.segment_location == "row=1,col=2"
     assert s.original == "a@b.com"
     assert s.action == SpanAction.REDACT
     assert plan.strip_hidden_and_metadata is True
 
 
-def test_build_pseudonymize_plan_assigns_consistent_tokens():
+def test_build_pseudonymize_plan_assigns_consistent_opaque_tokens():
     m1 = _match("EMAIL:row=1,col=2:span=0-5")
     m2 = _match("EMAIL:row=2,col=2:span=0-5")
-    a = TokenAssigner()
+    a = _assigner()
     plan = build_pseudonymize_plan(
         [m1, m2], {m1.location: "a@b.com", m2.location: "a@b.com"}, a,
     )
-    # Same original in two cells → same token (coherence).
-    assert plan.spans[0].token == plan.spans[1].token == "[EMAIL_1]"
-    assert a.reverse_map == {"[EMAIL_1]": "a@b.com"}
+    # Same original in two cells → same opaque token (coherence).
+    assert plan.spans[0].token == plan.spans[1].token
+    assert _OPAQUE_RE.match(plan.spans[0].token)
+    assert a.reverse_map == {plan.spans[0].token: "a@b.com"}

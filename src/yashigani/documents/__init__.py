@@ -62,20 +62,39 @@ from yashigani.documents.pipeline import (
     DISPOSITION_LOG,
     DISPOSITION_PSEUDONYMIZE,
     DISPOSITION_REDACT,
+    DISPOSITION_ROUTE_LOCAL,
+    OPERATE_ON_ALLOW_BLOB,
+    OPERATE_ON_BLOCK,
+    OPERATE_ON_ROUTE_LOCAL,
     DocumentInspectionPipeline,
     DocumentInspectionResult,
+    IntegrityVerifyResult,
     ModeBRestoreResult,
+)
+from yashigani.documents.field_role import (
+    FieldRole,
+    classify_field_role,
+    is_operate_on_sensitive,
 )
 from yashigani.documents.pseudonymize import (
     CorrespondenceTable,
     EchoEgressError,
     ModeBRoundTrip,
+    OpaqueTokenAssigner,
     PositionBinder,
     ReplacerMap,
     ReplacerMapExpiredError,
     TokenAssigner,
     build_modeb_roundtrip,
+    is_pseudonymization_token,
     local_remerge,
+)
+from yashigani.documents.token_scheme import (
+    TOKEN_CHARS,
+    compute_doc_hash,
+    derive_token,
+    load_deployment_secret,
+    token_matches_doc,
 )
 from yashigani.documents.segment import (
     ExtractionResult,
@@ -121,17 +140,28 @@ __all__ = [
     # pipeline
     "DocumentInspectionPipeline",
     "DocumentInspectionResult",
+    "IntegrityVerifyResult",
     "ModeBRestoreResult",
     "DISPOSITION_LOG",
     "DISPOSITION_REDACT",
     "DISPOSITION_PSEUDONYMIZE",
     "DISPOSITION_BLOCK",
+    "DISPOSITION_ROUTE_LOCAL",
+    # PART 2 (Laura D1) field-role routing
+    "FieldRole",
+    "classify_field_role",
+    "is_operate_on_sensitive",
+    "OPERATE_ON_ROUTE_LOCAL",
+    "OPERATE_ON_BLOCK",
+    "OPERATE_ON_ALLOW_BLOB",
     # re-render plan contract (host <-> jail)
     "RenderPlan",
     "RenderSpan",
     "SpanAction",
     # PSEUDONYMIZE engine (host-side; crown-jewel custody)
     "TokenAssigner",
+    "OpaqueTokenAssigner",
+    "is_pseudonymization_token",
     "ReplacerMap",
     "ReplacerMapExpiredError",
     "CorrespondenceTable",
@@ -140,6 +170,12 @@ __all__ = [
     "ModeBRoundTrip",
     "build_modeb_roundtrip",
     "local_remerge",
+    # opaque, per-file-salted token scheme (DECIDED 2026-06-10)
+    "TOKEN_CHARS",
+    "compute_doc_hash",
+    "derive_token",
+    "load_deployment_secret",
+    "token_matches_doc",
     # column-semantic identifying-class detection (L-01 / F2 QI breadth)
     "ContextMatch",
     "classify_columns",

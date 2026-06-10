@@ -186,8 +186,10 @@ def _make_pseudonymized_doc(tc) -> str:
         ReplacerMap,
         TokenAssigner,
     )
+    from yashigani.documents.token_scheme import compute_doc_hash
 
-    assigner = TokenAssigner()
+    # Opaque, per-file-salted assigner (DECIDED 2026-06-10): bind to a fixed salt.
+    assigner = TokenAssigner(compute_doc_hash(b"people.csv-bytes"), secret=None)
     # Two real values → consistent tokens (builds the crown-jewel reverse map).
     assigner.token_for("jane@example.com", "PII.EMAIL")
     assigner.token_for("john@example.com", "PII.EMAIL")
@@ -264,7 +266,10 @@ def test_doc_rt_07_table_csv_rbac_gate(client):
     r2 = tc.get(f"/admin/documents/results/{rid}/table.csv")
     assert r2.status_code == 200
     assert "text/csv" in r2.headers.get("content-type", "")
-    assert r2.text.splitlines()[0] == "token,original"
+    lines = r2.text.splitlines()
+    # Mapping file header binds the table to its source document (per-file salt).
+    assert lines[0].startswith("# doc_hash=")
+    assert lines[1] == "token,original"
 
 
 # ---------------------------------------------------------------------------

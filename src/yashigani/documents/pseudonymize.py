@@ -46,82 +46,128 @@ from typing import Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from yashigani.documents.datamatch import DataMatch
+from yashigani.documents.token_scheme import (
+    TOKEN_CHARS,
+    derive_token,
+)
 from yashigani.documents.transform import RenderPlan, RenderSpan, SpanAction
 
 
 # ---------------------------------------------------------------------------
-# Token assignment — consistent, type-tagged, value-keyed (plan §5.3a, F2).
+# Token assignment — opaque, per-file-salted, value-keyed (DECIDED 2026-06-10).
 # ---------------------------------------------------------------------------
 
-#: Canonical pseudonymization token shape — ``[<TAG>_<N>]`` as minted by
-#: :meth:`TokenAssigner.token_for` (e.g. ``[PERSON_NAME_1]``, ``[EMAIL_2]``).
-#: SINGLE source of truth for the token shape so the residual re-detect can
-#: recognise (and never re-flag) our OWN emitted tokens — a name-shaped token
-#: like ``[PERSON_NAME_1]`` would otherwise trip the header-driven name
-#: classifier on the tokenized output and BLOCK a perfectly clean artefact
-#: (csv name-column false positive, L-01-adjacent).  Anchored so it matches a
-#: whole cell value, not a token embedded in surrounding prose.
-_TOKEN_SHAPE = re.compile(r"^\s*\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_\d+\]\s*$")
+#: Canonical opaque-token shape — a short lowercase base32 alphanumeric string of
+#: exactly :data:`TOKEN_CHARS` characters, minted by
+#: :meth:`OpaqueTokenAssigner.token_for` as the truncated HMAC of
+#: ``doc_hash || value`` (see ``token_scheme``).  It carries NO class tag and NO
+#: counter — the deliberate opacity that closes Laura's class/count-leak finding
+#: on the old ``[CLASS_N]`` scheme.  SINGLE source of truth for the shape so the
+#: residual re-detect (``qi_context._value_plausible``) recognises and never
+#: re-flags our OWN emitted tokens (an opaque token under a still-present ``name``
+#: header would otherwise be re-classified and BLOCK a clean artefact).  Anchored
+#: so it matches a whole cell value, not a fragment embedded in prose.
+_TOKEN_SHAPE = re.compile(rf"^\s*[a-z2-7]{{{TOKEN_CHARS}}}\s*$")
 
 
 def is_pseudonymization_token(value: str) -> bool:
-    """Whether ``value`` is one of OUR emitted pseudonymization tokens.
+    """Whether ``value`` has the shape of one of OUR emitted opaque tokens.
 
     Used by the residual re-detect (``qi_context._value_plausible``) to avoid
-    re-flagging our own ``[CLASS_N]`` substitutions as surviving PII when the
-    re-render output is re-classified.  A real input cell containing a literal
-    ``[PERSON_NAME_1]`` is not a plausible person name anyway, so excluding the
-    token shape from the input-side classifier is correct, not just convenient.
+    re-flagging our own opaque substitutions as surviving PII when the re-render
+    output is re-classified.  The opaque token has no value structure, so a real
+    input cell is extremely unlikely to collide with the shape; excluding it from
+    the input-side classifier is correct, not merely convenient.
+
+    NOTE this is a *shape* test (12 lowercase base32 chars), not a validity test —
+    it does not prove the token was minted for THIS document.  Cross-file splice
+    / foreign-salt detection is the job of ``token_scheme.token_matches_doc`` and
+    :meth:`verify_token_integrity`, which recompute the keyed HMAC.
     """
     return bool(_TOKEN_SHAPE.match(value))
 
 
-def _type_tag(data_class: str) -> str:
-    """Map a (possibly namespaced) data_class to a token type tag.
+class OpaqueTokenAssigner:
+    """Assigns consistent, **opaque, per-file-salted** tokens to matched values.
 
-    ``PII.EMAIL`` -> ``EMAIL``; ``PII.CREDIT_CARD`` -> ``CARD``; an unknown class
-    falls back to the bare class so a token is always type-tagged (the downstream
-    model still knows it reasons over *a* class — §5.3a)."""
-    bare = data_class.rsplit(".", 1)[-1].upper()
-    # Normalise a couple of long names to the short tags used in the plan/docs.
-    return {
-        "CREDIT_CARD": "CARD",
-        "DATE_OF_BIRTH": "DOB",
-        "NATIONAL_ID": "ID",
-        "DRIVERS_LICENCE": "DL",
-        "NHS_NUMBER": "NHS",
-        "IP_ADDRESS": "IP",
-    }.get(bare, bare or "VALUE")
+    DECIDED 2026-06-10 (supersedes the type-tagged sequential ``[CLASS_N]``
+    assigner, which leaked class + count — Laura).  Each token is
+    ``base32(HMAC-SHA256(deployment_secret, doc_hash || value))[:N]`` (see
+    ``token_scheme``):
 
+      * **Value-keyed coherence (§5.3a)** — the SAME original value derives the
+        SAME token everywhere it appears in THIS document (the salt is constant
+        within the file), so joins / repeats / cross-references survive.
+      * **Per-file uniqueness** — the salt is ``doc_hash`` (SHA-256 of the
+        original bytes), so the same value in a DIFFERENT document derives a
+        DIFFERENT token — defeating cross-file correlation + binding the token to
+        its source document for integrity / splice detection.
+      * **Opaque** — no class tag, no counter, no value structure.
 
-class TokenAssigner:
-    """Assigns consistent, type-tagged tokens to matched values within a request.
+    Bijection guarantee: distinct values derive distinct tokens with overwhelming
+    probability (≈4·10⁻⁷ even at 10⁶ values, N=12), AND any actual within-document
+    collision is **detected and resolved** deterministically by re-deriving with a
+    bounded domain-separation counter — so two distinct values never share a token
+    (which would corrupt the data on restore).
 
-    Value-keyed: the SAME original value gets the SAME token everywhere it
-    appears (across cells/paragraphs/slides) so the tokenized artefact stays
-    internally coherent (joins, repeats and cross-references survive — §5.3a).
-    Distinct values get distinct tokens.  Counters are per type tag so tokens
-    read ``[PERSON_1]``, ``[PERSON_2]``, ``[IBAN_1]`` …
-
-    The assigner builds the token->original map (the crown jewel) which the
-    caller hands to :class:`ReplacerMap` for encrypted, TTL'd custody.
+    The assigner builds the token→original map (the crown jewel) which the caller
+    hands to :class:`ReplacerMap` for encrypted, TTL'd custody.
     """
 
-    def __init__(self) -> None:
+    #: Bound on the collision-resolution counter.  A run of this many derivations
+    #: all colliding for distinct values is astronomically improbable at 60 bits;
+    #: exceeding it is a hard error (we never silently ship a non-bijective map).
+    _MAX_COLLISION_RESOLVE = 8
+
+    def __init__(
+        self,
+        doc_hash: str,
+        *,
+        secret: Optional[bytes],
+        chars: int = TOKEN_CHARS,
+    ) -> None:
+        if not doc_hash:
+            raise ValueError("OpaqueTokenAssigner requires a non-empty doc_hash salt")
+        self._doc_hash = doc_hash
+        self._secret = secret
+        self._chars = chars
         # original value -> token (the forward, value-keyed coherence map)
         self._value_to_token: dict[str, str] = {}
         # token -> original value (the reverse map; the crown jewel)
         self._token_to_value: dict[str, str] = {}
-        # per-type-tag running counter
-        self._counters: dict[str, int] = {}
 
-    def token_for(self, original: str, data_class: str) -> str:
-        """Return the stable token for ``original`` (minting one on first sight)."""
-        if original in self._value_to_token:
-            return self._value_to_token[original]
-        tag = _type_tag(data_class)
-        self._counters[tag] = self._counters.get(tag, 0) + 1
-        token = f"[{tag}_{self._counters[tag]}]"
+    @property
+    def doc_hash(self) -> str:
+        """The per-file salt this assigner is bound to (mapping-file header)."""
+        return self._doc_hash
+
+    def token_for(self, original: str, data_class: str = "") -> str:
+        """Return the stable opaque token for ``original`` (minting on first sight).
+
+        ``data_class`` is accepted for call-site compatibility but is deliberately
+        NOT used in the derivation — the token must leak nothing about the class.
+        """
+        existing = self._value_to_token.get(original)
+        if existing is not None:
+            return existing
+        # Derive; resolve the (rare) collision against a DISTINCT value
+        # deterministically with a domain-separation counter.
+        for counter in range(0, self._MAX_COLLISION_RESOLVE + 1):
+            token = derive_token(
+                self._doc_hash, original,
+                secret=self._secret, chars=self._chars, counter=counter,
+            )
+            holder = self._token_to_value.get(token)
+            if holder is None:
+                break  # free token
+            if holder == original:  # pragma: no cover - guarded by _value_to_token
+                break  # same value (shouldn't reach here)
+            # Collision with a DISTINCT value → try the next counter.
+        else:
+            raise RuntimeError(
+                "opaque token collision could not be resolved within bound — "
+                "refusing to ship a non-bijective map (fail-closed)"
+            )
         self._value_to_token[original] = token
         self._token_to_value[token] = original
         return token
@@ -134,6 +180,13 @@ class TokenAssigner:
     @property
     def token_count(self) -> int:
         return len(self._token_to_value)
+
+
+#: Back-compat alias.  The old name ``TokenAssigner`` referred to the type-tagged
+#: sequential assigner; it now resolves to the opaque assigner so existing call
+#: sites keep working — but the constructor signature CHANGED (it now requires a
+#: ``doc_hash`` salt + ``secret``), which is the whole point of the new scheme.
+TokenAssigner = OpaqueTokenAssigner
 
 
 # ---------------------------------------------------------------------------
@@ -262,19 +315,36 @@ class CorrespondenceTable:
 
     rows: dict[str, str]  # token -> original
     detokenize_rbac_role: str
+    #: The per-file salt (doc_hash) the tokens were derived under — the
+    #: mapping-file HEADER (DECIDED 2026-06-10).  Lets the holder confirm the
+    #: table belongs to a given document (integrity) and lets the local re-merge
+    #: reject a table paired with the wrong file.  Not a secret (hash of bytes
+    #: the holder already has).
+    doc_hash: str = ""
 
     @classmethod
-    def from_assigner(cls, assigner: TokenAssigner, *, detokenize_rbac_role: str) -> "CorrespondenceTable":
-        return cls(rows=assigner.reverse_map, detokenize_rbac_role=detokenize_rbac_role)
+    def from_assigner(
+        cls, assigner: "OpaqueTokenAssigner", *, detokenize_rbac_role: str
+    ) -> "CorrespondenceTable":
+        return cls(
+            rows=assigner.reverse_map,
+            detokenize_rbac_role=detokenize_rbac_role,
+            doc_hash=assigner.doc_hash,
+        )
 
     def to_csv(self) -> str:
         """Render the table as a CSV the user can keep (token,original).
 
+        The mapping-file HEADER carries the per-file salt (``# doc_hash=…``) so
+        the table is bound to its source document (integrity / splice rejection).
         This is the user's key — the pipeline delivers it over the RBAC'd channel
         and never writes it to an audit/log line."""
         import csv
         import io
         buf = io.StringIO()
+        if self.doc_hash:
+            # Comment header binds the table to the document it re-identifies.
+            buf.write(f"# doc_hash={self.doc_hash}\n")
         w = csv.writer(buf)
         w.writerow(["token", "original"])
         for tok, val in self.rows.items():
@@ -333,8 +403,24 @@ class _EgressOccurrence:
     contexts: dict[str, int] = field(default_factory=dict)
 
 
-# Token-shaped fragments the response path scans for: ``[TAG_n]``.
-_TOKEN_RE_SRC = r"\[[A-Z0-9]+_\d+\]"
+def _token_alternation(tokens: "list[str]") -> "re.Pattern[str]":
+    """Compile a regex matching EXACTLY the known egress tokens.
+
+    Opaque tokens (DECIDED 2026-06-10) are bare 12-char base32 strings with no
+    bracketed shape, so the response path can no longer scan for a generic
+    ``[TAG_n]`` shape — it must look for the EXACT tokens it issued.  Longest
+    first so a token is never partially matched by a shorter one (defensive; all
+    opaque tokens are the same length, but a mixed-length namespace stays safe).
+    Word-boundaried so a token is matched as a whole alphanumeric run, not as a
+    substring of a longer word.
+    """
+    import re as _re
+
+    if not tokens:
+        # Match nothing.
+        return _re.compile(r"(?!x)x")
+    alt = "|".join(_re.escape(t) for t in sorted(tokens, key=len, reverse=True))
+    return _re.compile(rf"(?<![A-Za-z0-9])(?:{alt})(?![A-Za-z0-9])")
 
 
 class EchoEgressError(Exception):
@@ -490,29 +576,33 @@ class PositionBinder:
         response that structurally reproduces it is rejected as an echo."""
         self._egress_frame = egress_text or ""
 
-    @staticmethod
-    def _structural_skeleton(text: str) -> list[str]:
-        """The inter-token structural skeleton of ``text``: the ordered list of
-        normalised non-token fragments BETWEEN the placeholder tokens, plus the
-        token *tags* (type, not index) in order.
+    def _token_re(self) -> "re.Pattern[str]":
+        """Regex matching exactly THIS binder's known egress tokens (opaque)."""
+        return _token_alternation(list(self._egress.keys()))
 
-        Two texts with the same skeleton say the same thing around the same kinds
-        of tokens in the same order — i.e. one is an echo of the other's frame.
-        A genuine answer rearranges / drops / summarises the frame and so has a
-        very different skeleton.  Token *indices* are elided (``[PERSON_1]`` and
-        ``[PERSON_2]`` both become ``PERSON``) so that simply permuting which
-        person lands where does not evade the check."""
+    def _structural_skeleton(self, text: str) -> list[str]:
+        """The inter-token structural skeleton of ``text``: the ordered list of
+        normalised non-token fragments BETWEEN the placeholder tokens, plus a
+        generic ``TOKEN`` marker at each token position in order.
+
+        Two texts with the same skeleton say the same thing around tokens in the
+        same order — i.e. one is an echo of the other's frame.  A genuine answer
+        rearranges / drops / summarises the frame and so has a very different
+        skeleton.  Token IDENTITY is elided to a generic ``TOKEN`` marker (opaque
+        tokens carry no type tag) so that simply permuting which value lands where
+        does not evade the check — the structure (prose around N tokens) is what
+        the echo-guard compares."""
         import re as _re
 
+        token_re = self._token_re()
         parts: list[str] = []
         last = 0
-        for m in _re.finditer(_TOKEN_RE_SRC, text):
+        for m in token_re.finditer(text):
             between = text[last:m.start()]
             norm = _re.sub(r"\s+", " ", between).strip().casefold()
             if norm:
                 parts.append(norm)
-            tag = m.group(0).strip("[]").rsplit("_", 1)[0]
-            parts.append(f"\x00{tag}")
+            parts.append("\x00TOKEN")
             last = m.end()
         tail = _re.sub(r"\s+", " ", text[last:]).strip().casefold()
         if tail:
@@ -547,22 +637,21 @@ class PositionBinder:
             if jaccard >= self.echo_similarity_threshold:
                 return True
 
-        # Signal 2 — the egress token-tag sequence appears verbatim in the
-        # response (the frame pasted back, optionally wrapped).
-        import re as _re
+        # Signal 2 — the egress token sequence (by token IDENTITY) appears
+        # verbatim in the response (the frame pasted back, optionally wrapped).
+        # Opaque tokens carry no tag, so identity IS the sequence — an attacker
+        # echoing the frame reproduces the exact token order.
+        token_re = self._token_re()
 
-        def _tag_seq(t: str) -> list[str]:
-            return [
-                m.group(0).strip("[]").rsplit("_", 1)[0]
-                for m in _re.finditer(_TOKEN_RE_SRC, t)
-            ]
+        def _seq(t: str) -> list[str]:
+            return [m.group(0) for m in token_re.finditer(t)]
 
-        frame_tags = _tag_seq(frame)
-        resp_tags = _tag_seq(response_text)
-        if frame_tags and len(frame_tags) >= 2 and len(resp_tags) >= len(frame_tags):
-            n = len(frame_tags)
-            for i in range(0, len(resp_tags) - n + 1):
-                if resp_tags[i:i + n] == frame_tags:
+        frame_seq = _seq(frame)
+        resp_seq = _seq(response_text)
+        if frame_seq and len(frame_seq) >= 2 and len(resp_seq) >= len(frame_seq):
+            n = len(frame_seq)
+            for i in range(0, len(resp_seq) - n + 1):
+                if resp_seq[i:i + n] == frame_seq:
                     return True
         return False
 
@@ -605,8 +694,6 @@ class PositionBinder:
         chosen positions consume no budget and are LEFT AS THE TOKEN — so the
         namespace-dump attack restores nothing.
         """
-        import re
-
         # --- Verbatim-echo close (L-02): reject an echo of the egress frame ----
         if self._is_echo_shaped(response_text):
             raise EchoEgressError(
@@ -624,12 +711,12 @@ class PositionBinder:
             tok: dict(occ.contexts) for tok, occ in self._egress.items()
         }
 
-        token_re = re.compile(_TOKEN_RE_SRC)
+        token_re = self._token_re()
 
         def _replace(m: "re.Match[str]") -> str:
             tok = m.group(0)
             occ = self._egress.get(tok)
-            if occ is None:
+            if occ is None:  # pragma: no cover - token_re only matches known tokens
                 # Unknown token — never guessed (§5.4 fail-closed).
                 return tok
             # Count budget exhausted → over-restore; leave as token.

@@ -37,6 +37,11 @@ class DataMatch:
     location: str           # provenance: "<kind>:<segment.location>:<span>"
     char_start: int
     char_end: int
+    # PART 2 (Laura D1): how the downstream model must USE this value —
+    # REFERENCE_ONLY (safe to opaque-tokenise) vs OPERATE_ON (the model computes
+    # on / validates it, so an opaque blob makes it hallucinate).  Defaults to
+    # the empty string for back-compat; the pipeline sets it during enumeration.
+    field_role: str = ""
 
     def as_opa_match(self) -> dict:
         """Shape consumed by the OPA ``document.matches[]`` input (plan §4.2)."""
@@ -45,6 +50,9 @@ class DataMatch:
             "qi": self.qi,
             "instance": self.instance,
             "location": self.location,
+            # PART 2: carried so a policy can route operate-on fields (local /
+            # keep / generalise) instead of blobbing them to the cloud.
+            "field_role": self.field_role,
         }
 
 

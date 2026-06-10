@@ -63,8 +63,11 @@ class RenderSpan:
     action:
         REDACT (destroy) or PSEUDONYMIZE (token-substitute).
     token:
-        For PSEUDONYMIZE only — the consistent, type-tagged placeholder
-        (``[PERSON_1]``, ``[IBAN_1]``, …).  Empty for REDACT.
+        For PSEUDONYMIZE only — the consistent, OPAQUE placeholder (a short
+        lowercase base32 string derived host-side as a per-file-salted HMAC of
+        the value; DECIDED 2026-06-10).  The worker treats it as an inert string
+        to substitute in place of ``original`` — it never parses or derives the
+        token, so the opaque scheme is entirely host-side.  Empty for REDACT.
     data_class:
         The data class (audit/labelling only; the worker does not branch on it).
     """

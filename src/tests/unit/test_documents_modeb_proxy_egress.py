@@ -181,9 +181,20 @@ async def test_modeb_proxy_tokenizes_outbound_and_restores_inbound(monkeypatch):
     monkeypatch.setenv("YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED", "true")
     monkeypatch.setenv("YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED", "true")
 
-    # A genuine transformed upstream answer that reproduces the token's egress
-    # neighbourhood (so position binding restores it) but is NOT an echo.
-    upstream_answer = ("Answer: " + _LEFT + "[EMAIL_1]" + _RIGHT + " — end.").encode()
+    # Opaque token (DECIDED 2026-06-10): the token is a deterministic function of
+    # (doc_hash, value, secret), so a probe pipeline tokenizing the SAME bytes
+    # yields the SAME token the proxy will emit.  Learn it, then build a genuine
+    # transformed upstream answer that reproduces the token's egress neighbourhood
+    # (so position binding restores it) but is NOT an echo.
+    probe = _real_pipeline().inspect(
+        data=_DOC_BYTES, declared_mime=_DOC_MIME, request_id="probe",
+        requested_action="PSEUDONYMIZE", pseudonymize_mode="B",
+    )
+    email_tok = next(
+        tok for tok, occ in probe.mode_b_roundtrip.binder._egress.items()
+        if occ.original == _ORIGINAL
+    )
+    upstream_answer = ("Answer: " + _LEFT + email_tok + _RIGHT + " — end.").encode()
     upstream = httpx.Response(200, content=upstream_answer)
 
     captured: dict = {}
@@ -194,7 +205,7 @@ async def test_modeb_proxy_tokenizes_outbound_and_restores_inbound(monkeypatch):
 
     # OUTBOUND: the upstream received the tokenized artefact, never the original.
     fwd = captured["forwarded_body"].decode()
-    assert "[EMAIL_1]" in fwd, "outbound body was not tokenized"
+    assert email_tok in fwd, "outbound body was not tokenized"
     assert _ORIGINAL not in fwd, "original value leaked to upstream (mode-B failed)"
 
     # INBOUND: the response delivered downstream carries the restored cleartext.
@@ -233,7 +244,12 @@ async def test_modeb_proxy_blocks_verbatim_echo(monkeypatch):
     # the round-trip is flagged tainted.
     assert resp.status_code == 200
     assert _ORIGINAL.encode() not in resp.body, "echo harvest recovered cleartext (L-02 breach)"
-    assert b"[EMAIL_1]" in resp.body, "tokenized echo response not preserved"
+    # The opaque token survives in the (rejected) echo response, unrestored.
+    email_tok = next(
+        tok for tok, occ in pre.mode_b_roundtrip.binder._egress.items()
+        if occ.original == _ORIGINAL
+    )
+    assert email_tok.encode() in resp.body, "tokenized echo response not preserved"
     assert resp.headers.get("X-Yashigani-Document-ModeB") == "tainted"
 
 

@@ -31,9 +31,15 @@ complete", F9).
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+
+def secrets_compare(a: str, b: str) -> bool:
+    """Constant-time string compare (doc_hash binding check)."""
+    return hmac.compare_digest(a, b)
 
 from yashigani.documents.datamatch import (
     DataMatch,
@@ -46,6 +52,10 @@ from yashigani.documents.extractor import (
     ExtractorNotAvailableError,
     ExtractorRegistry,
     UnsupportedFormatError,
+)
+from yashigani.documents.field_role import (
+    classify_field_role,
+    is_operate_on_sensitive,
 )
 from yashigani.documents.pseudonymize import (
     DEFAULT_MAP_TTL_S,
@@ -61,6 +71,11 @@ from yashigani.documents.pseudonymize import (
 from yashigani.documents.qi_context import header_driven_matches
 from yashigani.documents.residual_proof import residual_substring_hit
 from yashigani.documents.segment import ExtractionResult, Segment, SegmentKind
+from yashigani.documents.token_scheme import (
+    compute_doc_hash,
+    load_deployment_secret,
+    token_matches_doc,
+)
 from yashigani.pii.detector import PiiDetector, PiiMode, _mask
 
 logger = logging.getLogger(__name__)
@@ -71,6 +86,18 @@ DISPOSITION_LOG = "LOG"
 DISPOSITION_REDACT = "REDACT"
 DISPOSITION_PSEUDONYMIZE = "PSEUDONYMIZE"
 DISPOSITION_BLOCK = "BLOCK"
+#: PART 2 (Laura D1): the document carries an operate-on sensitive field that an
+#: opaque blob would make the cloud hallucinate, so it must NOT go to the cloud —
+#: route the whole document + its agent call to a LOCAL model instead (reuse the
+#: existing sensitivity→local-model routing).  A document-level disposition, not
+#: a per-span transform.
+DISPOSITION_ROUTE_LOCAL = "ROUTE_LOCAL"
+
+#: PART 2 routing policy for operate-on sensitive fields on a CLOUD-bound
+#: (mode-B) PSEUDONYMIZE.  Conservative default = ROUTE_LOCAL (never silent-blob).
+OPERATE_ON_ROUTE_LOCAL = "route_local"   # send the whole doc to the local model
+OPERATE_ON_BLOCK = "block"               # fail-closed if no local route
+OPERATE_ON_ALLOW_BLOB = "allow_blob"     # explicit opt-in: tokenise anyway (unsafe)
 
 #: Formats with proven regenerate-from-cleaned-content re-render this version
 #: (plan §5.2 / §5.5).  A REDACT/PSEUDONYMIZE decision on any OTHER format fails
@@ -111,6 +138,22 @@ class DocumentInspectionResult:
     correspondence_table: Optional["CorrespondenceTable"] = None
     #: The PSEUDONYMIZE delivery mode actually applied ("A" | "B").
     pseudonymize_mode: Optional[str] = None
+    #: The per-file salt (SHA-256 of the ORIGINAL document bytes) the opaque
+    #: tokens were derived under.  Stored in the mapping-file header and used by
+    #: :meth:`DocumentInspectionPipeline.verify_integrity` to confirm a tokenised
+    #: output + its mapping belong to the original (and to reject a cross-file
+    #: splice).  Not a secret (it is a hash of bytes the holder already has), so
+    #: it MAY be carried in the audit event as a correlation/integrity field.
+    doc_hash: Optional[str] = None
+    # --- PART 2 (Laura D1) field-role routing -----------------------------
+    #: True when the document carries an operate-on SENSITIVE field that an opaque
+    #: blob would make the cloud hallucinate, so it was NOT tokenised to the
+    #: cloud — the document must be routed to the LOCAL model instead.  Drives the
+    #: ``DISPOSITION_ROUTE_LOCAL`` disposition.
+    route_local: bool = False
+    #: The operate-on sensitive data classes that forced the routing decision
+    #: (audit / layman-alert breadcrumb; class names only, never values).
+    operate_on_classes: list[str] = field(default_factory=list)
     #: Mode-B artefact (F3 / L-02): the request-scoped round-trip holder — the
     #: PositionBinder primed with the egress frame + provenance, wrapping the
     #: encrypted/TTL'd ReplacerMap.  The gateway holds it keyed by the map handle
@@ -136,6 +179,21 @@ class ModeBRestoreResult:
     restored: bool
     echo_rejected: bool
     flags: list[str] = field(default_factory=list)
+    audit_fields: dict = field(default_factory=dict)
+
+
+@dataclass
+class IntegrityVerifyResult:
+    """Outcome of :meth:`DocumentInspectionPipeline.verify_integrity`.
+
+    ``ok`` is True only when the mapping's recorded salt matches the recomputed
+    SHA-256 of the original bytes AND every token re-derives under that salt + the
+    deployment secret (no foreign-salt / cross-file-splice tokens)."""
+
+    ok: bool
+    salt_match: bool
+    actual_doc_hash: str
+    foreign_tokens: list[str] = field(default_factory=list)
     audit_fields: dict = field(default_factory=dict)
 
 
@@ -167,6 +225,12 @@ class DocumentInspectionPipeline:
         # LOG mode: enumerate only; never mutate text in the detector — the
         # document path owns the action decision (LOG/REDACT/PSEUDONYMIZE/BLOCK).
         self._pii = pii_detector or PiiDetector(mode=PiiMode.LOG)
+        # Opaque-token deployment secret, sourced ONCE from the existing gateway
+        # secret mechanism (/run/secrets / KMS).  None → salt-only keying
+        # fallback (still per-file-unique + opaque; keyed form preferred).  Read
+        # at construction so a per-request hot path never touches the filesystem;
+        # never logged.
+        self._pseudonymize_secret = load_deployment_secret()
         self._on_audit = on_audit or (lambda name, data: None)
         # F2 small-set re-identification threshold (mirrors the rego default).
         self._small_set_threshold = small_set_threshold
@@ -188,6 +252,7 @@ class DocumentInspectionPipeline:
         pseudonymize_mode: str = "A",
         detokenize_rbac_role: str = DEFAULT_DETOKENIZE_ROLE,
         map_ttl_s: int = DEFAULT_MAP_TTL_S,
+        operate_on_routing: str = OPERATE_ON_ROUTE_LOCAL,
     ) -> DocumentInspectionResult:
         """Inspect a document end-to-end.
 
@@ -268,6 +333,7 @@ class DocumentInspectionPipeline:
                 mode=pseudonymize_mode,
                 detokenize_rbac_role=detokenize_rbac_role,
                 map_ttl_s=map_ttl_s,
+                operate_on_routing=operate_on_routing,
             )
         # Unknown action → fail-closed.
         return self._block(
@@ -333,6 +399,7 @@ class DocumentInspectionPipeline:
                     location=loc,
                     char_start=cm.char_start,
                     char_end=cm.char_end,
+                    field_role=classify_field_role(cm.data_class).value,
                 )
             )
             originals[loc] = seg.text[cm.char_start:cm.char_end]
@@ -348,14 +415,16 @@ class DocumentInspectionPipeline:
             for f in result.findings:
                 loc = location_for(seg, f.start, f.end)
                 is_qi = f.pii_type.value in self._QI_TYPES
+                data_class = f"PII.{f.pii_type.value}"
                 matches.append(
                     DataMatch(
-                        data_class=f"PII.{f.pii_type.value}",
+                        data_class=data_class,
                         qi=is_qi,
                         instance=f.masked_value,
                         location=loc,
                         char_start=f.start,
                         char_end=f.end,
+                        field_role=classify_field_role(data_class).value,
                     )
                 )
                 # The raw substring (host-side only) for the re-render transform.
@@ -443,6 +512,53 @@ class DocumentInspectionPipeline:
             opa_input=opa_input,
             audit_fields=audit,
             forward_bytes=data,  # LOG forwards the original document unchanged.
+        )
+
+    def _route_local(
+        self,
+        request_id: str,
+        data: bytes,
+        extraction: ExtractionResult,
+        matches: list[DataMatch],
+        opa_input: Optional[dict],
+        operate_on_classes: list[str],
+    ) -> DocumentInspectionResult:
+        """PART 2 (Laura D1): route the whole document + its agent call to the
+        LOCAL model instead of blobbing an operate-on sensitive field to the
+        cloud.  This reuses the existing sensitivity→local-model routing seam (the
+        document rides the rerouted call — plan §5.0 reroute-to-local); the
+        gateway forwards the ORIGINAL bytes to the LOCAL route (the values never
+        leave the estate, so they need no tokenisation), and the disposition tells
+        the proxy to pin the local model.  We never silently feed the cloud a
+        hallucination-prone blob."""
+        audit = {
+            "event_type": "DOCUMENT_ROUTED_LOCAL",
+            "request_id": request_id,
+            "disposition": DISPOSITION_ROUTE_LOCAL,
+            "detected_format": extraction.detected_format,
+            "match_count": len(matches),
+            "matches": [m.as_opa_match() for m in matches],
+            # Class names only — never values.
+            "operate_on_classes": operate_on_classes,
+            "reason": (
+                "operate-on sensitive field present; opaque blob would make the "
+                "cloud hallucinate — routed to the local model (PART 2)"
+            ),
+        }
+        self._on_audit("DOCUMENT_ROUTED_LOCAL", audit)
+        return DocumentInspectionResult(
+            request_id=request_id,
+            disposition=DISPOSITION_ROUTE_LOCAL,
+            extraction_complete=extraction.extraction_complete,
+            detected_format=extraction.detected_format,
+            matches=matches,
+            opa_input=opa_input,
+            audit_fields=audit,
+            # The LOCAL route receives the ORIGINAL bytes (values stay in-estate,
+            # no broken blob).  The proxy pins the local model off route_local.
+            forward_bytes=data,
+            route_local=True,
+            operate_on_classes=operate_on_classes,
         )
 
     # ------------------------------------------------------------------
@@ -654,16 +770,48 @@ class DocumentInspectionPipeline:
         mode: str,
         detokenize_rbac_role: str,
         map_ttl_s: int,
+        operate_on_routing: str = OPERATE_ON_ROUTE_LOCAL,
     ) -> DocumentInspectionResult:
         """PSEUDONYMIZE: replace each matched value with a consistent reversible
         token (all QIs — F2), re-render in the jail (F6), vault the replacer map
         (F5), and emit the mode-A table / wire the mode-B binder.
 
         Fail-closed: an empty plan, a re-render failure, a residual leak, OR a
-        small-set re-identification escalation (F2) → BLOCK."""
+        small-set re-identification escalation (F2) → BLOCK.
+
+        PART 2 (Laura D1) — field-role routing: when the tokenised artefact is
+        CLOUD-bound (mode B) AND the document carries an operate-on SENSITIVE
+        field (a currency amount, DOB, IBAN/PAN the model would compute on /
+        validate), an opaque blob would make the cloud HALLUCINATE a plausible
+        value and reason over the invention.  We therefore do NOT silently blob
+        such a field to the cloud — per ``operate_on_routing`` we route the whole
+        document to the LOCAL model (default), or fail-closed to BLOCK, or (only
+        on explicit opt-in) tokenise anyway."""
         fmt = extraction.detected_format
         if not matches:
             return self._log(request_id, data, extraction, matches, opa_input)
+
+        # PART 2 routing seam (Laura D1): an operate-on sensitive field must not be
+        # silently blobbed to the CLOUD.  Mode B is the definite cloud round-trip,
+        # so the seam fires there; mode A (deliver-the-table) keeps the join under
+        # the user's local control and is not gated here.
+        operate_on = sorted({
+            m.data_class for m in matches
+            if is_operate_on_sensitive(m.data_class)
+        })
+        if mode == "B" and operate_on and operate_on_routing != OPERATE_ON_ALLOW_BLOB:
+            if operate_on_routing == OPERATE_ON_ROUTE_LOCAL:
+                return self._route_local(
+                    request_id, data, extraction, matches, opa_input, operate_on,
+                )
+            # Fail-closed: no local route available → BLOCK rather than blob.
+            return self._block(
+                request_id,
+                "operate-on sensitive field present (an opaque blob would make "
+                f"the cloud hallucinate): {', '.join(operate_on)} — fail-closed "
+                "(no local route), not blobbed to cloud (PART 2 / Laura D1)",
+                detected=fmt, matches=matches, opa_input=opa_input,
+            )
 
         # F2 small-set gate (L-01): consistent tokenization of a SMALL structured
         # record set is still re-identifiable by row co-occurrence — tokenizing
@@ -681,7 +829,16 @@ class DocumentInspectionPipeline:
                 detected=fmt, matches=matches, opa_input=opa_input,
             )
 
-        assigner = TokenAssigner()
+        # Opaque, per-file-salted token assigner (DECIDED 2026-06-10):
+        # token = base32(HMAC-SHA256(deployment_secret, doc_hash || value))[:N].
+        # doc_hash = SHA-256(ORIGINAL document bytes) = the per-file salt, so the
+        # same value in two documents derives different tokens (cross-file
+        # correlation defeated) and every token binds to THIS document for
+        # integrity/splice detection.  The deployment secret comes from the
+        # existing gateway secret mechanism (/run/secrets / KMS); salt-only
+        # keying is the fallback when unset.  Never logged.
+        doc_hash = compute_doc_hash(data)
+        assigner = TokenAssigner(doc_hash, secret=self._pseudonymize_secret)
         plan = build_pseudonymize_plan(matches, originals, assigner)
         try:
             result = self._registry.render(
@@ -745,6 +902,10 @@ class DocumentInspectionPipeline:
             "detokenize_rbac_role": detokenize_rbac_role,
             "replacer_map_ttl_s": replacer_map.ttl_s,
             "no_residual_verified": True,
+            # The per-file salt the opaque tokens were derived under (not a
+            # secret — a hash of bytes the holder already has).  Binds the audit
+            # record to the document for integrity/splice correlation.
+            "doc_hash": doc_hash,
             # The unguessable handle is a CORRELATION-safe field ONLY if it is
             # never the retrieval capability in a log; we deliberately DO NOT put
             # the handle in the audit event (F5) — it is the capability token.
@@ -763,6 +924,7 @@ class DocumentInspectionPipeline:
             correspondence_table=table,
             pseudonymize_mode=mode,
             mode_b_roundtrip=mode_b,
+            doc_hash=doc_hash,
         )
 
     # ------------------------------------------------------------------
@@ -834,6 +996,65 @@ class DocumentInspectionPipeline:
             restored=ok,
             echo_rejected=False,
             flags=list(flags),
+            audit_fields=audit,
+        )
+
+    # ------------------------------------------------------------------
+    # Integrity verify — tokenised output + mapping belong to the original;
+    # cross-file splice (foreign-salt tokens) rejected (DECIDED 2026-06-10).
+    # ------------------------------------------------------------------
+
+    def verify_integrity(
+        self,
+        original_bytes: bytes,
+        mapping: "dict[str, str]",
+        claimed_doc_hash: str,
+    ) -> "IntegrityVerifyResult":
+        """Confirm a tokenised output + its mapping file belong to ``original_bytes``.
+
+        Two independent checks; a failure on either fails closed:
+
+          1. **Salt binding** — recompute ``doc_hash = SHA-256(original_bytes)``
+             and compare it to the ``claimed_doc_hash`` recorded in the mapping
+             file header.  A mismatch means the mapping was paired with the WRONG
+             original (splice / wrong-file) → reject.
+
+          2. **Foreign-salt token rejection** — every token in the mapping must
+             validly re-derive from its value under THIS document's salt + the
+             deployment secret (``token_scheme.token_matches_doc``).  A token
+             minted under a different document's salt (cross-file splice) will not
+             re-derive and is reported as ``foreign_tokens`` → reject.
+
+        Returns an :class:`IntegrityVerifyResult`; ``ok`` is True only when the
+        salt binds AND no foreign tokens are present.  The deployment secret is
+        read from the same source the assigner used; the mapping cleartext is
+        never logged (only token strings appear in the result's foreign list)."""
+        actual = compute_doc_hash(original_bytes)
+        salt_ok = secrets_compare(actual, claimed_doc_hash)
+
+        foreign: list[str] = []
+        for token, value in mapping.items():
+            if not token_matches_doc(
+                token, value, actual, secret=self._pseudonymize_secret
+            ):
+                foreign.append(token)
+
+        ok = salt_ok and not foreign
+        audit = {
+            "event_type": "DOCUMENT_INTEGRITY_VERIFIED" if ok
+            else "DOCUMENT_INTEGRITY_FAILED",
+            "disposition": "INTEGRITY_OK" if ok else "INTEGRITY_REJECTED",
+            "salt_match": salt_ok,
+            "doc_hash": actual,
+            # token IDs only — never the mapping cleartext.
+            "foreign_token_count": len(foreign),
+        }
+        self._on_audit(str(audit["event_type"]), audit)
+        return IntegrityVerifyResult(
+            ok=ok,
+            salt_match=salt_ok,
+            actual_doc_hash=actual,
+            foreign_tokens=foreign,
             audit_fields=audit,
         )
 
