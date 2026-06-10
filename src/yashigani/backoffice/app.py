@@ -81,6 +81,8 @@ from yashigani.backoffice.routes import (
     models_router,
     sensitivity_router,
     sso_router,
+    # v2.26 — Document Enforcement admin surface
+    documents_router,
     # v2.23.2 — Backup status + verify (#47)
     backup_router,
     # v2.23.3 — Admin-triggered secret rotation
@@ -594,18 +596,22 @@ async def lifespan(app: FastAPI):
 
         logging.getLogger(__name__).warning("Could not start backoffice scheduler: %s", exc)
 
-    # v2.25.1 (OPA-PERSIST): re-sync OPA from the durable Redis-backed RBAC store at the END of
+    # (OPA-PERSIST): re-sync OPA from the durable Redis-backed stores at the END of
     # lifespan startup — NOT in _bootstrap(), which runs at module import before the internal-PKI
-    # client is ready (it fails with "no bootstrap_token_sha256 in the manifest"). OPA holds the
-    # RBAC document in memory ONLY, so an OPA (or upgrade) restart drops it even though the store
-    # persists to Redis db/3 — leaving OPA empty until the next mutation. Re-pushing here recovers
-    # OPA's view from the durable store on every deploy/upgrade/restart. Best-effort with retries;
-    # groups are safe in Redis, so a transient OPA-not-ready never blocks backoffice startup.
+    # client is ready (it fails with "no bootstrap_token_sha256 in the manifest"). OPA holds its
+    # data documents in memory ONLY, so an OPA (or upgrade) restart drops them even though the
+    # stores persist to Redis db/3 — leaving OPA empty until the next mutation. Re-pushing here
+    # recovers OPA's view from the durable stores on every deploy/upgrade/restart. Best-effort with
+    # retries; the data is safe in Redis, so a transient OPA-not-ready never blocks startup.
+    import asyncio  # noqa: PLC0415 — local; the await sleep below must not depend on the
+    #                                 scheduler block having imported it.
+    _osync_log = _logging.getLogger("yashigani.backoffice.lifespan")
+
+    # --- RBAC + agents data document (data.yashigani.rbac / .agents) ---
     try:
         _rbac_store = backoffice_state.rbac_store
         if _rbac_store is not None:
             from yashigani.rbac.opa_push import push_rbac_data
-            _osync_log = _logging.getLogger("yashigani.backoffice.lifespan")
             _grp_n = len(_rbac_store.list_groups())
             for _attempt in range(1, 4):
                 try:
@@ -623,13 +629,11 @@ async def lifespan(app: FastAPI):
                         await asyncio.sleep(2)
                     else:
                         _osync_log.warning(
-                            "OPA-PERSIST: startup re-sync failed after 3 attempts (%s) — groups "
+                            "OPA-PERSIST: RBAC startup re-sync failed after 3 attempts (%s) — groups "
                             "remain in Redis; OPA will sync on next mutation", _push_exc
                         )
     except Exception as _outer_exc:
-        _logging.getLogger("yashigani.backoffice.lifespan").warning(
-            "OPA-PERSIST: startup re-sync skipped (%s)", _outer_exc
-        )
+        _osync_log.warning("OPA-PERSIST: RBAC startup re-sync skipped (%s)", _outer_exc)
 
     # #16 (OPA Phase 2): re-push client-policy bindings to OPA on startup (OPA holds
     # data in memory only). SEPARATE /v1/data/client_bindings namespace — does not
@@ -689,6 +693,34 @@ async def lifespan(app: FastAPI):
             "AGENT-RECONCILE: startup reconcile FAILED (%s) — @agent routes may "
             "return agent_not_found until the registry is restored", _areconcile_exc
         )
+
+    # --- Document-enforcement policy matrix (data.yashigani.document) — 2.26 ---
+    # Same persistence + re-push pattern as RBAC, targeting the document sub-tree
+    # so the production rego (policy/document.rego) evaluates the operator's live
+    # matrix after any policy-container restart.
+    try:
+        _doc_store = backoffice_state.document_policy_store
+        if _doc_store is not None:
+            from yashigani.documents.opa_push import push_document_data
+            _pol_n = len(_doc_store.list_policies())
+            for _attempt in range(1, 4):
+                try:
+                    push_document_data(_doc_store, backoffice_state.opa_url)
+                    _osync_log.info(
+                        "OPA-PERSIST: re-synced OPA from document policy store on startup "
+                        "(%d policy(ies))", _pol_n
+                    )
+                    break
+                except Exception as _push_exc:
+                    if _attempt < 3:
+                        await asyncio.sleep(2)
+                    else:
+                        _osync_log.warning(
+                            "OPA-PERSIST: document startup re-sync failed after 3 attempts (%s) — "
+                            "policies remain in Redis; OPA will sync on next mutation", _push_exc
+                        )
+    except Exception as _outer_exc:
+        _osync_log.warning("OPA-PERSIST: document startup re-sync skipped (%s)", _outer_exc)
 
     yield
 
@@ -1064,6 +1096,8 @@ def create_backoffice_app() -> FastAPI:
     # v2.1 — Model alias management + Sensitivity patterns
     app.include_router(models_router, prefix="/admin/models", tags=["models"])
     app.include_router(sensitivity_router, prefix="/admin/sensitivity", tags=["sensitivity"])
+    # v2.26 — Document Enforcement admin surface (ships dark; flag-gated routes)
+    app.include_router(documents_router, prefix="/admin/documents", tags=["documents"])
     # v2.1 — SSO / OIDC login flow (no auth required — serves anonymous users)
     app.include_router(sso_router, prefix="/auth", tags=["sso"])
 

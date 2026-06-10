@@ -36,6 +36,8 @@ function showPage(name, triggerEl) {
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
     if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
+    // Document Enforcement panel — loadDocuments is defined in documents.js (loaded defer).
+    if (name === 'documents' && typeof window.loadDocuments === 'function') window.loadDocuments();
 }
 
 // ---------------------------------------------------------------------------

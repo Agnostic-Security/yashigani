@@ -192,6 +192,8 @@ def _bootstrap():
     rbac_store = None
     agent_registry = None
     binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
+    document_policy_store = None
+    document_set_store = None
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -241,6 +243,26 @@ def _bootstrap():
             logger.info(
                 "Binding store initialised: %d client-policy binding(s) loaded",
                 len(binding_store.list()),
+            )
+            # Document-enforcement policy store (2.26) shares Redis db/3
+            # (key namespace "document:"); same persistence + startup-OPA-re-push
+            # pattern as the RBAC store. Seed the demo matrix on first boot only.
+            from yashigani.documents.policy_store import DocumentPolicyStore
+            document_policy_store = DocumentPolicyStore(redis_client=redis_rbac_client)
+            document_policy_store.seed_defaults()
+            logger.info(
+                "Document policy store initialised: %d policy(ies) loaded from Redis",
+                len(document_policy_store.list_policies()),
+            )
+            # Document-SET store (2.26 set-scoped-salt) shares Redis db/3
+            # (key namespace "document:set:"); holds the opaque per-set salt for
+            # operator-defined cross-file correlation sets.  No seeding — sets are
+            # operator-created (default stays per-file isolation).
+            from yashigani.documents.set_store import DocumentSetStore
+            document_set_store = DocumentSetStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Document set store initialised: %d set(s) loaded from Redis",
+                len(document_set_store.list_sets()),
             )
             break  # success
         except Exception as exc:
@@ -407,6 +429,8 @@ def _bootstrap():
     backoffice_state.rbac_store = rbac_store
     backoffice_state.binding_store = binding_store    # #16
     backoffice_state.agent_registry = agent_registry
+    backoffice_state.document_policy_store = document_policy_store
+    backoffice_state.document_set_store = document_set_store
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
     backoffice_state.opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")

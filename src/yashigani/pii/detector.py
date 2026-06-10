@@ -36,16 +36,22 @@ class PiiMode(str, Enum):
 
 
 class PiiType(str, Enum):
-    SSN              = "SSN"
-    CREDIT_CARD      = "CREDIT_CARD"
-    EMAIL            = "EMAIL"
-    PHONE            = "PHONE"
-    IBAN             = "IBAN"
-    PASSPORT         = "PASSPORT"
-    NHS_NUMBER       = "NHS_NUMBER"
-    DRIVERS_LICENCE  = "DRIVERS_LICENCE"
-    IP_ADDRESS       = "IP_ADDRESS"
-    DATE_OF_BIRTH    = "DATE_OF_BIRTH"
+    SSN                  = "SSN"
+    CREDIT_CARD          = "CREDIT_CARD"
+    EMAIL                = "EMAIL"
+    PHONE                = "PHONE"
+    IBAN                 = "IBAN"
+    PASSPORT             = "PASSPORT"
+    NHS_NUMBER           = "NHS_NUMBER"
+    DRIVERS_LICENCE      = "DRIVERS_LICENCE"
+    IP_ADDRESS           = "IP_ADDRESS"
+    DATE_OF_BIRTH        = "DATE_OF_BIRTH"
+    # Identifying / quasi-identifying classes broadened for document
+    # enforcement (L-01 / red-team F2): a small structured record set is
+    # re-identifiable when these survive in the clear, so PSEUDONYMIZE must
+    # tokenize them and the small-set gate must see them as quasi-identifiers.
+    NATIONAL_INSURANCE   = "NATIONAL_INSURANCE"   # UK NINO (AA 10 10 10 A)
+    POSTAL_ADDRESS       = "POSTAL_ADDRESS"       # UK postcode / postal address
 
 
 # ---------------------------------------------------------------------------

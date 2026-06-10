@@ -19,6 +19,7 @@
                 <button data-action="showPage" data-param="models">Models</button>
                 <button data-action="showPage" data-param="policies">Policies</button>
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
+                <button data-action="showPage" data-param="documents">Documents</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
                 <button data-action="showPage" data-param="monitoring">Monitoring</button>
@@ -415,6 +416,139 @@
                     <textarea id="test-text" rows="3" class="classify-textarea" placeholder="Paste text to classify..."></textarea>
                     <button data-action="testClassify" class="classify-btn">Classify</button>
                     <div id="classify-result" class="classify-result"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Document Enforcement Page — v2.26 (document-content OPA enforcement) -->
+        <div class="page" id="page-documents">
+            <h2>Document Enforcement</h2>
+
+            <!-- 1. Enablement / status -->
+            <div class="cards" id="doc-status-cards">
+                <div class="card"><span class="loading">Loading…</span></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">Supported Formats (full-depth inspection)</div>
+                <div class="panel-body">
+                    <p class="txt-note">These six formats are inspected end-to-end (visible + hidden parts + metadata). Any other format fails closed to BLOCK.</p>
+                    <table>
+                        <thead><tr><th>Format</th><th>Family</th><th>Description</th></tr></thead>
+                        <tbody id="doc-formats-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">Parked Formats (fail-closed BLOCK)</div>
+                <div class="panel-body">
+                    <table>
+                        <thead><tr><th>Format</th><th>Family</th><th>Disposition</th></tr></thead>
+                        <tbody id="doc-parked-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 2. Policy configuration: data-class × format × route → action -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Action Policies (data-class × format × route)</span>
+                    <button data-action="docToggleForm" data-form-id="doc-add-policy-form" class="btn-xs-add">+ Add Policy</button>
+                </div>
+                <div id="doc-add-policy-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Data class</label><br><select id="doc-pol-class" class="fi"><option value="PII">PII</option><option value="QI">QI</option><option value="PHI">PHI</option><option value="PCI">PCI</option><option value="SECRET">SECRET</option><option value="IP_MARKING">IP_MARKING</option></select></div>
+                        <div><label class="lbl">Format</label><br><select id="doc-pol-format" class="fi"><option value="any">any</option><option value="docx">docx</option><option value="xlsx">xlsx</option><option value="pptx">pptx</option><option value="pdf">pdf</option><option value="csv">csv</option><option value="txt">txt</option></select></div>
+                        <div><label class="lbl">Route</label><br><select id="doc-pol-route" class="fi"><option value="any">any</option><option value="ingress-upload">ingress-upload</option><option value="egress-mcp-result">egress-mcp-result</option><option value="json-attachment">json-attachment</option></select></div>
+                        <div><label class="lbl">Action</label><br><select id="doc-pol-action" class="fi"><option value="LOG">LOG</option><option value="REDACT">REDACT</option><option value="PSEUDONYMIZE">PSEUDONYMIZE</option><option value="BLOCK">BLOCK</option></select></div>
+                        <div><label class="lbl">Pseudonymize mode</label><br><select id="doc-pol-mode" class="fi"><option value="A">A — give user table</option><option value="B">B — internal round-trip</option></select></div>
+                        <div><label class="lbl">Small-set / QI escalation</label><br><select id="doc-pol-escalate" class="fi"><option value="true">on</option><option value="false">off</option></select></div>
+                        <div><label class="lbl">Description</label><br><input id="doc-pol-desc" type="text" placeholder="What this policy does" class="fi w-180"></div>
+                        <button data-action="docAddPolicy" class="btn-sm-save">Save</button>
+                    </div>
+                    <div id="doc-policy-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>Data class</th><th>Format</th><th>Route</th><th>Action</th><th>Mode</th><th>Escalate</th><th>Description</th><th>Actions</th></tr></thead>
+                    <tbody id="doc-policies-tbody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+                </table>
+            </div>
+
+            <!-- 3. Inspect a sample document -->
+            <div class="panel">
+                <div class="panel-header">Inspect a Sample Document</div>
+                <div class="panel-body">
+                    <p class="txt-note">Run a sample through the real enforcement pipeline. Paste CSV / text content; pick the action a policy would apply.</p>
+                    <div class="form-row">
+                        <div><label class="lbl">Filename</label><br><input id="doc-insp-name" type="text" value="sample.csv" class="fi w-180"></div>
+                        <div><label class="lbl">Action</label><br><select id="doc-insp-action" class="fi"><option value="LOG">LOG</option><option value="REDACT">REDACT</option><option value="PSEUDONYMIZE">PSEUDONYMIZE</option><option value="BLOCK">BLOCK</option></select></div>
+                        <div><label class="lbl">Pseudonymize mode</label><br><select id="doc-insp-mode" class="fi"><option value="A">A — give user table</option><option value="B">B — internal round-trip</option></select></div>
+                        <div><label class="lbl">Detokenize role</label><br><input id="doc-insp-role" type="text" value="doc-pseudonymize-reverser" class="fi w-180"></div>
+                        <div><label class="lbl">Document set (salt scope)</label><br><select id="doc-insp-set" class="fi"><option value="">Per-file (default, max isolation)</option></select></div>
+                    </div>
+                    <textarea id="doc-insp-content" rows="4" class="classify-textarea" placeholder="name,email&#10;Jane Doe,jane@example.com"></textarea>
+                    <button data-action="docInspect" class="classify-btn">Inspect</button>
+                    <div id="doc-insp-result" class="form-result"></div>
+                </div>
+            </div>
+
+            <!-- 3b. Per-document verdict viewer -->
+            <div class="panel">
+                <div class="panel-header" id="doc-viewer-header">Verdict Viewer</div>
+                <div class="panel-body">
+                    <div id="doc-verdict-summary" class="doc-verdict-summary"></div>
+                    <div id="doc-user-alert" class="doc-user-alert"></div>
+                    <div id="doc-routing-note" class="doc-routing-note"></div>
+                    <table>
+                        <thead><tr><th>Data class</th><th>QI</th><th>Masked value</th><th>Field role</th><th>Location / provenance</th><th>Part</th></tr></thead>
+                        <tbody id="doc-matches-tbody"><tr><td colspan="6" class="empty">Inspect a document to see matches.</td></tr></tbody>
+                    </table>
+                    <div class="doc-integrity-row">
+                        <button data-action="docVerifyIntegrity" class="btn-sm-secondary">Verify integrity / splice</button>
+                        <span class="txt-note">Confirms the tokenised output + mapping belong to this document (rejects cross-file splice).</span>
+                    </div>
+                    <div id="doc-integrity-result" class="form-result"></div>
+                </div>
+            </div>
+
+            <!-- 4. Correspondence-table retrieval (mode A, RBAC'd) -->
+            <div class="panel">
+                <div class="panel-header">Correspondence Table Retrieval (mode A — RBAC gated)</div>
+                <div class="panel-body">
+                    <p class="txt-note">The token→original table is the re-identification key. Only an admin in the document's detokenize role may retrieve it. Unauthorised retrieval is denied (403) and the rows are never shown.</p>
+                    <div class="form-row">
+                        <div><label class="lbl">Document (request id)</label><br><input id="doc-table-rid" type="text" placeholder="doc-1-sample.csv" class="fi w-250"></div>
+                        <button data-action="docRetrieveTable" class="btn-sm-primary">Retrieve table</button>
+                        <button data-action="docDownloadTable" class="btn-sm-secondary">Download CSV</button>
+                    </div>
+                    <div id="doc-table-result" class="form-result"></div>
+                    <table id="doc-table-table" class="doc-hidden">
+                        <thead><tr><th>Token</th><th>Original</th></tr></thead>
+                        <tbody id="doc-table-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 5. Document sets — set-scoped salt (cross-file correlation) -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Document Sets (set-scoped salt)</span>
+                    <button data-action="docToggleForm" data-form-id="doc-add-set-form" class="btn-xs-add">+ New Set</button>
+                </div>
+                <div class="panel-body">
+                    <div id="doc-set-security-note" class="doc-alert-box doc-set-note"></div>
+                    <div id="doc-add-set-form" class="form-panel">
+                        <div class="form-row">
+                            <div><label class="lbl">Set name</label><br><input id="doc-set-name" type="text" placeholder="e.g. Q2 customer exports" class="fi w-250"></div>
+                            <button data-action="docCreateSet" class="btn-sm-save">Create set</button>
+                        </div>
+                        <div id="doc-set-result" class="form-result"></div>
+                    </div>
+                    <table>
+                        <thead><tr><th>ID</th><th>Name</th><th>Members</th><th>Salt</th><th>Created</th><th>Actions</th></tr></thead>
+                        <tbody id="doc-sets-tbody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -860,5 +994,6 @@
     <script src="/static/js/hibp.js" defer></script>
     <script src="/static/js/pki.js" defer></script>
     <script src="/static/js/runtime-settings.js" defer></script>
+    <script src="/static/js/documents.js" defer></script>
 </body>
 </html>
