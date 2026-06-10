@@ -195,6 +195,15 @@ Hiring: https://agnosticsec.com/careers
     handle /v1/* {
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        # Track C (F-B) anti-spoof: strip any client-supplied forwarded-user
+        # identity headers on the public /v1 path so an external caller cannot
+        # impersonate an OWUI user. ONLY OWUI (internal, via gateway:8081) may
+        # set these; the gateway honours them solely under the internal bearer.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -417,6 +426,13 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-Forwarded-User
         request_header -X-Forwarded-Name
         request_header -X-Forwarded-Groups
+        # Track C (F-B): also strip OWUI forwarded-user headers on the public
+        # path so a browser cannot smuggle them to OWUI (which would re-emit
+        # them upstream). Only OWUI's own authenticated session sets the user.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
 
         # ── Open WebUI socket.io WebSocket — F-WS fix (YSG-2253) ───────────
         # See Caddyfile.selfsigned for the full rationale. forward_auth copies
