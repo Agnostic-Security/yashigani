@@ -166,6 +166,16 @@ spec:
               mountPath: /policies/document.rego
               subPath: document.rego
               readOnly: true
+            # 3.0 (Iris-flagged, Captain): clients_aggregate.rego must be
+            # subPath-mounted too, same drift class as mcp.rego/document.rego
+            # above. It is canonical + in the ConfigMap but was absent here, so
+            # OPA loaded /policies/ without the clients-aggregate package and
+            # every data.yashigani.clients_aggregate.* decision was undefined on
+            # K8s (defined on the compose whole-dir mount — multi-runtime drift).
+            - name: policies
+              mountPath: /policies/clients_aggregate.rego
+              subPath: clients_aggregate.rego
+              readOnly: true
             {{- if .Values.mtls.enabled }}
             - name: pki-certs
               mountPath: /run/secrets

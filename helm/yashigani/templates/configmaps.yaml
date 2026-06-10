@@ -39,6 +39,8 @@ data:
 {{ .Files.Get "files/policy/mcp.rego" | indent 4 }}
   document.rego: |
 {{ .Files.Get "files/policy/document.rego" | indent 4 }}
+  clients_aggregate.rego: |
+{{ .Files.Get "files/policy/clients_aggregate.rego" | indent 4 }}
 {{- end }}
 
 {{- if .Values.otelCollector.enabled }}
