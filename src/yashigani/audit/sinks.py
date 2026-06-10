@@ -592,10 +592,15 @@ def _audit_checkpoint_signing() -> tuple[Optional[Any], str]:
     import os
     from pathlib import Path
 
+    from yashigani.identity.trust_domain import audit_signer_spiffe_id
+
+    # MI-6 (YSG-RISK-061): the explicit env var (compose sets it per instance)
+    # takes precedence; the fallback default is derived from THIS instance's
+    # trust domain so a non-legacy instance signs in its own audit namespace.
     key_path_str = os.environ.get("YASHIGANI_AUDIT_SIGNING_KEY_PATH", "").strip()
     spiffe_id = os.environ.get(
         "YASHIGANI_AUDIT_SIGNING_SPIFFE_ID",
-        "spiffe://yashigani.internal/audit",
+        audit_signer_spiffe_id(),
     ).strip()
     if key_path_str:
         kp = Path(key_path_str)

@@ -76,6 +76,41 @@ from cryptography.hazmat.primitives import serialization
 # ---------------------------------------------------------------------------
 
 
+async def _allow_client_policies(*_args, **_kwargs):
+    """No-op client-policy result (allow) — these broker tests bind no client
+    policies, so prod semantics are pass-through (deny-only / additive)."""
+    return {"allow": True, "deny": [], "obligations": []}
+
+
+@pytest.fixture(autouse=True)
+def _service_identity_env(monkeypatch):
+    """Close the client-enforce fixture gap (Su ``ccae785``, #16).
+
+    The broker's INGRESS client-policy gate (broker.py step 2d) calls
+    ``evaluate_client_policies`` which opens an mTLS OPA round-trip via
+    ``pki.client.internal_httpx_client`` → ``pki.identity.current_service()``.
+    That requires the container's own identity (``YASHIGANI_SERVICE_NAME``) AND a
+    service manifest + bootstrap-token + cert tree — production compose/helm
+    provision all of these per service, but these in-process unit fixtures cannot,
+    so the gate fails CLOSED (``client_enforce_unavailable``) on the allow-path
+    tests.  This is an ENV/INFRA fixture gap, NOT a regression: the fail-closed
+    behaviour on genuinely-missing identity is correct (covered by pki/identity
+    tests), and these broker tests bind no client policies (prod = pass-through).
+
+    We set ``YASHIGANI_SERVICE_NAME`` for completeness and patch
+    ``evaluate_client_policies`` to the benign allow result — mirroring the
+    established pattern in test_g_new_5_agent_principal_signing.py (which patches
+    the same symbol).  The broker imports it function-locally, so we patch at the
+    source module (``yashigani.gateway._client_enforce``).
+    """
+    monkeypatch.setenv("YASHIGANI_SERVICE_NAME", "gateway")
+    monkeypatch.setattr(
+        "yashigani.gateway._client_enforce.evaluate_client_policies",
+        _allow_client_policies,
+        raising=False,
+    )
+
+
 def _make_p384_key_pem_b64() -> str:
     """Generate a P-384 key and return it as base64-encoded PEM for env injection."""
     key = ec.generate_private_key(SECP384R1())

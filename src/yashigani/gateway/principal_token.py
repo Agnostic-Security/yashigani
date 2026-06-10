@@ -60,6 +60,7 @@ from typing import Optional
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
+from yashigani.identity.trust_domain import agent_spiffe_uri, gateway_issuer_prefix
 from yashigani.mcp._jwt import McpJwtIssuer
 from yashigani.mcp._nonce import NonceStore
 
@@ -76,7 +77,11 @@ _AUDIENCE = "yashigani-orchestration-principal"
 #: WITHIN this window; the short window bounds the residual.
 _TTL_SECONDS = 30
 _CLOCK_SKEW_SECONDS = 5
-_ISS_PREFIX = "https://gateway.yashigani.internal/"
+#: Gateway issuer prefix — derived from the instance trust domain (MI-6 /
+#: YSG-RISK-061) via ``gateway_issuer_prefix()`` at each call site below, so a
+#: non-legacy instance mints AND accepts only its own
+#: ``https://gateway.<project>.yashigani.internal/`` issuer and rejects a foreign
+#: (incl. legacy) issuer.  Resolved per-call, never frozen at import time.
 
 
 class PrincipalClaimError(Exception):
@@ -92,9 +97,12 @@ def caller_spiffe_uri(tenant_id: str, agent_id: str) -> str:
 
     Mirrors the canonical agent identity format used across the codebase
     (``pool/manager.py``, ``manifest/codegen.py``):
-    ``spiffe://yashigani.internal/agents/{tenant_id}/{agent_name}``.  This is the
-    'real caller's SPIFFE identity' the principal claim is bound to."""
-    return f"spiffe://yashigani.internal/agents/{tenant_id}/{agent_id}"
+    ``spiffe://<trust_domain>/agents/{tenant_id}/{agent_name}``.  This is the
+    'real caller's SPIFFE identity' the principal claim is bound to.  The trust
+    domain is per-instance (MI-6 / YSG-RISK-061), so on a non-legacy instance the
+    binding uses ``<project>.yashigani.internal`` and matches that instance's own
+    cert SAN."""
+    return agent_spiffe_uri(tenant_id, agent_id)
 
 
 class OrchestrationPrincipalSigner:
@@ -158,7 +166,7 @@ class OrchestrationPrincipalSigner:
             raise PrincipalClaimError("cannot sign a principal with no caller SPIFFE binding")
         iat = int(time.time())
         payload = {
-            "iss": f"{_ISS_PREFIX}{self._tenant_id}",
+            "iss": f"{gateway_issuer_prefix()}{self._tenant_id}",
             "aud": _AUDIENCE,
             "iat": iat,
             "exp": iat + self._ttl,
@@ -278,8 +286,10 @@ class OrchestrationPrincipalVerifier:
             raise PrincipalClaimError(f"principal claim verification failed: {last_exc}")
 
         # Issuer prefix check (belt-and-suspenders — decode already validated aud).
+        # Per-instance trust domain (MI-6): a foreign-issuer claim (incl. legacy
+        # ``yashigani.internal`` on a non-legacy instance) is rejected here.
         iss = payload.get("iss", "")
-        if not iss.startswith(_ISS_PREFIX):
+        if not iss.startswith(gateway_issuer_prefix()):
             raise PrincipalClaimError(f"principal claim iss={iss!r} not a gateway issuer")
 
         # SPIFFE binding: the claim must have been issued FOR the presenting

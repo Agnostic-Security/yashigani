@@ -46,6 +46,7 @@ from yashigani.mcp._types import (
     McpPosture,
     OpaDecision,
 )
+from yashigani.identity.trust_domain import agent_spiffe_uri
 from yashigani.mcp._jwt import ChainDepthExceeded, McpJwtIssuer, McpJwtVerifier
 from yashigani.mcp._nonce import NonceStore, InMemoryNonceStore
 from yashigani.mcp._opa import (
@@ -327,10 +328,10 @@ class McpBroker:
                 await self._emit_audit(ctx, decision)
                 return decision
 
-        # Step 2: query OPA (fail-closed)
-        spiffe_uri = (
-            f"spiffe://yashigani.internal/agents/{ctx.tenant_id}/{ctx.agent_name}"
-        )
+        # Step 2: query OPA (fail-closed).  MI-6 (YSG-RISK-061): build the agent
+        # SPIFFE URI in THIS instance's trust domain so OPA adjudicates the
+        # instance's own identity (matches the per-instance cert SAN).
+        spiffe_uri = agent_spiffe_uri(ctx.tenant_id, ctx.agent_name)
         chain_for_opa = list(upstream_chain)
 
         # FIX-C (Iris FIND-001): pass sensitivity fields so OPA audit_capture
@@ -795,7 +796,7 @@ class McpBroker:
             account_tier=AccountTier.SYSTEM,
             tenant_id=ctx.tenant_id,
             agent_name=ctx.agent_name,
-            identity_id=f"spiffe://yashigani.internal/agents/{ctx.tenant_id}/{ctx.agent_name}",
+            identity_id=agent_spiffe_uri(ctx.tenant_id, ctx.agent_name),
             request_id=ctx.request_id,
             tool_name=ctx.tool_name or ctx.prompt_name or ctx.resource_uri or "",
             server_id=ctx.server_id,

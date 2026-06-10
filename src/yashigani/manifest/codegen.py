@@ -2255,8 +2255,10 @@ def _gen_service_identity_entry_shape_c(
     """
     Generate service_identities.yaml append entry (Shape C).
 
-    Shape-C uses SPIFFE URI: spiffe://yashigani.internal/agents/{tenant_id}/{name}
-    (same pattern as Shape-A; shape marker differs).
+    Shape-C uses SPIFFE URI: spiffe://<trust_domain>/agents/{tenant_id}/{name}
+    (trust_domain is per-instance, MI-6 / YSG-RISK-061; legacy: yashigani.internal;
+    resolved at runtime via manifest/linter.resolve_spiffe_uri.  Same pattern as
+    Shape-A; shape marker differs).
     """
     from yashigani.manifest.linter import resolve_spiffe_uri  # noqa: PLC0415
 
