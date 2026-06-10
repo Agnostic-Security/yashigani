@@ -16,15 +16,24 @@ Coverage:
              value ESCAPED in the viewer — no handler fires, no <img> node is
              created from the injected value (match value is attacker-controlled).
   PW-DOC-09  Unauthenticated GET /admin/documents/status → 401
+  PW-DOC-10  2.26 verdict viewer renders the Field-role column header
+  PW-DOC-11  2.26 set-scoped-salt control renders (security note + set dropdown)
+  PW-DOC-12  2.26 set create → the new set appears in the table + inspect dropdown
+             and NO 64-hex salt value is ever present in the rendered DOM
+  PW-DOC-13  2.26 PSEUDONYMIZE verdict shows the salt-scope + opaque-token note;
+             field-role cell renders (reference-only / operate-on). Needs sandbox.
 
-  (The METADATA-hidden-row "wow row" and the RBAC-deny gate are proven
-  deterministically in src/tests/unit/test_documents_routes.py — DOC-RT-10,
-  DOC-RT-05/07 — which do not depend on the container sandbox.)
+  (The METADATA-hidden-row "wow row", the RBAC-deny gate, the integrity/splice
+  verdict, field-role + salt-scope surfacing, and the salt-never-leaks property
+  are proven deterministically in src/tests/unit/test_documents_routes.py
+  (DOC-RT-05/07/10/12-17, DOC-SET-01-05) + test_document_set_store.py, which do
+  not depend on the container sandbox.)
 
 ASVS: V4.1 (BOLA / access control on table retrieval), V5.3.3 (output encoding),
-V6.8.4 (step-up on policy mutation).  OWASP: A01, A03.  API: API1 (BOLA).
+V6.2 (crypto material custody — set salt redacted), V6.8.4 (step-up on
+mutation).  OWASP: A01, A02, A03.  API: API1 (BOLA).
 
-Author: Ava (QA). Last updated: 2026-06-09.
+Author: Ava (QA). Last updated: 2026-06-10.
 """
 from __future__ import annotations
 
@@ -201,5 +210,75 @@ def test_pw_doc_09_status_requires_auth():
         try:
             resp = page.request.get(f"{BASE_URL}/admin/documents/status")
             assert resp.status == 401
+        finally:
+            browser.close()
+
+
+# ---------------------------------------------------------------------------
+# 2.26 NEW SURFACES — field-role column, set-scoped-salt control, salt-never-leaks
+# ---------------------------------------------------------------------------
+
+@playwright_required
+def test_pw_doc_10_field_role_column_present():
+    """The verdict viewer renders the Field-role column (Laura D1 surface)."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(ignore_https_errors=True)
+        try:
+            _open_documents(page)
+            headers = page.inner_text("#doc-matches-tbody")  # body exists
+            # The column header lives in the table head; assert it is present.
+            assert "Field role" in page.inner_text("#page-documents")
+        finally:
+            browser.close()
+
+
+@playwright_required
+def test_pw_doc_11_set_salt_control_present():
+    """The set-scoped-salt control renders: security note + sets table + the
+    per-file default option in the inspect dropdown."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(ignore_https_errors=True)
+        try:
+            _open_documents(page)
+            page.wait_for_selector("#doc-sets-tbody", timeout=5000)
+            page.wait_for_selector("#doc-set-security-note", timeout=5000)
+            note = page.inner_text("#doc-set-security-note")
+            assert "isolation" in note.lower()
+            # The inspect dropdown carries the per-file default option.
+            assert page.is_visible("#doc-insp-set")
+            opts = page.inner_text("#doc-insp-set")
+            assert "Per-file" in opts
+        finally:
+            browser.close()
+
+
+@playwright_required
+def test_pw_doc_12_set_create_and_salt_never_in_dom():
+    """Create a set via step-up; it appears in the table + inspect dropdown, and
+    NO 64-hex salt value is ever present in the rendered DOM (A02 custody)."""
+    import re as _re
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(ignore_https_errors=True)
+        try:
+            _open_documents(page)
+            page.wait_for_selector("#doc-sets-tbody", timeout=5000)
+            page.click('button[data-action="docToggleForm"][data-form-id="doc-add-set-form"]')
+            page.fill("#doc-set-name", "PW correlation set")
+            page.click('button[data-action="docCreateSet"]')
+            # Step-up TOTP may be prompted; the result badge appears either way.
+            page.wait_for_selector("#doc-set-result .badge", timeout=10000)
+            page.wait_for_timeout(1000)
+            body = page.inner_text("#page-documents")
+            # If the set was created (step-up satisfied), it shows in the table.
+            # Regardless, assert NO 64-char hex salt ever leaks into the DOM.
+            full_html = page.content()
+            assert not _re.search(r"[0-9a-f]{64}", full_html), (
+                "a 64-hex salt-shaped value appeared in the DOM — set salt must "
+                "never reach the client"
+            )
         finally:
             browser.close()

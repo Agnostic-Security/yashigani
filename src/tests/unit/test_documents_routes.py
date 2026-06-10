@@ -368,8 +368,168 @@ def test_doc_rt_11_policy_add_uses_stepup_dep():
     import inspect as _inspect
     src = _inspect.getsource(docroutes)
     assert "StepUpAdminSession" in src
-    # Both mutating routes carry the step-up session dependency.
+    # Both mutating routes + the set mutations carry the step-up session dep.
     assert src.count("session: StepUpAdminSession") >= 2
+
+
+# ===========================================================================
+# 2.26 NEW SURFACES — opaque-token render, field-role, integrity, set-salt
+# (regression coverage for the verdict-viewer + set-scoped-salt deliverables)
+# ===========================================================================
+
+def _register_pseudonymize_result(salt_scope="file", *, field_role="REFERENCE_ONLY",
+                                   operate_on_classes=None, route_local=False):
+    """Register a synthetic PSEUDONYMIZE result carrying the new 2.26 fields, with
+    a REAL correspondence table so the integrity endpoint can re-derive."""
+    from yashigani.documents.datamatch import DataMatch
+    from yashigani.documents.pipeline import (
+        DocumentInspectionResult, DISPOSITION_PSEUDONYMIZE,
+    )
+    from yashigani.documents.pseudonymize import CorrespondenceTable, ReplacerMap, TokenAssigner
+    from yashigani.documents.token_scheme import compute_doc_hash
+
+    salt = compute_doc_hash(b"doc-bytes-for-2.26-surfaces")
+    assigner = TokenAssigner(salt, secret=None)
+    assigner.token_for("jane@example.com", "PII.EMAIL")
+    rmap = ReplacerMap.create(assigner.reverse_map, detokenize_rbac_role=DETOK_ROLE)
+    table = CorrespondenceTable.from_assigner(assigner, detokenize_rbac_role=DETOK_ROLE)
+    m = DataMatch("PII.EMAIL", False, "ja****om", "TABLE_CELL:row=2,col=2:span=0-16", 0, 16,
+                  field_role=field_role)
+    rid = f"doc-{len(docroutes._results) + 1}-surfaces.csv"
+    docroutes._results[rid] = DocumentInspectionResult(
+        request_id=rid,
+        disposition=DISPOSITION_PSEUDONYMIZE,
+        extraction_complete=True,
+        detected_format="csv",
+        matches=[m],
+        replacer_map=rmap,
+        correspondence_table=table,
+        pseudonymize_mode="A",
+        doc_hash=salt,
+        salt_scope=salt_scope,
+        route_local=route_local,
+        operate_on_classes=operate_on_classes or [],
+    )
+    return rid, salt
+
+
+def test_doc_rt_12_summary_surfaces_salt_scope_and_doc_hash(client):
+    """DOC-RT-12: the verdict summary surfaces salt_scope + doc_hash (never a
+    salt secret) so the operator sees the isolation level.  [func / set-salt]"""
+    tc, app = client
+    rid, salt = _register_pseudonymize_result(salt_scope="set")
+    r = tc.get(f"/admin/documents/results/{rid}")
+    assert r.status_code == 200, r.text
+    summary = r.json()["summary"]
+    assert summary["salt_scope"] == "set"
+    assert summary["doc_hash"] == salt          # doc_hash IS surfaced (not secret)
+    # The salt value itself must NEVER appear (we never store a set salt on the
+    # result; assert the response carries no field literally named "salt").
+    assert "\"salt\"" not in r.text
+
+
+def test_doc_rt_13_matches_surface_field_role(client):
+    """DOC-RT-13: each match carries field_role + operate_on_sensitive so the UI
+    can render the reference-only vs operate-on/kept-local indicator. [Laura D1]"""
+    tc, app = client
+    rid, _ = _register_pseudonymize_result(field_role="OPERATE_ON")
+    r = tc.get(f"/admin/documents/results/{rid}")
+    assert r.status_code == 200
+    rows = r.json()["matches"]
+    assert rows[0]["field_role"] == "OPERATE_ON"
+    assert "operate_on_sensitive" in rows[0]
+
+
+def test_doc_rt_14_route_local_outcome_surfaced(client):
+    """DOC-RT-14: a kept-local routing decision surfaces route_local +
+    operate_on_classes (class names only, never values). [Laura D1]"""
+    tc, app = client
+    rid, _ = _register_pseudonymize_result(
+        route_local=True, operate_on_classes=["PCI.IBAN", "PII.SALARY"],
+    )
+    r = tc.get(f"/admin/documents/results/{rid}")
+    summary = r.json()["summary"]
+    assert summary["route_local"] is True
+    assert summary["operate_on_classes"] == ["PCI.IBAN", "PII.SALARY"]
+
+
+def test_doc_rt_15_integrity_ok_for_intact_result(client):
+    """DOC-RT-15: integrity endpoint confirms a clean result binds to its doc_hash
+    and reports zero foreign tokens. [integrity / splice-verify]"""
+    tc, app = client
+    rid, _ = _register_pseudonymize_result()
+    r = tc.get(f"/admin/documents/results/{rid}/integrity")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["foreign_token_count"] == 0
+    assert body["token_count"] >= 1
+    # Never leaks the mapping cleartext — only counts + the non-secret doc_hash.
+    assert "jane@example.com" not in r.text
+
+
+def test_doc_rt_16_integrity_detects_foreign_salt_splice(client):
+    """DOC-RT-16: a spliced mapping (token minted under a DIFFERENT salt) is
+    rejected — foreign_token_count > 0, ok=False. [integrity / cross-file splice]"""
+    tc, app = client
+    from yashigani.documents.datamatch import DataMatch
+    from yashigani.documents.pipeline import DocumentInspectionResult, DISPOSITION_PSEUDONYMIZE
+    from yashigani.documents.pseudonymize import CorrespondenceTable, ReplacerMap, TokenAssigner
+    from yashigani.documents.token_scheme import compute_doc_hash
+
+    # Mint a token under salt-A, but record salt-B as the result's doc_hash —
+    # exactly a cross-file splice (mapping paired with the wrong original).
+    salt_a = compute_doc_hash(b"file-A")
+    salt_b = compute_doc_hash(b"file-B")
+    assigner = TokenAssigner(salt_a, secret=None)
+    assigner.token_for("alice@corp.com", "PII.EMAIL")
+    table = CorrespondenceTable.from_assigner(assigner, detokenize_rbac_role=DETOK_ROLE)
+    rmap = ReplacerMap.create(assigner.reverse_map, detokenize_rbac_role=DETOK_ROLE)
+    rid = "doc-spliced"
+    docroutes._results[rid] = DocumentInspectionResult(
+        request_id=rid, disposition=DISPOSITION_PSEUDONYMIZE, extraction_complete=True,
+        detected_format="csv",
+        matches=[DataMatch("PII.EMAIL", False, "al****om", "TABLE_CELL:row=1:span=0-1", 0, 1)],
+        replacer_map=rmap, correspondence_table=table, pseudonymize_mode="A",
+        doc_hash=salt_b,  # WRONG salt → splice
+    )
+    r = tc.get(f"/admin/documents/results/{rid}/integrity")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["foreign_token_count"] >= 1
+
+
+def test_doc_rt_16b_integrity_not_applicable_at_set_scope(client):
+    """DOC-RT-16b: a set-scoped result's tokens were minted under the SET salt
+    (not retained on the result), so the per-file splice verify must report
+    'not applicable' (ok=None, applicable=False) — NEVER a false splice.
+    [honest assurance — A09]"""
+    tc, app = client
+    rid, _ = _register_pseudonymize_result(salt_scope="set")
+    r = tc.get(f"/admin/documents/results/{rid}/integrity")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["applicable"] is False
+    assert body["ok"] is None
+    assert body["salt_scope"] == "set"
+    assert body["foreign_token_count"] is None
+
+
+def test_doc_rt_17_integrity_404_when_no_artefacts(client):
+    """DOC-RT-17: integrity on a LOG result (no table/doc_hash) → 404, never 500."""
+    tc, app = client
+    from yashigani.documents.datamatch import DataMatch
+    from yashigani.documents.pipeline import DocumentInspectionResult, DISPOSITION_LOG
+    rid = "doc-log-only"
+    docroutes._results[rid] = DocumentInspectionResult(
+        request_id=rid, disposition=DISPOSITION_LOG, extraction_complete=True,
+        detected_format="csv",
+        matches=[DataMatch("PII.EMAIL", False, "x", "BODY:span=0-1", 0, 1)],
+    )
+    r = tc.get(f"/admin/documents/results/{rid}/integrity")
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "no_integrity_artefacts"
 
 
 # ===========================================================================
@@ -514,3 +674,104 @@ def test_doc_prod_06_inspect_block_carries_user_alert(store_client, monkeypatch)
     assert body["user_alert"]["code"] == "DOCUMENT_BLOCKED"
     assert body["user_alert"]["policy_id"] == "DOC-ENFORCE-001"
     assert body["user_alert"]["user_message"] == "blocked for safety"
+
+
+# ===========================================================================
+# 2.26 DOCUMENT SETS — set-scoped-salt control (CRUD + salt-never-leaks)
+# ===========================================================================
+
+@pytest.fixture
+def set_client(monkeypatch):
+    """documents router wired to a REAL DocumentSetStore (fakeredis)."""
+    import fakeredis
+    from yashigani.documents.set_store import DocumentSetStore
+
+    monkeypatch.setenv("YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED", "true")
+    app = FastAPI()
+    app.include_router(docroutes.router, prefix="/admin/documents")
+
+    store = DocumentSetStore(fakeredis.FakeStrictRedis())
+    backoffice_state.document_set_store = store
+    backoffice_state.rbac_store = _FakeRBACStore({})
+    backoffice_state.audit_writer = None
+
+    app.dependency_overrides[require_admin_session] = lambda: _session(AUTHORISED_ADMIN)
+    app.dependency_overrides[require_stepup_admin_session] = lambda: _session(AUTHORISED_ADMIN)
+
+    docroutes._results.clear()
+    yield TestClient(app), app, store
+    backoffice_state.document_set_store = None
+    backoffice_state.rbac_store = None
+    docroutes._results.clear()
+
+
+def test_doc_set_01_create_and_list_salt_redacted(set_client):
+    """DOC-SET-01: create a set; the salt is NEVER returned (create or list).
+    [A02 crypto custody — the set salt is a secret]"""
+    tc, app, store = set_client
+    r = tc.post("/admin/documents/sets", json={"name": "Q2 exports"})
+    assert r.status_code == 201, r.text
+    created = r.json()["set"]
+    assert created["name"] == "Q2 exports"
+    assert "salt" not in created and created["has_salt"] is True
+    # The salt is non-empty in the store (real secret) but absent from the wire.
+    assert store.get_salt(created["id"])  # exists internally
+    assert "salt" not in r.text or "has_salt" in r.text
+
+    lst = tc.get("/admin/documents/sets")
+    assert lst.status_code == 200
+    body = lst.json()
+    assert any(s["name"] == "Q2 exports" for s in body["sets"])
+    assert "REDUCES per-file isolation" in body["security_note"]
+    # No salt value in the list response (the real 64-hex salt never appears).
+    salt = store.get_salt(created["id"])
+    assert salt not in lst.text
+
+
+def test_doc_set_02_create_is_stepup_gated():
+    """DOC-SET-02: set mutation requires StepUpAdminSession (source-level)."""
+    import inspect as _inspect
+    src = _inspect.getsource(docroutes.create_set)
+    assert "StepUpAdminSession" in src
+    assert "StepUpAdminSession" in _inspect.getsource(docroutes.delete_set)
+
+
+def test_doc_set_03_delete(set_client):
+    tc, app, store = set_client
+    sid = tc.post("/admin/documents/sets", json={"name": "temp"}).json()["set"]["id"]
+    r = tc.delete(f"/admin/documents/sets/{sid}")
+    assert r.status_code == 200
+    assert store.get_set(sid) is None
+    # Deleting a missing set is a clean 404, not a 500.
+    assert tc.delete("/admin/documents/sets/nope").status_code == 404
+
+
+def test_doc_set_04_inspect_unknown_set_id_404(set_client, monkeypatch):
+    """DOC-SET-04: inspecting with a set_id that does not exist fails closed (404)
+    — never silently falls back to the per-file salt. [fail-closed]"""
+    tc, app, store = set_client
+
+    async def _fake(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+        return {"action": "LOG", "policy_id": "P", "code": "C", "user_message": "m", "deny": [], "obligations": []}
+
+    monkeypatch.setattr(
+        "yashigani.documents.opa_decision.evaluate_document_decision", _fake
+    )
+    r = tc.post("/admin/documents/inspect", json={
+        "content": "name,email\nJane,jane@example.com\n", "filename": "p.csv",
+        "declared_mime": "text/csv", "set_id": "does-not-exist",
+    })
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "document_set_not_found"
+
+
+def test_doc_set_05_inspect_503_when_set_id_but_store_unwired(set_client, monkeypatch):
+    """DOC-SET-05: set_id supplied but the set store is unwired → 503, never a
+    silent per-file fallback. [fail-closed]"""
+    tc, app, store = set_client
+    backoffice_state.document_set_store = None
+    r = tc.post("/admin/documents/inspect", json={
+        "content": "x", "filename": "p.csv", "set_id": "1",
+    })
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "set_store_unavailable"

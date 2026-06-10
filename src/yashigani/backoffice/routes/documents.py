@@ -52,6 +52,7 @@ from yashigani.documents.config import (
     DocumentEnforcementConfig,
     is_document_enforcement_enabled,
 )
+from yashigani.documents.field_role import is_operate_on_sensitive
 from yashigani.documents.pipeline import (
     DISPOSITION_BLOCK,
     DISPOSITION_LOG,
@@ -172,6 +173,12 @@ class InspectRequest(BaseModel):
     route: str = Field(
         default="any", pattern=r"^(ingress-upload|egress-mcp-result|json-attachment|any)$"
     )
+    # Set-scoped-salt opt-in: when set, the PSEUDONYMIZE path derives tokens under
+    # the named document SET's shared salt instead of the per-file salt, so the
+    # same value tokenises consistently across the set (cross-file correlation).
+    # Empty (default) = per-file isolation.  The salt itself is NEVER supplied by
+    # the client — the route looks it up from the operator's set store by id.
+    set_id: str = Field(default="", max_length=64)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -203,7 +210,18 @@ def _build_pipeline() -> DocumentInspectionPipeline:
 
 
 def _result_summary(result) -> dict:
-    """JSON-safe verdict summary for the results list (no raw values, no map)."""
+    """JSON-safe verdict summary for the results list (no raw values, no map).
+
+    2.26 surfaces (demo/operator value, no secrets):
+      * ``salt_scope`` — "file" (per-file isolation, default) or "set" (shared set
+        salt; reduced isolation).  The scope NAME only — never the salt value.
+      * ``route_local`` + ``operate_on_classes`` — the field-role routing outcome
+        (an operate-on sensitive field was kept LOCAL rather than blobbed to the
+        cloud).  Class names only, never values.
+      * ``doc_hash`` — the per-file integrity salt recorded in the mapping header
+        (NOT a secret — a hash of bytes the holder already has).  Surfaced so the
+        operator can run the integrity/splice-verify and see the binding.
+    """
     return {
         "request_id": result.request_id,
         "disposition": result.disposition,
@@ -220,6 +238,14 @@ def _result_summary(result) -> dict:
             if result.correspondence_table is not None
             else None
         ),
+        # Token salt SCOPE (never the salt value).  Default "file".
+        "salt_scope": getattr(result, "salt_scope", "file"),
+        # The per-file integrity salt — not a secret; backs the integrity-verify.
+        "doc_hash": getattr(result, "doc_hash", None),
+        # Field-role routing outcome (Laura D1): an operate-on sensitive field was
+        # routed to the LOCAL model rather than blobbed to the cloud.
+        "route_local": getattr(result, "route_local", False),
+        "operate_on_classes": list(getattr(result, "operate_on_classes", []) or []),
     }
 
 
@@ -243,6 +269,13 @@ def _match_view(result) -> list[dict]:
                 "location": m.location,
                 "segment_kind": kind,
                 "hidden": hidden,
+                # PART 2 (Laura D1): how the downstream model must USE this value.
+                # REFERENCE_ONLY → safe to opaque-tokenise; OPERATE_ON → the model
+                # computes on / validates it, so an operate-on SENSITIVE field is
+                # kept LOCAL rather than blobbed to the cloud.  Surfaced so the
+                # operator sees, per match, why a field stayed local.
+                "field_role": getattr(m, "field_role", "") or "",
+                "operate_on_sensitive": is_operate_on_sensitive(m.data_class),
             }
         )
     return rows
@@ -359,6 +392,27 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
     request_id = f"doc-{len(_results) + 1}-{body.filename}"
     data_bytes = body.content.encode("utf-8", errors="replace")
 
+    # Resolve the set-scoped salt (opt-in).  The client supplies only the set id;
+    # the opaque salt is looked up from the operator's set store and NEVER echoed
+    # back.  An unknown set id is a 404 (fail-closed: never silently fall back to
+    # the per-file salt when the operator explicitly asked for a set — that would
+    # give false cross-file-correlation assurance).
+    set_salt: str | None = None
+    if body.set_id:
+        store = backoffice_state.document_set_store
+        if store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "set_store_unavailable",
+                        "message": "Document set store not initialised (Redis db/3 unavailable)."},
+            )
+        set_salt = store.get_salt(body.set_id)
+        if set_salt is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "document_set_not_found", "set_id": body.set_id},
+            )
+
     # --- Step 1+2: enumerate, then ask REAL OPA for the action ---------------
     from yashigani.documents.opa_decision import evaluate_document_decision
 
@@ -414,6 +468,7 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
                 requested_action=opa_action,
                 pseudonymize_mode=decision.get("pseudonymize_mode", body.pseudonymize_mode),
                 detokenize_rbac_role=decision.get("detokenize_rbac_role", body.detokenize_rbac_role),
+                set_salt=set_salt,
             )
         except Exception as exc:
             envelope, _ = safe_error_envelope(exc, public_message="document action failed")
@@ -545,3 +600,175 @@ async def download_correspondence_table(request_id: str, session: AdminSession):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="correspondence-{request_id}.csv"'},
     )
+
+
+# ── Integrity / splice verify (plan integrity step) ─────────────────────────
+#
+# Confirm a tokenised output + its mapping file belong to the SAME source
+# document, and reject a cross-file splice (a token minted under a different
+# document's salt).  The operator can re-run this on a processed result to SEE
+# the binding hold (demo/assurance value): the result's recorded ``doc_hash`` is
+# recomputed from the original bytes and every mapping token re-derives under it.
+
+
+@router.get("/results/{request_id}/integrity")
+async def verify_result_integrity(request_id: str, session: AdminSession):
+    """Surface the integrity/splice-verify result for a processed PSEUDONYMIZE doc.
+
+    Re-runs :meth:`DocumentInspectionPipeline.verify_integrity` over the stored
+    result's correspondence mapping against the recorded per-file ``doc_hash`` —
+    proving (a) the mapping binds to THIS document's salt (no wrong-file pairing)
+    and (b) no foreign-salt (cross-file-splice) tokens are present.  Returns only
+    the boolean verdict + the (non-secret) doc_hash + the COUNT of foreign tokens
+    — never the mapping cleartext, never a salt secret.
+
+    Only available for a mode-A PSEUDONYMIZE result (which carries a
+    correspondence table to re-derive against)."""
+    result = _results.get(request_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "result_not_found"})
+    table = getattr(result, "correspondence_table", None)
+    doc_hash = getattr(result, "doc_hash", None)
+    if table is None or doc_hash is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "no_integrity_artefacts",
+                    "message": "Integrity verify needs a mode-A PSEUDONYMIZE result with a recorded doc_hash."},
+        )
+
+    # Per-file-salt integrity/splice verify re-derives each token under the
+    # recorded per-FILE salt (doc_hash) + the deployment secret; a foreign-salt
+    # token would not re-derive (the splice rejection the operator wants to SEE).
+    #
+    # SET-SCOPED results: the tokens were minted under the SET salt (a secret we
+    # deliberately do NOT retain on the result), so re-deriving against doc_hash
+    # would falsely flag every token as foreign.  The per-file splice guarantee is
+    # intentionally NOT a property of a set (the set salt spans files by design),
+    # so we return an explicit "not applicable at set scope" verdict rather than a
+    # misleading splice.  This keeps the surface honest (A09 logging/assurance).
+    salt_scope = getattr(result, "salt_scope", "file")
+    if salt_scope == "set":
+        return {
+            "request_id": request_id,
+            "ok": None,                 # not a binary pass/fail at set scope
+            "applicable": False,
+            "salt_scope": "set",
+            "doc_hash": doc_hash,
+            "token_count": len(table.rows),
+            "foreign_token_count": None,
+            "detail": (
+                "Per-file splice verify does not apply to a set-scoped result — "
+                "the shared set salt spans files by design (reduced per-file "
+                "isolation). Tokens here are NOT bound to a single document."
+            ),
+        }
+
+    from yashigani.documents.token_scheme import token_matches_doc
+
+    secret = getattr(_build_pipeline(), "_pseudonymize_secret", None)
+    foreign = 0
+    for token, original in table.rows.items():
+        if not token_matches_doc(token, original, doc_hash, secret=secret):
+            foreign += 1
+    ok = foreign == 0
+    return {
+        "request_id": request_id,
+        "ok": ok,
+        "applicable": True,
+        "salt_scope": salt_scope,
+        # doc_hash is NOT a secret (hash of bytes the holder already has).
+        "doc_hash": doc_hash,
+        "token_count": len(table.rows),
+        # COUNT only — never the token strings or the mapping cleartext.
+        "foreign_token_count": foreign,
+        "detail": (
+            "Output and mapping bind to this document's salt; no spliced/foreign tokens."
+            if ok else
+            "SPLICE/FOREIGN-SALT DETECTED — one or more tokens do not belong to this document."
+        ),
+    }
+
+
+# ── Document SETS — set-scoped-salt control (operator-defined) ──────────────
+#
+# A "set" shares a PSEUDONYMIZE salt across its member files so the SAME value
+# tokenises consistently across the set (legitimate cross-file correlation).
+# This REDUCES per-file isolation, so set mutation is STEP-UP gated (same bar as
+# policy mutation — a hijacked session must not silently widen the salt scope).
+# The salt is a high-entropy secret minted server-side; it is NEVER returned to
+# the client (every response uses ``DocumentSetStore.public_view`` which redacts
+# it).  Default behaviour (no set) stays per-file isolation.
+
+
+class SetRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class SetMemberRequest(BaseModel):
+    member: str = Field(min_length=1, max_length=255)
+
+
+def _set_store():
+    store = backoffice_state.document_set_store
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "set_store_unavailable",
+                    "message": "Document set store not initialised (Redis db/3 unavailable)."},
+        )
+    return store
+
+
+@router.get("/sets")
+async def list_sets(session: AdminSession):
+    """List operator-defined document sets (salt REDACTED) + the security note."""
+    from yashigani.documents.set_store import SECURITY_NOTE, DocumentSetStore
+    store = backoffice_state.document_set_store
+    sets = [DocumentSetStore.public_view(s) for s in store.list_sets()] if store else []
+    return {"sets": sets, "security_note": SECURITY_NOTE}
+
+
+@router.post("/sets", status_code=201)
+async def create_set(body: SetRequest, session: StepUpAdminSession):
+    """Create a document set with a freshly-minted opaque shared salt (step-up).
+
+    The salt is minted server-side (256-bit) and never returned.  Binding files
+    to this set reduces per-file isolation — surfaced to the operator via the
+    security note."""
+    _require_enabled()
+    from yashigani.documents.set_store import DocumentSetStore
+    store = _set_store()
+    try:
+        row = store.create_set(name=body.name)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_set", "message": str(exc)})
+    logger.info("document set created: account=%s set=%s name=%r",
+                session.account_id, row["id"], row["name"])
+    # public_view REDACTS the salt — the secret never leaves the gateway.
+    return {"status": "ok", "set": DocumentSetStore.public_view(row)}
+
+
+@router.post("/sets/{set_id}/members")
+async def add_set_member(set_id: str, body: SetMemberRequest, session: StepUpAdminSession):
+    """Add a document/member label to a set (step-up gated)."""
+    _require_enabled()
+    from yashigani.documents.set_store import DocumentSetStore
+    store = _set_store()
+    try:
+        row = store.add_member(set_id, body.member)
+    except KeyError:
+        raise HTTPException(status_code=404, detail={"error": "document_set_not_found", "set_id": set_id})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_member", "message": str(exc)})
+    return {"status": "ok", "set": DocumentSetStore.public_view(row)}
+
+
+@router.delete("/sets/{set_id}")
+async def delete_set(set_id: str, session: StepUpAdminSession):
+    """Delete a document set + destroy its shared salt (step-up gated)."""
+    _require_enabled()
+    store = _set_store()
+    if not store.remove_set(set_id):
+        raise HTTPException(status_code=404, detail={"error": "document_set_not_found", "set_id": set_id})
+    logger.info("document set deleted: account=%s set=%s", session.account_id, set_id)
+    return {"status": "ok"}

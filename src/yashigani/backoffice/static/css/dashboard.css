@@ -256,3 +256,10 @@ tr:hover { background: #f8fafc; }
 .doc-user-alert { margin: 8px 0; }
 .doc-alert-box { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 10px 14px; font-size: 0.85rem; color: #7f1d1d; }
 .doc-alert-pol { color: #9ca3af; font-size: 0.75rem; font-family: monospace; }
+/* 2.26 set-scoped-salt + field-role + integrity surfaces */
+.doc-routing-note { margin: 6px 0; font-size: 0.82rem; }
+.doc-integrity-row { margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.doc-set-note { background: #fffbeb; border-color: #fcd34d; color: #78350f; margin-bottom: 10px; }
+.doc-fieldrole-local { background: #ecfdf5; }
+.badge-salt-file { background: #dbeafe; color: #1e40af; }
+.badge-salt-set { background: #fef3c7; color: #92400e; }

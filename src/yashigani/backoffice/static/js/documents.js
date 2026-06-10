@@ -21,7 +21,7 @@
 // ---------------------------------------------------------------------------
 
 async function loadDocuments() {
-    await Promise.all([_docLoadStatus(), _docLoadPolicies()]);
+    await Promise.all([_docLoadStatus(), _docLoadPolicies(), _docLoadSets()]);
 }
 
 async function _docLoadStatus() {
@@ -157,7 +157,9 @@ async function docInspect() {
         declared_mime: 'text/plain',
         requested_action: document.getElementById('doc-insp-action').value,
         pseudonymize_mode: document.getElementById('doc-insp-mode').value,
-        detokenize_rbac_role: document.getElementById('doc-insp-role').value.trim() || 'doc-pseudonymize-reverser'
+        detokenize_rbac_role: document.getElementById('doc-insp-role').value.trim() || 'doc-pseudonymize-reverser',
+        // Set-scoped-salt opt-in. Empty = per-file isolation (default).
+        set_id: (document.getElementById('doc-insp-set') || {}).value || ''
     };
     if (!body.content) { resultEl.innerHTML = '<span class="badge badge-red">Paste some content first.</span>'; return; }
     resultEl.innerHTML = '<span class="loading">Inspecting…</span>';
@@ -200,10 +202,35 @@ function _docRenderVerdict(data) {
         if (summary.has_correspondence_table) {
             s += ' · <span class="badge badge-green">mode-A table available</span> (role <code>' + escapeHtml(summary.detokenize_rbac_role || '—') + '</code>)';
         }
+        // Salt-scope indicator: tokens are OPAQUE (no class/count leak); the scope
+        // tells the operator the isolation level (per-file vs shared set salt).
+        if (summary.disposition === 'PSEUDONYMIZE') {
+            if (summary.salt_scope === 'set') {
+                s += ' · <span class="badge badge-salt-set">set-scoped salt</span> (cross-file correlation; reduced isolation)';
+            } else {
+                s += ' · <span class="badge badge-salt-file">per-file salt</span> (max isolation)';
+            }
+            s += ' · <span class="txt-note">tokens are opaque (no class/count revealed)</span>';
+        }
         if (summary.block_reason) {
             s += '<br><span class="doc-block-reason">Reason: ' + escapeHtml(summary.block_reason) + '</span>';
         }
         sumEl.innerHTML = s;
+    }
+
+    // Field-role routing outcome (Laura D1): an operate-on sensitive field was
+    // kept LOCAL rather than blobbed to the cloud (where an opaque blob would make
+    // the model hallucinate). Surfaced as a clear operator note.
+    var routeEl = document.getElementById('doc-routing-note');
+    if (routeEl) {
+        if (summary.route_local) {
+            var classes = (summary.operate_on_classes || []).map(escapeHtml).join(', ');
+            routeEl.innerHTML = '<span class="badge badge-amber">kept local</span> '
+                + 'Operate-on sensitive field(s) present (' + escapeHtml(classes || '—')
+                + ') — routed to the LOCAL model instead of sending an opaque blob to the cloud.';
+        } else {
+            routeEl.innerHTML = '';
+        }
     }
 
     // Layman alert surface for BLOCK/HOLD (unified user-alert contract).
@@ -223,7 +250,7 @@ function _docRenderVerdict(data) {
     var tbody = document.getElementById('doc-matches-tbody');
     if (!tbody) { return; }
     if (!matches.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">No matches found.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No matches found.</td></tr>';
         return;
     }
     var html = '';
@@ -232,10 +259,24 @@ function _docRenderVerdict(data) {
         var hiddenFlag = m.hidden
             ? ' <span class="badge badge-red">' + escapeHtml(m.segment_kind) + '</span>'
             : '';
-        html += '<tr' + (m.hidden ? ' class="doc-row-hidden"' : '') + '>'
+        // Field-role indicator: REFERENCE_ONLY → safe to opaque-tokenise;
+        // OPERATE_ON (sensitive) → the model computes on it, so it is kept local.
+        var roleCell;
+        if (m.field_role === 'OPERATE_ON' && m.operate_on_sensitive) {
+            roleCell = '<span class="badge badge-amber">operate-on</span> <span class="txt-note">kept local</span>';
+        } else if (m.field_role === 'OPERATE_ON') {
+            roleCell = '<span class="badge badge-blue">operate-on</span>';
+        } else if (m.field_role === 'REFERENCE_ONLY') {
+            roleCell = '<span class="badge badge-green">reference-only</span>';
+        } else {
+            roleCell = '<span class="txt-note">—</span>';
+        }
+        var localRow = (m.field_role === 'OPERATE_ON' && m.operate_on_sensitive) ? ' doc-fieldrole-local' : '';
+        html += '<tr class="' + (m.hidden ? 'doc-row-hidden' : '') + localRow + '">'
             + '<td>' + escapeHtml(m.data_class) + (m.qi ? ' <span class="badge badge-amber">QI</span>' : '') + '</td>'
             + '<td>' + (m.qi ? 'yes' : 'no') + '</td>'
             + '<td><code>' + escapeHtml(m.instance) + '</code></td>'
+            + '<td>' + roleCell + '</td>'
             + '<td><code>' + escapeHtml(m.location) + '</code></td>'
             + '<td>' + escapeHtml(m.segment_kind || 'BODY') + hiddenFlag + '</td>'
             + '</tr>';
@@ -297,6 +338,117 @@ function docDownloadTable() {
 }
 
 // ---------------------------------------------------------------------------
+// Integrity / splice verify — re-check the stored result binds to its document
+// ---------------------------------------------------------------------------
+
+async function docVerifyIntegrity() {
+    var rid = (document.getElementById('doc-table-rid') || {}).value;
+    rid = rid ? rid.trim() : '';
+    var el = document.getElementById('doc-integrity-result');
+    if (!el) { return; }
+    if (!rid) { el.innerHTML = '<span class="badge badge-amber">Inspect a PSEUDONYMIZE doc first (no request id).</span>'; return; }
+    el.innerHTML = '<span class="loading">Verifying…</span>';
+    var raw = await fetch('/admin/documents/results/' + encodeURIComponent(rid) + '/integrity', { credentials: 'same-origin' }).catch(function () { return null; });
+    if (!raw) { el.innerHTML = '<span class="badge badge-red">Network error.</span>'; return; }
+    if (raw.status === 404) { el.innerHTML = '<span class="badge badge-amber">No integrity artefacts (needs a mode-A PSEUDONYMIZE result).</span>'; return; }
+    if (!raw.ok) { el.innerHTML = '<span class="badge badge-red">HTTP ' + raw.status + '</span>'; return; }
+    var d = await raw.json();
+    // Set-scoped results: per-file splice verify does not apply (the set salt
+    // spans files by design) — show an honest "not applicable" verdict.
+    if (d.applicable === false) {
+        el.innerHTML = '<span class="badge badge-p4">N/A at set scope</span> '
+            + '<span class="txt-note">' + escapeHtml(d.detail || '') + '</span>';
+        return;
+    }
+    var badge = d.ok ? 'badge-green' : 'badge-red';
+    var msg = d.ok
+        ? 'Integrity OK — output + mapping bind to this document.'
+        : 'SPLICE DETECTED — ' + escapeHtml(String(d.foreign_token_count)) + ' foreign-salt token(s).';
+    el.innerHTML = '<span class="badge ' + badge + '">' + escapeHtml(msg) + '</span> '
+        + '<span class="txt-note">scope <code>' + escapeHtml(d.salt_scope || 'file') + '</code> · '
+        + escapeHtml(String(d.token_count)) + ' token(s) · doc_hash <code>' + escapeHtml((d.doc_hash || '').slice(0, 12)) + '…</code></span>';
+}
+
+// ---------------------------------------------------------------------------
+// Document sets — set-scoped salt (cross-file correlation). Salt never shown.
+// ---------------------------------------------------------------------------
+
+async function _docLoadSets() {
+    var tbody = document.getElementById('doc-sets-tbody');
+    var note = document.getElementById('doc-set-security-note');
+    var dropdown = document.getElementById('doc-insp-set');
+    var data = await api('/admin/documents/sets').catch(function () { return null; });
+    if (note && data && data.security_note) {
+        note.innerHTML = '<strong>Security note:</strong> ' + escapeHtml(data.security_note);
+    }
+    var sets = (data && data.sets) ? data.sets : [];
+    if (tbody) {
+        if (!sets.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="empty">No sets — pseudonymisation uses a per-file salt (max isolation).</td></tr>';
+        } else {
+            var html = '';
+            sets.forEach(function (s) {
+                html += '<tr>'
+                    + '<td><code>' + escapeHtml(s.id) + '</code></td>'
+                    + '<td>' + escapeHtml(s.name) + '</td>'
+                    + '<td>' + escapeHtml(String(s.member_count)) + '</td>'
+                    // The salt is a secret and is NEVER returned by the API; we show
+                    // only that one exists, never the value.
+                    + '<td><span class="badge badge-p4">' + (s.has_salt ? 'sealed' : 'none') + '</span></td>'
+                    + '<td>' + escapeHtml(s.created_at ? new Date(s.created_at * 1000).toISOString().slice(0, 10) : '—') + '</td>'
+                    + '<td><button class="btn-sm-danger" data-action="docDeleteSet" data-set-id="' + escapeHtml(s.id) + '">Delete</button></td>'
+                    + '</tr>';
+            });
+            tbody.innerHTML = html;
+        }
+    }
+    // Refresh the inspect dropdown (preserve the per-file default option).
+    if (dropdown) {
+        var current = dropdown.value;
+        var opts = '<option value="">Per-file (default, max isolation)</option>';
+        sets.forEach(function (s) {
+            opts += '<option value="' + escapeHtml(s.id) + '">' + escapeHtml(s.name) + ' (set salt)</option>';
+        });
+        dropdown.innerHTML = opts;
+        dropdown.value = current;
+    }
+}
+
+async function docCreateSet() {
+    var nameEl = document.getElementById('doc-set-name');
+    var resultEl = document.getElementById('doc-set-result');
+    var name = nameEl ? nameEl.value.trim() : '';
+    if (!name) { resultEl.innerHTML = '<span class="badge badge-red">Set name is required.</span>'; return; }
+    resultEl.innerHTML = '<span class="loading">Creating…</span>';
+    var resp = await apiMutate('/admin/documents/sets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name })
+    }).catch(function () { return null; });
+    if (!resp) { resultEl.innerHTML = '<span class="badge badge-red">Network error or step-up cancelled.</span>'; return; }
+    if (!resp.ok) {
+        var err = await resp.json().catch(function () { return {}; });
+        var msg = (err.detail && (err.detail.error || err.detail.message)) ? (err.detail.error || err.detail.message) : ('HTTP ' + resp.status);
+        resultEl.innerHTML = '<span class="badge badge-red">Error: ' + escapeHtml(msg) + '</span>';
+        return;
+    }
+    resultEl.innerHTML = '<span class="badge badge-green">Set created (salt minted server-side, never shown).</span>';
+    if (nameEl) { nameEl.value = ''; }
+    _docLoadSets();
+}
+
+async function docDeleteSet(setId) {
+    if (!confirm('Delete this document set and destroy its shared salt? Requires TOTP step-up.')) { return; }
+    var resp = await apiMutate('/admin/documents/sets/' + encodeURIComponent(setId), { method: 'DELETE' }).catch(function () { return null; });
+    if (!resp || !resp.ok) {
+        var resultEl = document.getElementById('doc-set-result');
+        if (resultEl) { resultEl.innerHTML = '<span class="badge badge-red">Delete failed or step-up cancelled.</span>'; }
+        return;
+    }
+    _docLoadSets();
+}
+
+// ---------------------------------------------------------------------------
 // Show/hide the add-policy form (mirrors dashboard.js toggleForm)
 // ---------------------------------------------------------------------------
 
@@ -332,6 +484,15 @@ document.addEventListener('click', function (e) {
             break;
         case 'docDownloadTable':
             docDownloadTable();
+            break;
+        case 'docVerifyIntegrity':
+            docVerifyIntegrity();
+            break;
+        case 'docCreateSet':
+            docCreateSet();
+            break;
+        case 'docDeleteSet':
+            docDeleteSet(actionEl.getAttribute('data-set-id'));
             break;
         default:
             break;

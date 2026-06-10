@@ -452,6 +452,7 @@
                         <div><label class="lbl">Action</label><br><select id="doc-insp-action" class="fi"><option value="LOG">LOG</option><option value="REDACT">REDACT</option><option value="PSEUDONYMIZE">PSEUDONYMIZE</option><option value="BLOCK">BLOCK</option></select></div>
                         <div><label class="lbl">Pseudonymize mode</label><br><select id="doc-insp-mode" class="fi"><option value="A">A — give user table</option><option value="B">B — internal round-trip</option></select></div>
                         <div><label class="lbl">Detokenize role</label><br><input id="doc-insp-role" type="text" value="doc-pseudonymize-reverser" class="fi w-180"></div>
+                        <div><label class="lbl">Document set (salt scope)</label><br><select id="doc-insp-set" class="fi"><option value="">Per-file (default, max isolation)</option></select></div>
                     </div>
                     <textarea id="doc-insp-content" rows="4" class="classify-textarea" placeholder="name,email&#10;Jane Doe,jane@example.com"></textarea>
                     <button data-action="docInspect" class="classify-btn">Inspect</button>
@@ -465,10 +466,16 @@
                 <div class="panel-body">
                     <div id="doc-verdict-summary" class="doc-verdict-summary"></div>
                     <div id="doc-user-alert" class="doc-user-alert"></div>
+                    <div id="doc-routing-note" class="doc-routing-note"></div>
                     <table>
-                        <thead><tr><th>Data class</th><th>QI</th><th>Masked value</th><th>Location / provenance</th><th>Part</th></tr></thead>
-                        <tbody id="doc-matches-tbody"><tr><td colspan="5" class="empty">Inspect a document to see matches.</td></tr></tbody>
+                        <thead><tr><th>Data class</th><th>QI</th><th>Masked value</th><th>Field role</th><th>Location / provenance</th><th>Part</th></tr></thead>
+                        <tbody id="doc-matches-tbody"><tr><td colspan="6" class="empty">Inspect a document to see matches.</td></tr></tbody>
                     </table>
+                    <div class="doc-integrity-row">
+                        <button data-action="docVerifyIntegrity" class="btn-sm-secondary">Verify integrity / splice</button>
+                        <span class="txt-note">Confirms the tokenised output + mapping belong to this document (rejects cross-file splice).</span>
+                    </div>
+                    <div id="doc-integrity-result" class="form-result"></div>
                 </div>
             </div>
 
@@ -486,6 +493,28 @@
                     <table id="doc-table-table" class="doc-hidden">
                         <thead><tr><th>Token</th><th>Original</th></tr></thead>
                         <tbody id="doc-table-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 5. Document sets — set-scoped salt (cross-file correlation) -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Document Sets (set-scoped salt)</span>
+                    <button data-action="docToggleForm" data-form-id="doc-add-set-form" class="btn-xs-add">+ New Set</button>
+                </div>
+                <div class="panel-body">
+                    <div id="doc-set-security-note" class="doc-alert-box doc-set-note"></div>
+                    <div id="doc-add-set-form" class="form-panel">
+                        <div class="form-row">
+                            <div><label class="lbl">Set name</label><br><input id="doc-set-name" type="text" placeholder="e.g. Q2 customer exports" class="fi w-250"></div>
+                            <button data-action="docCreateSet" class="btn-sm-save">Create set</button>
+                        </div>
+                        <div id="doc-set-result" class="form-result"></div>
+                    </div>
+                    <table>
+                        <thead><tr><th>ID</th><th>Name</th><th>Members</th><th>Salt</th><th>Created</th><th>Actions</th></tr></thead>
+                        <tbody id="doc-sets-tbody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
                     </table>
                 </div>
             </div>

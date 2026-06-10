@@ -145,6 +145,13 @@ class DocumentInspectionResult:
     #: splice).  Not a secret (it is a hash of bytes the holder already has), so
     #: it MAY be carried in the audit event as a correlation/integrity field.
     doc_hash: Optional[str] = None
+    #: Which salt scope the opaque tokens were derived under: ``"file"`` (default,
+    #: per-file isolation — the same value tokenises differently across files) or
+    #: ``"set"`` (a shared set salt — the same value tokenises consistently across
+    #: the operator-defined set, REDUCING per-file isolation).  Surfaced so the
+    #: operator can SEE the isolation level in the verdict viewer.  Never carries
+    #: the salt value itself (only the scope name) — the salt stays opaque.
+    salt_scope: str = "file"
     # --- PART 2 (Laura D1) field-role routing -----------------------------
     #: True when the document carries an operate-on SENSITIVE field that an opaque
     #: blob would make the cloud hallucinate, so it was NOT tokenised to the
@@ -253,6 +260,7 @@ class DocumentInspectionPipeline:
         detokenize_rbac_role: str = DEFAULT_DETOKENIZE_ROLE,
         map_ttl_s: int = DEFAULT_MAP_TTL_S,
         operate_on_routing: str = OPERATE_ON_ROUTE_LOCAL,
+        set_salt: Optional[str] = None,
     ) -> DocumentInspectionResult:
         """Inspect a document end-to-end.
 
@@ -264,6 +272,19 @@ class DocumentInspectionPipeline:
 
         ``pseudonymize_mode`` selects mode A (deliver the user the correspondence
         table — default) or B (internal vault round-trip; position-binding wired).
+
+        ``set_salt`` is the **set-scoped-salt** hook (salt-parameterised assigner).
+        When ``None`` (the default) the PSEUDONYMIZE path derives tokens under the
+        per-FILE salt ``doc_hash = SHA-256(original bytes)`` — maximum isolation,
+        the same value tokenises DIFFERENTLY across files.  When an operator has
+        defined a "document set" that should share a salt (so the same value
+        tokenises CONSISTENTLY across that defined set for legitimate cross-file
+        correlation), the gateway passes that set's salt here; it replaces the
+        per-file salt as the HMAC salt.  This REDUCES per-file isolation (a value's
+        token is now recognisable across every file in the set) and is opt-in only;
+        the engine never widens the salt scope on its own.  The set salt is an
+        opaque high-entropy string minted + custodied by the operator's set store,
+        never the set name (so the token still leaks nothing about the set).
         """
         # --- Extract (fail-closed on every error) -------------------------
         try:
@@ -347,6 +368,7 @@ class DocumentInspectionPipeline:
                 detokenize_rbac_role=detokenize_rbac_role,
                 map_ttl_s=map_ttl_s,
                 operate_on_routing=operate_on_routing,
+                set_salt=set_salt,
             )
         # Unknown action → fail-closed.
         return self._block(
@@ -784,6 +806,7 @@ class DocumentInspectionPipeline:
         detokenize_rbac_role: str,
         map_ttl_s: int,
         operate_on_routing: str = OPERATE_ON_ROUTE_LOCAL,
+        set_salt: Optional[str] = None,
     ) -> DocumentInspectionResult:
         """PSEUDONYMIZE: replace each matched value with a consistent reversible
         token (all QIs — F2), re-render in the jail (F6), vault the replacer map
@@ -851,7 +874,16 @@ class DocumentInspectionPipeline:
         # existing gateway secret mechanism (/run/secrets / KMS); salt-only
         # keying is the fallback when unset.  Never logged.
         doc_hash = compute_doc_hash(data)
-        assigner = TokenAssigner(doc_hash, secret=self._pseudonymize_secret)
+        # Set-scoped-salt hook (salt-parameterised assigner): default is the
+        # per-FILE salt (doc_hash) for maximum isolation; when the operator has
+        # bound this document to a defined "set" the gateway passes that set's
+        # opaque salt, so the SAME value tokenises consistently across the set
+        # (legitimate cross-file correlation) at the cost of per-file isolation.
+        # doc_hash is ALWAYS retained as the integrity/splice salt recorded in the
+        # mapping header (the token salt and the integrity salt are decoupled).
+        token_salt = set_salt if set_salt else doc_hash
+        salt_scope = "set" if set_salt else "file"
+        assigner = TokenAssigner(token_salt, secret=self._pseudonymize_secret)
         plan = build_pseudonymize_plan(matches, originals, assigner)
         try:
             result = self._registry.render(
@@ -919,6 +951,10 @@ class DocumentInspectionPipeline:
             # secret — a hash of bytes the holder already has).  Binds the audit
             # record to the document for integrity/splice correlation.
             "doc_hash": doc_hash,
+            # Token salt SCOPE only (never the salt value): "file" = per-file
+            # isolation (default), "set" = shared set salt (reduced isolation,
+            # cross-file correlation within the operator-defined set).
+            "salt_scope": salt_scope,
             # The unguessable handle is a CORRELATION-safe field ONLY if it is
             # never the retrieval capability in a log; we deliberately DO NOT put
             # the handle in the audit event (F5) — it is the capability token.
@@ -938,6 +974,7 @@ class DocumentInspectionPipeline:
             pseudonymize_mode=mode,
             mode_b_roundtrip=mode_b,
             doc_hash=doc_hash,
+            salt_scope=salt_scope,
         )
 
     # ------------------------------------------------------------------
