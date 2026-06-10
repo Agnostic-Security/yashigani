@@ -60,6 +60,7 @@ class BackofficeState:
     auth_settings_store: Optional[Any] = None             # AuthSettingsStore (v2.23.3)
     document_policy_store: Optional[Any] = None           # DocumentPolicyStore (2.26)
     document_set_store: Optional[Any] = None               # DocumentSetStore (2.26 set-scoped-salt)
+    envelope_pending_store: Optional[Any] = None          # EnvelopePendingStore (3.0 capability-envelope re-approval queue)
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None

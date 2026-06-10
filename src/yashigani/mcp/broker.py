@@ -166,6 +166,19 @@ class McpBrokerConfig:
     # prod (the gate fail-closes a pinned server regardless).
     enforce_capability_envelope: bool = True
 
+    # 3.0 / YSG-RISK-060 (Ava — re-approval SPA wiring) — optional callback the
+    # broker invokes when it LATCHES a block on a refresh, handing the
+    # operator-facing layer the CANDIDATE (refreshed) surface so the re-approval
+    # admin SPA can show the diff vs the ORIGINAL baseline and mint it on a
+    # step-up approve.  Signature:
+    #     sink(provenance_id, tenant_id, server_id, candidate_env,
+    #          triage_class, new_surface_hash, findings) -> None
+    # None ⇒ no operator queue wired (dev/test, or gateway-only deploy); the
+    # block is still latched in the DB regardless (the queue is purely the
+    # operator-visible mirror).  The callback is best-effort: a sink fault never
+    # affects the fail-closed block.
+    pending_block_sink: Optional[Any] = None
+
     # FIX-P3-ENFORCE (Iris F2): Shape-C filesystem MCP-server flag.
     # When True, broker runs a SECOND OPA gate (filesystem_tool_allowed)
     # after the global mcp_decision allow, enforcing per-tool + path-arg
@@ -270,6 +283,8 @@ class McpBroker:
         # [3.0 / YSG-RISK-060] Capability-envelope invocation gate.
         self._envelope_service = config.envelope_service
         self._enforce_capability_envelope = bool(config.enforce_capability_envelope)
+        # 3.0 — operator re-approval queue sink (best-effort; see config doc).
+        self._pending_block_sink = config.pending_block_sink
 
     async def enforce(self, ctx: McpCallContext) -> BrokerDecision:
         """
@@ -944,6 +959,31 @@ class McpBroker:
             self._emit_envelope_blocked_at_refresh(
                 server_id, provenance_id, outcome
             )
+            # 3.0 / YSG-RISK-060 — hand the CANDIDATE surface to the operator
+            # re-approval queue so the admin SPA can show the diff vs the
+            # ORIGINAL baseline and mint it on a step-up approve.  Best-effort:
+            # a sink fault never affects the fail-closed block above.
+            if self._pending_block_sink is not None:
+                try:
+                    findings = [
+                        {"dimension": f.dimension, "tool_key": f.tool_key,
+                         "detail": f.detail}
+                        for f in outcome.findings
+                    ]
+                    self._pending_block_sink(
+                        provenance_id=provenance_id,
+                        tenant_id=self._config.tenant_id,
+                        server_id=server_id,
+                        candidate=current_env,
+                        triage_class=outcome.triage_class.value,
+                        new_surface_hash=outcome.new_surface_hash,
+                        findings=findings,
+                    )
+                except Exception as exc:  # noqa: BLE001 — queue is best-effort
+                    logger.error(
+                        "mcp-broker: pending_block_sink failed for provenance=%.12s "
+                        "(block still latched): %s", provenance_id, exc,
+                    )
         return outcome
 
     def _emit_envelope_benign_update(

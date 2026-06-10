@@ -194,6 +194,7 @@ def _bootstrap():
     binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
     document_policy_store = None
     document_set_store = None
+    envelope_pending_store = None    # 3.0 — capability-envelope re-approval queue
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -263,6 +264,20 @@ def _bootstrap():
             logger.info(
                 "Document set store initialised: %d set(s) loaded from Redis",
                 len(document_set_store.list_sets()),
+            )
+            # Capability-envelope PENDING re-approval store (3.0 / YSG-RISK-060)
+            # shares Redis db/3 (key namespace "mcp_envelope_pending:"). Holds the
+            # candidate (refreshed) tool surface for every BLOCKED imported-MCP
+            # refresh so the re-approval admin SPA can show the diff vs the
+            # ORIGINAL baseline and mint it on step-up approve. No seeding —
+            # entries are created by the broker when it latches a block.
+            from yashigani.mcp.envelope_pending_store import EnvelopePendingStore
+            envelope_pending_store = EnvelopePendingStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Capability-envelope pending store initialised: %d pending re-approval(s)",
+                len(envelope_pending_store.list_for_tenant(
+                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+                )),
             )
             break  # success
         except Exception as exc:
@@ -431,6 +446,7 @@ def _bootstrap():
     backoffice_state.agent_registry = agent_registry
     backoffice_state.document_policy_store = document_policy_store
     backoffice_state.document_set_store = document_set_store
+    backoffice_state.envelope_pending_store = envelope_pending_store
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
     backoffice_state.opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")

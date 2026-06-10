@@ -38,6 +38,8 @@ function showPage(name, triggerEl) {
     if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
     // Document Enforcement panel — loadDocuments is defined in documents.js (loaded defer).
     if (name === 'documents' && typeof window.loadDocuments === 'function') window.loadDocuments();
+    // MCP capability-envelope re-approvals — loadEnvelopes is in envelope_reapproval.js (defer).
+    if (name === 'envelopes' && typeof window.loadEnvelopes === 'function') window.loadEnvelopes();
 }
 
 // ---------------------------------------------------------------------------

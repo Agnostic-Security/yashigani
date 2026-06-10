@@ -83,6 +83,8 @@ from yashigani.backoffice.routes import (
     sso_router,
     # v2.26 — Document Enforcement admin surface
     documents_router,
+    # 3.0 — Capability-envelope re-approval admin surface (YSG-RISK-060)
+    envelope_reapproval_router,
     # v2.23.2 — Backup status + verify (#47)
     backup_router,
     # v2.23.3 — Admin-triggered secret rotation
@@ -1098,6 +1100,10 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(sensitivity_router, prefix="/admin/sensitivity", tags=["sensitivity"])
     # v2.26 — Document Enforcement admin surface (ships dark; flag-gated routes)
     app.include_router(documents_router, prefix="/admin/documents", tags=["documents"])
+    # 3.0 — Capability-envelope re-approval admin surface (YSG-RISK-060)
+    app.include_router(
+        envelope_reapproval_router, prefix="/admin/mcp/envelopes", tags=["mcp-envelopes"]
+    )
     # v2.1 — SSO / OIDC login flow (no auth required — serves anonymous users)
     app.include_router(sso_router, prefix="/auth", tags=["sso"])
 

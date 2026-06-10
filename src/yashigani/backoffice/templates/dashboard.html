@@ -20,6 +20,7 @@
                 <button data-action="showPage" data-param="policies">Policies</button>
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
                 <button data-action="showPage" data-param="documents">Documents</button>
+                <button data-action="showPage" data-param="envelopes">MCP Re-approvals</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
                 <button data-action="showPage" data-param="monitoring">Monitoring</button>
@@ -553,6 +554,57 @@
             </div>
         </div>
 
+        <!-- MCP Capability-Envelope Re-approvals Page — 3.0 (YSG-RISK-060) -->
+        <div class="page" id="page-envelopes">
+            <h2>MCP Tool-Surface Re-approvals</h2>
+            <p class="txt-note">When an imported MCP's tool surface tries to EXPAND beyond its originally-approved capability envelope (a new tool, a read&rarr;write/network jump, a widened argument schema, an egress-posture change), the broker <strong>blocks it</strong> and parks it here. Review the change <strong>against the ORIGINAL approved envelope</strong> &mdash; not just the last version &mdash; then approve (re-pins a new baseline, requires TOTP step-up) or keep it blocked.</p>
+
+            <!-- 1. Pending queue -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Pending re-approvals</span>
+                    <button data-action="envRefresh" class="btn-xs-add">Refresh</button>
+                </div>
+                <div class="panel-body">
+                    <div id="env-pending-result"></div>
+                    <table>
+                        <thead><tr><th>MCP server</th><th>Provenance</th><th>Reason</th><th>Tools</th><th>Egress</th><th>Blocked</th><th>Action</th></tr></thead>
+                        <tbody id="env-pending-tbody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 2. Field-level diff — vs ORIGINAL baseline (anti-rug-pull) -->
+            <div class="panel" id="env-diff-panel">
+                <div class="panel-header">Change review</div>
+                <div class="panel-body">
+                    <div id="env-diff-empty" class="empty">Select a pending re-approval above to review the field-level diff.</div>
+                    <div id="env-diff-body" class="env-hidden">
+                        <div id="env-diff-headline"></div>
+
+                        <h3 class="env-h3">What changed vs the ORIGINAL approved envelope</h3>
+                        <p class="txt-note">Cumulative drift since this MCP was first imported. Incremental re-approvals cannot hide a big change behind small steps &mdash; this is always the full picture.</p>
+                        <table>
+                            <thead><tr><th>Dimension</th><th>Tool</th><th>Detail</th></tr></thead>
+                            <tbody id="env-vsorig-tbody"></tbody>
+                        </table>
+
+                        <h3 class="env-h3">Delta vs the immediately-prior approved version</h3>
+                        <table>
+                            <thead><tr><th>Dimension</th><th>Tool</th><th>Detail</th></tr></thead>
+                            <tbody id="env-vsprior-tbody"></tbody>
+                        </table>
+
+                        <div class="env-actions">
+                            <button data-action="envApprove" class="btn-sm-save">Approve &mdash; re-pin new baseline (TOTP)</button>
+                            <button data-action="envReject" class="btn-sm-danger">Keep blocked (TOTP)</button>
+                        </div>
+                        <div id="env-decision-result"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Audit Log Page -->
         <div class="page" id="page-audit">
             <h2>Audit Log</h2>
@@ -995,5 +1047,6 @@
     <script src="/static/js/pki.js" defer></script>
     <script src="/static/js/runtime-settings.js" defer></script>
     <script src="/static/js/documents.js" defer></script>
+    <script src="/static/js/envelope_reapproval.js" defer></script>
 </body>
 </html>
