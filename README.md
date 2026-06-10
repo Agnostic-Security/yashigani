@@ -18,6 +18,18 @@
 ---
 **Latest Tagged Release:** v2.25.2 (2026-06-06) — Wazuh SIEM full-stack Linux/Docker fixes (mTLS auto-provisioning, convergence-gate improvements), audit DB least-privilege role split, PostgresSink audit wiring, OPA hardening (deny-override class fix, Helm bundle parity, depth-limit corrections), decode-before-classify PII inspection on encoded payloads; see `CHANGELOG.md` for the full release history.
 
+---
+### 🦀 Coming next — Yashigani 3.0 *(early-access beta)*
+
+The next major release is now in **early-access beta**. What's coming:
+
+- **File redaction & pseudonymisation, in-flight** — proportionate enforcement beyond log/block: sensitive data in prompts, responses and documents is **redacted or pseudonymised** as it crosses the gateway (`Log · Redact · Pseudonymise · Block`).
+- **Security-mediated agent orchestration** — agents can fan out to other agents, LLMs and MCP tools, and **every hop is OPA-adjudicated at ingress *and* egress, up to 9 nested levels**; no agent ever holds direct network reach to an upstream.
+- **Tool-result inspection** — a poisoned MCP tool result or a compromised API response is inspected and **blocked before it re-enters an agent's context**.
+- **Multi-instance / HA** and **MCP capability-envelope pinning**.
+
+Early-access beta is open to design partners — get in touch or watch this repo. **Watch this crab! 🦀**
+
 > **Upgrade notice (v2.25.0+):** Backup format changed to dual-wrap AES-256-GCM with argon2id KEK; legacy age-encrypted archives are not forward-compatible — migrate before upgrading. TLS 1.2 is disabled on the internal mesh (TLS 1.3 minimum from v2.25.1); internal clients must support TLS 1.3.
 
 > **Upgrade notice (v2.23.4):** OPA now fails-CLOSED on every exception path (timeout, 5xx, connection refused). Operators with intermittently-reachable OPA should alert on `yashigani_opa_response_check_failures_total`. Dev opt-in to prior fail-open behaviour: `YASHIGANI_OPA_OPTIONAL=true` (non-production only).
