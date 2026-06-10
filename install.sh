@@ -135,6 +135,17 @@ MODE="compose"
 MODE_EXPLICIT=0
 DEPLOY_MODE=""                # demo|production|enterprise — set interactively or via --deploy
 DOMAIN=""
+# Multi-instance (3.0, scoping-draft §4a). The compose PROJECT name scopes every
+# container/volume/network. Historically hardcoded/derived as "docker" (the compose
+# file's directory name), so two instances on one host collided. PROJECT now derives
+# from --domain (sanitised), with an optional explicit --project override.
+#   - PROJECT_EXPLICIT=1 when --project was passed (override beats domain derivation).
+#   - PROJECT defaults to "docker" until resolved, preserving backward-compat for
+#     single-instance installs whose state file predates the PROJECT field.
+PROJECT=""
+PROJECT_EXPLICIT=0
+LIST_INSTANCES=false          # --list: enumerate instances on the host then exit
+MULTI_INSTANCE_TIER_ACK=false # --i-understand-tier: acknowledge advisory Pro+/Enterprise gate
 TLS_MODE="acme"
 # FIPS_MODE — operator opt-in to FIPS-mode crypto (CMVP #4985 when a FIPS-
 # configured base image is in use). Default 0 = standard OpenSSL. Set to 1
@@ -245,7 +256,24 @@ OPTIONS
                                           Docker/Podman install use --deploy production
                                           (or demo) with --runtime docker|podman.
   --mode           compose|k8s|vm         Legacy deployment mode (prefer --deploy)
-  --domain         DOMAIN                 TLS domain, e.g. yashigani.example.com
+  --domain         DOMAIN                 TLS domain, e.g. yashigani.example.com.
+                                          ALSO the instance identity: the compose
+                                          project derives from it (eu-west.acme.com
+                                          -> eu-west-acme-com), so two instances on
+                                          one host no longer collide (multi-instance,
+                                          Professional Plus / Enterprise).
+  --project        NAME                   Override the derived compose project name
+                                          (sanitised to [a-z0-9][a-z0-9_-]*). Use a
+                                          stable short name (e.g. eu-west) that
+                                          --upgrade / --wazuh / uninstall.sh then
+                                          target. Defaults to the sanitised --domain.
+  --list                                  List Yashigani instances on this host
+                                          (project + domain + runtime), then exit.
+                                          Use it to pick which instance to upgrade
+                                          or uninstall on a shared host.
+  --i-understand-tier                     Acknowledge the advisory multi-instance
+                                          tier notice (Pro+/Enterprise). The running
+                                          instance enforces org limits authoritatively.
   --tls-mode       acme|ca|selfsigned     TLS provisioning mode (default: acme)
   --fips-mode      [0|1]                  Enable FIPS-mode crypto routing (default: 0).
                                           Pass --fips-mode 1 OR --fips-mode (no arg → 1)
@@ -401,6 +429,26 @@ parse_args() {
           exit 1
         fi
         shift 2
+        ;;
+      --project)
+        # Multi-instance (3.0): explicit compose-project override. Normally PROJECT
+        # derives from --domain; this flag lets the operator pin a stable short name
+        # (e.g. "eu-west") used by --upgrade/--add-component/uninstall.sh thereafter.
+        # Sanitised + validated by _sanitise_project (called after parse_args).
+        PROJECT="${2:?'--project requires a value'}"
+        PROJECT_EXPLICIT=1
+        shift 2
+        ;;
+      --list)
+        # Multi-instance (3.0): enumerate Yashigani instances on this host
+        # (project + domain) so the operator can pick one for upgrade/uninstall.
+        LIST_INSTANCES=true
+        shift
+        ;;
+      --i-understand-tier)
+        # Advisory multi-instance tier-gate acknowledgement (see _multi_instance_tier_gate).
+        MULTI_INSTANCE_TIER_ACK=true
+        shift
         ;;
       --tls-mode)
         TLS_MODE="${2:?'--tls-mode requires a value: acme|ca|selfsigned'}"
@@ -671,6 +719,246 @@ trap on_error ERR
 set_step() {
   CURRENT_STEP="$1"
   CURRENT_STEP_NAME="$2"
+}
+
+# =============================================================================
+# Multi-instance support (3.0 — scoping-draft §4a)
+# -----------------------------------------------------------------------------
+# The compose PROJECT name scopes every container/volume/network. It was hardcoded
+# or directory-derived as "docker", so two instances on one host collided. PROJECT
+# now derives from --domain (sanitised to a valid compose project), with an optional
+# --project override, and is persisted in docker/.yashigani-install-state so
+# upgrade/uninstall/add-component target the right instance.
+#
+# Compose project naming is identical on Docker and Podman (lowercase, [a-z0-9_-],
+# leading alnum). We feed it via COMPOSE_PROJECT_NAME in docker/.env (compose reads
+# the project-dir .env on BOTH runtimes) AND export it for the label-filter ps calls.
+# =============================================================================
+
+# _sanitise_project <raw> — emit a valid compose project name on stdout.
+# Compose/Podman rule: must match ^[a-z0-9][a-z0-9_-]*$ (lowercase). We:
+#   lowercase → replace every run of disallowed chars with '-' → strip leading
+#   non-alnum → trim trailing '-' / '_' → cap length → fall back to "yashigani"
+#   if nothing valid remains. Pure string op; no I/O.
+_sanitise_project() {
+  local _raw="${1:-}"
+  local _s
+  # lowercase
+  _s="$(printf '%s' "$_raw" | tr '[:upper:]' '[:lower:]')"
+  # any char not in [a-z0-9_-] → '-'
+  _s="$(printf '%s' "$_s" | sed 's/[^a-z0-9_-]/-/g')"
+  # collapse repeated separators to a single '-'
+  _s="$(printf '%s' "$_s" | sed -E 's/[-_]{2,}/-/g')"
+  # strip leading non-alphanumeric (compose requires a leading [a-z0-9])
+  _s="$(printf '%s' "$_s" | sed -E 's/^[^a-z0-9]+//')"
+  # trim trailing separators
+  _s="$(printf '%s' "$_s" | sed -E 's/[-_]+$//')"
+  # length cap (compose/k8s-safe); 60 leaves headroom for "<proj>_<volume>" names
+  _s="${_s:0:60}"
+  # trim again in case the cap left a trailing separator
+  _s="$(printf '%s' "$_s" | sed -E 's/[-_]+$//')"
+  if [[ -z "$_s" || ! "$_s" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    _s="yashigani"
+  fi
+  printf '%s' "$_s"
+}
+
+# _resolve_project — set the global PROJECT for a fresh install / explicit override.
+# Precedence: explicit --project (sanitised) > derived from --domain (sanitised) >
+# "docker" (backward-compatible default; what every pre-3.0 single-instance install used).
+# Idempotent: safe to call once after parse_args.
+_resolve_project() {
+  local _candidate=""
+  if [[ "$PROJECT_EXPLICIT" -eq 1 && -n "$PROJECT" ]]; then
+    _candidate="$PROJECT"
+  elif [[ -n "$DOMAIN" ]]; then
+    _candidate="$DOMAIN"
+  fi
+  if [[ -z "$_candidate" ]]; then
+    # No domain and no override (e.g. demo/localhost path) → preserve legacy name.
+    PROJECT="docker"
+  else
+    PROJECT="$(_sanitise_project "$_candidate")"
+  fi
+  export COMPOSE_PROJECT_NAME="$PROJECT"
+  log_info "Compose project: ${PROJECT}$( [[ "$PROJECT" == "docker" ]] && printf ' (legacy default — single instance)' || true )"
+}
+
+# _read_state_project <state_file> — echo the PROJECT recorded in a state file, or
+# "docker" if the field is absent (backward-compat: pre-3.0 state files have no
+# PROJECT line, and those installs all used the "docker" project). Used by the
+# upgrade / add-component paths so they target the EXISTING instance, not a
+# re-derivation (the operator may have used --project the first time).
+_read_state_project() {
+  local _sf="${1:-${WORK_DIR}/docker/.yashigani-install-state}"
+  local _p=""
+  if [[ -f "$_sf" && -r "$_sf" ]]; then
+    _p="$(grep -E '^PROJECT=' "$_sf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  if [[ -z "$_p" ]]; then
+    _p="docker"
+  fi
+  printf '%s' "$_p"
+}
+
+# _list_instances — enumerate Yashigani compose instances on this host as
+# "<project>\t<domain>\t<runtime>" rows. Works on Docker (com.docker.compose.project)
+# and Podman (io.podman.compose.project) by listing running containers and reading
+# the project label + our YASHIGANI_TLS_DOMAIN env from the gateway container.
+# Best-effort + read-only; never mutates state. Exit 0 always (empty = no instances).
+_list_instances() {
+  local _runtimes=() _rt
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && _runtimes+=("docker")
+  command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1 && _runtimes+=("podman")
+
+  if [[ "${#_runtimes[@]}" -eq 0 ]]; then
+    log_warn "No reachable container runtime (docker/podman) — cannot list instances."
+    return 0
+  fi
+
+  printf '%-30s %-40s %-8s\n' "PROJECT" "DOMAIN" "RUNTIME"
+  printf '%-30s %-40s %-8s\n' "-------" "------" "-------"
+
+  local _found=0
+  for _rt in "${_runtimes[@]}"; do
+    local _label_key
+    if [[ "$_rt" == "podman" ]]; then
+      _label_key="io.podman.compose.project"
+    else
+      _label_key="com.docker.compose.project"
+    fi
+    # All distinct compose projects that have a yashigani gateway container.
+    local _projects
+    _projects="$("$_rt" ps -a \
+        --filter 'name=gateway' \
+        --format '{{.Label "'"$_label_key"'"}}' 2>/dev/null \
+        | grep -v '^$' | sort -u || true)"
+    local _proj
+    while IFS= read -r _proj; do
+      [[ -z "$_proj" ]] && continue
+      # Pull the domain from the caddy container's env (the canonical holder of
+      # YASHIGANI_TLS_DOMAIN). Read-only inspect; the gateway container does NOT
+      # carry the domain. Fall back to "(unknown)" if caddy is absent/stopped.
+      local _caddy_cid _domain
+      _caddy_cid="$("$_rt" ps -a \
+          --filter "label=${_label_key}=${_proj}" \
+          --filter 'name=caddy' \
+          --format '{{.ID}}' 2>/dev/null | head -n1 || true)"
+      _domain="(unknown)"
+      if [[ -n "$_caddy_cid" ]]; then
+        _domain="$("$_rt" inspect "$_caddy_cid" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+            | grep -E '^YASHIGANI_TLS_DOMAIN=' | head -n1 | cut -d= -f2- || true)"
+        [[ -z "$_domain" ]] && _domain="(unknown)"
+      fi
+      printf '%-30s %-40s %-8s\n' "$_proj" "$_domain" "$_rt"
+      _found=$((_found + 1))
+    done <<< "$_projects"
+  done
+
+  if [[ "$_found" -eq 0 ]]; then
+    printf '%s\n' "(no Yashigani instances found on this host)"
+  fi
+  return 0
+}
+
+# _host_has_other_instance <this_project> — return 0 if a DIFFERENT Yashigani
+# compose project already exists on this host (i.e. this install would create a
+# 2nd, side-by-side instance → multi-instance territory). Read-only.
+_host_has_other_instance() {
+  local _this="$1"
+  local _rt _label_key _projects
+  for _rt in docker podman; do
+    command -v "$_rt" >/dev/null 2>&1 || continue
+    "$_rt" info >/dev/null 2>&1 || continue
+    if [[ "$_rt" == "podman" ]]; then
+      _label_key="io.podman.compose.project"
+    else
+      _label_key="com.docker.compose.project"
+    fi
+    _projects="$("$_rt" ps -a --filter 'name=gateway' \
+        --format '{{.Label "'"$_label_key"'"}}' 2>/dev/null \
+        | grep -v '^$' | sort -u || true)"
+    local _p
+    while IFS= read -r _p; do
+      [[ -z "$_p" ]] && continue
+      if [[ "$_p" != "$_this" ]]; then
+        return 0
+      fi
+    done <<< "$_projects"
+  done
+  return 1
+}
+
+# _unverified_license_tier — echo the tier string from the UNVERIFIED license-key
+# payload, or "community" when no license / unparseable. ADVISORY ONLY: this does
+# NOT verify the Ed25519 signature (the verify key is image-baked, not on the host),
+# so the value is forgeable and used purely for the up-front UX gate. The running
+# gateway/backoffice perform the authoritative signed-license + max_orgs enforcement.
+_unverified_license_tier() {
+  local _lic="${WORK_DIR}/docker/secrets/license_key"
+  [[ -n "${LICENSE_KEY_PATH:-}" && -f "$LICENSE_KEY_PATH" ]] && _lic="$LICENSE_KEY_PATH"
+  if [[ ! -f "$_lic" ]]; then
+    printf 'community'; return 0
+  fi
+  local _content _seg1 _json _tier
+  _content="$(tr -d '[:space:]' < "$_lic" 2>/dev/null || true)"
+  if [[ -z "$_content" || "$_content" == \#community* || "${#_content}" -le 20 ]]; then
+    printf 'community'; return 0
+  fi
+  # v4 format: base64url(json).base64url(sig).base64url(countersig) — decode segment 1.
+  _seg1="${_content%%.*}"
+  # base64url → base64, pad to a multiple of 4, decode (best-effort).
+  local _b64 _pad
+  _b64="$(printf '%s' "$_seg1" | tr '_-' '/+')"
+  _pad=$(( ${#_b64} % 4 ))
+  [[ "$_pad" -ne 0 ]] && _b64="${_b64}$(printf '%*s' $((4 - _pad)) '' | tr ' ' '=')"
+  _json="$(printf '%s' "$_b64" | base64 -d 2>/dev/null || true)"
+  # Extract "tier":"..." without a JSON parser (grep is enough for this single field).
+  _tier="$(printf '%s' "$_json" | grep -oE '"tier"[[:space:]]*:[[:space:]]*"[a-z_]+"' \
+            | head -n1 | sed -E 's/.*"([a-z_]+)"$/\1/' || true)"
+  if [[ -z "$_tier" ]]; then
+    printf 'community'; return 0
+  fi
+  printf '%s' "$_tier"
+}
+
+# _multi_instance_tier_gate — advisory Pro+/Enterprise gate for the multi-instance
+# path. Triggered ONLY when this install would create a 2nd instance alongside an
+# existing one on the host. Default behaviour (Tiago decision pending — memo
+# project_v300_design_conflict_tiergate.md): WARN + proceed; server-side max_orgs is
+# the authoritative boundary. To switch to a hard ack-required gate, flip the
+# `_block_without_ack` flag below to true (one-line change).
+_multi_instance_tier_gate() {
+  local _block_without_ack=false   # <-- decision seam: false = warn+proceed (a); true = require --i-understand-tier (b)
+
+  # Only relevant when a SECOND instance is being created on this host.
+  if ! _host_has_other_instance "$PROJECT"; then
+    return 0
+  fi
+
+  local _tier
+  _tier="$(_unverified_license_tier)"
+  case "$_tier" in
+    professional_plus|enterprise|academic_nonprofit)
+      log_info "Multi-instance: license tier '${_tier}' — multi-instance permitted."
+      return 0
+      ;;
+  esac
+
+  log_warn "MULTI-INSTANCE TIER GATE (advisory):"
+  log_warn "  Another Yashigani instance already exists on this host."
+  log_warn "  Running multiple instances side-by-side is a Professional Plus / Enterprise"
+  log_warn "  capability. The detected license tier is: ${_tier}."
+  log_warn "  The RUNNING instance enforces per-tier org limits (max_orgs) authoritatively;"
+  log_warn "  this installer cannot verify the signed license host-side (key is image-baked)."
+
+  if [[ "$_block_without_ack" == "true" && "$MULTI_INSTANCE_TIER_ACK" != "true" ]]; then
+    log_error "  Re-run with --i-understand-tier to proceed, or upgrade to Pro+/Enterprise."
+    exit 1
+  fi
+  log_warn "  Proceeding — server-side licensing will enforce the actual limits."
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1747,11 +2035,14 @@ _is_existing_yashigani_running() {
   # The socket is local so hang risk is low. Use label filter (fastest — no compose
   # parsing) as primary, compose ps as fallback.
   # Label filter: works even without compose CLI installed.
-  if docker ps --filter 'label=com.docker.compose.project=docker' \
+  # Multi-instance (3.0): scope the label filter to THIS install's project, not a
+  # hardcoded "docker" — otherwise a 2nd named instance false-matches the first.
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  if docker ps --filter "label=com.docker.compose.project=${_proj}" \
        --format '{{.Names}}' 2>/dev/null | grep -q .; then
     return 0
   fi
-  if podman ps --filter 'label=io.podman.compose.project=docker' \
+  if podman ps --filter "label=io.podman.compose.project=${_proj}" \
        --format '{{.Names}}' 2>/dev/null | grep -q .; then
     return 0
   fi
@@ -2268,6 +2559,17 @@ _write_aes_key_to_env() {
   # --- Domain ---
   _env_set "YASHIGANI_TLS_DOMAIN" "${DOMAIN}"
 
+  # --- Multi-instance compose project (3.0 — scoping-draft §4a) ---
+  # COMPOSE_PROJECT_NAME in docker/.env is the single source of truth for the
+  # project name on BOTH Docker and Podman compose (each reads the project-dir
+  # .env). Without it, compose derives the project from the directory name
+  # ("docker") and two instances on one host collide on container/volume/network
+  # names. PROJECT is resolved in main() (from --project / --domain / state file).
+  # Same .env-over-process-env rationale as FIPS_MODE above.
+  if [[ -n "${PROJECT:-}" && "${PROJECT}" != "docker" ]]; then
+    _env_set "COMPOSE_PROJECT_NAME" "${PROJECT}"
+  fi
+
   # --- TLS mode ---
   _env_set "YASHIGANI_TLS_MODE" "${TLS_MODE}"
   # Captain v2.24.4 B8 closure (install.sh side per Nico N-001):
@@ -2717,10 +3019,12 @@ _backup_existing_data() {
     # the compose project prefix. The compose file lives in docker/, so the
     # project name is "docker" and volumes are "docker_langflow_data" etc. —
     # NOT bare "langflow_data". The chown path at the post-install step already
-    # uses _compose_project_prefix="docker" (see the agent-bundle chown block);
-    # mirror it here so `volume inspect` actually finds the volume instead of
-    # always reporting "not present — skipping" and silently losing agent state.
-    local _compose_project_prefix="docker"
+    # uses _compose_project_prefix (see the agent-bundle chown block); mirror it
+    # here so `volume inspect` actually finds the volume instead of always
+    # reporting "not present — skipping" and silently losing agent state.
+    # Multi-instance (3.0): the prefix is THIS install's compose project, not a
+    # hardcoded "docker" — a 2nd named instance has e.g. "eu-west-acme-com_langflow_data".
+    local _compose_project_prefix="${COMPOSE_PROJECT_NAME:-docker}"
     # Ordered list: <volume_name>:<bundle_label>
     local -a _agent_volumes=(
       "${_compose_project_prefix}_langflow_data:langflow"
@@ -3425,8 +3729,14 @@ check_existing_installation() {
       # macOS does not ship `timeout` (GNU coreutils). Use label filter via
       # docker/podman ps (fastest, no compose parsing, socket is local) and fall
       # back to compose ps without timeout.
+      # Multi-instance (3.0): scope to THIS install's project (not hardcoded
+      # "docker") and use the runtime's own compose-project label key (podman and
+      # docker differ), so a 2nd named instance is detected correctly.
       local _runtime_bin="${COMPOSE_CMD[0]%%[[:space:]]*}"
-      if "$_runtime_bin" ps --filter 'label=com.docker.compose.project=docker' \
+      local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+      local _label_key="com.docker.compose.project"
+      [[ "$_runtime_bin" == podman* ]] && _label_key="io.podman.compose.project"
+      if "$_runtime_bin" ps --filter "label=${_label_key}=${_proj}" \
            --format '{{.Names}}' 2>/dev/null | grep -q .; then
         running=true
       elif "${COMPOSE_CMD[@]}" -f "$compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
@@ -10503,11 +10813,12 @@ _chown_agent_volumes() {
 
   log_info "Chown'ing agent named volumes to container UIDs (runtime: ${_effective_runtime})"
 
-  # Docker Compose prefixes named volumes with the project name derived from the
-  # directory containing the compose file. Our compose file lives under docker/,
-  # so the project name is "docker" → volumes are docker_langflow_data, etc.
-  # This matches the _project_prefix convention in _check_contaminated_volumes.
-  local _compose_project_prefix="docker"
+  # Docker Compose prefixes named volumes with the project name. Pre-3.0 this was
+  # always "docker" (the compose-file directory name) → docker_langflow_data, etc.
+  # Multi-instance (3.0): the project is now THIS install's COMPOSE_PROJECT_NAME, so a
+  # 2nd named instance gets e.g. eu-west-acme-com_langflow_data. Falls back to "docker"
+  # for single-instance / legacy installs. Matches _check_contaminated_volumes.
+  local _compose_project_prefix="${COMPOSE_PROJECT_NAME:-docker}"
 
   # langflow_data → uid=1000 (langflowai/langflow USER langflow = UID 1000)
   # ASVS V14.1.1: least privilege — volume must not be root-owned when process
@@ -12512,6 +12823,15 @@ handle_pki_subcommand() {
 main() {
   parse_args "$@"
 
+  # Multi-instance (3.0): --list enumerates instances on the host, then exits.
+  # No working-directory / wizard needed — it only reads the runtime's container
+  # labels. Placed before all other short-circuits so it works on any host state.
+  if [[ "$LIST_INSTANCES" == "true" ]]; then
+    detect_working_directory 2>/dev/null || true
+    _list_instances
+    exit 0
+  fi
+
   # Short-circuit path for PKI maintenance commands: no full install, no wizard.
   if [[ -n "$PKI_ACTION" ]]; then
     detect_working_directory
@@ -12628,6 +12948,11 @@ main() {
         printf 'RUNTIME=%s\n'            "k8s"
         printf 'NAMESPACE=%s\n'          "${NAMESPACE}"
         printf 'HELM_RELEASE=%s\n'       "yashigani"
+        # Multi-instance (3.0): on k8s, instance separation is by namespace/release
+        # (already parameterised); PROJECT/DOMAIN are recorded for state-file parity
+        # with the compose path and for `--list`. PROJECT defaults to NAMESPACE here.
+        printf 'PROJECT=%s\n'            "${NAMESPACE:-yashigani}"
+        printf 'DOMAIN=%s\n'             "${DOMAIN:-}"
         printf 'INSTALL_UID=%s\n'        "$(id -u)"
         printf 'INSTALL_USER=%s\n'       "$(id -un)"
         printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -12657,6 +12982,40 @@ main() {
       log_step "6/${TOTAL_STEPS}" "Skipping wizard (demo mode — using defaults)"
     else
       run_wizard
+    fi
+
+    # Multi-instance (3.0): resolve the compose PROJECT name NOW — after the wizard
+    # has finalised DOMAIN, before any project-scoped operation (existing-install
+    # detection, contaminated-volume check, compose up).
+    #
+    # Precedence:
+    #   1. --upgrade / add-component against an EXISTING install → read PROJECT from
+    #      that install's state file (don't re-derive; the operator may have used a
+    #      custom --project the first time, or --domain may differ on the upgrade run).
+    #   2. Explicit --project override (fresh install) → sanitised override.
+    #   3. Derived from --domain (fresh install) → sanitised domain.
+    #   4. No domain (demo/localhost) → legacy "docker" (single-instance default).
+    #
+    # The resolved name is exported as COMPOSE_PROJECT_NAME (read by both Docker and
+    # Podman compose) and written into docker/.env in generate_env_file().
+    if [[ "$UPGRADE" == "true" ]]; then
+      # Upgrade / add-component targets an EXISTING instance. Precedence:
+      #   1. explicit --project (operator names the instance directly — required to
+      #      disambiguate on a multi-instance host) → sanitise it.
+      #   2. PROJECT recorded in the state file → use as-is (already a valid name).
+      #   3. "docker" legacy default (single-instance, pre-3.0 state file).
+      if [[ "$PROJECT_EXPLICIT" -eq 1 && -n "$PROJECT" ]]; then
+        PROJECT="$(_sanitise_project "$PROJECT")"
+        log_info "Upgrade/add-component targeting instance — project: ${PROJECT} (from --project)"
+      else
+        PROJECT="$(_read_state_project "${WORK_DIR}/docker/.yashigani-install-state")"
+        log_info "Upgrade/add-component targeting existing instance — project: ${PROJECT} (from state file)"
+      fi
+      export COMPOSE_PROJECT_NAME="$PROJECT"
+    else
+      _resolve_project
+      # Advisory Pro+/Enterprise gate (only fires for a 2nd side-by-side instance).
+      _multi_instance_tier_gate
     fi
 
     # Idempotency: check for running installation before making changes
@@ -13123,6 +13482,11 @@ main() {
     # git-ignored via docker/.yashigani-install-state entry in .gitignore.
     {
       printf 'RUNTIME=%s\n'            "${RUNTIME:-${YSG_RUNTIME:-docker}}"
+      # Multi-instance (3.0): record the compose project + domain so upgrade /
+      # add-component / uninstall.sh target THIS instance without re-deriving.
+      # PROJECT falls back to "docker" (legacy single-instance default).
+      printf 'PROJECT=%s\n'            "${PROJECT:-docker}"
+      printf 'DOMAIN=%s\n'             "${DOMAIN:-}"
       printf 'INSTALL_UID=%s\n'        "$(id -u)"
       printf 'INSTALL_USER=%s\n'       "$(id -un)"
       printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -13130,6 +13494,7 @@ main() {
     } > "${WORK_DIR}/docker/.yashigani-install-state"
     chmod 0644 "${WORK_DIR}/docker/.yashigani-install-state"
     log_info "Install state written: ${WORK_DIR}/docker/.yashigani-install-state"
+    log_info "  PROJECT=${PROJECT:-docker}  DOMAIN=${DOMAIN:-(none)}"
 
     # Step 13: Completion summary
     print_completion_summary
