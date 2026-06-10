@@ -36,6 +36,7 @@ function showPage(name, triggerEl) {
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
     if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
+    if (name === 'rbac') loadGroups();        // RBAC group management (parity with /admin/rbac API)
 }
 
 // ---------------------------------------------------------------------------
@@ -54,9 +55,9 @@ async function loadPolicies() {
     }
     var catLabel = { example: 'Templates (immutable examples)', core: 'Core gateway policies', test: 'Test policies' };
     var catBadge = {
-        example: '<span class="badge" style="background:#fef3c7;color:#92400e;">template</span>',
+        example: '<span class="badge badge-amber">template</span>',
         core: '<span class="badge badge-green">core</span>',
-        test: '<span class="badge" style="background:#f1f5f9;color:#64748b;">test</span>'
+        test: '<span class="badge badge-slate">test</span>'
     };
     var groups = {};
     data.policies.forEach(function(p) { (groups[p.category] = groups[p.category] || []).push(p); });
@@ -64,19 +65,19 @@ async function loadPolicies() {
     ['example', 'core', 'test'].forEach(function(cat) {
         var list = groups[cat];
         if (!list || !list.length) return;
-        html += '<h3 style="margin:14px 0 6px;font-size:0.95rem;">' + escapeHtml(catLabel[cat] || cat) + '</h3>';
+        html += '<h3 class="h3-section">' + escapeHtml(catLabel[cat] || cat) + '</h3>';
         html += '<table><thead><tr><th>Name</th><th>Package</th><th></th><th></th></tr></thead><tbody>';
         list.forEach(function(p) {
             html += '<tr>'
-                + '<td style="font-family:monospace;">' + escapeHtml(p.name) + '</td>'
-                + '<td style="font-size:0.8rem;color:#475569;">' + escapeHtml(p.package || '—') + '</td>'
+                + '<td class="td-mono">' + escapeHtml(p.name) + '</td>'
+                + '<td class="td-pkg">' + escapeHtml(p.package || '—') + '</td>'
                 + '<td>' + (catBadge[p.category] || '') + '</td>'
                 + '<td><button class="btn btn-sm" data-action="policyView" data-id="' + escapeHtml(p.id) + '" data-cat="' + escapeHtml(p.category) + '">View</button></td>'
                 + '</tr>';
         });
         html += '</tbody></table>';
     });
-    container.innerHTML = html + '<p class="txt-note" style="margin-top:10px;">' +
+    container.innerHTML = html + '<p class="txt-note txt-mt8">' +
         escapeHtml(String(data.count)) + ' policy modules loaded in OPA (' + escapeHtml(data.opa_url || '') + ').</p>';
 }
 
@@ -92,13 +93,13 @@ async function viewPolicy(id, cat) {
         : (cat === 'client' ? '<span class="badge badge-green">client copy</span>' : '');
     // Reset to view (read-only) state each time.
     ta.readOnly = true;
-    var sa = document.getElementById('policy-saveas'); if (sa) sa.style.display = 'none';
-    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.style.display = '';
+    var sa = document.getElementById('policy-saveas'); if (sa) sa.classList.remove('is-open');
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.classList.remove('is-hidden');
     var res = document.getElementById('policy-save-result'); if (res) res.innerHTML = '';
     var nm = document.getElementById('policy-copy-name');
     if (nm) nm.value = (id.split('/').pop().replace(/\.rego$/, '') + '_copy').toLowerCase().replace(/[^a-z0-9_]/g, '');
     ta.value = 'Loading…';
-    panel.style.display = 'block';
+    panel.classList.remove('is-hidden');
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     // {policy_id:path} — keep the slashes, encode each segment
     var encoded = id.split('/').map(encodeURIComponent).join('/');
@@ -113,8 +114,8 @@ function policyEditCopy() {
     var sa = document.getElementById('policy-saveas');
     var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]');
     if (ta) { ta.readOnly = false; ta.focus(); }
-    if (sa) sa.style.display = 'inline-flex';
-    if (ec) ec.style.display = 'none';
+    if (sa) sa.classList.add('is-open');
+    if (ec) ec.classList.add('is-hidden');
 }
 
 async function policySaveCopy() {
@@ -144,7 +145,7 @@ async function policySaveCopy() {
 
 function closePolicyView() {
     var panel = document.getElementById('policy-view-panel');
-    if (panel) panel.style.display = 'none';
+    if (panel) panel.classList.add('is-hidden');
 }
 
 // Open the editor pre-loaded with an AI draft, in edit mode, ready to save.
@@ -156,14 +157,14 @@ function viewPolicyDraft(name, rego) {
     var nm = document.getElementById('policy-copy-name');
     if (!panel || !ta) return;
     title.textContent = 'AI draft: clients.' + name;
-    badge.innerHTML = '<span class="badge" style="background:#ede9fe;color:#6d28d9;">AI draft — review before saving</span>';
+    badge.innerHTML = '<span class="badge badge-violet">AI draft — review before saving</span>';
     ta.value = rego;
     ta.readOnly = false;
     if (nm) nm.value = name;
-    var sa = document.getElementById('policy-saveas'); if (sa) sa.style.display = 'inline-flex';
-    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.style.display = 'none';
+    var sa = document.getElementById('policy-saveas'); if (sa) sa.classList.add('is-open');
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.classList.add('is-hidden');
     var sr = document.getElementById('policy-save-result'); if (sr) sr.innerHTML = '';
-    panel.style.display = 'block';
+    panel.classList.remove('is-hidden');
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
@@ -202,11 +203,11 @@ async function loadBindings() {
     data.bindings.forEach(function(b) {
         var scope = escapeHtml(b.scope_kind) + ':' + escapeHtml(b.scope_id || '*');
         html += '<tr>'
-            + '<td style="font-family:monospace;">' + escapeHtml(b.policy_name) + '</td>'
-            + '<td style="font-family:monospace;">' + scope + '</td>'
+            + '<td class="td-mono">' + escapeHtml(b.policy_name) + '</td>'
+            + '<td class="td-mono">' + scope + '</td>'
             + '<td>' + escapeHtml(b.direction) + '</td>'
             + '<td>' + (b.enabled ? 'yes' : 'no') + '</td>'
-            + '<td><button class="btn btn-sm" data-action="unbindBinding" data-binding-id="' + escapeHtml(b.id) + '" style="background:#dc2626;color:#fff;">Remove</button></td>'
+            + '<td><button class="btn btn-sm btn-sm-danger" data-action="unbindBinding" data-binding-id="' + escapeHtml(b.id) + '">Remove</button></td>'
             + '</tr>';
     });
     c.innerHTML = html + '</tbody></table>';
@@ -241,6 +242,210 @@ async function unbindBinding(id) {
     if (resp.ok) { loadBindings(); return; }
     var d = await resp.json().catch(function() { return {}; });
     alert('Remove failed: ' + errMsg(d, resp.status));
+}
+
+// ── RBAC group management (parity with the /admin/rbac API) ──────────────────
+// All mutating calls go through apiMutate() so the step-up TOTP modal is handled
+// transparently; GETs go through api(). The selected group for member management
+// is tracked in _rbacSelectedGroup.
+var _rbacSelectedGroup = null;  // {id, display_name} of the group whose members are shown
+
+function _rbacResourcesSummary(resources) {
+    if (!resources || !resources.length) return '<span class="txt-muted-sm">none</span>';
+    return resources.map(function(r) {
+        return escapeHtml((r.method || '*') + ' ' + (r.path_glob || ''));
+    }).join('<br>');
+}
+
+async function loadGroups() {
+    var tbody = document.getElementById('rbac-groups-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading...</td></tr>';
+    var data = await api('/admin/rbac/groups');
+    if (!data || !data.groups) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">Could not load RBAC groups.</td></tr>';
+        return;
+    }
+    if (data.groups.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No groups yet. Use "+ Create group" above.</td></tr>';
+        return;
+    }
+    var html = '';
+    data.groups.forEach(function(g) {
+        html += '<tr>'
+            + '<td class="txt-xs cred-code">' + escapeHtml(g.id) + '</td>'
+            + '<td>' + escapeHtml(g.display_name) + '</td>'
+            + '<td>' + (g.members ? g.members.length : 0) + '</td>'
+            + '<td class="txt-xs">' + _rbacResourcesSummary(g.allowed_resources) + '</td>'
+            + '<td>'
+            + '<button class="btn btn-sm btn-sm-primary" data-action="rbacManageMembers" data-group-id="' + escapeHtml(g.id) + '" data-group-name="' + escapeHtml(g.display_name) + '">Members</button> '
+            + '<button class="btn btn-sm btn-sm-danger" data-action="deleteGroup" data-group-id="' + escapeHtml(g.id) + '" data-group-name="' + escapeHtml(g.display_name) + '">Delete</button>'
+            + '</td>'
+            + '</tr>';
+    });
+    tbody.innerHTML = html;
+    // If a members panel is open for a group that still exists, refresh it; else close.
+    if (_rbacSelectedGroup) {
+        var still = data.groups.filter(function(g) { return g.id === _rbacSelectedGroup.id; });
+        if (still.length) { _rbacRenderMembers(still[0]); }
+        else { rbacMembersClose(); }
+    }
+}
+
+function rbacAddResourceRow() {
+    var rows = document.getElementById('rbac-resource-rows');
+    if (!rows) return;
+    var div = document.createElement('div');
+    div.className = 'form-row rbac-resource-row';
+    div.innerHTML =
+        '<div><label class="lbl">Method</label><br><select class="fi rbac-res-method">'
+        + '<option value="*">*</option><option value="GET">GET</option><option value="POST">POST</option>'
+        + '<option value="PUT">PUT</option><option value="DELETE">DELETE</option></select></div>'
+        + '<div><label class="lbl">Path glob</label><br><input type="text" placeholder="/mcp/**" class="fi w-250 rbac-res-path"></div>';
+    rows.appendChild(div);
+}
+
+function _rbacCollectResources() {
+    var out = [];
+    document.querySelectorAll('#rbac-resource-rows .rbac-resource-row').forEach(function(row) {
+        var method = row.querySelector('.rbac-res-method');
+        var path = row.querySelector('.rbac-res-path');
+        var pv = path ? (path.value || '').trim() : '';
+        if (!pv) return;  // blank path → skip the row
+        out.push({ method: method ? method.value : '*', path_glob: pv });
+    });
+    return out;
+}
+
+async function createGroup() {
+    var res = document.getElementById('rbac-create-result');
+    var name = (document.getElementById('rbac-group-name').value || '').trim();
+    if (!name) { if (res) res.innerHTML = '<span class="badge badge-red">Enter a display name.</span>'; return; }
+    var resources = _rbacCollectResources();
+    var resp = await apiMutate('/admin/rbac/groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ display_name: name, allowed_resources: resources })
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok) {
+        if (res) res.innerHTML = '<span class="badge badge-green">Group created.</span>';
+        document.getElementById('rbac-group-name').value = '';
+        // Reset resource rows to a single blank row.
+        var rows = document.getElementById('rbac-resource-rows');
+        if (rows) {
+            rows.innerHTML = '';
+            rbacAddResourceRow();
+        }
+        loadGroups();
+    } else {
+        if (res) res.innerHTML = '<span class="badge badge-red">Create failed: ' + escapeHtml(errMsg(d, resp.status)) + '</span>';
+    }
+}
+
+async function deleteGroup(id, name) {
+    if (!id) return;
+    if (!confirm('Delete group "' + (name || id) + '"? This removes all its members and resource grants.')) return;
+    var resp = await apiMutate('/admin/rbac/groups/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!resp) return;
+    if (resp.ok) { loadGroups(); return; }
+    var d = await resp.json().catch(function() { return {}; });
+    alert('Delete failed: ' + errMsg(d, resp.status));
+}
+
+function rbacManageMembers(id, name) {
+    _rbacSelectedGroup = { id: id, display_name: name };
+    var panel = document.getElementById('rbac-members-panel');
+    if (panel) panel.className = 'panel';
+    var title = document.getElementById('rbac-members-title');
+    if (title) title.textContent = 'Members — ' + name;
+    var input = document.getElementById('rbac-member-email');
+    if (input) input.value = '';
+    // Fetch the fresh group so the member list reflects current state.
+    _rbacRefreshSelected();
+}
+
+async function _rbacRefreshSelected() {
+    if (!_rbacSelectedGroup) return;
+    var g = await api('/admin/rbac/groups/' + encodeURIComponent(_rbacSelectedGroup.id));
+    if (!g || !g.id) {
+        var c = document.getElementById('rbac-members-container');
+        if (c) c.innerHTML = '<p class="txt-note">Group not found (it may have been deleted).</p>';
+        return;
+    }
+    _rbacRenderMembers(g);
+}
+
+function _rbacRenderMembers(group) {
+    var c = document.getElementById('rbac-members-container');
+    if (!c) return;
+    var members = group.members || [];
+    if (members.length === 0) {
+        c.innerHTML = '<p class="txt-note">No members yet. Add one above.</p>';
+        return;
+    }
+    var html = '<table><thead><tr><th>Email</th><th>Actions</th></tr></thead><tbody>';
+    members.forEach(function(m) {
+        html += '<tr><td>' + escapeHtml(m) + '</td>'
+            + '<td><button class="btn btn-sm btn-sm-danger" data-action="removeRbacMember" data-group-id="'
+            + escapeHtml(group.id) + '" data-member-email="' + escapeHtml(m) + '">Remove</button></td></tr>';
+    });
+    c.innerHTML = html + '</tbody></table>';
+}
+
+function rbacMembersClose() {
+    _rbacSelectedGroup = null;
+    var panel = document.getElementById('rbac-members-panel');
+    if (panel) panel.className = 'panel is-hidden';
+}
+
+async function addRbacMember(id) {
+    var gid = id || (_rbacSelectedGroup && _rbacSelectedGroup.id);
+    if (!gid) return;
+    var input = document.getElementById('rbac-member-email');
+    var email = input ? (input.value || '').trim() : '';
+    if (!email) { alert('Enter a member email.'); return; }
+    var resp = await apiMutate('/admin/rbac/groups/' + encodeURIComponent(gid) + '/members', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email })
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok) {
+        if (input) input.value = '';
+        _rbacRefreshSelected();
+        loadGroups();  // refresh member counts in the table
+    } else {
+        alert('Add member failed: ' + errMsg(d, resp.status));
+    }
+}
+
+async function removeRbacMember(id, email) {
+    if (!id || !email) return;
+    if (!confirm('Remove ' + email + ' from this group?')) return;
+    var resp = await apiMutate(
+        '/admin/rbac/groups/' + encodeURIComponent(id) + '/members/' + encodeURIComponent(email),
+        { method: 'DELETE' }
+    );
+    if (!resp) return;
+    if (resp.ok) { _rbacRefreshSelected(); loadGroups(); return; }
+    var d = await resp.json().catch(function() { return {}; });
+    alert('Remove member failed: ' + errMsg(d, resp.status));
+}
+
+async function rbacForcePush() {
+    var res = document.getElementById('rbac-push-result');
+    if (res) res.textContent = 'Pushing…';
+    var resp = await apiMutate('/admin/rbac/policy/push', { method: 'POST' });
+    if (!resp) { if (res) res.textContent = ''; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.pushed) {
+        if (res) res.textContent = 'Pushed: ' + (d.groups_count || 0) + ' group(s), ' + (d.users_count || 0) + ' user mapping(s).';
+    } else {
+        if (res) res.textContent = 'Push failed: ' + errMsg(d, resp.status);
+    }
 }
 
 async function api(path) {
@@ -319,13 +524,13 @@ function _showStepUpModal() {
     if (!modal) return;
     document.getElementById('stepup-code').value = '';
     document.getElementById('stepup-error').textContent = '';
-    modal.style.display = 'flex';
+    modal.classList.add('is-open');
     document.getElementById('stepup-code').focus();
 }
 
 function _hideStepUpModal() {
     var modal = document.getElementById('stepup-modal');
-    if (modal) modal.style.display = 'none';
+    if (modal) modal.classList.remove('is-open');
     _stepupQueue = null;
 }
 
@@ -427,11 +632,11 @@ async function loadAgents() {
         for (var i = 0; i < agents.length; i++) {
             var a = agents[i];
             var statusBadge = a.status === 'active' ? 'badge-green' : 'badge-red';
-            var actions = '<button data-action="rotateAgentToken" data-agent-id="' + escapeHtml(a.agent_id) + '" data-agent-name="' + escapeHtml(a.name) + '" style="padding:2px 8px;background:#2563eb;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Rotate Token</button>';
+            var actions = '<button data-action="rotateAgentToken" data-agent-id="' + escapeHtml(a.agent_id) + '" data-agent-name="' + escapeHtml(a.name) + '" class="btn-tbl btn-tbl--blue">Rotate Token</button>';
             if (a.status === 'active') {
-                actions += ' <button data-action="deactivateAgent" data-agent-id="' + escapeHtml(a.agent_id) + '" style="padding:2px 8px;background:#dc2626;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem;margin-left:4px">Deactivate</button>';
+                actions += ' <button data-action="deactivateAgent" data-agent-id="' + escapeHtml(a.agent_id) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Deactivate</button>';
             }
-            html += '<tr><td>' + escapeHtml(a.name) + '</td><td style="font-family:monospace;font-size:0.8rem;">' + escapeHtml(a.agent_id) + '</td><td style="font-size:0.8rem;">' + escapeHtml(a.upstream_url) + '</td><td><span class="badge ' + statusBadge + '">' + escapeHtml(a.status) + '</span></td><td style="font-size:0.8rem;">' + escapeHtml(a.last_seen_at || 'Never') + '</td><td>' + actions + '</td></tr>';
+            html += '<tr><td>' + escapeHtml(a.name) + '</td><td class="td-mono-xs">' + escapeHtml(a.agent_id) + '</td><td class="td-xs">' + escapeHtml(a.upstream_url) + '</td><td><span class="badge ' + statusBadge + '">' + escapeHtml(a.status) + '</span></td><td class="td-xs">' + escapeHtml(a.last_seen_at || 'Never') + '</td><td>' + actions + '</td></tr>';
         }
         tbody.innerHTML = html;
     } else {
@@ -466,7 +671,7 @@ async function registerAgent() {
         document.getElementById('agent-url').value = '';
         document.getElementById('agent-token-name').textContent = name;
         document.getElementById('agent-token-value').textContent = data.token;
-        document.getElementById('agent-token-panel').style.display = 'block';
+        document.getElementById('agent-token-panel').classList.add('is-open');
         loadAgents();
     } else {
         var err = await resp.json().catch(function() { return {}; });
@@ -483,7 +688,7 @@ async function rotateAgentToken(agentId, name) {
         var data = await resp.json();
         document.getElementById('agent-token-name').textContent = name;
         document.getElementById('agent-token-value').textContent = data.token;
-        document.getElementById('agent-token-panel').style.display = 'block';
+        document.getElementById('agent-token-panel').classList.add('is-open');
     } else if (resp) {
         alert('Token rotation failed: ' + resp.status);
     }
@@ -514,9 +719,9 @@ async function loadAccounts() {
             var totpBadge = acc.force_totp_provision ? 'badge-yellow' : 'badge-green';
             var totpText = acc.force_totp_provision ? 'Not provisioned' : 'Active';
             var toggleBtn = acc.disabled
-                ? '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="enable" style="padding:2px 8px;background:#16a34a;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Enable</button>'
-                : '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="disable" style="padding:2px 8px;background:#f59e0b;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Disable</button>';
-            var deleteBtn = '<button data-action="deleteAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" style="padding:2px 8px;background:#dc2626;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem;margin-left:4px">Delete</button>';
+                ? '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="enable" class="btn-tbl btn-tbl--green">Enable</button>'
+                : '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="disable" class="btn-tbl btn-tbl--amber">Disable</button>';
+            var deleteBtn = '<button data-action="deleteAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Delete</button>';
             html += '<tr><td><strong>' + escapeHtml(acc.username) + '</strong></td><td><span class="badge ' + statusBadge + '">' + statusText + '</span></td><td><span class="badge ' + pwBadge + '">' + pwText + '</span></td><td><span class="badge ' + totpBadge + '">' + totpText + '</span></td><td>' + toggleBtn + deleteBtn + '</td></tr>';
         }
         tbody.innerHTML = html;
@@ -538,9 +743,9 @@ async function loadAccounts() {
             var tb = u.force_totp_provision ? 'badge-yellow' : 'badge-green';
             var tt = u.force_totp_provision ? 'Not provisioned' : 'Active';
             var toggleBtn = u.disabled
-                ? '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="enable" style="padding:2px 8px;background:#16a34a;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Enable</button>'
-                : '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="disable" style="padding:2px 8px;background:#f59e0b;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Disable</button>';
-            var deleteBtn = '<button data-action="deleteAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" style="padding:2px 8px;background:#dc2626;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem;margin-left:4px">Delete</button>';
+                ? '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="enable" class="btn-tbl btn-tbl--green">Enable</button>'
+                : '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="disable" class="btn-tbl btn-tbl--amber">Disable</button>';
+            var deleteBtn = '<button data-action="deleteAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Delete</button>';
             html += '<tr><td><strong>' + escapeHtml(u.username) + '</strong></td><td><span class="badge ' + sb + '">' + st + '</span></td><td><span class="badge ' + pb + '">' + pt + '</span></td><td><span class="badge ' + tb + '">' + tt + '</span></td><td>' + toggleBtn + deleteBtn + '</td></tr>';
         }
         utbody.innerHTML = html;
@@ -551,7 +756,9 @@ async function loadAccounts() {
 
 function toggleForm(id) {
     var el = document.getElementById(id);
-    el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    // Strict-CSP: toggle the `is-open` modifier instead of writing element.style.
+    // Base `.form-panel` is display:none; `.is-open` reveals it.
+    el.classList.toggle('is-open');
 }
 
 function showCredentials(username, password, totpSecret, totpUri) {
@@ -559,7 +766,7 @@ function showCredentials(username, password, totpSecret, totpUri) {
     document.getElementById('cred-password').textContent = password;
     document.getElementById('cred-totp').textContent = totpSecret || 'Provisioned at first login';
     document.getElementById('cred-totp-uri').textContent = totpUri || 'Generated at first login';
-    document.getElementById('credentials-panel').style.display = 'block';
+    document.getElementById('credentials-panel').classList.add('is-open');
 }
 
 function generatePassword() {
@@ -755,7 +962,7 @@ async function loadModels() {
             var m = data.models[i];
             var size = m.size ? (m.size / (1024*1024*1024)).toFixed(1) + ' GB' : '-';
             var modified = m.modified_at ? new Date(m.modified_at).toLocaleDateString() : '-';
-            html += '<tr><td style="font-family:monospace">' + escapeHtml(m.name) + '</td><td>' + escapeHtml(size) + '</td><td>' + escapeHtml(modified) + '</td></tr>';
+            html += '<tr><td class="td-mono">' + escapeHtml(m.name) + '</td><td>' + escapeHtml(size) + '</td><td>' + escapeHtml(modified) + '</td></tr>';
         }
         tbody.innerHTML = html;
     } else {
@@ -769,8 +976,8 @@ async function loadModels() {
         var html = '';
         for (var i = 0; i < aliases.aliases.length; i++) {
             var a = aliases.aliases[i];
-            var localBadge = a.force_local ? '<span class="badge badge-green">Yes</span>' : '<span class="badge" style="background:#f1f5f9;color:#64748b">No</span>';
-            html += '<tr><td style="font-family:monospace">' + escapeHtml(a.alias) + '</td><td>' + escapeHtml(a.provider) + '</td><td>' + escapeHtml(a.model) + '</td><td>' + localBadge + '</td><td><button data-action="deleteAlias" data-alias="' + escapeHtml(a.alias) + '" style="padding:2px 8px;background:#dc2626;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Delete</button></td></tr>';
+            var localBadge = a.force_local ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-slate">No</span>';
+            html += '<tr><td class="td-mono">' + escapeHtml(a.alias) + '</td><td>' + escapeHtml(a.provider) + '</td><td>' + escapeHtml(a.model) + '</td><td>' + localBadge + '</td><td><button data-action="deleteAlias" data-alias="' + escapeHtml(a.alias) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
         }
         atbody.innerHTML = html;
     } else {
@@ -784,7 +991,7 @@ async function loadModels() {
         var html = '';
         for (var i = 0; i < allocs.allocations.length; i++) {
             var al = allocs.allocations[i];
-            html += '<tr><td style="font-family:monospace">' + escapeHtml(al.model_alias) + '</td><td>' + escapeHtml(al.target_type) + '</td><td>' + escapeHtml(al.target_id) + '</td><td><button data-action="deleteAllocation" data-allocation-id="' + escapeHtml(al.id) + '" style="padding:2px 8px;background:#dc2626;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Remove</button></td></tr>';
+            html += '<tr><td class="td-mono">' + escapeHtml(al.model_alias) + '</td><td>' + escapeHtml(al.target_type) + '</td><td>' + escapeHtml(al.target_id) + '</td><td><button data-action="deleteAllocation" data-allocation-id="' + escapeHtml(al.id) + '" class="btn-tbl btn-tbl--red">Remove</button></td></tr>';
         }
         altbody.innerHTML = html;
     } else {
@@ -839,7 +1046,7 @@ async function loadCloudOverride() {
             + ' — proposed by ' + escapeHtml(d.initiated_by || '?') + ', approved by ' + escapeHtml(d.approver || '?')
             + ', expires ' + escapeHtml(d.expires_at || '') + '<br><span class="txt-note">Justification: ' + escapeHtml(d.justification || '') + '</span>';
     } else if (s === 'PENDING_APPROVAL') {
-        el.innerHTML = '<span class="badge" style="background:#fef3c7;color:#92400e">PENDING</span> '
+        el.innerHTML = '<span class="badge badge-amber">PENDING</span> '
             + escapeHtml(d.provider + '/' + d.model) + ' — proposed by ' + escapeHtml(d.initiated_by || '?')
             + ' awaiting a SECOND admin to Approve (within 5 min).';
     } else {
@@ -936,7 +1143,7 @@ async function loadSensitivity() {
         for (var i = 0; i < patterns.patterns.length; i++) {
             var p = patterns.patterns[i];
             var cb = classBadge[p.classification] || 'badge-blue';
-            html += '<tr><td><span class="badge ' + cb + '">' + escapeHtml(p.classification) + '</span></td><td>' + escapeHtml(p.type) + '</td><td style="font-family:monospace;font-size:0.75rem">' + escapeHtml(p.pattern) + '</td><td>' + escapeHtml(p.description) + '</td><td><button data-action="deletePattern" data-pattern-id="' + escapeHtml(p.id) + '" style="padding:2px 8px;background:#dc2626;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:0.75rem">Delete</button></td></tr>';
+            html += '<tr><td><span class="badge ' + cb + '">' + escapeHtml(p.classification) + '</span></td><td>' + escapeHtml(p.type) + '</td><td class="td-mono-xxs">' + escapeHtml(p.pattern) + '</td><td>' + escapeHtml(p.description) + '</td><td><button data-action="deletePattern" data-pattern-id="' + escapeHtml(p.id) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
         }
         tbody.innerHTML = html;
     } else {
@@ -1007,14 +1214,14 @@ async function loadSettings() {
             if (o.unlimited) return 'Unlimited';
             return (o.maximum !== null && o.maximum !== undefined) ? String(o.maximum) : '-';
         }
-        container.innerHTML = '<p style="font-size:0.85rem;color:#334155;"><strong>Tier:</strong> ' + escapeHtml(data.tier || 'community') +
+        container.innerHTML = '<p class="prose-sm"><strong>Tier:</strong> ' + escapeHtml(data.tier || 'community') +
             ' | <strong>Max Agents:</strong> ' + escapeHtml(fmtLimit(lim.agents)) +
             ' | <strong>Users:</strong> ' + escapeHtml(fmtLimit(lim.end_users)) +
             ' | <strong>Admins:</strong> ' + escapeHtml(fmtLimit(lim.admin_seats)) +
             ' | <strong>Orgs:</strong> ' + escapeHtml(fmtLimit(lim.orgs)) +
             ' | <strong>Expires:</strong> ' + escapeHtml(data.expires_at || 'Never') + '</p>';
     } else {
-        container.innerHTML = '<p style="font-size:0.85rem;color:#334155;"><strong>Tier:</strong> Community Edition — no license required.<br><span style="color:#64748b;">To use other features please add a license for your preferred tier.</span></p>';
+        container.innerHTML = '<p class="prose-sm"><strong>Tier:</strong> Community Edition — no license required.<br><span class="faint">To use other features please add a license for your preferred tier.</span></p>';
     }
     // Crypto inventory (ASVS 11.1.3)
     loadCryptoInventory();
@@ -1028,21 +1235,21 @@ async function loadCryptoInventory() {
     var data = await api('/admin/crypto/inventory');
     _cryptoInventoryCache = data;
     var el = document.getElementById('crypto-inventory');
-    if (!data) { el.innerHTML = '<span style="color:#ef4444">Failed to load</span>'; return; }
+    if (!data) { el.innerHTML = '<span class="txt-err">Failed to load</span>'; return; }
     var html = '<table><thead><tr><th>Algorithm</th><th>Usage</th><th>Strength</th></tr></thead><tbody>';
     (data.algorithms || []).forEach(function(a) {
         html += '<tr><td>' + a.name + '</td><td>' + a.usage + '</td><td>' + a.strength + '</td></tr>';
     });
     html += '</tbody></table>';
     if (data.deprecated && data.deprecated.length) {
-        html += '<p style="margin-top:8px;color:#ef4444;font-size:0.85rem;"><strong>Deprecated:</strong> ' + data.deprecated.join(', ') + '</p>';
+        html += '<p class="crypto-line crypto-line--bad"><strong>Deprecated:</strong> ' + data.deprecated.join(', ') + '</p>';
     } else {
-        html += '<p style="margin-top:8px;color:#22c55e;font-size:0.85rem;">No deprecated algorithms in use.</p>';
+        html += '<p class="crypto-line crypto-line--ok">No deprecated algorithms in use.</p>';
     }
     if (data.post_quantum && data.post_quantum.length) {
-        html += '<p style="font-size:0.85rem;color:#2563eb;"><strong>Post-Quantum:</strong> ' + data.post_quantum.join(', ') + '</p>';
+        html += '<p class="crypto-line--pq"><strong>Post-Quantum:</strong> ' + data.post_quantum.join(', ') + '</p>';
     }
-    html += '<p style="font-size:0.75rem;color:#64748b;margin-top:4px;"><strong>Compliance:</strong> ' + (data.compliance || '') + '</p>';
+    html += '<p class="crypto-line--compliance"><strong>Compliance:</strong> ' + (data.compliance || '') + '</p>';
     el.innerHTML = html;
 }
 
@@ -1158,16 +1365,16 @@ async function searchAudit(cursor) {
         var outcome = e.verdict || e.outcome || '-';
         var blocked = /block|deni|reject|fail/i.test(outcome);
         var detail = e.detail || e.summary || e.client_ip_prefix || '';
-        return '<tr><td style="font-size:0.75rem">' + escapeHtml(e.timestamp || e.created_at || '') + '</td>' +
+        return '<tr><td class="td-xxs">' + escapeHtml(e.timestamp || e.created_at || '') + '</td>' +
             '<td>' + escapeHtml(e.event_type || '') + '</td>' +
             '<td>' + escapeHtml(who) + '</td>' +
             '<td><span class="badge ' + (blocked ? 'badge-red' : 'badge-green') + '">' + escapeHtml(outcome) + '</span></td>' +
-            '<td style="font-size:0.75rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(detail) + '</td></tr>';
+            '<td class="td-ellipsis">' + escapeHtml(detail) + '</td></tr>';
     }).join('');
     auditCursor = data.cursor || '';
     var pag = document.getElementById('audit-pagination');
     if (data.has_more) {
-        pag.innerHTML = '<button data-action="searchAuditMore" data-cursor="' + auditCursor + '" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Load more</button>';
+        pag.innerHTML = '<button data-action="searchAuditMore" data-cursor="' + auditCursor + '" class="btn-page">Load more</button>';
     } else {
         pag.innerHTML = '';
     }
@@ -1195,8 +1402,8 @@ async function loadIpAccess() {
         for (var ip in blocked.blocked_ips) {
             var info = blocked.blocked_ips[ip];
             var ts = info.blocked_at ? new Date(info.blocked_at * 1000).toLocaleString() : '-';
-            html += '<tr><td>' + escapeHtml(ip) + '</td><td style="font-size:0.75rem">' + escapeHtml(ts) + '</td><td style="font-size:0.75rem">' + escapeHtml(info.reason || '-') + '</td>';
-            html += '<td><button data-action="unblockIp" data-ip="' + escapeHtml(ip) + '" style="padding:2px 8px;background:#ef4444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.75rem">Unblock</button></td></tr>';
+            html += '<tr><td>' + escapeHtml(ip) + '</td><td class="td-xxs">' + escapeHtml(ts) + '</td><td class="td-xxs">' + escapeHtml(info.reason || '-') + '</td>';
+            html += '<td><button data-action="unblockIp" data-ip="' + escapeHtml(ip) + '" class="btn-unblock">Unblock</button></td></tr>';
         }
         html += '</tbody></table>';
         el.innerHTML = html;
@@ -1209,7 +1416,7 @@ async function loadIpAccess() {
     if (allowed && allowed.total > 0) {
         var html2 = '';
         allowed.allowed_ips.forEach(function(ip) {
-            html2 += '<span style="display:inline-flex;align-items:center;gap:4px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;padding:2px 8px;margin:2px;font-size:0.8rem;">' + escapeHtml(ip) + ' <button data-action="removeAllowedIp" data-ip="' + escapeHtml(ip) + '" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:0.7rem;">x</button></span>';
+            html2 += '<span class="ip-chip">' + escapeHtml(ip) + ' <button data-action="removeAllowedIp" data-ip="' + escapeHtml(ip) + '" class="chip-x">x</button></span>';
         });
         el2.innerHTML = html2;
     } else {
@@ -1238,16 +1445,16 @@ async function removeAllowedIp(ip) {
 
 // Dismiss helpers
 function dismissOnboarding() {
-    document.getElementById('onboarding-checklist').style.display = 'none';
+    document.getElementById('onboarding-checklist').classList.remove('is-open');
     localStorage.setItem('ysg_onboarding_dismissed', '1');
 }
 
 function dismissAgentToken() {
-    document.getElementById('agent-token-panel').style.display = 'none';
+    document.getElementById('agent-token-panel').classList.remove('is-open');
 }
 
 function dismissCredentials() {
-    document.getElementById('credentials-panel').style.display = 'none';
+    document.getElementById('credentials-panel').classList.remove('is-open');
 }
 
 function extendSession() {
@@ -1283,7 +1490,7 @@ async function checkOnboarding() {
     if (!agCb.checked || !alCb.checked) {
         show = true;
     }
-    if (show) obEl.style.display = 'block';
+    if (show) obEl.classList.add('is-open');
 }
 checkOnboarding();
 
@@ -1302,11 +1509,11 @@ setInterval(function() {
         var mins = Math.ceil(remaining / 60000);
         var banner = document.createElement('div');
         banner.id = 'session-warning';
-        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#f59e0b;color:#000;padding:8px 16px;text-align:center;font-size:0.85rem;z-index:9999;';
+        banner.className = 'session-banner';
         banner.textContent = 'Session expires in ' + mins + ' minutes. ';
         var extendBtn = document.createElement('button');
         extendBtn.setAttribute('data-action', 'extendSession');
-        extendBtn.style.cssText = 'margin-left:12px;padding:4px 12px;background:#fff;border:1px solid #d97706;border-radius:4px;cursor:pointer;font-size:0.8rem';
+        extendBtn.className = 'session-banner-btn';
         extendBtn.textContent = 'Extend session';
         banner.appendChild(extendBtn);
         document.body.prepend(banner);
@@ -1545,6 +1752,32 @@ document.addEventListener('click', function(e) {
         case 'unbindBinding':
             unbindBinding(actionEl.getAttribute('data-binding-id'));
             break;
+
+        // RBAC group management (parity with /admin/rbac API)
+        case 'rbacAddResourceRow':
+            rbacAddResourceRow();
+            break;
+        case 'createGroup':
+            createGroup();
+            break;
+        case 'deleteGroup':
+            deleteGroup(actionEl.getAttribute('data-group-id'), actionEl.getAttribute('data-group-name'));
+            break;
+        case 'rbacManageMembers':
+            rbacManageMembers(actionEl.getAttribute('data-group-id'), actionEl.getAttribute('data-group-name'));
+            break;
+        case 'rbacMembersClose':
+            rbacMembersClose();
+            break;
+        case 'addRbacMember':
+            addRbacMember(actionEl.getAttribute('data-group-id'));
+            break;
+        case 'removeRbacMember':
+            removeRbacMember(actionEl.getAttribute('data-group-id'), actionEl.getAttribute('data-member-email'));
+            break;
+        case 'rbacForcePush':
+            rbacForcePush();
+            break;
         case 'policyEditCopy':
             policyEditCopy();
             break;
@@ -1573,11 +1806,11 @@ async function loadServices() {
         // host engine). "Deployed" vs "Not deployed" instead of Running/Stopped.
         var badge = s.status === 'running'
             ? '<span class="badge badge-green">Deployed</span>'
-            : '<span class="badge" style="background:#f1f5f9;color:#64748b;">Not deployed</span>';
+            : '<span class="badge badge-slate">Not deployed</span>';
         var note = s.status === 'running'
-            ? '<span style="font-size:0.75rem;color:#64748b">enabled at install</span>'
-            : '<span style="font-size:0.75rem;color:#94a3b8">re-run installer with --' + escapeHtml(s.profile || s.id) + ' to add</span>';
-        html += '<tr><td>' + escapeHtml(s.name) + '</td><td style="font-size:0.8rem;color:#64748b">' + escapeHtml(s.description) + '</td><td>' + badge + '</td><td>' + note + '</td></tr>';
+            ? '<span class="svc-note">enabled at install</span>'
+            : '<span class="svc-note-faint">re-run installer with --' + escapeHtml(s.profile || s.id) + ' to add</span>';
+        html += '<tr><td>' + escapeHtml(s.name) + '</td><td class="td-muted">' + escapeHtml(s.description) + '</td><td>' + badge + '</td><td>' + note + '</td></tr>';
     });
     el.innerHTML = html || '<tr><td colspan="4" class="empty">No optional services available</td></tr>';
 }
@@ -1615,7 +1848,7 @@ async function loadBackup() {
         return;
     }
     if (!data.backups || data.backups.length === 0) {
-        container.innerHTML = '<p style="font-size:0.85rem;color:#64748b;">No backups found.</p>';
+        container.innerHTML = '<p class="backup-empty">No backups found.</p>';
         if (btn) btn.disabled = true;
         return;
     }
@@ -1626,11 +1859,11 @@ async function loadBackup() {
     };
     var rows = data.backups.map(function(b) {
         return '<tr>' +
-            '<td style="font-family:monospace;font-size:0.8rem">' + escapeHtml(b.name) + '</td>' +
+            '<td class="td-mono-xs">' + escapeHtml(b.name) + '</td>' +
             '<td>' + escapeHtml(b.type) + '</td>' +
-            '<td style="font-size:0.8rem;color:#64748b">' + (b.created_at ? escapeHtml(b.created_at) : 'unknown') + '</td>' +
+            '<td class="td-muted">' + (b.created_at ? escapeHtml(b.created_at) : 'unknown') + '</td>' +
             '<td>' + manifestBadge(b.manifest_state) + '</td>' +
-            '<td style="font-size:0.8rem">' + (b.size_bytes / 1024).toFixed(1) + ' KB</td>' +
+            '<td class="td-xs">' + (b.size_bytes / 1024).toFixed(1) + ' KB</td>' +
             '</tr>';
     }).join('');
     container.innerHTML = '<table><thead><tr><th>Name</th><th>Type</th><th>Created</th><th>Manifest</th><th>Size</th></tr></thead><tbody>' + rows + '</tbody></table>';
@@ -1644,19 +1877,19 @@ async function createBackup() {
     var btn = document.getElementById('btn-create-backup');
     var resultDiv = document.getElementById('backup-create-result');
     if (!resultDiv) return;
-    resultDiv.style.display = 'block';
+    resultDiv.classList.add('is-open');
     resultDiv.innerHTML = '<span class="loading">Creating database backup…</span>';
     if (btn) btn.disabled = true;
     try {
         var resp = await apiMutate('/admin/backup/create', { method: 'POST', headers: {'Content-Type': 'application/json'} });
-        if (!resp) { resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">Request failed or was cancelled</span>'; return; }
+        if (!resp) { resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span class="txt-err-dk">Request failed or was cancelled</span>'; return; }
         var data = await resp.json().catch(function() { return {}; });
         if (resp.ok && data.status === 'ok') {
             var kb = Math.round((data.size_bytes || 0) / 1024);
-            resultDiv.innerHTML = '<span class="badge badge-green">Created</span> <span style="font-size:0.8rem;color:#334155">' + escapeHtml(data.backup_name) + ' &mdash; ' + kb + ' KB</span>';
+            resultDiv.innerHTML = '<span class="badge badge-green">Created</span> <span class="txt-ok-dk">' + escapeHtml(data.backup_name) + ' &mdash; ' + kb + ' KB</span>';
             loadBackup();
         } else {
-            resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">' + escapeHtml(errMsg(data, resp.status)) + '</span>';
+            resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span class="txt-err-dk">' + escapeHtml(errMsg(data, resp.status)) + '</span>';
         }
     } finally {
         if (btn) btn.disabled = false;
@@ -1669,7 +1902,7 @@ async function verifyBackup() {
     if (!btn || !resultDiv) return;
     var backupName = btn.dataset.backupName;
     if (!backupName) return;
-    resultDiv.style.display = 'block';
+    resultDiv.classList.add('is-open');
     resultDiv.innerHTML = '<span class="loading">Verifying...</span>';
     btn.disabled = true;
     try {
@@ -1678,23 +1911,23 @@ async function verifyBackup() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({backup_name: backupName})
         });
-        if (!resp) { resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">Request failed or was cancelled</span>'; return; }
+        if (!resp) { resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span class="txt-err-dk">Request failed or was cancelled</span>'; return; }
         var data = await resp.json();
         if (resp.ok && data.ok) {
-            resultDiv.innerHTML = '<span class="badge badge-green">PASS</span> <span style="font-size:0.8rem;color:#334155">' + escapeHtml(data.backup_name) + ' &mdash; manifest: ' + escapeHtml(data.manifest_state) + ' &mdash; verified at ' + escapeHtml(data.verified_at) + '</span>';
+            resultDiv.innerHTML = '<span class="badge badge-green">PASS</span> <span class="txt-ok-dk">' + escapeHtml(data.backup_name) + ' &mdash; manifest: ' + escapeHtml(data.manifest_state) + ' &mdash; verified at ' + escapeHtml(data.verified_at) + '</span>';
         } else if (resp.ok && !data.ok) {
             var mismatches = (data.mismatches || []).map(function(m) {
                 var rec = m.recorded ? m.recorded.substring(0, 12) + '...' : 'n/a';
                 var comp = m.computed ? m.computed.substring(0, 12) + '...' : 'n/a';
-                return '<li style="font-size:0.75rem;font-family:monospace">' + escapeHtml(m.file) + ' (' + escapeHtml(m.issue || 'mismatch') + '): recorded=' + rec + ' computed=' + comp + '</li>';
+                return '<li class="crypto-mismatch">' + escapeHtml(m.file) + ' (' + escapeHtml(m.issue || 'mismatch') + '): recorded=' + rec + ' computed=' + comp + '</li>';
             }).join('');
-            resultDiv.innerHTML = '<span class="badge badge-red">FAIL</span> <span style="font-size:0.8rem;color:#334155">' + escapeHtml(data.backup_name) + ' &mdash; manifest: ' + escapeHtml(data.manifest_state) + '</span>' + (mismatches ? '<ul style="margin-top:6px;padding-left:16px">' + mismatches + '</ul>' : '');
+            resultDiv.innerHTML = '<span class="badge badge-red">FAIL</span> <span class="txt-ok-dk">' + escapeHtml(data.backup_name) + ' &mdash; manifest: ' + escapeHtml(data.manifest_state) + '</span>' + (mismatches ? '<ul class="mismatch-list">' + mismatches + '</ul>' : '');
         } else {
             var errDetail = (data && data.detail && data.detail.error) ? data.detail.error : ('HTTP ' + resp.status);
-            resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">' + escapeHtml(errDetail) + '</span>';
+            resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span class="txt-err-dk">' + escapeHtml(errDetail) + '</span>';
         }
     } catch (err) {
-        resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">Request failed: ' + escapeHtml(err.message) + '</span>';
+        resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span class="txt-err-dk">Request failed: ' + escapeHtml(err.message) + '</span>';
     } finally {
         if (btn) btn.disabled = false;
     }

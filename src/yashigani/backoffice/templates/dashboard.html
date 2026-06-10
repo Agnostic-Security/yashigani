@@ -18,6 +18,7 @@
                 <button data-action="showPage" data-param="budgets">Budgets</button>
                 <button data-action="showPage" data-param="models">Models</button>
                 <button data-action="showPage" data-param="policies">Policies</button>
+                <button data-action="showPage" data-param="rbac">Access</button>
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
@@ -527,6 +528,63 @@
                     <p class="txt-note mt-sm">Examples are <strong>immutable templates</strong>. "Create editable copy"
                         lets you edit and save under a new name (<code>clients.&lt;name&gt;</code>) — validated by OPA and loaded immediately.
                         To persist across a full redeploy, add it to your policy bundle. (Activate + ingress/egress enforcement is the next phase.)</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Access (RBAC) Page — wires the existing /admin/rbac group-management API -->
+        <div class="page" id="page-rbac">
+            <h2>Access (RBAC Groups)</h2>
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Groups</span>
+                    <button data-action="toggleForm" data-form-id="create-group-form" class="btn-xs-add">+ Create group</button>
+                </div>
+                <div id="create-group-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Display name</label><br><input id="rbac-group-name" type="text" placeholder="e.g. Support team" class="fi w-200"></div>
+                    </div>
+                    <p class="txt-note mt-sm">Allowed resources (method + path glob). Add one or more rows; blank rows are ignored.</p>
+                    <div id="rbac-resource-rows">
+                        <div class="form-row rbac-resource-row">
+                            <div><label class="lbl">Method</label><br><select class="fi rbac-res-method"><option value="*">*</option><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option><option value="DELETE">DELETE</option></select></div>
+                            <div><label class="lbl">Path glob</label><br><input type="text" placeholder="/mcp/**" class="fi w-250 rbac-res-path"></div>
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <button data-action="rbacAddResourceRow" class="btn-xs-add">+ Add resource</button>
+                        <button data-action="createGroup" class="btn-sm-save">Create group</button>
+                    </div>
+                    <div id="rbac-create-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>ID</th><th>Display name</th><th>Members</th><th>Allowed resources</th><th>Actions</th></tr></thead>
+                    <tbody id="rbac-groups-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                </table>
+            </div>
+            <div class="panel is-hidden" id="rbac-members-panel">
+                <div class="panel-header panel-header-flex">
+                    <span id="rbac-members-title">Members</span>
+                    <button data-action="rbacMembersClose" class="btn btn-sm">Close</button>
+                </div>
+                <div class="panel-body">
+                    <div class="form-row--wrap-mb">
+                        <label class="lbl">Member email<br>
+                            <input id="rbac-member-email" type="email" placeholder="user@example.com" class="fi-sm"></label>
+                        <button data-action="addRbacMember" class="btn-sm-primary">Add member</button>
+                    </div>
+                    <div id="rbac-members-container"><span class="loading">Select a group's "Members" action to manage members.</span></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">OPA synchronisation</div>
+                <div class="panel-body">
+                    <p class="txt-note">Group changes are pushed to the OPA decision service automatically on every
+                        mutation. Use this to force a re-push (e.g. after an OPA restart).</p>
+                    <div class="form-row--mt-center">
+                        <button data-action="rbacForcePush" class="btn-sm-save">Re-push to OPA</button>
+                        <span id="rbac-push-result" class="txt-note"></span>
+                    </div>
                 </div>
             </div>
         </div>
