@@ -62,6 +62,7 @@ from yashigani.documents.pipeline import (
     DISPOSITION_BLOCK,
     DISPOSITION_LOG,
     DISPOSITION_PSEUDONYMIZE,
+    DISPOSITION_ROUTE_LOCAL,
     DocumentInspectionPipeline,
 )
 from yashigani.documents.pseudonymize import ModeBRoundTrip
@@ -136,6 +137,15 @@ class EgressOutcome:
     round_trip: Optional[ModeBRoundTrip] = None
     block_reason: Optional[str] = None
     action: str = DISPOSITION_LOG
+    #: PART 2 (Laura D1) field-role routing: OPA decided ROUTE_LOCAL — the document
+    #: carries an OPERATE_ON sensitive field a cloud model would hallucinate over,
+    #: so the proxy MUST pin the whole call to the LOCAL model and forward the
+    #: ORIGINAL bytes (values stay in-estate, never tokenised to the cloud).  When
+    #: True the proxy reroutes to the local model instead of the cloud upstream.
+    route_local: bool = False
+    #: The operate-on sensitive data classes that forced ROUTE_LOCAL (audit /
+    #: layman-alert breadcrumb; class names only, never values).
+    operate_on_classes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -167,6 +177,7 @@ async def egress_decide(
     content_type: str,
     request_id: str,
     route: str = PROXY_EGRESS_ROUTE,
+    egress_mode: str = "B",
     detokenize_rbac_role: Optional[str] = None,
 ) -> EgressOutcome:
     """OUTBOUND: ask REAL OPA what to do with a document leaving via the proxy,
@@ -178,15 +189,25 @@ async def egress_decide(
     ``/inspect`` route uses (:func:`evaluate_document_decision`), so there is ONE
     decision source of truth for the UI and the proxy.
 
+    ``egress_mode`` (default ``"B"``) is the pseudonymize mode the proxy egress
+    declares to OPA — the egress is the CLOUD round-trip leg, so it is mode B by
+    default.  It is what lets the rego drive a mode-B round-trip AND fire the PART 2
+    ROUTE_LOCAL field-role escalation (cloud-bound / mode-B PSEUDONYMIZE only).
+
     Two passes, mirroring ``/inspect``:
       1. enumerate (LOG mode) to build the OPA input WITHOUT applying any
          transform — the action decision is OPA's job;
-      2. ``evaluate_document_decision`` over the live matrix → the action + mode;
+      2. ``evaluate_document_decision`` over the live matrix (declaring
+         ``egress_mode``) → the action + mode;
       3. apply the OPA-decided action via the pipeline.
 
     Mapping of the OPA action onto the egress:
       * BLOCK         → ``blocked=True`` (the proxy holds the document);
       * LOG           → forward the ORIGINAL bytes unchanged (allow + audit);
+      * ROUTE_LOCAL   → forward the ORIGINAL bytes to the LOCAL model
+        (``route_local=True``); the values never go cloud-bound (PART 2 / Laura
+        D1 field-role routing — an operate-on sensitive field the cloud would
+        hallucinate over).  OPA decides; the pipeline ``_route_local`` applies;
       * REDACT        → forward the stripped artefact (``transformed=True``);
       * PSEUDONYMIZE mode A → forward the tokenized artefact, NO round-trip (the
         user holds the correspondence table; the cloud only ever sees tokens);
@@ -227,13 +248,20 @@ async def egress_decide(
     # --- Pass 2: ask REAL OPA (the SAME decision source as /inspect). ----------
     # evaluate_document_decision NEVER raises and NEVER fails open: any OPA error /
     # timeout / unreachable → a synthetic fail-closed BLOCK decision.
+    # The proxy egress IS the CLOUD round-trip leg, so it declares ``egress_mode``
+    # (default "B") to OPA: that is what lets the rego (a) drive a mode-B
+    # PSEUDONYMIZE round-trip, and (b) fire the PART 2 ROUTE_LOCAL field-role
+    # escalation (which only applies to a cloud-bound / mode-B PSEUDONYMIZE).  A
+    # mode-A egress would never see ROUTE_LOCAL because mode A keeps the join under
+    # the user's local control (no cloud blob).
     decision = await evaluate_document_decision(
         opa_url,
         opa_input,
         route=route,
+        pseudonymize_mode=egress_mode,
     )
     opa_action = decision.get("action", DISPOSITION_BLOCK)
-    opa_mode = decision.get("pseudonymize_mode", "A")
+    opa_mode = decision.get("pseudonymize_mode", egress_mode)
 
     if opa_action == DISPOSITION_BLOCK:
         return EgressOutcome(
@@ -246,6 +274,49 @@ async def egress_decide(
         # Allow + audit — forward the original bytes unchanged (the enum pass
         # already wrote the LOG audit event).  Not a transform, not a round-trip.
         return EgressOutcome(engaged=False, action=DISPOSITION_LOG)
+
+    if opa_action == DISPOSITION_ROUTE_LOCAL:
+        # PART 2 (Laura D1): OPA decided the field-role escalation — an OPERATE_ON
+        # sensitive field a cloud model would hallucinate over.  We do NOT tokenise
+        # to the cloud; we pin the whole call to the LOCAL model and forward the
+        # ORIGINAL bytes (values stay in-estate).  Re-run the pipeline with the
+        # OPA-decided action so the single source of truth (the pipeline's
+        # _route_local) writes the DOCUMENT_ROUTED_LOCAL audit event + computes the
+        # operate_on_classes breadcrumb — OPA decides, the pipeline applies.
+        try:
+            rl = pipeline.inspect(
+                data=body,
+                declared_mime=content_type,
+                request_id=request_id,
+                requested_action=DISPOSITION_ROUTE_LOCAL,
+            )
+        except Exception:
+            # An unexpected fault on the route-local apply must not break traffic
+            # NOR fail open to the cloud: degrade to BLOCK (hold the document)
+            # rather than forward an operate-on sensitive value to the cloud.
+            logger.exception(
+                "doc egress: ROUTE_LOCAL apply raised — holding the document "
+                "(fail-closed, not forwarded to cloud) (request_id=%s)", request_id,
+            )
+            return EgressOutcome(
+                engaged=False, blocked=True, forward_bytes=None,
+                block_reason="route_local_apply_failed", action=DISPOSITION_BLOCK,
+            )
+        if rl.disposition != DISPOSITION_ROUTE_LOCAL or rl.forward_bytes is None:
+            # The pipeline did not produce a clean route-local result — fail-closed
+            # to BLOCK rather than risk a cloud-bound forward of a sensitive value.
+            return EgressOutcome(
+                engaged=False, blocked=True, forward_bytes=None,
+                block_reason=rl.block_reason or "route_local_not_produced",
+                action=DISPOSITION_BLOCK,
+            )
+        return EgressOutcome(
+            engaged=False,
+            action=DISPOSITION_ROUTE_LOCAL,
+            route_local=True,
+            forward_bytes=rl.forward_bytes,
+            operate_on_classes=list(rl.operate_on_classes),
+        )
 
     # --- Pass 3: apply the OPA-decided transform (REDACT / PSEUDONYMIZE). ------
     detok = decision.get("detokenize_rbac_role") or detokenize_rbac_role

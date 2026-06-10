@@ -337,3 +337,188 @@ test_format_scoping_unmatched_blocks if {
 test_default_block_no_input if {
 	document.action == "BLOCK" with input as {}
 }
+
+# ---------------------------------------------------------------------------
+# 16. PART 2 (Laura D1) field-role routing — ROUTE_LOCAL.
+#     An OPERATE_ON sensitive field (e.g. SALARY/AMOUNT/IBAN/DOB) on a CLOUD-bound
+#     (mode-B) PSEUDONYMIZE escalates the disposition to ROUTE_LOCAL: the whole
+#     document is routed to the LOCAL model rather than blobbing a value the cloud
+#     would hallucinate over.  Precedence: BLOCK > REDACT > ROUTE_LOCAL >
+#     PSEUDONYMIZE > LOG.
+# ---------------------------------------------------------------------------
+
+# An OPERATE_ON sensitive match (currency amount the cloud would sum/compute on).
+_match_amount_operate := {
+	"data_class": "PII.AMOUNT",
+	"qi": false,
+	"instance": "£**,***",
+	"location": "TABLE_CELL:sheet=S!C2:span=0-7",
+	"field_role": "OPERATE_ON",
+}
+
+# An OPERATE_ON sensitive IBAN (checksum-validated by the model).
+_match_iban_operate := {
+	"data_class": "PII.IBAN",
+	"qi": false,
+	"instance": "GB**...**",
+	"location": "TABLE_CELL:sheet=S!D2:span=0-21",
+	"field_role": "OPERATE_ON",
+}
+
+# A REFERENCE_ONLY match (email — safe to opaque-tokenise; no ROUTE_LOCAL).
+_match_email_reference := {
+	"data_class": "PII.EMAIL",
+	"qi": false,
+	"instance": "j***@e.com",
+	"location": "BODY:p1:span=0-9",
+	"field_role": "REFERENCE_ONLY",
+}
+
+# A pseudonymize policy on the cloud egress route (the matrix asks PSEUDONYMIZE).
+_policies_pseudo_pii_b := [{
+	"data_class": "PII",
+	"format": "any",
+	"route": "any",
+	"action": "PSEUDONYMIZE",
+	"pseudonymize_mode": "B",
+	"small_set_escalation": false,
+}]
+
+# 16a — OPERATE_ON sensitive + cloud (mode B) + PSEUDONYMIZE ⇒ ROUTE_LOCAL.
+test_route_local_operate_on_sensitive_cloud if {
+	document.action == "ROUTE_LOCAL" with input as {
+		"document": _doc([_match_amount_operate], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+}
+
+# 16b — REFERENCE_ONLY field on the same cloud PSEUDONYMIZE ⇒ normal PSEUDONYMIZE.
+test_route_local_reference_only_stays_pseudonymize if {
+	document.action == "PSEUDONYMIZE" with input as {
+		"document": _doc([_match_email_reference], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+}
+
+# 16c — OPERATE_ON sensitive but MODE A (table stays under the user's local
+# control, not cloud-bound) ⇒ normal PSEUDONYMIZE (the seam fires on mode B only).
+test_route_local_mode_a_stays_pseudonymize if {
+	document.action == "PSEUDONYMIZE" with input as {
+		"document": _doc([_match_amount_operate], true, true),
+		"request": {"pseudonymize_mode": "A"},
+	}
+		with data.yashigani.document.policies as [{
+			"data_class": "PII", "format": "any", "route": "any",
+			"action": "PSEUDONYMIZE", "pseudonymize_mode": "A",
+			"small_set_escalation": false,
+		}]
+}
+
+# 16d — precedence: REDACT configured beats ROUTE_LOCAL (the operate-on field is
+# permanently removed, so there is nothing for the cloud to hallucinate over).
+test_route_local_redact_wins if {
+	policies := [
+		{"data_class": "PII", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "B", "small_set_escalation": false},
+		{"data_class": "PII", "format": "any", "route": "any", "action": "REDACT", "pseudonymize_mode": "B", "small_set_escalation": false},
+	]
+	document.action == "REDACT" with input as {
+		"document": _doc([_match_amount_operate], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as policies
+}
+
+# 16e — precedence: BLOCK configured beats ROUTE_LOCAL (a hold still wins).
+test_route_local_block_wins if {
+	policies := [
+		{"data_class": "PII", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "B", "small_set_escalation": false},
+		{"data_class": "PII", "format": "any", "route": "any", "action": "BLOCK", "pseudonymize_mode": "B", "small_set_escalation": false},
+	]
+	document.action == "BLOCK" with input as {
+		"document": _doc([_match_amount_operate], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as policies
+}
+
+# 16f — precedence: ROUTE_LOCAL beats a plain (non-escalated) PSEUDONYMIZE when
+# both an operate-on sensitive AND a reference-only field are present on mode B.
+test_route_local_beats_pseudonymize_mixed if {
+	document.action == "ROUTE_LOCAL" with input as {
+		"document": _doc([_match_email_reference, _match_iban_operate], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+}
+
+# 16g — ROUTE_LOCAL fires even on an UNSUPPORTED re-render format (it forwards the
+# ORIGINAL bytes to the local model — no re-render needed), rather than BLOCKing.
+test_route_local_unsupported_format_still_routes if {
+	document.action == "ROUTE_LOCAL" with input as {
+		"document": _doc([_match_amount_operate], true, false),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+}
+
+# 16h — unknown OPERATE_ON class is fail-safe SENSITIVE ⇒ ROUTE_LOCAL (mirrors the
+# Python is_operate_on_sensitive fail-safe: unknown operate-on class is sensitive).
+test_route_local_unknown_operate_on_is_sensitive if {
+	unknown := {
+		"data_class": "PII.MYSTERY_VALUE",
+		"qi": false,
+		"instance": "***",
+		"location": "BODY:p1:span=0-3",
+		"field_role": "OPERATE_ON",
+	}
+	document.action == "ROUTE_LOCAL" with input as {
+		"document": _doc([unknown], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+}
+
+# 16i — known OPERATE_ON but NON-sensitive class (PHONE/DATE) does NOT route local;
+# it stays a normal PSEUDONYMIZE (mirrors _operate_on_nonsensitive_classes).
+test_route_local_nonsensitive_operate_on_stays_pseudonymize if {
+	phone := {
+		"data_class": "PII.PHONE",
+		"qi": false,
+		"instance": "+44******",
+		"location": "BODY:p1:span=0-9",
+		"field_role": "OPERATE_ON",
+	}
+	document.action == "PSEUDONYMIZE" with input as {
+		"document": _doc([phone], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+}
+
+# 16j — self-describing contract on a ROUTE_LOCAL decision: code, user_message,
+# allow, obligation, operate_on_classes breadcrumb all present + correct.
+test_route_local_decision_contract if {
+	d := document.decision with input as {
+		"document": _doc([_match_amount_operate, _match_iban_operate], true, true),
+		"request": {"pseudonymize_mode": "B"},
+	}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+	d.action == "ROUTE_LOCAL"
+	d.code == "DOCUMENT_ROUTED_LOCAL"
+	d.allow == true
+	d.user_message != ""
+	d.policy_id == "DOC-ENFORCE-001"
+	d.operate_on_classes == {"PII.AMOUNT", "PII.IBAN"}
+	"route_document_to_local_model" in d.obligations
+	"audit_document_decision" in d.obligations
+}
+
+# 16k — a LOG/PSEUDONYMIZE decision carries an EMPTY operate_on_classes set (the
+# breadcrumb is ROUTE_LOCAL-only).
+test_operate_on_classes_empty_off_route_local if {
+	d := document.decision with input as {"document": _doc([_match_email_reference], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii_b
+	count(d.operate_on_classes) == 0
+}

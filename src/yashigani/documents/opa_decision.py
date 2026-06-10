@@ -4,8 +4,13 @@ Yashigani Document Enforcement — real-OPA decision client (2.26).
 Queries the production document rego (policy/document.rego, package
 ``yashigani.document``) for the document disposition.  This is the path that
 makes the document decision run through the ACTUAL OPA engine — the matrix-driven
-``action`` (LOG / REDACT / PSEUDONYMIZE / BLOCK) is computed by OPA from the
-operator's persisted policies, NOT by a Python branch.
+``action`` (LOG / REDACT / PSEUDONYMIZE / ROUTE_LOCAL / BLOCK) is computed by OPA
+from the operator's persisted policies, NOT by a Python branch.  ROUTE_LOCAL is the
+PART 2 (Laura D1) field-role escalation: a cloud-bound (mode-B) PSEUDONYMIZE that
+carries an OPERATE_ON sensitive field is routed to the LOCAL model by OPA rather
+than blobbing a value the cloud would hallucinate over (policy/document.rego
+``_route_local_escalation``).  The pipeline's field-role seam stays as the
+fail-closed backstop when OPA is unreachable.
 
 Query shape mirrors the gateway proxy's ``_opa_check`` (gateway/proxy.py):
     POST {opa_url}/v1/data/yashigani/document/decision
@@ -58,7 +63,7 @@ def _coerce(result: object) -> dict:
         logger.error("document OPA: result is not an object (%r) — fail-closed", type(result))
         return dict(_FAIL_CLOSED_DECISION)
     action = result.get("action")
-    if action not in ("LOG", "REDACT", "PSEUDONYMIZE", "BLOCK"):
+    if action not in ("LOG", "REDACT", "PSEUDONYMIZE", "ROUTE_LOCAL", "BLOCK"):
         logger.error("document OPA: unknown action %r — fail-closed", action)
         return dict(_FAIL_CLOSED_DECISION)
     return result

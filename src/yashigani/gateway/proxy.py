@@ -750,6 +750,40 @@ async def _proxy_request_body(
                     },
                     headers={"X-Yashigani-Request-Id": request_id},
                 )
+            if _egress.route_local:
+                # OPA decided ROUTE_LOCAL (PART 2 / Laura D1): the document carries
+                # an OPERATE_ON sensitive field a cloud model would hallucinate over,
+                # so it must be handled by the LOCAL model, not this CLOUD-bound MCP
+                # upstream.  This proxy egress has NO local-model leg attached, so
+                # the only fail-closed-correct action is to HOLD the document (never
+                # forward an operate-on sensitive value to the cloud).  The operator
+                # routes such documents through the local-model path; the header
+                # tells the caller why.  Mirrors the pipeline's no-local-route
+                # fail-closed (OPERATE_ON_BLOCK) — hold, never leak.
+                _audit_request(
+                    audit_writer, request_id, "BLOCKED", "document_route_local_no_cloud",
+                    request, path,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "DOCUMENT_ROUTED_LOCAL",
+                        "detail": (
+                            "The document contains values an external model would "
+                            "compute on (e.g. amounts, dates of birth, account "
+                            "numbers). Replacing them with placeholders would make "
+                            "the external model invent wrong values, so it was not "
+                            "forwarded to the cloud upstream. Route this document "
+                            "through the local-model path."
+                        ),
+                        "operate_on_classes": _egress.operate_on_classes,
+                        "request_id": request_id,
+                    },
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-Document-Route": "local",
+                    },
+                )
             if _egress.transformed and _egress.forward_bytes is not None:
                 # OPA decided REDACT or PSEUDONYMIZE — send the transformed
                 # (stripped/tokenized) artefact to the upstream, never the original.

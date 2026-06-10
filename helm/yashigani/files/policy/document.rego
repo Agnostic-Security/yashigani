@@ -14,7 +14,21 @@
 #   matches contributes a candidate action.  The document disposition is the
 #   STRONGEST candidate action under the precedence:
 #
-#       BLOCK  >  REDACT  >  PSEUDONYMIZE  >  LOG
+#       BLOCK  >  REDACT  >  ROUTE_LOCAL  >  PSEUDONYMIZE  >  LOG
+#
+#   ROUTE_LOCAL (PART 2 / Laura D1, field-role routing): the matrix asked for
+#   PSEUDONYMIZE on a CLOUD-bound (mode-B) egress, but a matched value is an
+#   OPERATE_ON sensitive field (a currency amount, DOB, IBAN/PAN the cloud model
+#   would compute on / validate).  An opaque token in place of such a value makes
+#   the cloud model HALLUCINATE a plausible value and reason over the invention —
+#   a correctness AND a confidentiality problem.  So instead of blobbing it to the
+#   cloud we route the WHOLE document to the LOCAL model (the original values stay
+#   in-estate, no broken blob).  It sits ABOVE PSEUDONYMIZE (overrides a
+#   cloud-bound pseudonymize) and BELOW REDACT/BLOCK (a configured permanent
+#   removal or a hold still wins — the operate-on value is gone / held either way).
+#   This is the OPA-side mirror of the pipeline's field-role seam
+#   (documents/pipeline.py _pseudonymize PART 2): OPA decides, the Python seam is
+#   the fail-closed backstop when OPA is unreachable.
 #
 #   Fail-closed (plan §6.1, NON-NEGOTIABLE):
 #     - extraction_complete == false             → BLOCK (uninspectable parts)
@@ -30,7 +44,14 @@
 #   input.document.matches[]              DataMatch[] (datamatch.py as_opa_match), each:
 #                                           { data_class: "PII.EMAIL"|... ,
 #                                             qi: bool, instance: <MASKED>,
-#                                             location: "<kind>:<loc>:span=a-b" }
+#                                             location: "<kind>:<loc>:span=a-b",
+#                                             field_role: "REFERENCE_ONLY"|
+#                                                         "OPERATE_ON" }
+#                                           field_role (PART 2 / field_role.py):
+#                                           OPERATE_ON = the model computes on /
+#                                           validates the value; an opaque blob
+#                                           makes the cloud hallucinate.  Drives
+#                                           the ROUTE_LOCAL decision below.
 #   input.document.record_count           int — population size (small-set gate, F2)
 #   input.document.reid_handle            string — UNGUESSABLE capability token (F5)
 #   input.document.pseudonymize_supported bool — format re-renders coherently this version
@@ -181,11 +202,56 @@ _reid_escalation if {
 }
 
 # ---------------------------------------------------------------------------
-# Strongest-action precedence: BLOCK > REDACT > PSEUDONYMIZE > LOG.
-# _strongest_configured is the strongest action the MATRIX asked for (before the
-# fail-closed overrides); _action folds in the overrides.
+# PART 2 (Laura D1) field-role routing — ROUTE_LOCAL gate.
+# A match is OPERATE_ON *sensitive* when field_role == "OPERATE_ON" AND its class
+# is one the cloud would compute on / validate as a confidentiality concern, not a
+# mere format check.  Mirrors documents/field_role.py is_operate_on_sensitive:
+# the known operate-on-but-non-sensitive classes (PHONE, DATE) are excluded; an
+# unknown OPERATE_ON class is fail-safe SENSITIVE (do not blob to the cloud).
 # ---------------------------------------------------------------------------
-_rank := {"LOG": 1, "PSEUDONYMIZE": 2, "REDACT": 3, "BLOCK": 4}
+_operate_on_nonsensitive_classes := {"PHONE", "DATE"}
+
+# Bare class name (drop the PII./PCI. namespace, upper-case) — mirrors _bare().
+_bare_class(data_class) := upper(c) if {
+	parts := split(data_class, ".")
+	c := parts[count(parts) - 1]
+}
+
+_operate_on_sensitive(m) if {
+	m.field_role == "OPERATE_ON"
+	not _operate_on_nonsensitive_classes[_bare_class(m.data_class)]
+}
+
+# At least one detected match is an operate-on sensitive field.
+_has_operate_on_sensitive if {
+	some m in _matches
+	_operate_on_sensitive(m)
+}
+
+# Mode B is the definite CLOUD round-trip (mode A keeps the join under the user's
+# local control — see pipeline _pseudonymize PART 2).  We mirror the pipeline's
+# trigger exactly: the seam fires on mode B only.
+_cloud_bound if _mode == "B"
+
+# ROUTE_LOCAL fires when the MATRIX asked for PSEUDONYMIZE, the egress is
+# cloud-bound (mode B), and an operate-on sensitive field is present.  This is the
+# field-role override of a cloud-bound pseudonymize: route the whole document to
+# the LOCAL model instead of blobbing a value the cloud would hallucinate over.
+_route_local_escalation if {
+	_strongest_configured == "PSEUDONYMIZE"
+	_cloud_bound
+	_has_operate_on_sensitive
+}
+
+# ---------------------------------------------------------------------------
+# Strongest-action precedence: BLOCK > REDACT > ROUTE_LOCAL > PSEUDONYMIZE > LOG.
+# _strongest_configured is the strongest action the MATRIX asked for (before the
+# fail-closed overrides + the ROUTE_LOCAL field-role escalation); _action folds in
+# the overrides.  ROUTE_LOCAL is not a matrix action — it is an escalation of a
+# cloud-bound PSEUDONYMIZE — so it is not in the matrix-candidate ranking; it is
+# applied as an override in `action` below, ranked between REDACT and PSEUDONYMIZE.
+# ---------------------------------------------------------------------------
+_rank := {"LOG": 1, "PSEUDONYMIZE": 2, "ROUTE_LOCAL": 3, "REDACT": 4, "BLOCK": 5}
 
 default _strongest_configured := "LOG"
 
@@ -209,14 +275,34 @@ action := "LOG" if {
 	count(_matches) == 0
 }
 
+# PART 2 field-role override: a cloud-bound PSEUDONYMIZE carrying an operate-on
+# sensitive field is escalated to ROUTE_LOCAL (route the whole document to the
+# LOCAL model rather than blob a value the cloud would hallucinate over).  This
+# beats PSEUDONYMIZE but is below REDACT/BLOCK — because the escalation requires
+# _strongest_configured == "PSEUDONYMIZE" (REDACT/BLOCK rank higher, so they win
+# the matrix before this rule is even eligible).  Gated by the same
+# fully-inspectable / policed / no-F2 invariants, but NOT by re-render support:
+# ROUTE_LOCAL forwards the ORIGINAL bytes to the local model (no re-render), so it
+# is well-defined even on a format that cannot be re-rendered (mirrors the Python
+# seam, which fires before any re-render is attempted).
+action := "ROUTE_LOCAL" if {
+	_extraction_complete
+	count(_matches) > 0
+	not _unpoliced_match
+	not _reid_escalation
+	_route_local_escalation
+}
+
 # Configured action wins when the document is fully inspectable, every matched
-# class is policed, the chosen re-render is supported, and no F2 escalation.
+# class is policed, the chosen re-render is supported, no F2 escalation, and the
+# PART 2 field-role escalation did not fire.
 action := _strongest_configured if {
 	_extraction_complete
 	count(_matches) > 0
 	not _unpoliced_match
 	not _reid_escalation
 	_action_supported(_strongest_configured)
+	not _route_local_escalation
 }
 
 # --- Fail-closed overrides (each forces BLOCK) -------------------------------
@@ -236,6 +322,10 @@ action := "BLOCK" if {
 	not _unpoliced_match
 	not _reid_escalation
 	not _action_supported(_strongest_configured)
+	# ROUTE_LOCAL needs no re-render (it forwards the ORIGINAL bytes to the local
+	# model), so an unsupported re-render format must NOT BLOCK a route-local
+	# escalation — the field-role override wins (and keeps the doc in-estate).
+	not _route_local_escalation
 }
 
 # A re-rendering action is "supported" only when the format can carry it.
@@ -282,6 +372,11 @@ allow if action == "PSEUDONYMIZE"
 
 allow if action == "REDACT"
 
+# ROUTE_LOCAL allows the document — it is forwarded (untransformed, original
+# bytes) to the LOCAL model, not blocked.  The obligation below pins the local
+# route so the gateway never sends it cloud-bound.
+allow if action == "ROUTE_LOCAL"
+
 deny contains "extraction_incomplete" if not _extraction_complete
 
 deny contains "unpoliced_sensitive_class" if {
@@ -322,6 +417,12 @@ obligations contains "bind_restore_to_egress_positions" if {
 
 obligations contains "strip_hidden_and_metadata" if action == "REDACT"
 
+# ROUTE_LOCAL: pin the whole document + its agent call to the LOCAL model (the
+# original values never leave the estate, so they need no tokenisation; an opaque
+# blob bound for the cloud would make the cloud model hallucinate).  Mirrors the
+# pipeline _route_local disposition (forward original bytes to the local route).
+obligations contains "route_document_to_local_model" if action == "ROUTE_LOCAL"
+
 obligations contains "audit_document_decision"
 
 # ---------------------------------------------------------------------------
@@ -334,6 +435,8 @@ code := "DOCUMENT_REDACTED" if action == "REDACT"
 code := "DOCUMENT_LOGGED" if action == "LOG"
 
 code := "DOCUMENT_BLOCKED" if action == "BLOCK"
+
+code := "DOCUMENT_ROUTED_LOCAL" if action == "ROUTE_LOCAL"
 
 user_message := msg if {
 	action == "PSEUDONYMIZE"
@@ -360,6 +463,19 @@ user_message := "This file could not be safely cleared for its content, so it wa
 	not _reid_escalation
 }
 
+# ROUTE_LOCAL: the file carries values the cloud model would compute on (amounts,
+# dates of birth, account numbers) — a placeholder there would make the cloud
+# invent a wrong value, so the whole file was handled by the on-site model
+# instead and never left your environment.
+user_message := "This file contained values that the external AI would need to calculate with (such as amounts, dates of birth or account numbers). Replacing those with placeholders would make the external AI guess wrong values, so the whole file was handled by the on-site model and never left your environment." if action == "ROUTE_LOCAL"
+
+# The operate-on sensitive data classes that forced the ROUTE_LOCAL decision
+# (audit / layman-alert breadcrumb — class names only, never values; mirrors the
+# pipeline result's operate_on_classes).  Empty for every other action.
+operate_on_classes := {m.data_class | some m in _matches; _operate_on_sensitive(m)} if action == "ROUTE_LOCAL"
+
+default operate_on_classes := set()
+
 # ---------------------------------------------------------------------------
 # The decision document — shared {allow, deny, obligations} at the top so the
 # gateway integrates it uniformly; the rest is document-action output (plan §4.2).
@@ -377,6 +493,8 @@ decision := {
 	"pseudonymize_mode": _mode,
 	"per_match_actions": per_match_actions,
 	"matched_classes": {m.data_class | some m in _matches},
+	# PART 2 field-role routing breadcrumb (class names only — never values).
+	"operate_on_classes": operate_on_classes,
 	# replacer-map custody (opaque handle ONLY — never the map itself; F5).
 	"replacer_map_handle": object.get(object.get(input, "document", {}), "reid_handle", ""),
 	"replacer_map_ttl": _map_ttl,

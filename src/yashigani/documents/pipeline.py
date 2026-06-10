@@ -323,6 +323,19 @@ class DocumentInspectionPipeline:
                 request_id, "policy requested BLOCK",
                 detected=extraction.detected_format, matches=matches, opa_input=opa_input,
             )
+        if action == DISPOSITION_ROUTE_LOCAL:
+            # PART 2 (Laura D1): OPA decided the field-role escalation — route the
+            # whole document to the LOCAL model (forward the ORIGINAL bytes; the
+            # values stay in-estate, no opaque blob bound for the cloud).  OPA is
+            # the decision source of truth; the in-_pseudonymize seam below stays
+            # as the fail-closed backstop for when OPA is unreachable.
+            operate_on = sorted({
+                m.data_class for m in matches
+                if is_operate_on_sensitive(m.data_class)
+            })
+            return self._route_local(
+                request_id, data, extraction, matches, opa_input, operate_on,
+            )
         if action == DISPOSITION_REDACT:
             return self._redact(
                 request_id, data, extraction, matches, originals, opa_input,
