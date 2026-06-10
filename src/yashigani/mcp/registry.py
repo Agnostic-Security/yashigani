@@ -114,9 +114,23 @@ class McpBrokerRegistry:
 def build_registry_from_env(
     opa_url: str,
     audit_writer: Optional[object] = None,
+    semantic_intent_sidecar: Optional[object] = None,
+    envelope_service: Optional[object] = None,
 ) -> tuple[McpBrokerRegistry, object]:  # (registry, jwks_store | None)
     """
     Parse YASHIGANI_MCP_SERVERS and build a McpBrokerRegistry.
+
+    ``semantic_intent_sidecar`` / ``envelope_service`` (3.0 / YSG-RISK-060):
+    when supplied, every broker built here is wired with the escalate-only
+    semantic-intent sidecar AND the capability-envelope service, so the
+    tool-surface refresh/import path (``McpBroker.refresh_and_triage_tools``)
+    can run the envelope triage at refresh — the structural diff vs the
+    ORIGINAL baseline plus the escalate-only sidecar over the network-reachable
+    inference backend (mesh-mTLS gateway→ollama edge; see
+    helm/.../networkpolicy.yaml allow-gateway-egress + allow-ollama-ingress,
+    and compose OLLAMA_BASE_URL/YASHIGANI_INSPECTION_DEFAULT_BACKEND).  When
+    None (dev / feature OFF / pre-pool), the broker triage no-ops and the
+    invocation gate still fail-closes in prod.
 
     YASHIGANI_MCP_SERVERS is a JSON array of objects:
     [
@@ -245,6 +259,11 @@ def build_registry_from_env(
             is_filesystem_agent=is_filesystem_agent,
             is_git_agent=is_git_agent,
             nonce_store=_nonce_store,
+            # 3.0 / YSG-RISK-060 — wire the refresh-path envelope triage:
+            # escalate-only sidecar (over the mesh-mTLS gateway→ollama edge) +
+            # the capability-envelope durable store.  None ⇒ triage no-ops.
+            semantic_intent_sidecar=semantic_intent_sidecar,
+            envelope_service=envelope_service,
         )
         broker = McpBroker(config=broker_cfg)
 
