@@ -113,6 +113,71 @@ test_proxy_allow_pii_for_human if {
     }
 }
 
+# ── models_list_decision (GAP-001) ────────────────────────────────────────
+# Rego-level parity for the /v1/models OPA rule. The Python handler
+# (_opa_models_check + list_models) is covered by
+# test_v241_gap001_models_opa.py; these assert the policy contract directly.
+
+# Under-privileged identity: anonymous / non-active → DENY (filter=denied).
+# This is the GAP-001 exploit class — an authenticated-but-not-active or
+# anonymous caller (e.g. compromised internal-mesh container presenting a
+# stale token) must NOT enumerate the topology.
+test_models_deny_anonymous if {
+    d := data.yashigani.v1.models_list_decision with input as {
+        "identity": {"status": "anonymous", "kind": "unknown"},
+    }
+    d.allow == false
+    d.filter == "denied"
+    d.reason == "identity_not_active_or_anonymous"
+}
+
+test_models_deny_inactive if {
+    not data.yashigani.v1.models_list_allowed with input as {
+        "identity": {"status": "suspended", "kind": "human"},
+    }
+}
+
+# Human / admin principal → full topology listing.
+test_models_human_full if {
+    d := data.yashigani.v1.models_list_decision with input as {
+        "identity": {"status": "active", "kind": "human"},
+    }
+    d.allow == true
+    d.filter == "full"
+    d.reason == "ok"
+}
+
+test_models_admin_full if {
+    data.yashigani.v1.models_list_filter == "full" with input as {
+        "identity": {"status": "active", "kind": "admin"},
+    }
+}
+
+# Service account → RESTRICTED by default (agent/service-identity topology
+# withheld). This is the conservative default that prevents a compromised
+# internal-bearer from mapping the full agent topology.
+test_models_service_restricted_default if {
+    d := data.yashigani.v1.models_list_decision with input as {
+        "identity": {"status": "active", "kind": "service"},
+    }
+    d.allow == true
+    d.filter == "restricted"
+}
+
+test_models_unknown_kind_restricted_default if {
+    data.yashigani.v1.models_list_filter == "restricted" with input as {
+        "identity": {"status": "active", "kind": "unknown"},
+    }
+}
+
+# Operator opt-in: data bundle grants service accounts the full list.
+test_models_service_full_with_operator_override if {
+    data.yashigani.v1.models_list_filter == "full" with input as {
+        "identity": {"status": "active", "kind": "service"},
+    }
+    with data.yashigani.v1.models_list_policy.service_account_filter as "full"
+}
+
 # ── sensitivity_allowed ───────────────────────────────────────────────────
 
 test_sensitivity_deny_absent_ceiling if {
