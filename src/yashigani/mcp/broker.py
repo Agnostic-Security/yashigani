@@ -1162,6 +1162,10 @@ class McpBroker:
         timeout: float = 5.0,
         _get_fp: Optional[Any] = None,
         _get_spiffe: Optional[Any] = None,
+        # YSG-RISK-058 revocation-watch injection hooks (testing).
+        pin_age_seconds: Optional[float] = None,
+        _check_revocation: Optional[Any] = None,
+        _get_der: Optional[Any] = None,
     ) -> PinVerificationResult:
         """
         Verify the upstream MCP server identified by server_id against the
@@ -1215,6 +1219,11 @@ class McpBroker:
             timeout=timeout,
             _get_fp=_get_fp,
             _get_spiffe=_get_spiffe,
+            # YSG-RISK-058: revocation-watch runs on a matched pin. A revoked /
+            # stale / (strict) no-channel / over-age leaf overrides the match.
+            pin_age_seconds=pin_age_seconds,
+            _get_der=_get_der,
+            _check_revocation=_check_revocation,
         )
         self._emit_upstream_pin_event(server_id, result, env=_env)
 
@@ -1222,7 +1231,7 @@ class McpBroker:
             raise ConnectionError(
                 f"mcp-broker: [P8] upstream pin verification FAILED for "
                 f"server_id={server_id!r} reason={result.reason!r} "
-                f"(env={_env!r}) — connection REFUSED. YSG-RISK-056."
+                f"(env={_env!r}) — connection REFUSED. YSG-RISK-056/058."
             )
 
         return result

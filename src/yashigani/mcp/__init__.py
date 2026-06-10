@@ -59,6 +59,17 @@ from yashigani.mcp._upstream_pin import (
     require_pin_mode_for_servers,
     CERT_PIN_MISMATCH_LABEL,
 )
+# 3.0 / YSG-RISK-058 — external-upstream revocation-watch
+from yashigani.mcp._upstream_revocation import (
+    RevocationConfig,
+    RevocationResult,
+    RevocationStatus,
+    check_revocation,
+    REVOKED_LABEL,
+    REVOCATION_STALE_LABEL,
+    REVOCATION_NO_CHANNEL_LABEL,
+    REVOCATION_PIN_EXPIRED_LABEL,
+)
 from yashigani.mcp._pool import TenantPoolManager
 
 # 3.0 / YSG-RISK-060 — capability-envelope tool-surface pin
@@ -131,6 +142,15 @@ __all__ = [
     "verify_upstream_pin",
     "require_pin_mode_for_servers",
     "CERT_PIN_MISMATCH_LABEL",
+    # 3.0: external-upstream revocation-watch (YSG-RISK-058)
+    "RevocationConfig",
+    "RevocationResult",
+    "RevocationStatus",
+    "check_revocation",
+    "REVOKED_LABEL",
+    "REVOCATION_STALE_LABEL",
+    "REVOCATION_NO_CHANNEL_LABEL",
+    "REVOCATION_PIN_EXPIRED_LABEL",
     # Phase-2: P1-pool
     "TenantPoolManager",
     # 3.0: capability-envelope tool-surface pin (YSG-RISK-060)
