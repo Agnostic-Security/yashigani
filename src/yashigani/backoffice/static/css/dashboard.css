@@ -182,6 +182,7 @@ tr:hover { background: #f8fafc; }
 .pol-prompt { width: 100%; min-height: 64px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; }
 .pol-src { width: 100%; min-height: 380px; box-sizing: border-box; background: #0f172a; color: #e2e8f0; padding: 14px; border: 1px solid #1e293b; border-radius: 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem; line-height: 1.45; white-space: pre; }
 .pol-saveas { display: none; gap: 6px; align-items: center; }
+.pol-saveas.is-open { display: inline-flex; }
 /* JS-injected policy-category badge */
 .badge-template { background: #fef3c7; color: #92400e; }
 .txt-mt8 { margin-top: 8px; }
@@ -272,3 +273,79 @@ tr:hover { background: #f8fafc; }
 .form-row--mt-center { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
 /* wrapping control row with bottom margin (client-policy bindings) */
 .form-row--wrap-mb { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 12px; }
+
+/* ── Strict-CSP page-load helpers (v2.25.4 — zero inline styles) ──────
+   The admin plane serves `style-src 'self'` with no `style-src-attr`, so both
+   inline `style=` attributes and `element.style` CSSOM writes are blocked.
+   These classes replace every remaining inline style in dashboard.js + the
+   template so the dashboard renders with zero CSP violations on page load. */
+
+/* Show modifiers — toggled in place of `.style.display`. Each base class
+   already declares `display:none`; the `is-open` modifier reveals it. */
+.form-panel.is-open { display: block; }
+.once-panel.is-open { display: block; }
+.onboarding.is-open { display: block; }
+.stepup-overlay.is-open { display: flex; }
+.backup-verify-result.is-open { display: block; }
+.pki-rotate-result.is-open { display: block; }
+
+/* Table-row action buttons (replace inline padding/background/etc.) */
+.btn-tbl { padding: 2px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 0.75rem; color: #fff; }
+.btn-tbl--blue { background: #2563eb; }
+.btn-tbl--red { background: #dc2626; }
+.btn-tbl--green { background: #16a34a; }
+.btn-tbl--amber { background: #f59e0b; }
+.btn-tbl--ml { margin-left: 4px; }
+/* Pagination / load-more button (4px radius, 0.8rem) */
+.btn-page { padding: 4px 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* Unblock button (4px radius) */
+.btn-unblock { padding: 2px 8px; background: #ef4444; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
+/* Allowlist remove "x" (bare text button inside chip) */
+.chip-x { background: none; border: none; color: #ef4444; cursor: pointer; font-size: 0.7rem; }
+
+/* Table cells */
+.td-mono { font-family: monospace; }
+.td-mono-xs { font-family: monospace; font-size: 0.8rem; }
+.td-mono-xxs { font-family: monospace; font-size: 0.75rem; }
+.td-xs { font-size: 0.8rem; }
+.td-xxs { font-size: 0.75rem; }
+.td-muted { font-size: 0.8rem; color: #64748b; }
+.td-muted-sm { font-size: 0.75rem; color: #475569; }
+.td-ellipsis { font-size: 0.75rem; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+
+/* JS-injected badge colour overrides (parity with `.badge-template`) */
+.badge-slate { background: #f1f5f9; color: #64748b; }
+.badge-amber { background: #fef3c7; color: #92400e; }
+.badge-violet { background: #ede9fe; color: #6d28d9; }
+
+/* Section sub-headings injected by loadPolicies */
+.h3-section { margin: 14px 0 6px; font-size: 0.95rem; }
+
+/* Inline status text spans (cloud-override, services notes, errors) */
+.txt-err { color: #ef4444; }
+.txt-err-dk { font-size: 0.8rem; color: #b91c1c; }
+.txt-ok-dk { font-size: 0.8rem; color: #334155; }
+.svc-note { font-size: 0.75rem; color: #64748b; }
+.svc-note-faint { font-size: 0.75rem; color: #94a3b8; }
+
+/* License / crypto / backup prose paragraphs */
+.prose-sm { font-size: 0.85rem; color: #334155; }
+.prose-sm .faint { color: #64748b; }
+.crypto-line { margin-top: 8px; font-size: 0.85rem; }
+.crypto-line--bad { color: #ef4444; }
+.crypto-line--ok { color: #22c55e; }
+.crypto-line--pq { font-size: 0.85rem; color: #2563eb; }
+.crypto-line--compliance { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+.crypto-mismatch { font-size: 0.75rem; font-family: monospace; }
+.backup-empty { font-size: 0.85rem; color: #64748b; }
+.mismatch-list { margin-top: 6px; padding-left: 16px; }
+
+/* Allowlist chip (settings IP access) */
+.ip-chip { display: inline-flex; align-items: center; gap: 4px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 4px; padding: 2px 8px; margin: 2px; font-size: 0.8rem; }
+
+/* Session-expiry banner (replaces `.style.cssText`) */
+.session-banner { position: fixed; top: 0; left: 0; right: 0; background: #f59e0b; color: #000; padding: 8px 16px; text-align: center; font-size: 0.85rem; z-index: 9999; }
+.session-banner-btn { margin-left: 12px; padding: 4px 12px; background: #fff; border: 1px solid #d97706; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+
+/* Policy table cells */
+.td-pkg { font-size: 0.8rem; color: #475569; }
