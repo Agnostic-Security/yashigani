@@ -536,8 +536,8 @@ def test_modeb_ttl_expiry_fails_closed_on_response_path():
     import time as _t
     # Force expiry by revealing with a now far in the future.
     with pytest.raises(ReplacerMapExpiredError):
-        rt.replacer_map.reveal(handle, now=_t.monotonic() + 10_000)
+        rt.replacer_map.reveal_unbound(handle, now=_t.monotonic() + 10_000)
     # Destroy is idempotent and also fails closed on subsequent reveal.
     rt.destroy()
     with pytest.raises(ReplacerMapExpiredError):
-        rt.replacer_map.reveal(handle)
+        rt.replacer_map.reveal_unbound(handle)

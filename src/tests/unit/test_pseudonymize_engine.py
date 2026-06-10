@@ -23,6 +23,7 @@ from yashigani.documents.pseudonymize import (
     PositionBinder,
     ReplacerMap,
     ReplacerMapExpiredError,
+    ReplacerMapIdentityError,
     TokenAssigner,
     build_pseudonymize_plan,
     build_redact_plan,
@@ -157,7 +158,14 @@ def test_token_matches_doc_accepts_own_salt_rejects_foreign():
 # ReplacerMap — F5 crown-jewel custody.
 # ---------------------------------------------------------------------------
 
+#: Default identity+tenant binding for the crown-jewel custody tests (G-NEW-2).
+_OWNER = "acct-alice"
+_TENANT = "default"
+
+
 def _map_with(reverse: dict, **kw) -> ReplacerMap:
+    kw.setdefault("owner_identity", _OWNER)
+    kw.setdefault("tenant", _TENANT)
     return ReplacerMap.create(reverse, detokenize_rbac_role="reverser", **kw)
 
 
@@ -170,32 +178,91 @@ def test_handle_is_unguessable_and_not_request_id():
 
 
 def test_reveal_requires_exact_handle():
-    m = _map_with({"aaaaaaaaaaaa": "Alice"})
-    assert m.reveal(m.handle) == {"aaaaaaaaaaaa": "Alice"}
+    m = _map_with({"aaaaaaaaaaaa": "Alice"}, single_use=False)
+    assert m.reveal(m.handle, identity=_OWNER, tenant=_TENANT) == {"aaaaaaaaaaaa": "Alice"}
     with pytest.raises(ReplacerMapExpiredError):
-        m.reveal("wrong-handle")
+        m.reveal("wrong-handle", identity=_OWNER, tenant=_TENANT)
 
 
 def test_ttl_expiry_fails_closed():
     m = ReplacerMap.create(
-        {"aaaaaaaaaaaa": "Alice"}, detokenize_rbac_role="reverser", ttl_s=10, now=0.0,
+        {"aaaaaaaaaaaa": "Alice"}, detokenize_rbac_role="reverser",
+        owner_identity=_OWNER, tenant=_TENANT, single_use=False, ttl_s=10, now=0.0,
     )
-    assert m.reveal(m.handle, now=5.0) == {"aaaaaaaaaaaa": "Alice"}
+    assert m.reveal(m.handle, identity=_OWNER, tenant=_TENANT, now=5.0) == {"aaaaaaaaaaaa": "Alice"}
     with pytest.raises(ReplacerMapExpiredError):
-        m.reveal(m.handle, now=15.0)
+        m.reveal(m.handle, identity=_OWNER, tenant=_TENANT, now=15.0)
 
 
 def test_destroy_fails_closed_and_zeroes():
     m = _map_with({"aaaaaaaaaaaa": "Alice"})
     m.destroy()
     with pytest.raises(ReplacerMapExpiredError):
-        m.reveal(m.handle)
+        m.reveal(m.handle, identity=_OWNER, tenant=_TENANT)
 
 
 def test_map_plaintext_never_in_object_repr():
     m = _map_with({"aaaaaaaaaaaa": "Alice-Cleartext-Secret"})
     assert "Alice-Cleartext-Secret" not in repr(m)
     assert b"Alice-Cleartext-Secret" not in m._ciphertext
+
+
+# ---------------------------------------------------------------------------
+# G-NEW-2 / R5 — identity + tenant binding (BOLA/IDOR close) + single-use.
+# ---------------------------------------------------------------------------
+
+def test_reveal_cross_identity_fails_closed():
+    """A DIFFERENT principal holding the handle cannot reveal (BOLA close)."""
+    m = _map_with({"aaaaaaaaaaaa": "Alice"}, single_use=False)
+    # Correct identity+tenant reveals.
+    assert m.reveal(m.handle, identity=_OWNER, tenant=_TENANT) == {"aaaaaaaaaaaa": "Alice"}
+    # Another admin's identity — even with the right handle + tenant — fails closed.
+    with pytest.raises(ReplacerMapIdentityError):
+        m.reveal(m.handle, identity="acct-mallory", tenant=_TENANT)
+
+
+def test_reveal_cross_tenant_fails_closed():
+    """A handle from tenant A is inert in tenant B (cross-tenant close)."""
+    m = _map_with({"aaaaaaaaaaaa": "Alice"}, single_use=False)
+    with pytest.raises(ReplacerMapIdentityError):
+        m.reveal(m.handle, identity=_OWNER, tenant="tenant-b")
+
+
+def test_reveal_unbound_map_via_identity_path_fails_closed():
+    """An UNBOUND map (no owner) is NOT retrievable through the identity path."""
+    m = ReplacerMap.create(
+        {"aaaaaaaaaaaa": "Alice"}, detokenize_rbac_role="reverser", single_use=False,
+    )  # no owner_identity/tenant
+    with pytest.raises(ReplacerMapIdentityError):
+        m.reveal(m.handle, identity=_OWNER, tenant=_TENANT)
+    # The gateway-internal (mode-B) path reveals it.
+    assert m.reveal_unbound(m.handle) == {"aaaaaaaaaaaa": "Alice"}
+
+
+def test_reveal_unbound_refuses_identity_bound_map():
+    """A bound map must NOT be revealable via the unbound (no-check) path."""
+    m = _map_with({"aaaaaaaaaaaa": "Alice"})
+    with pytest.raises(ReplacerMapIdentityError):
+        m.reveal_unbound(m.handle)
+
+
+def test_single_use_burns_after_read():
+    """Burn-after-read: a second reveal of a single-use map fails closed (replay)."""
+    m = _map_with({"aaaaaaaaaaaa": "Alice"}, single_use=True)
+    assert m.reveal(m.handle, identity=_OWNER, tenant=_TENANT) == {"aaaaaaaaaaaa": "Alice"}
+    # Replay with the SAME (valid) handle + identity + tenant now fails closed.
+    with pytest.raises(ReplacerMapExpiredError):
+        m.reveal(m.handle, identity=_OWNER, tenant=_TENANT)
+
+
+def test_aad_binds_ciphertext_to_identity():
+    """Identity+tenant are folded into the AEAD AAD: tampering the binding makes
+    the crypto itself fail, not merely the application check (defence in depth)."""
+    m = _map_with({"aaaaaaaaaaaa": "Alice"}, single_use=False)
+    # Decrypt with a forged (wrong) AAD raises at the cryptography layer.
+    from cryptography.exceptions import InvalidTag
+    with pytest.raises(InvalidTag):
+        m._decrypt(m.handle, "acct-mallory", _TENANT)
 
 
 # ---------------------------------------------------------------------------

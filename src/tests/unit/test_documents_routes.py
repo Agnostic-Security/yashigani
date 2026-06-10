@@ -111,6 +111,10 @@ def client(monkeypatch):
 
 def _as_admin(app: FastAPI, account_id: str) -> None:
     app.dependency_overrides[require_admin_session] = lambda: _session(account_id)
+    # The table-retrieval surfaces are step-up gated (G-NEW-2 / R5); override the
+    # step-up dep too so the test exercises the role/identity gate, not the TOTP
+    # freshness check (which has its own dedicated test).
+    app.dependency_overrides[require_stepup_admin_session] = lambda: _session(account_id)
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +201,17 @@ def _make_pseudonymized_doc(tc) -> str:
         DataMatch("PII.EMAIL", False, "ja****om", "TABLE_CELL:row=2,col=2:span=0-16", 0, 16),
         DataMatch("PII.EMAIL", False, "jo****om", "TABLE_CELL:row=3,col=2:span=0-16", 0, 16),
     ]
-    rmap = ReplacerMap.create(assigner.reverse_map, detokenize_rbac_role=DETOK_ROLE)
-    table = CorrespondenceTable.from_assigner(assigner, detokenize_rbac_role=DETOK_ROLE)
+    # G-NEW-2 / R5: bind the crown-jewel map + table to the requester identity +
+    # this install's tenant (the AUTHORISED admin "minted" it), single-use.  The
+    # retrieval gate requires the SAME identity + tenant (close BOLA).
+    rmap = ReplacerMap.create(
+        assigner.reverse_map, detokenize_rbac_role=DETOK_ROLE,
+        owner_identity=AUTHORISED_ADMIN, tenant="default", single_use=True,
+    )
+    table = CorrespondenceTable.from_assigner(
+        assigner, detokenize_rbac_role=DETOK_ROLE,
+        owner_identity=AUTHORISED_ADMIN, tenant="default",
+    )
 
     rid = f"doc-{len(docroutes._results) + 1}-people.csv"
     docroutes._results[rid] = DocumentInspectionResult(
@@ -270,6 +283,93 @@ def test_doc_rt_07_table_csv_rbac_gate(client):
     # Mapping file header binds the table to its source document (per-file salt).
     assert lines[0].startswith("# doc_hash=")
     assert lines[1] == "token,original"
+
+
+# ---------------------------------------------------------------------------
+# DOC-RT-G5-* — G-NEW-2 / R5: identity+tenant binding, step-up, single-use.
+# ---------------------------------------------------------------------------
+
+#: A second authorised reverser — IN the detokenize role but NOT the principal
+#: who minted the result (the BOLA actor: right role, wrong identity).
+OTHER_AUTHORISED = "reverser2@yashigani.local"
+
+
+def _grant_role(account_id: str) -> None:
+    """Add an account to the detokenize role group in the fake RBAC store."""
+    backoffice_state.rbac_store._membership[account_id] = [_FakeGroup(DETOK_ROLE, "Document Reversers")]
+
+
+def test_doc_rt_g5_01_cross_identity_same_role_denied(client):
+    """BOLA close: another admin IN the detokenize role but who did NOT mint the
+    result cannot retrieve the table (identity binding beats role-only)."""
+    tc, app = client
+    rid = _make_pseudonymized_doc(tc)  # bound to AUTHORISED_ADMIN
+    _grant_role(OTHER_AUTHORISED)
+    _as_admin(app, OTHER_AUTHORISED)   # right role, wrong identity
+    r = tc.get(f"/admin/documents/results/{rid}/table")
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["error"] == "detokenize_forbidden"
+    assert "rows" not in r.json()
+    assert "original" not in r.text.lower()
+
+
+def test_doc_rt_g5_02_cross_tenant_denied(client, monkeypatch):
+    """Cross-tenant close: the requester identity matches but the install tenant
+    differs from the one the table was minted under → 403, no rows."""
+    tc, app = client
+    rid = _make_pseudonymized_doc(tc)  # minted under tenant "default"
+    _as_admin(app, AUTHORISED_ADMIN)
+    # The retrieval install now reports a DIFFERENT tenant.
+    monkeypatch.setenv("YASHIGANI_TENANT_ID", "tenant-b")
+    r = tc.get(f"/admin/documents/results/{rid}/table")
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["error"] == "detokenize_forbidden"
+
+
+def test_doc_rt_g5_03_single_use_burn_after_read(client):
+    """Single-use: the first authorised retrieval burns the table; a replay 404s
+    (the crown jewel cannot be re-retrieved with a leaked/replayed request)."""
+    tc, app = client
+    rid = _make_pseudonymized_doc(tc)
+    _as_admin(app, AUTHORISED_ADMIN)
+    r1 = tc.get(f"/admin/documents/results/{rid}/table")
+    assert r1.status_code == 200, r1.text
+    assert len(r1.json()["rows"]) >= 1
+    # Replay — the table was burned; no rows are ever served again.
+    r2 = tc.get(f"/admin/documents/results/{rid}/table")
+    assert r2.status_code == 404, r2.text
+    assert "rows" not in r2.json()
+
+
+def test_doc_rt_g5_04_table_routes_require_stepup(client):
+    """Step-up is enforced on BOTH table surfaces (no fresh TOTP → 401).
+
+    We drop the fixture's step-up override so the REAL
+    ``require_stepup_admin_session`` runs against an admin session that never
+    performed a TOTP step-up (``last_totp_verified_at`` is None) → 401."""
+    tc, app = client
+    rid = _make_pseudonymized_doc(tc)
+    # Keep a valid admin session, but let the genuine step-up gate run (no TOTP).
+    app.dependency_overrides[require_admin_session] = lambda: _session(AUTHORISED_ADMIN)
+    app.dependency_overrides.pop(require_stepup_admin_session, None)
+
+    r = tc.get(f"/admin/documents/results/{rid}/table")
+    assert r.status_code == 401, r.text
+    assert r.json()["detail"]["error"] == "step_up_required"
+    # The table was NOT served and NOT burned (still retrievable with step-up).
+    assert "rows" not in r.json()
+
+    r_csv = tc.get(f"/admin/documents/results/{rid}/table.csv")
+    assert r_csv.status_code == 401, r_csv.text
+
+
+def test_doc_rt_g5_05_inspect_binds_requester_identity(client):
+    """The /inspect route threads the requester identity + tenant into the
+    pipeline so the minted map/table are identity+tenant bound."""
+    import inspect as _inspect
+    src = _inspect.getsource(docroutes.inspect_document)
+    assert "requester_identity=session.account_id" in src
+    assert "tenant=_install_tenant()" in src
 
 
 # ---------------------------------------------------------------------------

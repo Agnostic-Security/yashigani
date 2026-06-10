@@ -261,6 +261,8 @@ class DocumentInspectionPipeline:
         map_ttl_s: int = DEFAULT_MAP_TTL_S,
         operate_on_routing: str = OPERATE_ON_ROUTE_LOCAL,
         set_salt: Optional[str] = None,
+        requester_identity: str = "",
+        tenant: str = "",
     ) -> DocumentInspectionResult:
         """Inspect a document end-to-end.
 
@@ -369,6 +371,8 @@ class DocumentInspectionPipeline:
                 map_ttl_s=map_ttl_s,
                 operate_on_routing=operate_on_routing,
                 set_salt=set_salt,
+                requester_identity=requester_identity,
+                tenant=tenant,
             )
         # Unknown action → fail-closed.
         return self._block(
@@ -807,6 +811,8 @@ class DocumentInspectionPipeline:
         map_ttl_s: int,
         operate_on_routing: str = OPERATE_ON_ROUTE_LOCAL,
         set_salt: Optional[str] = None,
+        requester_identity: str = "",
+        tenant: str = "",
     ) -> DocumentInspectionResult:
         """PSEUDONYMIZE: replace each matched value with a consistent reversible
         token (all QIs — F2), re-render in the jail (F6), vault the replacer map
@@ -906,18 +912,38 @@ class DocumentInspectionPipeline:
 
         # Vault the replacer map (F5): unguessable handle, AES-256-GCM, TTL'd.
         # The map is the crown jewel — never logged.
-        replacer_map = ReplacerMap.create(
-            assigner.reverse_map,
-            detokenize_rbac_role=detokenize_rbac_role,
-            ttl_s=map_ttl_s,
-        )
-        table = (
-            CorrespondenceTable.from_assigner(
-                assigner, detokenize_rbac_role=detokenize_rbac_role
+        #
+        # G-NEW-2 / R5: a MODE-A map is the admin-retrievable re-identification
+        # key, so it is bound to the requester's IDENTITY + TENANT (close BOLA:
+        # only the requester, in this tenant, may reverse it — role membership is
+        # NOT sufficient) AND is single-use (burn-after-read so a leaked handle
+        # cannot be replayed within the TTL).  A MODE-B map is the gateway's own
+        # internal round-trip vault (never reached through the admin surface), so
+        # it stays UNBOUND + non-single-use (the gateway restores many response
+        # tokens across one round-trip via the binder, not via reveal()).
+        if mode == "A":
+            replacer_map = ReplacerMap.create(
+                assigner.reverse_map,
+                detokenize_rbac_role=detokenize_rbac_role,
+                owner_identity=requester_identity,
+                tenant=tenant,
+                single_use=True,
+                ttl_s=map_ttl_s,
             )
-            if mode == "A"
-            else None
-        )
+            table = CorrespondenceTable.from_assigner(
+                assigner,
+                detokenize_rbac_role=detokenize_rbac_role,
+                owner_identity=requester_identity,
+                tenant=tenant,
+            )
+        else:
+            replacer_map = ReplacerMap.create(
+                assigner.reverse_map,
+                detokenize_rbac_role=detokenize_rbac_role,
+                single_use=False,
+                ttl_s=map_ttl_s,
+            )
+            table = None
 
         # Mode B (F3 / L-02): prime the round-trip holder from the EGRESS FRAME —
         # the text of the tokenized artefact exactly as the untrusted cloud will

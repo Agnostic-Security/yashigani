@@ -205,17 +205,53 @@ class ReplacerMapExpiredError(Exception):
     (§5.4 fail-closed corner)."""
 
 
+class ReplacerMapIdentityError(ReplacerMapExpiredError):
+    """The presenting caller's identity / tenant does not match the identity +
+    tenant the map was bound to at mint time (G-NEW-2 / R5 — BOLA/IDOR close).
+
+    Subclasses :class:`ReplacerMapExpiredError` so existing fail-closed call
+    sites that catch the base error also fail closed on an identity/tenant
+    mismatch — but the distinct type lets the retrieval surface emit a precise
+    audit + 403 reason without leaking whether the map exists.  The reveal path
+    NEVER returns partial data on a mismatch (fail-closed corner)."""
+
+
+#: Sentinel binding used when a map is minted WITHOUT an identity/tenant owner
+#: (back-compat for the internal mode-B round-trip, which is gateway-scoped and
+#: never reached through the identity-gated admin retrieval surface).  An
+#: unbound map cannot be revealed through the identity-checked ``reveal`` path —
+#: it must use ``reveal_unbound`` explicitly (mode-B internal restore only).
+_UNBOUND = ""
+
+
 @dataclass
 class ReplacerMap:
     """A request-scoped, encrypted, TTL'd token->original map addressed by an
-    unguessable capability handle (red-team F5).
+    unguessable capability handle (red-team F5), bound to the requester's
+    IDENTITY + TENANT and (optionally) single-use (G-NEW-2 / R5).
 
     The map is encrypted at rest with AES-256-GCM (vetted ``cryptography`` lib).
     The plaintext map exists only transiently inside :meth:`reveal` while the
     caller holds it; at rest only the ciphertext + nonce are retained.  The
     ``handle`` is a 256-bit URL-safe random token — NOT ``request.id`` — and is
-    the only key that retrieves the map; it is bound to ``detokenize_rbac_role``
-    and is NEVER logged.
+    NOT sufficient on its own to retrieve the map:
+
+      * **Identity + tenant binding (G-NEW-2 / R5)** — ``owner_identity`` and
+        ``tenant`` are folded into the AEAD **additional authenticated data**
+        alongside the handle, AND checked explicitly (constant-time) in
+        :meth:`reveal`.  A leaked handle presented by a DIFFERENT principal, or
+        a role-downgraded principal whose identity no longer matches, fails the
+        AAD auth AND the explicit check → :class:`ReplacerMapIdentityError`
+        (fail-closed, no partial restore).  This closes the BOLA/IDOR seam where
+        any member of ``detokenize_rbac_role`` could reverse ANY document's map.
+      * **Single-use / burn-after-read** — when ``single_use`` is set the map is
+        :meth:`destroy`ed on the FIRST successful reveal, so a leaked handle (or
+        a replay) cannot re-retrieve it within the TTL window.
+      * **TTL** — fail-closed default expiry; an expired/destroyed map reveals
+        nothing.
+
+    ``detokenize_rbac_role`` is retained as the COARSE role gate (checked at the
+    route layer); identity+tenant is the FINE BOLA-closing gate enforced here.
     """
 
     handle: str
@@ -225,7 +261,25 @@ class ReplacerMap:
     _ciphertext: bytes
     _key: bytes
     _created_at: float
+    #: The identity (account_id) the map is bound to.  Empty == unbound
+    #: (internal mode-B round-trip only; never reachable via reveal()).
+    owner_identity: str = _UNBOUND
+    #: The tenant the map is bound to.  Empty == unbound.
+    tenant: str = _UNBOUND
+    #: Burn-after-read: destroy on first successful reveal (default True for the
+    #: identity-bound admin retrieval; mode-B internal maps mint single_use=False
+    #: because the gateway may restore many response tokens across the round-trip).
+    single_use: bool = True
     _destroyed: bool = False
+
+    @staticmethod
+    def _aad(handle: str, owner_identity: str, tenant: str) -> bytes:
+        """Additional authenticated data binding ciphertext to handle+identity+tenant.
+
+        Folding identity + tenant into the AAD means the AEAD decrypt itself
+        fails if a different (identity, tenant) is presented — the crypto, not
+        just an application check, enforces the binding (defence in depth)."""
+        return f"{handle}\x00{owner_identity}\x00{tenant}".encode("utf-8")
 
     @classmethod
     def create(
@@ -233,14 +287,19 @@ class ReplacerMap:
         reverse_map: dict[str, str],
         *,
         detokenize_rbac_role: str,
+        owner_identity: str = _UNBOUND,
+        tenant: str = _UNBOUND,
+        single_use: bool = True,
         ttl_s: int = DEFAULT_MAP_TTL_S,
         now: Optional[float] = None,
     ) -> "ReplacerMap":
-        """Mint a fresh map: unguessable handle + AES-256-GCM encryption.
+        """Mint a fresh map: unguessable handle + AES-256-GCM encryption, bound to
+        ``owner_identity`` + ``tenant`` in the AEAD AAD (G-NEW-2 / R5).
 
         The handle and the encryption key are independent high-entropy secrets;
         possession of the handle alone does not decrypt the map (the key lives in
-        the object held by the gateway, not in the handle)."""
+        the object held by the gateway, not in the handle), AND the presenting
+        caller's identity+tenant must match what the map was minted for."""
         # F5: 256-bit unguessable, single-use capability handle. NOT request.id.
         handle = secrets.token_urlsafe(32)
         key = AESGCM.generate_key(bit_length=256)
@@ -249,7 +308,8 @@ class ReplacerMap:
         # Raw originals are encrypted immediately and never held in plaintext at
         # rest on this object.
         blob = "\x01".join(f"{t}\x00{v}" for t, v in reverse_map.items()).encode("utf-8")
-        ciphertext = AESGCM(key).encrypt(nonce, blob, handle.encode("ascii"))
+        aad = cls._aad(handle, owner_identity, tenant)
+        ciphertext = AESGCM(key).encrypt(nonce, blob, aad)
         ttl = ttl_s if ttl_s and ttl_s > 0 else DEFAULT_MAP_TTL_S
         return cls(
             handle=handle,
@@ -259,18 +319,36 @@ class ReplacerMap:
             _ciphertext=ciphertext,
             _key=key,
             _created_at=now if now is not None else time.monotonic(),
+            owner_identity=owner_identity,
+            tenant=tenant,
+            single_use=single_use,
         )
 
     def _expired(self, now: Optional[float] = None) -> bool:
         t = now if now is not None else time.monotonic()
         return self._destroyed or (t - self._created_at) >= self.ttl_s
 
-    def reveal(self, handle: str, *, now: Optional[float] = None) -> dict[str, str]:
+    def reveal(
+        self,
+        handle: str,
+        *,
+        identity: str,
+        tenant: str,
+        now: Optional[float] = None,
+    ) -> dict[str, str]:
         """Decrypt + return the token->original map for an authorised caller.
 
-        The caller MUST present the exact capability handle (F5) — a mismatched
-        handle fails the AEAD auth (the handle is the AAD).  An expired/destroyed
-        map fails closed (:class:`ReplacerMapExpiredError`), never partial.
+        The caller MUST present (a) the exact capability handle (F5), AND (b) the
+        IDENTITY + TENANT the map was bound to at mint time (G-NEW-2 / R5).  Any
+        mismatch fails closed:
+
+          * expired / destroyed map → :class:`ReplacerMapExpiredError`;
+          * wrong handle           → :class:`ReplacerMapExpiredError` (uniform);
+          * wrong identity/tenant  → :class:`ReplacerMapIdentityError`
+            (the AEAD AAD check ALSO fails, but we reject early + uniformly).
+
+        On a successful reveal of a ``single_use`` map the map is destroyed
+        (burn-after-read) so the handle cannot be replayed within the TTL.
         """
         if self._expired(now):
             raise ReplacerMapExpiredError(
@@ -280,7 +358,51 @@ class ReplacerMap:
             # Wrong handle — do not reveal. (Constant-time compare; the AEAD AAD
             # check below would also fail, but reject early + uniformly.)
             raise ReplacerMapExpiredError("replacer map handle mismatch — fail-closed")
-        blob = AESGCM(self._key).decrypt(self._nonce, self._ciphertext, handle.encode("ascii"))
+        # G-NEW-2 / R5: identity + tenant must match the binding (BOLA/IDOR close).
+        # Constant-time compare each component; an unbound map (empty owner) is
+        # NOT retrievable through this identity-checked path.
+        identity_ok = (
+            bool(self.owner_identity)
+            and secrets.compare_digest(identity, self.owner_identity)
+        )
+        tenant_ok = (
+            bool(self.tenant)
+            and secrets.compare_digest(tenant, self.tenant)
+        )
+        if not (identity_ok and tenant_ok):
+            raise ReplacerMapIdentityError(
+                "replacer map identity/tenant mismatch — fail-closed "
+                "(another principal's handle, a role-downgrade, or an unbound map)"
+            )
+        out = self._decrypt(handle, identity, tenant)
+        if self.single_use:
+            # Burn-after-read: a leaked handle cannot be replayed within the TTL.
+            self.destroy()
+        return out
+
+    def reveal_unbound(self, handle: str, *, now: Optional[float] = None) -> dict[str, str]:
+        """Internal mode-B restore path: reveal an UNBOUND (gateway-scoped) map.
+
+        Used ONLY by the gateway's own mode-B round-trip restore (no external
+        principal is involved — the gateway holds the handle in request scope and
+        never exposes it).  Refuses to reveal a map that WAS bound to an identity
+        (that map must go through the identity-checked :meth:`reveal`)."""
+        if self._expired(now):
+            raise ReplacerMapExpiredError(
+                "replacer map expired/destroyed — fail-closed (no partial restore)"
+            )
+        if not secrets.compare_digest(handle, self.handle):
+            raise ReplacerMapExpiredError("replacer map handle mismatch — fail-closed")
+        if self.owner_identity or self.tenant:
+            raise ReplacerMapIdentityError(
+                "identity-bound map must be revealed through the identity-checked "
+                "path — refusing unbound reveal (fail-closed)"
+            )
+        return self._decrypt(handle, self.owner_identity, self.tenant)
+
+    def _decrypt(self, handle: str, identity: str, tenant: str) -> dict[str, str]:
+        aad = self._aad(handle, identity, tenant)
+        blob = AESGCM(self._key).decrypt(self._nonce, self._ciphertext, aad)
         out: dict[str, str] = {}
         text = blob.decode("utf-8")
         if text:
@@ -321,15 +443,28 @@ class CorrespondenceTable:
     #: reject a table paired with the wrong file.  Not a secret (hash of bytes
     #: the holder already has).
     doc_hash: str = ""
+    #: The identity (account_id) + tenant the correspondence table is bound to
+    #: (G-NEW-2 / R5).  Only this principal, in this tenant, may retrieve it — the
+    #: BOLA/IDOR close: role membership is NOT sufficient on its own.  Empty when
+    #: minted without a requester context (legacy / non-gated call shapes).
+    owner_identity: str = ""
+    tenant: str = ""
 
     @classmethod
     def from_assigner(
-        cls, assigner: "OpaqueTokenAssigner", *, detokenize_rbac_role: str
+        cls,
+        assigner: "OpaqueTokenAssigner",
+        *,
+        detokenize_rbac_role: str,
+        owner_identity: str = "",
+        tenant: str = "",
     ) -> "CorrespondenceTable":
         return cls(
             rows=assigner.reverse_map,
             detokenize_rbac_role=detokenize_rbac_role,
             doc_hash=assigner.doc_hash,
+            owner_identity=owner_identity,
+            tenant=tenant,
         )
 
     def to_csv(self) -> str:

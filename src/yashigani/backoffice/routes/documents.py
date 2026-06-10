@@ -41,6 +41,7 @@ Security properties enforced here (the brief's QA mandate on our own build):
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -281,6 +282,17 @@ def _match_view(result) -> list[dict]:
     return rows
 
 
+def _install_tenant() -> str:
+    """Resolve this install's tenant id (G-NEW-2 / R5 — identity+TENANT binding).
+
+    Single-tenant installs use the stable default ``"default"``; a multi-tenant
+    deployment sets ``YASHIGANI_TENANT_ID`` per install.  Binding the tenant
+    explicitly (rather than role-only) means a future multi-tenant deployment
+    cannot open a cross-tenant de-tokenize seam — the map is minted AND retrieved
+    under the same tenant, so a handle from tenant A is inert in tenant B."""
+    return os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+
+
 def _admin_in_detokenize_role(account_id: str, role: str) -> bool:
     """RBAC gate: True iff ``account_id`` is a member of the group identified by
     ``role`` (the document's ``detokenize_rbac_role``).
@@ -426,6 +438,8 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
             requested_action=DISPOSITION_LOG,
             pseudonymize_mode=body.pseudonymize_mode,
             detokenize_rbac_role=body.detokenize_rbac_role,
+            requester_identity=session.account_id,
+            tenant=_install_tenant(),
         )
     except Exception as exc:
         envelope, _ = safe_error_envelope(exc, public_message="document inspection failed")
@@ -469,6 +483,8 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
                 pseudonymize_mode=decision.get("pseudonymize_mode", body.pseudonymize_mode),
                 detokenize_rbac_role=decision.get("detokenize_rbac_role", body.detokenize_rbac_role),
                 set_salt=set_salt,
+                requester_identity=session.account_id,
+                tenant=_install_tenant(),
             )
         except Exception as exc:
             envelope, _ = safe_error_envelope(exc, public_message="document action failed")
@@ -516,85 +532,158 @@ async def get_result(request_id: str, session: AdminSession):
     return {"summary": _result_summary(result), "matches": _match_view(result)}
 
 
-# ── Correspondence-table retrieval (mode A) — RBAC GATED ───────────────────
+# ── Correspondence-table retrieval (mode A) — IDENTITY+TENANT GATED ─────────
+#
+# G-NEW-2 / R5 (crown-jewel read — reversing pseudonymisation hands back real
+# PII).  Three controls stack ON TOP of Laura's role gate:
+#   1. **Identity + tenant binding (BOLA/IDOR close)** — only the SAME principal
+#      who minted the result, in the SAME tenant, may retrieve the table.  Role
+#      membership alone is NOT sufficient: another admin's handle, or a
+#      role-downgraded principal, fails closed with 403.
+#   2. **Step-up (TOTP)** — the route uses ``StepUpAdminSession``, so a fresh
+#      TOTP within the step-up TTL is required at the moment of retrieval (a
+#      hijacked session without the second factor cannot reverse PII).
+#   3. **Single-use / burn-after-read** — the table is destroyed from the result
+#      index on first successful retrieval, so a leaked handle (or a replay)
+#      cannot re-retrieve it.
 
-@router.get("/results/{request_id}/table")
-async def get_correspondence_table(request_id: str, session: AdminSession):
-    """Retrieve the mode-A token→original correspondence table.
 
-    RBAC-GATED: only an admin who is a member of the document's
-    ``detokenize_rbac_role`` group may retrieve it.  An unauthorised admin gets
-    403 and NEVER the rows.  The unguessable replacer-map handle is NEVER
-    returned.  Every retrieval is audited (who, which document, when).
+def _detokenize_gate(result, request_id: str, session, *, surface: str):
+    """Shared fail-closed gate for the mode-A table surfaces (G-NEW-2 / R5).
+
+    Returns the (table, role) on success.  Raises the appropriate HTTPException
+    (404 / 403) on any failure, NEVER leaking the table contents.  Enforces:
+    role membership AND identity+tenant binding (BOLA close).  Step-up is
+    enforced by the ``StepUpAdminSession`` dependency on the calling route.
     """
-    result = _results.get(request_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail={"error": "result_not_found"})
     table = getattr(result, "correspondence_table", None)
     if table is None:
         raise HTTPException(
             status_code=404,
-            detail={"error": "no_correspondence_table", "message": "Not a mode-A PSEUDONYMIZE result."},
+            detail={"error": "no_correspondence_table",
+                    "message": "Not a mode-A PSEUDONYMIZE result (or already retrieved — single-use)."},
         )
 
     role = table.detokenize_rbac_role
+    # Coarse role gate (Laura) — still required.
     if not _admin_in_detokenize_role(session.account_id, role):
-        # Fail-closed: deny, audit the denied attempt, reveal NOTHING about the
-        # table contents.  The error does not leak whether the table is empty.
         logger.warning(
-            "detokenize RBAC DENIED: account=%s document=%s role=%s",
-            session.account_id, request_id, role,
+            "detokenize RBAC DENIED (%s): account=%s document=%s role=%s",
+            surface, session.account_id, request_id, role,
         )
         raise HTTPException(
             status_code=403,
             detail={"error": "detokenize_forbidden", "required_role": role},
         )
 
-    # Authorised — return the rows (token → original).  Audited.
+    # FINE identity+tenant gate (G-NEW-2 / R5 — BOLA/IDOR close).  The table is
+    # bound to the requester who minted it + this install's tenant; another
+    # principal's handle or a cross-tenant request fails closed.  An UNBOUND
+    # table (empty owner) is treated as not-retrievable through this surface.
+    owner = getattr(table, "owner_identity", "") or ""
+    bound_tenant = getattr(table, "tenant", "") or ""
+    this_tenant = _install_tenant()
+    if not owner or owner != session.account_id or bound_tenant != this_tenant:
+        logger.warning(
+            "detokenize IDENTITY/TENANT DENIED (%s): account=%s document=%s "
+            "(bound owner present=%s tenant_match=%s) — BOLA close",
+            surface, session.account_id, request_id, bool(owner),
+            bound_tenant == this_tenant,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "detokenize_forbidden",
+                    "reason": "identity_or_tenant_mismatch"},
+        )
+    return table, role
+
+
+def _audit_table_delivery(session, request_id: str, role: str, row_count: int) -> None:
+    if backoffice_state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import ConfigChangedEvent
+        backoffice_state.audit_writer.write(ConfigChangedEvent(
+            admin_account=session.account_id,
+            setting="document_correspondence_table_delivered",
+            previous_value="(sealed)",
+            new_value=f"document={request_id} role={role} rows={row_count} single_use=burned",
+        ))
+    except Exception:  # pragma: no cover - audit best-effort
+        logger.exception("table-delivery audit write failed")
+
+
+def _burn_correspondence_table(result, request_id: str) -> None:
+    """Single-use / burn-after-read (G-NEW-2 / R5).
+
+    Destroy the correspondence table AND the underlying encrypted ReplacerMap on
+    the result so a leaked handle (or a replay of this retrieval) cannot
+    re-retrieve the crown jewel within the TTL.  Idempotent."""
+    try:
+        result.correspondence_table = None
+        rmap = getattr(result, "replacer_map", None)
+        if rmap is not None:
+            rmap.destroy()
+    except Exception:  # pragma: no cover - defensive; never leave a live map
+        logger.exception("burn-after-read teardown failed for document=%s", request_id)
+
+
+@router.get("/results/{request_id}/table")
+async def get_correspondence_table(request_id: str, session: StepUpAdminSession):
+    """Retrieve the mode-A token→original correspondence table — ONCE.
+
+    IDENTITY+TENANT + STEP-UP + SINGLE-USE gated (G-NEW-2 / R5).  Only the
+    principal who minted the result, in this tenant, holding a fresh step-up
+    TOTP, may retrieve it — and only once (burn-after-read).  An unauthorised
+    admin (wrong role, wrong identity, wrong tenant, or no step-up) gets 403/401
+    and NEVER the rows.  The unguessable replacer-map handle is NEVER returned.
+    Every retrieval is audited (who, which document, when).
+    """
+    result = _results.get(request_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "result_not_found"})
+
+    table, role = _detokenize_gate(result, request_id, session, surface="json")
+    rows = [{"token": t, "original": v} for t, v in table.rows.items()]
+    row_count = len(table.rows)
+
+    # Authorised — audit, then burn (single-use) BEFORE returning so a concurrent
+    # replay cannot race a second retrieval.
     logger.info(
-        "correspondence table delivered: account=%s document=%s role=%s rows=%d",
-        session.account_id, request_id, role, len(table.rows),
+        "correspondence table delivered: account=%s document=%s role=%s rows=%d (single-use, burned)",
+        session.account_id, request_id, role, row_count,
     )
-    if backoffice_state.audit_writer is not None:
-        try:
-            from yashigani.audit.schema import ConfigChangedEvent
-            backoffice_state.audit_writer.write(ConfigChangedEvent(
-                admin_account=session.account_id,
-                setting="document_correspondence_table_delivered",
-                previous_value="(sealed)",
-                new_value=f"document={request_id} role={role} rows={len(table.rows)}",
-            ))
-        except Exception:  # pragma: no cover - audit best-effort
-            logger.exception("table-delivery audit write failed")
+    _audit_table_delivery(session, request_id, role, row_count)
+    _burn_correspondence_table(result, request_id)
 
     return {
         "request_id": request_id,
         "detokenize_rbac_role": role,
-        "rows": [{"token": t, "original": v} for t, v in table.rows.items()],
+        "rows": rows,
     }
 
 
 @router.get("/results/{request_id}/table.csv")
-async def download_correspondence_table(request_id: str, session: AdminSession):
-    """Download the mode-A table as CSV — same RBAC gate as the JSON endpoint."""
+async def download_correspondence_table(request_id: str, session: StepUpAdminSession):
+    """Download the mode-A table as CSV — same identity+tenant + step-up +
+    single-use gate as the JSON endpoint (G-NEW-2 / R5)."""
     from fastapi.responses import Response
 
     result = _results.get(request_id)
     if result is None:
         raise HTTPException(status_code=404, detail={"error": "result_not_found"})
-    table = getattr(result, "correspondence_table", None)
-    if table is None:
-        raise HTTPException(status_code=404, detail={"error": "no_correspondence_table"})
 
-    role = table.detokenize_rbac_role
-    if not _admin_in_detokenize_role(session.account_id, role):
-        logger.warning(
-            "detokenize RBAC DENIED (csv): account=%s document=%s role=%s",
-            session.account_id, request_id, role,
-        )
-        raise HTTPException(status_code=403, detail={"error": "detokenize_forbidden", "required_role": role})
-
+    table, role = _detokenize_gate(result, request_id, session, surface="csv")
     csv_text = table.to_csv()
+    row_count = len(table.rows)
+
+    logger.info(
+        "correspondence table delivered (csv): account=%s document=%s role=%s rows=%d (single-use, burned)",
+        session.account_id, request_id, role, row_count,
+    )
+    _audit_table_delivery(session, request_id, role, row_count)
+    _burn_correspondence_table(result, request_id)
+
     return Response(
         content=csv_text,
         media_type="text/csv",
