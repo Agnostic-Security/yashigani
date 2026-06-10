@@ -119,6 +119,19 @@ class EventType(str, Enum):
     OPA_ASSISTANT_SUGGESTION_REJECTED = "OPA_ASSISTANT_SUGGESTION_REJECTED"
     # v0.9.0 — Response-path inspection
     RESPONSE_INJECTION_DETECTED = "RESPONSE_INJECTION_DETECTED"
+    # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
+    ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
+    ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
+    ORCHESTRATION_BLOCKED_STEP = "ORCHESTRATION_BLOCKED_STEP"
+    ORCHESTRATION_DEPTH_CEILING = "ORCHESTRATION_DEPTH_CEILING"
+    # v2.25.4 — LAURA-ORCH-001: a tool hop emitted in direct response to prior
+    # tool-RESULT content (an injection-originated hop).  Flagged + budget-capped
+    # even though OPA-every-hop still adjudicates it.
+    ORCHESTRATION_INJECTION_HOP = "ORCHESTRATION_INJECTION_HOP"
+    # v2.25.4 — LAURA-ORCH-001(c): the model placed content derived from a prior
+    # RESTRICTED-sensitivity tool result into the ARGS of an outbound tool call
+    # (data-exfil-via-tool-args).  The hop is denied on egress before dispatch.
+    ORCHESTRATION_EXFIL_BLOCKED = "ORCHESTRATION_EXFIL_BLOCKED"
     # v0.9.0 — Break-glass (S-04)
     BREAK_GLASS_ACTIVATED = "BREAK_GLASS_ACTIVATED"
     BREAK_GLASS_EXPIRED = "BREAK_GLASS_EXPIRED"
@@ -1067,6 +1080,158 @@ class ResponseInjectionDetectedEvent(AuditEvent):
     content_type: str = ""  # Content-Type of the upstream response
     response_content_hash: str = ""  # SHA-256 of the raw response body
     classifier_only_mode: bool = False  # True when LLM fallback was skipped
+
+
+# ---------------------------------------------------------------------------
+# v2.25.4 — Agent/tool orchestration events (build sheet §7.6)
+#
+# Per the OPA-every-hop invariant (§0.1), each orchestration hop logs BOTH its
+# ingress OPA decision AND its egress OPA decision AND its inspection verdict,
+# plus the hop-depth, all correlated by a root_request_id.  This makes per-hop
+# OPA coverage *provable* from the audit sink (assertion 0 / 5).  Raw tool args
+# and tool results are NEVER stored — only a SHA-256 args-hash and the verdict.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrchestrationStepEvent(AuditEvent):
+    """One executed tool hop.  Carries the full adjudication triple."""
+
+    event_type: str = EventType.ORCHESTRATION_STEP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""        # correlates the whole orchestration tree
+    request_id: str = ""             # per-hop self-call request id
+    identity_id: str = ""            # the REAL caller (principal), not "internal"
+    # NTH1 (LAURA): the PostgresSink mirrors session_id/agent_id as queryable
+    # columns; set session_id=identity_id + agent_id="orchestrator" so the
+    # principal is queryable in the DB mirror, not only in the file sink.
+    session_id: str = ""             # = identity_id (queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""              # agent__<slug> | model__<id> | mcp__<server>__<tool>
+    tool_kind: str = ""              # agent | model | mcp
+    args_hash: str = ""              # SHA-256 of the JSON args (raw never stored)
+    depth: int = 0                   # hop-depth on the self-call chain (§0.1.2)
+    iteration: int = 0               # ReAct iteration index
+    ingress_opa_decision: str = ""   # allow | deny | <reason>
+    egress_opa_decision: str = ""    # allow | deny | not_applicable | <reason>
+    inspection_verdict: str = ""     # CLEAN | FLAGGED | BLOCKED | skipped
+    inspection_confidence: float = 1.0
+    blocked: bool = False
+    http_status: int = 0
+
+
+@dataclass
+class OrchestrationCapEvent(AuditEvent):
+    """The iteration / fan-out / wall-clock amplification cap was hit (§3.5)."""
+
+    event_type: str = EventType.ORCHESTRATION_CAP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    cap_kind: str = ""               # max_iters | max_fanout | deadline
+    cap_value: int = 0
+    iterations_run: int = 0
+
+
+@dataclass
+class OrchestrationBlockedStepEvent(AuditEvent):
+    """A tool result was BLOCKED on egress (OPA-egress and/or inspection).
+
+    The block-notice substitution (§3.4) means the raw upstream payload never
+    re-enters the orchestrator's context.  This is the 'cloud 9' headline event.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_BLOCKED_STEP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    tool_kind: str = ""
+    depth: int = 0
+    block_source: str = ""           # opa_egress | response_inspection | both
+    egress_opa_decision: str = ""
+    inspection_verdict: str = ""
+    inspection_confidence: float = 0.0
+    response_content_hash: str = ""  # SHA-256 of the withheld payload (never raw)
+
+
+@dataclass
+class OrchestrationDepthCeilingEvent(AuditEvent):
+    """A hop that would create a 10th nested link was hard-stopped (§0.1.2)."""
+
+    event_type: str = EventType.ORCHESTRATION_DEPTH_CEILING
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    attempted_depth: int = 0
+    max_depth: int = 9
+
+
+@dataclass
+class OrchestrationInjectionHopEvent(AuditEvent):
+    """A tool hop emitted in direct response to prior tool-RESULT content.
+
+    LAURA-ORCH-001: prompt injection is not lexically solvable, so the classifier
+    cannot be the load-bearing control.  The architectural guarantee is that every
+    such hop is (1) OPA-adjudicated ingress+egress like any other hop, (2) FLAGGED
+    here so an injection-driven hop is at minimum visible in the audit trail, and
+    (3) counted against a strict low budget (capped=True when the budget is hit, so
+    a result-steering loop cannot amplify).  Raw tool args/results are never stored.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_INJECTION_HOP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    tool_kind: str = ""
+    depth: int = 0
+    iteration: int = 0
+    injection_budget_used: int = 0   # how many provenance-derived hops so far
+    injection_budget_max: int = 0    # the strict low cap
+    capped: bool = False             # True → this hop was refused by the budget cap
+
+
+@dataclass
+class OrchestrationExfilBlockedEvent(AuditEvent):
+    """Data-exfil-via-tool-args was blocked on egress (LAURA-ORCH-001(c)).
+
+    The model placed content derived from a prior RESTRICTED/CONFIDENTIAL tool
+    result into the ARGS of an outbound tool call (esp. a PUBLIC-bound or MCP
+    egress hop).  The per-hop egress sensitivity check denied the smuggle before
+    dispatch.  Only the SHA-256 args-hash + the detected ceiling are stored.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_EXFIL_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    tool_kind: str = ""
+    depth: int = 0
+    args_hash: str = ""
+    args_sensitivity: str = ""       # detected sensitivity of the outbound args
+    deny_reason: str = ""            # sensitivity_exceeds_egress_ceiling
 
 
 # ---------------------------------------------------------------------------

@@ -219,16 +219,59 @@ def _service_account_full_list_enabled() -> bool:
     _SA_FULL_LIST_CACHE["ts"] = now
     return value
 
+def is_orchestration_self_call(request) -> bool:
+    """True when this request is an in-flight orchestration sub-hop.
+
+    The executor (orchestrator.py) stamps X-Yashigani-Orchestration-Depth on
+    every gateway self-call.  A present header (depth >= 1) means we are already
+    inside an orchestration loop, so the /v1 handler must NOT re-enter the
+    executor — it must run the hop as a normal chat/agent call.  This is the
+    guard that makes the self-call loop terminate (build sheet §3.1/§6).
+    """
+    return bool(request.headers.get("x-yashigani-orchestration-depth"))
+
+
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
 
 # ── Request/Response Models ──────────────────────────────────────────────
 
 
+# ── Tool-calling schema (orchestration, 2.25.4) ──────────────────────────
+# OpenAI-compatible function-tool shapes.  All additive + Optional so plain
+# chat callers (Open WebUI) are byte-for-byte unchanged when `tools` is absent.
+# Build sheet §1.1/§1.2 (orchestration-buildsheet-20260610).
+
+
+class ToolCallFunction(BaseModel):
+    name: str
+    # JSON-encoded string per OpenAI semantics.  The orchestrator/Ollama
+    # translation layer (orchestrator.py) serialises Ollama's object form here.
+    arguments: str = ""
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
+class ToolDef(BaseModel):
+    type: str = "function"
+    function: dict  # {name, description, parameters: JSON-Schema}
+
+
 class ChatMessage(BaseModel):
-    role: str = Field(description="Role: system, user, assistant")
-    content: str = Field(description="Message content")
+    # system | user | assistant | tool  (+"tool" now valid)
+    role: str = Field(description="Role: system, user, assistant, tool")
+    # Nullable: assistant tool-call turns carry content=null.  Audit/PII code
+    # joins with `if m.content` so None is treated as "" (build sheet §1.1 note).
+    content: Optional[str] = Field(default=None, description="Message content")
     name: Optional[str] = None
+    # assistant → requests tool calls
+    tool_calls: Optional[list[ToolCall]] = None
+    # role:"tool" → which assistant tool_call this message answers
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -241,11 +284,19 @@ class ChatCompletionRequest(BaseModel):
     # Yashigani extensions
     force_local: Optional[bool] = None
     force_cloud: Optional[bool] = None
+    # ── Orchestration (2.25.4, build sheet §1.2) ──────────────────────────
+    tools: Optional[list[ToolDef]] = None
+    # "auto" | "none" | "required" | {"type":"function","function":{"name":...}}
+    tool_choice: Optional[str | dict] = None
+    # Yashigani opt-in orchestration flag (§3.5 routing).  When tools is present
+    # OR orchestrate is True, /v1/chat/completions delegates to run_orchestration.
+    orchestrate: Optional[bool] = None
 
 
 class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: ChatMessage
+    # finish_reason gains "tool_calls" for assistant turns that request tools.
     finish_reason: str = "stop"
 
 
@@ -689,6 +740,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             },
         )
 
+    # ── 1c. Orchestration delegation (2.25.4, build sheet §3.1/§3.5) ──────
+    # When the caller supplies `tools` (or opts in via `orchestrate=true`), the
+    # request is a tool-calling orchestration, not a plain chat.  Delegate to the
+    # gateway-side ReAct executor, which runs every tool hop as a self-call that
+    # re-enters THIS full pipeline (OPA ingress + egress + ResponseInspection per
+    # hop, §0.1 invariant).  Orchestration self-calls do NOT carry `tools`, so
+    # they take the normal path below — there is no recursion through this branch.
+    if (body.tools or body.orchestrate) and not is_orchestration_self_call(request):
+        from yashigani.gateway.orchestrator import run_orchestration
+        return await run_orchestration(
+            body=body,
+            identity=identity,
+            request=request,
+            request_id=request_id,
+        )
+
     # ── 2. Extract prompt text for classification ─────────────────────
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
 
@@ -1083,7 +1150,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
             ollama_body = {
                 "model": selected_model,
-                "messages": [{"role": m.role, "content": m.content} for m in body.messages],
+                "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
                 "stream": True,
             }
             if body.temperature is not None:
@@ -1195,7 +1262,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
         # ── 7b. Buffered path (agent calls + stream=False + streaming disabled) ──
         if is_agent_call and agent_upstream:
-            agent_messages = [{"role": m.role, "content": m.content} for m in body.messages]
+            agent_messages = [{"role": m.role, "content": m.content or ""} for m in body.messages]
 
             if agent_protocol == "letta":
                 from yashigani.gateway.letta_client import letta_chat
@@ -1337,7 +1404,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # Standard Ollama routing (buffered)
             ollama_body = {
                 "model": selected_model if not is_agent_call else _state.default_model,
-                "messages": [{"role": m.role, "content": m.content} for m in body.messages],
+                "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
                 "stream": False,
             }
             if body.temperature is not None:
@@ -1868,9 +1935,31 @@ def _resolve_identity(request: Request) -> Optional[dict]:
         key = auth[7:]
         if hmac.compare_digest(key, _INTERNAL_BEARER):
             # Internal service-to-service calls (Open WebUI, agents)
-            # Treated as authenticated internal identity — same OPA rules apply
+            # Treated as authenticated internal identity — same OPA rules apply.
+            #
+            # ── Orchestration confused-deputy guard (build sheet §6 / §7.2) ──
+            # When an orchestration self-call carries X-Yashigani-Orchestration-
+            # Principal, OPA must evaluate the REAL caller's authorisation, not the
+            # internal service account.  We resolve that principal from the registry
+            # so every per-hop ingress/egress OPA decision (§0.1) names the true
+            # identity.  The header is only honoured on the internal-bearer path
+            # (mesh port 8081, network-isolated), so an external caller cannot set
+            # it to impersonate another principal.  Fail-closed: an unknown/empty
+            # principal falls back to the internal service identity (no privilege
+            # escalation — internal is RESTRICTED).
+            orch_principal = request.headers.get("x-yashigani-orchestration-principal", "").strip()
+            if orch_principal and _state.identity_registry is not None:
+                try:
+                    real = _state.identity_registry.get_by_slug(orch_principal)
+                except Exception:  # registry blip — fall back to internal
+                    real = None
+                if real:
+                    real = dict(real)
+                    real["_orchestration_self_call"] = True
+                    return real
             return {"identity_id": "internal", "status": "active", "kind": "service",
-                    "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
+                    "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
+                    "_orchestration_self_call": bool(orch_principal)}
 
     if not _state.identity_registry:
         return None

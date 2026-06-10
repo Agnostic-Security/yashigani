@@ -2257,13 +2257,48 @@ _write_aes_key_to_env() {
   fi
 
   # --- Upstream MCP URL ---
-  # Demo mode: use a built-in echo server so compose doesn't fail on missing var
-  # Production: set from wizard or --upstream-url flag
+  # Demo mode: point the gateway at the bundled demo-mcp upstream so the headline
+  # "cloud 9" rogue-MCP leg is reproducible from committed code with zero manual
+  # steps (MUST-FIX-2). Two things MUST be codified together here:
+  #   1. UPSTREAM_MCP_URL=http://demo-mcp:8000 — compose maps this to the gateway's
+  #      YASHIGANI_UPSTREAM_URL; tool_catalog._resolve_mcp_servers() only projects
+  #      the demo MCP catalog when the upstream URL contains "demo-mcp" (otherwise
+  #      the orchestration MCP catalog is EMPTY and the cloud-9 leg silently
+  #      doesn't exist).
+  #   2. the `demo-mcp` compose profile (docker/docker-compose.yml: the demo-mcp
+  #      service sits behind `profiles: [demo-mcp]`, added in 01b0c15) — without it,
+  #      the service is never started even though the gateway points at it.
+  # Both land via the same codified path: COMPOSE_PROFILES drives `--profile`
+  # flags at compose up (and is persisted to YASHIGANI_ENABLED_PROFILES); the URL
+  # is written to docker/.env. Production: set from wizard or --upstream-url flag.
+  # generate_secrets() runs BEFORE select_agent_bundles(), which only appends and
+  # dedups COMPOSE_PROFILES — so a demo-mcp entry added here survives to compose up.
   local upstream="${UPSTREAM_URL}"
   if [[ -z "$upstream" && "$DEPLOY_MODE" == "demo" ]]; then
-    upstream="http://localhost:8080/echo"
+    upstream="http://demo-mcp:8000"
+    # Enable the demo-mcp compose profile (idempotent — guard against a duplicate).
+    if ! printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "demo-mcp"; then
+      COMPOSE_PROFILES+=("demo-mcp")
+      log_info "Demo mode: enabling demo-mcp compose profile + pointing UPSTREAM_MCP_URL at http://demo-mcp:8000 (cloud-9 demo upstream)"
+    fi
   fi
   _env_set "UPSTREAM_MCP_URL" "${upstream}"
+
+  # --- Orchestration caps (build-sheet §9 — operator-tunable) ---
+  # MUST-FIX-3: these four caps are read by src/yashigani/gateway/orchestrator.py
+  # (via configure_openai_router) but previously lived only as code defaults —
+  # they appeared in no compose/.env, so operators could not tune them. Write
+  # them to docker/.env (compose passes them into the gateway container env).
+  # Defaults mirror the code defaults; honour any value the operator exported in
+  # the install environment. MAX_DEPTH stays at 9 — the §0.1 9-level hop invariant
+  # (orchestrator floors MAX_ITERS at 9 in code regardless of this value).
+  _env_set "YASHIGANI_ORCH_MAX_DEPTH"  "${YASHIGANI_ORCH_MAX_DEPTH:-9}"
+  _env_set "YASHIGANI_ORCH_MAX_ITERS"  "${YASHIGANI_ORCH_MAX_ITERS:-9}"
+  _env_set "YASHIGANI_ORCH_DEADLINE_S" "${YASHIGANI_ORCH_DEADLINE_S:-300}"
+  _env_set "YASHIGANI_ORCH_MAX_FANOUT" "${YASHIGANI_ORCH_MAX_FANOUT:-4}"
+  # LAURA-ORCH-001(b): strict low budget for injection-originated (tool-result
+  # justified) hops; over-budget result-steered hops are refused (fail-closed).
+  _env_set "YASHIGANI_ORCH_INJECTION_BUDGET" "${YASHIGANI_ORCH_INJECTION_BUDGET:-2}"
 
   # --- Domain ---
   _env_set "YASHIGANI_TLS_DOMAIN" "${DOMAIN}"
