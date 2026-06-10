@@ -4707,6 +4707,55 @@ select_agent_bundles() {
 }
 
 # =============================================================================
+# 3.0 doc-OPA: build the per-job sandboxed extractor image (release artifact).
+#
+# yashigani/extractor:${YASHIGANI_VERSION} is the image the document-enforcement
+# feature spawns per job (src/yashigani/documents/sandbox.py
+# SandboxedExtractorRunner). It is a BUILD-ONLY service in the
+# docker-compose.extractor.yml overlay (never `up`), so it must be built + tagged
+# explicitly here to be present when the feature flag is flipped on. Idempotent:
+# skips the build if the versioned image is already present (airgap / re-run).
+# Failure is FATAL on the Docker path only when document enforcement is enabled;
+# otherwise it is a warning (the feature is OFF by default, so a missing image
+# does not break a default install — it is only needed if the operator opts in).
+# =============================================================================
+_build_extractor_image() {
+  resolve_compose_cmd
+  local _base="${WORK_DIR}/docker/docker-compose.yml"
+  local _overlay="${WORK_DIR}/docker/docker-compose.extractor.yml"
+  local _tag="yashigani/extractor:${YASHIGANI_VERSION}"
+
+  if [[ ! -f "$_overlay" ]]; then
+    log_warn "extractor overlay not found ($_overlay) — skipping extractor build"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "${COMPOSE_CMD[*]} -f $_base -f $_overlay build extractor"
+    return 0
+  fi
+
+  # Skip if already built (versioned tag), to support airgap / re-runs.
+  if docker image inspect "$_tag" >/dev/null 2>&1; then
+    log_info "Extractor image already present ($_tag) — skipping build"
+    return 0
+  fi
+
+  log_info "Building per-job extractor image ($_tag) as a release artifact..."
+  # build-only profile is required to materialise the `extractor` service.
+  if "${COMPOSE_CMD[@]}" -f "$_base" -f "$_overlay" --profile build-only build extractor; then
+    log_success "Extractor image built ($_tag)"
+  else
+    if [[ "${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}" == "true" ]]; then
+      log_error "Extractor image build FAILED and document enforcement is ENABLED — cannot continue"
+      exit 1
+    fi
+    log_warn "Extractor image build failed; document enforcement is OFF by default so continuing"
+    log_warn "Enable the feature only after a successful extractor build (Dockerfile.extractor)"
+  fi
+}
+
+# =============================================================================
 # STEP 9 (compose/vm): docker compose pull
 # =============================================================================
 compose_pull() {
@@ -4873,6 +4922,18 @@ except Exception:
       exit 1
     }
     log_success "Local images built"
+  fi
+
+  # --- 3.0 doc-OPA: build the per-job extractor image as a RELEASE ARTIFACT ---
+  # The document-enforcement feature spawns ephemeral yashigani/extractor:<ver>
+  # containers on demand (SandboxedExtractorRunner). The image is build-only
+  # (never `up`), so the standard `build gateway backoffice` does not produce
+  # it. Build + tag it here as part of the release image set so the image
+  # EXISTS when the operator flips YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true
+  # — without this an enabled feature fails at first spawn (image not found).
+  # Built on the Docker path here; Podman builds it in the Podman build block.
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    _build_extractor_image
   fi
 
   # letta-pgbouncer uses edoburu/pgbouncer:v1.25.1-p0 (same multi-arch image as the
@@ -6084,6 +6145,28 @@ compose_up() {
       podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" -t yashigani/gateway:latest "${WORK_DIR}"
       podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" -t yashigani/backoffice:latest "${WORK_DIR}"
       log_success "Images built with Podman"
+    fi
+
+    # 3.0 doc-OPA: build the per-job extractor image (release artifact) under
+    # Podman too. Build-only (never `up`), so it must be built + tagged
+    # explicitly with the VERSIONED tag the runner names
+    # (yashigani/extractor:${YASHIGANI_VERSION}). Idempotent on re-run.
+    if podman image exists "yashigani/extractor:${YASHIGANI_VERSION}" 2>/dev/null; then
+      log_info "Extractor image already present (yashigani/extractor:${YASHIGANI_VERSION}) — skipping"
+    elif [[ -f "${WORK_DIR}/docker/Dockerfile.extractor" ]]; then
+      log_info "Building per-job extractor image with Podman (release artifact)..."
+      if podman build -f "${WORK_DIR}/docker/Dockerfile.extractor" \
+           -t "yashigani/extractor:${YASHIGANI_VERSION}" \
+           -t "yashigani/extractor:latest" "${WORK_DIR}"; then
+        log_success "Extractor image built with Podman (yashigani/extractor:${YASHIGANI_VERSION})"
+      elif [[ "${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}" == "true" ]]; then
+        log_error "Extractor build FAILED and document enforcement is ENABLED — cannot continue"
+        exit 1
+      else
+        log_warn "Extractor build failed; document enforcement is OFF by default — continuing"
+      fi
+    else
+      log_warn "Dockerfile.extractor not found — skipping extractor build (Podman)"
     fi
   fi
 

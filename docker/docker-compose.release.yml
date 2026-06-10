@@ -56,6 +56,16 @@
 # registry.agnosticsec.com. Their image: fields here are intentionally omitted
 # — the dev compose's build: stanza applies in overlay mode, and the release
 # pipeline sets the image reference (with digest) in the deployment job.
+#
+# 3.0 doc-OPA: yashigani/extractor is ALSO our own built-from-source image (the
+# per-job sandboxed extractor the document-enforcement feature spawns;
+# docker/Dockerfile.extractor, build wired in install.sh _build_extractor_image).
+# Like gateway/backoffice it is built locally and digest-pinned by the release
+# pipeline. It is NOT a `services:` override here because it is build-only
+# (never `up` — spawned per job by SandboxedExtractorRunner); the release
+# pipeline tags + pins yashigani/extractor:${YASHIGANI_VERSION}@sha256:<digest>
+# and exports it as YASHIGANI_EXTRACTOR_IMAGE so the runner pulls the pinned
+# digest. Keep this digest-pin in lockstep with the gateway/backoffice pins.
 
 services:
 
