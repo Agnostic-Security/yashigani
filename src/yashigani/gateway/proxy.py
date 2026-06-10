@@ -221,6 +221,35 @@ def create_gateway_app(
                         "Gateway: DB audit sink wiring failed (%s) — "
                         "continuing with file sink only", exc
                     )
+
+            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): reconcile the agent
+            # registry from the durable Postgres mirror into Redis db/3 on every
+            # boot. Redis db/3 has no persistence (appendonly no / save ""), so a
+            # `docker compose up -d redis` recreate wipes every @agent — the
+            # gateway then returns agent_not_found for all of them. The gateway is
+            # the request-time consumer and may restart independently of
+            # backoffice, so it ALSO self-heals here (idempotent; mirrors the OPA
+            # store→OPA re-push). Runs DIRECTLY against the asyncpg pool + Redis —
+            # no admin API, no admin password, no service account.
+            try:
+                _agent_reg = _state.get("agent_registry")
+                if _agent_reg is not None:
+                    from yashigani.agents.durable_store import AgentDurableStore
+                    from yashigani.agents.reconciler import reconcile_agents_from_durable
+                    await reconcile_agents_from_durable(_agent_reg, AgentDurableStore())
+                else:
+                    logger.warning(
+                        "Gateway: agent_registry not wired — agent reconcile skipped "
+                        "(agents will not auto-restore after a redis recreate)"
+                    )
+            except Exception as exc:
+                # Fail-loud but non-blocking: the gateway must still serve other
+                # traffic even if reconcile cannot run.
+                logger.error(
+                    "Gateway: agent reconcile from durable store FAILED (%s) — @agent "
+                    "routes may return agent_not_found until the registry is restored",
+                    exc,
+                )
         yield
         # Shutdown: close the HTTP client and DB pool
         # v2.25.2 — drain + stop the DB audit sink first so in-flight audit

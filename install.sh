@@ -5081,6 +5081,103 @@ _provision_audit_signing_key() {
   log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
 }
 
+# =============================================================================
+# _ensure_agent_databases — idempotent agent-DB provisioning (INSTALL-AGENTDB-001)
+# =============================================================================
+# Postgres docker-entrypoint-initdb.d scripts (incl. 11-agent-dbs.sh, which
+# creates the `letta` database + pgvector) run ONLY on a FRESH/EMPTY PGDATA.
+# An upgrade — or any install onto a pre-existing postgres_data volume that was
+# initialized before the agent-DB init script existed (or before a given agent
+# bundle was enabled) — never runs that script, so the agent DB is missing and
+# the agent (e.g. letta) crash-loops on "database \"letta\" does not exist".
+#
+# This step closes that gap: on EVERY compose_up (fresh AND upgrade), after
+# postgres is accepting connections, re-execute the SAME init script that the
+# entrypoint would have run — by exec'ing the copy already bind-mounted into the
+# running postgres container at /docker-entrypoint-initdb.d/11-agent-dbs.sh.
+#
+# Single source of truth: the set of agent DBs + owners + extensions lives ONLY
+# in docker/postgres/init-agent-dbs.sh. We do NOT duplicate the DB list here.
+# The script is already idempotent — `CREATE DATABASE ... WHERE NOT EXISTS ...
+# \gexec` (CREATE DATABASE has no IF NOT EXISTS) + `CREATE EXTENSION IF NOT
+# EXISTS vector` — so re-running it on a populated volume is a no-op when the DB
+# already exists and provisions it when absent. Safe to run repeatedly.
+#
+# Runtime-agnostic: uses "${COMPOSE_CMD[@]}" ... exec -T postgres, the same
+# invocation pattern as _upgrade_postgres_ssl, which works under Docker and
+# Podman (rootful + rootless). No host-side psql, no ad-hoc one-liner, no
+# hard-coded container name.
+#
+# Fail behaviour: agent bundles are OPT-IN and OPTIONAL; a provisioning failure
+# must not block the core stack. We log the psql output and warn (non-fatal) so
+# the gateway/backoffice still come up — the agent will simply remain unreachable
+# until the DB is provisioned, which is strictly better than failing the whole
+# install. The convergence gate for core services runs separately.
+# -----------------------------------------------------------------------------
+_ensure_agent_databases() {
+  # Only meaningful when at least one agent bundle that needs a postgres DB is
+  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/openwebui/wazuh
+  # carry no dedicated agent DB). We gate on COMPOSE_PROFILES containing `letta`
+  # rather than hard-coding the DB name — if a future bundle adds a DB to the init
+  # script, add its profile here and the init script remains the single source for
+  # the actual DB/owner/extension definitions.
+  local _need_agent_db="false"
+  local _p
+  for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+    case "$_p" in
+      letta) _need_agent_db="true" ;;
+    esac
+  done
+  if [[ "$_need_agent_db" != "true" ]]; then
+    return 0
+  fi
+
+  local _compose_file="${1:-${WORK_DIR}/docker/docker-compose.yml}"
+  local _initdb_script="/docker-entrypoint-initdb.d/11-agent-dbs.sh"
+
+  log_info "Ensuring agent databases exist (idempotent; INSTALL-AGENTDB-001)..."
+
+  # Wait for postgres to accept connections over the local socket (trust auth,
+  # the path the init script itself uses). Transport errors only — retry with
+  # capped backoff; a non-transport psql error is surfaced, not retried-to-pass.
+  local _ready="false" _i
+  for _i in $(seq 1 30); do
+    if "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+         pg_isready -U yashigani_admin -d yashigani >/dev/null 2>&1; then
+      _ready="true"; break
+    fi
+    sleep 2
+  done
+  if [[ "$_ready" != "true" ]]; then
+    log_warn "  postgres did not become ready in 60s — skipping agent-DB provisioning (agents may be unreachable until next run)"
+    return 0
+  fi
+
+  # Confirm the init script is mounted in the running container. If the volume
+  # mount is missing (older compose file), fall back to a warn — we do NOT inline
+  # a duplicate DB list (single-source-of-truth rule).
+  if ! "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+         test -r "$_initdb_script" 2>/dev/null; then
+    log_warn "  ${_initdb_script} not mounted in postgres container — cannot provision agent DBs"
+    log_warn "  (ensure docker/postgres/init-agent-dbs.sh is mounted; see docker-compose.yml)"
+    return 0
+  fi
+
+  # Re-run the EXACT init script the entrypoint runs on a fresh volume. It reads
+  # POSTGRES_USER / POSTGRES_DB from the container env (already set) and is
+  # idempotent. Capture output so failures are visible, never silent.
+  local _out _rc=0
+  _out="$("${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+            bash "$_initdb_script" 2>&1)" || _rc=$?
+  if [[ "$_rc" -eq 0 ]]; then
+    log_success "Agent databases ensured (init-agent-dbs.sh ran clean)"
+  else
+    log_warn "Agent-DB provisioning returned non-zero (rc=${_rc}) — agents may be unreachable:"
+    printf '%s\n' "$_out" | sed 's/^/    /' >&2
+  fi
+  return 0
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -5935,6 +6032,19 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # Timeout: 60 seconds (polling every 2s).
   # ---------------------------------------------------------------------------
   _verify_gateway_healthz
+
+  # ---------------------------------------------------------------------------
+  # INSTALL-AGENTDB-001: idempotently ensure opt-in agent databases exist.
+  #
+  # The postgres initdb agent-DB script (creates `letta` + pgvector) runs ONLY
+  # on a fresh PGDATA. On an upgrade — or an install onto a postgres_data volume
+  # that predates the agent-DB init script / the bundle being enabled — the DB is
+  # never created and the agent crash-loops. This re-runs the SAME (idempotent)
+  # init script inside the running postgres container so the DB is provisioned on
+  # every install/upgrade. Non-fatal: agent bundles are optional, so a failure
+  # here must not block the core stack.
+  # ---------------------------------------------------------------------------
+  _ensure_agent_databases "$compose_file"
 }
 
 # =============================================================================
@@ -6732,9 +6842,26 @@ _ctx.load_cert_chain(
     os.path.join(secrets, "backoffice_client.key"),
 )
 
-user = read_secret("admin1_username")
-pw = read_secret("admin1_password")
-totp_secret = read_secret("admin1_totp_secret")
+# ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): authenticate as the NON-INTERACTIVE
+# install-path service account (svc_admin_*), NOT admin1. admin1_password goes
+# stale the moment the human completes the forced first-login rotation (the
+# rotation control writes the new hash to Postgres only — never back to disk),
+# which broke every post-rotation re-run of this flow (notably the Redis-
+# durability agent re-registration after a redis recreate wipes the registry).
+# The service account is seeded with force_password_change=false /
+# force_totp_provision=false (backoffice/app.py _bootstrap_admin_accounts), so
+# its on-disk credential is never rotated by a human and re-runs always work.
+# Fall back to admin1_* only if svc_admin_* is absent (upgrade from a stack
+# installed before this fix, where no service account was seeded) — that legacy
+# path still works pre-rotation and matches prior behaviour.
+user = read_secret("svc_admin_username")
+pw = read_secret("svc_admin_password")
+totp_secret = read_secret("svc_admin_totp_secret")
+if not all([user, pw, totp_secret]):
+    user = read_secret("admin1_username")
+    pw = read_secret("admin1_password")
+    totp_secret = read_secret("admin1_totp_secret")
+    print("WARNING:svc_admin_secrets_absent_falling_back_to_admin1", file=sys.stderr)
 caddy_hmac = read_secret("caddy_internal_hmac")
 if not all([user, pw, totp_secret, caddy_hmac]):
     print("ERROR:missing_secrets", file=sys.stderr)
@@ -8024,6 +8151,78 @@ generate_secrets() {
     # backup tools, process env) and is intentionally avoided.
     # END YSG-P3-MCP-SIGKEY-UPGRADE
 
+    # BEGIN ISSUE-AGENT-REG-STALE-PW-UPGRADE-BACKFILL
+    # Install-path service account (svc_admin_*) on the UPGRADE path.
+    #
+    # The fresh-install svc_admin_* block lives below the `return 0` that ends
+    # this upgrade short-circuit, so on an already-rotated stack (postgres+redis
+    # present) the three svc_admin_* secrets were NEVER created. That is exactly
+    # the stack where a redis-wipe forces agent re-registration: with svc_admin_*
+    # absent, backoffice _bootstrap_service_account early-returns (no service
+    # account) and register_agent_bundles() falls back to the STALE admin1
+    # password (post forced-first-login rotation) → ISSUE-AGENT-REG-STALE-PW.
+    #
+    # Fix mirrors the caddy_internal_hmac / yashigani_internal_bearer upgrade
+    # backfills above: generate each secret only if its file is absent/empty
+    # (idempotent — never rotates an existing svc credential). The static
+    # username `install_svc` matches the fresh-install value exactly so a
+    # previously-seeded service account keeps the same identity.
+    #
+    # No .env sync: backoffice reads svc_admin_* from /run/secrets (file-tier),
+    # same as the fresh case.
+    #
+    # UID-1001 OWNERSHIP MUST BE APPLIED HERE — NOT deferred to
+    # _pki_chown_client_keys(). On the DOMINANT Docker-rootful upgrade (certs
+    # current, no SAN drift / not expired), bootstrap_internal_pki takes the
+    # no-rotation branch (~L10855) which EXPLICITLY SKIPS _pki_chown_client_keys
+    # under the upgrade no-touch rule (GATE5-BUG-01); it only re-chowns in the
+    # podman-rootless exception. So although svc_admin_* ARE listed in the
+    # _uid1001_secrets set, that set never runs on this path — the backfilled
+    # files would stay root:root 0600. Backoffice (UID 1001, cap_drop:[ALL], no
+    # DAC_OVERRIDE) then EACCESes on open() → _bootstrap_service_account
+    # early-returns → register_agent_bundles() falls back to the stale admin1
+    # password = ISSUE-AGENT-REG-STALE-PW, reproduced on the no-rotation path.
+    # Mirror the pgbouncer_authenticator_password backfill above (L8114): chown
+    # to the consumer UID at creation time so fresh and upgrade converge to the
+    # same owner:mode (UID 1001, 0600 — matching _uid1001_secrets + fresh block).
+    #
+    # This credential is NON-INTERACTIVE (seeded force_password_change=false,
+    # force_totp_provision=false) — never subject to human rotation. The human
+    # admin's forced first-login rotation control is UNCHANGED.
+    local _svc_user_file_up="${secrets_dir}/svc_admin_username"
+    local _svc_pw_file_up="${secrets_dir}/svc_admin_password"
+    local _svc_totp_file_up="${secrets_dir}/svc_admin_totp_secret"
+
+    if [[ ! -s "$_svc_user_file_up" ]]; then
+      printf "%s" "install_svc" > "$_svc_user_file_up"
+      chmod 600 "$_svc_user_file_up"
+      _do_chown "1001" "$_svc_user_file_up" "svc_admin_username" "" "${secrets_dir}" || true
+      log_info "Generated svc_admin_username → ${_svc_user_file_up} (mode 0600 uid 1001, upgrade path)"
+    else
+      log_info "svc_admin_username already present — preserving (upgrade path)"
+    fi
+    if [[ ! -s "$_svc_pw_file_up" ]]; then
+      local _svc_pw_up
+      _svc_pw_up="$(_gen_password)"
+      printf "%s" "$_svc_pw_up" > "$_svc_pw_file_up"
+      chmod 600 "$_svc_pw_file_up"
+      _do_chown "1001" "$_svc_pw_file_up" "svc_admin_password" "" "${secrets_dir}" || true
+      log_info "Generated svc_admin_password → ${_svc_pw_file_up} (mode 0600 uid 1001, upgrade path)"
+    else
+      log_info "svc_admin_password already present — preserving (upgrade path)"
+    fi
+    if [[ ! -s "$_svc_totp_file_up" ]]; then
+      local _svc_totp_up
+      _svc_totp_up="$(_gen_totp_secret)"
+      printf "%s" "$_svc_totp_up" > "$_svc_totp_file_up"
+      chmod 600 "$_svc_totp_file_up"
+      _do_chown "1001" "$_svc_totp_file_up" "svc_admin_totp_secret" "" "${secrets_dir}" || true
+      log_info "Generated svc_admin_totp_secret → ${_svc_totp_file_up} (mode 0600 uid 1001, upgrade path)"
+    else
+      log_info "svc_admin_totp_secret already present — preserving (upgrade path)"
+    fi
+    # END ISSUE-AGENT-REG-STALE-PW-UPGRADE-BACKFILL
+
     return 0
   fi
 
@@ -8085,6 +8284,29 @@ generate_secrets() {
   printf "%s" "$GEN_ADMIN2_TOTP_SECRET" > "${secrets_dir}/admin2_totp_secret"
   chmod 600 "${secrets_dir}/admin2_totp_secret"
   GEN_ADMIN2_TOTP_URI="$(_gen_totp_uri "$GEN_ADMIN2_USERNAME" "$GEN_ADMIN2_TOTP_SECRET")"
+
+  # --- Install-path service account (non-interactive bootstrap operations) ---
+  #
+  # ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): register_agent_bundles() used
+  # admin1_password, which goes stale after the human's forced first-login
+  # rotation (the rotation control writes the new hash to Postgres only — never
+  # back to disk). Post-rotation re-runs (e.g. Redis-durability re-registration
+  # after a redis recreate wipes the agent registry) then broke on a dead
+  # password. This service account is NON-INTERACTIVE: seeded by the backoffice
+  # bootstrap with force_password_change=false + force_totp_provision=false (see
+  # backoffice/app.py _bootstrap_admin_accounts), so its on-disk credential is
+  # never subject to human rotation and re-runs always authenticate. The human
+  # admin's forced first-login rotation is UNCHANGED. This credential is never
+  # printed for or used by a human login.
+  GEN_SVC_ADMIN_USERNAME="install_svc"
+  printf "%s" "$GEN_SVC_ADMIN_USERNAME" > "${secrets_dir}/svc_admin_username"
+  chmod 600 "${secrets_dir}/svc_admin_username"
+  GEN_SVC_ADMIN_PASSWORD="$(_gen_password)"
+  printf "%s" "$GEN_SVC_ADMIN_PASSWORD" > "${secrets_dir}/svc_admin_password"
+  chmod 600 "${secrets_dir}/svc_admin_password"
+  GEN_SVC_ADMIN_TOTP_SECRET="$(_gen_totp_secret)"
+  printf "%s" "$GEN_SVC_ADMIN_TOTP_SECRET" > "${secrets_dir}/svc_admin_totp_secret"
+  chmod 600 "${secrets_dir}/svc_admin_totp_secret"
 
   # --- PostgreSQL ---
   GEN_POSTGRES_PASSWORD="$(_gen_password)"
@@ -10072,6 +10294,11 @@ _pki_chown_client_keys() {
     admin2_password
     admin2_username
     admin2_totp_secret
+    # Install-path service account — read by backoffice (UID 1001) at bootstrap
+    # seed AND by register_agent_bundles() inside the backoffice container.
+    svc_admin_username
+    svc_admin_password
+    svc_admin_totp_secret
     grafana_admin_password
     caddy_internal_hmac
     openclaw_gateway_token

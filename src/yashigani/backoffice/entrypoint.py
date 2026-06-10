@@ -205,7 +205,31 @@ def _bootstrap():
                 len(rbac_store.list_groups()),
             )
             # Agent registry shares the same Redis db/3 instance (different key namespace)
-            agent_registry = AgentRegistry(redis_client=redis_rbac_client)
+            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): wire the durable
+            # Postgres mirror so register/update/deactivate dual-write to
+            # agent_registry. Redis db/3 has no persistence (appendonly no /
+            # save ""), so a redis recreate wipes the registry; the durable store
+            # + startup reconciler (lifespan) restore it. Constructed only when a
+            # usable (non-templated) DSN is present; otherwise the registry stays
+            # Redis-only as before. The store uses its own sync psycopg2 conn at
+            # write time, so it does not depend on the asyncpg pool being open yet.
+            _durable_agent_store = None
+            try:
+                from yashigani.agents.durable_store import AgentDurableStore, _direct_dsn
+                if _direct_dsn() and "${POSTGRES_PASSWORD}" not in _direct_dsn():
+                    _durable_agent_store = AgentDurableStore()
+                    logger.info("Agent durable store (Postgres mirror) wired")
+                else:
+                    logger.warning(
+                        "Agent durable store NOT wired — no usable Postgres DSN; "
+                        "agent registrations will NOT survive a redis recreate"
+                    )
+            except Exception as _ds_exc:
+                logger.warning("Agent durable store init skipped (%s)", _ds_exc)
+            agent_registry = AgentRegistry(
+                redis_client=redis_rbac_client,
+                durable_store=_durable_agent_store,
+            )
             logger.info(
                 "Agent registry initialised: %d agent(s) in index",
                 agent_registry.count("all"),
