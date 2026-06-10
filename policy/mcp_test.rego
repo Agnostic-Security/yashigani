@@ -1412,3 +1412,60 @@ test_fix_p3002_move_clean_args_allowed_readwrite if {
         "tool": {"name": "move_file", "args": {"source": "old.txt", "destination": "new.txt"}},
     } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
 }
+
+# ---------------------------------------------------------------------------
+# 16. Capability-envelope decision contract (3.0 / YSG-RISK-060)
+#
+# The structural diff + invocation gate are enforced in the broker (code is the
+# authority — an LLM never grants).  OPA carries only the SELF-DESCRIBING
+# decision contract (I6): policy_id + code + layman user_message keyed by the
+# broker's envelope deny_reason.  These tests assert the contract is stable,
+# closed-world (unknown reason => fail-closed wording), and code is constant.
+# ---------------------------------------------------------------------------
+
+# 16.1 policy_id is the stable envelope identifier.
+test_capability_envelope_policy_id if {
+    data.yashigani.mcp.capability_envelope_policy_id == "mcp.capability_envelope"
+}
+
+# 16.2 not-active reason maps to the re-approval contract with code.
+test_capability_envelope_not_active_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_not_active")
+    out.policy_id == "mcp.capability_envelope"
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    out.user_message != ""
+}
+
+# 16.3 tool-not-approved reason has its own message.
+test_capability_envelope_tool_not_approved_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_tool_not_approved")
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    contains(out.user_message, "approved capability set")
+}
+
+# 16.4 stale-surface reason has its own message.
+test_capability_envelope_stale_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_surface_stale")
+    contains(out.user_message, "changed since it was last approved")
+}
+
+# 16.5 refresh_* expansion reasons share the expansion message.
+test_capability_envelope_refresh_expanding_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("refresh_expanding")
+    contains(out.user_message, "expand what it can do")
+}
+
+test_capability_envelope_refresh_uncertain_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("refresh_uncertain")
+    contains(out.user_message, "expand what it can do")
+}
+
+# 16.6 CLOSED-WORLD: an unknown/unmapped reason still yields a fail-closed
+# contract (never undefined) — a new reason we have not typed defaults to the
+# conservative review wording.
+test_capability_envelope_unknown_reason_fail_closed if {
+    out := data.yashigani.mcp.capability_envelope_contract("some_brand_new_reason")
+    out.policy_id == "mcp.capability_envelope"
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    contains(out.user_message, "requires operator review")
+}

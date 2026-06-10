@@ -61,6 +61,44 @@ from yashigani.mcp._upstream_pin import (
 )
 from yashigani.mcp._pool import TenantPoolManager
 
+# 3.0 / YSG-RISK-060 — capability-envelope tool-surface pin
+from yashigani.mcp._envelope import (
+    EffectClass,
+    ArgShape,
+    ToolEnvelope,
+    ServerEnvelope,
+    StructuralDiffResult,
+    DiffFinding,
+    compute_provenance_id,
+    namespaced_tool_key,
+    surface_set_hash,
+    project_tool,
+    project_surface,
+    combine_effect_classes,
+    diff_envelope,
+)
+from yashigani.mcp._envelope_triage import (
+    TriageClass,
+    TriageOutcome,
+    triage_refresh,
+)
+from yashigani.mcp.envelope_service import (
+    CapabilityEnvelopeService,
+    EnvelopeRecord,
+    serialise_envelope,
+    deserialise_envelope,
+    STATUS_ACTIVE,
+    STATUS_BLOCKED,
+    STATUS_SUPERSEDED,
+    TOPOLOGY_RING_FENCED,
+    TOPOLOGY_EXTERNAL_RELAY,
+)
+from yashigani.mcp.envelope_reapproval import (
+    FieldLevelDiff,
+    compute_field_level_diff,
+    reapprove_envelope,
+)
+
 __all__ = [
     # Core
     "McpBroker",
@@ -95,4 +133,33 @@ __all__ = [
     "CERT_PIN_MISMATCH_LABEL",
     # Phase-2: P1-pool
     "TenantPoolManager",
+    # 3.0: capability-envelope tool-surface pin (YSG-RISK-060)
+    "EffectClass",
+    "ArgShape",
+    "ToolEnvelope",
+    "ServerEnvelope",
+    "StructuralDiffResult",
+    "DiffFinding",
+    "compute_provenance_id",
+    "namespaced_tool_key",
+    "surface_set_hash",
+    "project_tool",
+    "project_surface",
+    "combine_effect_classes",
+    "diff_envelope",
+    "TriageClass",
+    "TriageOutcome",
+    "triage_refresh",
+    "CapabilityEnvelopeService",
+    "EnvelopeRecord",
+    "serialise_envelope",
+    "deserialise_envelope",
+    "STATUS_ACTIVE",
+    "STATUS_BLOCKED",
+    "STATUS_SUPERSEDED",
+    "TOPOLOGY_RING_FENCED",
+    "TOPOLOGY_EXTERNAL_RELAY",
+    "FieldLevelDiff",
+    "compute_field_level_diff",
+    "reapprove_envelope",
 ]

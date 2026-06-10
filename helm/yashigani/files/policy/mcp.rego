@@ -461,6 +461,77 @@ deny_reason_value := "ok" if { allow }
 ra := redact_args
 
 # ---------------------------------------------------------------------------
+# 3.0 / YSG-RISK-060 — capability-envelope decision contract (self-describing)
+#
+# The capability-envelope INVOCATION HARD GATE and the refresh-time triage are
+# enforced in the broker (deterministic structural diff is the authority — an
+# LLM is never trusted to grant; see _envelope.py / _envelope_triage.py).  OPA
+# does NOT re-derive the structural diff (that authority is code, by design).
+#
+# What lives here is the SELF-DESCRIBING DECISION CONTRACT (I6 / the unified
+# user-alert envelope, 2026-06-06): stable policy_id + layman user_message +
+# code keyed by the broker's envelope deny_reason, so the gateway can render a
+# consistent layman explanation at the enforcement point WITHOUT a lookup
+# table.  The broker passes its deny_reason; this maps it to the contract.
+#
+# Whether the re-approval ADMIN action is rendered as a real OPA admin-plane
+# decision or as broker-internal-fail-closed + AdminSession+StepUp is contingent
+# on Tiago design-call #1 (GAP-003/004 admin-plane OPA).  The fresh-TOTP step-up
+# is UNCONDITIONAL either way (auth.stepup.assert_privileged_mutation).
+# ---------------------------------------------------------------------------
+
+# Stable policy identifier for the capability-envelope enforcement point.
+capability_envelope_policy_id := "mcp.capability_envelope"
+
+# capability_envelope_contract(reason) -> {policy_id, code, user_message}
+# `reason` is the broker's envelope deny_reason (e.g.
+# "capability_envelope_not_active", "capability_envelope_tool_not_approved",
+# "capability_envelope_surface_stale", "refresh_expanding", "refresh_uncertain").
+capability_envelope_contract(reason) := out if {
+    out := {
+        "policy_id": capability_envelope_policy_id,
+        "code": "TOOL_SURFACE_REAPPROVAL_REQUIRED",
+        "user_message": _capability_envelope_user_message(reason),
+    }
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    reason == "capability_envelope_not_active"
+    msg := "This imported tool has not been approved (or its approval was suspended pending review), so it cannot be used until an operator re-approves it."
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    reason == "capability_envelope_tool_not_approved"
+    msg := "The tool you tried to use is not part of the approved capability set for this imported service, so it was blocked."
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    reason == "capability_envelope_surface_stale"
+    msg := "This imported tool changed since it was last approved. It is blocked until an operator reviews the change."
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    startswith(reason, "refresh_")
+    msg := "An imported tool tried to expand what it can do beyond what was approved, so it was blocked. An operator must review and re-approve the change before this tool can be used again."
+}
+
+# Fallback for any unmapped envelope reason — fail-closed wording (closed-world).
+_capability_envelope_user_message(reason) := msg if {
+    not _known_envelope_reason(reason)
+    msg := "This imported tool was blocked by the capability-envelope control and requires operator review."
+}
+
+_known_envelope_reason(reason) if {
+    reason in {
+        "capability_envelope_not_active",
+        "capability_envelope_tool_not_approved",
+        "capability_envelope_surface_stale",
+    }
+}
+
+_known_envelope_reason(reason) if { startswith(reason, "refresh_") }
+
+# ---------------------------------------------------------------------------
 # P3 — Filesystem MCP server tool gating (Laura threat model §5)
 #
 # These rules enforce the filesystem-specific OPA constraints for the

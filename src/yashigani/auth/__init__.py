@@ -14,7 +14,11 @@ from yashigani.auth.totp import (
 from yashigani.auth.session import SessionStore, Session
 from yashigani.auth.local_auth import LocalAuthService, AccountRecord
 from yashigani.auth.spiffe import require_spiffe_id
-from yashigani.auth.stepup import has_fresh_stepup, assert_fresh_stepup, StepUpRequired, STEPUP_TTL_SECONDS
+from yashigani.auth.stepup import (
+    has_fresh_stepup, assert_fresh_stepup, StepUpRequired, STEPUP_TTL_SECONDS,
+    assert_privileged_mutation, PrivilegedMutationContext,
+    NotAuthorisedForPrivilegedMutation,
+)
 from yashigani.auth.caddy_verified import load_caddy_secret, CaddyVerifiedMiddleware
 # v2.23.3 (#59)
 from yashigani.auth.settings_store import AuthSettingsStore
@@ -35,6 +39,8 @@ __all__ = [
     "LocalAuthService", "AccountRecord",
     "require_spiffe_id",
     "has_fresh_stepup", "assert_fresh_stepup", "StepUpRequired", "STEPUP_TTL_SECONDS",
+    "assert_privileged_mutation", "PrivilegedMutationContext",
+    "NotAuthorisedForPrivilegedMutation",
     "load_caddy_secret", "CaddyVerifiedMiddleware",
     # v2.23.3 (#59)
     "AuthSettingsStore",

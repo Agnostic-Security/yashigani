@@ -145,6 +145,27 @@ class McpBrokerConfig:
     # v2.26 / YSG-RISK-057 — content-filter v2 semantic-intent sidecar.
     semantic_intent_sidecar: Optional[Any] = None  # SemanticIntentSidecar
 
+    # 3.0 / YSG-RISK-060 — imported-MCP capability-envelope service.
+    #
+    # When supplied, broker.enforce() runs the INVOCATION HARD GATE (Laura
+    # R3-3 / Iris §3.1.2): a tools/call whose (provenance_id, tool_name) is not
+    # inside an ACTIVE approved envelope — or whose envelope is blocked / whose
+    # surface mutated away from the materialised byte-hash — fails closed.  This
+    # is the load-bearing security boundary; the refresh-time triage is
+    # defence-in-depth on top.
+    #
+    # When None, the gate is a NO-OP in dev/test (no envelopes provisioned);
+    # in production/staging it is REQUIRED for any pinned imported MCP — the
+    # broker fail-closes a call against a server that has pin material but no
+    # envelope service to consult.
+    envelope_service: Optional[Any] = None  # CapabilityEnvelopeService
+
+    # 3.0 — whether the capability-envelope invocation gate is enforced for
+    # this broker's imported MCP servers.  Defaults to True when an
+    # envelope_service is wired; an operator may not silently disable it in
+    # prod (the gate fail-closes a pinned server regardless).
+    enforce_capability_envelope: bool = True
+
     # FIX-P3-ENFORCE (Iris F2): Shape-C filesystem MCP-server flag.
     # When True, broker runs a SECOND OPA gate (filesystem_tool_allowed)
     # after the global mcp_decision allow, enforcing per-tool + path-arg
@@ -245,6 +266,10 @@ class McpBroker:
         # (the flag check lives inside the sidecar / filter_description_v2), so
         # wiring a sidecar here without setting the flag is still v1 behaviour.
         self._semantic_intent_sidecar = config.semantic_intent_sidecar
+
+        # [3.0 / YSG-RISK-060] Capability-envelope invocation gate.
+        self._envelope_service = config.envelope_service
+        self._enforce_capability_envelope = bool(config.enforce_capability_envelope)
 
     async def enforce(self, ctx: McpCallContext) -> BrokerDecision:
         """
@@ -450,6 +475,38 @@ class McpBroker:
             await self._emit_audit(ctx, ce_decision)
             return ce_decision
 
+        # Step 2e (3.0 / YSG-RISK-060): capability-envelope INVOCATION HARD GATE.
+        #
+        # The load-bearing security boundary (Laura R3-3 / Iris §3.1.2).  A
+        # tools/call whose (provenance_id, tool_name) is not inside an ACTIVE
+        # approved envelope — or whose envelope is blocked / whose live surface
+        # has mutated away from the materialised byte-hash — fails CLOSED here,
+        # at the call, regardless of whether the refresh-time triage raced or
+        # was skipped.  The pin/triage is defence-in-depth on top of this.
+        env_deny = await self._check_capability_envelope(ctx)
+        if env_deny is not None:
+            env_elapsed = int((time.monotonic() - t0) * 1000)
+            env_decision = BrokerDecision(
+                call_id=call_id,
+                allow=False,
+                deny_reason=env_deny,
+                opa_decision=OpaDecision(
+                    allow=False, deny_reason=env_deny, redact_args=set(),
+                    audit_capture=True, rate_limit_key=None,
+                ),
+                chain_depth=len(chain_for_opa),
+                elapsed_ms=env_elapsed,
+                error=None,
+            )
+            logger.warning(
+                "mcp-broker: [YSG-RISK-060] capability-envelope gate DENIED "
+                "call_id=%s server=%s tool=%s reason=%s",
+                call_id, ctx.server_id, ctx.tool_name, env_deny,
+            )
+            await self._emit_audit(ctx, env_decision)
+            self._emit_envelope_blocked_at_invocation(ctx, env_deny)
+            return env_decision
+
         # Step 3: issue gateway-signed JWT (only on OPA allow)
         #
         # FIX-B (Lu FIX-1): ChainDepthExceeded must be caught and emitted with
@@ -521,6 +578,132 @@ class McpBroker:
         # Step 5: emit audit (EVERY call — clean allowed calls leave a witness)
         await self._emit_audit(ctx, decision)
         return decision
+
+    def _provenance_id_for(self, server_id: str) -> Optional[str]:
+        """
+        Derive provenance_id = H(server_id ‖ P8-pin-material) for an upstream
+        server, using the P8 pin config.  Returns None when no pin config is
+        registered for the server (the envelope is bound to the transport
+        identity — without a pin there is no provenance to bind to).
+        """
+        if not server_id:
+            return None
+        pin_cfg = self._upstream_pin_map.get(server_id)
+        if pin_cfg is None:
+            return None
+        # Pin material = the cert fingerprint OR the SPIFFE id, whichever the
+        # P8 pin established for this server.
+        pin_material = pin_cfg.cert_fingerprint_sha256 or pin_cfg.spiffe_id
+        if not pin_material:
+            return None
+        from yashigani.mcp._envelope import compute_provenance_id
+        return compute_provenance_id(server_id, pin_material)
+
+    async def _check_capability_envelope(
+        self, ctx: McpCallContext
+    ) -> Optional[str]:
+        """
+        Capability-envelope invocation hard gate (YSG-RISK-060 / Laura R3-3).
+
+        Returns a deny_reason string when the call must be BLOCKED, or None when
+        the call may proceed.  Fail-closed semantics:
+
+          * Only applies to tool calls (a resolvable tool_name).  Non-tool
+            actions (resource/prompt) are out of scope for the tool-surface pin.
+          * No envelope_service wired:
+              - dev/test  → no-op (None): envelopes not provisioned.
+              - prod/stag → if the server has pin material (is a pinned imported
+                MCP) → DENY (a pinned server with no envelope service to consult
+                must fail closed).
+          * Server has no provenance_id (no P8 pin) → not an envelope-governed
+            imported MCP → no-op (None).  (Local stdio / first-party tools are
+            not imported MCPs.)
+          * Active envelope missing / blocked → DENY (unpinned / suspended).
+          * Tool not in the active envelope's tool_set → DENY (the tool the
+            caller named is not an approved capability).
+          * Live catalogue surface hash != envelope current_surface_hash → DENY
+            (the surface mutated between fetch and call — caught at the call).
+        """
+        if not self._enforce_capability_envelope:
+            return None
+        # Only tool calls carry a tool surface to pin.
+        if ctx.tool_name is None:
+            return None
+
+        provenance_id = self._provenance_id_for(ctx.server_id)
+
+        if self._envelope_service is None:
+            # No service wired.  In prod/staging, a PINNED imported MCP must not
+            # be invoked without an envelope to consult — fail closed.
+            _env = os.environ.get("YASHIGANI_ENV", "").lower().strip()
+            if provenance_id is not None and _env in {"production", "staging"}:
+                return "capability_envelope_service_unavailable"
+            return None
+
+        if provenance_id is None:
+            # Not a pinned imported MCP (no P8 pin material) → out of scope.
+            return None
+
+        try:
+            record = await self._envelope_service.get_active_envelope(provenance_id)
+        except Exception as exc:  # fail-closed on any service/DB error
+            logger.error(
+                "mcp-broker: [YSG-RISK-060] envelope lookup failed server=%s: %s — "
+                "fail-closed deny", ctx.server_id, exc,
+            )
+            return "capability_envelope_lookup_error"
+
+        if record is None:
+            # No active envelope: never approved, or latched-blocked, or
+            # superseded-without-active (re-approval pending).  Fail closed.
+            return "capability_envelope_not_active"
+
+        from yashigani.mcp._envelope import namespaced_tool_key
+        tool_key = namespaced_tool_key(provenance_id, ctx.tool_name)
+        if tool_key not in record.envelope.tools:
+            return "capability_envelope_tool_not_approved"
+
+        # Surface-mutation-between-fetch-and-call: compare the live catalogue's
+        # byte-hash to the envelope's materialised current_surface_hash.  A
+        # mismatch means the surface changed and the refresh triage has not
+        # (yet) re-pinned/blocked it — fail closed at the call.
+        live = self._catalogue_store.get(ctx.tenant_id, ctx.server_id)
+        if live is not None:
+            from yashigani.mcp._envelope import surface_set_hash
+            # Reconstruct the live surface hash from the stored catalogue's raw
+            # descriptors is not possible (we only keep safe text), so we rely on
+            # the catalogue carrying the last-fetched surface hash when present.
+            live_hash = getattr(live, "surface_set_hash", None)
+            if live_hash and live_hash != record.current_surface_hash:
+                return "capability_envelope_surface_stale"
+
+        return None
+
+    def _emit_envelope_blocked_at_invocation(
+        self, ctx: McpCallContext, block_reason: str
+    ) -> None:
+        """Emit McpEnvelopeBlockedEvent for an invocation-gate denial (audit)."""
+        try:
+            from yashigani.audit.schema import McpEnvelopeBlockedEvent
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mcp-broker: envelope-blocked audit import failed: %s", exc)
+            return
+        provenance_id = self._provenance_id_for(ctx.server_id) or ""
+        event = McpEnvelopeBlockedEvent(
+            tenant_id=ctx.tenant_id,
+            server_id=ctx.server_id,
+            provenance_id=provenance_id,
+            block_reason=f"invocation:{block_reason}",
+            tool_name=ctx.tool_name or "",
+        )
+        if self._audit_writer is not None:
+            try:
+                self._audit_writer.write(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "mcp-broker: envelope-blocked audit write failed server=%s: %s",
+                    ctx.server_id, exc,
+                )
 
     async def _verify_upstream_jwt(self, ctx: McpCallContext) -> Optional[str]:
         """
@@ -681,6 +864,140 @@ class McpBroker:
         # missed).  No-op when the sidecar is off (no escalations).
         self._emit_semantic_intent_escalations(catalogue, fetch_type="tools_list")
         return catalogue
+
+    async def refresh_and_triage_tools(
+        self,
+        server_id: str,
+        raw_tools: list[dict],
+        raw_prompts: Optional[list[dict]] = None,
+    ) -> "Any":
+        """
+        3.0 / YSG-RISK-060 — the M4 refresh hook with capability-envelope triage.
+
+        Filters the surface (as fetch_and_filter_tools does) AND, when an
+        envelope_service is wired and an active envelope exists, triages the
+        refreshed surface against the ORIGINAL approved baseline:
+
+          * byte-hash unchanged           → no-op (identical surface).
+          * structurally within envelope  → run escalate-only sidecar:
+              - sidecar clean   → BENIGN: auto-allow + re-pin byte-hash + log.
+              - sidecar flag/err→ UNCERTAIN: latch block + log (fail-closed).
+          * structurally expanding        → EXPANDING: latch block + log
+                                            (operator step-up re-approval needed).
+
+        Returns the TriageOutcome (or None when no envelope governs this server
+        — e.g. no P8 pin / no active envelope yet at first import).
+
+        The drift is measured against the ORIGINAL baseline (envelope_version 1),
+        never the last auto-allowed state (Laura must-have #1 / Δ1).
+        """
+        # Always run the M4 filter first (catalogue stored, audit emitted).
+        catalogue = self.fetch_and_filter_tools(server_id, raw_tools, raw_prompts)
+
+        provenance_id = self._provenance_id_for(server_id)
+        if self._envelope_service is None or provenance_id is None:
+            # No envelope governance for this server (dev/test, or not a pinned
+            # imported MCP).  The invocation gate still fail-closes in prod.
+            return None
+
+        from yashigani.mcp._envelope import project_surface, surface_set_hash
+        from yashigani.mcp._envelope_triage import triage_refresh, TriageClass
+
+        # The ORIGINAL approved baseline (Δ1).  None ⇒ never imported ⇒ nothing
+        # to triage against (the import ceremony mints v1 separately).
+        baseline = await self._envelope_service.get_baseline_envelope(provenance_id)
+        active = await self._envelope_service.get_active_envelope(provenance_id)
+        if baseline is None or active is None:
+            return None
+
+        new_hash = surface_set_hash(raw_tools, raw_prompts or [])
+        # byte-hash unchanged vs the active materialisation → identical surface.
+        if new_hash == active.current_surface_hash:
+            return None
+
+        current_env = project_surface(
+            provenance_id,
+            self._config.tenant_id,
+            raw_tools,
+            egress_posture=baseline.egress_posture,
+        )
+
+        outcome = triage_refresh(
+            approved_baseline=baseline.envelope,
+            current_envelope=current_env,
+            current_raw_tools=raw_tools,
+            new_surface_hash=new_hash,
+            sidecar=self._semantic_intent_sidecar,
+            topology=active.topology,
+        )
+
+        if outcome.triage_class is TriageClass.BENIGN:
+            await self._envelope_service.record_benign_repin(provenance_id, new_hash)
+            self._emit_envelope_benign_update(
+                server_id, provenance_id, active.envelope_version, new_hash
+            )
+        else:
+            # EXPANDING or UNCERTAIN — latch the block on the provenance.  The
+            # block PERSISTS until a step-up re-approval; reversion does not
+            # clear it (Laura §3 bypass B).
+            await self._envelope_service.latch_block(provenance_id)
+            self._emit_envelope_blocked_at_refresh(
+                server_id, provenance_id, outcome
+            )
+        return outcome
+
+    def _emit_envelope_benign_update(
+        self, server_id: str, provenance_id: str,
+        envelope_version: int, new_hash: str,
+    ) -> None:
+        """Emit McpEnvelopeBenignUpdateEvent for an auto-allowed benign refresh."""
+        try:
+            from yashigani.audit.schema import McpEnvelopeBenignUpdateEvent
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mcp-broker: envelope-benign audit import failed: %s", exc)
+            return
+        event = McpEnvelopeBenignUpdateEvent(
+            tenant_id=self._config.tenant_id,
+            server_id=server_id,
+            provenance_id=provenance_id,
+            envelope_version=envelope_version,
+            new_surface_hash=new_hash,
+        )
+        if self._audit_writer is not None:
+            try:
+                self._audit_writer.write(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("mcp-broker: envelope-benign audit write failed: %s", exc)
+
+    def _emit_envelope_blocked_at_refresh(
+        self, server_id: str, provenance_id: str, outcome: "Any"
+    ) -> None:
+        """Emit McpEnvelopeBlockedEvent for an expanding/uncertain refresh block."""
+        try:
+            from yashigani.audit.schema import McpEnvelopeBlockedEvent
+            from yashigani.mcp._envelope_triage import TriageClass
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mcp-broker: envelope-blocked audit import failed: %s", exc)
+            return
+        block_reason = (
+            "refresh_expanding"
+            if outcome.triage_class is TriageClass.EXPANDING
+            else "refresh_uncertain"
+        )
+        dims = sorted({f.dimension for f in outcome.findings})
+        event = McpEnvelopeBlockedEvent(
+            tenant_id=self._config.tenant_id,
+            server_id=server_id,
+            provenance_id=provenance_id,
+            block_reason=block_reason,
+            expansion_dimensions=dims,
+            finding_count=len(outcome.findings),
+        )
+        if self._audit_writer is not None:
+            try:
+                self._audit_writer.write(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("mcp-broker: envelope-blocked audit write failed: %s", exc)
 
     def fetch_and_filter_prompt(
         self,

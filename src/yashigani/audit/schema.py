@@ -292,6 +292,15 @@ class EventType(str, Enum):
     OPA_DECISION_ON_MCP = "OPA_DECISION_ON_MCP"
     # Egress allowlist entry exercised (covert-channel audit — TM-URF-023 / G3)
     EGRESS_ALLOW_USED = "EGRESS_ALLOW_USED"
+    # 3.0 / YSG-RISK-060 — imported-MCP capability-envelope tool-surface pin.
+    # Benign sub-envelope refresh auto-allowed + byte-hash re-pinned (no operator).
+    MCP_ENVELOPE_BENIGN_UPDATE = "MCP_ENVELOPE_BENIGN_UPDATE"
+    # Capability-expanding OR sidecar-uncertain refresh blocked (latched until
+    # step-up re-approval).  The invocation gate also emits this on a stale /
+    # unpinned tool surface at call time.
+    MCP_ENVELOPE_BLOCKED = "MCP_ENVELOPE_BLOCKED"
+    # Shared privileged-mutation gate fired (envelope re-approval / #4 / #5).
+    PRIVILEGED_MUTATION = "PRIVILEGED_MUTATION"
 
 
 # ---------------------------------------------------------------------------
@@ -2416,6 +2425,121 @@ class SemanticIntentEscalatedEvent(AuditEvent):
         "tries to manipulate the AI. It was blocked before reaching the agent."
     )
     code: int = 403
+
+
+@dataclass
+class McpEnvelopeBenignUpdateEvent(AuditEvent):
+    """
+    3.0 / YSG-RISK-060 — emitted when an imported-MCP tool-surface refresh is
+    triaged BENIGN (structurally within the approved capability envelope AND
+    the escalate-only sidecar found no injection intent) and auto-allowed.
+
+    The envelope's typed dimensions are UNCHANGED; only the byte-surface-hash
+    change-detector is re-pinned (Iris §2.2).  No operator involvement.
+
+    Self-describing per the user-alert / OPA-decision contract: rule_id +
+    layman user_message + code.  The raw surface text is NEVER stored.
+
+    Security invariants:
+      - The decision was made by the deterministic STRUCTURAL diff (authority),
+        not the LLM (Laura must-have #2).
+      - provenance_id binds the envelope to the P8 transport identity.
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_BENIGN_UPDATE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""              # H(server_id ‖ pin-material)
+    envelope_version: int = 0            # the unchanged active envelope version
+    new_surface_hash: str = ""           # the re-pinned byte-hash (audit-safe)
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "An imported tool was updated. The change did not add any new "
+        "capability, so it was accepted automatically and recorded for audit."
+    )
+    code: int = 200
+
+
+@dataclass
+class McpEnvelopeBlockedEvent(AuditEvent):
+    """
+    3.0 / YSG-RISK-060 — emitted when an imported-MCP tool surface is BLOCKED:
+      - a refresh that EXPANDS capability vs the approved envelope (block +
+        step-up re-approve), OR
+      - a refresh the escalate-only sidecar flagged / fail-closed (UNCERTAIN),
+        OR
+      - the invocation hard gate in broker.enforce() denying a call whose tool
+        surface is unpinned / blocked / stale (the load-bearing security
+        boundary — Laura R3-3).
+
+    The block LATCHES on the provenance until a step-up re-approval; a surface
+    reversion does NOT auto-clear it (Laura §3 bypass B / Δ1).
+
+    Self-describing contract.  The raw surface text is NEVER stored — only the
+    expansion dimension labels + masked detail.
+
+    Security invariants:
+      - The block decision was structural (authority) or fail-closed; the LLM
+        can never DOWNGRADE this to an allow (Laura must-have #2).
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""
+    # "refresh_expanding" | "refresh_uncertain" | "invocation_unpinned" |
+    # "invocation_stale" | "invocation_blocked"
+    block_reason: str = ""
+    # Sorted list of expansion dimension labels (NOT the raw text), e.g.
+    # ["effect_class", "arg_shape", "tool_set"].
+    expansion_dimensions: list = field(default_factory=list)
+    finding_count: int = 0
+    tool_name: str = ""                  # the tool at invocation time (if any)
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "An imported tool tried to expand what it can do beyond what was "
+        "approved, so it was blocked. An operator must review and re-approve "
+        "the change before this tool can be used again."
+    )
+    code: int = 403
+
+
+@dataclass
+class PrivilegedMutationEvent(AuditEvent):
+    """
+    Shared privileged-mutation audit shape (Iris §5.2 / Laura R3-9).
+
+    Emitted by ``auth.stepup.assert_privileged_mutation`` after BOTH the
+    operator-RBAC and fresh-step-up gates pass, for EVERY privileged-mutation
+    surface across tensions #3 (MCP envelope re-approval), #4, and #5.  One
+    uniform tamper-evident shape so all privileged actions are auditable
+    consistently (rides YSG-RISK-059 immutability).
+
+    Security invariants:
+      - Emitted only AFTER fresh TOTP + operator RBAC are proven.
+      - ``before``/``after`` carry state snapshots (e.g. the envelope
+        field-level diff) — callers must pass audit-safe (non-secret) values.
+    """
+
+    event_type: str = EventType.PRIVILEGED_MUTATION
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""                     # e.g. "mcp.envelope.reapprove"
+    principal: str = ""                  # operator identity (sub / account_id)
+    target: str = ""                     # object mutated (e.g. provenance_id)
+    justification: str = ""              # operator free-text (recorded, untrusted)
+    before: Optional[dict] = None
+    after: Optional[dict] = None
+    rule_id: str = "yashigani.auth.privileged-mutation"
+    user_message: str = (
+        "A privileged operator action was performed after fresh identity "
+        "re-verification and recorded for audit."
+    )
+    code: int = 200
 
 
 @dataclass

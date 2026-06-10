@@ -554,6 +554,11 @@ class TenantCatalogue:
     server_id: str
     tools: list[ToolDescriptor] = field(default_factory=list)
     prompts: list[PromptDescriptor] = field(default_factory=list)
+    # 3.0 / YSG-RISK-060 — byte-surface-hash of the raw surface this catalogue
+    # was built from (the capability-envelope change-detector).  Populated by
+    # build_catalogue; "" when not computed.  Used by the invocation gate to
+    # detect a surface that mutated between fetch and call.
+    surface_set_hash: str = ""
 
     # Aggregate stats for audit emission
     @property
@@ -690,9 +695,18 @@ def build_catalogue(
             filter_result=result,
         ))
 
+    # 3.0 / YSG-RISK-060 — compute the byte-surface-hash change-detector over
+    # the raw surface (lazy import to avoid a cycle at module load).
+    try:
+        from yashigani.mcp._envelope import surface_set_hash as _ssh
+        _hash = _ssh(raw_tools, raw_prompts)
+    except Exception:  # pragma: no cover — never let hashing break the filter
+        _hash = ""
+
     return TenantCatalogue(
         tenant_id=tenant_id,
         server_id=server_id,
         tools=tools,
         prompts=prompts,
+        surface_set_hash=_hash,
     )
