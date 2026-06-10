@@ -118,6 +118,15 @@ class McpBrokerConfig:
     pool_manager:
         [P1-pool] TenantPoolManager for per-tenant HTTP connection pools.
         If None, a new manager is created at broker init.
+
+    semantic_intent_sidecar:
+        [v2.26 / YSG-RISK-057] Optional content-filter v2 sidecar.  When
+        supplied AND the YASHIGANI_SEMANTIC_INTENT_SIDECAR flag is ON, each
+        clean-heuristic tool description / prompt gets a second, encoding-aware
+        look (decode-before-classify) that catches the encoded-injection
+        residual the v1 heuristic cannot.  When None or the flag is OFF, the
+        broker's filter path is byte-identical to v1.  Escalate-only,
+        fail-closed — see ``inspection.semantic_intent``.
     """
 
     opa_url: str
@@ -132,6 +141,9 @@ class McpBrokerConfig:
     catalogue_store: Optional[ToolCatalogueStore] = None
     upstream_pin_configs: Optional[list] = None  # list[UpstreamPinConfig]
     pool_manager: Optional[TenantPoolManager] = None
+
+    # v2.26 / YSG-RISK-057 — content-filter v2 semantic-intent sidecar.
+    semantic_intent_sidecar: Optional[Any] = None  # SemanticIntentSidecar
 
     # FIX-P3-ENFORCE (Iris F2): Shape-C filesystem MCP-server flag.
     # When True, broker runs a SECOND OPA gate (filesystem_tool_allowed)
@@ -226,6 +238,13 @@ class McpBroker:
             self._pool_manager = config.pool_manager
         else:
             self._pool_manager = TenantPoolManager()
+
+        # [v2.26 / YSG-RISK-057] Content-filter v2 semantic-intent sidecar.
+        # None by default → the filter path is byte-identical to v1.  When a
+        # sidecar is supplied, it only escalates when its own feature flag is ON
+        # (the flag check lives inside the sidecar / filter_description_v2), so
+        # wiring a sidecar here without setting the flag is still v1 behaviour.
+        self._semantic_intent_sidecar = config.semantic_intent_sidecar
 
     async def enforce(self, ctx: McpCallContext) -> BrokerDecision:
         """
@@ -653,9 +672,14 @@ class McpBroker:
             server_id=server_id,
             raw_tools=raw_tools,
             raw_prompts=raw_prompts or [],
+            sidecar=self._semantic_intent_sidecar,
         )
         self._catalogue_store.store(catalogue)
         self._emit_tool_description_fetched_event(catalogue, fetch_type="tools_list")
+        # v2.26 / YSG-RISK-057 — emit a dedicated, self-describing audit event
+        # for every descriptor the sidecar ESCALATED (caught what the heuristic
+        # missed).  No-op when the sidecar is off (no escalations).
+        self._emit_semantic_intent_escalations(catalogue, fetch_type="tools_list")
         return catalogue
 
     def fetch_and_filter_prompt(
@@ -676,8 +700,10 @@ class McpBroker:
 
         Returns the FilterResult.  Use ``result.safe_text`` downstream.
         """
-        from yashigani.mcp._content_filter import filter_description
-        result = filter_description(prompt_content)
+        from yashigani.mcp._content_filter import filter_description_v2
+        result = filter_description_v2(
+            prompt_content, sidecar=self._semantic_intent_sidecar
+        )
 
         # Build a minimal catalogue entry for audit emission
         from yashigani.mcp._content_filter import (
@@ -695,6 +721,9 @@ class McpBroker:
             )],
         )
         self._emit_tool_description_fetched_event(
+            mini_catalogue, fetch_type="prompts_get"
+        )
+        self._emit_semantic_intent_escalations(
             mini_catalogue, fetch_type="prompts_get"
         )
         return result
@@ -739,6 +768,68 @@ class McpBroker:
                 "server_id=%s tenant=%s rejected=%d",
                 catalogue.server_id, catalogue.tenant_id, rejected_count,
             )
+
+    def _emit_semantic_intent_escalations(
+        self,
+        catalogue: TenantCatalogue,
+        fetch_type: str,
+    ) -> None:
+        """
+        v2.26 / YSG-RISK-057 — emit a dedicated SemanticIntentEscalatedEvent for
+        every descriptor the content-filter v2 sidecar ESCALATED (caught what
+        the v1 heuristic missed: an encoded/obfuscated injection).
+
+        An escalation is identified by ``filter_result.reject_reason ==
+        "semantic_intent"`` — set only by ``filter_description_v2`` when the
+        sidecar flagged a clean-heuristic verdict.  When the sidecar is off, no
+        descriptor carries that reason and this is a no-op.
+
+        The event is self-describing (rule_id + layman user_message + code) and
+        carries ONLY masked / audit-safe verdict detail (flagged_view codec name,
+        masked encoded segment, aggregate score) — never the raw content.
+        """
+        from yashigani.audit.schema import SemanticIntentEscalatedEvent
+
+        # Gather (item_name, filter_result) pairs for tools + prompts.
+        items: list[tuple[str, Any]] = [
+            (t.tool_name, t.filter_result) for t in catalogue.tools
+        ] + [
+            (p.prompt_name, p.filter_result) for p in catalogue.prompts
+        ]
+
+        for item_name, fr in items:
+            if fr is None or fr.reject_reason != "semantic_intent":
+                continue
+
+            event = SemanticIntentEscalatedEvent(
+                tenant_id=catalogue.tenant_id,
+                server_id=catalogue.server_id,
+                fetch_type=fetch_type,
+                item_name=item_name,
+                flagged_view=fr.semantic_intent_view or "",
+                # Masked encoded token of the decoded view that triggered the
+                # verdict (pii.decode._mask_token: first4…last4 + length).
+                # Never the raw content.
+                flagged_segment=fr.semantic_intent_segment or "",
+                intent_score=float(fr.semantic_intent_score or 0.0),
+            )
+
+            if self._audit_writer is not None:
+                try:
+                    self._audit_writer.write(event)
+                except Exception as exc:
+                    logger.error(
+                        "mcp-broker: audit write failed for SemanticIntentEscalatedEvent "
+                        "server_id=%s item=%s: %s",
+                        catalogue.server_id, item_name, exc,
+                    )
+            else:
+                logger.warning(
+                    "mcp-broker: no audit_writer — SemanticIntentEscalatedEvent NOT written "
+                    "server_id=%s item=%s view=%s score=%.2f",
+                    catalogue.server_id, item_name,
+                    event.flagged_view, event.intent_score,
+                )
 
     # -----------------------------------------------------------------------
     # [P8] Upstream MCP-server cert/SPIFFE pinning  (FIX-P8-002)

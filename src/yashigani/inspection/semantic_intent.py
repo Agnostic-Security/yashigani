@@ -91,6 +91,41 @@ from yashigani.pii.decode import decode_views, DecodeResult
 
 logger = logging.getLogger(__name__)
 
+# Prometheus verdict labels for inspection_semantic_intent_total{verdict}.
+_METRIC_ESCALATED = "escalated"
+_METRIC_CLEAN = "clean"
+_METRIC_ERROR = "error"
+
+
+def _record_verdict_metric(verdict: "SemanticIntentVerdict") -> None:
+    """Emit the dashboard metric for a sidecar decision (reuses the inspection
+    metrics registry — no parallel registry).  Never raises: a metrics fault
+    must not break the enforcement path.
+
+    Mapping (engine-agnostic):
+      escalated — the sidecar flagged injection intent (catches the residual).
+      clean     — the sidecar ran and did not escalate.
+      error     — fail-closed disposition driven by an indeterminate/unreachable
+                  backend (flagged_view in {indeterminate_fail_closed}) — i.e.
+                  the sidecar could not reach a real verdict and fail-closed.
+    """
+    try:
+        from yashigani.metrics.registry import inspection_semantic_intent_total
+
+        if verdict.flagged_view == "indeterminate_fail_closed":
+            metric_verdict = _METRIC_ERROR
+        elif verdict.is_injection:
+            metric_verdict = _METRIC_ESCALATED
+        else:
+            metric_verdict = _METRIC_CLEAN
+        inspection_semantic_intent_total.labels(
+            verdict=metric_verdict,
+            view=(verdict.flagged_view or "none"),
+        ).inc()
+    except Exception as exc:  # metrics are best-effort; never break enforcement
+        logger.debug("semantic-intent: metric emit failed: %s", exc)
+
+
 # ── Verdict labels ─────────────────────────────────────────────────────────
 INTENT_CLEAN = "CLEAN"
 INTENT_INJECTION = "INJECTION_INTENT"
@@ -299,7 +334,7 @@ class SemanticIntentSidecar:
             best_score = max(best_score, 1.0)
             best_view = "indeterminate_fail_closed"
 
-        return SemanticIntentVerdict(
+        verdict = SemanticIntentVerdict(
             label=best_label,
             score=best_score,
             flagged_view=best_view,
@@ -308,6 +343,8 @@ class SemanticIntentSidecar:
             latency_ms=latency_ms,
             skipped=False,
         )
+        _record_verdict_metric(verdict)
+        return verdict
 
     # ── Internal ───────────────────────────────────────────────────────────
 
@@ -351,13 +388,17 @@ class SemanticIntentSidecar:
 
     def _fail_closed_verdict(self, view: str, start_ms: int) -> SemanticIntentVerdict:
         label = INTENT_INJECTION if self._fail_closed else INTENT_INDETERMINATE
-        return SemanticIntentVerdict(
+        verdict = SemanticIntentVerdict(
             label=label,
+            # flagged_view marks this as a fail-closed-on-error disposition so
+            # the metric records it under verdict="error", not "escalated".
+            flagged_view="indeterminate_fail_closed" if self._fail_closed else view,
             score=1.0 if self._fail_closed else 0.0,
-            flagged_view=view,
             latency_ms=int(time.monotonic() * 1000) - start_ms,
             skipped=False,
         )
+        _record_verdict_metric(verdict)
+        return verdict
 
 
 def _flag_truthy(value: str) -> bool:

@@ -317,6 +317,9 @@ class FilterResult:
     # supplied (v1 heuristic-only behaviour is byte-identical to before).
     semantic_intent_score: Optional[float] = None
     semantic_intent_view: Optional[str] = None
+    # MASKED encoded token (pii.decode._mask_token: first4…last4 + length) of the
+    # decoded view that drove the verdict — audit-safe, never raw content.
+    semantic_intent_segment: Optional[str] = None
 
 
 def filter_description(text: str) -> FilterResult:
@@ -481,9 +484,18 @@ def filter_description_v2(
         # Flag OFF — v1 behaviour.
         return base
 
+    # Masked encoded token of the view that drove the verdict (audit-safe).
+    # ViewVerdict.segment is already masked by pii.decode._mask_token.
+    flagged_segment = ""
+    for vv in verdict.view_verdicts:
+        if vv.view_name == verdict.flagged_view:
+            flagged_segment = vv.segment or ""
+            break
+
     # Annotate for audit regardless of disposition.
     base.semantic_intent_score = verdict.score
     base.semantic_intent_view = verdict.flagged_view
+    base.semantic_intent_segment = flagged_segment
 
     if verdict.is_injection:
         return FilterResult(
@@ -495,6 +507,7 @@ def filter_description_v2(
             matched_pattern=f"semantic_intent:{verdict.flagged_view}",
             semantic_intent_score=verdict.score,
             semantic_intent_view=verdict.flagged_view,
+            semantic_intent_segment=flagged_segment,
         )
     return base
 
@@ -625,10 +638,17 @@ def build_catalogue(
     server_id: str,
     raw_tools: list[dict],
     raw_prompts: Optional[list[dict]] = None,
+    sidecar=None,  # Optional[SemanticIntentSidecar]
 ) -> TenantCatalogue:
     """
     Build a TenantCatalogue from raw tools/list and optional prompts/list
-    responses by running each description through filter_description().
+    responses by running each description through the content filter.
+
+    Filtering uses ``filter_description_v2`` so that — when a ``sidecar`` is
+    supplied AND the YSG-RISK-057 feature flag is ON — each clean-heuristic
+    description gets a second, encoding-aware look (decode-before-classify).
+    When ``sidecar`` is None or the flag is OFF, behaviour is byte-identical to
+    the v1 ``filter_description`` path.
 
     Parameters
     ----------
@@ -643,12 +663,15 @@ def build_catalogue(
     raw_prompts:
         List of prompt dicts from prompts/list or prompts/get.  Expected
         keys: ``name`` (str) and ``description``/``content`` (str).
+    sidecar:
+        Optional semantic-intent sidecar (content-filter v2).  Escalate-only,
+        flag-gated, fail-closed — see ``filter_description_v2``.
     """
     tools: list[ToolDescriptor] = []
     for raw in raw_tools:
         name = str(raw.get("name") or "")
         desc = str(raw.get("description") or "")
-        result = filter_description(desc)
+        result = filter_description_v2(desc, sidecar=sidecar)
         tools.append(ToolDescriptor(
             tool_name=name,
             safe_description=result.safe_text,
@@ -660,7 +683,7 @@ def build_catalogue(
         name = str(raw.get("name") or "")
         # MCP prompts/get response uses "content" or "description"
         content = str(raw.get("content") or raw.get("description") or "")
-        result = filter_description(content)
+        result = filter_description_v2(content, sidecar=sidecar)
         prompts.append(PromptDescriptor(
             prompt_name=name,
             safe_content=result.safe_text,

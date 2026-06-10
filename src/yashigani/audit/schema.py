@@ -283,6 +283,9 @@ class EventType(str, Enum):
     # MCP data-plane events
     MCP_CALL = "MCP_CALL"
     MCP_TOOL_DESCRIPTION_FETCHED = "MCP_TOOL_DESCRIPTION_FETCHED"
+    # v2.26 / YSG-RISK-057 — semantic-intent sidecar escalation (content-filter
+    # v2 caught an encoded injection the v1 heuristic missed).
+    SEMANTIC_INTENT_ESCALATED = "SEMANTIC_INTENT_ESCALATED"
     # KMS secret distribution to a ring-fenced agent
     KMS_SECRET_DISTRIBUTED_TO_AGENT = "KMS_SECRET_DISTRIBUTED_TO_AGENT"
     # OPA decision on an MCP tool call (distinct from OPA_RESPONSE_CHECK_FAILED)
@@ -2368,6 +2371,51 @@ class McpToolDescriptionFetchedEvent(AuditEvent):
     filtered_count: int = 0      # number of descriptors modified by sanitiser
     rejected_count: int = 0      # number of descriptors rejected (over cap / pattern)
     fetch_type: str = ""         # "tools_list" | "prompts_list"
+
+
+@dataclass
+class SemanticIntentEscalatedEvent(AuditEvent):
+    """
+    Emitted when the semantic-intent sidecar (content-filter v2 / YSG-RISK-057)
+    ESCALATES a tool-description / prompt that the v1 surface-pattern heuristic
+    passed — i.e. the sidecar caught what the heuristic missed (an encoded /
+    obfuscated injection: base64/hex/url/rot13 in an MCP tool description).
+
+    Self-describing per the user-alert / OPA-decision contract (2026-06-06):
+    every enforcement action carries a stable ``rule_id`` (the "id"), a layman
+    ``user_message`` (education + deterrence), and an HTTP ``code``.  This lets
+    the unified ``yashigani_alert`` envelope surface a consistent explanation at
+    this enforcement point without a gateway lookup table.
+
+    Security invariants:
+      - The raw attacker content is NEVER stored.  ``flagged_segment`` is the
+        already-masked encoded token (pii.decode._mask_token: first4…last4 +
+        length), ``flagged_view`` is a codec name (raw|base64|hex|url|rot13|
+        suspicious_blob), and ``intent_score`` is the aggregate 0–1 score.
+      - masking_applied is always True.
+
+    v2.26.0 / YSG-RISK-057 / CWE-184 / content-filter v2.
+    """
+
+    event_type: str = EventType.SEMANTIC_INTENT_ESCALATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True  # immutable floor — always True
+    tenant_id: str = ""
+    server_id: str = ""
+    # What was being filtered when the sidecar escalated.
+    fetch_type: str = ""          # "tools_list" | "prompts_get"
+    item_name: str = ""           # tool_name or prompt_name (NOT the content)
+    # Sidecar verdict detail — all audit-safe / masked.
+    flagged_view: str = ""        # decoded view that drove the verdict (codec name)
+    flagged_segment: str = ""     # MASKED encoded token (first4…last4 + length)
+    intent_score: float = 0.0     # aggregate injection-intent score (0.0–1.0)
+    # Self-describing contract (id + layman message + code).
+    rule_id: str = "yashigani.inspection.semantic-intent"
+    user_message: str = (
+        "This tool description contained a hidden, encoded instruction that "
+        "tries to manipulate the AI. It was blocked before reaching the agent."
+    )
+    code: int = 403
 
 
 @dataclass
