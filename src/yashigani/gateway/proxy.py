@@ -136,6 +136,9 @@ def create_gateway_app(
     mcp_broker_registry=None,  # v2.25.0 P3 — McpBrokerRegistry | None
     mcp_jwks_store=None,       # v2.25.0 P3 — JwksStore | None
     document_pipeline=None,  # v2.26 — DocumentInspectionPipeline | None (mode-B egress)
+    principal_signer=None,    # #47/G-NEW-5 — OrchestrationPrincipalSigner | None
+    principal_verifier=None,  # #47/G-NEW-5 — OrchestrationPrincipalVerifier | None
+    principal_tenant_id="default",  # #47/G-NEW-5 — tenant for caller SPIFFE derivation
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -163,6 +166,12 @@ def create_gateway_app(
         "mcp_broker_registry": mcp_broker_registry,  # v2.25.0 P3
         "mcp_jwks_store": mcp_jwks_store,             # v2.25.0 P3
         "document_pipeline": document_pipeline,  # v2.26 — mode-B egress round-trip
+        # #47/G-NEW-5 — signed orchestration-principal claim machinery.  The
+        # gateway SIGNS the principal on forward and VERIFIES it (SPIFFE-bound,
+        # replay-deduped) on re-entry so OPA adjudicates a verified fact.
+        "principal_signer": principal_signer,
+        "principal_verifier": principal_verifier,
+        "principal_tenant_id": principal_tenant_id,
         "http_client": None,
     }
 

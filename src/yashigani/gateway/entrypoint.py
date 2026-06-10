@@ -742,6 +742,31 @@ def _build_app(mesh_mode: bool = False):
             f"MCP broker wiring failed — gateway cannot start safely: {exc}"
         ) from exc
 
+    # ── Signed orchestration-principal machinery (#47 / G-NEW-5 / R3) ─────────
+    # The gateway SIGNS the orchestration principal (ES384, the SAME signing key
+    # the MCP broker uses) bound to the caller's SPIFFE identity, and VERIFIES it
+    # (SPIFFE-bound + jti replay-deduped) on re-entry — so the agent-to-agent OPA
+    # adjudication receives the principal as a VERIFIED fact, not a trusted
+    # header.  Fail-closed: a key/FIPS misconfiguration (or a missing persistent
+    # key in production/staging) raises here at startup, not at request time.
+    _principal_tenant_id = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+    try:
+        from yashigani.gateway.principal_token import build_principal_machinery
+        _principal_signer, _principal_verifier = build_principal_machinery(
+            tenant_id=_principal_tenant_id,
+        )
+        logger.info(
+            "orchestration-principal: signer+verifier wired (tenant=%s) — "
+            "agent principal is now a verified signed claim (#47/G-NEW-5)",
+            _principal_tenant_id,
+        )
+    except Exception as exc:
+        logger.exception("orchestration-principal machinery wiring failed: %s", exc)
+        raise RuntimeError(
+            f"orchestration-principal machinery wiring failed — gateway cannot "
+            f"start safely (fail-closed, #47/G-NEW-5): {exc}"
+        ) from exc
+
     gateway_app = create_gateway_app(
         config=cfg,
         inspection_pipeline=pipeline,
@@ -763,6 +788,9 @@ def _build_app(mesh_mode: bool = False):
         mcp_broker_registry=_mcp_registry,
         mcp_jwks_store=_mcp_jwks_store,
         document_pipeline=document_pipeline,
+        principal_signer=_principal_signer,
+        principal_verifier=_principal_verifier,
+        principal_tenant_id=_principal_tenant_id,
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 
