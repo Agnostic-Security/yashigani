@@ -357,6 +357,28 @@ gateway:
     agentTokenMinLength: "64"
     # v0.5.0
     deploymentStream: "opensource"
+    # --- Orchestration caps (build-sheet §9 — operator-tunable; MF3 helm parity) ---
+    # Mirrors docker-compose.yml x-gateway env exactly so Docker and K8s gateways
+    # are config-equivalent. Read by src/yashigani/gateway/orchestrator.py via
+    # configure_openai_router().
+    #   orchMaxDepth=9 is the §0.1 9-level hop invariant — do NOT lower below 9.
+    #   orchMaxIters is floored at 9 in code so a 9-deep chain isn't truncated.
+    #   orchDeadlineS is the orchestration wall-clock budget (seconds).
+    #   orchMaxFanout caps parallel sub-calls per level.
+    orchMaxDepth: "9"
+    orchMaxIters: "9"
+    orchDeadlineS: "300"
+    orchMaxFanout: "4"
+    # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
+    # derives from prior tool-RESULT content (injection-originated hops). An
+    # over-budget result-steered hop is REFUSED so a result-steering injection
+    # loop cannot amplify. Keep low (default 2); raise only with care.
+    orchInjectionBudget: "2"
+    # SELFCALL_BASE — internal mesh self-call target. Same-pod loopback to the
+    # http-mesh container port (8081, no Caddy, internal bearer, NetworkPolicy-
+    # isolated). orchestrator._mesh_base() reads the key directly (empty string
+    # would NOT fall through to the code default), so set the real value here.
+    orchSelfcallBase: "http://127.0.0.1:8081"
     # M-01 fix: overridden to grpcs:// by gateway.yaml when mtls.enabled=true.
     # This value applies only when mTLS is disabled (non-default, testing only).
     otelEndpoint: "http://otel-collector:4317"

@@ -116,6 +116,26 @@ spec:
               value: {{ $gwEnv.agentTokenMinLength | quote }}
             - name: YASHIGANI_DEPLOYMENT_STREAM
               value: {{ $gwEnv.deploymentStream | quote }}
+            # --- Orchestration caps (build-sheet §9 — MF3 helm parity). Mirrors
+            # docker-compose.yml x-gateway env exactly so Docker and K8s gateways
+            # are config-equivalent. MAX_DEPTH=9 is the §0.1 9-level hop invariant.
+            - name: YASHIGANI_ORCH_MAX_DEPTH
+              value: {{ $gwEnv.orchMaxDepth | quote }}
+            - name: YASHIGANI_ORCH_MAX_ITERS
+              value: {{ $gwEnv.orchMaxIters | quote }}
+            - name: YASHIGANI_ORCH_DEADLINE_S
+              value: {{ $gwEnv.orchDeadlineS | quote }}
+            - name: YASHIGANI_ORCH_MAX_FANOUT
+              value: {{ $gwEnv.orchMaxFanout | quote }}
+            # LAURA-ORCH-001(b): strict low budget for injection-originated
+            # (tool-result justified) hops; over-budget result-steered hops are
+            # refused (fail-closed).
+            - name: YASHIGANI_ORCH_INJECTION_BUDGET
+              value: {{ $gwEnv.orchInjectionBudget | quote }}
+            # SELFCALL_BASE — internal mesh self-call target (http-mesh port 8081,
+            # same-pod loopback, internal bearer, NetworkPolicy-isolated).
+            - name: YASHIGANI_ORCH_SELFCALL_BASE
+              value: {{ $gwEnv.orchSelfcallBase | quote }}
             {{- /*
               Fix-6 (Captain): YASHIGANI_MCP_SERVERS — JSON array of onboarded MCP
               servers.  Read by build_registry_from_env() at gateway startup.
