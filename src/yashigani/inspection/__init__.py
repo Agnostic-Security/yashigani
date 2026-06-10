@@ -1,6 +1,15 @@
 """Yashigani Inspection — prompt injection detection pipeline."""
 from yashigani.inspection.classifier import PromptInjectionClassifier, ClassifierResult
 from yashigani.inspection.sanitizer import sanitize, SanitizationResult
+from yashigani.inspection.semantic_intent import (
+    SemanticIntentSidecar,
+    SemanticIntentVerdict,
+    ViewVerdict,
+    sidecar_enabled,
+    INTENT_CLEAN,
+    INTENT_INJECTION,
+    INTENT_INDETERMINATE,
+)
 from yashigani.inspection.pipeline import (
     InspectionPipeline,
     PipelineResult,
@@ -16,6 +25,14 @@ __all__ = [
     "PromptInjectionClassifier", "ClassifierResult",
     "sanitize", "SanitizationResult",
     "InspectionPipeline", "PipelineResult",
+    # v2.26 — YSG-RISK-057 semantic-intent sidecar (content-filter v2)
+    "SemanticIntentSidecar",
+    "SemanticIntentVerdict",
+    "ViewVerdict",
+    "sidecar_enabled",
+    "INTENT_CLEAN",
+    "INTENT_INJECTION",
+    "INTENT_INDETERMINATE",
     # v0.9.0 — response-path inspection
     "ResponseInspectionPipeline",
     "ResponseInspectionConfig",
