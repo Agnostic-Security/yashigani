@@ -140,6 +140,11 @@ spec:
               value: {{ .Values.openWebui.env.webuiAuthTrustedNameHeader | quote }}
             - name: ENABLE_SIGNUP
               value: {{ .Values.openWebui.env.enableSignup | quote }}
+            # Track C (F-B): emit X-OpenWebUI-User-* on upstream gateway calls
+            # so the gateway resolves the per-user Yashigani identity (compose
+            # parity with ENABLE_FORWARD_USER_INFO_HEADERS).
+            - name: ENABLE_FORWARD_USER_INFO_HEADERS
+              value: {{ .Values.openWebui.env.enableForwardUserInfoHeaders | default "true" | quote }}
             - name: WEBUI_SECRET_KEY
               valueFrom:
                 secretKeyRef:

@@ -169,6 +169,167 @@ _INTERNAL_BEARER: str = _load_internal_bearer()
 
 
 # ---------------------------------------------------------------------------
+# Track C (F-B) — per-user identity through Open WebUI.
+#
+# THE GAP: Open WebUI (OWUI) authenticates to the gateway's internal mesh port
+# (8081) with the shared `yashigani_internal_bearer`. Historically the resolver
+# mapped that bearer to a flat `internal` service identity (RESTRICTED, empty
+# allowed_models) BEFORE any per-user path, so every OWUI user shared one
+# identity and per-user/group/org RBAC (models, agents, sensitivity ceiling)
+# NEVER applied to OWUI traffic.
+#
+# THE FIX (trusted-forwarder model): the internal bearer establishes OWUI as a
+# TRUSTED FORWARDER — exactly the same trust anchor already used for the
+# orchestration-principal header. When (and ONLY when) a request carries the
+# internal bearer, the gateway honours OWUI's forwarded-user headers
+# (X-OpenWebUI-User-Email etc., emitted when ENABLE_FORWARD_USER_INFO_HEADERS=
+# true on the OWUI service) and resolves the ACTUAL per-user Yashigani identity.
+#
+# MAPPING (email -> Yashigani identity), in priority order:
+#   1. The forwarded email's local-part is matched as an identity SLUG
+#      (alice@corp.example -> slug "alice"); if a registered identity exists,
+#      that identity (with its own groups/allowed_models/sensitivity_ceiling)
+#      is used. Operators provision OWUI users by creating a Yashigani identity
+#      whose slug equals the user's email local-part.
+#   2. Optionally, an explicit slug override map (YASHIGANI_OWUI_SLUG_MAP, JSON
+#      object "email": "slug") lets an operator pin specific emails to slugs.
+#   3. No match / missing / malformed email -> the configurable baseline
+#      OWUI-users default identity (YASHIGANI_OWUI_DEFAULT_SLUG, default
+#      "owui-users"). If that slug is not registered either, fall back to a
+#      synthetic baseline-RESTRICTED identity (NEVER a higher privilege).
+#
+# SPOOFING DEFENSE (load-bearing): the forwarded-user header is honoured ONLY
+# under the internal bearer. A direct/external caller WITHOUT the bearer can set
+# X-OpenWebUI-User-* freely and it is IGNORED — the resolver never consults it
+# off the internal-bearer path. Caddy also strips inbound X-OpenWebUI-User-* /
+# X-Forwarded-User on the public path (defence in depth). Fail-closed: under the
+# bearer, an unmatched/missing/malformed forwarded user resolves to the
+# baseline-restricted default, NEVER to elevated privilege.
+# ---------------------------------------------------------------------------
+_OWUI_FORWARD_ENABLED: bool = (
+    os.environ.get("YASHIGANI_OWUI_FORWARD_USER", "true").strip().lower() == "true"
+)
+_OWUI_DEFAULT_SLUG: str = os.environ.get(
+    "YASHIGANI_OWUI_DEFAULT_SLUG", "owui-users"
+).strip()
+_OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
+
+
+def _load_owui_slug_map() -> dict[str, str]:
+    """Parse YASHIGANI_OWUI_SLUG_MAP (JSON object email->slug). Fail-safe: {}."""
+    raw = os.environ.get("YASHIGANI_OWUI_SLUG_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {str(k).strip().lower(): str(v).strip() for k, v in parsed.items() if v}
+    except Exception as exc:  # malformed map must not break startup
+        logger.warning("YASHIGANI_OWUI_SLUG_MAP is not valid JSON (%s) — ignoring", exc)
+    return {}
+
+
+_OWUI_SLUG_MAP: dict[str, str] = _load_owui_slug_map()
+
+
+def _baseline_owui_identity() -> dict:
+    """Synthetic fail-closed baseline for OWUI users with no registered identity.
+
+    RESTRICTED ceiling, empty allowed_models — strictly the LOWEST privilege.
+    Used only when neither the per-user slug NOR the configured default slug
+    resolves to a registered identity. kind="service" keeps it out of the
+    end-user seat count while still being subject to OPA RBAC. It is NEVER the
+    `internal` identity_id, so the brain-reasoning marker cannot be tripped by
+    an OWUI user (that marker keys on identity_id == "internal").
+    """
+    return {
+        "identity_id": _OWUI_DEFAULT_SLUG or "owui-users",
+        "status": "active",
+        "kind": "service",
+        "groups": ["owui-users"],
+        "allowed_models": [],
+        "sensitivity_ceiling": "RESTRICTED",
+        "_owui_forwarded": True,
+        "_owui_baseline": True,
+    }
+
+
+def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
+    """Resolve the ACTUAL OWUI user identity from forwarded headers.
+
+    CALLED ONLY from the internal-bearer fast-path — i.e. the request is already
+    proven to come from the trusted forwarder (OWUI). The forwarded-user header
+    is therefore trustworthy at this point and never consulted elsewhere, which
+    is the whole spoofing defence.
+
+    Returns a registered identity dict (per-user RBAC applies) when the email
+    maps to one; otherwise the configured default-slug identity; otherwise the
+    synthetic baseline-RESTRICTED identity. NEVER returns None and NEVER returns
+    a privilege higher than the matched identity — fail-closed by construction.
+    Returns None only to signal "no forwarded user present" so the caller can
+    fall through to the flat `internal` service identity (preserves the
+    orchestration / brain path, which carries NO forwarded-user header).
+    """
+    if not _OWUI_FORWARD_ENABLED:
+        return None
+    email = request.headers.get(_OWUI_USER_EMAIL_HEADER, "").strip()
+    if not email:
+        # No forwarded user -> not an OWUI per-user call (e.g. brain self-call,
+        # in-mesh agent). Caller falls back to flat `internal`.
+        return None
+    email_l = email.lower()
+
+    # Registry unavailable -> fail-closed to baseline (NEVER internal/elevated).
+    if _state.identity_registry is None:
+        logger.warning(
+            "OWUI forwarded user %r present but identity_registry unavailable — "
+            "baseline-RESTRICTED", email,
+        )
+        return _baseline_owui_identity()
+
+    # Resolve candidate slug: explicit map override first, else email local-part.
+    slug = _OWUI_SLUG_MAP.get(email_l)
+    if not slug:
+        local_part = email_l.split("@", 1)[0]
+        # Sanitise to the slug charset to avoid odd lookups; empty -> default.
+        slug = "".join(ch for ch in local_part if ch.isalnum() or ch in "-_.").strip(".")
+
+    identity = None
+    if slug:
+        try:
+            identity = _state.identity_registry.get_by_slug(slug)
+        except Exception as exc:  # registry blip — fail-closed to baseline
+            logger.warning("OWUI slug lookup failed for %r (%s) — baseline", slug, exc)
+            identity = None
+
+    if identity:
+        identity = dict(identity)
+        identity["_owui_forwarded"] = True
+        identity["_owui_email"] = email
+        return identity
+
+    # No per-user match -> configured default-slug identity if registered.
+    if _OWUI_DEFAULT_SLUG:
+        try:
+            default_ident = _state.identity_registry.get_by_slug(_OWUI_DEFAULT_SLUG)
+        except Exception:
+            default_ident = None
+        if default_ident:
+            default_ident = dict(default_ident)
+            default_ident["_owui_forwarded"] = True
+            default_ident["_owui_email"] = email
+            default_ident["_owui_default"] = True
+            return default_ident
+
+    # Nothing registered -> synthetic baseline-RESTRICTED.
+    logger.info(
+        "OWUI user %r mapped to baseline (no identity for slug %r, no default %r)",
+        email, slug, _OWUI_DEFAULT_SLUG,
+    )
+    return _baseline_owui_identity()
+
+
+# ---------------------------------------------------------------------------
 # Admin-configurable: GET /v1/models visibility for service accounts.
 #
 # OPA classifies service-account principals (e.g. Open WebUI, which calls with
@@ -2173,6 +2334,28 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     real = dict(real)
                     real["_orchestration_self_call"] = True
                     return real
+
+            # ── Track C (F-B): OWUI trusted-forwarder per-user resolution ──
+            # The internal bearer establishes OWUI as a TRUSTED FORWARDER. Only
+            # here — having proven the bearer — do we honour OWUI's forwarded
+            # user header (X-OpenWebUI-User-Email) and resolve the ACTUAL
+            # per-user Yashigani identity so per-user/group/org RBAC applies.
+            #
+            # ORDERING: this runs AFTER the orchestration-principal check (which
+            # is the brain/orchestration self-call path) and is gated on the
+            # forwarded-user header being present. The brain reasoning leg and
+            # in-mesh agent self-calls carry NO X-OpenWebUI-User-* header, so
+            # they return None here and fall through to the flat `internal`
+            # identity below — the brain-reasoning marker (keys on identity_id
+            # == "internal") is preserved byte-for-byte.
+            #
+            # SPOOFING DEFENSE: because we are inside the proven-internal-bearer
+            # branch, an external caller without the bearer never reaches this
+            # code, so it can never set X-OpenWebUI-User-* to impersonate a user.
+            owui_identity = _resolve_owui_forwarded_user(request)
+            if owui_identity is not None:
+                return owui_identity
+
             return {"identity_id": "internal", "status": "active", "kind": "service",
                     "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
                     "_orchestration_self_call": bool(orch_principal)}

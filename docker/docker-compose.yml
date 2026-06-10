@@ -704,6 +704,16 @@ services:
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "X-Forwarded-User"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "X-Forwarded-Name"
       ENABLE_SIGNUP: "true"
+      # Track C (F-B): forward the authenticated OWUI user to the gateway on
+      # every upstream call. OWUI v0.9.2 then emits X-OpenWebUI-User-Email /
+      # X-OpenWebUI-User-Id / X-OpenWebUI-User-Name / X-OpenWebUI-User-Role on
+      # its requests to gateway:8081/v1. The gateway's trusted-forwarder
+      # resolver maps X-OpenWebUI-User-Email -> the actual per-user Yashigani
+      # identity so per-user/group/org RBAC (models, agents, sensitivity
+      # ceiling) applies to OWUI traffic instead of the flat `internal`
+      # service identity. The header is honoured ONLY under the internal
+      # bearer (trusted-forwarder anchor); a direct caller cannot spoof it.
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
       # Secret key for JWT signing — allows programmatic API access.
       # Fail-closed: MUST be set in docker/.env (install.sh generates it).
       WEBUI_SECRET_KEY: ${OWUI_SECRET_KEY:?OWUI_SECRET_KEY must be set in docker/.env — run install.sh to generate}

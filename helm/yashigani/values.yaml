@@ -1410,6 +1410,11 @@ openWebui:
     webuiAuthTrustedEmailHeader: "X-Forwarded-User"
     webuiAuthTrustedNameHeader: "X-Forwarded-Name"
     enableSignup: "true"
+    # Track C (F-B): forward the authenticated OWUI user to the gateway so OWUI
+    # emits X-OpenWebUI-User-Email/-Id/-Name/-Role on upstream calls. The
+    # gateway trusted-forwarder resolver maps the email -> per-user Yashigani
+    # identity so per-user/group/org RBAC applies (compose parity).
+    enableForwardUserInfoHeaders: "true"
     webuiSecretKeySecretName: "yashigani-open-webui-secrets"
     webuiSecretKeySecretKey: "secret_key"
     # BUG-2 (v2.23.4): gateway:8080 is mTLS-only. Use the internal mesh port
