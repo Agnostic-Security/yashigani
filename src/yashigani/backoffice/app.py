@@ -662,6 +662,62 @@ async def lifespan(app: FastAPI):
             "OPA-PERSIST: binding re-sync skipped (%s)", _bouter_exc
         )
 
+    # Track B1 (model-RBAC): reconcile model allocations from the Postgres durable
+    # mirror into Redis db/3 — SAME drift class as the agent-reg reconcile below.
+    # Redis db/3 has NO persistence; a `docker compose up -d redis` recreate (or a
+    # redis restart) wipes every allocation and model RBAC silently stops enforcing
+    # until the next admin mutation. This re-hydrates Postgres → Redis db/3 on every
+    # boot. Idempotent; existing Redis allocations win. MUST run BEFORE the OPA
+    # allocation re-sync below so OPA sees the restored set.
+    try:
+        _alloc_store = backoffice_state.model_allocation_store
+        _alloc_durable = getattr(_alloc_store, "_durable", None) if _alloc_store else None
+        if _alloc_store is not None and _alloc_durable is not None:
+            from yashigani.models.allocation_durable_store import (
+                reconcile_allocations_from_durable,
+            )
+            reconcile_allocations_from_durable(_alloc_store, _alloc_durable)
+    except Exception as _arec_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "ALLOC-RECONCILE: startup reconcile FAILED (%s) — allocations may be "
+            "absent until the next admin mutation", _arec_exc
+        )
+
+    # Track B1 (model-RBAC): re-sync the model-allocation document to OPA from the
+    # durable Redis db/3 store on startup. OPA holds data in memory only, so an OPA
+    # restart drops the allocation document; the gateway enforces from the durable
+    # store directly (so enforcement is unaffected), but re-pushing keeps OPA's
+    # inspectable view consistent. SEPARATE /v1/data/yashigani/allocations namespace
+    # — does not touch the rbac push above. Non-fatal (allocations stay durable in
+    # Redis and re-push on the next mutation).
+    try:
+        _alloc_store = backoffice_state.model_allocation_store
+        if _alloc_store is not None:
+            from yashigani.models.opa_push import push_allocations_data
+            _async_log = _logging.getLogger("yashigani.backoffice.lifespan")
+            _alloc_n = len(_alloc_store.list_all())
+            for _aattempt in range(1, 4):
+                try:
+                    push_allocations_data(_alloc_store, backoffice_state.opa_url)
+                    _async_log.info(
+                        "OPA-PERSIST: re-synced model allocations on startup (%d allocation(s))",
+                        _alloc_n,
+                    )
+                    break
+                except Exception as _apush_exc:
+                    if _aattempt < 3:
+                        await asyncio.sleep(2)
+                    else:
+                        _async_log.warning(
+                            "OPA-PERSIST: allocation re-sync failed after 3 attempts (%s) — "
+                            "allocations remain in Redis; OPA will sync on next mutation",
+                            _apush_exc,
+                        )
+    except Exception as _aouter_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").warning(
+            "OPA-PERSIST: allocation re-sync skipped (%s)", _aouter_exc
+        )
+
     # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): reconcile the agent registry
     # from the durable Postgres mirror into Redis db/3 — SAME drift class as the
     # OPA re-push above. @agent registrations live in Redis db/3, which has NO

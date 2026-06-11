@@ -98,6 +98,7 @@ class OptimizationEngine:
         budget: BudgetState,
         force_local: bool = False,
         force_cloud: bool = False,
+        allowed_local_default: str | None = None,
     ) -> RoutingDecision:
         """
         Evaluate all routing rules and return the optimal backend.
@@ -109,11 +110,30 @@ class OptimizationEngine:
             budget: Current budget state from BudgetEnforcer
             force_local: Identity-level override
             force_cloud: Identity-level override
+            allowed_local_default: LAURA-B1-OBS-1 — the local model the engine
+                must substitute for ``self._default_model`` whenever a local-route
+                rule (P1/P2/P3/P4/P7/P9) falls back to the local default.  The
+                router resolves this to a LOCAL model the caller is ACTUALLY
+                allocated (or to None when the caller is unrestricted/entitled to
+                the global default).  Without this, a caller allocated only a
+                NON-default local model (e.g. ``phi3.5``) — or a cloud-only caller
+                with no force_cloud — gets rewritten to the global ``default_local``
+                (``qwen2.5:3b``) and then DENIED by the B1 alloc-bind re-check for a
+                model they never asked for.  Over-restriction, not over-grant (the
+                security bar holds: we only ever substitute a model the caller is
+                allocated), but broken UX.  Substituting the caller's OWN allowed
+                local model serves them a model they are entitled to.  When None,
+                behaviour is BYTE-FOR-BYTE the legacy global-default path.
 
         Returns:
             RoutingDecision with provider, model, and full reasoning
         """
         start = time.monotonic_ns()
+
+        # LAURA-B1-OBS-1: the local default this caller may actually be served.
+        # Falls back to the global default for unrestricted/entitled callers
+        # (allowed_local_default=None) — legacy behaviour unchanged.
+        local_default = allowed_local_default or self._default_model
 
         # Resolve model alias
         provider, model, alias_force_local = self._resolve_alias(requested_model)
@@ -155,7 +175,7 @@ class OptimizationEngine:
                 )
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P1",
                 reason=f"Sensitivity {sensitivity.level.value} — local only",
@@ -169,7 +189,7 @@ class OptimizationEngine:
         if budget.signal == BudgetSignal.EXHAUSTED:
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P2",
                 reason=f"Cloud budget exhausted ({budget.pct}%) — local only",
@@ -183,7 +203,7 @@ class OptimizationEngine:
         if budget.signal == BudgetSignal.WARN:
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P3",
                 reason=f"Budget warning ({budget.pct}%) — prefer local",
@@ -197,7 +217,7 @@ class OptimizationEngine:
         if force_local or alias_force_local:
             return self._decide(
                 provider="ollama",
-                model=model if provider == "ollama" else self._default_model,
+                model=model if provider == "ollama" else local_default,
                 route="local",
                 rule="P4",
                 reason="Identity or alias force_local",
@@ -239,7 +259,7 @@ class OptimizationEngine:
         if complexity.level == ComplexityLevel.LOW:
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P7",
                 reason="Complexity LOW — prefer local",
@@ -266,7 +286,7 @@ class OptimizationEngine:
         # P9: Fallback -> LOCAL
         return self._decide(
             provider="ollama",
-            model=self._default_model,
+            model=local_default,
             route="local",
             rule="P9",
             reason="Fallback — local default",

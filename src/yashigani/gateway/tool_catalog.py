@@ -130,18 +130,33 @@ def _agent_tools(agent_registry, identity: Optional[dict],
 
 
 def _model_tools(identity: Optional[dict], allowed_model_ids: list[str],
-                 name_map: dict[str, CatalogEntry]) -> list[dict]:
-    """Project model-as-tool entries.
+                 name_map: dict[str, CatalogEntry],
+                 effective=None) -> list[dict]:
+    """Project model-as-tool entries — RBAC-projected through the EFFECTIVE alloc.
 
-    A model appears iff the caller's identity allowed_models permits it (or the
-    identity has an empty allowed_models, meaning "all", mirroring _opa_v1_check's
-    permissive-on-empty semantics).  The execution-time OPA ingress on the model
-    self-call is the load-bearing gate (defence in depth).
+    LAURA-B1R-001 (catalog projection gap): a model appears as a callable tool
+    ONLY if the caller is ALLOCATED it under the SAME single model-RBAC authority
+    the chat egress + orchestration seed use (``EffectiveModels.is_model_denied``,
+    which folds in own allowed_models ∪ org/group/user allocations ∪ the global
+    gated set).  Previously this used the identity's RAW ``allowed_models`` and
+    treated empty == "all" — so an allocation-based caller (empty raw list) saw
+    EVERY local model as a tool, including a gated model allocated only to another
+    user/group (e.g. fastuser saw model__qwen2_5_3b).  A non-allocated model must
+    NOT appear as a callable tool.  The execution-time alloc-bind on the model
+    self-call is the load-bearing second gate (defence in depth, openai_router).
+
+    ``effective`` is the caller's resolved ``EffectiveModels``; when None (no
+    allocation enforcement wired) we fall back to the legacy raw-allowed_models
+    projection so deployments with no model RBAC keep their behaviour.
     """
     out: list[dict] = []
     caller_allowed = {str(m) for m in (identity.get("allowed_models") or [])} if identity else set()
     for model_id in allowed_model_ids:
-        if caller_allowed and model_id not in caller_allowed:
+        if effective is not None:
+            # Single authority: hide any model this caller would be DENIED.
+            if effective.is_model_denied(model_id):
+                continue
+        elif caller_allowed and model_id not in caller_allowed:
             continue
         token = sanitise_tool_token(model_id)
         tool_name = f"{_MODEL_PREFIX}{token}"
@@ -208,6 +223,7 @@ def build_tool_catalog(
     agent_registry,
     available_models: Optional[list[dict]] = None,
     default_model: str = "",
+    effective=None,
 ) -> ToolCatalog:
     """Assemble the RBAC-projected catalog for one orchestration request (§2).
 
@@ -215,6 +231,11 @@ def build_tool_catalog(
     whose ``name_map`` the executor uses to resolve each tool-call back to a gated
     self-call target.  Sources that fail (registry down, MCP unreachable) degrade
     gracefully to fewer tools rather than failing the whole orchestration.
+
+    ``effective`` is the caller's resolved ``EffectiveModels`` (Track B1).  When
+    supplied, ``model__*`` tools are projected through the SINGLE model-RBAC
+    authority so a non-allocated model never appears as a callable tool
+    (LAURA-B1R-001).  When None, the legacy raw-allowed_models projection applies.
     """
     name_map: dict[str, CatalogEntry] = {}
     tools: list[dict] = []
@@ -234,7 +255,7 @@ def build_tool_catalog(
             model_ids.append(mid)
     if not model_ids and default_model:
         model_ids = [default_model]
-    tools.extend(_model_tools(identity, model_ids, name_map))
+    tools.extend(_model_tools(identity, model_ids, name_map, effective=effective))
 
     # 3) MCP tools.
     #    Phase-1 demo wiring: when an explicit orchestration MCP upstream is

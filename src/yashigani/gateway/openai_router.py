@@ -83,6 +83,10 @@ from yashigani.audit.schema import (
 )
 from yashigani.gateway._client_enforce import evaluate_client_policies, scope_kind_for
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from yashigani.models.effective import EffectiveModels
+
 logger = logging.getLogger(__name__)
 
 
@@ -614,6 +618,10 @@ class OpenAIRouterState:
         self.default_model: str = "qwen2.5:3b"
         self.available_models: list[dict] = []
         self.agent_registry = None
+        # Track B1 (model-RBAC): durable allocation store + alias store, read on
+        # the request path to compute effective-allowed-models for the caller.
+        self.model_allocation_store = None   # ModelAllocationStore | None
+        self.model_alias_store = None        # ModelAliasStore | None
         self.response_inspection_pipeline = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
@@ -666,6 +674,8 @@ def configure(
     opa_url: str = "https://policy:8181",
     content_relay_detector=None,
     pool_manager=None,    # v2.4.1 — PoolManager | None
+    model_allocation_store=None,  # Track B1 — ModelAllocationStore | None
+    model_alias_store=None,       # Track B1 — ModelAliasStore | None
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -697,6 +707,8 @@ def configure(
     _state.opa_url = opa_url
     _state.content_relay_detector = content_relay_detector
     _state.pool_manager = pool_manager  # v2.4.1
+    _state.model_allocation_store = model_allocation_store  # Track B1
+    _state.model_alias_store = model_alias_store            # Track B1
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -1278,7 +1290,35 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
 
+    # ── Track B1 (model-RBAC): compute the caller's EFFECTIVE allowed-models ──
+    # once, BEFORE optimisation, and reuse it for (a) the OPA model_allowed check
+    # and (b) the optimiser-binding re-check below. effective.allowed carries both
+    # the alias names AND the concrete models behind allocated aliases, so it
+    # matches whatever form (alias or concrete) the optimiser ultimately selects.
+    _effective = _effective_allowed_models(identity) if not is_agent_call else None
+    _eff_opa_list = _effective.to_opa_allowed_models() if _effective is not None else None
+
     if _state.optimization_engine and _state.sensitivity_classifier and _state.complexity_scorer and not is_agent_call:
+        # LAURA-B1-OBS-1: if the engine's global local default would be DENIED to
+        # this caller (restricted/gated), resolve a LOCAL model the caller IS
+        # allocated and hand it to the optimiser as the local-fallback substitute.
+        # None ⇒ caller is entitled to the global default (legacy behaviour); None
+        # ALSO when no allowed local model exists ⇒ the optimiser keeps the (denied)
+        # global default so the alloc-bind re-check below DENIES the truly-
+        # unallocated request (deny-by-default preserved, no over-grant).
+        _allowed_local_default = None
+        if _effective is not None:
+            try:
+                _allowed_local_default = _effective.pick_allowed_local_default(
+                    _state.model_alias_store,
+                    _state.optimization_engine._default_model,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail-open the route
+                logger.warning(
+                    "B1-OBS-1 allowed-local-default resolution failed (%s) — "
+                    "using global default", exc,
+                )
+                _allowed_local_default = None
         decision = _state.optimization_engine.route(
             requested_model=selected_model,
             sensitivity=s_result,
@@ -1286,6 +1326,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             budget=budget_state,
             force_local=body.force_local or False,
             force_cloud=body.force_cloud or False,
+            allowed_local_default=_allowed_local_default,
         )
         selected_provider = decision.provider
         selected_model = decision.model
@@ -1297,10 +1338,73 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         if sensitivity_level in ("CONFIDENTIAL", "RESTRICTED"):
             route_reason = "sensitivity_local"
 
+    # ── Track B1: BIND the FINALLY-SELECTED model to the allocation ──────
+    # Runs on the model that will ACTUALLY be served (after optimisation OR the
+    # fallback path), so the optimiser cannot escape the allocation by
+    # re-selecting a model the caller is not allocated. Denies when the model is
+    # outside a restricted caller's allowlist OR is globally allocation-gated and
+    # not allocated to this caller (so a user NOT in the allocated group is denied
+    # a model allocated only to that group). Fail-closed, deny-by-default.
+    #
+    # MUST-FIX-1 (Iris BLOCKER — B1 breaks orchestration): EXEMPT the server-
+    # determined brain/internal cognition leg from this alloc-bind re-check.  The
+    # letta brain's A→L reasoning hop arrives as a FRESH inbound request from
+    # the `internal` service identity (groups[], no org, allowed_models[]) on the
+    # brain model (LETTA_LLM_MODEL=qwen2.5:3b).  That model is allocation-gated the
+    # instant any alias resolving to it is allocated to some group → `internal`
+    # holds no allocation → is_model_denied() returns True → the brain's cognition
+    # leg 403s → orchestration dies.  The exemption opens NO bypass for real users:
+    # ``brain_reasoning_leg`` is SERVER-MINTED + UNFORGEABLE — it requires a
+    # process-local brain round-trip to be OPEN *and* the internal-bearer identity
+    # *and* the brain model (is_brain_reasoning_leg, line 1104) — letta cannot read,
+    # set, or forge the round-trip counter.
+    #
+    # SECURITY — LAURA-B1R-001 (model-hop bypass, v2.25.4): the exemption is the
+    # SERVER-MINTED brain-reasoning leg ONLY.  It MUST NOT include the
+    # ``_orchestration_self_call`` identity flag: a principal-bearing orchestration
+    # self-call (a model/agent TOOL HOP) resolves to the REAL caller's identity
+    # WITH their real allocations, so the real caller's allocation MUST be enforced
+    # on the hop.  Exempting on ``_orchestration_self_call`` let a model tool-hop
+    # reach a non-allocated model (fastuser → model__qwen2_5_3b → served).  We now
+    # gate the hop too: only the genuine internal-identity brain leg (which carries
+    # NO principal) is exempt; the model hop re-enters here and is DENIED if the
+    # real caller is not allocated the concrete model.  The raw client header
+    # X-Yashigani-Orchestration-Depth (is_orchestration_self_call) is NEVER
+    # consulted — it is forgeable.  Real external/user traffic carries no
+    # server-minted marker, so this re-check runs BYTE-FOR-BYTE unchanged for them.
+    _model_rbac_exempt = brain_reasoning_leg
+    if (
+        _effective is not None
+        and not _model_rbac_exempt
+        and _effective.is_model_denied(selected_model)
+    ):
+        logger.warning(
+            "MODEL-RBAC DENIED (alloc-bind): identity=%s requested=%s served=%s "
+            "NOT permitted (allowed=%s gated=%s restricted=%s) — denying",
+            identity_id, body.model, selected_model,
+            sorted(_effective.allowed), sorted(_effective.gated), _effective.has_restriction,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": (
+                        "Request denied by policy: you are not allocated this model. "
+                        "Request a model within your allocation or ask an administrator "
+                        "to allocate it to you."
+                    ),
+                    "type": "policy_denied",
+                    "code": "model_not_allocated",
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+        )
+
     # ── 6a. OPA policy check (v2.2 — all /v1 traffic) ─────────────────
     # Evaluates v1_routing.rego: identity active, model allowed, routing
     # safety (CONFIDENTIAL never to untrusted cloud), sensitivity ceiling.
-    # Fail-closed: any OPA error → deny.
+    # Fail-closed: any OPA error → deny. Track B1: feed the effective
+    # allowed-models so OPA's model_allowed denies non-allocated models too.
     opa_decision = await _opa_v1_check(
         identity=identity,
         selected_model=selected_model,
@@ -1308,6 +1412,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         sensitivity_level=sensitivity_level,
         route_reason=route_reason,
         request_path="/v1/chat/completions",
+        effective_allowed_models=_eff_opa_list,
     )
     if not opa_decision.get("allow", False):
         opa_reason = opa_decision.get("reason", "policy_denied")
@@ -1325,6 +1430,49 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 }
             },
             headers={"X-Yashigani-OPA-Reason": opa_reason},
+        )
+
+    # ── 6a-model. OPA model_allowed backstop (belt-and-braces, v2.25.4) ──
+    # The gate above checks only opa_decision["allow"] (allow_v1 = identity
+    # active).  It does NOT consult opa_decision["model_allowed"], so before
+    # this the alloc-bind re-check above was the SOLE model-RBAC enforcement
+    # point at /v1 — a single point that the Laura+Iris bypass disabled by
+    # forging the orchestration-depth header.  We now ALSO enforce OPA's
+    # independent positive-allowlist verdict here, making effective.py's
+    # docstring ("OPA enforces the positive allowlist") actually true and
+    # giving a SECOND enforcement layer behind the alloc-bind.
+    #
+    # The OPA input already carries the effective allowed_models (B1,
+    # effective_allowed_models=_eff_opa_list above), so model_allowed is the
+    # true positive-allowlist decision for this caller.
+    #
+    # Same exemption as the alloc-bind: the SERVER-MINTED brain-reasoning leg
+    # ONLY (internal holds no allocation → the brain model is gated for it).  A
+    # principal-bearing model tool-hop is NOT exempt — the real caller's
+    # allocation is enforced.  The forgeable depth header is NEVER consulted.
+    if (
+        not _model_rbac_exempt
+        and not opa_decision.get("model_allowed", False)
+    ):
+        logger.warning(
+            "OPA DENIED /v1 request (model_allowed backstop): identity=%s "
+            "model=%s served=%s — model not in positive allowlist",
+            identity_id, body.model, selected_model,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": (
+                        "Request denied by policy: you are not allocated this model. "
+                        "Request a model within your allocation or ask an administrator "
+                        "to allocate it to you."
+                    ),
+                    "type": "policy_denied",
+                    "code": "model_not_allocated",
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
         )
 
     # ── 6a-bind. Client-policy enforcement — INGRESS (#16, OPA Phase 2) ──
@@ -2422,6 +2570,60 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     return None
 
 
+def _effective_allowed_models(identity: dict | None) -> "EffectiveModels":
+    """Compute the caller's EFFECTIVE allowed-models (Track B1 model-RBAC).
+
+    Combines the identity's own ``allowed_models`` with the models allocated to
+    its org / groups / user via the durable allocation store, expanding each
+    allocated alias to {alias name, concrete model}. Returns an EffectiveModels
+    with deny-by-default / fail-closed semantics (see models.effective).
+
+    Resolved once per request and reused for BOTH the OPA input AND the
+    optimiser-binding re-check, so the two cannot disagree.
+    """
+    from yashigani.models.effective import resolve_effective_allowed_models
+    # getattr-guard: a partially-configured _state (e.g. allocation stores not
+    # wired in a minimal test/dev harness) degrades to "no allocation enforcement"
+    # rather than crashing the request path — the resolver already treats a None
+    # alloc_store as own-allowed_models only (fail-safe, never fail-open).
+    return resolve_effective_allowed_models(
+        identity,
+        getattr(_state, "model_allocation_store", None),
+        getattr(_state, "model_alias_store", None),
+    )
+
+
+def model_denied_for_caller(
+    identity: dict | None,
+    model: str,
+    *,
+    brain_leg: bool = False,
+) -> tuple[bool, "EffectiveModels"]:
+    """THE gateway-side model-RBAC CHOKE POINT (Track B1 — single authority).
+
+    Every model-selection path in the gateway — chat egress, orchestration-seed
+    brain choice, tool-catalog projection, and the model-tool hop — consults THIS
+    one function to decide whether a (caller, model) pair is denied.  It pulls the
+    live allocation + alias stores from ``_state`` and delegates to
+    ``models.effective.model_denied_for_caller`` (the cross-module authority).
+
+    ``brain_leg`` MUST be the SERVER-MINTED ``is_brain_reasoning_leg`` marker only
+    (process-local round-trip + internal identity + brain model).  It is the lone
+    exemption: the internal cognition leg holds no allocation and would otherwise
+    be denied the gated brain model.  A principal-bearing orchestration self-call
+    (a model/agent tool hop) is NEVER passed brain_leg=True — it carries the real
+    caller's allocations, which are enforced.  Fail-closed; never raises.
+    """
+    from yashigani.models.effective import model_denied_for_caller as _authority
+    return _authority(
+        identity,
+        model,
+        _state.model_allocation_store,
+        _state.model_alias_store,
+        brain_leg=brain_leg,
+    )
+
+
 async def _opa_v1_check(
     identity: dict | None,
     selected_model: str,
@@ -2429,6 +2631,7 @@ async def _opa_v1_check(
     sensitivity_level: str,
     route_reason: str,
     request_path: str,
+    effective_allowed_models: list[str] | None = None,
 ) -> dict:
     """
     Query OPA v1_routing policy for allow/deny + reason.
@@ -2457,7 +2660,15 @@ async def _opa_v1_check(
                 "allowing request without policy check (dev opt-in)",
                 _ysg_env,
             )
-            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+            # Dev-opt-in: OPA is intentionally bypassed, so EVERY sub-decision is
+            # bypassed consistently — including model_allowed.  Without this, the
+            # B1 model_allowed backstop (which reads opa_decision["model_allowed"])
+            # would fail-closed on the .get(...,False) default and 403 every dev
+            # request even though policy was deliberately skipped.  Production never
+            # reaches this branch (startup guard requires YASHIGANI_OPA_URL).
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in",
+                    "model_allowed": True, "routing_safe": True,
+                    "sensitivity_allowed": True}
         logger.error(
             "OPA not configured and fail-closed triggered (env=%s, opa_optional=%s)",
             _ysg_env, _opa_optional,
@@ -2467,11 +2678,21 @@ async def _opa_v1_check(
         ).inc()
         return {"allow": False, "reason": "opa_not_configured"}
 
+    # Track B1: when the caller has an effective-allowed-models set computed from
+    # allocations, it OVERRIDES the identity's own allowed_models in the OPA input
+    # so `model_allowed` denies any model outside the union of own + allocated.
+    # None means "not computed" → fall back to the identity's own list (unchanged
+    # behaviour for callers/paths with no allocation enforcement).
+    if effective_allowed_models is not None:
+        _allowed_models_doc = effective_allowed_models
+    else:
+        _allowed_models_doc = identity.get("allowed_models", []) if identity else []
+
     identity_doc = {
         "status": identity.get("status", "active") if identity else "anonymous",
         "kind": identity.get("kind", "unknown") if identity else "unknown",
         "groups": identity.get("groups", []) if identity else [],
-        "allowed_models": identity.get("allowed_models", []) if identity else [],
+        "allowed_models": _allowed_models_doc,
         "sensitivity_ceiling": identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC",
     }
 

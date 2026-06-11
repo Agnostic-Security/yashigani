@@ -335,6 +335,51 @@ def _bootstrap():
             exc,
         )
 
+    # ── Model allocation store (Redis db/3, key prefix model:alloc:*) ──────
+    # Track B1: durable model-RBAC allocations (org/group/user -> alias). Shares
+    # Redis db/3 with the RBAC + agent registry stores (disjoint namespace).
+    # Fail-closed: if Redis is down the store stays None and the allocation
+    # admin API returns 503 rather than silently dropping a grant.
+    model_allocation_store = None
+    try:
+        import redis as _redis
+        from yashigani.models.allocation_store import ModelAllocationStore
+        redis_alloc_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        # Wire the Postgres durable mirror so allocations survive a redis
+        # recreate/restart (Redis db/3 has no persistence). Constructed only when
+        # a usable (non-templated) DSN is present; otherwise Redis-only.
+        _durable_alloc_store = None
+        try:
+            from yashigani.models.allocation_durable_store import (
+                AllocationDurableStore, _direct_dsn as _alloc_dsn,
+            )
+            if _alloc_dsn() and "${POSTGRES_PASSWORD}" not in _alloc_dsn():
+                _durable_alloc_store = AllocationDurableStore()
+                logger.info("Allocation durable store (Postgres mirror) wired")
+            else:
+                logger.warning(
+                    "Allocation durable store NOT wired — no usable Postgres DSN; "
+                    "allocations will NOT survive a redis recreate"
+                )
+        except Exception as _ads_exc:
+            logger.warning("Allocation durable store init skipped (%s)", _ads_exc)
+        model_allocation_store = ModelAllocationStore(
+            redis_client=redis_alloc_client,
+            durable_store=_durable_alloc_store,
+        )
+        logger.info(
+            "Model allocation store initialised: %d allocation(s) loaded from Redis",
+            len(model_allocation_store.list_all()),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Model allocation store init failed (%s) — model allocations disabled",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer
@@ -419,6 +464,7 @@ def _bootstrap():
     backoffice_state.response_cache = response_cache
     backoffice_state.license_state = license_state
     backoffice_state.model_alias_store = model_alias_store
+    backoffice_state.model_allocation_store = model_allocation_store
 
     # v0.9.0 — WebAuthn + EventBus (optional, graceful degradation if unavailable)
     try:
