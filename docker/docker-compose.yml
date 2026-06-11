@@ -1008,6 +1008,12 @@ services:
       - ollama_data:/root/.ollama
     environment:
       OLLAMA_HOST: "0.0.0.0"
+      # WARMUP-001: keep models resident in VRAM indefinitely (idle-eviction disabled).
+      # Ollama default keep-alive is 5 minutes; after eviction the next request pays the
+      # cold-load penalty (qwen2.5:3b=37s, llama3.2:3b=46s), which exceeds both the
+      # classifier 10s timeout (fail-closes to RESTRICTED) and the Caddy 30s write
+      # timeout (client-visible hang). -1 = never evict. Configurable via .env.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
     healthcheck:
       # ollama image has no curl/wget — use bash /dev/tcp to check port
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/11434' 2>/dev/null"]

@@ -5213,6 +5213,98 @@ _ensure_agent_databases() {
   return 0
 }
 
+# =============================================================================
+# _warm_ollama_models — WARMUP-001: prime models into VRAM post-compose-up
+# =============================================================================
+# Without warmup the first real request pays the cold-load penalty:
+#   qwen2.5:3b (classifier)  COLD=36.9s  WARM=0.13s
+#   llama3.2:3b (route model) COLD=45.6s  WARM=~0.1s
+# Cold load exceeds both the classifier 10s timeout (fail-closes to RESTRICTED)
+# and the Caddy write timeout (client-visible hang). This function eliminates
+# the cold path by loading every present model before any user request arrives.
+#
+# Behaviour:
+#   1. Waits for ollama to be reachable (port 11434, capped retry, non-fatal).
+#   2. Warms the classifier/default model (${OLLAMA_MODEL:-qwen2.5:3b}) first.
+#   3. Iterates `ollama list` and warms every other present model.
+#   4. Each warm call hits /api/generate with a 1-token prompt and keep_alive:-1
+#      so the model loads resident (never idle-evict) via the API.
+#   5. Per-model timeout (${YSG_OLLAMA_WARMUP_TIMEOUT_S:-120}s) guards against
+#      a broken model hanging the installer indefinitely.
+#   6. Non-fatal throughout: warmup failures warn but never block the install.
+#      A stack that fails warmup is better than an install that exits 1.
+#
+# Runtime-agnostic: uses the compose exec path (same as _ensure_agent_databases).
+# Works under Docker and Podman (rootful + rootless). No host-side curl required
+# — the warm call runs inside the ollama container via /dev/tcp + bash heredoc.
+# -----------------------------------------------------------------------------
+_warm_ollama_models() {
+  local _compose_file="${1:-${WORK_DIR}/docker/docker-compose.yml}"
+  local _timeout_s="${YSG_OLLAMA_WARMUP_TIMEOUT_S:-120}"
+  local _classifier_model="${OLLAMA_MODEL:-qwen2.5:3b}"
+
+  log_info "Warming Ollama models into VRAM (WARMUP-001)..."
+
+  # Wait for ollama port to be reachable inside the container (capped 60s).
+  local _ollama_ready="false" _i
+  for _i in $(seq 1 20); do
+    if "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T ollama \
+        bash -c '</dev/tcp/localhost/11434' 2>/dev/null; then
+      _ollama_ready="true"; break
+    fi
+    sleep 3
+  done
+  if [[ "$_ollama_ready" != "true" ]]; then
+    log_warn "  ollama not reachable after 60s — skipping model warmup (first request may be slow)"
+    return 0
+  fi
+
+  # Helper: warm a single model via /api/generate with keep_alive:-1.
+  # Runs inside the container so no host-side curl dependency.
+  # Timeout via bash `read -t` loop so a hung model doesn't stall forever.
+  _warm_one_model() {
+    local _model="$1"
+    log_info "  warming ${_model} ..."
+    local _rc=0
+    # POST /api/generate with a 1-token prompt; keep_alive:-1 loads resident.
+    # Use bash /dev/tcp (available in the ollama image) so no curl needed.
+    timeout "${_timeout_s}" \
+      "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T ollama \
+      bash -c "
+        printf 'POST /api/generate HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s' \
+          \"\$(printf '{\"model\":\"%s\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}' '${_model}' | wc -c)\" \
+          \"\$(printf '{\"model\":\"%s\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}' '${_model}')\" \
+          >/dev/tcp/localhost/11434 2>/dev/null
+        cat /dev/tcp/localhost/11434 2>/dev/null | tail -1
+      " >/dev/null 2>&1 || _rc=$?
+    if [[ "$_rc" -eq 0 ]]; then
+      log_success "  ${_model} warm"
+    elif [[ "$_rc" -eq 124 ]]; then
+      log_warn "  ${_model} warmup timed out after ${_timeout_s}s (model may be broken or too large)"
+    else
+      log_warn "  ${_model} warmup returned rc=${_rc} (non-fatal)"
+    fi
+  }
+
+  # 1. Warm the classifier/default model first (every request hits this one).
+  _warm_one_model "$_classifier_model"
+
+  # 2. Warm all other present models (common route models: llama3.2:3b, etc.).
+  local _model_list _m
+  _model_list="$("${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T ollama \
+    bash -c 'OLLAMA_HOST=http://localhost:11434 ollama list 2>/dev/null | tail -n +2 | awk "{print \$1}"' \
+    2>/dev/null || echo "")"
+  while IFS= read -r _m; do
+    [[ -z "$_m" ]] && continue
+    # Skip the classifier model — already warmed above.
+    [[ "$_m" == "$_classifier_model" ]] && continue
+    _warm_one_model "$_m"
+  done <<< "$_model_list"
+
+  log_success "Ollama model warmup complete"
+  return 0
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -6080,6 +6172,17 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # here must not block the core stack.
   # ---------------------------------------------------------------------------
   _ensure_agent_databases "$compose_file"
+
+  # ---------------------------------------------------------------------------
+  # WARMUP-001: prime Ollama models into VRAM so the first real request is warm.
+  #
+  # Cold-model load times (qwen2.5:3b=37s, llama3.2:3b=46s) exceed both the
+  # classifier 10s timeout (fail-closes to RESTRICTED) and Caddy's write timeout.
+  # Running warmup here — after the stack is healthy and ollama-init has completed
+  # its pull — eliminates the cold path for every fresh install AND upgrade.
+  # Non-fatal: a warmup failure warns but never blocks the install.
+  # ---------------------------------------------------------------------------
+  _warm_ollama_models "$compose_file"
 }
 
 # =============================================================================

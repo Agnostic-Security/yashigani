@@ -701,6 +701,10 @@ ollama:
     minReplicas: 1
     maxReplicas: 4
   model: "qwen2.5:3b"
+  # keepAlive: how long a loaded model stays resident in VRAM after last use.
+  # -1 = never evict (recommended — cold load is 37-46s, exceeds classifier timeout).
+  # Set to "5m" to restore Ollama default idle-eviction behaviour.
+  keepAlive: "-1"
   env:
     ollamaHost: "0.0.0.0"
     # HOME=/data routes ollama's key + state (~/.ollama) to the persistent

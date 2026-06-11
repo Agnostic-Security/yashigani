@@ -38,7 +38,7 @@
         timeouts {
             read_body   10s
             read_header 5s
-            write       30s
+            write       120s  # raised 30→120s: accommodates local LLM generations; warm models keep normal responses ~8s
             idle        120s
         }
         # ── SNI-host enforcement (public-edge TLS fix, 2026-06-11) ──────────
