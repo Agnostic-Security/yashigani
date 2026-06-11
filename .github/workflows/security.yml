@@ -85,7 +85,7 @@ jobs:
       # V232-CI-TRIVY-SPLIT: hashFiles guard — only upload if Trivy actually wrote
       # the SARIF (i.e. the scan ran). Build failure before scan = no SARIF = skip.
       - name: Upload SARIF gateway
-        uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
         if: always() && hashFiles('trivy-gateway.sarif') != ''
         with:
           sarif_file: trivy-gateway.sarif
@@ -152,7 +152,7 @@ jobs:
       # V232-CI-TRIVY-SPLIT: hashFiles guard — only upload if Trivy actually wrote
       # the SARIF (i.e. the scan ran). Build failure before scan = no SARIF = skip.
       - name: Upload SARIF backoffice
-        uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
         if: always() && hashFiles('trivy-backoffice.sarif') != ''
         with:
           sarif_file: trivy-backoffice.sarif
@@ -265,7 +265,7 @@ jobs:
             --config p/supply-chain \
             --sarif-output opengrep.sarif \
             src/yashigani/
-      - uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4
+      - uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
         if: always()
         with:
           sarif_file: opengrep.sarif
@@ -372,7 +372,7 @@ jobs:
             opengrep-summary.txt
           retention-days: 90
 
-      - uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4
+      - uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
         if: always()
         with:
           sarif_file: opengrep-push.sarif
