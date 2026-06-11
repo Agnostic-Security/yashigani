@@ -623,6 +623,31 @@ async def _execute_tool_call(*, tool_name: str, args: dict, catalog, identity,
         return ToolResult(f"[UNKNOWN TOOL] '{tool_name}' is not in your allowed catalog.",
                           blocked=True, ingress_opa="deny:unknown_tool", http_status=400)
 
+    # ── LAURA-B1R-001 (model-tool hop) — execution-time model-RBAC, FIRST ────────
+    # Defence in depth: even if a non-allocated model__* tool was named (a crafted
+    # tool_call, or a stale catalog), the HOP to the concrete model is enforced
+    # through the SAME single model-RBAC authority BEFORE anything else runs.  The
+    # hop carries the REAL caller's identity (principal header), so the real
+    # caller's allocation applies — the brain-leg exemption does NOT (a tool hop is
+    # never the internal brain-reasoning leg).  Runs ahead of the exfil-args guard
+    # so a non-allocated model is rejected regardless of args content.  The
+    # self-call re-entry's alloc-bind is the third, structural gate.
+    if entry.kind == "model":
+        from yashigani.gateway.openai_router import model_denied_for_caller
+        denied, eff = model_denied_for_caller(identity, entry.target, brain_leg=False)
+        if denied:
+            logger.warning(
+                "orchestration model-hop: MODEL-RBAC DENIED model=%s identity=%s "
+                "(allowed=%s gated=%s) — not executing",
+                entry.target, _principal_id(identity),
+                sorted(eff.allowed), sorted(eff.gated),
+            )
+            return ToolResult(
+                f"[BLOCKED BY YASHIGANI POLICY] You are not allocated the model "
+                f"'{entry.target}'; the delegation was not executed.",
+                blocked=True, ingress_opa="deny:model_not_allocated",
+                http_status=403, block_source="model_rbac")
+
     # ── Data-exfil-via-tool-args guard (LAURA-ORCH-001(c)) ───────────────────
     # Classify the OUTBOUND args and adjudicate them as an egress event BEFORE the
     # hop runs.  A malicious tool result must not be able to make the model smuggle
@@ -657,6 +682,7 @@ async def _execute_tool_call(*, tool_name: str, args: dict, catalog, identity,
         return _toolresult_from_chat(status, body)
 
     if entry.kind == "model":
+        # Model-RBAC for this hop was already enforced above (FIRST gate).
         task = args.get("task") if isinstance(args, dict) else None
         task = task or json.dumps(args)
         status, body = await _self_call_chat(model=entry.target, task=task,
@@ -766,7 +792,10 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
     The reused helpers (_opa_v1_check, classify_decoded, pii_detector) are already
     fail-closed individually.
     """
-    from yashigani.gateway.openai_router import _state, _opa_v1_check
+    from yashigani.gateway.openai_router import (
+        _state, _opa_v1_check, model_denied_for_caller,
+        _effective_allowed_models, is_brain_reasoning_leg,
+    )
 
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
 
@@ -779,10 +808,43 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
             logger.error("orchestration seed: sensitivity classify failed: %s — denying", exc)
             return _seed_denied(request_id, "seed_sensitivity_classify_failed", sensitivity_level)
 
+    # ── LAURA-B1R-001 (orchestrate-seed model-RBAC) — THE CHOKE POINT ────────────
+    # The /v1 handler delegated here BEFORE its own model-RBAC alloc-bind ran, so
+    # the brain-model choice was previously gated ONLY by OPA — and that OPA call
+    # was made WITHOUT the effective allowlist, so OPA saw the caller's RAW
+    # allowed_models ([] for allocation-based callers) → empty == no-restriction →
+    # model_allowed=True → a restricted caller (fastuser) reached the gated brain
+    # model qwen2.5:3b by simply setting orchestrate=true.  We now enforce the SAME
+    # single model-RBAC authority the chat egress uses, BEFORE the brain runs:
+    #   • EXPLICIT deny via model_denied_for_caller (effective alloc + gated set), AND
+    #   • the effective allowlist is fed to OPA below so model_allowed agrees.
+    # EXEMPTION: the genuine internal brain-reasoning leg (server-minted) — the
+    # internal identity legitimately runs the gated brain model.  A real principal
+    # (fastuser) is NEVER exempt, so the brain-model choice is enforced for them.
+    _seed_brain_leg = is_brain_reasoning_leg(identity, orchestrator_model)
+    _seed_denied_model, _seed_eff = model_denied_for_caller(
+        identity, orchestrator_model, brain_leg=_seed_brain_leg,
+    )
+    if _seed_denied_model:
+        logger.warning(
+            "orchestration seed: MODEL-RBAC DENIED brain model=%s identity=%s "
+            "(allowed=%s gated=%s restricted=%s) — denying before brain",
+            orchestrator_model, _principal_id(identity),
+            sorted(_seed_eff.allowed), sorted(_seed_eff.gated), _seed_eff.has_restriction,
+        )
+        return _seed_denied(request_id, "model_not_allocated", sensitivity_level)
+
     # 2) OPA ingress on the brain model choice.  The brain is a LOCAL model, so the
     #    provider is ollama; the caller must be OPA-allowed to use it at this
     #    sensitivity (mirrors the chat-path _opa_v1_check, request_path tagged so
-    #    the decision is attributable to the orchestration entry).
+    #    the decision is attributable to the orchestration entry).  B1: feed the
+    #    EFFECTIVE allowlist so OPA's model_allowed is the true positive-allowlist
+    #    verdict for this caller (mirrors openai_router.py:1298-1299/1417) — without
+    #    it OPA saw the caller's empty raw allowed_models and never denied the brain.
+    _seed_eff_opa = (
+        None if _seed_brain_leg
+        else _effective_allowed_models(identity).to_opa_allowed_models()
+    )
     opa = await _opa_v1_check(
         identity=identity,
         selected_model=orchestrator_model,
@@ -790,6 +852,7 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
         sensitivity_level=sensitivity_level,
         route_reason="orchestration:seed:brain",
         request_path="/v1/chat/completions:orchestration",
+        effective_allowed_models=_seed_eff_opa,
     )
     # STRICTER-THAN-CHAT (M1 intent): the chat path gates only on the top-level
     # `allow` (which, for local ollama routing, reflects identity-active alone —
@@ -1144,9 +1207,17 @@ async def run_orchestration(*, body, identity, request, request_id: str,
         entry_depth = 0
 
     orchestrator_model = _orchestrator_model(body)
+    # LAURA-B1R-001 (catalog projection): resolve the caller's EFFECTIVE allocation
+    # ONCE and project the model-as-tool catalog through it, so a non-allocated
+    # model never appears as a callable tool.  Same single authority as the chat
+    # egress + seed gate.  A model hop the brain still names is re-gated at
+    # execution by the alloc-bind (defence in depth).
+    from yashigani.gateway.openai_router import _effective_allowed_models
+    _caller_effective = _effective_allowed_models(identity)
     catalog = build_tool_catalog(
         identity=identity, agent_registry=_state.agent_registry,
         available_models=_state.available_models, default_model=_state.default_model,
+        effective=_caller_effective,
     )
     # If the caller passed an explicit `tools` list, intersect the RBAC catalog
     # with the requested tool NAMES (build sheet §2.3 — the catalog stays a

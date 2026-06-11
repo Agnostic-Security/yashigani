@@ -644,6 +644,94 @@ def _build_app(mesh_mode: bool = False):
             "RuntimeSettings gateway wiring failed (%s) — using startup values only", exc
         )
 
+    # ── Track B1 (model-RBAC): allocation store (db/3) + alias store (db/1) ──
+    # The gateway reads BOTH on the request path to compute the caller's
+    # effective-allowed-models (own allowed_models ∪ allocated aliases, expanded
+    # to concrete models). Both share the existing per-DB Redis clients' URLs.
+    # Fail-closed: if a store cannot be built it stays None and the resolver
+    # treats the caller as restricted to its own allowed_models (no allocation
+    # widening) — never fail-open.
+    model_allocation_store = None
+    model_alias_store = None
+    try:
+        import redis as _redis
+        from yashigani.models.allocation_store import ModelAllocationStore
+        _redis_alloc = _redis.from_url(_gw_redis_url(3), decode_responses=False)
+        _redis_alloc.ping()
+        # Wire the Postgres durable mirror (when a usable DSN exists) and reconcile
+        # Postgres → Redis db/3 on boot. Redis db/3 has no persistence, so a redis
+        # recreate/restart wipes allocations; the gateway re-hydrates them
+        # independently of the backoffice (same pattern as the agent reconcile).
+        _gw_alloc_durable = None
+        try:
+            from yashigani.models.allocation_durable_store import (
+                AllocationDurableStore, _direct_dsn as _alloc_dsn,
+            )
+            if _alloc_dsn() and "${POSTGRES_PASSWORD}" not in _alloc_dsn():
+                _gw_alloc_durable = AllocationDurableStore()
+        except Exception as _gads_exc:
+            logger.warning("Gateway allocation durable store skipped (%s)", _gads_exc)
+        model_allocation_store = ModelAllocationStore(
+            redis_client=_redis_alloc, durable_store=_gw_alloc_durable,
+        )
+        if _gw_alloc_durable is not None:
+            try:
+                from yashigani.models.allocation_durable_store import (
+                    reconcile_allocations_from_durable,
+                )
+                reconcile_allocations_from_durable(model_allocation_store, _gw_alloc_durable)
+            except Exception as _grec_exc:
+                logger.error(
+                    "Gateway ALLOC-RECONCILE failed (%s) — allocations may be absent "
+                    "until the next admin mutation", _grec_exc,
+                )
+        logger.info(
+            "Gateway model allocation store ready: %d allocation(s)",
+            len(model_allocation_store.list_all()),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Gateway model allocation store unavailable (%s) — allocations not enforced "
+            "(callers restricted to their own allowed_models)", exc,
+        )
+    try:
+        import redis as _redis
+        from yashigani.models.alias_store import ModelAliasStore
+        _redis_alias = _redis.from_url(_gw_redis_url(1), decode_responses=False)
+        _redis_alias.ping()
+        model_alias_store = ModelAliasStore(redis_client=_redis_alias)
+        _all_aliases = model_alias_store.list_all()
+        logger.info(
+            "Gateway model alias store ready: %d alias(es)",
+            len(_all_aliases),
+        )
+        # Track B1: feed the alias map into the OptimizationEngine so it resolves
+        # an alias (e.g. 'smart') to its concrete provider/model (anthropic/
+        # claude-sonnet-4-6) instead of treating the alias name as a local Ollama
+        # model. Without this the OE downgrades every aliased request to local
+        # default, so an allocated CLOUD alias would never actually serve its
+        # cloud model. Format: {alias: (provider, model, force_local)}.
+        if optimization_engine is not None and _all_aliases:
+            try:
+                optimization_engine.update_aliases({
+                    name: (cfg.provider, cfg.model, cfg.force_local)
+                    for name, cfg in _all_aliases.items()
+                })
+                logger.info(
+                    "OptimizationEngine alias map loaded from store: %d alias(es)",
+                    len(_all_aliases),
+                )
+            except Exception as _oe_alias_exc:
+                logger.warning(
+                    "Failed to load OE alias map from store (%s) — aliases resolve "
+                    "to local default", _oe_alias_exc,
+                )
+    except Exception as exc:
+        logger.warning(
+            "Gateway model alias store unavailable (%s) — allocated aliases will "
+            "only be matched by name, not expanded to concrete models", exc,
+        )
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -664,6 +752,8 @@ def _build_app(mesh_mode: bool = False):
         content_relay_detector=content_relay_detector,
         pool_manager=pool_manager,
         ddos_protector=ddos_protector,
+        model_allocation_store=model_allocation_store,
+        model_alias_store=model_alias_store,
     )
 
     # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────

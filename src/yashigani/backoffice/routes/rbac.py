@@ -12,11 +12,12 @@ Last updated: 2026-05-03
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from yashigani.backoffice.middleware import AdminSession
 from yashigani.backoffice.state import backoffice_state
@@ -30,9 +31,49 @@ router = APIRouter()
 # Request / response models
 # ---------------------------------------------------------------------------
 
+# Ava input-validation finding: constrain ResourcePatternIn so a malformed
+# pattern cannot reach the store / OPA. method must be one of a fixed allowlist
+# (or "*"); path_glob is length-capped and charset-restricted to path-glob
+# characters (no whitespace, control chars, or shell/regex metacharacters that
+# would never appear in a legitimate MCP path pattern).
+_ALLOWED_METHODS = frozenset({"*", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
+# Allowed path_glob characters: path segments + the supported glob tokens
+# (* ? ** ) plus the usual URL path punctuation. Deliberately excludes spaces,
+# quotes, backslashes, and shell/regex metacharacters.
+_PATH_GLOB_RE = re.compile(r"^[A-Za-z0-9._~:@%+\-/*?{}\[\]]+$")
+_PATH_GLOB_MAX = 512
+
+
 class ResourcePatternIn(BaseModel):
     method: str = Field(default="*", description="HTTP method or '*' for any")
-    path_glob: str = Field(description="Path pattern: '**', '/prefix/**', or exact path")
+    path_glob: str = Field(
+        min_length=1,
+        max_length=_PATH_GLOB_MAX,
+        description="Path pattern: '**', '/prefix/**', or exact path",
+    )
+
+    @field_validator("method")
+    @classmethod
+    def _validate_method(cls, v: str) -> str:
+        vv = v.strip().upper() if v else "*"
+        if vv not in _ALLOWED_METHODS:
+            raise ValueError(
+                f"method must be one of {sorted(_ALLOWED_METHODS)}"
+            )
+        return vv
+
+    @field_validator("path_glob")
+    @classmethod
+    def _validate_path_glob(cls, v: str) -> str:
+        vv = v.strip()
+        if not vv:
+            raise ValueError("path_glob must not be empty")
+        if not _PATH_GLOB_RE.match(vv):
+            raise ValueError(
+                "path_glob contains invalid characters (allowed: path chars and "
+                "glob tokens * ? ** { } [ ] ; no whitespace or shell metacharacters)"
+            )
+        return vv
 
 
 class RateLimitOverrideIn(BaseModel):

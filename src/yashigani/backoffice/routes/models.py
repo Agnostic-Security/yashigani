@@ -33,13 +33,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── In-memory fallback for allocations ────────────────────────────────────
-# Allocations are not yet Redis-backed; that is a separate future task.
-
-_allocations: list[dict] = []
-_alloc_counter = 0
-
-
 # ── Request / Response models ─────────────────────────────────────────────
 
 class AliasRequest(BaseModel):
@@ -73,6 +66,44 @@ def _alias_store():
             detail={"error": "alias_store_unavailable", "detail": "Redis not connected"},
         )
     return store
+
+
+def _alloc_store():
+    """
+    Return the durable ModelAllocationStore from backoffice state.
+
+    Raises HTTP 503 if the store was not initialised (Redis db/3 unavailable at
+    boot) — fail-closed: an admin must never believe an allocation persisted
+    when it only touched a transient in-memory list.
+    """
+    store = backoffice_state.model_allocation_store
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "allocation_store_unavailable", "detail": "Redis db/3 not connected"},
+        )
+    return store
+
+
+def _push_allocations_to_opa() -> None:
+    """Force-push the live allocation set to OPA after a mutation.
+
+    Mirrors the RBAC force-push: the durable store is authoritative, so an OPA
+    push failure is logged but does NOT fail the mutation (the allocation is
+    already persisted and will re-sync on the next mutation or on startup
+    reconcile). The gateway computes effective-allowed-models from the same
+    durable store on the request path, so enforcement is correct even if this
+    informational push is briefly stale.
+    """
+    store = backoffice_state.model_allocation_store
+    opa_url = backoffice_state.opa_url
+    if store is None or not opa_url:
+        return
+    try:
+        from yashigani.models.opa_push import push_allocations_data
+        push_allocations_data(store, opa_url)
+    except Exception as exc:  # non-fatal — store remains authoritative
+        logger.warning("Allocation OPA push failed (%s) — store remains authoritative", exc)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -176,31 +207,33 @@ async def pull_model(body: PullModelRequest, session: StepUpAdminSession):
 
 @router.get("/allocations")
 async def list_allocations(session: AdminSession):
-    return {"allocations": _allocations}
+    store = _alloc_store()
+    return {"allocations": [a.to_dict() for a in store.list_all()]}
 
 
 @router.post("/allocations", status_code=201)
 async def create_allocation(body: AllocationRequest, session: StepUpAdminSession):
-    global _alloc_counter
-    store = _alias_store()
-    if store.get(body.model_alias) is None:
+    alias_store = _alias_store()
+    if alias_store.get(body.model_alias) is None:
         raise HTTPException(status_code=404, detail={"error": "alias_not_found"})
-    _alloc_counter += 1
-    alloc = {
-        "id": str(_alloc_counter),
-        "model_alias": body.model_alias,
-        "target_type": body.target_type,
-        "target_id": body.target_id,
-    }
-    _allocations.append(alloc)
-    return {"status": "ok", "allocation": alloc}
+    store = _alloc_store()
+    try:
+        alloc = store.add(body.model_alias, body.target_type, body.target_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_allocation", "detail": str(exc)})
+    _push_allocations_to_opa()
+    logger.info(
+        "Admin %s allocated model %s to %s:%s (id=%s)",
+        session.account_id, body.model_alias, body.target_type, body.target_id, alloc.id,
+    )
+    return {"status": "ok", "allocation": alloc.to_dict()}
 
 
 @router.delete("/allocations/{alloc_id}")
 async def delete_allocation(alloc_id: str, session: StepUpAdminSession):
-    global _allocations
-    before = len(_allocations)
-    _allocations = [a for a in _allocations if a["id"] != alloc_id]
-    if len(_allocations) == before:
+    store = _alloc_store()
+    if not store.delete(alloc_id):
         raise HTTPException(status_code=404, detail={"error": "allocation_not_found"})
+    _push_allocations_to_opa()
+    logger.info("Admin %s removed allocation %s", session.account_id, alloc_id)
     return {"status": "ok"}

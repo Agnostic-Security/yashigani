@@ -110,6 +110,27 @@
 # with /run/secrets/caddy_internal_hmac mounted, so a forged header cannot
 # match.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Strip orchestration-context headers at the public edge (LAURA/IRIS drift).
+# X-Yashigani-Orchestration-* carry the agent-orchestration identity context
+# (depth, principal, root-request-id) the gateway uses for model-RBAC. A real
+# external user proved they can FORGE X-Yashigani-Orchestration-Depth at the
+# public edge to bypass model-RBAC. These headers are LEGITIMATE only on the
+# internal mesh self-call path (gateway:8081), exactly like X-OpenWebUI-User-*.
+# Imported into EVERY public handle that reaches the gateway (direct or via the
+# OWUI catch-all). Single-source snippet = no per-handle drift across renders.
+# Pairs with Tom's gateway-side identity-gate (the two halves ship together).
+# `request_header -X` (delete) runs unconditionally here; no inbound value
+# survives to the gateway, so it can only ever see an internally-set value.
+# ─────────────────────────────────────────────────────────────────────────────
+(strip-orchestration-headers) {
+    request_header -X-Yashigani-Orchestration-Depth
+    request_header -X-Yashigani-Orchestration-Principal
+    request_header -X-Yashigani-Orchestration-Root-Request-Id
+    # Defence-in-depth catch for any future X-Yashigani-Orchestration-* header.
+    request_header -X-Yashigani-Orchestration-*
+}
+
 (inject-caddy-verified) {
     # Inject the per-install shared secret from the mounted secrets file.
     # {$CADDY_INTERNAL_HMAC} is a parse-time env substitution (NOT a request-time
@@ -219,6 +240,7 @@ Hiring: https://agnosticsec.com/careers
 
     # ── Gateway health check — /healthz ──────────────────────────────────
     handle /healthz {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -233,6 +255,7 @@ Hiring: https://agnosticsec.com/careers
     handle /agents/* {
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -255,6 +278,7 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-OpenWebUI-User-Name
         request_header -X-OpenWebUI-User-Role
         request_header -X-Forwarded-User
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -272,6 +296,7 @@ Hiring: https://agnosticsec.com/careers
     # in declaration order and first-match wins for non-path-prefix handles.
     # Last updated: 2026-05-30 (P3 broker E2E gate — J8-JWKS fix)
     handle /.well-known/yashigani-mcp-jwks.json {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -282,6 +307,7 @@ Hiring: https://agnosticsec.com/careers
 
     # ── MCP proxy — /mcp/* ─────────────────────────────────────────────
     handle /mcp/* {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -296,6 +322,7 @@ Hiring: https://agnosticsec.com/careers
     # Without explicit handles these requests fell through to the Open WebUI
     # catch-all and were functionally unreachable.
     handle /openapi.json {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -305,6 +332,7 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /docs {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -507,6 +535,11 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-OpenWebUI-User-Id
         request_header -X-OpenWebUI-User-Name
         request_header -X-OpenWebUI-User-Role
+        # Strip forged orchestration-context headers before they reach OWUI
+        # (which re-emits to gateway:8081 on the internal mesh). Same anti-spoof
+        # rationale as the OWUI user headers above — only the internal mesh path
+        # may carry X-Yashigani-Orchestration-*.
+        import strip-orchestration-headers
 
         # ── Open WebUI socket.io WebSocket — F-WS fix (YSG-2253) ───────────
         # Open WebUI streams chat tokens over a socket.io WebSocket at

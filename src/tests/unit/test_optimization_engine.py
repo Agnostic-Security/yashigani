@@ -174,3 +174,68 @@ class TestOptimizationEngine:
                         _comp(ComplexityLevel.HIGH), _budget(), force_cloud=True)
         assert d.rule == "P1"
         assert d.is_local
+
+
+class TestAllowedLocalDefaultSubstitution:
+    """LAURA-B1-OBS-1 — the optimiser substitutes the caller's allowed local
+    model (not the global default) in every LOCAL-route rule when supplied.
+
+    allowed_local_default=None ⇒ legacy global-default behaviour (byte-for-byte).
+    A non-None value ⇒ that model replaces the global default in P1/P2/P3/P4/P7/P9.
+    Cloud rules (P5/P6/P8) are unaffected — they never use the local default.
+    """
+
+    def test_none_keeps_global_default_p9(self, engine):
+        d = engine.route("unknown-x", _sens(), _comp(ComplexityLevel.MEDIUM), _budget(),
+                         allowed_local_default=None)
+        assert d.rule == "P9"
+        assert d.model == "qwen2.5:3b"
+
+    def test_p9_substitutes_allowed_local(self, engine):
+        d = engine.route("unknown-x", _sens(), _comp(ComplexityLevel.MEDIUM), _budget(),
+                         allowed_local_default="phi3.5")
+        assert d.rule == "P9"
+        assert d.model == "phi3.5"
+        assert d.is_local
+
+    def test_p7_low_complexity_substitutes(self, engine):
+        d = engine.route("x", _sens(), _comp(ComplexityLevel.LOW), _budget(),
+                         allowed_local_default="phi3.5")
+        assert d.rule == "P7"
+        assert d.model == "phi3.5"
+
+    def test_p1_confidential_substitutes(self, engine):
+        d = engine.route("gpt-4o", _sens(SensitivityLevel.CONFIDENTIAL), _comp(), _budget(),
+                         allowed_local_default="phi3.5")
+        assert d.rule == "P1"
+        assert d.model == "phi3.5"
+        assert d.is_local
+
+    def test_p2_budget_exhausted_substitutes(self, engine):
+        d = engine.route("gpt-4o", _sens(), _comp(ComplexityLevel.HIGH),
+                         _budget(BudgetSignal.EXHAUSTED, 100), allowed_local_default="phi3.5")
+        assert d.rule == "P2"
+        assert d.model == "phi3.5"
+
+    def test_p3_budget_warn_substitutes(self, engine):
+        d = engine.route("gpt-4o", _sens(), _comp(ComplexityLevel.MEDIUM),
+                         _budget(BudgetSignal.WARN, 85), allowed_local_default="phi3.5")
+        assert d.rule == "P3"
+        assert d.model == "phi3.5"
+
+    def test_p4_force_local_default_substitutes(self, engine):
+        # force_local with a requested model resolving to a NON-ollama provider
+        # ('smart' → anthropic) → engine falls back to the local default → must use
+        # the caller's allowed local model, not the global default.
+        d = engine.route("smart", _sens(), _comp(ComplexityLevel.MEDIUM), _budget(),
+                         force_local=True, allowed_local_default="phi3.5")
+        assert d.rule == "P4"
+        assert d.model == "phi3.5"
+
+    def test_cloud_rules_unaffected_by_local_default(self, engine):
+        # P6 (HIGH complexity → cloud) must NOT pick up the local-default substitute.
+        d = engine.route("x", _sens(), _comp(ComplexityLevel.HIGH), _budget(),
+                         allowed_local_default="phi3.5")
+        assert d.rule == "P6"
+        assert not d.is_local
+        assert d.model != "phi3.5"
