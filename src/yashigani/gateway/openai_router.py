@@ -1298,6 +1298,67 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _effective = _effective_allowed_models(identity) if not is_agent_call else None
     _eff_opa_list = _effective.to_opa_allowed_models() if _effective is not None else None
 
+    # ── LAURA-B1-OBS-A: EXPLICIT-pin deny is VISIBLE (403), not silent-substitute ─
+    # Two distinct intents must be distinguished, and only ONE may be silently
+    # rerouted by the OBS-1 fallback:
+    #   • EXPLICIT request — the caller PINNED a concrete model in the request body
+    #     (``body.model`` truthy) that they are NOT allocated.  A security product
+    #     MUST be honest: deny VISIBLY with 403 model_not_allocated, byte-for-byte
+    #     the same verdict the orchestrate-seed path returns.  Silently serving an
+    #     allocated substitute (HTTP 200) would MASK enforcement.
+    #   • OPTIMISER/DEFAULT AUTO-selection — the caller did NOT pin a model
+    #     (``body.model`` falsy → the global default was used) OR the optimiser
+    #     later re-selects a model (P1 local pin, budget reroute, …).  Here the
+    #     caller never asked for the denied model, so the OBS-1 fallback below
+    #     substitutes a model they ARE allocated (preserved, no 403).
+    # The discriminator is purely "did the CALLER pin the model" (``body.model``),
+    # which is forgery-proof: it is the caller's own request body, and a deny only
+    # ever REMOVES access — no over-grant.  The security bar is unchanged: no
+    # non-allocated model is ever served on EITHER branch (auto-path falls back to
+    # an allocated model or is denied by the alloc-bind re-check downstream).
+    # brain_reasoning_leg stays exempt (server-minted, holds no allocation) exactly
+    # as the alloc-bind re-check below.
+    if (
+        body.model  # caller PINNED a model explicitly (vs default/auto)
+        and not is_agent_call
+        and not brain_reasoning_leg
+        and _effective is not None
+    ):
+        _pinned_denied = _effective.is_model_denied(body.model)
+        if not _pinned_denied and _state.optimization_engine is not None:
+            # Resolve the pinned alias to its concrete model and re-check, so a
+            # pin of an ALIAS whose concrete is denied is also caught (mirrors the
+            # downstream alloc-bind, which runs on the resolved concrete).
+            try:
+                _, _pinned_concrete, _ = _state.optimization_engine._resolve_alias(body.model)
+                _pinned_denied = _effective.is_model_denied(_pinned_concrete)
+            except Exception as exc:  # noqa: BLE001 — never fail-open the route
+                logger.warning(
+                    "B1-OBS-A pinned-alias resolution failed (%s) — relying on "
+                    "name-level + downstream alloc-bind checks", exc,
+                )
+        if _pinned_denied:
+            logger.warning(
+                "MODEL-RBAC DENIED (explicit-pin, B1-OBS-A): identity=%s "
+                "pinned=%s NOT allocated — visible 403 (no silent substitute)",
+                identity_id, body.model,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": (
+                            "Request denied by policy: you are not allocated this model. "
+                            "Request a model within your allocation or ask an administrator "
+                            "to allocate it to you."
+                        ),
+                        "type": "policy_denied",
+                        "code": "model_not_allocated",
+                    }
+                },
+                headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+            )
+
     if _state.optimization_engine and _state.sensitivity_classifier and _state.complexity_scorer and not is_agent_call:
         # LAURA-B1-OBS-1: if the engine's global local default would be DENIED to
         # this caller (restricted/gated), resolve a LOCAL model the caller IS
@@ -2511,9 +2572,34 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     if not _state.identity_registry:
         return None
 
-    # SSO headers (from Caddy)
+    # ── SSO headers (from Caddy) ── LAURA-OBS-B: trust-gate X-Forwarded-User ──
+    # X-Forwarded-User is the SSO identity Caddy's forward_auth re-injects AFTER
+    # the backoffice has verified the session (the copy_headers X-Forwarded-User
+    # in the forward_auth blocks).  Caddy ALSO strips any inbound X-Forwarded-User
+    # at the public edge AND injects X-Caddy-Verified-Secret (the per-install
+    # caddy_internal_hmac) on every reverse_proxy hop to the gateway.
+    #
+    # ASYMMETRY CLOSED: X-OpenWebUI-User-* is honoured ONLY inside the proven
+    # internal-bearer branch above, but X-Forwarded-User was previously honoured
+    # here UNCONDITIONALLY.  On the mesh listener (8081) CaddyVerifiedMiddleware is
+    # NOT active (mesh_entrypoint: "N/A for direct mesh calls"), so a raw in-mesh
+    # caller (e.g. OWUI's own network) could set `X-Forwarded-User: coderuser` and
+    # be served coderuser's identity — an in-mesh identity-reassignment primitive.
+    # Caddy strips it at the public edge so it is not edge-exploitable today, but
+    # the latent asymmetry is closed here.
+    #
+    # FIX: honour X-Forwarded-User ONLY when the request carries a VALID
+    # X-Caddy-Verified-Secret — the SAME cryptographic trust proof that anchors the
+    # legitimate Caddy forward_auth/SSO path.  A genuine SSO request (proxied
+    # through Caddy 8080) always carries it, so the per-user API/SSO path is
+    # preserved byte-for-byte.  A raw mesh caller without the secret is IGNORED
+    # (falls through to API-key auth below).  validate_caddy_secret fail-closes
+    # when the secret is unloaded (returns False), so this never fail-opens.
+    from yashigani.auth.caddy_verified import validate_caddy_secret
     forwarded_user = request.headers.get("X-Forwarded-User")
-    if forwarded_user:
+    if forwarded_user and validate_caddy_secret(
+        request.headers.get("X-Caddy-Verified-Secret", "")
+    ):
         identity = _state.identity_registry.get_by_slug(forwarded_user)
         if identity:
             return identity
