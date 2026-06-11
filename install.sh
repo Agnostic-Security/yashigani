@@ -6892,12 +6892,20 @@ _ctx.load_cert_chain(
 user = read_secret("svc_admin_username")
 pw = read_secret("svc_admin_password")
 totp_secret = read_secret("svc_admin_totp_secret")
-if not all([user, pw, totp_secret]):
+# Fallback SELECTOR (not the missing-secrets guard): if the svc_admin set is
+# absent, fall back to admin1. Written as an explicit `and` chain so it is
+# unambiguously distinct from the comprehensive missing-secrets guard below.
+# That guard includes caddy_hmac — an empty HMAC would silently produce a
+# broken X-Caddy-Verified-Secret header and CaddyVerifiedMiddleware returns 401.
+if not (user and pw and totp_secret):
     user = read_secret("admin1_username")
     pw = read_secret("admin1_password")
     totp_secret = read_secret("admin1_totp_secret")
     print("WARNING:svc_admin_secrets_absent_falling_back_to_admin1", file=sys.stderr)
 caddy_hmac = read_secret("caddy_internal_hmac")
+# Missing-secrets guard — caddy_hmac MUST be included (BUG-INSTALLER-AUTO-AGENT-
+# REG-401): without it the script would proceed and send an empty HMAC header.
+# This is the comprehensive guard the regression test asserts against.
 if not all([user, pw, totp_secret, caddy_hmac]):
     print("ERROR:missing_secrets", file=sys.stderr)
     sys.exit(1)
