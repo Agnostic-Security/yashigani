@@ -17,3 +17,5 @@
 # for host access is a separate concern not governed by this file.
 #
 maxine@agnosticsec.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN7sU9TP7sFNq+8NNW33zQyoV3dJksPMGqzvpFe/iK6W
+# Linux release signer, used since v2.25.3
+max@agnosticsec.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICSEkWs1ayLjYpmixguTSKQ2FeFhV3torBaqcjnHAlKS
