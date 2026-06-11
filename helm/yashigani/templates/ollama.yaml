@@ -57,6 +57,11 @@ spec:
               value: {{ .Values.ollama.env.home | default "/data" | quote }}
             - name: OLLAMA_MODELS
               value: {{ .Values.ollama.env.ollamaModels | default "/data/models" | quote }}
+            # WARMUP-001: keep models resident in VRAM indefinitely (idle-eviction disabled).
+            # Cold-load penalty (37-46s) exceeds the classifier 10s timeout and Caddy write
+            # timeout. -1 = never evict. Configurable via values.yaml ollama.keepAlive.
+            - name: OLLAMA_KEEP_ALIVE
+              value: {{ .Values.ollama.keepAlive | default "-1" | quote }}
           readinessProbe:
             tcpSocket:
               port: 11434
@@ -224,6 +229,20 @@ spec:
                 fi
               fi
               echo "Model pull complete: ${OLLAMA_MODEL}"
+              # WARMUP-001: prime the pulled model into VRAM with keep_alive:-1 so the
+              # first real request (classifier or route) is warm. Cold-load penalty is
+              # 37-46s — exceeds both classifier 10s timeout and Caddy write timeout.
+              # Non-fatal: warmup failure warns but does not fail the Job.
+              echo "Warming ${OLLAMA_MODEL} into VRAM (keep_alive:-1)..."
+              PAYLOAD="{\"model\":\"${OLLAMA_MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}"
+              PAYLOAD_LEN=$(printf '%s' "$PAYLOAD" | wc -c)
+              {
+                printf 'POST /api/generate HTTP/1.0\r\nHost: yashigani-ollama\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s' \
+                  "$PAYLOAD_LEN" "$PAYLOAD"
+              } >/dev/tcp/yashigani-ollama/11434 2>/dev/null && \
+              cat /dev/tcp/yashigani-ollama/11434 2>/dev/null | tail -1 && \
+              echo "Warmup complete: ${OLLAMA_MODEL}" || \
+              echo "WARNING: warmup returned non-zero — first request may be slow (non-fatal)"
           resources:
             {{- toYaml .Values.ollama.initJob.resources | nindent 12 }}
           volumeMounts:
