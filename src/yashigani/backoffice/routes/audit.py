@@ -390,18 +390,23 @@ async def test_siem_target(name: str, session: AdminSession):
             detail=payload,
         )
 
+    # Mirror _send_to_target (#21): cert-identity (mesh_mtls) targets carry no
+    # shared secret — present this service's mesh leaf via client_ssl_context()
+    # and omit the auth header. Otherwise the "Test connection" button always
+    # fails for the bundled-Wazuh target (and would send an empty Authorization).
+    headers = {"Content-Type": content_type}
+    if target.auth_value:
+        headers[target.auth_header] = target.auth_value
+    test_ctx = writer._mesh_client_ctx() if getattr(target, "mesh_mtls", False) else None
     req = urllib.request.Request(
         url=target.url,
         data=body_str.encode("utf-8"),
         method="POST",
-        headers={
-            "Content-Type": content_type,
-            target.auth_header: target.auth_value,
-        },
+        headers=headers,
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=test_ctx) as resp:
             http_status = resp.status
     except urllib.error.HTTPError as exc:
         payload, _ = safe_error_envelope(exc, public_message="siem test failed", status=502)

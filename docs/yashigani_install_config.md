@@ -2464,6 +2464,27 @@ YASHIGANI_OPENWEBUI_TRUSTED_HEADER=X-Yashigani-User-Id   # Header containing aut
 
 Set `YASHIGANI_OPENWEBUI_ENABLED=false` in `.env` and restart Caddy. The `/chat/*` routes will return 404.
 
+### 21.4 Populating the model picker — `gateway.models.service_account_full_list`
+
+Open WebUI authenticates to the gateway with the shared **internal service bearer**, so to the gateway every Open WebUI request is one *service-account* identity. By default, as part of the internal-topology-disclosure hardening, service accounts get a **RESTRICTED** `GET /v1/models` listing — only their `allowed_models` allowlist, empty by default — so the Open WebUI **model picker shows nothing** and end users cannot start a chat.
+
+To make the picker populate, an operator enables the runtime setting:
+
+| Setting key | Type | Default | Effect when ON |
+|---|---|---|---|
+| `gateway.models.service_account_full_list` | bool | `false` | Service-account identities receive the **FULL** `/v1/models` list — the local Ollama models **plus** every registered agent (as `@agent`) **plus** every active service identity (as `@service`). Open WebUI's picker then lists them all; each is invoked the same way (e.g. `@langflow …`, a model name, or `@some-service`). |
+
+**Set it from the admin UI:** *Admin → Runtime Settings →* edit `gateway.models.service_account_full_list` to `true` (step-up TOTP required; audited; takes effect within ~30s, no restart). Or via the API:
+
+```bash
+curl -X PUT https://<domain>/admin/runtime-settings/gateway.models.service_account_full_list \
+  -H 'Content-Type: application/json' -b "<admin session>" -d '{"value": true}'
+```
+
+Seeded default value can also be set at install time via the env var `YASHIGANI_MODELS_SERVICE_ACCOUNT_FULL_LIST=true`.
+
+**Security note:** this only ever *widens* a service account's model **listing** (enumeration). It does not change which models a request may actually *call* (that is enforced separately), and it never affects human/admin principals (already full) or a hard OPA deny. Leave it OFF if you do not run Open WebUI or do not want service accounts enumerating the model/agent/service topology. Per-user/group/org model RBAC (allocations) is a separate, identity-scoped control.
+
 ---
 
 ## 22. Optimization Engine (since v2.0)

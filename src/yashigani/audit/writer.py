@@ -139,9 +139,63 @@ class SiemTarget:
     name: str
     target_type: str       # webhook | splunk_hec | elastic_opensearch
     url: str
-    auth_header: str       # e.g. "Authorization"
-    auth_value: str        # secret — never logged
+    auth_header: str = "Authorization"
+    auth_value: str = ""   # secret — never logged; empty for mesh_mtls targets
     enabled: bool = True
+    mesh_mtls: bool = False  # when True, authenticate by presenting THIS service's
+                             # internal-mesh leaf via pki.client_ssl_context()
+                             # (Pattern A) instead of a shared header secret — for
+                             # internal SIEMs that trust the Yashigani mesh CA, e.g.
+                             # the bundled Wazuh indexer (serves a DNS:wazuh-indexer
+                             # leaf, trusts ca_root+ca_intermediate). No shared secret.
+
+
+def siem_targets_from_env(env_var: str = "YASHIGANI_SIEM_TARGETS") -> list["SiemTarget"]:
+    """Load audit SIEM-forwarding targets from deployment config at startup.
+
+    The target set is owned by the deployment layer (install.sh / compose env),
+    NOT the running app's admin state — so forwarding survives restarts and is
+    populated when a SIEM (e.g. the bundled Wazuh) is selected at install time.
+
+    ``env_var`` holds a JSON array; each entry:
+        {"name","target_type","url","auth_value", ["auth_header"], ["enabled"]}
+    Unset / empty / malformed → ``[]`` (forward to none). Never raises — a bad
+    config must not stop the gateway from starting (audit still writes locally).
+    """
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("%s is not valid JSON — no SIEM targets loaded", env_var)
+        return []
+    if not isinstance(data, list):
+        logger.warning("%s must be a JSON array — no SIEM targets loaded", env_var)
+        return []
+    targets: list[SiemTarget] = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            logger.warning("%s[%d] is not an object — skipped", env_var, i)
+            continue
+        try:
+            targets.append(
+                SiemTarget(
+                    name=entry["name"],
+                    target_type=entry["target_type"],
+                    url=entry["url"],
+                    auth_header=entry.get("auth_header", "Authorization"),
+                    # auth_value optional: mesh_mtls (cert-identity) targets and
+                    # unauthenticated webhooks carry no shared secret.
+                    auth_value=entry.get("auth_value", ""),
+                    enabled=bool(entry.get("enabled", True)),
+                    mesh_mtls=bool(entry.get("mesh_mtls", False)),
+                )
+            )
+        except (KeyError, TypeError) as exc:
+            logger.warning("%s[%d] missing/invalid field (%s) — skipped", env_var, i, exc)
+    logger.info("Loaded %d SIEM target(s) from %s", len(targets), env_var)
+    return targets
 
 
 # ---------------------------------------------------------------------------
@@ -401,22 +455,44 @@ class AuditLogWriter:
         validate_siem_url(target.url)
 
         body, content_type = self._format_for_target(raw_json, target)
+        headers = {"Content-Type": content_type}
+        # Cert-identity (mesh_mtls) targets carry no shared secret — the client
+        # cert IS the credential. Only set the auth header when a value exists.
+        if target.auth_value:
+            headers[target.auth_header] = target.auth_value
         req = urllib.request.Request(
             url=target.url,
             data=body.encode("utf-8"),
             method="POST",
-            headers={
-                "Content-Type": content_type,
-                target.auth_header: target.auth_value,
-            },
+            headers=headers,
         )
+        # mesh_mtls: present this service's internal-mesh leaf via the canonical
+        # PKI helper (Pattern A — own leaf + ca_root anchor, TLS 1.3, peer verify
+        # + hostname). The bundled Wazuh indexer trusts the Yashigani mesh CA and
+        # serves a DNS:wazuh-indexer leaf, so the writer is authenticated by cert
+        # identity (a low-privilege mesh leaf, NOT the wazuh admin credential).
+        ctx = self._mesh_client_ctx() if target.mesh_mtls else None
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 if resp.status >= 300:
                     raise RuntimeError(f"HTTP {resp.status}")
         except urllib.error.HTTPError as exc:
             exc.status_code = exc.code  # type: ignore[attr-defined]
             raise
+
+    def _mesh_client_ctx(self):
+        """Lazily build + cache this service's internal-mesh client SSLContext.
+
+        Uses pki.ssl_context.client_ssl_context() (resolves THIS service's own
+        leaf via current_service()). Cached because building it reads cert files
+        and verifies the bootstrap token on every call.
+        """
+        ctx = getattr(self, "_mesh_ctx", None)
+        if ctx is None:
+            from yashigani.pki.ssl_context import client_ssl_context
+            ctx = client_ssl_context()
+            self._mesh_ctx = ctx
+        return ctx
 
     @staticmethod
     def _format_for_target(raw_json: str, target: SiemTarget) -> tuple[str, str]:

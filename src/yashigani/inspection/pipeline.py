@@ -24,6 +24,23 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SANITIZE_THRESHOLD = 0.85
 
 
+def _record_classification(classification: str, severity: str) -> None:
+    """Emit the inspection-pipeline verdict metric (label = threat category,
+    severity = ''/HIGH/CRITICAL).
+
+    This is the metric the Security Overview / Agent Activity dashboards and the
+    CredentialExfil / PromptInjection alerts query. Lazy import avoids a
+    metrics<->pipeline import cycle; metrics must never break a request.
+    """
+    try:
+        from yashigani.metrics.registry import inspection_classifications_total
+        inspection_classifications_total.labels(
+            label=classification, severity=severity
+        ).inc()
+    except Exception:  # pragma: no cover — never fail a request on metrics
+        pass
+
+
 @dataclass
 class PipelineResult:
     request_id: str
@@ -100,18 +117,20 @@ class InspectionPipeline:
 
         # Step 3: Disposition
         if result.label == LABEL_CLEAN:
-            return self._pass_through(request_id, raw_query, session_id, agent_id)
-
-        if result.label == LABEL_CREDENTIAL_EXFIL:
-            return self._handle_credential_exfil(
+            pipeline_result = self._pass_through(request_id, raw_query, session_id, agent_id)
+        elif result.label == LABEL_CREDENTIAL_EXFIL:
+            pipeline_result = self._handle_credential_exfil(
                 request_id, raw_query, masked_query, result,
                 session_id, agent_id, user_id,
             )
+        else:  # PROMPT_INJECTION_ONLY
+            pipeline_result = self._handle_injection_only(
+                request_id, result, session_id, agent_id, user_id,
+            )
 
-        # PROMPT_INJECTION_ONLY
-        return self._handle_injection_only(
-            request_id, result, session_id, agent_id, user_id,
-        )
+        # Emit the designed pipeline-verdict metric for every disposition.
+        _record_classification(pipeline_result.classification, pipeline_result.severity)
+        return pipeline_result
 
     def update_threshold(self, threshold: float) -> None:
         """Admin-configurable sanitization confidence threshold."""
@@ -207,7 +226,7 @@ class InspectionPipeline:
             "action_taken": action,
             "sanitized": sanitized,
         }
-        user_alert = _build_user_alert(request_id, action, sanitized)
+        user_alert = _build_user_alert(request_id, action, sanitized, LABEL_CREDENTIAL_EXFIL)
 
         audit = {
             "event_type": "PROMPT_INJECTION_DETECTED",
@@ -264,7 +283,7 @@ class InspectionPipeline:
             "sanitized": False,
             "admin_alerted": True,
         }
-        user_alert = _build_user_alert(request_id, "DISCARDED", False)
+        user_alert = _build_user_alert(request_id, "DISCARDED", False, LABEL_PROMPT_INJECTION_ONLY)
 
         audit = {
             "event_type": "PROMPT_INJECTION_DETECTED",
@@ -300,25 +319,52 @@ class InspectionPipeline:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_user_alert(request_id: str, action: str, sanitized: bool) -> dict:
-    import datetime
-    code = "QUERY_MODIFIED" if action == "SANITIZED" else "QUERY_DISCARDED"
-    msg = (
-        "Your query was modified before processing."
-        if code == "QUERY_MODIFIED"
-        else "Your query was not processed due to a policy violation."
+def _build_user_alert(
+    request_id: str,
+    action: str,
+    sanitized: bool,
+    classification: str = LABEL_PROMPT_INJECTION_ONLY,
+) -> dict:
+    """Unified layman alert for request-leg inspection blocks (#4, direction=from_you).
+
+    Uses the shared yashigani.common.user_alert envelope so the same plain-English
+    shape is returned at every enforcement point (educate + deter).
+    """
+    from yashigani.common.user_alert import (
+        build_alert,
+        ACTION_BLOCKED,
+        ACTION_MODIFIED,
+        DIRECTION_FROM_YOU,
     )
-    return {
-        "yashigani_alert": {
-            "code": code,
-            "message": msg,
-            "request_id": request_id,
-            "timestamp": datetime.datetime.now(
-                tz=datetime.timezone.utc
-            ).isoformat(),
-        },
-        "result": None,
-    }
+
+    is_exfil = classification == LABEL_CREDENTIAL_EXFIL
+    if action == "SANITIZED":
+        act = ACTION_MODIFIED
+        reason = (
+            "Your message appeared to try to extract credentials or secrets; the "
+            "risky part was removed before the request continued."
+            if is_exfil
+            else "Your message was modified to remove content that violates policy "
+            "before it continued."
+        )
+    else:
+        act = ACTION_BLOCKED
+        reason = (
+            "Your message appeared to try to extract credentials or secrets, so it "
+            "was blocked and not sent to the assistant."
+            if is_exfil
+            else "Your message looked like an attempt to override the assistant's "
+            "instructions (a prompt injection), so it was blocked and not sent to "
+            "the assistant."
+        )
+    rule = (
+        "Credential exfiltration (your request)"
+        if is_exfil
+        else "Prompt injection (your request)"
+    )
+    return build_alert(
+        act, reason, rule=rule, direction=DIRECTION_FROM_YOU, request_id=request_id
+    )
 
 
 def _content_hash(content: str) -> str:
@@ -358,7 +404,7 @@ class ResponseInspectionConfig:
 
     Fields:
         enabled             Toggle the pipeline entirely.
-        fasttext_only       Skip LLM fallback — classify with FastText only.
+        classifier_only     Skip LLM fallback — classify with the first-pass classifier only.
                             Faster but lower recall on novel injection patterns.
         blocked_action      HTTP status code to return when a response is BLOCKED.
                             Must be "502" (upstream tainted) per the security design.
@@ -371,7 +417,7 @@ class ResponseInspectionConfig:
                             Each addition is an explicit trust assumption; document the reason.
     """
     enabled: bool = True
-    fasttext_only: bool = False
+    classifier_only: bool = False
     blocked_action: str = "502"
     exempt_content_types: list[str] = field(
         default_factory=list
@@ -562,7 +608,7 @@ class ResponseInspectionPipeline:
             "action_taken": action_taken,
             "content_type": content_type,
             "response_content_hash": content_hash,
-            "fasttext_only_mode": cfg.fasttext_only,
+            "classifier_only_mode": cfg.classifier_only,
             "response_sensitivity": response_sensitivity_value,
         }
         self._on_audit("RESPONSE_INJECTION_DETECTED", audit)

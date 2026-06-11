@@ -2,19 +2,24 @@
 """
 Bootstrap Postgres for Yashigani.
 
-Generates a 36-char password for the yashigani_app role,
-writes it to the secrets volume, runs Alembic migrations.
+Runs Alembic migrations, then sets the yashigani_app runtime role password to the
+SINGLE install-generated credential (docker/secrets/postgres_password, written by
+install.sh's `_gen_password` — the one and only password generator). It does NOT
+mint a password of its own: migration 0001 creates yashigani_app with the literal
+placeholder PASSWORD 'PLACEHOLDER_REPLACED_BY_BOOTSTRAP', and this script (or the
+equivalent ALTER in install.sh's bootstrap_postgres step) swaps in the real one.
 
-Prints credentials clearly delimited to stdout exactly once.
-Must be run as a one-shot init container before the application starts.
+A second, independent generator here was the root cause of "SASL authentication
+failed": it ALTERed the role to a freshly-minted token while the app's DSN used
+install.sh's credential, so the SCRAM verifier never matched. Single source only.
+
+Must run as a one-shot init step before the application starts.
 """
 from __future__ import annotations
 
 import os
-import secrets
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 
@@ -23,20 +28,21 @@ SENTINEL = SECRETS_DIR / ".postgres_bootstrapped"
 DB_DSN_ENV = "YASHIGANI_DB_DSN"
 
 
-def _generate_password() -> str:
-    return secrets.token_urlsafe(27)  # 36 chars base64url
-
-
-def _print_credentials(pg_password: str) -> None:
-    block = textwrap.dedent(f"""
-    ╔══════════════════════════════════════════════════════════════════════╗
-    ║            YASHIGANI POSTGRES FIRST-RUN CREDENTIALS                 ║
-    ║   Store these securely — they will NOT be shown again.              ║
-    ╠══════════════════════════════════════════════════════════════════════╣
-    ║  Postgres password (yashigani_app): {pg_password:<34} ║
-    ╚══════════════════════════════════════════════════════════════════════╝
-    """).strip()
-    print(block, flush=True)
+def _read_app_password() -> str:
+    """Read the single install-generated credential. Never generate one here."""
+    pw_file = SECRETS_DIR / "postgres_password"
+    if not pw_file.exists():
+        print(
+            f"[bootstrap_postgres] {pw_file} missing — install.sh must write the "
+            "single postgres_password secret before bootstrap.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pw = pw_file.read_text().strip()
+    if not pw:
+        print(f"[bootstrap_postgres] {pw_file} is empty.", file=sys.stderr)
+        sys.exit(1)
+    return pw
 
 
 def main() -> None:
@@ -46,13 +52,8 @@ def main() -> None:
 
     SECRETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Generate password
-    pg_password = _generate_password()
-
-    # Write to secrets file
-    pg_password_file = SECRETS_DIR / "postgres_password"
-    pg_password_file.write_text(pg_password)
-    pg_password_file.chmod(0o600)
+    # The single install-generated runtime credential (do not generate here).
+    pg_password = _read_app_password()
 
     # Ensure license_key secret file exists (empty = Community edition).
     # Docker Compose requires the file to exist even if unused.
@@ -87,12 +88,14 @@ def main() -> None:
         sys.exit(1)
     print("[bootstrap_postgres] Migrations applied successfully.", flush=True)
 
-    # Update the yashigani_app role password via psql
+    # Replace the migration-0001 placeholder on yashigani_app with the single
+    # install-generated credential. Parameterise via psql variable so the password
+    # is never shell- or SQL-interpolated.
     update_pw_sql = (
-        f"ALTER ROLE yashigani_app WITH PASSWORD '{pg_password}';"
+        "ALTER ROLE yashigani_app WITH PASSWORD :'pw';"
     )
     result2 = subprocess.run(
-        ["psql", migration_dsn, "-c", update_pw_sql],
+        ["psql", migration_dsn, "-v", f"pw={pg_password}", "-c", update_pw_sql],
         capture_output=True,
         text=True,
     )
@@ -100,9 +103,11 @@ def main() -> None:
         print("[bootstrap_postgres] Password update FAILED:", file=sys.stderr)
         print(result2.stderr, file=sys.stderr)
         sys.exit(1)
-
-    # Print credentials
-    _print_credentials(pg_password)
+    print(
+        "[bootstrap_postgres] yashigani_app runtime credential set "
+        "(migration-0001 placeholder replaced).",
+        flush=True,
+    )
 
     # Mark bootstrapped
     SENTINEL.touch()

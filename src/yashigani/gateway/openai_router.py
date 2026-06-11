@@ -50,7 +50,7 @@ Streaming limitations
   response-path inspection. This adds ~2-3s latency but ensures PII
   cannot leak through streamed responses.
 """
-# Last updated: 2026-05-18T00:00:00+00:00
+# Last updated: 2026-06-09T00:00:00+00:00
 from __future__ import annotations
 
 import hmac
@@ -69,6 +69,8 @@ from pydantic import BaseModel, Field
 from yashigani.pki.client import internal_httpx_client
 from yashigani.metrics.registry import _C as _metric_counter
 from yashigani.audit.schema import (
+    ClientPolicyCheckFailedEvent,
+    ClientPolicyDeniedEvent,
     EncodedPayloadDetectedEvent,
     OpaResponseCheckFailedEvent,
     PIIDetectedEvent,
@@ -76,8 +78,45 @@ from yashigani.audit.schema import (
     ResponseInjectionDetectedEvent,
     StreamTerminatedEvent,
 )
+from yashigani.gateway._client_enforce import evaluate_client_policies, scope_kind_for
 
 logger = logging.getLogger(__name__)
+
+
+def _client_enforce_input(identity, request_path, route_reason="", provider="", model=""):
+    """Build the clients-contract input doc shared by ingress + egress (#16)."""
+    ident = identity or {}
+    return {
+        "identity": {
+            "agent": ident.get("identity_id", ""),
+            "role": ident.get("kind", ""),
+            "clearance": ident.get("sensitivity_ceiling", ""),
+            "groups": ident.get("groups", []),
+        },
+        "request": {"path": request_path, "method": "POST"},
+        "routing_decision": {"route": route_reason, "provider": provider, "model": model},
+    }
+
+
+def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result):
+    """Audit a client-policy denial / fail-closed, mirroring the OPA-check events."""
+    aw = _state.audit_writer
+    if aw is None:
+        return
+    deny = ce_result.get("deny", []) or []
+    failclosed = {"client_enforce_unavailable", "client_enforce_undefined", "client_enforce_not_configured"}
+    try:
+        if set(deny) & failclosed:
+            aw.write(ClientPolicyCheckFailedEvent(
+                reason=next(iter(set(deny) & failclosed)), outcome="fail_closed", direction=direction,
+            ))
+        else:
+            aw.write(ClientPolicyDeniedEvent(
+                identity_id=identity_id, scope_kind=scope_kind, scope_id=scope_id,
+                direction=direction, deny_codes=list(deny),
+            ))
+    except Exception:  # pragma: no cover — audit must never break the request path
+        pass
 
 # ---------------------------------------------------------------------------
 # OPA fail-closed Prometheus counter (Path 1 + Path 3)
@@ -124,6 +163,61 @@ def _load_internal_bearer() -> str:
 
 # Cached at module load — fails fast if env-var is absent.
 _INTERNAL_BEARER: str = _load_internal_bearer()
+
+
+# ---------------------------------------------------------------------------
+# Admin-configurable: GET /v1/models visibility for service accounts.
+#
+# OPA classifies service-account principals (e.g. Open WebUI, which calls with
+# the shared internal bearer) as RESTRICTED — they see only their allowed_models
+# allowlist, empty by default (FINDING-59-01 topology-disclosure hardening).
+# Without a way to relax that, the OWUI model picker is empty in simple
+# deployments. This runtime setting (gateway.models.service_account_full_list,
+# editable in the admin Runtime Settings panel; default OFF) lets an operator
+# grant service accounts the FULL list (models + agents + service identities).
+# Read live from the DB-backed runtime_settings table, cached 30s. Fail-secure:
+# any error -> False (restricted).
+# ---------------------------------------------------------------------------
+_SA_FULL_LIST_CACHE: dict = {"value": False, "ts": 0.0}
+_SA_FULL_LIST_TTL = 30.0
+
+
+def _service_account_full_list_enabled() -> bool:
+    """True iff the operator has enabled the full /v1/models list for service
+    accounts via the gateway.models.service_account_full_list runtime setting."""
+    import time as _t
+    now = _t.monotonic()
+    if now - _SA_FULL_LIST_CACHE["ts"] < _SA_FULL_LIST_TTL:
+        return _SA_FULL_LIST_CACHE["value"]
+    value = False
+    try:
+        import psycopg2, json as _json
+        from yashigani.runtime_settings.keys import KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST as _K
+        dsn = os.getenv("YASHIGANI_DB_DSN", "")
+        if dsn and "${POSTGRES_PASSWORD}" not in dsn:
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            conn.autocommit = True
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM runtime_settings WHERE key = %s", (_K,))
+                    row = cur.fetchone()
+                if row:
+                    raw = row[0]
+                    # value is jsonb: psycopg2 may hand back a native python type
+                    # (bool/int/str) OR a json string depending on adapters — handle both.
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode()
+                    if isinstance(raw, str):
+                        raw = _json.loads(raw)
+                    value = bool(raw)
+            finally:
+                conn.close()
+    except Exception as _exc:  # fail-secure: restricted on any error
+        logger.debug("service_account_full_list read failed (%s) — restricted", _exc)
+        value = False
+    _SA_FULL_LIST_CACHE["value"] = value
+    _SA_FULL_LIST_CACHE["ts"] = now
+    return value
 
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
@@ -448,6 +542,72 @@ def _encoded_payload_audit(
         logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
 
 
+def _sse_from_completion(completion: dict, headers: dict) -> StreamingResponse:
+    """Wrap a buffered OpenAI chat-completion dict as a single-chunk SSE stream.
+
+    F-STREAM (2026-06-09): Open WebUI (and any OpenAI-compatible client) sends
+    ``stream:true``.  When OPA policies are active (always, in real deployments)
+    or PII block/redact is on, the gateway force-disables streaming and buffers
+    the full response for inspection — but it must still answer a ``stream:true``
+    request with ``text/event-stream``, or OWUI's SSE reader renders nothing
+    ("perpetual thinking" → "Failed to fetch").
+
+    OpenAI semantics: a stream:true request ALWAYS returns SSE, even if the body
+    was produced via a single buffered upstream call.  To match the canonical
+    OpenAI streaming framing that browser SSE clients (incl. Open WebUI) expect,
+    we emit THREE ``chat.completion.chunk`` frames:
+      1. ``delta={"role":"assistant"}``  — opens the message (no content yet)
+      2. ``delta={"content": <full text>}`` — the full assistant text
+      3. ``delta={}, finish_reason=<reason>`` — closes the message
+    followed by the ``data: [DONE]`` sentinel.  Splitting role/content/finish
+    into separate frames (rather than one fat frame) is what real OpenAI does and
+    avoids frontend SSE parsers that reject a role+content+finish_reason combined
+    in a single opening delta.  The buffered inspection (OPA / PII) has already
+    run before we reach here, so no content escapes un-inspected.
+    """
+    choice = (completion.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    cid = completion.get("id", "")
+    created = completion.get("created", 0)
+    model = completion.get("model", "")
+    index = choice.get("index", 0)
+    content = message.get("content", "")
+    role = message.get("role", "assistant")
+    finish_reason = choice.get("finish_reason", "stop")
+
+    def _frame(delta: dict, finish):
+        return {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": index, "delta": delta, "finish_reason": finish}
+            ],
+        }
+
+    def _gen():
+        # 1) open with role
+        yield f"data: {json.dumps(_frame({'role': role}, None))}\n\n"
+        # 2) full content in a single content delta
+        yield f"data: {json.dumps(_frame({'content': content}, None))}\n\n"
+        # 3) close with finish_reason and empty delta
+        yield f"data: {json.dumps(_frame({}, finish_reason))}\n\n"
+        yield "data: [DONE]\n\n"
+
+    # SSE-specific headers; merge the caller's X-Yashigani-* headers on top.
+    sse_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
+    }
+    sse_headers.update(headers)
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers=sse_headers,
+    )
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────
 
 
@@ -759,6 +919,28 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 }
             },
             headers={"X-Yashigani-OPA-Reason": opa_reason},
+        )
+
+    # ── 6a-bind. Client-policy enforcement — INGRESS (#16, OPA Phase 2) ──
+    # Runs STRICTLY AFTER the core _opa_v1_check gate above so it can only ADD
+    # denials, never remove one. Fail-closed (evaluate_client_policies denies on
+    # any OPA error/undefined). No-op for callers with no bound policies.
+    _ce_scope_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_in = await evaluate_client_policies(
+        _state, _ce_scope_kind, identity_id, "ingress",
+        _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
+                              provider=selected_provider, model=selected_model),
+    )
+    if not _ce_in.get("allow", False):
+        _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
+        logger.warning("CLIENT-POLICY DENIED /v1 ingress: identity=%s scope=%s:%s deny=%s",
+                       identity_id, _ce_scope_kind, identity_id, _ce_reason)
+        _audit_client_policy("ingress", identity_id, _ce_scope_kind, identity_id, _ce_in)
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"Request denied by client policy: {_ce_reason}",
+                               "type": "client_policy_denied", "code": _ce_reason}},
+            headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
         )
 
     # ── 6b. PII detection on request ──────────────────────────────────
@@ -1252,7 +1434,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                 action_taken=_af.get("action_taken", ""),
                                 content_type=_af.get("content_type", ""),
                                 response_content_hash=_af.get("response_content_hash", ""),
-                                fasttext_only_mode=bool(_af.get("fasttext_only_mode", False)),
+                                classifier_only_mode=bool(_af.get("classifier_only_mode", False)),
                             )
                         )
                     except Exception as _exc:
@@ -1392,6 +1574,26 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
 
+    # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
+    # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
+    # the caller has no bound egress policies.
+    _ce_eg_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_eg = await evaluate_client_policies(
+        _state, _ce_eg_kind, identity_id, "egress",
+        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
+    )
+    if not _ce_eg.get("allow", False):
+        _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
+        logger.warning("CLIENT-POLICY BLOCKED /v1 egress: identity=%s deny=%s", identity_id, _ce_eg_reason)
+        _audit_client_policy("egress", identity_id, _ce_eg_kind, identity_id, _ce_eg)
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"Response blocked by client policy: {_ce_eg_reason}",
+                               "type": "client_policy_denied", "code": _ce_eg_reason}},
+            headers={"X-Yashigani-Request-Id": request_id,
+                     "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
+        )
+
     # ── 9. Build response ─────────────────────────────────────────────
     elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -1444,8 +1646,29 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         headers["X-Yashigani-Budget-Total"] = str(budget_total)
         headers["X-Yashigani-Budget-Pct"] = str(budget_pct)
 
+    # ── #16 step 9. Client-policy obligations (allow-path directives) ──
+    # audit_* / redact_* obligations from bound client policies are surfaced here
+    # so they are NEVER silently ignored: logged + conveyed to the caller/operator
+    # UI via header. (Content-mutation redaction routing through the PII redactor
+    # is a tracked follow-up; the directive itself is always recorded.)
+    _client_obligations = sorted(set(
+        (_ce_in.get("obligations") or []) + (_ce_eg.get("obligations") or [])
+    ))
+    if _client_obligations:
+        headers["X-Yashigani-Client-Obligations"] = ",".join(_client_obligations).encode(
+            "ascii", "replace").decode("ascii")
+        logger.info("client-policy obligations for %s: %s", identity_id, _client_obligations)
+
+    # F-STREAM: a stream:true request must always be answered as SSE, even when
+    # streaming was force-disabled (OPA active / PII block|redact) and the body
+    # was produced via the buffered path.  This single return point covers clean
+    # success, PII-redacted success, and agent-call success — all funnel here.
+    _completion = response.model_dump()
+    if body.stream:
+        return _sse_from_completion(_completion, headers)
+
     return JSONResponse(
-        content=response.model_dump(),
+        content=_completion,
         headers=headers,
     )
 
@@ -1519,6 +1742,14 @@ async def list_models(request: Request):
         )
 
     opa_filter = opa_result.get("filter", "restricted")
+    # Admin override: operators can grant service accounts the FULL list (so the
+    # Open WebUI model picker populates) via the gateway.models.service_account_full_list
+    # runtime setting (admin Runtime Settings panel; default OFF). Only ever
+    # WIDENS a restricted service-account listing — never affects human/admin
+    # (already full) or a hard deny. Restores the FINDING-59-01 "picker populates
+    # after login" behaviour for OWUI deployments.
+    if opa_filter == "restricted" and _service_account_full_list_enabled():
+        opa_filter = "full"
     # Identify allowed_models for service-account RESTRICTED filter.
     # Three states:
     #   opa_filter == "full"         → no restriction (None sentinel OK)

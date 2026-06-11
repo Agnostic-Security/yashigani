@@ -21,7 +21,7 @@ import time
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
-from yashigani.audit.writer import AuditLogWriter
+from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
 from yashigani.auth.bootstrap import (
     load_or_generate,
     print_credentials,
@@ -90,6 +90,7 @@ def _bootstrap():
     audit_writer = AuditLogWriter(
         config=audit_config,
         masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
     )
 
     # ── Session store (Redis db/1) ──────────────────────────────────────────
@@ -190,6 +191,7 @@ def _bootstrap():
     # typical kube-dns propagation window without blocking readiness probes.
     rbac_store = None
     agent_registry = None
+    binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -203,10 +205,42 @@ def _bootstrap():
                 len(rbac_store.list_groups()),
             )
             # Agent registry shares the same Redis db/3 instance (different key namespace)
-            agent_registry = AgentRegistry(redis_client=redis_rbac_client)
+            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): wire the durable
+            # Postgres mirror so register/update/deactivate dual-write to
+            # agent_registry. Redis db/3 has no persistence (appendonly no /
+            # save ""), so a redis recreate wipes the registry; the durable store
+            # + startup reconciler (lifespan) restore it. Constructed only when a
+            # usable (non-templated) DSN is present; otherwise the registry stays
+            # Redis-only as before. The store uses its own sync psycopg2 conn at
+            # write time, so it does not depend on the asyncpg pool being open yet.
+            _durable_agent_store = None
+            try:
+                from yashigani.agents.durable_store import AgentDurableStore, _direct_dsn
+                if _direct_dsn() and "${POSTGRES_PASSWORD}" not in _direct_dsn():
+                    _durable_agent_store = AgentDurableStore()
+                    logger.info("Agent durable store (Postgres mirror) wired")
+                else:
+                    logger.warning(
+                        "Agent durable store NOT wired — no usable Postgres DSN; "
+                        "agent registrations will NOT survive a redis recreate"
+                    )
+            except Exception as _ds_exc:
+                logger.warning("Agent durable store init skipped (%s)", _ds_exc)
+            agent_registry = AgentRegistry(
+                redis_client=redis_rbac_client,
+                durable_store=_durable_agent_store,
+            )
             logger.info(
                 "Agent registry initialised: %d agent(s) in index",
                 agent_registry.count("all"),
+            )
+            # #16 — client-policy BindingStore shares the same Redis db/3 instance
+            # (key prefix ysgbind:*, disjoint from rbac:* and the agent registry).
+            from yashigani.policy_bindings.store import BindingStore as _BindingStore
+            binding_store = _BindingStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Binding store initialised: %d client-policy binding(s) loaded",
+                len(binding_store.list()),
             )
             break  # success
         except Exception as exc:
@@ -371,6 +405,7 @@ def _bootstrap():
     backoffice_state.resource_monitor = resource_monitor
     backoffice_state.rate_limiter = rate_limiter
     backoffice_state.rbac_store = rbac_store
+    backoffice_state.binding_store = binding_store    # #16
     backoffice_state.agent_registry = agent_registry
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
@@ -521,6 +556,13 @@ def _bootstrap():
         if _ping_ok:
             backoffice_state.break_glass_manager = init_break_glass(redis_bg, audit_writer)
             logger.info("Break glass manager initialized")
+            # #25: dual-admin cloud-LLM override shares the same db/0 Redis client.
+            try:
+                from yashigani.optimization.cloud_override import CloudLlmOverrideManager
+                backoffice_state.cloud_override_manager = CloudLlmOverrideManager(redis_bg, audit_writer)
+                logger.info("Cloud-LLM override manager initialized")
+            except Exception as _co_exc:
+                logger.warning("Cloud-override manager init failed (%s)", _co_exc)
         else:
             logger.warning("Break glass unavailable — Redis unreachable after %d attempts", _BG_MAX_ATTEMPTS)
     except Exception as exc:

@@ -78,6 +78,15 @@ x-common-env: &common-env
   YASHIGANI_AUDIT_LOG_PATH: /data/audit/audit.log
   YASHIGANI_AUDIT_MAX_FILE_SIZE_MB: ${YASHIGANI_AUDIT_MAX_FILE_SIZE_MB:-100}
   YASHIGANI_AUDIT_RETENTION_DAYS: ${YASHIGANI_AUDIT_RETENTION_DAYS:-90}
+  # Audit SIEM forwarding (#21) — JSON array of targets; empty → forward to none.
+  # install.sh populates this with the bundled-Wazuh target (mesh_mtls cert
+  # identity) when --wazuh is selected; otherwise unset → nothing forwarded.
+  # No cert paths needed: mesh_mtls targets present this service's own internal-CA
+  # leaf via pki.client_ssl_context() (resolved from the standard secret paths).
+  YASHIGANI_SIEM_TARGETS: ${YASHIGANI_SIEM_TARGETS:-}
+  # SSRF allowlist (CWE-918): hosts here bypass the private-IP block in
+  # validate_siem_url. install.sh sets wazuh-indexer when --wazuh is selected.
+  YASHIGANI_SIEM_HOSTNAMES: ${YASHIGANI_SIEM_HOSTNAMES:-}
   # Internal mTLS — every service reads its identity from this manifest + its
   # own bootstrap token. Path is mounted read-only on every Python service.
   YASHIGANI_SERVICE_MANIFEST_PATH: /etc/yashigani/service_identities.yaml
@@ -138,7 +147,7 @@ services:
     build:
       context: ..
       dockerfile: docker/caddy/Dockerfile.caddy
-    image: yashigani/caddy:${YASHIGANI_VERSION:-2.24.1}
+    image: yashigani/caddy:${YASHIGANI_VERSION:-2.25.3}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_CADDY_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_CADDY_CPU_LIMIT:-0.5}
@@ -154,6 +163,9 @@ services:
       - "8445"
     environment:
       YASHIGANI_TLS_DOMAIN: ${YASHIGANI_TLS_DOMAIN:?set YASHIGANI_TLS_DOMAIN}
+      # Published HTTPS port — so the Caddyfile HTTP->HTTPS redirect targets the
+      # real edge port (e.g. :8456), not bare :443 (dead on non-standard deploys).
+      YASHIGANI_HTTPS_PORT: ${YASHIGANI_HTTPS_PORT:-443}
       CADDY_ACME_EMAIL: ${YASHIGANI_ADMIN_USERNAME:-admin@yashigani.local}
       PROMETHEUS_BASICAUTH_USER: ${PROMETHEUS_BASICAUTH_USER:-prometheus}
       PROMETHEUS_BASICAUTH_HASH: ${PROMETHEUS_BASICAUTH_HASH:?run bootstrap to get this value}
@@ -262,7 +274,7 @@ services:
   # ---------------------------------------------------------------------------
   gateway:
     dns_search: ["."]
-    image: yashigani/gateway:${YASHIGANI_VERSION:-2.25.0}
+    image: yashigani/gateway:${YASHIGANI_VERSION:-2.25.3}
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
@@ -418,16 +430,23 @@ services:
     networks:
       - caddy_internal
       - data
+      # obs (#21): reach wazuh-indexer:9200 to forward audit events to the bundled
+      # SIEM. wazuh-indexer is obs-plane only; without this the SIEM target is
+      # unreachable. Outbound is mesh-mTLS (client_ssl_context); no inbound exposure.
+      - obs
       - langflow_isolated
       - letta_isolated
       - openclaw_isolated
+      # demo-mcp upstream dispatch path (demo opt-in). Harmless when the
+      # demo-mcp profile is not active: the bridge exists, the service does not.
+      - demo_mcp_isolated
 
   # ---------------------------------------------------------------------------
   # Backoffice — Admin control plane (generates first-run credentials)
   # ---------------------------------------------------------------------------
   backoffice:
     dns_search: ["."]
-    image: yashigani/backoffice:${YASHIGANI_VERSION:-2.25.0}
+    image: yashigani/backoffice:${YASHIGANI_VERSION:-2.25.3}
     build:
       context: ..
       dockerfile: docker/Dockerfile.backoffice
@@ -442,6 +461,10 @@ services:
       REDIS_USE_TLS: "true"
       # v2.23.2: OPA serves mTLS; backoffice uses internal_httpx_client (EX-231-01).
       YASHIGANI_OPA_URL: https://policy:8181
+      # Optional-service profiles deployed at install time (deploy-time/IaC).
+      # The Optional Services panel reads this for accurate status — the hardened
+      # backoffice has no Docker access to probe live containers. install.sh writes it.
+      YASHIGANI_ENABLED_PROFILES: ${YASHIGANI_ENABLED_PROFILES:-}
       YASHIGANI_ADMIN_USERNAME: ${YASHIGANI_ADMIN_USERNAME:-admin@yashigani.local}
       YASHIGANI_ADMIN_MIN_TOTAL: "2"
       YASHIGANI_ADMIN_MIN_ACTIVE: "2"
@@ -555,7 +578,9 @@ services:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
       # v2.23.2 #47 — Backup directory mount (read-only — backoffice reads, never writes).
-      - ${INSTALL_DIR:-..}/backups:/data/backups:ro
+      # rw so the admin "Create backup" button can write on-demand DB snapshots
+      # (pg_dump) here; the installer also writes its backups to the same host dir.
+      - ${INSTALL_DIR:-..}/backups:/data/backups:rw
       # LIC-007 / LIC-012 (v2.24.0 DEFERRED): This mount is writable because
       # write_docker_secrets() writes admin credentials + license_key here during
       # bootstrap. After bootstrap, license_key should be chmod 0400. The trivial
@@ -605,10 +630,12 @@ services:
         condition: service_healthy
     # EX-231-10: backoffice joins caddy_internal (Caddy→backoffice:8443) AND
     # data (backoffice→redis, policy, ollama, pgbouncer outbound).
-    # Does NOT join obs or edge.
+    # obs (#21): also joins obs to forward audit events to wazuh-indexer:9200
+    # (obs-plane only). Outbound mesh-mTLS only; no inbound exposure. Does NOT join edge.
     networks:
       - caddy_internal
       - data
+      - obs
 
   # ---------------------------------------------------------------------------
   # Open WebUI — User-facing chat interface (v1.0)
@@ -654,6 +681,16 @@ services:
       OPENAI_API_BASE_URL: http://gateway:8081/v1
       # OPENAI_API_KEY is injected by the entrypoint shim from
       # /run/secrets/yashigani_internal_bearer — do NOT set it here.
+      # F-OWUI-MODELS (v2.25.3): OWUI v0.9.x get_filtered_models() hides any
+      # connection-sourced model that has NO row in OWUI's `model` DB table
+      # from non-admin users ("No DB entry means no access control configured
+      # yet; only admins can see unconfigured models"). All gateway models are
+      # connection-sourced (no DB rows), so the non-admin picker was EMPTY while
+      # admin saw all 8. In this deployment Yashigani's gateway + OPA is the
+      # real per-user/per-model access-control plane; OWUI's redundant per-model
+      # RBAC must be bypassed so every authenticated user sees the full model
+      # list and enforcement happens downstream at the gateway.
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
       # Disable direct Ollama access — everything through gateway
       OLLAMA_BASE_URL: ""
       ENABLE_OLLAMA_API: "false"
@@ -1141,7 +1178,7 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
-      GF_SERVER_ROOT_URL: "https://${YASHIGANI_TLS_DOMAIN}/admin/grafana"
+      GF_SERVER_ROOT_URL: "${YASHIGANI_PUBLIC_URL:-https://${YASHIGANI_TLS_DOMAIN}}/admin/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # retro #83: Grafana ingress mTLS.
       # Grafana serves HTTPS on port 3443. Caddy proxies /admin/grafana/* over
@@ -1246,6 +1283,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      # start_period: a FRESH initdb runs the heavy /docker-entrypoint-initdb.d
+      # scripts (05-enable-ssl.sh, the 17 KB 10-pgbouncer-auth.sh that creates the
+      # auth role + SECURITY DEFINER function + pg_ident/cert wiring, init-agent-dbs)
+      # before postgres accepts connections. Without a start_period the default is
+      # 0s, so after retries×interval (~50s) the container flips to "unhealthy" and
+      # `docker compose up` ABORTS every dependent (backoffice/gateway/pgbouncer) to
+      # "Created" — they never start. On a loaded host that 50s window is routinely
+      # exceeded. During start_period a failing probe keeps the status "starting"
+      # (compose waits) and the first success marks it healthy immediately.
+      start_period: 180s
     # YSG-RISK-008 (v2.23.4): read_only skipped on compose path for postgres.
     # postgres needs writable /var/run/postgresql (unix-domain socket + PID lock file)
     # owned by uid 999 (postgres-in-container) with restrictive perms (e.g. 0755 or 0700).
@@ -2078,6 +2125,57 @@ services:
       - openclaw
 
   # ---------------------------------------------------------------------------
+  # demo-mcp — purpose-built demo MCP upstream (v2.25.3 journey, demo opt-in)
+  # ---------------------------------------------------------------------------
+  # A tiny stdlib-only JSON-RPC 2.0 MCP server (tools/list, tools/call) exposing
+  # echo/add/uppercase/word_count/current_time. It exists so the demo stack has a
+  # GENUINE upstream behind the gateway's MCP broker instead of the
+  # https://mcp.example.com placeholder.
+  #
+  # Demo "rogue server" trigger: when an incoming tool-call argument contains the
+  # digit "9", this upstream returns a credential-exfil prompt-injection payload
+  # (inert canned string) so the gateway's ResponseInspectionPipeline classifies
+  # it non-CLEAN and BLOCKS it (502) before it reaches the calling agent. Benign
+  # calls (no "9") flow through and return a real result.
+  #
+  # This is a DEMO OPT-IN, exactly like YASHIGANI_INSPECT_RESPONSES: production
+  # deployments leave UPSTREAM_MCP_URL pointed at the operator's real MCP server.
+  # To activate the demo upstream set in .env:
+  #   UPSTREAM_MCP_URL=http://demo-mcp:8000
+  #
+  # Network: its own isolated bridge (demo_mcp_isolated), mirroring the per-agent
+  # UA-10 isolation pattern. The gateway joins demo_mcp_isolated for the
+  # broker→upstream dispatch path. demo-mcp cannot reach any other agent.
+  demo-mcp:
+    dns_search: ["."]
+    image: yashigani/demo-mcp:${YASHIGANI_DEMO_MCP_VERSION:-2.25.3}
+    restart: unless-stopped
+    mem_limit: ${YASHIGANI_DEMO_MCP_MEM_LIMIT:-128m}
+    cpus: ${YASHIGANI_DEMO_MCP_CPU_LIMIT:-0.5}
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+    # GET / returns a liveness page (200) — used by the image's own HEALTHCHECK.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/',timeout=2).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    # Non-root (Dockerfile USER 10001); binds non-privileged 8000.
+    cap_drop: [ALL]
+    networks:
+      - demo_mcp_isolated
+    profiles:
+      - demo-mcp
+
+  # ---------------------------------------------------------------------------
   # Wazuh SIEM — Open source security monitoring (opt-in)
   # Full stack: manager (receives events) + indexer (OpenSearch) + dashboard
   # All Yashigani audit events are forwarded via the SIEM sink (audit/sinks.py)
@@ -2187,7 +2285,7 @@ services:
       wazuh-indexer:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5601 || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/admin/wazuh/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -2266,6 +2364,10 @@ volumes:
   # secrets_volume removed — all services now bind-mount ./secrets directly
   redis_data:
     driver: local
+  # Dedicated Ollama model store (#24): grows dynamically with the host disk that
+  # backs the runtime data-root. The full local model set can exceed 80 GB —
+  # install.sh preflights free space (YASHIGANI_OLLAMA_MIN_DISK_GB, default 80).
+  # For a dedicated disk, relocate the Docker/Podman data-root onto it.
   ollama_data:
     driver: local
   prometheus_data:
@@ -2481,6 +2583,13 @@ networks:
     enable_ipv6: false
     internal: true
   openclaw_isolated:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  # demo-mcp upstream bridge (v2.25.3 demo opt-in). Same UA-10 isolation
+  # posture: gateway joins for broker→upstream dispatch; demo-mcp reaches
+  # nothing else. internal:true — no host-external egress.
+  demo_mcp_isolated:
     driver: bridge
     enable_ipv6: false
     internal: true

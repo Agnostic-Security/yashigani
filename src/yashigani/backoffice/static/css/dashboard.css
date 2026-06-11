@@ -2,11 +2,12 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f1f5f9; }
 nav { background: #0f172a; color: #fff; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
-nav h1 { font-size: 1.1rem; font-weight: 700; }
+/* Agnostic Security brand: orange #EC6B2D (wordmark + active nav), blue #1F5F8E (buttons). */
+nav h1 { font-size: 1.1rem; font-weight: 700; color: #EC6B2D; }
 .nav-links { display: flex; gap: 4px; }
 .nav-links button { background: none; border: none; color: #94a3b8; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
-.nav-links button:hover { background: #1e293b; color: #fff; }
-.nav-links button.active { background: #334155; color: #fff; }
+.nav-links button:hover { background: #1e293b; color: #EC6B2D; }
+.nav-links button.active { background: #334155; color: #EC6B2D; }
 .nav-right { display: flex; align-items: center; gap: 12px; font-size: 0.8rem; color: #64748b; }
 .nav-right button { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 0.8rem; }
 .nav-right button:hover { color: #fff; }
@@ -69,6 +70,7 @@ tr:hover { background: #f8fafc; }
 .fi-url { padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 100%; }
 .fi-hibp { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 340px; max-width: 100%; }
 /* width variants */
+.w-80 { width: 80px; }
 .w-120 { width: 120px; }
 .w-140 { width: 140px; }
 .w-150 { width: 150px; }
@@ -83,9 +85,9 @@ tr:hover { background: #f8fafc; }
 /* base action button */
 .btn { border: none; border-radius: 4px; cursor: pointer; }
 /* xs add button (+ Register / + Add) */
-.btn-xs-add { padding: 4px 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-/* sm save/create (green) */
-.btn-sm-save { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+.btn-xs-add { padding: 4px 12px; background: #1F5F8E; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* sm save/create — Agnostic Security blue */
+.btn-sm-save { padding: 6px 16px; background: #1F5F8E; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* sm primary (blue) */
 .btn-sm-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* sm secondary (slate) */
@@ -125,7 +127,7 @@ tr:hover { background: #f8fafc; }
 .onboarding { display: none; margin-bottom: 20px; padding: 16px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; }
 .onboarding-title { margin: 0 0 12px; font-size: 1rem; color: #1e40af; }
 .onboarding-items { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; }
-.onboarding-lbl { color: #64748b; }
+.onboarding-lbl { color: #64748b; cursor: pointer; }
 
 /* ── Credentials / token panels ────────────────────────────── */
 /* hidden until shown once */
@@ -166,6 +168,22 @@ tr:hover { background: #f8fafc; }
 .txt-info { font-size: 0.8rem; color: #64748b; }
 .txt-version { font-size: 0.85rem; color: #64748b; }
 .txt-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+
+/* ── Policies page (moved off inline styles — strict CSP, v2.25.3) ── */
+.is-hidden { display: none; }
+.mt-sm { margin-top: 8px; }
+.mt-xs { margin-top: 6px; }
+.pol-row { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pol-lbl { font-size: 0.82rem; color: #475569; }
+.pol-result { font-size: 0.8rem; }
+.pol-badge { font-size: 0.7rem; margin-left: 8px; }
+.pol-close { float: right; font-size: 0.75rem; }
+.pol-input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 160px; }
+.pol-prompt { width: 100%; min-height: 64px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; }
+.pol-src { width: 100%; min-height: 380px; box-sizing: border-box; background: #0f172a; color: #e2e8f0; padding: 14px; border: 1px solid #1e293b; border-radius: 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem; line-height: 1.45; white-space: pre; }
+.pol-saveas { display: none; gap: 6px; align-items: center; }
+/* JS-injected policy-category badge */
+.badge-template { background: #fef3c7; color: #92400e; }
 .txt-mt8 { margin-top: 8px; }
 .txt-mt16 { margin-top: 16px; }
 /* panel body prose: PKI CA mode */
@@ -246,3 +264,11 @@ tr:hover { background: #f8fafc; }
 .rs-toast-visible { opacity: 1; }
 .rs-toast-ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
 .rs-toast-err { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }
+
+/* ── Layout utilities (CSP-INLINE-STYLE-SPA, #16/#25 panels) ─── */
+.flex-1 { flex: 1; }
+.w-full { width: 100%; }
+/* center-aligned button/control row (pull-model, cloud-override actions) */
+.form-row--mt-center { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+/* wrapping control row with bottom margin (client-policy bindings) */
+.form-row--wrap-mb { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 12px; }

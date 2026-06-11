@@ -108,36 +108,33 @@ def _load_module(filename: str, module_name: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 class TestServicesManageServiceFailure:
-    """V232-CSCAN-01j: service management failed must use safe_error_envelope."""
+    """services.py: optional services are deploy-time/IaC managed. The admin plane
+    must NOT shell out to the host engine (no Docker socket by design) — manage_service
+    is informational-only. (Was a subprocess-failure sweep; services.py was redesigned
+    to deploy-time-managed, so these now assert the no-shell-out contract.)"""
 
-    def test_manage_service_generic_exception_safe_envelope(self):
-        """Generic Exception in manage_service must not leak exc message to client."""
-        from fastapi import HTTPException
-        import subprocess
-
+    def test_manage_service_is_informational_no_shellout(self):
+        """A known service returns deploy_time_managed guidance, never executes anything."""
         mod, state = _load_module("services.py", "services_01j")
-
-        exc_msg = "docker compose: ENOENT /var/run/docker.sock — connection refused"
 
         body = MagicMock()
         body.action = "enable"
         session = MagicMock()
         session.account_id = "admin-001"
 
-        with (
-            patch.object(mod, "_get_compose_cmd", return_value=["docker", "compose"]),
-            patch.object(mod, "_get_compose_file", return_value="/app/docker/docker-compose.yml"),
-            patch("subprocess.run", side_effect=OSError(exc_msg)),
-        ):
-            import asyncio
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(mod.manage_service("openwebui", body, session))
+        import asyncio
+        result = asyncio.run(mod.manage_service("openwebui", body, session))
 
-        assert exc_info.value.status_code == 500
-        _assert_safe_envelope(exc_info.value.detail, exc_msg, "OSError")
+        assert result["status"] == "deploy_time_managed"
+        assert result["service"] == "openwebui"
+        assert result["action"] == "enable"
+        # guidance points the operator at the installer, not a runtime toggle
+        assert "installer" in result["message"].lower()
+        # the module must not even import subprocess (no host-engine shell-out)
+        assert not hasattr(mod, "subprocess")
 
-    def test_manage_service_detail_has_expected_keys(self):
-        """detail must have 'error' and 'request_id', nothing more from exc."""
+    def test_manage_service_unknown_service_404(self):
+        """Unknown service id → 404 with the available list, no leakage."""
         from fastapi import HTTPException
 
         mod, state = _load_module("services.py", "services_01j_b")
@@ -147,19 +144,13 @@ class TestServicesManageServiceFailure:
         session = MagicMock()
         session.account_id = "admin-002"
 
-        with (
-            patch.object(mod, "_get_compose_cmd", return_value=["podman", "compose"]),
-            patch.object(mod, "_get_compose_file", return_value="/app/docker/docker-compose.yml"),
-            patch("subprocess.run", side_effect=RuntimeError("podman socket /run/user/1000/podman/podman.sock")),
-        ):
-            import asyncio
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(mod.manage_service("langflow", body, session))
+        import asyncio
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(mod.manage_service("does-not-exist", body, session))
 
-        detail = exc_info.value.detail
-        assert "podman.sock" not in str(detail)
-        assert "error" in detail
-        assert "request_id" in detail
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.detail["error"] == "unknown_service"
+        assert "available" in exc_info.value.detail
 
 
 # ---------------------------------------------------------------------------

@@ -99,7 +99,7 @@ services:
   wazuh-dashboard:
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
     healthcheck:
-      test: ["CMD-SHELL", "curl -sk http://localhost:5601 -o /dev/null -w '%{http_code}' | grep -qE '^(200|302|401)$'"]
+      test: ["CMD-SHELL", "curl -sk http://localhost:5601/admin/wazuh/ -o /dev/null -w '%{http_code}' | grep -qE '^(200|302|401)$'"]
       interval: 30s
       timeout: 10s
       retries: 5

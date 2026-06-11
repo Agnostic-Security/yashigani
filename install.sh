@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="2.25.2"
+YASHIGANI_VERSION="2.25.3.1"
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 YSG_INSTALL_DIR="${YSG_INSTALL_DIR:-$HOME/.yashigani}"
@@ -392,6 +392,14 @@ parse_args() {
         ;;
       --domain)
         DOMAIN="${2:?'--domain requires a value'}"
+        # LAURA-V2253-001: reject anything but an RFC-1123 hostname charset so a
+        # value with newlines can't inject extra lines into docker/.env (which is
+        # later written via these flags and fed to every container). Operator-
+        # supplied, but cheap to harden and closes the class for all DOMAIN writes.
+        if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+          log_error "--domain must be a valid hostname (letters, digits, dot, hyphen), got: ${DOMAIN}"
+          exit 1
+        fi
         shift 2
         ;;
       --tls-mode)
@@ -1095,6 +1103,36 @@ print_platform_summary() {
     printf "  %-22s %s\n" "GPU:"        "none detected"
   fi
   printf "\n"
+
+  # --- Optional services — DEPLOY-TIME choice (CLAUDE.md / Optional Services panel) ---
+  # Listed so the operator sees exactly what is (and is NOT) being installed, what
+  # each does, and that the choice is deploy-time — missing one means re-running
+  # the installer. Avoids the "I expected service X" surprise post-install.
+  local _ow=" " _wz=" " _ca=" " _lf=" " _le=" " _oc=" "
+  [[ "${INSTALL_OPENWEBUI:-false}" == true ]] && _ow="x"
+  [[ "${INSTALL_WAZUH:-false}" == true ]] && _wz="x"
+  [[ "${INSTALL_INTERNAL_CA:-false}" == true ]] && _ca="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx langflow && _lf="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx letta && _le="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw && _oc="x"
+  # Non-interactive --agent-bundles is parsed into AGENT_BUNDLES but only pushed
+  # into COMPOSE_PROFILES at step 8 (after this summary), so read AGENT_BUNDLES too
+  # — otherwise the summary shows agents unticked even though they WILL install.
+  local _ab=",${AGENT_BUNDLES//[[:space:]]/},"
+  [[ "$_ab" == *",all,"* ]] && { _lf="x"; _le="x"; _oc="x"; }
+  [[ "$_ab" == *",langflow,"* ]] && _lf="x"
+  [[ "$_ab" == *",letta,"* ]] && _le="x"
+  [[ "$_ab" == *",openclaw,"* ]] && _oc="x"
+  printf "  Optional services (deploy-time choice):\n"
+  printf "    [%s] %-12s %s\n" "$_ow" "Open WebUI"  "browser chat UI for end users"
+  printf "    [%s] %-12s %s\n" "$_wz" "Wazuh SIEM"  "security monitoring — SIEM (manager+indexer+dashboard)"
+  printf "    [%s] %-12s %s\n" "$_ca" "Internal CA" "Smallstep CA for service-to-service mTLS"
+  printf "    [%s] %-12s %s\n" "$_lf" "Langflow"    "visual multi-agent workflow builder"
+  printf "    [%s] %-12s %s\n" "$_le" "Letta"       "stateful agent with persistent memory"
+  printf "    [%s] %-12s %s\n" "$_oc" "OpenClaw"    "connected agent (web search + messaging)"
+  printf "    %s\n" "[x] = will be installed. This is a DEPLOY-TIME choice: to add or remove a"
+  printf "    %s\n" "service later you re-run the installer (an update/redeploy preserving data)."
+  printf "\n"
   _print_model_recommendations
 }
 
@@ -1415,6 +1453,34 @@ check_installer_preflight() {
         fi
       fi
     fi
+  fi
+
+  # --- Check 1d (#24): Ollama model-store free-space preflight ---------------
+  # The Ollama model store (compose: the dedicated ollama_data volume → /root/.ollama;
+  # K8s: a 100Gi PVC) grows with each model pull. The full local model set can
+  # exceed 80 GB; a "no space left on device" mid-pull leaves models half-written
+  # and inference broken. Warn (non-fatal) when the filesystem backing the
+  # container-volume store has less than YASHIGANI_OLLAMA_MIN_DISK_GB (default 80)
+  # GB free, so the operator can relocate the runtime data-root to a larger disk
+  # (or mount one) before pulling models.
+  local _min_gb="${YASHIGANI_OLLAMA_MIN_DISK_GB:-80}"
+  local _vol_root=""
+  if [[ "${YSG_RUNTIME:-}" == "docker" ]] && command -v docker >/dev/null 2>&1; then
+    _vol_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo "")"
+  elif command -v podman >/dev/null 2>&1; then
+    _vol_root="$(podman info -f '{{.Store.GraphRoot}}' 2>/dev/null || echo "")"
+  fi
+  [[ -z "$_vol_root" || ! -d "$_vol_root" ]] && _vol_root="/var/lib/docker"
+  [[ ! -d "$_vol_root" ]] && _vol_root="/"
+  local _avail_gb
+  _avail_gb="$(df -PBG "$_vol_root" 2>/dev/null | awk 'NR==2{gsub(/[A-Za-z]/,"",$4); print $4}')"
+  if [[ -n "$_avail_gb" ]] && awk "BEGIN { exit !($_avail_gb < $_min_gb) }"; then
+    printf "\n"
+    printf "${C_YELLOW}[WARN] Only %s GB free on %s (container-volume store).${C_RESET}\n" "$_avail_gb" "$_vol_root"
+    printf "       The dedicated Ollama model store needs >= %s GB for the local model set;\n" "$_min_gb"
+    printf "       a 'no space left on device' mid-pull breaks inference. Relocate the runtime\n"
+    printf "       data-root to a larger disk (or mount one) before continuing.\n"
+    printf "       Override the threshold with YASHIGANI_OLLAMA_MIN_DISK_GB.\n\n"
   fi
 
   # --- Check 1c: rootless Podman linger pre-flight ---------------------------
@@ -4879,6 +4945,48 @@ if 'kibanaserver' in d: d['kibanaserver']['hash']=kh
 yaml.safe_dump(d,open(p,'w'),default_flow_style=False,sort_keys=False)
 PYEOF
 
+  # 5b. (#21) least-privilege cert-identity for audit forwarding. The agnostic
+  #     audit pipeline (gateway + backoffice) forwards events to this indexer over
+  #     mesh mTLS, presenting each service's OWN internal-CA leaf (CN=gateway /
+  #     CN=backoffice). Map those CNs to a WRITE-ONLY role on yashigani-audit*
+  #     — never the wazuh admin. Three edits, applied by securityadmin (security-init):
+  #       - config.yml: enable the clientcert_auth_domain (cert CN → username).
+  #       - roles.yml: add yashigani_audit_writer (bulk + write/create on yashigani-audit* only).
+  #       - roles_mapping.yml: map backoffice + gateway → yashigani_audit_writer.
+  #     clientauth_mode is OPTIONAL (default), challenge:false — basic-auth clients
+  #     (dashboard/filebeat/securityadmin) are unaffected.
+  python3 - "${wp}/opensearch-security" <<'PYEOF'
+import sys,yaml,os
+sec=sys.argv[1]
+cfgp=os.path.join(sec,"config.yml")
+cfg=yaml.safe_load(open(cfgp))
+authc=cfg["config"]["dynamic"]["authc"]
+dom=authc.get("clientcert_auth_domain")
+if dom is None:
+    dom={"description":"Authenticate via SSL client certificates","transport_enabled":False,
+         "order":1,"http_authenticator":{"type":"clientcert",
+         "config":{"username_attribute":"cn"},"challenge":False},
+         "authentication_backend":{"type":"noop"}}
+    authc["clientcert_auth_domain"]=dom
+dom["http_enabled"]=True
+yaml.safe_dump(cfg,open(cfgp,"w"),default_flow_style=False,sort_keys=False)
+
+rp=os.path.join(sec,"roles.yml")
+roles=yaml.safe_load(open(rp))
+roles["yashigani_audit_writer"]={"reserved":False,
+  "cluster_permissions":["cluster_composite_ops"],
+  "index_permissions":[{"index_patterns":["yashigani-audit*"],
+    "allowed_actions":["indices:admin/create","indices:admin/mapping/put",
+      "indices:admin/mapping/auto_put","indices:data/write/index","indices:data/write/bulk*"]}]}
+yaml.safe_dump(roles,open(rp,"w"),default_flow_style=False,sort_keys=False)
+
+rmp=os.path.join(sec,"roles_mapping.yml")
+rm=yaml.safe_load(open(rmp))
+rm["yashigani_audit_writer"]={"reserved":False,"users":["backoffice","gateway"]}
+yaml.safe_dump(rm,open(rmp,"w"),default_flow_style=False,sort_keys=False)
+print("[wazuh-mtls] clientcert auth + yashigani_audit_writer (write-only) mapped to backoffice,gateway")
+PYEOF
+
   # 6. dashboard config: real indexer password + internal-CA bundle + full verification
   {
     printf 'server.host: "0.0.0.0"\nserver.port: 5601\nserver.ssl.enabled: false\n'
@@ -4889,6 +4997,11 @@ PYEOF
     printf 'opensearch.password: "%s"\n' "$(cat "${secrets}/wazuh_indexer_password")"
     printf 'opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]\n'
     printf 'opensearch_security.multitenancy.enabled: false\n'
+    # Served behind Caddy at /admin/wazuh/* — basePath makes the dashboard
+    # generate links/redirects under that prefix instead of escaping to /app/login
+    # (which falls through to the data-plane verifier). rewriteBasePath=true means
+    # OSD expects the prefix on inbound requests, so Caddy uses `handle` (no strip).
+    printf 'server.basePath: "/admin/wazuh"\nserver.rewriteBasePath: true\n'
   } > "${wp}/opensearch_dashboards.yml"
 
   # 7. ownership: indexer/dashboard/sidecar run as uid 1000; CA bundle world-readable (manager uid 999)
@@ -4966,6 +5079,103 @@ _provision_audit_signing_key() {
   chown 1001:1001 "$keyf" 2>/dev/null || true
   chown 1001:1001 "$asd"  2>/dev/null || true
   log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+}
+
+# =============================================================================
+# _ensure_agent_databases — idempotent agent-DB provisioning (INSTALL-AGENTDB-001)
+# =============================================================================
+# Postgres docker-entrypoint-initdb.d scripts (incl. 11-agent-dbs.sh, which
+# creates the `letta` database + pgvector) run ONLY on a FRESH/EMPTY PGDATA.
+# An upgrade — or any install onto a pre-existing postgres_data volume that was
+# initialized before the agent-DB init script existed (or before a given agent
+# bundle was enabled) — never runs that script, so the agent DB is missing and
+# the agent (e.g. letta) crash-loops on "database \"letta\" does not exist".
+#
+# This step closes that gap: on EVERY compose_up (fresh AND upgrade), after
+# postgres is accepting connections, re-execute the SAME init script that the
+# entrypoint would have run — by exec'ing the copy already bind-mounted into the
+# running postgres container at /docker-entrypoint-initdb.d/11-agent-dbs.sh.
+#
+# Single source of truth: the set of agent DBs + owners + extensions lives ONLY
+# in docker/postgres/init-agent-dbs.sh. We do NOT duplicate the DB list here.
+# The script is already idempotent — `CREATE DATABASE ... WHERE NOT EXISTS ...
+# \gexec` (CREATE DATABASE has no IF NOT EXISTS) + `CREATE EXTENSION IF NOT
+# EXISTS vector` — so re-running it on a populated volume is a no-op when the DB
+# already exists and provisions it when absent. Safe to run repeatedly.
+#
+# Runtime-agnostic: uses "${COMPOSE_CMD[@]}" ... exec -T postgres, the same
+# invocation pattern as _upgrade_postgres_ssl, which works under Docker and
+# Podman (rootful + rootless). No host-side psql, no ad-hoc one-liner, no
+# hard-coded container name.
+#
+# Fail behaviour: agent bundles are OPT-IN and OPTIONAL; a provisioning failure
+# must not block the core stack. We log the psql output and warn (non-fatal) so
+# the gateway/backoffice still come up — the agent will simply remain unreachable
+# until the DB is provisioned, which is strictly better than failing the whole
+# install. The convergence gate for core services runs separately.
+# -----------------------------------------------------------------------------
+_ensure_agent_databases() {
+  # Only meaningful when at least one agent bundle that needs a postgres DB is
+  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/openwebui/wazuh
+  # carry no dedicated agent DB). We gate on COMPOSE_PROFILES containing `letta`
+  # rather than hard-coding the DB name — if a future bundle adds a DB to the init
+  # script, add its profile here and the init script remains the single source for
+  # the actual DB/owner/extension definitions.
+  local _need_agent_db="false"
+  local _p
+  for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+    case "$_p" in
+      letta) _need_agent_db="true" ;;
+    esac
+  done
+  if [[ "$_need_agent_db" != "true" ]]; then
+    return 0
+  fi
+
+  local _compose_file="${1:-${WORK_DIR}/docker/docker-compose.yml}"
+  local _initdb_script="/docker-entrypoint-initdb.d/11-agent-dbs.sh"
+
+  log_info "Ensuring agent databases exist (idempotent; INSTALL-AGENTDB-001)..."
+
+  # Wait for postgres to accept connections over the local socket (trust auth,
+  # the path the init script itself uses). Transport errors only — retry with
+  # capped backoff; a non-transport psql error is surfaced, not retried-to-pass.
+  local _ready="false" _i
+  for _i in $(seq 1 30); do
+    if "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+         pg_isready -U yashigani_admin -d yashigani >/dev/null 2>&1; then
+      _ready="true"; break
+    fi
+    sleep 2
+  done
+  if [[ "$_ready" != "true" ]]; then
+    log_warn "  postgres did not become ready in 60s — skipping agent-DB provisioning (agents may be unreachable until next run)"
+    return 0
+  fi
+
+  # Confirm the init script is mounted in the running container. If the volume
+  # mount is missing (older compose file), fall back to a warn — we do NOT inline
+  # a duplicate DB list (single-source-of-truth rule).
+  if ! "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+         test -r "$_initdb_script" 2>/dev/null; then
+    log_warn "  ${_initdb_script} not mounted in postgres container — cannot provision agent DBs"
+    log_warn "  (ensure docker/postgres/init-agent-dbs.sh is mounted; see docker-compose.yml)"
+    return 0
+  fi
+
+  # Re-run the EXACT init script the entrypoint runs on a fresh volume. It reads
+  # POSTGRES_USER / POSTGRES_DB from the container env (already set) and is
+  # idempotent. Capture output so failures are visible, never silent.
+  local _out _rc=0
+  _out="$("${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+            bash "$_initdb_script" 2>&1)" || _rc=$?
+  if [[ "$_rc" -eq 0 ]]; then
+    log_success "Agent databases ensured (init-agent-dbs.sh ran clean)"
+  else
+    log_warn "Agent-DB provisioning returned non-zero (rc=${_rc}) — agents may be unreachable:"
+    printf '%s\n' "$_out" | sed 's/^/    /' >&2
+  fi
+  return 0
 }
 
 compose_up() {
@@ -5121,6 +5331,44 @@ compose_up() {
       fi
     fi
 
+    # Public base URL (scheme://domain[:port]) — single source for the external
+    # URLs that reverse-proxied sub-apps must self-reference (Grafana root_url,
+    # Wazuh basePath, …). Port suffix omitted when standard 443. Without the
+    # published port these apps 301-redirect to :443 ("site can't be reached"
+    # on a non-standard port). update-or-append into .env.
+    local _pub_port_suffix=""
+    if [[ -n "${YASHIGANI_HTTPS_PORT:-}" && "${YASHIGANI_HTTPS_PORT}" != "443" ]]; then
+      _pub_port_suffix=":${YASHIGANI_HTTPS_PORT}"
+    fi
+    local _pub_url="https://${YASHIGANI_TLS_DOMAIN:-${DOMAIN:-localhost}}${_pub_port_suffix}"
+    if grep -q "^YASHIGANI_PUBLIC_URL=" "$env_file" 2>/dev/null; then
+      local _tmp_env2; _tmp_env2="$(mktemp)"
+      sed "s|^YASHIGANI_PUBLIC_URL=.*|YASHIGANI_PUBLIC_URL=${_pub_url}|" "$env_file" > "$_tmp_env2"
+      mv "$_tmp_env2" "$env_file"
+    else
+      echo "YASHIGANI_PUBLIC_URL=${_pub_url}" >> "$env_file"
+    fi
+    export YASHIGANI_PUBLIC_URL="$_pub_url"
+
+    # Declared set of enabled optional-service profiles, for the backoffice
+    # Optional Services panel (observational; the hardened container can't probe
+    # Docker). Assemble from agent bundles + the per-flag opt-ins.
+    local _enabled_profiles=()
+    [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _enabled_profiles+=("${COMPOSE_PROFILES[@]}")
+    [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _enabled_profiles+=("openwebui")
+    [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _enabled_profiles+=("wazuh")
+    [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _enabled_profiles+=("internal-ca")
+    # de-dupe, comma-join
+    local _ep_csv; _ep_csv="$(printf '%s\n' "${_enabled_profiles[@]+"${_enabled_profiles[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
+    if grep -q "^YASHIGANI_ENABLED_PROFILES=" "$env_file" 2>/dev/null; then
+      local _tmp_env3; _tmp_env3="$(mktemp)"
+      sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv}|" "$env_file" > "$_tmp_env3"
+      mv "$_tmp_env3" "$env_file"
+    else
+      echo "YASHIGANI_ENABLED_PROFILES=${_ep_csv}" >> "$env_file"
+    fi
+    export YASHIGANI_ENABLED_PROFILES="$_ep_csv"
+
     # 3. Create Docker-compatible directories for promtail (best-effort).
     # On CI runners (GitHub Actions / Podman) /var/lib/docker does not exist and
     # is owned by root, so a plain mkdir fails with EPERM. The installer body
@@ -5200,6 +5448,43 @@ compose_up() {
       log_success "Images built with Podman"
     fi
   fi
+
+  # --- Runtime-agnostic .env writes (MUST run for docker AND podman) ----------
+  # BUGFIX (2026-06-08): YASHIGANI_PUBLIC_URL and YASHIGANI_ENABLED_PROFILES were
+  # only written inside the `if podman` branch above, so on Docker they were never
+  # set. Result: the backoffice Optional-Services panel read an empty
+  # YASHIGANI_ENABLED_PROFILES and showed EVERY deployed optional service + agent
+  # (openwebui, wazuh, langflow, letta, openclaw) as "Not deployed"; external
+  # sub-apps (Grafana/Wazuh) had no public-URL to self-reference. Recomputed here
+  # (the in-branch `local`s never execute on docker) and written unconditionally.
+  local _env_file_rt="${WORK_DIR}/docker/.env"
+  local _pub_suffix_rt=""
+  [[ -n "${YASHIGANI_HTTPS_PORT:-}" && "${YASHIGANI_HTTPS_PORT}" != "443" ]] && _pub_suffix_rt=":${YASHIGANI_HTTPS_PORT}"
+  local _pub_url_rt="https://${YASHIGANI_TLS_DOMAIN:-${DOMAIN:-localhost}}${_pub_suffix_rt}"
+  if grep -q "^YASHIGANI_PUBLIC_URL=" "$_env_file_rt" 2>/dev/null; then
+    local _t1_rt; _t1_rt="$(mktemp)"
+    sed "s|^YASHIGANI_PUBLIC_URL=.*|YASHIGANI_PUBLIC_URL=${_pub_url_rt}|" "$_env_file_rt" > "$_t1_rt"
+    mv "$_t1_rt" "$_env_file_rt"
+  else
+    echo "YASHIGANI_PUBLIC_URL=${_pub_url_rt}" >> "$_env_file_rt"
+  fi
+  export YASHIGANI_PUBLIC_URL="$_pub_url_rt"
+
+  local _ep_rt=()
+  [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _ep_rt+=("${COMPOSE_PROFILES[@]}")
+  [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _ep_rt+=("openwebui")
+  [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _ep_rt+=("wazuh")
+  [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _ep_rt+=("internal-ca")
+  local _ep_csv_rt; _ep_csv_rt="$(printf '%s\n' "${_ep_rt[@]+"${_ep_rt[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
+  if grep -q "^YASHIGANI_ENABLED_PROFILES=" "$_env_file_rt" 2>/dev/null; then
+    local _t2_rt; _t2_rt="$(mktemp)"
+    sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}|" "$_env_file_rt" > "$_t2_rt"
+    mv "$_t2_rt" "$_env_file_rt"
+  else
+    echo "YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}" >> "$_env_file_rt"
+  fi
+  export YASHIGANI_ENABLED_PROFILES="$_ep_csv_rt"
+  log_info "Enabled optional-service profiles: ${_ep_csv_rt:-<none>}"
 
   # Ensure all required directories and secret files exist (handles upgrades,
   # re-runs, and failed previous installs). Docker Desktop for Mac (VirtioFS)
@@ -5747,6 +6032,19 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # Timeout: 60 seconds (polling every 2s).
   # ---------------------------------------------------------------------------
   _verify_gateway_healthz
+
+  # ---------------------------------------------------------------------------
+  # INSTALL-AGENTDB-001: idempotently ensure opt-in agent databases exist.
+  #
+  # The postgres initdb agent-DB script (creates `letta` + pgvector) runs ONLY
+  # on a fresh PGDATA. On an upgrade — or an install onto a postgres_data volume
+  # that predates the agent-DB init script / the bundle being enabled — the DB is
+  # never created and the agent crash-loops. This re-runs the SAME (idempotent)
+  # init script inside the running postgres container so the DB is provisioned on
+  # every install/upgrade. Non-fatal: agent bundles are optional, so a failure
+  # here must not block the core stack.
+  # ---------------------------------------------------------------------------
+  _ensure_agent_databases "$compose_file"
 }
 
 # =============================================================================
@@ -6544,9 +6842,26 @@ _ctx.load_cert_chain(
     os.path.join(secrets, "backoffice_client.key"),
 )
 
-user = read_secret("admin1_username")
-pw = read_secret("admin1_password")
-totp_secret = read_secret("admin1_totp_secret")
+# ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): authenticate as the NON-INTERACTIVE
+# install-path service account (svc_admin_*), NOT admin1. admin1_password goes
+# stale the moment the human completes the forced first-login rotation (the
+# rotation control writes the new hash to Postgres only — never back to disk),
+# which broke every post-rotation re-run of this flow (notably the Redis-
+# durability agent re-registration after a redis recreate wipes the registry).
+# The service account is seeded with force_password_change=false /
+# force_totp_provision=false (backoffice/app.py _bootstrap_admin_accounts), so
+# its on-disk credential is never rotated by a human and re-runs always work.
+# Fall back to admin1_* only if svc_admin_* is absent (upgrade from a stack
+# installed before this fix, where no service account was seeded) — that legacy
+# path still works pre-rotation and matches prior behaviour.
+user = read_secret("svc_admin_username")
+pw = read_secret("svc_admin_password")
+totp_secret = read_secret("svc_admin_totp_secret")
+if not all([user, pw, totp_secret]):
+    user = read_secret("admin1_username")
+    pw = read_secret("admin1_password")
+    totp_secret = read_secret("admin1_totp_secret")
+    print("WARNING:svc_admin_secrets_absent_falling_back_to_admin1", file=sys.stderr)
 caddy_hmac = read_secret("caddy_internal_hmac")
 if not all([user, pw, totp_secret, caddy_hmac]):
     print("ERROR:missing_secrets", file=sys.stderr)
@@ -7836,6 +8151,78 @@ generate_secrets() {
     # backup tools, process env) and is intentionally avoided.
     # END YSG-P3-MCP-SIGKEY-UPGRADE
 
+    # BEGIN ISSUE-AGENT-REG-STALE-PW-UPGRADE-BACKFILL
+    # Install-path service account (svc_admin_*) on the UPGRADE path.
+    #
+    # The fresh-install svc_admin_* block lives below the `return 0` that ends
+    # this upgrade short-circuit, so on an already-rotated stack (postgres+redis
+    # present) the three svc_admin_* secrets were NEVER created. That is exactly
+    # the stack where a redis-wipe forces agent re-registration: with svc_admin_*
+    # absent, backoffice _bootstrap_service_account early-returns (no service
+    # account) and register_agent_bundles() falls back to the STALE admin1
+    # password (post forced-first-login rotation) → ISSUE-AGENT-REG-STALE-PW.
+    #
+    # Fix mirrors the caddy_internal_hmac / yashigani_internal_bearer upgrade
+    # backfills above: generate each secret only if its file is absent/empty
+    # (idempotent — never rotates an existing svc credential). The static
+    # username `install_svc` matches the fresh-install value exactly so a
+    # previously-seeded service account keeps the same identity.
+    #
+    # No .env sync: backoffice reads svc_admin_* from /run/secrets (file-tier),
+    # same as the fresh case.
+    #
+    # UID-1001 OWNERSHIP MUST BE APPLIED HERE — NOT deferred to
+    # _pki_chown_client_keys(). On the DOMINANT Docker-rootful upgrade (certs
+    # current, no SAN drift / not expired), bootstrap_internal_pki takes the
+    # no-rotation branch (~L10855) which EXPLICITLY SKIPS _pki_chown_client_keys
+    # under the upgrade no-touch rule (GATE5-BUG-01); it only re-chowns in the
+    # podman-rootless exception. So although svc_admin_* ARE listed in the
+    # _uid1001_secrets set, that set never runs on this path — the backfilled
+    # files would stay root:root 0600. Backoffice (UID 1001, cap_drop:[ALL], no
+    # DAC_OVERRIDE) then EACCESes on open() → _bootstrap_service_account
+    # early-returns → register_agent_bundles() falls back to the stale admin1
+    # password = ISSUE-AGENT-REG-STALE-PW, reproduced on the no-rotation path.
+    # Mirror the pgbouncer_authenticator_password backfill above (L8114): chown
+    # to the consumer UID at creation time so fresh and upgrade converge to the
+    # same owner:mode (UID 1001, 0600 — matching _uid1001_secrets + fresh block).
+    #
+    # This credential is NON-INTERACTIVE (seeded force_password_change=false,
+    # force_totp_provision=false) — never subject to human rotation. The human
+    # admin's forced first-login rotation control is UNCHANGED.
+    local _svc_user_file_up="${secrets_dir}/svc_admin_username"
+    local _svc_pw_file_up="${secrets_dir}/svc_admin_password"
+    local _svc_totp_file_up="${secrets_dir}/svc_admin_totp_secret"
+
+    if [[ ! -s "$_svc_user_file_up" ]]; then
+      printf "%s" "install_svc" > "$_svc_user_file_up"
+      chmod 600 "$_svc_user_file_up"
+      _do_chown "1001" "$_svc_user_file_up" "svc_admin_username" "" "${secrets_dir}" || true
+      log_info "Generated svc_admin_username → ${_svc_user_file_up} (mode 0600 uid 1001, upgrade path)"
+    else
+      log_info "svc_admin_username already present — preserving (upgrade path)"
+    fi
+    if [[ ! -s "$_svc_pw_file_up" ]]; then
+      local _svc_pw_up
+      _svc_pw_up="$(_gen_password)"
+      printf "%s" "$_svc_pw_up" > "$_svc_pw_file_up"
+      chmod 600 "$_svc_pw_file_up"
+      _do_chown "1001" "$_svc_pw_file_up" "svc_admin_password" "" "${secrets_dir}" || true
+      log_info "Generated svc_admin_password → ${_svc_pw_file_up} (mode 0600 uid 1001, upgrade path)"
+    else
+      log_info "svc_admin_password already present — preserving (upgrade path)"
+    fi
+    if [[ ! -s "$_svc_totp_file_up" ]]; then
+      local _svc_totp_up
+      _svc_totp_up="$(_gen_totp_secret)"
+      printf "%s" "$_svc_totp_up" > "$_svc_totp_file_up"
+      chmod 600 "$_svc_totp_file_up"
+      _do_chown "1001" "$_svc_totp_file_up" "svc_admin_totp_secret" "" "${secrets_dir}" || true
+      log_info "Generated svc_admin_totp_secret → ${_svc_totp_file_up} (mode 0600 uid 1001, upgrade path)"
+    else
+      log_info "svc_admin_totp_secret already present — preserving (upgrade path)"
+    fi
+    # END ISSUE-AGENT-REG-STALE-PW-UPGRADE-BACKFILL
+
     return 0
   fi
 
@@ -7897,6 +8284,29 @@ generate_secrets() {
   printf "%s" "$GEN_ADMIN2_TOTP_SECRET" > "${secrets_dir}/admin2_totp_secret"
   chmod 600 "${secrets_dir}/admin2_totp_secret"
   GEN_ADMIN2_TOTP_URI="$(_gen_totp_uri "$GEN_ADMIN2_USERNAME" "$GEN_ADMIN2_TOTP_SECRET")"
+
+  # --- Install-path service account (non-interactive bootstrap operations) ---
+  #
+  # ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): register_agent_bundles() used
+  # admin1_password, which goes stale after the human's forced first-login
+  # rotation (the rotation control writes the new hash to Postgres only — never
+  # back to disk). Post-rotation re-runs (e.g. Redis-durability re-registration
+  # after a redis recreate wipes the agent registry) then broke on a dead
+  # password. This service account is NON-INTERACTIVE: seeded by the backoffice
+  # bootstrap with force_password_change=false + force_totp_provision=false (see
+  # backoffice/app.py _bootstrap_admin_accounts), so its on-disk credential is
+  # never subject to human rotation and re-runs always authenticate. The human
+  # admin's forced first-login rotation is UNCHANGED. This credential is never
+  # printed for or used by a human login.
+  GEN_SVC_ADMIN_USERNAME="install_svc"
+  printf "%s" "$GEN_SVC_ADMIN_USERNAME" > "${secrets_dir}/svc_admin_username"
+  chmod 600 "${secrets_dir}/svc_admin_username"
+  GEN_SVC_ADMIN_PASSWORD="$(_gen_password)"
+  printf "%s" "$GEN_SVC_ADMIN_PASSWORD" > "${secrets_dir}/svc_admin_password"
+  chmod 600 "${secrets_dir}/svc_admin_password"
+  GEN_SVC_ADMIN_TOTP_SECRET="$(_gen_totp_secret)"
+  printf "%s" "$GEN_SVC_ADMIN_TOTP_SECRET" > "${secrets_dir}/svc_admin_totp_secret"
+  chmod 600 "${secrets_dir}/svc_admin_totp_secret"
 
   # --- PostgreSQL ---
   GEN_POSTGRES_PASSWORD="$(_gen_password)"
@@ -9884,6 +10294,11 @@ _pki_chown_client_keys() {
     admin2_password
     admin2_username
     admin2_totp_secret
+    # Install-path service account — read by backoffice (UID 1001) at bootstrap
+    # seed AND by register_agent_bundles() inside the backoffice container.
+    svc_admin_username
+    svc_admin_password
+    svc_admin_totp_secret
     grafana_admin_password
     caddy_internal_hmac
     openclaw_gateway_token
@@ -12717,6 +13132,31 @@ main() {
       esac
     fi
 
+    # Step 8c-siem (#21): when Wazuh is selected, point the agnostic audit SIEM
+    # pipeline at the bundled indexer via deployment config (.env), loaded at
+    # startup by AuditLogWriter.siem_targets_from_env(). Identity = each service's
+    # OWN internal-mesh leaf cert (mesh_mtls → pki.client_ssl_context()): no
+    # password, NEVER the wazuh admin credential. wazuh-indexer is added to the
+    # SSRF allowlist (its name resolves to a private docker IP). If Wazuh is NOT
+    # selected, both stay unset → forward to none.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "wazuh"; then
+      local _siem_env_file="${WORK_DIR}/docker/.env"
+      local _siem_targets_json='[{"name":"wazuh-bundled","target_type":"elastic_opensearch","url":"https://wazuh-indexer:9200/_bulk","mesh_mtls":true}]'
+      _siem_set_env() {  # set-or-replace KEY=VALUE in docker/.env (value may contain |)
+        local _k="$1" _v="$2"
+        if grep -q "^${_k}=" "$_siem_env_file" 2>/dev/null; then
+          local _t; _t="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+          awk -v k="$_k" -v v="$_v" 'BEGIN{FS=OFS="="} $1==k{print k"="v;next} {print}' "$_siem_env_file" > "$_t"
+          mv "$_t" "$_siem_env_file"
+        else
+          printf '%s=%s\n' "$_k" "$_v" >> "$_siem_env_file"
+        fi
+      }
+      _siem_set_env "YASHIGANI_SIEM_TARGETS" "$_siem_targets_json"
+      _siem_set_env "YASHIGANI_SIEM_HOSTNAMES" "wazuh-indexer"
+      log_success "Audit SIEM forwarding pointed at bundled Wazuh indexer (mesh-mTLS leaf identity)"
+    fi
+
     # Step 8d: Write agent-bundle token placeholders NOW — while the installer
     # still owns docker/secrets/ (before _prepare_secrets_dir_for_pki chowns it
     # to UID 1001 for the PKI issuer container). INSTALLER-BUG-AGENT-TOKENS:
@@ -12891,27 +13331,13 @@ main() {
     # Step 11b: Register agent bundles (after backoffice is healthy)
     register_agent_bundles
 
-    # Step 11c: Auto-configure SIEM sink when Wazuh is installed
-    if [[ "$INSTALL_WAZUH" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; then
-      log_info "Configuring audit SIEM sink for Wazuh..."
-      # FIX-3: use --cacert to verify the local PKI root; never --insecure/-k.
-      # This call carries the admin session cookie + Wazuh API password —
-      # disabling TLS verification here allows a loopback MITM to harvest
-      # both (Laura F2 / HIGH — admin cookie replay + wazuh credential).
-      local _bo_url="https://localhost:${YASHIGANI_HTTPS_PORT:-443}"
-      local _siem_config='{"backend":"wazuh","wazuh_url":"https://wazuh-manager:55000","wazuh_username":"wazuh-wui","wazuh_password":"'"${GEN_WAZUH_API_PASSWORD:-}"'","enabled":true}'
-      if curl --silent --fail \
-              --cacert "${WORK_DIR}/docker/secrets/ca_root.crt" \
-              -X PUT "${_bo_url}/admin/alerts/sinks" \
-              -H "Content-Type: application/json" \
-              -d "$_siem_config" \
-              -b "$(cat "${WORK_DIR}/docker/secrets/admin1_session_cookie" 2>/dev/null || echo '')" \
-              >/dev/null 2>&1; then
-        log_success "Wazuh SIEM sink auto-configured"
-      else
-        log_warn "Wazuh SIEM sink auto-configuration failed — configure manually via admin UI"
-      fi
-    fi
+    # Step 11c (#21): audit SIEM forwarding is configured PRE-deploy at Step
+    # 8c-siem by writing YASHIGANI_SIEM_TARGETS + YASHIGANI_SIEM_HOSTNAMES into
+    # docker/.env, which AuditLogWriter loads at startup. The previous post-deploy
+    # auto-config here PUT to a non-existent endpoint (/admin/alerts/sinks) with a
+    # mismatched schema and a session cookie that couldn't satisfy the step-up
+    # gate — it silently failed every install, so nothing was ever forwarded.
+    # Removed; nothing to do post-deploy.
 
     # Step 12: Health check
     run_health_check

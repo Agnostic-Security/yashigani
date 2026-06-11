@@ -17,6 +17,7 @@
                 <button data-action="showPage" data-param="accounts">Accounts</button>
                 <button data-action="showPage" data-param="budgets">Budgets</button>
                 <button data-action="showPage" data-param="models">Models</button>
+                <button data-action="showPage" data-param="policies">Policies</button>
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
@@ -28,7 +29,7 @@
             </div>
         </div>
         <div class="nav-right">
-            <span>v2.2</span>
+            <span>v{{ yashigani_version }}</span>
             <button data-action="logout">Logout</button>
         </div>
     </nav>
@@ -40,10 +41,10 @@
             <div id="onboarding-checklist" class="onboarding">
                 <h3 class="onboarding-title">Getting Started</h3>
                 <div class="onboarding-items">
-                    <label id="ob-password" class="onboarding-lbl"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" class="onboarding-lbl"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" class="onboarding-lbl"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" class="onboarding-lbl"><input type="checkbox" disabled> Set up alert webhooks</label>
+                    <label id="ob-password" class="onboarding-lbl" data-action="showPage" data-param="accounts"><input type="checkbox" disabled> Change default password</label>
+                    <label id="ob-agent" class="onboarding-lbl" data-action="showPage" data-param="agents"><input type="checkbox" disabled> Register your first agent</label>
+                    <label id="ob-budget" class="onboarding-lbl" data-action="showPage" data-param="budgets"><input type="checkbox" disabled> Configure budget allocation</label>
+                    <label id="ob-alerts" class="onboarding-lbl" data-action="showPage" data-param="alerts"><input type="checkbox" disabled> Set up alert webhooks</label>
                 </div>
                 <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
             </div>
@@ -297,6 +298,12 @@
                     <thead><tr><th>Model</th><th>Size</th><th>Modified</th></tr></thead>
                     <tbody id="models-tbody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
                 </table>
+                <!-- #25: pull a model into the local Ollama store -->
+                <div class="form-row--mt-center">
+                    <input id="pull-model-name" type="text" placeholder="e.g. gemma3:4b" class="fi w-180">
+                    <button data-action="pullModel" class="btn-sm-save">Pull model</button>
+                    <span id="pull-model-status" class="txt-note"></span>
+                </div>
             </div>
             <div class="panel">
                 <div class="panel-header panel-header-flex">
@@ -337,6 +344,32 @@
                     <tbody id="allocs-tbody"><tr><td colspan="4" class="empty">No allocations configured</td></tr></tbody>
                 </table>
             </div>
+            <!-- #25: dual-admin cloud-LLM risk-accepted override (break-glass) -->
+            <div class="panel">
+                <div class="panel-header">Cloud-LLM Override (dual-admin, risk-accepted)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Emergency/contractual override: allow a <b>specific cloud LLM</b> to serve
+                        even CONFIDENTIAL/RESTRICTED traffic the optimization engine would normally keep on-prem —
+                        for a customer who has signed a cloud-provider agreement and accepts the P1–P9 risk. Requires
+                        <b>two admins</b> (a second, different admin must approve within 5 min) and a written
+                        justification. Auto-expires. Does NOT affect auth, RBAC, or threat inspection.</p>
+                    <div id="cloud-override-status" class="form-result">Loading…</div>
+                    <div class="form-row form-row--mt">
+                        <div><label class="lbl">Cloud provider</label><br><input id="co-provider" type="text" placeholder="openai" class="fi w-120"></div>
+                        <div><label class="lbl">Cloud model</label><br><input id="co-model" type="text" placeholder="gpt-4o" class="fi w-160"></div>
+                        <div><label class="lbl">TTL (hours, 1–72)</label><br><input id="co-ttl" type="number" min="1" max="72" value="4" class="fi w-80"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="flex-1"><label class="lbl">Justification (ticket #, contract #, CEO email — required)</label><br>
+                            <input id="co-justification" type="text" placeholder="e.g. CONTRACT-ACME-2026 / approved by CEO 2026-06-07" class="fi w-full"></div>
+                    </div>
+                    <div class="form-row--gap12">
+                        <button data-action="cloudOverridePropose" class="btn-sm-save">Propose (admin 1)</button>
+                        <button data-action="cloudOverrideApprove" class="btn-sm-save">Approve (admin 2)</button>
+                        <button data-action="cloudOverrideRevoke" class="btn-sm-danger">Revoke</button>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- Sensitivity Page -->
@@ -348,8 +381,8 @@
                     <span class="badge badge-green">Active (always on)</span>
                 </div>
                 <div class="card">
-                    <div class="card-label">Layer 2: FastText</div>
-                    <span class="badge badge-green" id="fasttext-status">Active</span>
+                    <div class="card-label">Layer 2: sklearn</div>
+                    <span class="badge badge-green" id="classifier-status">Active</span>
                 </div>
                 <div class="card">
                     <div class="card-label">Layer 3: Ollama</div>
@@ -412,6 +445,92 @@
             </div>
         </div>
 
+        <!-- Policies Page — read-only view of the Rego modules loaded in OPA -->
+        <div class="page" id="page-policies">
+            <h2>Policies (OPA)</h2>
+            <div class="panel">
+                <div class="panel-header">Active policy modules</div>
+                <div class="panel-body">
+                    <p class="txt-note">Rego policy modules currently loaded in the OPA decision service. These
+                        are deployed declaratively (policy bundle / install-time load) and are read-only here —
+                        editing happens in the policy source, not the admin UI. "Example" modules are the loaded
+                        governance examples (GDPR, EU AI Act, HIPAA, PCI, data residency, …); "Core" are the
+                        gateway's own policies.</p>
+                    <div id="policies-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">Client-policy bindings (#16 — enforcement)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Bind a saved client policy (clients/&lt;name&gt;) to a subject scope and a
+                        direction. Bound policies are enforced by the gateway on every matching request
+                        (ingress) and/or response (egress), in addition to the core gates — they can only add
+                        denials, never remove one. Wildcard = leave Subject ID empty (all subjects of that kind).</p>
+                    <div class="form-row--wrap-mb">
+                        <label class="lbl">Policy name<br>
+                            <input id="bind-policy-name" type="text" placeholder="e.g. secrets_egress"
+                                   class="fi-sm"></label>
+                        <label class="lbl">Subject kind<br>
+                            <select id="bind-scope-kind" class="fi-sm">
+                                <option value="human">human</option>
+                                <option value="service">service</option>
+                                <option value="api_client">api_client</option>
+                                <option value="mcp_server">mcp_server</option>
+                                <option value="agent">agent</option>
+                            </select></label>
+                        <label class="lbl">Subject ID (blank = all)<br>
+                            <input id="bind-scope-id" type="text" placeholder="(wildcard)"
+                                   class="fi-sm"></label>
+                        <label class="lbl">Direction<br>
+                            <select id="bind-direction" class="fi-sm">
+                                <option value="ingress">ingress</option>
+                                <option value="egress">egress</option>
+                                <option value="both">both</option>
+                            </select></label>
+                        <button data-action="bindPolicy" class="btn-sm-primary">Bind</button>
+                    </div>
+                    <div id="bindings-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">Create a policy with AI</div>
+                <div class="panel-body">
+                    <p class="txt-note">Describe the policy in plain English; the internal LLM drafts the Rego. Review &amp; edit
+                        below, then save (which OPA‑validates it). e.g. <em>"allow openclaw to read and reply to all my emails but not delete them"</em>.</p>
+                    <textarea id="policy-gen-prompt" spellcheck="false" placeholder="Describe the policy…" class="pol-prompt"></textarea>
+                    <div class="pol-row">
+                        <label class="pol-lbl">Name <code>clients.</code></label>
+                        <input id="policy-gen-name" type="text" placeholder="email_guard" class="pol-input">
+                        <button class="btn btn-sm btn-sm-save" data-action="policyGenerate">Generate</button>
+                        <span id="policy-gen-result" class="pol-result"></span>
+                    </div>
+                </div>
+            </div>
+            <div class="panel is-hidden" id="policy-view-panel">
+                <div class="panel-header">
+                    <span id="policy-view-title">Policy source</span>
+                    <span id="policy-view-badge" class="pol-badge"></span>
+                    <button class="btn btn-sm pol-close" data-action="policyClose">Close</button>
+                </div>
+                <div class="panel-body">
+                    <textarea id="policy-view-src" readonly spellcheck="false" class="pol-src"></textarea>
+                    <div id="policy-edit-controls" class="pol-row">
+                        <button class="btn btn-sm" data-action="policyEditCopy">Create editable copy</button>
+                        <span id="policy-saveas" class="pol-saveas">
+                            <label class="pol-lbl">Save as <code>clients.</code></label>
+                            <input id="policy-copy-name" type="text" placeholder="my_org_gdpr" pattern="[a-z][a-z0-9_]*"
+                                   class="pol-input">
+                            <button class="btn btn-sm btn-sm-save" data-action="policySaveCopy">Save</button>
+                        </span>
+                        <span id="policy-save-result" class="pol-result"></span>
+                    </div>
+                    <p class="txt-note mt-sm">Examples are <strong>immutable templates</strong>. "Create editable copy"
+                        lets you edit and save under a new name (<code>clients.&lt;name&gt;</code>) — validated by OPA and loaded immediately.
+                        To persist across a full redeploy, add it to your policy bundle. (Activate + ingress/egress enforcement is the next phase.)</p>
+                </div>
+            </div>
+        </div>
+
         <!-- Monitoring Page -->
         <div class="page" id="page-monitoring">
             <h2>Monitoring</h2>
@@ -438,18 +557,18 @@
                     <table>
                         <thead><tr><th>Dashboard</th><th>Description</th><th>Link</th></tr></thead>
                         <tbody>
-                            <tr><td>System Health</td><td>CPU, memory, uptime, container status</td><td><a href="/admin/grafana/d/system_health" target="_blank">Open</a></td></tr>
-                            <tr><td>Security Overview</td><td>Prompt injection, credential exfil, OPA denials</td><td><a href="/admin/grafana/d/security_overview" target="_blank">Open</a></td></tr>
-                            <tr><td>Budget Usage</td><td>Token consumption per identity and provider</td><td><a href="/admin/grafana/d/budget_usage" target="_blank">Open</a></td></tr>
-                            <tr><td>Agent Activity</td><td>Request patterns, latency, error rates per agent</td><td><a href="/admin/grafana/d/agent_activity" target="_blank">Open</a></td></tr>
-                            <tr><td>Rate Limit Status</td><td>Rate limit violations and near-limit warnings</td><td><a href="/admin/grafana/d/rate_limit_status" target="_blank">Open</a></td></tr>
-                            <tr><td>Optimization Engine</td><td>Routing decisions, model selection, cost tracking</td><td><a href="/admin/grafana/d/optimization_engine" target="_blank">Open</a></td></tr>
-                            <tr><td>Pool Manager</td><td>Container lifecycle, per-identity isolation</td><td><a href="/admin/grafana/d/pool_manager" target="_blank">Open</a></td></tr>
-                            <tr><td>Logs (Loki)</td><td>Aggregated application and service logs</td><td><a href="/admin/grafana/d/logs" target="_blank">Open</a></td></tr>
-                            <tr><td>Tracing (Jaeger)</td><td>Distributed request traces end-to-end</td><td><a href="/admin/grafana/d/tracing" target="_blank">Open</a></td></tr>
-                            <tr><td>Anomaly Detection</td><td>Behavioral anomaly metrics and alerts</td><td><a href="/admin/grafana/d/anomaly" target="_blank">Open</a></td></tr>
-                            <tr><td>Inspection Backend</td><td>Classification backend health and latency</td><td><a href="/admin/grafana/d/inspection_backend" target="_blank">Open</a></td></tr>
-                            <tr><td>CI/CD</td><td>Pipeline metrics and deployment tracking</td><td><a href="/admin/grafana/d/cicd" target="_blank">Open</a></td></tr>
+                            <tr><td>System Health</td><td>CPU, memory, uptime, container status</td><td><a href="/admin/grafana/d/yashigani-system-health" target="_blank">Open</a></td></tr>
+                            <tr><td>Security Overview</td><td>Prompt injection, credential exfil, OPA denials</td><td><a href="/admin/grafana/d/yashigani-security" target="_blank">Open</a></td></tr>
+                            <tr><td>Budget Usage</td><td>Token consumption per identity and provider</td><td><a href="/admin/grafana/d/yashigani-budget" target="_blank">Open</a></td></tr>
+                            <tr><td>Agent Activity</td><td>Request patterns, latency, error rates per agent</td><td><a href="/admin/grafana/d/yashigani-agent-activity" target="_blank">Open</a></td></tr>
+                            <tr><td>Rate Limit Status</td><td>Rate limit violations and near-limit warnings</td><td><a href="/admin/grafana/d/yashigani-ratelimit" target="_blank">Open</a></td></tr>
+                            <tr><td>Optimization Engine</td><td>Routing decisions, model selection, cost tracking</td><td><a href="/admin/grafana/d/yashigani-oe" target="_blank">Open</a></td></tr>
+                            <tr><td>Pool Manager</td><td>Container lifecycle, per-identity isolation</td><td><a href="/admin/grafana/d/yashigani-pool" target="_blank">Open</a></td></tr>
+                            <tr><td>Logs (Loki)</td><td>Aggregated application and service logs</td><td><a href="/admin/grafana/d/yashigani-logs" target="_blank">Open</a></td></tr>
+                            <tr><td>Tracing (Jaeger)</td><td>Distributed request traces end-to-end</td><td><a href="/admin/grafana/d/yashigani-tracing" target="_blank">Open</a></td></tr>
+                            <tr><td>Anomaly Detection</td><td>Behavioral anomaly metrics and alerts</td><td><a href="/admin/grafana/d/yashigani-anomaly" target="_blank">Open</a></td></tr>
+                            <tr><td>Inspection Backend</td><td>Classification backend health and latency</td><td><a href="/admin/grafana/d/yashigani-inspection-backend" target="_blank">Open</a></td></tr>
+                            <tr><td>CI/CD</td><td>Pipeline metrics and deployment tracking</td><td><a href="/admin/grafana/d/yashigani-cicd" target="_blank">Open</a></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -465,8 +584,12 @@
                     <p class="txt-note">Backups created by the installer and update scripts. Verify integrity by re-hashing against the recorded checksum manifest.</p>
                     <div id="backup-status-container"><span class="loading">Loading...</span></div>
                     <div id="backup-actions" class="backup-actions">
+                        <button id="btn-create-backup" data-action="createBackup" class="btn-sm-save">Create backup</button>
                         <button id="btn-verify-latest" data-action="verifyBackup" class="btn-verify" disabled>Verify latest</button>
                     </div>
+                    <p class="txt-note mt-xs">"Create backup" takes an on-demand database snapshot (accounts, RBAC,
+                        agents, policies, budgets, audit). Full-system restore/recovery is an installer operation.</p>
+                    <div id="backup-create-result" class="backup-verify-result"></div>
                     <div id="backup-verify-result" class="backup-verify-result"></div>
                 </div>
             </div>
@@ -500,7 +623,7 @@
                         <table class="pki-chain-table">
                             <tbody id="pki-chain-table-body"></tbody>
                         </table>
-                        <button onclick="hidePkiChain()" class="btn-pki-close">
+                        <button data-action="pkiClose" class="btn-pki-close">
                             Close
                         </button>
                     </div>
@@ -604,7 +727,7 @@
             <div class="panel">
                 <div class="panel-header">System Info</div>
                 <div class="panel-body">
-                    <p class="txt-version">Version: 2.1 | Runtime: Podman/Docker | TLS: Self-signed</p>
+                    <p class="txt-version">Version: {{ yashigani_version }} | Runtime: Podman/Docker | TLS: Self-signed</p>
                 </div>
             </div>
             <div class="panel">
@@ -723,10 +846,10 @@
                    class="stepup-input">
             <p id="stepup-error" class="stepup-error"></p>
             <div class="stepup-buttons">
-                <button id="stepup-submit" onclick="submitStepUp()" class="btn-stepup-submit">
+                <button id="stepup-submit" data-action="stepUpSubmit" class="btn-stepup-submit">
                     Verify
                 </button>
-                <button onclick="cancelStepUp()" class="btn-stepup-cancel">
+                <button data-action="stepUpCancel" class="btn-stepup-cancel">
                     Cancel
                 </button>
             </div>

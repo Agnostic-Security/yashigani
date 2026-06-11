@@ -14,7 +14,7 @@ from typing import Callable, Literal, cast
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
-from yashigani.audit.writer import AuditLogWriter
+from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
 from yashigani.chs.handle import CredentialHandleService
 from yashigani.chs.resource_monitor import ResourceMonitor
 from yashigani.inspection.classifier import PromptInjectionClassifier
@@ -54,6 +54,7 @@ def _build_app(mesh_mode: bool = False):
     audit_writer = AuditLogWriter(
         config=audit_config,
         masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
     )
 
     # Resource monitor (cgroup v2 for dynamic TTL)
@@ -85,11 +86,11 @@ def _build_app(mesh_mode: bool = False):
         logger.info("Response inspection pipeline enabled")
 
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
-    fasttext_backend = None  # legacy name retained; wired into SensitivityClassifier below
+    classifier_backend = None
     try:
         from yashigani.inspection.backends.sklearn_backend import SklearnBackend
-        fasttext_backend = SklearnBackend()
-        logger.info("sklearn sensitivity backend loaded: %s", fasttext_backend.model_path)
+        classifier_backend = SklearnBackend()
+        logger.info("sklearn sensitivity backend loaded: %s", classifier_backend.model_path)
     except Exception as exc:
         logger.warning("sklearn backend unavailable (%s) — LLM-only inspection", exc)
 
@@ -293,9 +294,9 @@ def _build_app(mesh_mode: bool = False):
     try:
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
         sensitivity_classifier = SensitivityClassifier(
-            enable_sklearn=fasttext_backend is not None,
+            enable_sklearn=classifier_backend is not None,
             enable_ollama=True,
-            sklearn_backend=fasttext_backend,
+            sklearn_backend=classifier_backend,
             ollama_url=ollama_url,
             ollama_model=model,
         )
@@ -336,6 +337,33 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("Token counter unavailable (%s)", exc)
 
+    # ── #25: dual-admin cloud-LLM override — engine reads the ACTIVE grant live ──
+    # (Redis db/0, same namespace home as break-glass). 5s in-process cache bounds
+    # Redis load to <=1 read / 5s instead of per-request. None when unavailable.
+    cloud_override_getter = None
+    try:
+        import redis as _redis_co_mod
+        from yashigani.optimization.cloud_override import CloudLlmOverrideManager
+        _redis_co = _redis_co_mod.from_url(_gw_redis_url(0), decode_responses=False)
+        _redis_co.ping()
+        _co_mgr = CloudLlmOverrideManager(_redis_co, audit_writer)
+        _co_cache = {"t": 0.0, "v": None}
+
+        def cloud_override_getter():  # noqa: F811 — assigned only on success
+            import time as _t
+            now = _t.monotonic()
+            if now - _co_cache["t"] > 5.0:
+                try:
+                    _co_cache["v"] = _co_mgr.get_active()
+                except Exception:
+                    _co_cache["v"] = None
+                _co_cache["t"] = now
+            return _co_cache["v"]
+        logger.info("Cloud-LLM override getter wired (engine honours dual-admin grants)")
+    except Exception as exc:
+        logger.warning("Cloud-override getter unavailable (%s) — engine override disabled", exc)
+        cloud_override_getter = None
+
     # ── v1.0: Optimization Engine ─────────────────────────────────────────
     optimization_engine = None
     try:
@@ -344,6 +372,7 @@ def _build_app(mesh_mode: bool = False):
             default_model=model,
             default_cloud_provider=os.getenv("YASHIGANI_DEFAULT_CLOUD_PROVIDER", "anthropic"),
             default_cloud_model=os.getenv("YASHIGANI_DEFAULT_CLOUD_MODEL", "claude-sonnet-4-6"),
+            cloud_override_getter=cloud_override_getter,
         )
     except Exception as exc:
         logger.warning("Optimization Engine unavailable (%s)", exc)
@@ -694,7 +723,7 @@ def _build_app(mesh_mode: bool = False):
         jwt_inspector=jwt_inspector,
         endpoint_rate_limiter=endpoint_rate_limiter,
         response_cache=response_cache,
-        fasttext_backend=fasttext_backend,
+        classifier_backend=classifier_backend,
         inference_logger=inference_logger,
         anomaly_detector=anomaly_detector,
         response_inspection_pipeline=response_pipeline,

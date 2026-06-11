@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -63,44 +62,22 @@ _OPTIONAL_SERVICES = {
 }
 
 
-def _get_compose_cmd() -> list[str]:
-    """Detect the compose command (podman compose or docker compose)."""
-    for cmd in [["podman", "compose"], ["docker", "compose"]]:
-        try:
-            subprocess.run(cmd + ["version"], capture_output=True, timeout=5)
-            return cmd
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    return ["docker", "compose"]
+def _enabled_profiles() -> set[str]:
+    """Optional-service profiles deployed at install time.
 
-
-def _get_compose_file() -> str:
-    """Find the docker-compose.yml path."""
-    # Check common locations
-    for path in [
-        Path("/app/docker/docker-compose.yml"),  # inside container
-        Path(os.getenv("YASHIGANI_COMPOSE_FILE", "")),
-        Path.home() / "yashigani" / "docker" / "docker-compose.yml",
-    ]:
-        if path.exists():
-            return str(path)
-    return "docker/docker-compose.yml"
+    The hardened backoffice container has NO Docker socket/binary/compose file, so
+    it cannot shell out to `compose ps` (that always failed -> every service showed
+    "stopped"). Optional services are a deploy-time/IaC choice; install.sh records
+    the enabled set in YASHIGANI_ENABLED_PROFILES (comma/space separated), which we
+    read here. This is the source of truth, topology-independent, no Docker access.
+    """
+    raw = os.getenv("YASHIGANI_ENABLED_PROFILES", "")
+    return {p.strip() for p in raw.replace(",", " ").split() if p.strip()}
 
 
 def _is_service_running(profile: str) -> bool:
-    """Check if a profiled service is currently running."""
-    try:
-        cmd = _get_compose_cmd()
-        compose_file = _get_compose_file()
-        result = subprocess.run(
-            cmd + ["-f", compose_file, "--profile", profile, "ps", "--format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return bool(result.stdout.strip())
-    except Exception:
-        return False
+    """A service is 'running' iff its profile was enabled at deploy time."""
+    return profile in _enabled_profiles()
 
 
 @router.get("")
@@ -128,69 +105,33 @@ class ServiceAction(BaseModel):
 @router.post("/{service_id}")
 async def manage_service(service_id: str, body: ServiceAction, session: StepUpAdminSession):
     """
-    Enable or disable an optional service.
+    Optional services are a DEPLOY-TIME / IaC choice — not toggled at runtime.
 
-    ACS gap #95 (BFLA): upgraded from AdminSession to StepUpAdminSession.
-    Starting or stopping system services is a high-value mutating action —
-    ASVS V6.8.4 requires step-up TOTP re-verification within 5 minutes.
-    A step-up token can be obtained from POST /auth/stepup.
+    The admin plane cannot (and must not) drive the host container engine: the
+    backoffice container has no Docker socket/binary by design, and a runtime
+    "enable" would be config drift plus a half-provisioned service (Wazuh/internal-CA
+    need install.sh secret+cert+OPA provisioning, not a bare `compose up`). So this
+    endpoint is informational: it explains how to change the set (re-run the
+    installer with the profile flag). See opa/services design notes + CLAUDE.md.
+    Runtime toggling, if ever required, is a future operator/reconciler feature.
     """
     if service_id not in _OPTIONAL_SERVICES:
         raise HTTPException(
             status_code=404, detail={"error": "unknown_service", "available": list(_OPTIONAL_SERVICES.keys())}
         )
-
     svc = _OPTIONAL_SERVICES[service_id]
-    profile = svc["profile"]
-    compose_file = _get_compose_file()
-    cmd = _get_compose_cmd()
-
-    try:
-        if body.action == "enable":
-            _log.info("Admin %s enabling service: %s (profile=%s)", session.account_id, service_id, profile)
-            result = subprocess.run(
-                cmd + ["-f", compose_file, "--profile", profile, "up", "-d"],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode != 0:
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error": "service_start_failed",
-                        "stderr": result.stderr[-500:] if result.stderr else "",
-                    },
-                )
-            return {
-                "status": "ok",
-                "service": service_id,
-                "action": "enabled",
-                "message": f"{svc['name']} is starting. It may take a minute to become healthy.",
-            }
-
-        elif body.action == "disable":
-            _log.info("Admin %s disabling service: %s (profile=%s)", session.account_id, service_id, profile)
-            result = subprocess.run(
-                cmd + ["-f", compose_file, "--profile", profile, "stop"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            return {
-                "status": "ok",
-                "service": service_id,
-                "action": "disabled",
-                "message": f"{svc['name']} stopped. Data volumes preserved.",
-            }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail={"error": "timeout", "message": "Service operation timed out. Check container logs."},
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        payload, _ = safe_error_envelope(exc, public_message="service management failed", status=500)
-        raise HTTPException(status_code=500, detail=payload)
+    _log.info(
+        "Admin %s requested %s for service %s — deploy-time managed, no runtime action",
+        session.account_id, body.action, service_id,
+    )
+    return {
+        "status": "deploy_time_managed",
+        "service": service_id,
+        "action": body.action,
+        "message": (
+            f"{svc['name']} is selected at install time, not from the console. To "
+            f"{body.action} it, re-run the installer with the '--{svc['profile']}' "
+            f"profile (this is part of an update/redeploy and preserves data volumes)."
+        ),
+        "profile": svc["profile"],
+    }

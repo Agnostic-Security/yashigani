@@ -12,14 +12,21 @@ function showPage(name, triggerEl) {
     document.querySelectorAll('.page').forEach(function(p) { p.className = 'page'; });
     document.getElementById('page-' + name).className = 'page active';
     document.querySelectorAll('.nav-links button').forEach(function(b) { b.className = ''; });
-    if (triggerEl) triggerEl.className = 'active';
+    // Highlight the matching nav button by data-param — works whether triggered
+    // from the nav itself, the onboarding checklist, or programmatically (so a
+    // non-button trigger like an onboarding <label> doesn't lose its own class).
+    var navBtn = (triggerEl && triggerEl.tagName === 'BUTTON' && triggerEl.closest && triggerEl.closest('.nav-links'))
+        ? triggerEl
+        : document.querySelector('.nav-links button[data-param="' + name + '"]');
+    if (navBtn) navBtn.className = 'active';
     // Load data for the page
     if (name === 'dashboard') loadDashboard();
     if (name === 'agents') loadAgents();
     if (name === 'accounts') loadAccounts();
     if (name === 'budgets') loadBudgets();
-    if (name === 'models') loadModels();
+    if (name === 'models') { loadModels(); loadCloudOverride(); }
     if (name === 'sensitivity') loadSensitivity();
+    if (name === 'policies') loadPolicies();
     if (name === 'settings') loadSettings();
     if (name === 'backup') loadBackup();
     // PKI panel — loadPkiStatus is defined in pki.js (loaded defer).
@@ -28,6 +35,212 @@ function showPage(name, triggerEl) {
     if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
+    if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
+}
+
+// ---------------------------------------------------------------------------
+// Policies (OPA) — read-only viewer of the Rego modules loaded in OPA.
+// Example modules are IMMUTABLE templates; editable client copies + activation
+// + ingress/egress enforcement are phased features (opa_policy_management_design).
+// ---------------------------------------------------------------------------
+async function loadPolicies() {
+    var container = document.getElementById('policies-container');
+    if (!container) return;
+    container.innerHTML = '<span class="loading">Loading…</span>';
+    var data = await api('/admin/policies');
+    if (!data || !data.policies) {
+        container.innerHTML = '<p class="error">Could not load policies from the policy service.</p>';
+        return;
+    }
+    var catLabel = { example: 'Templates (immutable examples)', core: 'Core gateway policies', test: 'Test policies' };
+    var catBadge = {
+        example: '<span class="badge" style="background:#fef3c7;color:#92400e;">template</span>',
+        core: '<span class="badge badge-green">core</span>',
+        test: '<span class="badge" style="background:#f1f5f9;color:#64748b;">test</span>'
+    };
+    var groups = {};
+    data.policies.forEach(function(p) { (groups[p.category] = groups[p.category] || []).push(p); });
+    var html = '';
+    ['example', 'core', 'test'].forEach(function(cat) {
+        var list = groups[cat];
+        if (!list || !list.length) return;
+        html += '<h3 style="margin:14px 0 6px;font-size:0.95rem;">' + escapeHtml(catLabel[cat] || cat) + '</h3>';
+        html += '<table><thead><tr><th>Name</th><th>Package</th><th></th><th></th></tr></thead><tbody>';
+        list.forEach(function(p) {
+            html += '<tr>'
+                + '<td style="font-family:monospace;">' + escapeHtml(p.name) + '</td>'
+                + '<td style="font-size:0.8rem;color:#475569;">' + escapeHtml(p.package || '—') + '</td>'
+                + '<td>' + (catBadge[p.category] || '') + '</td>'
+                + '<td><button class="btn btn-sm" data-action="policyView" data-id="' + escapeHtml(p.id) + '" data-cat="' + escapeHtml(p.category) + '">View</button></td>'
+                + '</tr>';
+        });
+        html += '</tbody></table>';
+    });
+    container.innerHTML = html + '<p class="txt-note" style="margin-top:10px;">' +
+        escapeHtml(String(data.count)) + ' policy modules loaded in OPA (' + escapeHtml(data.opa_url || '') + ').</p>';
+}
+
+async function viewPolicy(id, cat) {
+    var panel = document.getElementById('policy-view-panel');
+    var ta = document.getElementById('policy-view-src');
+    var title = document.getElementById('policy-view-title');
+    var badge = document.getElementById('policy-view-badge');
+    if (!panel || !ta) return;
+    title.textContent = id;
+    badge.innerHTML = (cat === 'example')
+        ? '<span class="badge badge-template">immutable template</span>'
+        : (cat === 'client' ? '<span class="badge badge-green">client copy</span>' : '');
+    // Reset to view (read-only) state each time.
+    ta.readOnly = true;
+    var sa = document.getElementById('policy-saveas'); if (sa) sa.style.display = 'none';
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.style.display = '';
+    var res = document.getElementById('policy-save-result'); if (res) res.innerHTML = '';
+    var nm = document.getElementById('policy-copy-name');
+    if (nm) nm.value = (id.split('/').pop().replace(/\.rego$/, '') + '_copy').toLowerCase().replace(/[^a-z0-9_]/g, '');
+    ta.value = 'Loading…';
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // {policy_id:path} — keep the slashes, encode each segment
+    var encoded = id.split('/').map(encodeURIComponent).join('/');
+    var data = await api('/admin/policies/' + encoded);
+    ta.value = (data && typeof data.raw === 'string' && data.raw) ? data.raw : 'Could not load policy source.';
+}
+
+// Turn the read-only viewer into an editable "copy" (templates are immutable —
+// we edit a copy and save it under a new clients.<name>).
+function policyEditCopy() {
+    var ta = document.getElementById('policy-view-src');
+    var sa = document.getElementById('policy-saveas');
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]');
+    if (ta) { ta.readOnly = false; ta.focus(); }
+    if (sa) sa.style.display = 'inline-flex';
+    if (ec) ec.style.display = 'none';
+}
+
+async function policySaveCopy() {
+    var ta = document.getElementById('policy-view-src');
+    var nm = document.getElementById('policy-copy-name');
+    var res = document.getElementById('policy-save-result');
+    if (!ta || !nm || !res) return;
+    var name = (nm.value || '').trim().toLowerCase();
+    if (!/^[a-z][a-z0-9_]{1,40}$/.test(name)) {
+        res.innerHTML = '<span class="badge badge-red">Error</span> name: lowercase, start with a letter (a-z0-9_)';
+        return;
+    }
+    res.innerHTML = '<span class="loading">Saving…</span>';
+    var resp = await apiMutate('/admin/policies/save', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, rego: ta.value })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> request cancelled'; return; }
+    var data = await resp.json().catch(function() { return {}; });
+    if (resp.ok && data.status === 'ok') {
+        res.innerHTML = '<span class="badge badge-green">Saved</span> clients.' + escapeHtml(name) + ' — loaded into OPA';
+        loadPolicies();
+    } else {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(data, resp.status));
+    }
+}
+
+function closePolicyView() {
+    var panel = document.getElementById('policy-view-panel');
+    if (panel) panel.style.display = 'none';
+}
+
+// Open the editor pre-loaded with an AI draft, in edit mode, ready to save.
+function viewPolicyDraft(name, rego) {
+    var panel = document.getElementById('policy-view-panel');
+    var ta = document.getElementById('policy-view-src');
+    var title = document.getElementById('policy-view-title');
+    var badge = document.getElementById('policy-view-badge');
+    var nm = document.getElementById('policy-copy-name');
+    if (!panel || !ta) return;
+    title.textContent = 'AI draft: clients.' + name;
+    badge.innerHTML = '<span class="badge" style="background:#ede9fe;color:#6d28d9;">AI draft — review before saving</span>';
+    ta.value = rego;
+    ta.readOnly = false;
+    if (nm) nm.value = name;
+    var sa = document.getElementById('policy-saveas'); if (sa) sa.style.display = 'inline-flex';
+    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.style.display = 'none';
+    var sr = document.getElementById('policy-save-result'); if (sr) sr.innerHTML = '';
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function generatePolicy() {
+    var promptEl = document.getElementById('policy-gen-prompt');
+    var nmEl = document.getElementById('policy-gen-name');
+    var res = document.getElementById('policy-gen-result');
+    if (!promptEl || !res) return;
+    var p = (promptEl.value || '').trim();
+    if (p.length < 4) { res.innerHTML = '<span class="badge badge-red">Error</span> describe the policy first'; return; }
+    var name = ((nmEl && nmEl.value) || 'generated').trim().toLowerCase().replace(/[^a-z0-9_]/g, '') || 'generated';
+    res.innerHTML = '<span class="loading">Asking the internal LLM… (can take ~20–60s)</span>';
+    var resp = await apiMutate('/admin/policies/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: p, name: name })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> request failed'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok' && d.rego) {
+        res.innerHTML = '<span class="badge badge-green">Drafted</span> review &amp; save below (model: ' + escapeHtml(d.model || '') + ')';
+        viewPolicyDraft(d.name || name, d.rego);
+    } else {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+    }
+}
+
+// ── #16 client-policy bindings (parity with the /admin/policies/bind* API) ──
+async function loadBindings() {
+    var c = document.getElementById('bindings-container');
+    if (!c) return;
+    c.innerHTML = '<span class="loading">Loading…</span>';
+    var data = await api('/admin/policies/bindings');
+    if (!data || !data.bindings) { c.innerHTML = '<p class="txt-note">No bindings (or failed to load).</p>'; return; }
+    if (data.bindings.length === 0) { c.innerHTML = '<p class="txt-note">No client-policy bindings yet.</p>'; return; }
+    var html = '<table><thead><tr><th>Policy</th><th>Scope</th><th>Direction</th><th>Enabled</th><th></th></tr></thead><tbody>';
+    data.bindings.forEach(function(b) {
+        var scope = escapeHtml(b.scope_kind) + ':' + escapeHtml(b.scope_id || '*');
+        html += '<tr>'
+            + '<td style="font-family:monospace;">' + escapeHtml(b.policy_name) + '</td>'
+            + '<td style="font-family:monospace;">' + scope + '</td>'
+            + '<td>' + escapeHtml(b.direction) + '</td>'
+            + '<td>' + (b.enabled ? 'yes' : 'no') + '</td>'
+            + '<td><button class="btn btn-sm" data-action="unbindBinding" data-binding-id="' + escapeHtml(b.id) + '" style="background:#dc2626;color:#fff;">Remove</button></td>'
+            + '</tr>';
+    });
+    c.innerHTML = html + '</tbody></table>';
+}
+
+async function bindPolicy() {
+    var name = (document.getElementById('bind-policy-name').value || '').trim();
+    var kind = document.getElementById('bind-scope-kind').value;
+    var sid = (document.getElementById('bind-scope-id').value || '').trim();
+    var dir = document.getElementById('bind-direction').value;
+    if (!name) { alert('Enter a client policy name (clients/<name>).'); return; }
+    var resp = await apiMutate('/admin/policies/bind', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ policy_name: name, scope_kind: kind, scope_id: sid, direction: dir })
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok') {
+        document.getElementById('bind-policy-name').value = '';
+        document.getElementById('bind-scope-id').value = '';
+        loadBindings();
+    } else {
+        alert('Bind failed: ' + errMsg(d, resp.status));
+    }
+}
+
+async function unbindBinding(id) {
+    if (!id || !confirm('Remove this client-policy binding?')) return;
+    var resp = await apiMutate('/admin/policies/bind/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!resp) return;
+    if (resp.ok) { loadBindings(); return; }
+    var d = await resp.json().catch(function() { return {}; });
+    alert('Remove failed: ' + errMsg(d, resp.status));
 }
 
 async function api(path) {
@@ -85,6 +298,20 @@ async function apiMutate(path, options) {
         console.error('apiMutate failed: ' + path + ' — ' + err.message);
         return null;
     }
+}
+
+// errMsg() extracts a human-readable string from a parsed JSON error body.
+// FastAPI `detail` may be a string, an object ({error,message}), or a Pydantic
+// validation list — never render an object directly or it shows "[object Object]".
+function errMsg(err, status) {
+    var d = err && err.detail;
+    if (d === undefined || d === null) return 'HTTP ' + status;
+    if (typeof d === 'string') return d;
+    if (Array.isArray(d)) {
+        return d.map(function(x) { return (x && (x.msg || x.message)) || JSON.stringify(x); }).join('; ');
+    }
+    if (typeof d === 'object') return d.message || d.error || JSON.stringify(d);
+    return String(d);
 }
 
 function _showStepUpModal() {
@@ -226,11 +453,12 @@ async function registerAgent() {
     if (groups.length) body.groups = groups;
     if (callerGroups.length) body.allowed_caller_groups = callerGroups;
     if (cidrs.length) body.allowed_cidrs = cidrs;
-    var resp = await fetch('/admin/agents', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/agents', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) {
         var data = await resp.json();
         result.innerHTML = '<span class="badge badge-green">Registered</span>';
@@ -242,7 +470,7 @@ async function registerAgent() {
         loadAgents();
     } else {
         var err = await resp.json().catch(function() { return {}; });
-        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail || resp.status);
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
     }
 }
 
@@ -568,8 +796,8 @@ async function addAlias() {
     var result = document.getElementById('alias-result');
     var alias = document.getElementById('alias-name').value.trim();
     if (!alias) { result.textContent = 'Alias name is required.'; return; }
-    var resp = await fetch('/admin/models', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/models', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             alias: alias,
@@ -578,15 +806,87 @@ async function addAlias() {
             force_local: document.getElementById('alias-local').value === 'true'
         })
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('alias-name').value = ''; document.getElementById('alias-model').value = ''; loadModels(); }
-    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail ? (err.detail.error || JSON.stringify(err.detail)) : resp.status); }
+    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
+}
+
+async function pullModel() {
+    // #25: pull an Ollama model (step-up gated). Can take a while for large models.
+    var st = document.getElementById('pull-model-status');
+    var name = document.getElementById('pull-model-name').value.trim();
+    if (!name) { st.textContent = 'Enter a model name (e.g. gemma3:4b).'; return; }
+    st.textContent = 'Pulling ' + name + '… (this can take a while)';
+    var resp = await apiMutate('/admin/models/pull', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name })
+    });
+    if (!resp) { st.textContent = 'Request failed or was cancelled.'; return; }
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok) { st.innerHTML = '<span class="badge badge-green">Pulled</span> ' + escapeHtml(name); document.getElementById('pull-model-name').value = ''; loadModels(); }
+    else { st.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
+}
+
+// ── #25 dual-admin cloud-LLM override (parity with /admin/cloud-override API) ──
+async function loadCloudOverride() {
+    var el = document.getElementById('cloud-override-status');
+    if (!el) return;
+    var d = await api('/admin/cloud-override/status');
+    if (!d) { el.textContent = 'Status unavailable.'; return; }
+    var s = d.status || 'INACTIVE';
+    if (s === 'ACTIVE') {
+        el.innerHTML = '<span class="badge badge-red">ACTIVE</span> ' + escapeHtml(d.provider + '/' + d.model)
+            + ' — proposed by ' + escapeHtml(d.initiated_by || '?') + ', approved by ' + escapeHtml(d.approver || '?')
+            + ', expires ' + escapeHtml(d.expires_at || '') + '<br><span class="txt-note">Justification: ' + escapeHtml(d.justification || '') + '</span>';
+    } else if (s === 'PENDING_APPROVAL') {
+        el.innerHTML = '<span class="badge" style="background:#fef3c7;color:#92400e">PENDING</span> '
+            + escapeHtml(d.provider + '/' + d.model) + ' — proposed by ' + escapeHtml(d.initiated_by || '?')
+            + ' awaiting a SECOND admin to Approve (within 5 min).';
+    } else {
+        el.innerHTML = '<span class="badge badge-green">INACTIVE</span> No cloud-LLM override in effect.';
+    }
+}
+
+async function cloudOverridePropose() {
+    var el = document.getElementById('cloud-override-status');
+    var body = {
+        provider: (document.getElementById('co-provider').value || '').trim(),
+        model: (document.getElementById('co-model').value || '').trim(),
+        justification: (document.getElementById('co-justification').value || '').trim(),
+        ttl_hours: parseInt(document.getElementById('co-ttl').value || '4', 10)
+    };
+    if (!body.provider || !body.model) { el.textContent = 'Provider and model are required.'; return; }
+    if (body.justification.length < 4) { el.textContent = 'A justification is required (ticket/contract/CEO email).'; return; }
+    var resp = await apiMutate('/admin/cloud-override/propose', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok) { document.getElementById('co-justification').value = ''; loadCloudOverride(); }
+    else { el.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
+}
+
+async function cloudOverrideApprove() {
+    var el = document.getElementById('cloud-override-status');
+    var resp = await apiMutate('/admin/cloud-override/approve', { method: 'POST' });
+    if (!resp) return;
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok) { loadCloudOverride(); }
+    else { el.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status)); }
+}
+
+async function cloudOverrideRevoke() {
+    if (!confirm('Revoke the cloud-LLM override now?')) return;
+    var resp = await apiMutate('/admin/cloud-override/revoke', { method: 'POST' });
+    if (resp && resp.ok) loadCloudOverride();
 }
 
 async function deleteAlias(alias) {
     if (!confirm('Delete alias "' + alias + '"?')) return;
-    var resp = await fetch('/admin/models/' + encodeURIComponent(alias), { method: 'DELETE', credentials: 'same-origin' });
+    var resp = await apiMutate('/admin/models/' + encodeURIComponent(alias), { method: 'DELETE' });
+    if (!resp) return;
     if (resp.ok) loadModels();
-    else alert('Delete failed: ' + resp.status);
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
 }
 
 async function addAllocation() {
@@ -594,8 +894,8 @@ async function addAllocation() {
     var alias = document.getElementById('alloc-alias').value.trim();
     var target = document.getElementById('alloc-target').value.trim();
     if (!alias || !target) { result.textContent = 'All fields required.'; return; }
-    var resp = await fetch('/admin/models/allocations', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/models/allocations', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             model_alias: alias,
@@ -603,14 +903,16 @@ async function addAllocation() {
             target_id: target
         })
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Allocated</span>'; loadModels(); }
-    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail ? (err.detail.error || JSON.stringify(err.detail)) : resp.status); }
+    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
 async function deleteAllocation(id) {
-    var resp = await fetch('/admin/models/allocations/' + id, { method: 'DELETE', credentials: 'same-origin' });
+    var resp = await apiMutate('/admin/models/allocations/' + id, { method: 'DELETE' });
+    if (!resp) return;
     if (resp.ok) loadModels();
-    else alert('Remove failed: ' + resp.status);
+    else { var err = await resp.json().catch(function(){return {};}); alert('Remove failed: ' + errMsg(err, resp.status)); }
 }
 
 // Sensitivity
@@ -618,8 +920,9 @@ async function loadSensitivity() {
     // Pipeline status
     var data = await api('/admin/sensitivity/status');
     if (data) {
-        document.getElementById('fasttext-status').textContent = data.fasttext_available ? 'Active' : 'Unavailable';
-        document.getElementById('fasttext-status').className = 'badge ' + (data.fasttext_available ? 'badge-green' : 'badge-yellow');
+        var classifierAvailable = (data.classifier_available !== undefined) ? data.classifier_available : data.fasttext_available;
+        document.getElementById('classifier-status').textContent = classifierAvailable ? 'Active' : 'Unavailable';
+        document.getElementById('classifier-status').className = 'badge ' + (classifierAvailable ? 'badge-green' : 'badge-yellow');
         document.getElementById('ollama-status').textContent = data.ollama_available ? 'Active' : 'Unavailable';
         document.getElementById('ollama-status').className = 'badge ' + (data.ollama_available ? 'badge-green' : 'badge-yellow');
     }
@@ -646,8 +949,8 @@ async function addPattern() {
     var pattern = document.getElementById('pat-pattern').value.trim();
     var desc = document.getElementById('pat-desc').value.trim();
     if (!pattern || !desc) { result.textContent = 'Pattern and description required.'; return; }
-    var resp = await fetch('/admin/sensitivity/patterns', {
-        method: 'POST', credentials: 'same-origin',
+    var resp = await apiMutate('/admin/sensitivity/patterns', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             classification: document.getElementById('pat-class').value,
@@ -656,15 +959,17 @@ async function addPattern() {
             description: desc
         })
     });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('pat-pattern').value = ''; document.getElementById('pat-desc').value = ''; loadSensitivity(); }
-    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail || resp.status); }
+    else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
 async function deletePattern(id) {
     if (!confirm('Delete this pattern?')) return;
-    var resp = await fetch('/admin/sensitivity/patterns/' + id, { method: 'DELETE', credentials: 'same-origin' });
+    var resp = await apiMutate('/admin/sensitivity/patterns/' + id, { method: 'DELETE' });
+    if (!resp) return;
     if (resp.ok) loadSensitivity();
-    else alert('Delete failed: ' + resp.status);
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
 }
 
 // Test classifier
@@ -694,8 +999,19 @@ async function loadSettings() {
     var data = await api('/admin/license');
     var container = document.getElementById('license-info');
     if (data) {
+        // Limits live under data.limits.<key>.{maximum,unlimited}; render all
+        // four (agents / users / admins / orgs) the license enforces.
+        var lim = data.limits || {};
+        function fmtLimit(o) {
+            if (!o) return '-';
+            if (o.unlimited) return 'Unlimited';
+            return (o.maximum !== null && o.maximum !== undefined) ? String(o.maximum) : '-';
+        }
         container.innerHTML = '<p style="font-size:0.85rem;color:#334155;"><strong>Tier:</strong> ' + escapeHtml(data.tier || 'community') +
-            ' | <strong>Max Agents:</strong> ' + escapeHtml(data.max_agents === -1 ? 'Unlimited' : (data.max_agents || '-')) +
+            ' | <strong>Max Agents:</strong> ' + escapeHtml(fmtLimit(lim.agents)) +
+            ' | <strong>Users:</strong> ' + escapeHtml(fmtLimit(lim.end_users)) +
+            ' | <strong>Admins:</strong> ' + escapeHtml(fmtLimit(lim.admin_seats)) +
+            ' | <strong>Orgs:</strong> ' + escapeHtml(fmtLimit(lim.orgs)) +
             ' | <strong>Expires:</strong> ' + escapeHtml(data.expires_at || 'Never') + '</p>';
     } else {
         container.innerHTML = '<p style="font-size:0.85rem;color:#334155;"><strong>Tier:</strong> Community Edition — no license required.<br><span style="color:#64748b;">To use other features please add a license for your preferred tier.</span></p>';
@@ -823,25 +1139,32 @@ async function searchAudit(cursor) {
     if (et) params.set('event_type', et);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
-    if (text) params.set('free_text', text);
+    // free_text is a substring match, not a glob — treat a lone '*' as "match all".
+    if (text && text !== '*') params.set('free_text', text);
     if (cursor) params.set('cursor', cursor);
     var data = await api('/admin/audit/search?' + params.toString());
     var tbody = document.getElementById('audit-tbody');
-    if (!data || !data.events || data.events.length === 0) {
+    // Backend returns {rows, count, cursor, has_more} — not {events, next_cursor}.
+    var rows = (data && data.rows) ? data.rows : null;
+    if (!rows || rows.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5" class="empty">No events found</td></tr>';
         document.getElementById('audit-count').textContent = 'Events (0)';
         document.getElementById('audit-pagination').innerHTML = '';
         return;
     }
-    document.getElementById('audit-count').textContent = 'Events (' + data.events.length + (data.has_more ? '+' : '') + ')';
-    tbody.innerHTML = data.events.map(function(e) {
+    document.getElementById('audit-count').textContent = 'Events (' + rows.length + (data.has_more ? '+' : '') + ')';
+    tbody.innerHTML = rows.map(function(e) {
+        var who = e.admin_account || e.user || e.user_handle || e.agent_id || '';
+        var outcome = e.verdict || e.outcome || '-';
+        var blocked = /block|deni|reject|fail/i.test(outcome);
+        var detail = e.detail || e.summary || e.client_ip_prefix || '';
         return '<tr><td style="font-size:0.75rem">' + escapeHtml(e.timestamp || e.created_at || '') + '</td>' +
             '<td>' + escapeHtml(e.event_type || '') + '</td>' +
-            '<td>' + escapeHtml(e.user || e.agent_id || '') + '</td>' +
-            '<td><span class="badge ' + (e.verdict === 'BLOCKED' ? 'badge-red' : 'badge-green') + '">' + escapeHtml(e.verdict || '-') + '</span></td>' +
-            '<td style="font-size:0.75rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(e.detail || e.summary || '') + '</td></tr>';
+            '<td>' + escapeHtml(who) + '</td>' +
+            '<td><span class="badge ' + (blocked ? 'badge-red' : 'badge-green') + '">' + escapeHtml(outcome) + '</span></td>' +
+            '<td style="font-size:0.75rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(detail) + '</td></tr>';
     }).join('');
-    auditCursor = data.next_cursor || '';
+    auditCursor = data.cursor || '';
     var pag = document.getElementById('audit-pagination');
     if (data.has_more) {
         pag.innerHTML = '<button data-action="searchAuditMore" data-cursor="' + auditCursor + '" style="padding:4px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">Load more</button>';
@@ -1089,6 +1412,18 @@ document.addEventListener('click', function(e) {
         case 'addAlias':
             addAlias();
             break;
+        case 'pullModel':
+            pullModel();
+            break;
+        case 'cloudOverridePropose':
+            cloudOverridePropose();
+            break;
+        case 'cloudOverrideApprove':
+            cloudOverrideApprove();
+            break;
+        case 'cloudOverrideRevoke':
+            cloudOverrideRevoke();
+            break;
         case 'deleteAlias':
             deleteAlias(actionEl.getAttribute('data-alias'));
             break;
@@ -1154,6 +1489,9 @@ document.addEventListener('click', function(e) {
             toggleService(e.target.dataset.service, 'disable');
             break;
         // Backup
+        case 'createBackup':
+            createBackup();
+            break;
         case 'verifyBackup':
             verifyBackup();
             break;
@@ -1173,6 +1511,52 @@ document.addEventListener('click', function(e) {
                 rsResetRow(actionEl.getAttribute('data-rs-key'));
             }
             break;
+
+        // PKI actions (defined in pki.js) — data-action so they work under the
+        // strict CSP (script-src 'self'; inline onclick handlers are blocked).
+        case 'pkiView':
+            if (typeof showPkiChain === 'function') showPkiChain(actionEl.getAttribute('data-service'));
+            break;
+        case 'pkiRotate':
+            if (typeof pkiRotate === 'function') pkiRotate(actionEl.getAttribute('data-service'));
+            break;
+        case 'pkiDownload':
+            if (typeof pkiDownloadBundle === 'function') pkiDownloadBundle(actionEl.getAttribute('data-service'));
+            break;
+        case 'pkiClose':
+            if (typeof hidePkiChain === 'function') hidePkiChain();
+            break;
+
+        // Step-up verification modal
+        case 'stepUpSubmit':
+            submitStepUp();
+            break;
+        case 'stepUpCancel':
+            cancelStepUp();
+            break;
+
+        // Policies (OPA) viewer + authoring
+        case 'policyView':
+            viewPolicy(actionEl.getAttribute('data-id'), actionEl.getAttribute('data-cat'));
+            break;
+        case 'bindPolicy':
+            bindPolicy();
+            break;
+        case 'unbindBinding':
+            unbindBinding(actionEl.getAttribute('data-binding-id'));
+            break;
+        case 'policyEditCopy':
+            policyEditCopy();
+            break;
+        case 'policySaveCopy':
+            policySaveCopy();
+            break;
+        case 'policyGenerate':
+            generatePolicy();
+            break;
+        case 'policyClose':
+            closePolicyView();
+            break;
     }
 });
 
@@ -1183,13 +1567,17 @@ async function loadServices() {
     if (!el || !data || !data.services) return;
     var html = '';
     data.services.forEach(function(s) {
+        // Observational: optional services are a deploy-time/IaC choice. Status
+        // reflects what was enabled at install (YASHIGANI_ENABLED_PROFILES); there
+        // are no runtime enable/disable buttons (the admin plane doesn't drive the
+        // host engine). "Deployed" vs "Not deployed" instead of Running/Stopped.
         var badge = s.status === 'running'
-            ? '<span class="badge badge-green">Running</span>'
-            : '<span class="badge" style="background:#f1f5f9;color:#64748b;">Stopped</span>';
-        var btn = s.status === 'running'
-            ? '<button data-action="disableService" data-service="' + s.id + '" style="padding:2px 8px;background:#ef4444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.75rem">Disable</button>'
-            : '<button data-action="enableService" data-service="' + s.id + '" style="padding:2px 8px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.75rem">Enable</button>';
-        html += '<tr><td>' + s.name + '</td><td style="font-size:0.8rem;color:#64748b">' + s.description + '</td><td>' + badge + '</td><td>' + btn + '</td></tr>';
+            ? '<span class="badge badge-green">Deployed</span>'
+            : '<span class="badge" style="background:#f1f5f9;color:#64748b;">Not deployed</span>';
+        var note = s.status === 'running'
+            ? '<span style="font-size:0.75rem;color:#64748b">enabled at install</span>'
+            : '<span style="font-size:0.75rem;color:#94a3b8">re-run installer with --' + escapeHtml(s.profile || s.id) + ' to add</span>';
+        html += '<tr><td>' + escapeHtml(s.name) + '</td><td style="font-size:0.8rem;color:#64748b">' + escapeHtml(s.description) + '</td><td>' + badge + '</td><td>' + note + '</td></tr>';
     });
     el.innerHTML = html || '<tr><td colspan="4" class="empty">No optional services available</td></tr>';
 }
@@ -1197,18 +1585,19 @@ async function loadServices() {
 async function toggleService(serviceId, action) {
     var result = document.getElementById('services-result');
     if (result) result.innerHTML = '<span class="badge badge-yellow">' + action + 'ing ' + serviceId + '...</span>';
-    var r = await fetch('/admin/services/' + serviceId, {
-        method: 'POST', credentials: 'same-origin',
+    var r = await apiMutate('/admin/services/' + serviceId, {
+        method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({action: action})
     });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Failed: request cancelled</span>'; return; }
     if (r.ok) {
         var data = await r.json();
         if (result) result.innerHTML = '<span class="badge badge-green">' + escapeHtml(data.message || 'Done') + '</span>';
         loadServices();
     } else {
         var err = await r.json().catch(function(){return {};});
-        if (result) result.innerHTML = '<span class="badge badge-red">Failed: ' + escapeHtml(err.detail?.error || r.status) + '</span>';
+        if (result) result.innerHTML = '<span class="badge badge-red">Failed: ' + escapeHtml(errMsg(err, r.status)) + '</span>';
     }
 }
 
@@ -1248,6 +1637,29 @@ async function loadBackup() {
     if (btn) {
         btn.disabled = false;
         btn.dataset.backupName = data.latest ? data.latest.name : '';
+    }
+}
+
+async function createBackup() {
+    var btn = document.getElementById('btn-create-backup');
+    var resultDiv = document.getElementById('backup-create-result');
+    if (!resultDiv) return;
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<span class="loading">Creating database backup…</span>';
+    if (btn) btn.disabled = true;
+    try {
+        var resp = await apiMutate('/admin/backup/create', { method: 'POST', headers: {'Content-Type': 'application/json'} });
+        if (!resp) { resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">Request failed or was cancelled</span>'; return; }
+        var data = await resp.json().catch(function() { return {}; });
+        if (resp.ok && data.status === 'ok') {
+            var kb = Math.round((data.size_bytes || 0) / 1024);
+            resultDiv.innerHTML = '<span class="badge badge-green">Created</span> <span style="font-size:0.8rem;color:#334155">' + escapeHtml(data.backup_name) + ' &mdash; ' + kb + ' KB</span>';
+            loadBackup();
+        } else {
+            resultDiv.innerHTML = '<span class="badge badge-red">Error</span> <span style="font-size:0.8rem;color:#b91c1c">' + escapeHtml(errMsg(data, resp.status)) + '</span>';
+        }
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 

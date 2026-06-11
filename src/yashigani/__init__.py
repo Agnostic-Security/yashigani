@@ -13,4 +13,4 @@ Modules:
 """
 # Last updated: 2026-05-16T00:00:00+01:00 (v2.23.4: align __version__ with pyproject.toml — pre-existing drift from be38110)
 
-__version__ = "2.25.0"
+__version__ = "2.25.3.1"

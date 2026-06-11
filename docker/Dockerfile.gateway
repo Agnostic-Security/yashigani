@@ -40,12 +40,12 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
     pip install --no-cache-dir "scikit-learn>=1.4" "joblib>=1.3"
 
 # Copy training corpus and training script
-COPY data/fasttext/ ./data/fasttext/
+COPY data/classifier/ ./data/classifier/
 COPY scripts/train_sensitivity_classifier.py ./scripts/train_sensitivity_classifier.py
 
 RUN mkdir -p data && \
     python scripts/train_sensitivity_classifier.py \
-        --data    data/fasttext/training_data.txt \
+        --data    data/classifier/training_data.txt \
         --output  data/sensitivity_classifier.joblib \
         --seed    42 \
         --C       1.0 \

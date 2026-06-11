@@ -296,3 +296,136 @@ class TestAuditLogExporter:
                 pass
         with pytest.raises(ValueError):
             asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# FINDING F-AUDIT — PostgresSink must NOT drop chat audit rows whose
+# request_id is a non-UUID correlation id (e.g. Open WebUI "chatcmpl-...").
+# owui-rbac-buildsheet §A2.
+# ---------------------------------------------------------------------------
+
+class TestFAuditCoerceUuid:
+    """request_id="chatcmpl-..." must store request_id=NULL, not drop the row."""
+
+    def test_coerce_uuid_non_uuid_is_none(self):
+        import uuid as _uuid
+        from yashigani.audit.sinks import _coerce_uuid
+
+        # Non-UUID correlation ids (the bug input) coerce to None.
+        assert _coerce_uuid("chatcmpl-abc123") is None
+        assert _coerce_uuid("internal") is None
+        assert _coerce_uuid("") is None
+        assert _coerce_uuid(None) is None
+        assert _coerce_uuid(12345) is None
+
+        # A real UUID (str or UUID object) is preserved.
+        u = _uuid.uuid4()
+        assert _coerce_uuid(str(u)) == u
+        assert _coerce_uuid(u) == u
+
+    def test_flush_batch_chatcmpl_request_id_binds_null_not_drop(self):
+        """Drain a chatcmpl event: must not raise and must bind request_id=NULL."""
+        import asyncio
+        import uuid as _uuid
+        from unittest.mock import AsyncMock, MagicMock
+        from yashigani.audit.sinks import PostgresSink
+
+        captured: dict = {}
+
+        # Fake asyncpg conn: capture the INSERT_AUDIT_EVENT bound params.
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value=None)  # set_config(...)
+
+        async def _fetchrow(query, *args):
+            # The INSERT is the fetchrow call (RETURNING seq); set_config uses execute.
+            captured["args"] = args
+            return {"seq": 1}
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        # async context managers: pool.acquire() and conn.transaction()
+        class _ACtx:
+            def __init__(self, obj):
+                self._obj = obj
+            async def __aenter__(self):
+                return self._obj
+            async def __aexit__(self, *exc):
+                return False
+
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=_ACtx(conn))
+        conn.transaction = MagicMock(return_value=_ACtx(None))
+
+        # require_chain=False (legacy/test path) → no chain service needed.
+        sink = PostgresSink(pool_getter=lambda: pool, chain_service=None)
+
+        event = {
+            "tenant_id": "internal",            # synthetic identity, non-UUID
+            "event_type": "INFERENCE_PROXIED",
+            "request_id": "chatcmpl-abc123",    # the bug input
+            "session_id": "sess-1",
+            "agent_id": "open-webui",
+            "action": "ALLOW",
+        }
+
+        # Must NOT raise (previously: ValueError "badly formed hexadecimal UUID").
+        asyncio.run(sink._flush_batch([event]))
+
+        args = captured["args"]
+        # INSERT_AUDIT_EVENT positional order:
+        #   $1 tenant_id, $2 event_type, $3 request_id, ...
+        tenant_arg, event_type_arg, request_id_arg = args[0], args[1], args[2]
+
+        # request_id non-UUID → NULL (None), row still inserted.
+        assert request_id_arg is None, (
+            "chatcmpl request_id must bind as NULL, not drop the row"
+        )
+        # tenant_id non-UUID → all-zeros UUID (NOT NULL column preserved).
+        assert tenant_arg == _uuid.UUID("00000000-0000-0000-0000-000000000000")
+        assert isinstance(tenant_arg, _uuid.UUID)
+        assert event_type_arg == "INFERENCE_PROXIED"
+
+    def test_flush_batch_real_uuid_request_id_preserved(self):
+        """A genuine UUID request_id is still bound as a UUID (no regression)."""
+        import asyncio
+        import uuid as _uuid
+        from unittest.mock import AsyncMock, MagicMock
+        from yashigani.audit.sinks import PostgresSink
+
+        captured: dict = {}
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value=None)
+
+        async def _fetchrow(query, *args):
+            captured["args"] = args
+            return {"seq": 1}
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        class _ACtx:
+            def __init__(self, obj):
+                self._obj = obj
+            async def __aenter__(self):
+                return self._obj
+            async def __aexit__(self, *exc):
+                return False
+
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=_ACtx(conn))
+        conn.transaction = MagicMock(return_value=_ACtx(None))
+
+        sink = PostgresSink(pool_getter=lambda: pool, chain_service=None)
+
+        real_tenant = _uuid.uuid4()
+        real_req = _uuid.uuid4()
+        event = {
+            "tenant_id": str(real_tenant),
+            "event_type": "ADMIN_LOGIN",
+            "request_id": str(real_req),
+            "action": "ALLOW",
+        }
+        asyncio.run(sink._flush_batch([event]))
+
+        args = captured["args"]
+        assert args[0] == real_tenant
+        assert args[2] == real_req

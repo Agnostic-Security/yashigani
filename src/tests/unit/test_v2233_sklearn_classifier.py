@@ -29,7 +29,7 @@ import pytest
 # Corpus helpers (shared with train_sensitivity_classifier.py logic)
 # ---------------------------------------------------------------------------
 
-_CORPUS_PATH = Path(__file__).parent.parent.parent.parent / "data" / "fasttext" / "training_data.txt"
+_CORPUS_PATH = Path(__file__).parent.parent.parent.parent / "data" / "classifier" / "training_data.txt"
 
 
 def _load_corpus():
@@ -256,15 +256,25 @@ class TestSensitivityClassifierSklearnLayer:
 
 class TestMetricAliases:
     def test_sensitivity_classifier_is_fasttext_alias(self):
-        """Canonical aliases point to the same Prometheus counter object."""
+        """All metric aliases point to the same Prometheus counter object.
+
+        v2.25.3: classifier_* is the canonical name. fasttext_* and
+        sensitivity_classifier_* are deprecated aliases that must remain
+        pointing at the same object for one release cycle (v2.26.0 removal).
+        """
         from yashigani.metrics.registry import (
+            classifier_classifications_total,
+            classifier_latency_ms,
             fasttext_classifications_total,
             sensitivity_classifier_classifications_total,
             fasttext_latency_ms,
             sensitivity_classifier_latency_ms,
         )
-        assert fasttext_classifications_total is sensitivity_classifier_classifications_total
-        assert fasttext_latency_ms is sensitivity_classifier_latency_ms
+        # Canonical: classifier_* is the primary object.
+        assert fasttext_classifications_total is classifier_classifications_total
+        assert sensitivity_classifier_classifications_total is classifier_classifications_total
+        assert fasttext_latency_ms is classifier_latency_ms
+        assert sensitivity_classifier_latency_ms is classifier_latency_ms
 
 
 # ---------------------------------------------------------------------------

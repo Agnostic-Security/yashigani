@@ -85,6 +85,14 @@ inspection_classifications_total = _C(
     ["label", "severity"],
 )
 
+# #16 (OPA Phase 2): client-policy aggregate query failures (fail-closed denies).
+# Alert on sustained rate — like the OPA *_CHECK_FAILED audit events.
+client_enforce_failures_total = _C(
+    "yashigani_client_enforce_failures_total",
+    "Client-policy aggregate query failures by direction and outcome (fail-closed).",
+    ["direction", "outcome"],
+)
+
 inspection_duration_seconds = _H(
     "yashigani_inspection_duration_seconds",
     "Inspection pipeline latency (classify + sanitise).",
@@ -439,26 +447,30 @@ jwks_cache_hits_total = _C(
     ["layer"],  # memory | redis
 )
 
-# v2.23.3: renamed from fasttext_classifications_total / fasttext_latency_ms.
-# Legacy metric names kept for Grafana dashboard backward-compatibility; a
-# `backend` label distinguishes sklearn (current) from fasttext (removed).
-# Existing dashboards that query `yashigani_fasttext_classifications_total`
-# continue to work — they now receive data with `backend="sklearn"`.
-fasttext_classifications_total = _C(
-    "yashigani_fasttext_classifications_total",
+# v2.25.3: renamed from yashigani_fasttext_* to yashigani_classifier_* (engine-agnostic).
+# Deprecated fasttext_* Python names kept as aliases for one release cycle (v2.26.0 removal).
+# Consumers of the old yashigani_fasttext_classifications_total Prometheus metric name must
+# update their dashboards — the metric name has changed (series continuity break is
+# acceptable for this internal pre-GA rename).
+classifier_classifications_total = _C(
+    "yashigani_classifier_classifications_total",
     "First-pass sensitivity classifier outcomes (backend label distinguishes implementation).",
     ["result", "backend"],  # result: clean | unsafe | uncertain; backend: sklearn
 )
-# Canonical alias — preferred name for new dashboards.
-sensitivity_classifier_classifications_total = fasttext_classifications_total
+# v2.23.3 canonical alias — deprecated in v2.25.3, removed in v2.26.0.
+sensitivity_classifier_classifications_total = classifier_classifications_total
+# Legacy name — DEPRECATED in v2.25.3, removed in v2.26.0.
+fasttext_classifications_total = classifier_classifications_total
 
-fasttext_latency_ms = _H(
-    "yashigani_fasttext_latency_ms",
+classifier_latency_ms = _H(
+    "yashigani_classifier_latency_ms",
     "First-pass sensitivity classifier inference latency in milliseconds.",
     buckets=[0.5, 1, 2, 5, 10, 20, 50],
 )
-# Canonical alias — preferred name for new dashboards.
-sensitivity_classifier_latency_ms = fasttext_latency_ms
+# v2.23.3 canonical alias — deprecated in v2.25.3, removed in v2.26.0.
+sensitivity_classifier_latency_ms = classifier_latency_ms
+# Legacy name — DEPRECATED in v2.25.3, removed in v2.26.0.
+fasttext_latency_ms = classifier_latency_ms
 
 trace_spans_total = _C(
     "yashigani_trace_spans_total",

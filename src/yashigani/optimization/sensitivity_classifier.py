@@ -291,13 +291,16 @@ class SensitivityClassifier:
             return level
         return SensitivityLevel.PUBLIC
 
+    def _scan_classifier(self, text: str, triggers: list[str]) -> SensitivityLevel:
+        """Engine-agnostic alias for _scan_sklearn (v2.25.3+). Preferred name."""
+        return self._scan_sklearn(text, triggers)
+
     # ---------------------------------------------------------------------------
-    # Legacy alias — streaming.py calls _scan_fasttext by name directly.
-    # Kept for one release cycle so streaming tests still pass; remove in v2.24.0.
+    # Legacy aliases — kept for back-compat; removed in v2.26.0.
     # ---------------------------------------------------------------------------
     def _scan_fasttext(self, text: str, triggers: list[str]) -> SensitivityLevel:
-        """Deprecated alias for _scan_sklearn. Removed in v2.24.0."""
-        return self._scan_sklearn(text, triggers)
+        """Deprecated alias for _scan_classifier. Removed in v2.26.0."""
+        return self._scan_classifier(text, triggers)
 
     def _scan_ollama(self, text: str, triggers: list[str]) -> SensitivityLevel:
         """Layer 3: Ollama deep contextual scan.

@@ -160,13 +160,45 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         X-Content-Type-Options    "nosniff"
         X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
-        Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+        # CSP is set per-path below (strict everywhere except the Wazuh SIEM
+        # subpath, whose OSD bundles need unsafe-eval). Not set here to avoid the
+        # global SET shadowing the per-path override.
         Cross-Origin-Opener-Policy "same-origin"
         # Product / fingerprint hygiene (QA Wave 2 observations 5 + 6).
         -Server
         -Via
         -Alt-Svc
     }
+
+    # CSP, set per-path so exactly one policy applies per request.
+    #
+    # STRICT (script-src 'self', style-src 'self', no inline) applies to the
+    # Yashigani-native admin plane ONLY — the backoffice SPA (/admin/*), auth
+    # (/auth/*, /login), and the other first-party backoffice routes. These were
+    # deliberately made strict-CSP-compliant (inline styles moved to CSS classes,
+    # f7a3228); do NOT weaken them.
+    #
+    # LENIENT (unsafe-eval + unsafe-inline) applies to everything else:
+    #  - the proxied observability sub-apps (Grafana, Wazuh/OSD, Prometheus),
+    #    which ship nonce-less inline bootstrap scripts + eval()/inline styles —
+    #    strict CSP stops their SPA mounting ("failed to load application files");
+    #  - the Open WebUI end-user chat surface served at the root catch-all
+    #    (--with-openwebui), whose SvelteKit build emits inline hydration scripts —
+    #    strict CSP blocks them and the page renders blank (YSG-2253 blocker).
+    # curl never shows this (it doesn't enforce CSP).
+    #
+    # The boundary is a single path set used in both matchers so exactly one
+    # policy applies per request. @strict_ui = native admin plane AND NOT a
+    # proxied sub-app subpath; @lenient_ui = the complement (sub-apps + OWUI root).
+    @strict_ui {
+        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    }
+    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
@@ -354,11 +386,22 @@ Hiring: https://agnosticsec.com/careers
     # retro #83: Grafana now serves HTTPS on port 3443 with mTLS (Pattern B).
     # Caddy presents caddy_client.crt to Grafana; Grafana verifies via
     # ca_intermediate.crt. The forward_auth check still applies (admin only).
-    handle_path /admin/grafana/* {
+    handle /admin/grafana/* {
+        # Normalise misrouted asset requests: Grafana's static assets always live
+        # at /public/... regardless of the dashboard URL the browser was on, but
+        # some browsers resolve the relative asset refs against the dashboard path
+        # (e.g. /admin/grafana/d/x/public/build/… → 404). Collapse any extra
+        # segment between /admin/grafana/ and /public/ back to the canonical path.
+        # Only a spurious dashboard-path prefix (…/d/<uid>[/<slug>]/) before a
+        # Grafana root path gets stripped. Canonical /admin/grafana/api|public/…
+        # (no /d/ prefix) is NOT matched, so it passes through untouched — earlier
+        # greedy/lazy variants mangled nested api/ paths like the alert ruler API.
+        @grafana_misroute path_regexp gmis ^/admin/grafana/d/(?:[^/]+/)*?((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login?next=/admin/grafana/ 302
@@ -372,11 +415,11 @@ Hiring: https://agnosticsec.com/careers
     }
 
     # ── Wazuh Dashboard — admin-authenticated access via /admin/wazuh/* ────
-    handle_path /admin/wazuh/* {
+    handle /admin/wazuh/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
@@ -394,7 +437,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
@@ -449,43 +492,108 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-Forwarded-Name
         request_header -X-Forwarded-Groups
 
-        # Forward auth: validate session cookie against backoffice.
-        # On 200: copies X-Forwarded-User/Name from response into the request.
-        # On 401: redirects to login page.
-        forward_auth https://backoffice:8443 {
-        import internal-mtls
-        import inject-caddy-verified
-            uri /auth/verify
-            copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
+        # ── Open WebUI socket.io WebSocket — F-WS fix (YSG-2253) ───────────
+        # Open WebUI streams chat tokens over a socket.io WebSocket at
+        # /ws/socket.io/. A WebSocket upgrade carries `Connection: Upgrade` +
+        # `Upgrade: websocket`. Caddy's `forward_auth` directive copies the
+        # ENTIRE inbound request (upgrade headers included) into the auth
+        # subrequest to /auth/verify, then wraps the main proxy in a
+        # handle_response. That wrapping does NOT pass a hop-by-hop upgrade
+        # through cleanly: the handshake never reaches 101 and the (logged-in)
+        # browser saw a 302 instead — tokens never rendered.
+        #
+        # Fix: still gate the WS by the SAME session cookie, but on the auth
+        # SUBREQUEST only, strip the upgrade headers (`header_up -Connection`
+        # / `-Upgrade`) so /auth/verify sees a plain GET, validates the cookie,
+        # and returns 200/401/403 normally. The MAIN reverse_proxy then carries
+        # the original (un-stripped) request and performs the real 101 upgrade
+        # to open-webui:8080. Unauthenticated WS still gets a 401 (the browser
+        # WS client treats it as a failed handshake and the page redirect logic
+        # handles the HTTP login) — this is NOT an auth bypass.
+        @owui_ws {
+            header Connection *Upgrade*
+            header Upgrade websocket
+            path /ws/*
+        }
+        handle @owui_ws {
+            forward_auth https://backoffice:8443 {
+            import internal-mtls
+            import inject-caddy-verified
+                uri /auth/verify
+                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
+                # Strip the upgrade headers from the AUTH subrequest only so
+                # /auth/verify sees a normal GET and returns a clean status.
+                # The main reverse_proxy below keeps the original upgrade.
+                header_up -Connection
+                header_up -Upgrade
 
-            @unauthorized status 401
-            handle_response @unauthorized {
-                redir * /login?next={http.request.uri} 302
+                @unauthorized status 401
+                handle_response @unauthorized {
+                    respond 401
+                }
+                @admin_on_dataplane status 403
+                handle_response @admin_on_dataplane {
+                    respond 403
+                }
+            }
+            reverse_proxy open-webui:8080 {
+                import inject-caddy-verified
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
+                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
+                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
 
-        # inject-caddy-verified: open-webui does not validate the header but
-
-        # we inject it uniformly across all reverse_proxy blocks. Auth is
-
-        # enforced by the forward_auth block above. Closes LU-231-10-A.
-
-        reverse_proxy open-webui:8080 {
-
+        # ── Open WebUI HTTP (non-WS) — forward_auth + proxy ────────────────
+        # Forward auth: validate session cookie against backoffice.
+        # On 200: copies X-Forwarded-User/Name from response into the request.
+        # On 401: redirects to login page.
+        handle {
+            forward_auth https://backoffice:8443 {
+            import internal-mtls
             import inject-caddy-verified
-            header_up X-Forwarded-Proto https
-            header_up X-Real-IP {remote_host}
-            # Explicitly pass the trusted identity headers from forward_auth
-            header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-            header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-            header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+                uri /auth/verify
+                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
+
+                @unauthorized status 401
+                handle_response @unauthorized {
+                    redir * /login?next={http.request.uri} 302
+                }
+
+                # Admin sessions are blocked from the data plane (SoD). Instead of
+                # surfacing the raw {admin_session_not_allowed_data_plane} 403 JSON
+                # (confusing — looks broken; hit on /, /query, etc.), bounce them to
+                # the admin console.
+                @admin_on_dataplane status 403
+                handle_response @admin_on_dataplane {
+                    redir * /admin/ 302
+                }
+            }
+
+            # inject-caddy-verified: open-webui does not validate the header but
+            # we inject it uniformly across all reverse_proxy blocks. Auth is
+            # enforced by the forward_auth block above. Closes LU-231-10-A.
+            reverse_proxy open-webui:8080 {
+                import inject-caddy-verified
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+                # Explicitly pass the trusted identity headers from forward_auth
+                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
+                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
+                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+            }
         }
     }
 }
 
 # Also serve on HTTP for local convenience (self-signed mode only)
 http://{$YASHIGANI_TLS_DOMAIN}:80 {
-    redir https://{$YASHIGANI_TLS_DOMAIN}{uri} permanent
+    # Redirect to HTTPS on the PUBLISHED port (not bare 443) — on a non-standard
+    # deploy (e.g. host :8456) bare https://host lands on :443 (dead). Include the
+    # published https port so the redirect actually reaches the running edge.
+    redir https://{$YASHIGANI_TLS_DOMAIN}:{$YASHIGANI_HTTPS_PORT:443}{uri} permanent
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

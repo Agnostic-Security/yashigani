@@ -15,6 +15,7 @@ package yashigani
 
 import future.keywords.if
 import future.keywords.in
+import future.keywords.contains
 
 # ---------------------------------------------------------------------------
 # Default: deny unless explicitly allowed
@@ -189,3 +190,36 @@ deny_agent_call if {
 # LAURA-OPA close-out (2.25.2), class-fix for the deny-override anti-pattern.
 _denied if { deny_rbac }
 _denied if { deny_agent_call }
+
+# ---------------------------------------------------------------------------
+# #4 — User-facing decision contract (additive, OPA decision contract).
+# The boolean `allow` above remains the gate. `decision`/`denials` only ENRICH
+# the gateway's deny response with a stable policy_id (ID of the OPA), a layman
+# user_message (human OR non-human agent), and an HTTP status code (any standard
+# 1xx-5xx, RFC 9110) — educate + deter. Scales to 100+ policies: each deny
+# condition contributes one self-describing denial. agents.rego and rbac.rego
+# (same package) contribute their own denials too.
+# ---------------------------------------------------------------------------
+
+denials contains {
+    "policy_id": "yashigani.core.path-restricted",
+    "rule": "Restricted path",
+    "user_message": "Blocked: this path is restricted — admin, internal, metrics and health endpoints are not reachable through the gateway.",
+    "code": 403,
+    "action": "DENIED",
+} if { path_blocked }
+
+denials contains {
+    "policy_id": "yashigani.core.default-deny",
+    "rule": "Default deny (no matching allow)",
+    "user_message": "Blocked by default-deny: the request did not match any allow rule (for example a missing or anonymous session, an undeclared agent identity, or a method that is not permitted).",
+    "code": 403,
+    "action": "DENIED",
+} if {
+    not allow
+    not path_blocked
+    not deny_rbac
+    not deny_agent_call
+}
+
+decision := {"allow": allow, "denials": denials}

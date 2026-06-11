@@ -20,6 +20,9 @@ KEY_RATE_LIMIT_PER_USER_RPS = "gateway.ratelimit.per_user_rps"
 KEY_DDOS_PER_IP_LIMIT = "gateway.ddos.per_ip_limit"
 KEY_DDOS_WINDOW_SECONDS = "gateway.ddos.window_seconds"
 
+# ── Model-list visibility for service accounts (gateway.models) ──────────────
+KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST = "gateway.models.service_account_full_list"
+
 
 @dataclass(frozen=True)
 class SettingMeta:
@@ -66,6 +69,21 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         allowed_type="int",
         env_var="YASHIGANI_DDOS_WINDOW_SECONDS",
         class_default=60,
+    ),
+    SettingMeta(
+        key=KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST,
+        description=(
+            "When ON, service-account identities (notably the Open WebUI chat "
+            "surface, which authenticates with the shared internal bearer) receive "
+            "the FULL GET /v1/models list — local models + registered agents + "
+            "service identities — instead of the restricted default. Enable this "
+            "for Open WebUI deployments so the model picker populates with the "
+            "models and agents. Default OFF (restricted) per OPA GAP-001/002 / "
+            "FINDING-59-01 (internal-topology disclosure hardening)."
+        ),
+        allowed_type="bool",
+        env_var="YASHIGANI_MODELS_SERVICE_ACCOUNT_FULL_LIST",
+        class_default=False,
     ),
 ]
 

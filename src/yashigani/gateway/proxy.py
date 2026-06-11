@@ -126,7 +126,7 @@ def create_gateway_app(
     jwt_inspector=None,
     endpoint_rate_limiter=None,
     response_cache=None,
-    fasttext_backend=None,
+    classifier_backend=None,
     inference_logger=None,
     anomaly_detector=None,
     response_inspection_pipeline=None,  # v0.9.0 — ResponseInspectionPipeline | None
@@ -154,7 +154,7 @@ def create_gateway_app(
         "jwt_inspector": jwt_inspector,
         "endpoint_rate_limiter": endpoint_rate_limiter,
         "response_cache": response_cache,
-        "fasttext_backend": fasttext_backend,
+        "classifier_backend": classifier_backend,
         "inference_logger": inference_logger,
         "anomaly_detector": anomaly_detector,
         "ddos_protector": ddos_protector,  # v2.2
@@ -221,6 +221,35 @@ def create_gateway_app(
                         "Gateway: DB audit sink wiring failed (%s) — "
                         "continuing with file sink only", exc
                     )
+
+            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): reconcile the agent
+            # registry from the durable Postgres mirror into Redis db/3 on every
+            # boot. Redis db/3 has no persistence (appendonly no / save ""), so a
+            # `docker compose up -d redis` recreate wipes every @agent — the
+            # gateway then returns agent_not_found for all of them. The gateway is
+            # the request-time consumer and may restart independently of
+            # backoffice, so it ALSO self-heals here (idempotent; mirrors the OPA
+            # store→OPA re-push). Runs DIRECTLY against the asyncpg pool + Redis —
+            # no admin API, no admin password, no service account.
+            try:
+                _agent_reg = _state.get("agent_registry")
+                if _agent_reg is not None:
+                    from yashigani.agents.durable_store import AgentDurableStore
+                    from yashigani.agents.reconciler import reconcile_agents_from_durable
+                    await reconcile_agents_from_durable(_agent_reg, AgentDurableStore())
+                else:
+                    logger.warning(
+                        "Gateway: agent_registry not wired — agent reconcile skipped "
+                        "(agents will not auto-restore after a redis recreate)"
+                    )
+            except Exception as exc:
+                # Fail-loud but non-blocking: the gateway must still serve other
+                # traffic even if reconcile cannot run.
+                logger.error(
+                    "Gateway: agent reconcile from durable store FAILED (%s) — @agent "
+                    "routes may return agent_not_found until the registry is restored",
+                    exc,
+                )
         yield
         # Shutdown: close the HTTP client and DB pool
         # v2.25.2 — drain + stop the DB audit sink first so in-flight audit
@@ -733,7 +762,12 @@ async def _proxy_request_body(
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)
-        return _error_response(request_id, 403, "POLICY_DENIED")
+        # #4 OPA decision contract: enrich the deny with the policy's self-description
+        # (policy_id + layman user_message + HTTP code). Best-effort; the gate above
+        # (_opa_check) is the authority and is left untouched.
+        return await _opa_denial_alert(
+            cfg, request, path, session_id, agent_id, user_id, request_id,
+        )
 
     # 4b. Response cache — only on CLEAN forwarded requests (Phase 6)
     tenant_id = request.headers.get("x-yashigani-tenant-id", "platform")
@@ -825,13 +859,25 @@ async def _proxy_request_body(
                     confidence=resp_result.confidence,
                     response_inspection_verdict=resp_result.verdict,
                 )
+                # #4 unified user alert: the threat came FROM THE TOOL/upstream
+                # (e.g. a compromised MCP server injecting an instruction back at
+                # the user/agent). Return the same plain-English envelope used at
+                # every enforcement point — educate + deter.
+                from yashigani.common.user_alert import (
+                    build_alert, ACTION_BLOCKED, DIRECTION_FROM_TOOL,
+                )
+                _resp_alert = build_alert(
+                    ACTION_BLOCKED,
+                    "The tool/assistant tried to send back content that looked like a "
+                    "hidden instruction or an attempt to extract your credentials, so "
+                    "Yashigani blocked the response before it reached you.",
+                    rule="Response inspection (from the tool)",
+                    direction=DIRECTION_FROM_TOOL,
+                    request_id=request_id,
+                )
                 return JSONResponse(
                     status_code=502,
-                    content={
-                        "error": "UPSTREAM_RESPONSE_BLOCKED",
-                        "detail": "The upstream response was blocked by Yashigani response inspection.",
-                        "request_id": request_id,
-                    },
+                    content=_resp_alert,
                     headers={
                         "X-Yashigani-Request-Id": request_id,
                         "X-Yashigani-Response-Verdict": resp_result.verdict,
@@ -999,6 +1045,17 @@ async def _proxy_request_body(
     # 5f. PII detection header (v2.2)
     _pii_any = pii_detected_on_request or pii_detected_on_response
     response.headers["X-Yashigani-PII-Detected"] = "true" if _pii_any else "false"
+    # #4 unified user alert (non-blocking REDACT): the result still flows, so the
+    # alert travels via headers rather than replacing the body — same taxonomy as
+    # the blocking alerts so the user learns what was masked and why.
+    if _pii_any:
+        from yashigani.common.user_alert import alert_headers, ACTION_REDACTED
+        for _k, _v in alert_headers(
+            ACTION_REDACTED,
+            rule="PII protection",
+            reason="Personal or sensitive data was detected and masked before continuing.",
+        ).items():
+            response.headers[_k] = _v
 
     return response
 
@@ -1054,6 +1111,68 @@ async def _opa_check(
             path, session_id, exc,
         )
         return False  # fail-closed
+
+
+async def _opa_denial_alert(
+    cfg, request, path: str, session_id: str, agent_id: str, user_id: str, request_id: str
+):
+    """#4: build the unified DENIED user alert for an OPA policy denial, enriched
+    with the policy's self-description (policy_id + layman user_message + HTTP code)
+    from `data.yashigani.decision.denials`. Best-effort — any OPA/parse error falls
+    back to a generic DENIED alert. Never raises (the request is already denied)."""
+    from yashigani.common.user_alert import build_alert, valid_http_code, ACTION_DENIED
+
+    denial = None
+    try:
+        input_doc = {
+            "method": request.method,
+            "path": path,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "session": {"email": user_id},
+            "request": {"method": request.method, "path": path},
+            "headers": {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ("authorization", "cookie")
+            },
+        }
+        # Derive the decision doc path from the configured allow path.
+        decision_path = cfg.opa_policy_path.rsplit("/", 1)[0] + "/decision"
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                cfg.opa_url + decision_path,
+                json={"input": input_doc},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            denials = (resp.json().get("result") or {}).get("denials") or []
+            if denials:
+                denial = denials[0]
+    except Exception as exc:  # noqa: BLE001 — enrichment only; deny stands regardless
+        logger.warning(
+            "OPA decision enrichment failed (request_id=%s): %s — generic deny alert", request_id, exc
+        )
+
+    if denial:
+        code = valid_http_code(denial.get("code"), 403)
+        alert = build_alert(
+            ACTION_DENIED,
+            denial.get("user_message", "Your request was blocked by an access policy."),
+            rule=denial.get("rule"),
+            policy_id=denial.get("policy_id"),
+            request_id=request_id,
+        )
+    else:
+        code = 403
+        alert = build_alert(
+            ACTION_DENIED,
+            "Your request was blocked by an access policy.",
+            request_id=request_id,
+        )
+    return JSONResponse(
+        status_code=code, content=alert, headers={"X-Yashigani-Request-Id": request_id}
+    )
 
 
 # ---------------------------------------------------------------------------

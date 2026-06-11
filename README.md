@@ -11,12 +11,12 @@
 </html>
 
 ---
-**Yashigani is the security enforcement gateway for MCP servers and agentic AI systems.**
+**Yashigani is the proactive compliance enforcer for MCP servers and agentic AI systems.**
 ---
-*Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
+*Yashigani — Proactive compliance enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.25.2 (2026-06-06) — Wazuh SIEM full-stack Linux/Docker fixes (mTLS auto-provisioning, convergence-gate improvements), audit DB least-privilege role split, PostgresSink audit wiring, OPA hardening (deny-override class fix, Helm bundle parity, depth-limit corrections), decode-before-classify PII inspection on encoded payloads; see `CHANGELOG.md` for the full release history.
+**Latest Tagged Release:** v2.25.3.1 (2026-06-08) — durable agent registry (registered agents survive restart and reconcile cleanly) and the `gateway.models.service_account_full_list` runtime control (default-OFF restricted `/v1/models` listing for service accounts, opt-in to populate the Open WebUI model picker); built on v2.25.3 — MCP broker hardening with signed bundles, OPA fail-close correctness (deny-override class fix, path-traversal + default-deny inversions closed), least-privilege audit DB role with PostgresSink, Wazuh SIEM internal-CA mTLS codified with a TLS 1.3 floor, and a batch of clean-slate/upgrade install fixes; see `CHANGELOG.md` for the full release history.
 
 ---
 ### 🦀 Coming next — Yashigani 3.0 *(early-access beta)*
@@ -61,7 +61,7 @@ For architectural detail (request flow, components, network isolation, identity 
 
 ## 1. What is Yashigani
 
-Yashigani is a security enforcement gateway purpose-built for Model Context Protocol (MCP) servers and agentic AI systems. It operates as a reverse proxy, sitting between AI agents or human clients and the upstream MCP tool servers that those agents call. Every request passes through Yashigani before reaching a tool; every response is inspected before being returned. Nothing crosses the boundary without being authenticated, authorized, and inspected.
+Yashigani is a **proactive compliance enforcer** purpose-built for Model Context Protocol (MCP) servers and agentic AI systems. It operates as a reverse proxy, sitting between AI agents or human clients and the upstream MCP tool servers that those agents call. Every request passes through Yashigani before reaching a tool; every response is inspected before being returned. Nothing crosses the boundary without being authenticated, authorized, and inspected.
 
 The **Model Context Protocol** is an open standard that allows AI agents — systems driven by large language models — to call external tools: file system operations, database queries, API calls, shell commands, and more. MCP enables genuinely powerful agentic behavior, but it also exposes a new and largely unaddressed attack surface. An LLM that can call tools is an LLM that can be manipulated into exfiltrating credentials, bypassing access controls, or executing unintended actions. The MCP specification itself defines the protocol, not the security envelope around it.
 

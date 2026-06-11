@@ -47,7 +47,7 @@ class TestResponseInspectionPipelineSensitivity:
         # F-RT1: pipeline now calls classify_decoded (decode-before-classify).
         mock_sens.classify_decoded.return_value = SensitivityResult(level=level_enum)
 
-        cfg = ResponseInspectionConfig(enabled=True, fasttext_only=False)
+        cfg = ResponseInspectionConfig(enabled=True, classifier_only=False)
         return ResponseInspectionPipeline(
             classifier=mock_classifier,
             config=cfg,

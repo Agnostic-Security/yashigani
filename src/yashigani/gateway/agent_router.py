@@ -29,7 +29,29 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
+import types as _types
+
 from yashigani.pki.client import internal_httpx_client
+from yashigani.gateway._client_enforce import evaluate_client_policies
+
+
+def _agent_cp_deny(audit_writer, caller_agent_id, direction, ce_result):
+    """Audit a client-policy denial on the agent path (#16). Best-effort."""
+    if audit_writer is None:
+        return
+    deny = list(ce_result.get("deny", []) or [])
+    failclosed = {"client_enforce_unavailable", "client_enforce_undefined", "client_enforce_not_configured"}
+    try:
+        from yashigani.audit.schema import ClientPolicyDeniedEvent, ClientPolicyCheckFailedEvent
+        if set(deny) & failclosed:
+            audit_writer.write(ClientPolicyCheckFailedEvent(
+                reason=next(iter(set(deny) & failclosed)), outcome="fail_closed", direction=direction))
+        else:
+            audit_writer.write(ClientPolicyDeniedEvent(
+                identity_id=caller_agent_id, scope_kind="agent", scope_id=caller_agent_id,
+                direction=direction, deny_codes=deny))
+    except Exception:  # pragma: no cover — audit must never break the request
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +242,26 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
             },
         )
 
+    # ── Client-policy enforcement — INGRESS (#16, agent scope) ──
+    # After the agent_call_allowed gate; deny-only, fail-closed; no-op if unbound.
+    _ce_in = await evaluate_client_policies(
+        _types.SimpleNamespace(opa_url=opa_url), "agent", caller_agent_id, "ingress",
+        {"identity": {"agent": caller_agent_id, "groups": caller_groups},
+         "request": {"path": path, "method": request.method},
+         "target_agent": {"agent_id": target_agent_id}},
+    )
+    if not _ce_in.get("allow", False):
+        _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
+        logger.warning("CLIENT-POLICY DENIED agent ingress: caller=%s target=%s deny=%s",
+                       caller_agent_id, target_agent_id, _ce_reason)
+        _agent_cp_deny(audit_writer, caller_agent_id, "ingress", _ce_in)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "CLIENT_POLICY_DENIED", "reason": _ce_reason,
+                     "target_agent_id": target_agent_id},
+            headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
+        )
+
     upstream_url = target_agent["upstream_url"]
 
     # Forward request to upstream
@@ -357,6 +399,27 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
                     "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
                 },
             )
+
+    # ── Client-policy enforcement — EGRESS (#16, agent scope) ──
+    # After the core response-leg OPA gate; deny-only, fail-closed; no-op if unbound.
+    _ce_eg = await evaluate_client_policies(
+        _types.SimpleNamespace(opa_url=opa_url), "agent", caller_agent_id, "egress",
+        {"identity": {"agent": caller_agent_id, "groups": caller_groups},
+         "request": {"path": path, "method": request.method},
+         "target_agent": {"agent_id": target_agent_id},
+         "response_sensitivity": response_sensitivity_value},
+    )
+    if not _ce_eg.get("allow", False):
+        _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
+        logger.warning("CLIENT-POLICY BLOCKED agent egress: caller=%s target=%s deny=%s",
+                       caller_agent_id, target_agent_id, _ce_eg_reason)
+        _agent_cp_deny(audit_writer, caller_agent_id, "egress", _ce_eg)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "CLIENT_POLICY_DENIED", "reason": _ce_eg_reason,
+                     "target_agent_id": target_agent_id},
+            headers={"X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
+        )
 
     # Audit event
     if audit_writer is not None:

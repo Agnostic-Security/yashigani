@@ -8,6 +8,42 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [v2.25.3.1] — 2026-06-08
+
+Theme: **Durable agent registry + service-account model-listing control**.
+
+### Added
+
+- **feat(agents): durable agent registry** — the agent registry, reconciler, and durable store are hardened so registered agents survive a restart and reconcile cleanly. Migrations `0017_agent_registry_durable_shape` and `0018_drop_legacy_agent_name_unique` reshape the registry for durability. Regression coverage in `src/tests/regression/v2.25.3.1/test_agent_registry_durability.py`.
+- **feat(gateway): `gateway.models.service_account_full_list` runtime setting** — service-account identities (e.g. Open WebUI authenticating with the shared internal service bearer) receive a **RESTRICTED** `GET /v1/models` listing by default (their `allowed_models` allowlist only) as part of the internal-topology-disclosure hardening. Operators opt in — via admin Runtime Settings (step-up TOTP, audited), the API, or `YASHIGANI_MODELS_SERVICE_ACCOUNT_FULL_LIST` at install time — to receive the FULL model/agent/service listing and populate the Open WebUI model picker. This widens model **listing** only; it never changes which models a request may **call**, and never affects human/admin principals. Documented at `docs/yashigani_install_config.md` §21.4.
+
+### Changed
+
+- **chore(audit): audit schema, sink, and writer refinements** carried forward from the v2.25.3 line.
+
+---
+
+## [v2.25.3] — 2026-06-07
+
+Theme: **MCP broker hardening + OPA fail-close correctness + install/upgrade robustness**.
+
+### Added
+
+- **feat(mcp): MCP broker + signed server bundles through the gateway** — the MCP broker is wired into the gateway runtime with OPA-gated tool access, registry, and codegen; shipped server bundles are built as hardened images. Every MCP hop is policy-adjudicated, and a hard chain-depth ceiling is enforced as a policy constant with parity tests across the Docker and Kubernetes OPA bundles.
+
+### Security
+
+- **fix(opa): fail-close correctness** — retired the deny-override anti-pattern that produced `eval_conflict` 500s; closed path-traversal and default-deny inversions; made v1 sub-decisions fail closed; corrected stale chain-depth tests.
+- **feat(audit): least-privilege audit DB role + signed chain** — the audit writer runs under a least-privilege runtime database role with `PostgresSink` on the write path, so events land in an append-only, signed chain.
+- **fix(wazuh): TLS 1.3 floor on the SIEM link** — internal-CA mTLS provisioning for the Wazuh stack is fully codified into `install.sh` (no manual steps), with a TLS 1.3 minimum enforced on the indexer HTTP listener and the internal mesh.
+- **fix(inspection): decode-before-classify on the inference path** — response bodies are decoded before sensitivity classification so the inspection pipeline evaluates the real content.
+
+### Fixed
+
+- **fix(install): clean-slate and upgrade-path robustness** — GPU wired into Ollama via CDI on Podman, self-healing runtime-manifest bootstrap tokens, dual-wrap backup against read-only containers, and rootless-Podman PKI fixes, plus a local install-path regression gate.
+
+---
+
 ## [v2.25.2] — 2026-06-06
 
 Theme: **Wazuh SIEM hardening + install-path reliability + audit least-privilege + OPA durability**.

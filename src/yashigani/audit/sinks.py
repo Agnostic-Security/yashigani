@@ -48,6 +48,32 @@ _SIEM_DEFAULT_BATCH_SIZE = 50              # events per delivery batch
 _SIEM_BATCH_MIN = 1
 _SIEM_BATCH_MAX = 100
 
+# All-zeros tenant UUID used when an event carries no tenant_id (or a
+# non-UUID tenant such as the synthetic "internal" service identity).
+_NULL_TENANT_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
+
+def _coerce_uuid(v: Any) -> Optional[uuid.UUID]:
+    """Best-effort coerce a value to a uuid.UUID, else None.
+
+    FINDING F-AUDIT (owui-rbac-buildsheet §A2): the audit ``request_id`` column
+    is ``uuid`` (nullable), but Open WebUI chat completions set
+    request_id="chatcmpl-..." which is NOT a UUID.  The previous
+    ``uuid.UUID(str(req_id))`` raised ValueError, which bubbled up through
+    _flush_batch and dropped the ENTIRE audit INSERT for that event ("badly
+    formed hexadecimal UUID string").  Coercing a non-UUID correlation id to
+    None stores the row with request_id=NULL — the event (tenant/type/session/
+    agent/seq/hash-chain) is still captured rather than lost.
+
+    Returns None for None / non-UUID input; never raises.
+    """
+    if v is None:
+        return None
+    try:
+        return uuid.UUID(str(v))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
 
 class AuditSink(ABC):
     name: str
@@ -216,9 +242,17 @@ class PostgresSink(AuditSink):
                     # canonical ordering key; its value is DB-assigned (BIGSERIAL).
                     row = await conn.fetchrow(
                         INSERT_AUDIT_EVENT,
-                        uuid.UUID(str(tenant_id)),
+                        # FINDING F-AUDIT: tenant_id column is NOT NULL, so a
+                        # non-UUID tenant (e.g. the synthetic "internal" service
+                        # identity) must fall back to the all-zeros UUID rather
+                        # than crash the batch. Empty/missing already mapped to
+                        # the zeros UUID above (event.get(... ) or "0000...").
+                        (_coerce_uuid(tenant_id) or _NULL_TENANT_UUID),
                         event.get("event_type", "UNKNOWN"),
-                        uuid.UUID(str(req_id)) if req_id else None,
+                        # FINDING F-AUDIT: chat completions carry a non-UUID
+                        # correlation id (e.g. "chatcmpl-..."). Coerce to NULL
+                        # rather than raise + drop the whole audit row.
+                        _coerce_uuid(req_id),
                         event.get("session_id"),
                         event.get("agent_id"),
                         event.get("action", "UNKNOWN"),

@@ -16,21 +16,23 @@ auth_enabled: false
 
 server:
   http_listen_port: 3100
+  # gRPC is single-binary internal self-comms only (querier<->scheduler<->ingester).
+  # NOTHING external uses it — promtail/otel/grafana all use https://loki:3100.
+  # retro #84 put mTLS (RequireAndVerifyClientCert) here, which broke Loki's own
+  # internal gRPC clients (they don't present certs) -> "server preface EOF" ->
+  # query path dead -> logs 502. Bind gRPC to loopback (not network-exposed) and
+  # drop the gRPC TLS; the external HTTP surface (3100) keeps full mTLS.
+  grpc_listen_address: "127.0.0.1"
   grpc_listen_port: 9096
   log_level: warn
-  # retro #84: mTLS — Loki presents its own leaf cert; all clients must
-  # present a cert signed by the internal intermediate CA (Pattern B).
+  # retro #84: mTLS — Loki presents its own leaf cert on 3100; all HTTP clients
+  # must present a cert signed by the internal intermediate CA (Pattern B).
   http_tls_config:
     cert_file: /run/secrets/loki_client.crt
     key_file:  /run/secrets/loki_client.key
     client_ca_file: /run/secrets/ca_intermediate.crt
     # client_auth_type: RequireAndVerifyClientCert is the default when
     # client_ca_file is set in Loki 3.x; stated explicitly for clarity.
-    client_auth_type: RequireAndVerifyClientCert
-  grpc_tls_config:
-    cert_file: /run/secrets/loki_client.crt
-    key_file:  /run/secrets/loki_client.key
-    client_ca_file: /run/secrets/ca_intermediate.crt
     client_auth_type: RequireAndVerifyClientCert
 
 common:

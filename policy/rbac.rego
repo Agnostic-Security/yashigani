@@ -15,6 +15,7 @@ package yashigani
 
 import future.keywords.if
 import future.keywords.in
+import future.keywords.contains
 
 # ---------------------------------------------------------------------------
 # allow_rbac — true if the user is in a group that permits the request
@@ -58,3 +59,13 @@ _path_matches(glob, path) if {
     prefix := trim_suffix(glob, "/**")
     startswith(path, concat("", [prefix, "/"]))
 }
+
+# #4 — self-describing denial for the RBAC gate (same package `yashigani`,
+# contributes to the shared `denials` set consumed by the gateway deny response).
+denials contains {
+    "policy_id": "yashigani.rbac.group-permission",
+    "rule": "RBAC group permission",
+    "user_message": "Blocked by access policy: your group is not permitted to use this resource.",
+    "code": 403,
+    "action": "DENIED",
+} if { deny_rbac }

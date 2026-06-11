@@ -82,7 +82,27 @@ class PostgresLocalAuthService:
         username: str,
         auto_generate: bool = True,
         plaintext_password: Optional[str] = None,
+        *,
+        force_password_change: bool = True,
+        force_totp_provision: bool = True,
     ) -> tuple[AccountRecord, Optional[str]]:
+        """Create an admin account.
+
+        force_password_change / force_totp_provision default to True — the
+        normal human-admin posture (ASVS V2.1.x forced first-login rotation +
+        TOTP enrolment).
+
+        The install-path bootstrap service account (see
+        backoffice.app._bootstrap_admin_accounts) passes both as False. That
+        account is NON-INTERACTIVE: it is never logged into by a human, its
+        credential lives only in docker/secrets/ (CSPRNG-generated), and it is
+        used solely by install.sh's programmatic admin-API operations (agent
+        registration, RBAC seeding). Because no human ever rotates it, the
+        on-disk secret never goes stale — making install/agent-registration
+        re-runs robust against the human admin's first-login rotation. This
+        does NOT weaken the human's forced rotation, which still applies to
+        every account created with the defaults.
+        """
         plaintext = plaintext_password or (generate_password(36) if auto_generate else None)
         if plaintext is None:
             raise ValueError("Must provide password or set auto_generate=True")
@@ -97,8 +117,8 @@ class PostgresLocalAuthService:
             recovery_codes=None,
             account_tier="admin",
             email=username,
-            force_password_change=True,
-            force_totp_provision=True,
+            force_password_change=force_password_change,
+            force_totp_provision=force_totp_provision,
         )
         await self._insert(record)
         return record, plaintext if auto_generate else None

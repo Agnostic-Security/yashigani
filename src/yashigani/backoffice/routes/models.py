@@ -18,6 +18,7 @@ Model alias and allocation changes affect routing policy and sensitivity ceiling
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
@@ -127,6 +128,50 @@ async def list_available_models(session: AdminSession):
     except Exception as exc:
         logger.warning("Failed to list Ollama models: %s", exc)
     return {"models": []}
+
+
+class PullModelRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+def _ollama_base() -> str:
+    return (os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL")
+            or "http://ollama:11434").rstrip("/")
+
+
+@router.post("/pull", status_code=202)
+async def pull_model(body: PullModelRequest, session: StepUpAdminSession):
+    """#25: pull an Ollama model into the local model store (operational complement
+    to GET /available). Step-up gated. Consumes Ollama's NDJSON pull stream to
+    completion and returns the final status; fail-closed on any error/unreachable."""
+    import httpx
+    import json as _json
+    name = body.name.strip()
+    base = _ollama_base()
+    last: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+            async with client.stream("POST", base + "/api/pull",
+                                     json={"name": name, "stream": True}) as resp:
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=502,
+                                        detail={"error": "pull_failed", "status": resp.status_code})
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        last = _json.loads(line)
+                    except Exception:
+                        continue
+                    if last.get("error"):
+                        raise HTTPException(status_code=502,
+                                            detail={"error": "pull_error", "message": last["error"]})
+    except httpx.HTTPError as exc:
+        logger.warning("model pull failed for %s: %s", name, exc)
+        raise HTTPException(status_code=503,
+                            detail={"error": "ollama_unreachable", "message": "Could not reach Ollama."})
+    logger.info("Admin %s pulled model %s (status=%s)", session.account_id, name, last.get("status"))
+    return {"status": "ok", "model": name, "ollama_status": last.get("status", "success")}
 
 
 @router.get("/allocations")

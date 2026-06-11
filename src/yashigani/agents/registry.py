@@ -82,8 +82,14 @@ redis.call("SADD", KEYS[1], agent_id)
 return 1
 """
 
-    def __init__(self, redis_client) -> None:
+    def __init__(self, redis_client, durable_store=None) -> None:
         self._r = redis_client
+        # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): optional durable
+        # Postgres mirror. When wired, register/update/deactivate dual-write to
+        # Postgres so a Redis db/3 wipe (it runs appendonly no / save "") can be
+        # reconciled back on startup. None in tests / pre-DB-pool init paths —
+        # the registry then behaves exactly as before (Redis-only).
+        self._durable = durable_store
         total = self._r.scard("agent:index:all") or 0
         logger.info("AgentRegistry initialised: %d agent(s) in index", total)
         # V232-CSCAN-01a migration check: warn on names that pre-date the slug constraint.
@@ -199,6 +205,37 @@ return 1
             raise
 
         logger.info("AgentRegistry: registered %s (%s)", agent_id, name)
+
+        # ISSUE-AGENT-REG-DURABILITY: dual-write to the durable Postgres mirror
+        # (including the bcrypt token_hash) so this registration survives a Redis
+        # db/3 wipe. The Redis write above is the request-time source; Postgres
+        # is the durability anchor reconciled on startup. Best-effort: a durable
+        # write failure must NOT roll back a successful Redis registration (the
+        # agent still works right now), but it IS logged loudly so the operator
+        # can re-trigger before the next redis recreate.
+        if self._durable is not None:
+            try:
+                self._durable.upsert(
+                    {
+                        "agent_id": agent_id,
+                        "name": name,
+                        "upstream_url": upstream_url,
+                        "protocol": protocol,
+                        "status": "active",
+                        "groups": groups,
+                        "allowed_caller_groups": allowed_caller_groups,
+                        "allowed_paths": allowed_paths,
+                        "allowed_cidrs": allowed_cidrs or [],
+                    },
+                    token_hash=token_hash,
+                )
+            except Exception as exc:
+                logger.error(
+                    "AgentRegistry: DURABLE write failed for %s (%s) — agent is live in "
+                    "Redis but will NOT survive a redis recreate until re-registered: %s",
+                    agent_id, name, exc,
+                )
+
         return agent_id, plaintext_token
 
     # ── Reads ─────────────────────────────────────────────────────────────────
@@ -261,6 +298,19 @@ return 1
         if mapping:
             self._r.hset(reg_key, mapping=mapping)
             logger.info("AgentRegistry: updated %s fields=%s", agent_id, list(fields.keys()))
+            # ISSUE-AGENT-REG-DURABILITY: mirror the metadata update into Postgres
+            # (token_hash unchanged → None). Read the full post-update hash back so
+            # the durable row reflects every field, not just the changed ones.
+            if self._durable is not None:
+                try:
+                    agent = self.get(agent_id)
+                    if agent is not None:
+                        self._durable.upsert(agent, token_hash=None)
+                except Exception as exc:
+                    logger.error(
+                        "AgentRegistry: DURABLE update failed for %s — Postgres mirror "
+                        "stale until next mutation: %s", agent_id, exc,
+                    )
 
     def deactivate(self, agent_id: str) -> None:
         """Set status=inactive and remove from active index."""
@@ -268,6 +318,75 @@ return 1
         self._r.hset(reg_key, b"status", b"inactive")
         self._r.srem("agent:index:active", agent_id.encode("utf-8"))
         logger.info("AgentRegistry: deactivated %s", agent_id)
+        # ISSUE-AGENT-REG-DURABILITY: mirror the status change into Postgres.
+        if self._durable is not None:
+            try:
+                self._durable.set_status(agent_id, "inactive")
+            except Exception as exc:
+                logger.error(
+                    "AgentRegistry: DURABLE deactivate failed for %s — Postgres mirror "
+                    "stale until next mutation: %s", agent_id, exc,
+                )
+
+    # ── Reconcile (ISSUE-AGENT-REG-DURABILITY) ─────────────────────────────────
+
+    def restore_from_durable(self, agent: dict, token_hash: str) -> None:
+        """Re-materialise one durable agent row into Redis db/3 (idempotent).
+
+        Called by the startup reconciler (AgentReconciler) when Redis db/3 has
+        been wiped but Postgres still holds the registration. Writes the agent
+        hash, the bcrypt token_hash, and the index-set memberships WITHOUT going
+        through register() — register() would mint a NEW agent_id and a NEW token,
+        breaking every caller's stored PSK. We restore the EXACT stored hash so
+        existing agent tokens keep working.
+
+        Does not enforce the licence limit: this is a restore of already-licensed
+        registrations, not a new registration. Idempotent — re-running overwrites
+        with identical data.
+        """
+        agent_id = agent["agent_id"]
+        reg_key = f"agent:reg:{agent_id}"
+        token_key = f"agent:token:{agent_id}"
+        status = agent.get("status") or "active"
+
+        mapping = {
+            b"name": str(agent.get("name", "")).encode("utf-8"),
+            b"upstream_url": str(agent.get("upstream_url", "")).encode("utf-8"),
+            b"protocol": str(agent.get("protocol") or "openai").encode("utf-8"),
+            b"status": status.encode("utf-8"),
+            b"created_at": str(agent.get("created_at", "") or _now_iso()).encode("utf-8"),
+            b"last_seen_at": str(agent.get("last_seen_at", "")).encode("utf-8"),
+            b"groups": json.dumps(agent.get("groups", [])).encode("utf-8"),
+            b"allowed_caller_groups": json.dumps(agent.get("allowed_caller_groups", [])).encode("utf-8"),
+            b"allowed_paths": json.dumps(agent.get("allowed_paths", [])).encode("utf-8"),
+            b"allowed_cidrs": json.dumps(agent.get("allowed_cidrs", [])).encode("utf-8"),
+        }
+        pipe = self._r.pipeline()
+        pipe.hset(reg_key, mapping=mapping)
+        pipe.set(token_key, token_hash.encode("utf-8"))
+        pipe.sadd("agent:index:all", agent_id.encode("utf-8"))
+        if status == "active":
+            pipe.sadd("agent:index:active", agent_id.encode("utf-8"))
+        else:
+            pipe.srem("agent:index:active", agent_id.encode("utf-8"))
+        pipe.execute()
+        logger.info("AgentRegistry: restored %s (%s) into Redis db/3 from durable store",
+                    agent_id, agent.get("name", ""))
+
+    def get_token_hash(self, agent_id: str) -> Optional[str]:
+        """Return the stored bcrypt token_hash for an agent, or None.
+
+        Used by the durability back-fill (ISSUE-AGENT-REG-DURABILITY) to seed the
+        durable Postgres store from agents that already exist in Redis db/3 but
+        pre-date the dual-write (e.g. the letta/langflow agents registered at
+        install before this fix landed). NEVER returns plaintext — only the
+        bcrypt hash, exactly as stored.
+        """
+        token_key = f"agent:token:{agent_id}"
+        stored = self._r.get(token_key)
+        if not stored:
+            return None
+        return stored.decode("utf-8") if isinstance(stored, bytes) else stored
 
     # ── Token operations ──────────────────────────────────────────────────────
 
@@ -303,6 +422,20 @@ return 1
         token_key = f"agent:token:{agent_id}"
         self._r.set(token_key, token_hash.encode("utf-8"))
         logger.info("AgentRegistry: token rotated for %s", agent_id)
+        # ISSUE-AGENT-REG-DURABILITY: persist the new token_hash to Postgres so a
+        # post-rotation redis recreate reconciles the ROTATED hash, not the old
+        # one (which would leave the agent's current token rejected).
+        if self._durable is not None:
+            try:
+                agent = self.get(agent_id)
+                if agent is not None:
+                    self._durable.upsert(agent, token_hash=token_hash)
+            except Exception as exc:
+                logger.error(
+                    "AgentRegistry: DURABLE token-rotation write failed for %s — durable "
+                    "store holds the OLD hash; rotate again after fixing Postgres: %s",
+                    agent_id, exc,
+                )
         return plaintext_token
 
     # ── Counts ────────────────────────────────────────────────────────────────

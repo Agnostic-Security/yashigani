@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import types as _types
 from dataclasses import dataclass
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -399,6 +400,36 @@ class McpBroker:
                 )
                 await self._emit_audit(ctx, git_decision)
                 return git_decision
+
+        # Step 2d (#16): client-policy enforcement — mcp_server scope, INGRESS.
+        # Runs AFTER the global mcp_decision + per-tool gates; deny-only, fail-closed;
+        # no-op when this MCP server has no bound client policies. scope_id = the
+        # MCP server's agent_name.
+        from yashigani.gateway._client_enforce import evaluate_client_policies
+        _ce = await evaluate_client_policies(
+            _types.SimpleNamespace(opa_url=self._opa_url), "mcp_server", ctx.agent_name, "ingress",
+            {"identity": {"agent": ctx.agent_name},
+             "request": {"action": ctx.action, "tool": ctx.tool_name or ""}},
+        )
+        if not _ce.get("allow", False):
+            _ce_reason = ("client_policy:" + ",".join(_ce.get("deny", []) or ["denied"])).encode("ascii", "replace").decode("ascii")
+            _ce_elapsed = int((time.monotonic() - t0) * 1000)
+            ce_decision = BrokerDecision(
+                call_id=call_id,
+                allow=False,
+                deny_reason=_ce_reason,
+                opa_decision=OpaDecision(
+                    allow=False, deny_reason=_ce_reason, redact_args=set(),
+                    audit_capture=True, rate_limit_key=None,
+                ),
+                chain_depth=len(chain_for_opa),
+                elapsed_ms=_ce_elapsed,
+                error=None,
+            )
+            logger.info("mcp-broker: [#16] client-policy denied call_id=%s server=%s reason=%s",
+                        call_id, ctx.agent_name, _ce_reason)
+            await self._emit_audit(ctx, ce_decision)
+            return ce_decision
 
         # Step 3: issue gateway-signed JWT (only on OPA allow)
         #

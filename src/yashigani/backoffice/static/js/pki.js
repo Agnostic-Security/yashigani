@@ -38,45 +38,57 @@ async function loadPkiStatus() {
         return;
     }
 
-    var html = '<div style="margin-bottom:12px;font-size:0.85rem;color:#475569;">'
-        + 'CA Mode: <strong>' + escapeHtml(caMode) + '</strong>'
+    // CA Mode banner — prominent, on top (issuing authority for all certs).
+    var html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;">'
+        + '<span style="font-size:0.75rem;color:#475569;text-transform:uppercase;letter-spacing:0.05em;">CA Mode</span>'
+        + '<strong style="font-size:1rem;color:#1e3a8a;">' + escapeHtml(caMode) + '</strong>'
+        + '<span style="font-size:0.78rem;color:#64748b;margin-left:auto;">Issuing authority for all service certificates</span>'
         + '</div>';
 
-    html += '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
-        + '<thead><tr style="background:#f1f5f9;text-align:left;">'
-        + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Service</th>'
-        + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Status</th>'
-        + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Expires</th>'
-        + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Actions</th>'
-        + '</tr></thead><tbody>';
-
-    services.forEach(function(svc) {
-        var statusBadge;
-        if (svc.error) {
-            statusBadge = '<span class="badge badge-red">Error</span>';
-        } else if (svc.needs_renewal) {
-            statusBadge = '<span class="badge badge-yellow">Renewal needed</span>';
-        } else {
-            statusBadge = '<span class="badge badge-green">OK</span>';
-        }
-
-        var expiresStr = svc.not_after
+    function badgeFor(svc) {
+        if (svc.error) { return '<span class="badge badge-red">Error</span>'; }
+        if (svc.needs_renewal) { return '<span class="badge badge-yellow">Renewal needed</span>'; }
+        return '<span class="badge badge-green">OK</span>';
+    }
+    function expiresFor(svc) {
+        return svc.not_after
             ? escapeHtml(svc.not_after.replace('T', ' ').replace(/\+.*$/, ' UTC').replace(/\.\d+/, ''))
             : (svc.error ? '<span style="color:#ef4444">Unknown</span>' : '—');
-
-        html += '<tr style="border-bottom:1px solid #f1f5f9;">'
+    }
+    function rowHtml(svc) {
+        return '<tr style="border-bottom:1px solid #f1f5f9;">'
             + '<td style="padding:8px 12px;font-family:monospace;">' + escapeHtml(svc.service) + '</td>'
-            + '<td style="padding:8px 12px;">' + statusBadge + '</td>'
-            + '<td style="padding:8px 12px;font-size:0.8rem;color:#475569;">' + expiresStr + '</td>'
+            + '<td style="padding:8px 12px;">' + badgeFor(svc) + '</td>'
+            + '<td style="padding:8px 12px;font-size:0.8rem;color:#475569;">' + expiresFor(svc) + '</td>'
             + '<td style="padding:8px 12px;">'
-            + '<button class="btn btn-sm" onclick="showPkiChain(' + JSON.stringify(svc.service) + ')" style="margin-right:4px;">View</button>'
-            + '<button class="btn btn-sm btn-warning" onclick="pkiRotate(' + JSON.stringify(svc.service) + ')" style="margin-right:4px;">Rotate</button>'
-            + '<button class="btn btn-sm" onclick="pkiDownloadBundle(' + JSON.stringify(svc.service) + ')">Download</button>'
-            + '</td>'
-            + '</tr>';
-    });
+            + '<button class="btn btn-sm" data-action="pkiView" data-service="' + escapeHtml(svc.service) + '" style="margin-right:4px;">View</button>'
+            + '<button class="btn btn-sm btn-warning" data-action="pkiRotate" data-service="' + escapeHtml(svc.service) + '" style="margin-right:4px;">Rotate</button>'
+            + '<button class="btn btn-sm" data-action="pkiDownload" data-service="' + escapeHtml(svc.service) + '">Download</button>'
+            + '</td></tr>';
+    }
+    function tableHtml(rowsHtml) {
+        return '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+            + '<thead><tr style="background:#f1f5f9;text-align:left;">'
+            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Service</th>'
+            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Status</th>'
+            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Expires</th>'
+            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Actions</th>'
+            + '</tr></thead><tbody>' + rowsHtml + '</tbody></table>';
+    }
 
-    html += '</tbody></table>';
+    // Front-end certificate = the Caddy edge that terminates TLS for the admin UI
+    // AND the Open WebUI data plane — the cert users' browsers actually see.
+    // Surface it separately from the internal service mesh certs.
+    var frontend = services.filter(function(s) { return s.service === 'caddy'; });
+    var internal = services.filter(function(s) { return s.service !== 'caddy'; });
+
+    if (frontend.length) {
+        html += '<h3 style="margin:0 0 6px;font-size:0.95rem;">Front-end certificate '
+            + '<span style="font-weight:400;color:#64748b;font-size:0.8rem;">(browser-facing — admin UI &amp; Open WebUI edge)</span></h3>';
+        html += tableHtml(frontend.map(rowHtml).join(''));
+    }
+    html += '<h3 style="margin:16px 0 6px;font-size:0.95rem;">Internal service certificates</h3>';
+    html += tableHtml(internal.map(rowHtml).join(''));
     container.innerHTML = html;
 }
 
@@ -126,7 +138,7 @@ async function showPkiChain(serviceName) {
     var html = '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin-top:12px;">'
         + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
         + '<strong>Chain details — ' + escapeHtml(serviceName) + '</strong>'
-        + '<button class="btn btn-sm" onclick="hidePkiChain()" style="font-size:0.75rem;">Close</button>'
+        + '<button class="btn btn-sm" data-action="pkiClose" style="font-size:0.75rem;">Close</button>'
         + '</div>'
         + tableHtml
         + '</div>';
