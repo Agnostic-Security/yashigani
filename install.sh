@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="2.25.3.1"
+YASHIGANI_VERSION="3.0.0"
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 # MI-1: record whether the operator pinned YSG_INSTALL_DIR explicitly in the

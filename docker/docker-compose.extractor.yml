@@ -30,7 +30,7 @@ services:
     # extractor image tracks automatically.  install.sh builds + tags this as
     # part of the release image set (compose_pull step), so the image EXISTS
     # when the operator flips YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true.
-    image: yashigani/extractor:${YASHIGANI_VERSION:-2.25.3}
+    image: yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}
     build:
       context: ..
       dockerfile: docker/Dockerfile.extractor
@@ -48,7 +48,7 @@ services:
       # Point the runner at the built, digest-pinnable image (Verification §7).
       # Tracks ${YASHIGANI_VERSION} so the runner names the same tag install.sh
       # built; the release pipeline can pin this to @sha256 in the deploy job.
-      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-2.25.3}"
+      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
       # Per-job hardening caps (fail-closed defaults; tune per host capacity).
       YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"     # wall-clock kill
       YASHIGANI_EXTRACTOR_MEM_LIMIT: "512m"   # cgroup mem kill (no host OOM)
