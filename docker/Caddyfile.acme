@@ -32,6 +32,18 @@
 #   docs/yashigani_install_config.md Section 26.
 
 {
+    # ── Public-edge SNI defaulting (TLS fix, 2026-06-11) ───────────────────
+    # Identical mechanism to Caddyfile.selfsigned: client_auth (verify_if_given)
+    # on the public site compiles an SNI-matched TLS policy plus an empty catch-
+    # all, so a no-SNI / mismatched-SNI / direct-IP handshake aborts with `tlsv1
+    # alert internal error` / RECORD_LAYER_FAILURE. In ACME mode browsers send the
+    # real DNS SNI and pass; default_sni/fallback_sni recover the no-SNI and
+    # direct-IP cases (and any health-probe that omits SNI). The publicly-trusted
+    # ACME cert is still selected by SAN/CN. Safe: single path-routed edge, no
+    # host vhosting. (Selfsigned mode is the runtime-verified path for this fix.)
+    default_sni {$YASHIGANI_TLS_DOMAIN}
+    fallback_sni {$YASHIGANI_TLS_DOMAIN}
+
     # ── Admin API — unix socket only (MUST-4 / v2.24.1 hardening) ───────────
     # TCP :2019 removed. Filesystem permissions are the auth gate.
     # In-container tooling (healthcheck, reload) uses the socket directly.
@@ -46,6 +58,19 @@
             write       30s
             idle        120s
         }
+        # ── SNI-host enforcement (public-edge TLS fix, 2026-06-11) ──────────
+        # The public site configures client_auth (verify_if_given) to extract a
+        # SPIFFE URI from an optionally-presented client cert on /agents/* + /v1/*.
+        # Caddy AUTO-ENABLES strict SNI-host enforcement on any server that has
+        # client_auth configured, which REJECTS the TLS handshake (`tlsv1 alert
+        # internal error` / RECORD_LAYER_FAILURE) for every connection whose SNI
+        # != the site host. In ACME mode browsers send the real DNS SNI and pass,
+        # but NO-SNI clients and direct-IP access still fail without this. SAN /
+        # CN matching at the cert layer still applies. `insecure_off` disables the
+        # SNI-host *match* gate: safe here (single path-routed site, no host
+        # vhosting → no host-confusion class). verify_if_given SPIFFE extraction
+        # and mesh listeners :8444/:8445 are unaffected. See Caddyfile.selfsigned.
+        strict_sni_host insecure_off
     }
 }
 

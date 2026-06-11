@@ -18,6 +18,23 @@
     # Use Caddy's internal CA for self-signed certs (no ACME)
     local_certs
 
+    # ── Public-edge SNI defaulting (TLS fix, 2026-06-11) ───────────────────
+    # The public :443 site sets client_auth (verify_if_given) to extract a SPIFFE
+    # URI from an optionally-presented client cert on /agents/* + /v1/*. Caddy
+    # then compiles an SNI-matched TLS connection policy ({sni:[<domain>]}) plus an
+    # EMPTY catch-all. Any handshake with NO SNI, or an SNI != <domain> (a browser/
+    # curl/in-network client reaching the edge by IP, the real hostname, or no SNI)
+    # falls to the empty catch-all and aborts with `tlsv1 alert internal error` /
+    # RECORD_LAYER_FAILURE — which took the public /v1 + admin/OWUI UI down over
+    # TLS for everything except a literal SNI=<domain>. default_sni folds the
+    # no-SNI ("") case into the cert-bearing policy; fallback_sni serves the
+    # <domain> cert when a connection presents a non-matching SNI. Together they
+    # make the self-signed/internal edge cert reachable for every client. Safe:
+    # single path-routed edge, no host-based vhosting. verify_if_given SPIFFE
+    # extraction unchanged; mesh listeners :8444/:8445 (port-matched) unaffected.
+    default_sni {$YASHIGANI_TLS_DOMAIN}
+    fallback_sni {$YASHIGANI_TLS_DOMAIN}
+
     # ── Admin API — unix socket only (MUST-4 / v2.24.1 hardening) ───────────
     # TCP :2019 removed. Filesystem permissions are the auth gate.
     # In-container tooling (healthcheck, reload) uses the socket directly.
@@ -32,6 +49,23 @@
             write       30s
             idle        120s
         }
+        # ── SNI-host enforcement (public-edge TLS fix, 2026-06-11) ──────────
+        # The public localhost:443 site configures client_auth (verify_if_given)
+        # to extract a SPIFFE URI from an optionally-presented client cert on the
+        # /agents/* and /v1/* paths. Caddy AUTO-ENABLES strict SNI-host enforcement
+        # on any server that has client_auth configured. With strict enforcement,
+        # Caddy REJECTS the TLS handshake (`tlsv1 alert internal error` /
+        # RECORD_LAYER_FAILURE) for every connection whose SNI != the site host
+        # (localhost) — i.e. browsers/curl/in-network clients reaching the edge by
+        # IP, by the real hostname, or with NO SNI all fail. This broke the public
+        # /v1 + admin/OWUI UI over TLS for everything except literal SNI=localhost.
+        # `insecure_off` disables the SNI-host *match* gate. It is safe here: this
+        # edge serves a SINGLE site and routes purely on path — there is no
+        # host-based virtual hosting to confuse, so the host-confusion class the
+        # "insecure" label warns about does not apply. mTLS verify_if_given (the
+        # SPIFFE extraction) is unaffected. Mesh listeners :8444/:8445 are
+        # single-cert, port-matched, no vhosting — also unaffected.
+        strict_sni_host insecure_off
     }
 }
 
