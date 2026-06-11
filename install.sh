@@ -5261,21 +5261,26 @@ _warm_ollama_models() {
 
   # Helper: warm a single model via /api/generate with keep_alive:-1.
   # Runs inside the container so no host-side curl dependency.
-  # Timeout via bash `read -t` loop so a hung model doesn't stall forever.
+  # Uses bash /dev/tcp with a single bidirectional fd (exec 3<>/dev/tcp) so
+  # the request and response share one TCP connection (HTTP/1.0 compliant).
   _warm_one_model() {
     local _model="$1"
     log_info "  warming ${_model} ..."
     local _rc=0
     # POST /api/generate with a 1-token prompt; keep_alive:-1 loads resident.
-    # Use bash /dev/tcp (available in the ollama image) so no curl needed.
+    # exec 3<>/dev/tcp opens one fd for both write and read on a single socket.
+    # stream:false means the server sends one JSON line then closes. We read
+    # until EOF so we wait for the full response (model load + inference).
     timeout "${_timeout_s}" \
       "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T ollama \
       bash -c "
-        printf 'POST /api/generate HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s' \
-          \"\$(printf '{\"model\":\"%s\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}' '${_model}' | wc -c)\" \
-          \"\$(printf '{\"model\":\"%s\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}' '${_model}')\" \
-          >/dev/tcp/localhost/11434 2>/dev/null
-        cat /dev/tcp/localhost/11434 2>/dev/null | tail -1
+        PAYLOAD=\$(printf '{\"model\":\"%s\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}' '${_model}')
+        LEN=\$(printf '%s' \"\$PAYLOAD\" | wc -c)
+        exec 3<>/dev/tcp/localhost/11434
+        printf 'POST /api/generate HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s' \"\$LEN\" \"\$PAYLOAD\" >&3
+        # Read full response to stdout (waits for server close = model loaded)
+        cat <&3
+        exec 3>&-
       " >/dev/null 2>&1 || _rc=$?
     if [[ "$_rc" -eq 0 ]]; then
       log_success "  ${_model} warm"
