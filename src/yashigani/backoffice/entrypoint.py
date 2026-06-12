@@ -547,13 +547,25 @@ def _bootstrap():
         logger.warning("Identity broker init failed (%s) — SSO routes will return 503", exc)
 
     # v2.1 — Identity registry (Redis db/3, shared with RBAC)
+    # B1 follow-on (2.25.5): wire IdentityDurableStore so create/update/delete
+    # dual-write to Postgres and the startup reconciler can re-hydrate Redis
+    # after a volume-deletion.
     try:
         from yashigani.identity.registry import IdentityRegistry
+        from yashigani.identity.durable_store import IdentityDurableStore
         import redis as _redis
         redis_identity_url = _backoffice_redis_url(3)
         redis_identity_client = _redis.from_url(redis_identity_url, decode_responses=False)
-        backoffice_state.identity_registry = IdentityRegistry(redis_client=redis_identity_client)
-        logger.info("Identity registry initialised")
+        _id_durable_bo = None
+        try:
+            _id_durable_bo = IdentityDurableStore()
+        except Exception as _de_bo:
+            logger.warning("IdentityDurableStore unavailable (%s) — Redis-only mode", _de_bo)
+        backoffice_state.identity_registry = IdentityRegistry(
+            redis_client=redis_identity_client,
+            durable_store=_id_durable_bo,
+        )
+        logger.info("Identity registry initialised (durable_store=%s)", "wired" if _id_durable_bo else "off")
     except Exception as exc:
         logger.warning("Identity registry init failed (%s) — SSO identity resolution disabled", exc)
 
