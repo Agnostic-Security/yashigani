@@ -746,6 +746,26 @@ async def lifespan(app: FastAPI):
             "return agent_not_found until the registry is restored", _areconcile_exc
         )
 
+    # B1 follow-on (2.25.5) — IdentityDurableStore startup reconcile.
+    # Re-hydrates identities from Postgres into Redis db/3 if they are absent.
+    # Protects against volume-deletion (beyond Su's AOF recreate fix).
+    try:
+        _id_reg = getattr(backoffice_state, "identity_registry", None)
+        _id_durable = getattr(_id_reg, "_durable", None) if _id_reg else None
+        if _id_reg is not None and _id_durable is not None:
+            from yashigani.identity.durable_store import reconcile_identities_from_durable
+            reconcile_identities_from_durable(_id_reg, _id_durable)
+        else:
+            _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                "IDENTITY-RECONCILE: identity_registry or durable store not wired — "
+                "identities will NOT auto-restore after a volume-deletion"
+            )
+    except Exception as _ireconcile_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "IDENTITY-RECONCILE: startup reconcile FAILED (%s) — identities may be "
+            "absent from Redis until restored manually", _ireconcile_exc
+        )
+
     yield
 
     # Shutdown

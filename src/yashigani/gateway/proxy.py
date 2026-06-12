@@ -641,6 +641,13 @@ async def _proxy_request_body(
         _audit_request(audit_writer, request_id, "BLOCKED", "body_too_large", request, path)
         return _error_response(request_id, 413, "REQUEST_BODY_TOO_LARGE")
 
+    # Observe inference payload size (best-effort — never block on metric failure)
+    try:
+        from yashigani.metrics.registry import inference_payload_bytes
+        inference_payload_bytes.observe(len(body_bytes))
+    except Exception:
+        pass
+
     # 2. Extract session / API key identity
     session_id, agent_id, user_id = _extract_identity(request)
     # Prefer JWT sub over header-provided user_id

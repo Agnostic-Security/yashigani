@@ -347,6 +347,26 @@ class OptimizationEngine:
             "OE decision: %s/%s (%s) rule=%s reason=%s [%dus]",
             provider, model, route, rule, reason, elapsed_us,
         )
+
+        # Emit Prometheus metrics for every routing decision (best-effort).
+        try:
+            from yashigani.metrics.registry import (
+                yashigani_routing_decisions_total,
+                yashigani_sensitivity_detections_total,
+                yashigani_complexity_scores_total,
+            )
+            yashigani_routing_decisions_total.labels(
+                rule=rule, route=route
+            ).inc()
+            yashigani_sensitivity_detections_total.labels(
+                level=sensitivity.level.value
+            ).inc()
+            yashigani_complexity_scores_total.labels(
+                level=complexity.level.value
+            ).inc()
+        except Exception:  # noqa: BLE001 — metric must never break routing
+            pass
+
         return decision
 
     def update_aliases(self, aliases: dict[str, tuple[str, str, bool]]) -> None:
