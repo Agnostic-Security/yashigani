@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.24.1 — Docker Compose stack
+# Last updated: 2026-06-13T00:00:00+01:00 (fix(redis): B1 — enable AOF+volatile-lru on main redis; identities/agents/allocations survive --upgrade container recreate)
 # Last updated: 2026-05-24T12:00:00+01:00 (security(secrets): PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets mount removed; closes NICO-V241-001 + YSG-RISK-060)
 # Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
 # Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
@@ -952,10 +953,10 @@ services:
       --tls-ca-cert-file /run/secrets/ca_root.crt
       --tls-auth-clients yes
       --tls-protocols "TLSv1.2 TLSv1.3"
-      --save ""
-      --appendonly no
+      --appendonly yes
+      --appendfsync everysec
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
       --requirepass "$$(cat /run/secrets/redis_password)"'
     volumes:
       - redis_data:/data

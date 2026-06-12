@@ -5485,7 +5485,18 @@ compose_up() {
     # Declared set of enabled optional-service profiles, for the backoffice
     # Optional Services panel (observational; the hardened container can't probe
     # Docker). Assemble from agent bundles + the per-flag opt-ins.
+    # B13 FIX: on --upgrade, seed from existing .env value first (see runtime-
+    # agnostic block below for the authoritative fix; this Podman-only block is
+    # updated for consistency).
     local _enabled_profiles=()
+    if [[ "${UPGRADE:-false}" == "true" ]]; then
+      local _existing_ep_podman
+      _existing_ep_podman="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$env_file" 2>/dev/null | sed 's/^YASHIGANI_ENABLED_PROFILES=//' || true)"
+      if [[ -n "$_existing_ep_podman" ]]; then
+        IFS=',' read -ra _existing_ep_podman_arr <<< "$_existing_ep_podman"
+        _enabled_profiles+=("${_existing_ep_podman_arr[@]}")
+      fi
+    fi
     [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _enabled_profiles+=("${COMPOSE_PROFILES[@]}")
     [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _enabled_profiles+=("openwebui")
     [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _enabled_profiles+=("wazuh")
@@ -5602,7 +5613,25 @@ compose_up() {
   fi
   export YASHIGANI_PUBLIC_URL="$_pub_url_rt"
 
+  # B13 FIX (2026-06-13): On --upgrade the operator does not re-pass --wazuh /
+  # --with-openwebui / --agent-bundles, so INSTALL_WAZUH/INSTALL_OPENWEBUI/
+  # COMPOSE_PROFILES are all empty/false here — the old code overwrote
+  # YASHIGANI_ENABLED_PROFILES with an empty value, making every deployed
+  # service appear as "Not Deployed" in the Optional Services panel.
+  # Fix: on --upgrade, seed the profile list from the existing .env value so the
+  # already-deployed set is preserved, then merge in any newly-selected profiles
+  # (idempotent; dedup handles duplicates). On fresh install the existing value
+  # is absent so the behaviour is unchanged.
   local _ep_rt=()
+  if [[ "${UPGRADE:-false}" == "true" ]]; then
+    local _existing_ep
+    _existing_ep="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$_env_file_rt" 2>/dev/null | sed 's/^YASHIGANI_ENABLED_PROFILES=//' || true)"
+    if [[ -n "$_existing_ep" ]]; then
+      IFS=',' read -ra _existing_ep_arr <<< "$_existing_ep"
+      _ep_rt+=("${_existing_ep_arr[@]}")
+      log_info "Upgrade: seeding enabled profiles from existing .env: ${_existing_ep}"
+    fi
+  fi
   [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _ep_rt+=("${COMPOSE_PROFILES[@]}")
   [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _ep_rt+=("openwebui")
   [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _ep_rt+=("wazuh")
