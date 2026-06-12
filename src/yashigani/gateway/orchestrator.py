@@ -1465,10 +1465,27 @@ def _intersect_catalog(catalog, requested_names: set[str]):
 def _orchestrator_model(body) -> str:
     """The brain model.  Use the caller's `model` if it is a concrete local model;
     otherwise default to qwen2.5:3b (the deterministic tool-calling brain, Design B).
+
+    B7 fix (2.25.5): resolve model aliases before returning.  Previously an alias
+    like "qwen25-3b" was passed verbatim to Ollama, which does not recognise aliases
+    (only concrete model names) and returns an error.  Now look up the alias in the
+    model_alias_store and return the concrete target model name.  If the alias store
+    is unavailable or the name is not an alias, return the name unchanged (backward
+    compatible).
     """
     from yashigani.gateway.openai_router import _state
     m = (body.model or "").strip()
     if m and not m.startswith("@"):
+        # Attempt alias resolution — fail-safe: if the store is absent or lookup
+        # fails, return the name as-is (concrete model names pass through unchanged).
+        alias_store = getattr(_state, "model_alias_store", None)
+        if alias_store is not None:
+            try:
+                entry = alias_store.get(m)
+                if entry is not None and entry.model:
+                    return entry.model
+            except Exception as exc:
+                logger.warning("_orchestrator_model: alias lookup failed for %r (%s) — using as-is", m, exc)
         return m
     return _state.default_model or "qwen2.5:3b"
 

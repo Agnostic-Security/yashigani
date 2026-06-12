@@ -120,31 +120,38 @@ AUTH = {"Authorization": f"Bearer {BEARER}"}
 
 
 def test_t1_bearer_plus_email_resolves_registered_user():
+    """B5 fix: slug is now canonical email_to_slug("alice@corp.example")
+    = "alice-corp-example", not the local-part "alice"."""
     mod = _load_router_with_env({})
-    alice = _mk_identity("alice", groups=["engineering"],
+    # Register under the canonical slug, as the login handler does.
+    alice = _mk_identity("alice-corp-example", groups=["engineering"],
                          allowed_models=["gpt-4o"], sensitivity_ceiling="CONFIDENTIAL")
-    mod._state.identity_registry = _FakeRegistry({"alice": alice})
+    mod._state.identity_registry = _FakeRegistry({"alice-corp-example": alice})
     req = _FakeRequest({**AUTH, "X-OpenWebUI-User-Email": "alice@corp.example"})
     out = mod._resolve_identity(req)
     assert out is not None
-    assert out["identity_id"] == "id-alice"
+    assert out["identity_id"] == "id-alice-corp-example"
     assert out["allowed_models"] == ["gpt-4o"]
     assert out["sensitivity_ceiling"] == "CONFIDENTIAL"
     assert out["_owui_forwarded"] is True
 
 
 def test_t2_two_users_get_two_different_rbac():
+    """B5 fix: slugs are canonical email_to_slug values, not local-parts."""
     mod = _load_router_with_env({})
-    alice = _mk_identity("alice", groups=["eng"], allowed_models=["gpt-4o"])
-    bob = _mk_identity("bob", groups=["sales"], allowed_models=["qwen2.5:3b"])
-    mod._state.identity_registry = _FakeRegistry({"alice": alice, "bob": bob})
+    alice = _mk_identity("alice-corp-example", groups=["eng"], allowed_models=["gpt-4o"])
+    bob = _mk_identity("bob-corp-example", groups=["sales"], allowed_models=["qwen2.5:3b"])
+    mod._state.identity_registry = _FakeRegistry({
+        "alice-corp-example": alice,
+        "bob-corp-example": bob,
+    })
 
     out_a = mod._resolve_identity(
         _FakeRequest({**AUTH, "X-OpenWebUI-User-Email": "alice@corp.example"}))
     out_b = mod._resolve_identity(
         _FakeRequest({**AUTH, "X-OpenWebUI-User-Email": "bob@corp.example"}))
-    assert out_a["identity_id"] == "id-alice"
-    assert out_b["identity_id"] == "id-bob"
+    assert out_a["identity_id"] == "id-alice-corp-example"
+    assert out_b["identity_id"] == "id-bob-corp-example"
     assert out_a["allowed_models"] != out_b["allowed_models"]
     assert out_a["groups"] != out_b["groups"]
 
