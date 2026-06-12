@@ -2,6 +2,7 @@
 Yashigani Backoffice — Authentication routes.
 POST /auth/login                   — username + password + TOTP (returns redirect_to for role routing)
 POST /auth/logout                  — invalidate session (any session tier — single-logout fix)
+GET  /auth/logout-redirect         — browser-navigable single-logout (Phase 2: OWUI signout redirect target)
 GET  /auth/status                  — check session validity
 GET  /auth/verify                  — Caddy forward_auth for data-plane (user sessions only)
 GET  /auth/verify-admin            — Caddy forward_auth for /admin/* (admin sessions only)
@@ -20,7 +21,12 @@ Phase 1 changes (2026-06-12, feat/2.25.5-auth-ingress):
     sessions.  Caddy uses it for the /app/webui forward_auth leg.
   - Both /auth/verify and /auth/verify-user reject admin sessions (SoD-003 preserved).
 
-Last updated: 2026-06-12T00:00:00+00:00
+Phase 2 changes (2026-06-13, feat/2.25.5-auth-ingress):
+  - logout-redirect endpoint added: GET version of logout for browser navigation.
+    OWUI's WEBUI_AUTH_SIGNOUT_REDIRECT_URL points here so its logout button clears
+    the Yashigani session cookie.  See Phase 2 notes.
+
+Last updated: 2026-06-13T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -504,6 +510,62 @@ async def logout(
     if state.audit_writer is not None:
         state.audit_writer.write(_make_login_event(session.account_id, "logout", None, account_tier=session.account_tier))
     return {"status": "ok"}
+
+
+@router.get("/logout-redirect")
+async def logout_redirect(
+    request: Request,
+    response: Response,
+    store=Depends(get_session_store),
+):
+    """
+    Browser-navigable single-logout endpoint.
+
+    Phase 2 / 2.25.5-auth-ingress: OWUI (with WEBUI_AUTH=false) calls its own
+    /api/v1/auths/signout endpoint, which — when WEBUI_AUTH_SIGNOUT_REDIRECT_URL is
+    set — returns {"status": true, "redirect_url": "<url>"} to the SvelteKit client.
+    The client then navigates the browser to that URL.  We point it here so clicking
+    the logout button inside /app/webui actually clears the Yashigani session cookie.
+
+    Behaviour:
+      - Valid session (admin or user): invalidate in Redis, clear both cookies,
+        redirect to /login.
+      - No session / expired session: clear cookies defensively, redirect to /login.
+        (Not a security issue: if there is nothing to invalidate, forcing the user
+        back to /login is correct.)
+
+    Security: this is a GET handler that modifies state.  The CSRF risk is accepted
+    because:
+      1. Logging out is not a sensitive state change (worst-case: nuisance logout).
+      2. OWUI does NOT support submitting a POST form redirect via WEBUI_AUTH_SIGNOUT_REDIRECT_URL;
+         it only performs a browser navigation (window.location).
+      3. The action is idempotent — a forged logout just forces a re-login.
+    """
+    # Try to read the session token from either cookie name.
+    token = (
+        request.cookies.get(_USER_SESSION_COOKIE)
+        or request.cookies.get(_SESSION_COOKIE)
+    )
+
+    state = backoffice_state
+    if token:
+        try:
+            store.invalidate(token)
+            if state.audit_writer is not None:
+                # Resolve the account_id from the session if it is still valid.
+                session_data = store.get(token)
+                account_id = session_data.account_id if session_data else "unknown"
+                state.audit_writer.write(
+                    _make_login_event(account_id, "logout", None)
+                )
+        except Exception:
+            # Session already expired / gone — still clear the cookies.
+            pass
+
+    redirect = _RedirectResponse(url="/login", status_code=302)
+    redirect.delete_cookie(_SESSION_COOKIE, path="/")
+    redirect.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    return redirect
 
 
 @router.get("/status")

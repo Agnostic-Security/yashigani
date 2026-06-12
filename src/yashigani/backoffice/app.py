@@ -1049,29 +1049,10 @@ def create_backoffice_app() -> FastAPI:
         async def admin_login_page(request: Request):
             return _templates.TemplateResponse(request, "login.html")
 
-        # Phase 1 / 2.25.5-auth-ingress: /app/webui placeholder.
-        # Phase 2 will re-path OWUI to this prefix and wire Caddy's /app/webui
-        # route to forward_auth → /auth/verify-user + proxy → open-webui.
-        # For now this endpoint returns a 302 to / (the current OWUI catch-all)
-        # so the role-based redirect from login lands somewhere useful without
-        # Phase 2 being deployed.  Caddy's forward_auth + proxy is NOT wired
-        # to /app/webui yet — that is Phase 2.
-        @app.get("/app/webui", include_in_schema=False)
-        @app.get("/app/webui/", include_in_schema=False)
-        async def app_webui_placeholder(request: Request):
-            """
-            Phase 1 placeholder for the /app/webui path.
-
-            Returns 302 → / (the current Open WebUI catch-all at root) so that
-            user-tier post-login redirects land on the actual OWUI.  Phase 2 will
-            move OWUI onto /app/webui and this placeholder will be removed.
-
-            Security: no session check here.  Access control is enforced by Caddy's
-            forward_auth → /auth/verify-user on /app/webui/* once Phase 2 is wired.
-            Until then, / is already gated by forward_auth → /auth/verify.
-            """
-            return RedirectResponse(url="/", status_code=302)
-
+        # Phase 2 / 2.25.5-auth-ingress: /app/webui is now served directly by
+        # Open WebUI (OWUI).  Caddy routes /app/webui* to open-webui:8080 behind
+        # forward_auth → /auth/verify-user.  The backoffice placeholder endpoint
+        # has been removed; OWUI handles all /app/webui/* requests.
         @app.get("/admin/", include_in_schema=False)
         async def admin_dashboard_page(request: Request):
             # Server-side session-presence check before serving the dashboard HTML.
