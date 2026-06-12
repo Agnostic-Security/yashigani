@@ -248,6 +248,11 @@ class PoolManager:
                 ringfence_init_network=ringfence_init_network,
             )
             self._containers[key] = container_info
+            try:
+                from yashigani.metrics.registry import yashigani_pool_containers_created_total
+                yashigani_pool_containers_created_total.inc()
+            except Exception:
+                pass
             return container_info
 
     def get(self, identity_id: str, service_slug: str) -> Optional[ContainerInfo]:
@@ -329,6 +334,12 @@ class PoolManager:
         # Kill old container
         self._kill_container(old.container_id)
 
+        try:
+            from yashigani.metrics.registry import yashigani_pool_containers_replaced_total
+            yashigani_pool_containers_replaced_total.inc()
+        except Exception:
+            pass
+
         return new_info
 
     def teardown(self, identity_id: str, service_slug: str, reason: str = "idle") -> None:
@@ -372,6 +383,12 @@ class PoolManager:
         ]
         for key in idle_keys:
             self.teardown(key[0], key[1], f"idle>{self._idle_timeout}s")
+        if idle_keys:
+            try:
+                from yashigani.metrics.registry import yashigani_pool_containers_idle_teardown_total
+                yashigani_pool_containers_idle_teardown_total.inc(len(idle_keys))
+            except Exception:
+                pass
         return len(idle_keys)
 
     def count(self, identity_id: str | None = None) -> int:
@@ -386,6 +403,11 @@ class PoolManager:
         """Check tier limits before creating a new container."""
         identity_count = self.count(identity_id)
         if identity_count >= self._limits.total_concurrent:
+            try:
+                from yashigani.metrics.registry import yashigani_pool_limit_exceeded_total
+                yashigani_pool_limit_exceeded_total.inc()
+            except Exception:
+                pass
             raise PoolLimitExceeded(
                 f"Identity {identity_id} has {identity_count} containers "
                 f"(limit: {self._limits.total_concurrent})"
