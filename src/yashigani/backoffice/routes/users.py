@@ -299,6 +299,80 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     ).model_dump()
 
 
+class UpdateUserRequest(BaseModel):
+    """R5 (2.25.5): editable user-account fields.
+
+    email    — the canonical identity for a user-tier account. Optional; omit to
+               leave unchanged.
+    disabled — set active/disabled status. Optional; omit to leave unchanged.
+
+    NOTE (SoD-002): tier/role is NOT editable here — user and admin identities
+    are strictly separate by design. Promoting a user to admin must go through
+    delete + recreate in the admin store. Flagged for design review.
+    """
+    email: Optional[EmailStr] = None
+    disabled: Optional[bool] = None
+
+
+@router.put("/{username}")
+async def update_user(username: str, body: UpdateUserRequest, session: StepUpAdminSession):
+    """R5 (2.25.5): edit a user account's email and/or active status.
+
+    Step-up (TOTP) gated, modelled on delete_user / disable_user. Tier/role is
+    NOT editable here (SoD-002 — see UpdateUserRequest docstring).
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    assert state.session_store is not None  # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
+    record = await state.auth_service.get_account(username)
+    if record is None or record.account_tier != "user":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    changed: list[str] = []
+
+    if body.email is not None and str(body.email) != (getattr(record, "email", None) or ""):
+        new_email = str(body.email)
+        # SoD-002: reject if an admin-tier identity already uses this email.
+        try:
+            collision = await state.auth_service.get_account_by_email(new_email)
+        except Exception:
+            collision = None
+        if collision is not None and collision.account_tier == "admin":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "admin_user_collision",
+                    "message": "An admin account already uses this email. "
+                               "Admin and user identities must be strictly separate.",
+                },
+            )
+        await state.auth_service.set_email(username, new_email)
+        state.audit_writer.write(_config_event(session.account_id, "user_email_changed", getattr(record, "email", "") or "", new_email, account_tier=session.account_tier))
+        changed.append("email")
+
+    if body.disabled is not None and body.disabled != record.disabled:
+        if body.disabled:
+            if await state.auth_service.total_user_count() <= state.user_min_total:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "USER_MINIMUM_VIOLATION",
+                        "message": "Cannot disable the last user account",
+                    },
+                )
+            await state.auth_service.disable(username)
+            state.session_store.invalidate_all_for_account(record.account_id)
+            _suspend_identity_registry_for_account(record.account_id)
+            state.audit_writer.write(_config_event(session.account_id, "user_account_disabled", username, "disabled", account_tier=session.account_tier))
+        else:
+            await state.auth_service.enable(username)
+            state.audit_writer.write(_config_event(session.account_id, "user_account_enabled", username, "enabled", account_tier=session.account_tier))
+        changed.append("disabled")
+
+    return {"status": "ok", "changed": changed}
+
+
 @router.delete("/{username}")
 async def delete_user(username: str, session: StepUpAdminSession):
     """Delete a user. Blocked if last user (USER_MINIMUM_VIOLATION)."""
