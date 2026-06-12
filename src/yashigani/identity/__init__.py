@@ -11,6 +11,7 @@ Modules:
 
 from yashigani.identity.registry import IdentityRegistry, IdentityKind
 from yashigani.identity.api_key import generate_api_key, hash_api_key, verify_api_key
+from yashigani.identity.slug import email_to_slug
 
 __all__ = [
     "IdentityRegistry",
@@ -18,4 +19,5 @@ __all__ = [
     "generate_api_key",
     "hash_api_key",
     "verify_api_key",
+    "email_to_slug",
 ]

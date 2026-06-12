@@ -291,12 +291,19 @@ def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
         )
         return _baseline_owui_identity()
 
-    # Resolve candidate slug: explicit map override first, else email local-part.
+    # Resolve candidate slug: explicit map override first, else canonical email slug.
+    # B5 fix (2.25.5): previously used the email local-part with dots/underscores
+    # kept (e.g. "dana.lee"), which never matched the identity registered at login
+    # by _auth_email_to_slug ("dana-lee-example-com").  Now use the SAME canonical
+    # derivation (yashigani.identity.slug.email_to_slug) so both sides agree.
     slug = _OWUI_SLUG_MAP.get(email_l)
     if not slug:
-        local_part = email_l.split("@", 1)[0]
-        # Sanitise to the slug charset to avoid odd lookups; empty -> default.
-        slug = "".join(ch for ch in local_part if ch.isalnum() or ch in "-_.").strip(".")
+        try:
+            from yashigani.identity.slug import email_to_slug as _email_to_slug
+            slug = _email_to_slug(email_l)
+        except (ValueError, Exception) as _exc:
+            logger.warning("OWUI slug derivation failed for %r (%s) — baseline", email, _exc)
+            slug = ""
 
     identity = None
     if slug:
@@ -2934,40 +2941,61 @@ async def gate_relaxed_final(
     #     The ResponseInspectionPipeline above is an LLM inspector — it is
     #     NON-deterministic and MISSES a secret on ~10-15% of finals, which is
     #     precisely how a verbatim AWS_SECRET_ACCESS_KEY reached the user even with
-    #     the gate running.  So in ADDITION we run the SAME deterministic
-    #     sensitivity classifier the chat INGRESS leg uses (classify_decoded, which
-    #     fail-closes to RESTRICTED) over the final text, and feed OPA the STRICTER
-    #     of {inspection-sensitivity, deterministic-classified-sensitivity}.  A
-    #     final carrying a credential classifies CONFIDENTIAL/RESTRICTED every time
-    #     → OPA denies on the sensitivity ceiling → suppressed deterministically,
-    #     independent of the inspector's verdict.  This mirrors the chat path, whose
-    #     403 on the same secret comes from the deterministic classifier, not the
-    #     LLM inspector.
+    #     the gate running.  So in ADDITION we run the REGEX layer of the sensitivity
+    #     classifier over the final text and feed OPA the STRICTER of
+    #     {inspection-sensitivity, regex-classified-sensitivity}.  A final carrying a
+    #     known-pattern credential (API key, SSN, credit card, OFFICIAL-SENSITIVE,
+    #     etc.) classifies CONFIDENTIAL/RESTRICTED deterministically → OPA denies →
+    #     suppressed, independent of the LLM inspector.
+    #
+    #     B6 FIX (2.25.5): previously called classify_decoded() (full 3-layer
+    #     pipeline including Ollama).  The Ollama layer is an INGRESS classifier
+    #     trained on user prompts; running it on outbound prose summaries of CLEAN
+    #     tool results caused false-positive RESTRICTED classifications (e.g.
+    #     qwen2.5:3b marks "The tool returned: [query result]" as RESTRICTED), which
+    #     forced response_verdict="blocked" on every clean orchestration final.
+    #     The fix: use ONLY the REGEX layer here — it detects real credentials
+    #     deterministically and produces zero false-positives on plain prose.  The
+    #     scan_secrets() check (step 1a) already covers high-entropy key formats
+    #     missed by the regex set.  The combined (regex + scan_secrets) floor is
+    #     equivalent to the previous intent, without the Ollama false-positive.
+    #
+    #     INJECTION DEFENCE IS UNCHANGED: the cloud-9 / SYSTEM-OVERRIDE exfil
+    #     payloads contain literal API-key patterns (sk-... etc.) that fire the
+    #     regex CONFIDENTIAL/RESTRICTED → still blocked deterministically.
     if final_text and _state.sensitivity_classifier is not None:
         try:
-            classified = _state.sensitivity_classifier.classify_decoded(
-                final_text).level.value
+            _regex_triggers: list[str] = []
+            classified = _state.sensitivity_classifier._scan_regex(
+                final_text, _regex_triggers).value
         except Exception as exc:
-            # Fail-closed: an unclassifiable final must NOT pass on a clean verdict.
+            # Fail-closed: a scan error on a candidate final must NOT pass.
             logger.warning(
-                "gate_relaxed_final: content classify raised (%s) — treating "
+                "gate_relaxed_final: regex classify raised (%s) — treating "
                 "final as RESTRICTED (fail-closed)", exc)
             classified = "RESTRICTED"
         response_content_sensitivity = _stricter_sensitivity(
             response_content_sensitivity, classified)
-        # A brain final that deterministically classifies CONFIDENTIAL/RESTRICTED
-        # carries sensitive content (a secret, key, credential).  Such content must
-        # NOT egress in an orchestration final REGARDLESS of the caller's ceiling —
-        # the privileged internal-bearer service identity has a RESTRICTED ceiling,
-        # so the ceiling check alone would admit it.  Force a BLOCKED verdict so the
-        # response gate denies deterministically (the OPA response_decision denies
-        # on response_verdict=="blocked").  This is the deterministic leak-closure:
-        # it does not depend on the non-deterministic LLM inspector agreeing.
+        # A brain final that regex-classifies CONFIDENTIAL/RESTRICTED contains a
+        # hard credential pattern.  Force a BLOCKED verdict so the response gate
+        # denies deterministically.
         if classified in ("CONFIDENTIAL", "RESTRICTED"):
             logger.warning(
-                "gate_relaxed_final: final classifies %s (deterministic) — "
-                "BLOCKING egress of sensitive orchestration final", classified)
+                "gate_relaxed_final: final regex-classifies %s — "
+                "BLOCKING egress of sensitive orchestration final (triggers=%s)",
+                classified, _regex_triggers)
             response_verdict = "blocked"
+    # 1c) Deterministic block before OPA.  If step 1a (scan_secrets) or step 1b
+    #     (regex classifier) forced response_verdict="blocked", deny immediately
+    #     — independently of whether OPA is configured.  This ensures that
+    #     hard-pattern credentials are blocked even in YASHIGANI_OPA_OPTIONAL=true
+    #     deployments and in unit tests where OPA is not running.  This is the
+    #     single authoritative block point for deterministic denials.
+    if response_verdict == "blocked":
+        return False, (
+            "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's final "
+            "answer was identified as sensitive and was withheld; "
+            "the raw content was not delivered.")
     # 2) OPA response-leg gate (non-relaxed) — fail-closed on absent allow.
     if _state.opa_url:
         resp_opa = await _opa_response_check(

@@ -1993,21 +1993,18 @@ def _make_sessions_invalidated_event(
 #     migration.
 # ---------------------------------------------------------------------------
 
-_AUTH_SLUG_RE = re.compile(r"[^a-z0-9\-]")
-
-
 def _auth_email_to_slug(email: str) -> str:
     """
     Derive a stable registry slug from an email address.
-    Mirrors sso.py::_email_to_slug — kept separate to avoid coupling auth.py
-    to the SSO module, which has its own heavy import chain.
 
-    e.g. alice@example.com → alice-example-com
+    B5 (2.25.5): delegates to yashigani.identity.slug.email_to_slug — the single
+    canonical implementation.  All slug-derivation sites (auth.py, sso.py,
+    openai_router.py, users.py, me.py) produce the SAME slug for any given email.
+
+    e.g. dana.lee@example.com → dana-lee-example-com
     """
-    local, _, domain = email.partition("@")
-    raw = f"{local}-{domain}".lower()
-    slug = _AUTH_SLUG_RE.sub("-", raw).strip("-")
-    return slug[:64]
+    from yashigani.identity.slug import email_to_slug as _canonical_slug
+    return _canonical_slug(email)
 
 
 def _register_human_identity_on_login(record, state) -> None:
