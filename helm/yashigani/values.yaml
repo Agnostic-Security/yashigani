@@ -1413,6 +1413,13 @@ openWebui:
     webuiAuth: "false"
     webuiAuthTrustedEmailHeader: "X-Forwarded-User"
     webuiAuthTrustedNameHeader: "X-Forwarded-Name"
+    # Phase 2 / 2.25.5-auth-ingress: OWUI served under /app/webui.
+    # See docker-compose.yml for full rationale.
+    webuiUrl: "/app/webui"
+    webuiBaseUrl: "/app/webui"
+    # Single-logout: OWUI signout redirects to /auth/logout-redirect which
+    # clears the Yashigani session cookie and redirects to /login.
+    webuiAuthSignoutRedirectUrl: "/auth/logout-redirect"
     enableSignup: "true"
     # Track C (F-B): forward the authenticated OWUI user to the gateway so OWUI
     # emits X-OpenWebUI-User-Email/-Id/-Name/-Role on upstream calls. The

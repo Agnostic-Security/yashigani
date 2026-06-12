@@ -1049,6 +1049,10 @@ def create_backoffice_app() -> FastAPI:
         async def admin_login_page(request: Request):
             return _templates.TemplateResponse(request, "login.html")
 
+        # Phase 2 / 2.25.5-auth-ingress: /app/webui is now served directly by
+        # Open WebUI (OWUI).  Caddy routes /app/webui* to open-webui:8080 behind
+        # forward_auth → /auth/verify-user.  The backoffice placeholder endpoint
+        # has been removed; OWUI handles all /app/webui/* requests.
         @app.get("/admin/", include_in_schema=False)
         async def admin_dashboard_page(request: Request):
             # Server-side session-presence check before serving the dashboard HTML.

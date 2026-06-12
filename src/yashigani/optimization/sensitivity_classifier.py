@@ -63,6 +63,7 @@ _DEFAULT_PATTERNS: list[tuple[str, SensitivityLevel, str]] = [
     (r"\b\d{3}[- ]?\d{3}[- ]?\d{4}\b", SensitivityLevel.CONFIDENTIAL, "US/CA phone"),
     (r"\b(?:sk-|sk-ant-|sk-proj-)[A-Za-z0-9_-]{20,}\b", SensitivityLevel.RESTRICTED, "API key"),
     (r"\b(?:CONFIDENTIAL|TOP SECRET|RESTRICTED)\b", SensitivityLevel.RESTRICTED, "Classification marker"),
+    (r"\bOFFICIAL[\s_-]+SENSITIVE\b", SensitivityLevel.RESTRICTED, "UK Gov OFFICIAL-SENSITIVE marking"),
     (r"\b[A-Z]{2}\d{2}[ ]?\d{4}[ ]?\d{4}[ ]?\d{4}[ ]?\d{4}[ ]?\d{0,2}\b", SensitivityLevel.CONFIDENTIAL, "IBAN"),
 ]
 
