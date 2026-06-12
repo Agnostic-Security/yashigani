@@ -541,6 +541,68 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── /app/webui — user path (Phase 1 placeholder; Phase 2 wires OWUI here)
+    #
+    # Phase 1 / 2.25.5-auth-ingress (SU REVIEW REQUIRED):
+    #   This block introduces the /app/webui path with forward_auth →
+    #   /auth/verify-user.  In Phase 1, backoffice serves a 302 → / from
+    #   /app/webui (placeholder), so the forward_auth + proxy chain is a
+    #   pass-through to the existing OWUI catch-all behaviour.
+    #
+    # Phase 2 will change the reverse_proxy target from backoffice:8443
+    # (placeholder) to open-webui:8080, and OWUI will be configured with
+    # WEBUI_URL=/app/webui and a matching base-path.  The forward_auth gate
+    # is already the final form for Phase 2.
+    #
+    # NOTE for Su: this block MUST appear before the catch-all `handle {}` so
+    # Caddy matches /app/webui/* before the OWUI catch-all.  The catch-all
+    # still guards bare / for backward compat during Phase 1.
+    handle /app/webui* {
+        # Strip anti-spoof headers before auth subrequest.
+        request_header -X-Forwarded-User
+        request_header -X-Forwarded-Name
+        request_header -X-Forwarded-Groups
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        import strip-orchestration-headers
+
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            # Phase 1: verify-user rejects admin sessions (403) and
+            # unauthenticated sessions (401).
+            uri /auth/verify-user
+            copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
+
+            @unauthorized status 401
+            handle_response @unauthorized {
+                # User not logged in → redirect to /login, preserving next=
+                redir * /login?next={http.request.uri} 302
+            }
+
+            @admin_on_user_path status 403
+            handle_response @admin_on_user_path {
+                # Admin trying user path → send to admin console (NOT login page).
+                # This is a clear authz boundary, not an auth failure.
+                redir * /admin/ 302
+            }
+        }
+
+        # Phase 1: proxy to backoffice /app/webui placeholder (returns 302 → /).
+        # Phase 2: change target to open-webui:8080 once OWUI base-path is set.
+        reverse_proxy https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
+            header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
+            header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+        }
+    }
+
     handle /metrics-federate* {
         basic_auth {
             {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}

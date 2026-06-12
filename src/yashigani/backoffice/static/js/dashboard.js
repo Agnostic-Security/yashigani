@@ -465,17 +465,30 @@ async function api(path) {
 }
 
 // ---------------------------------------------------------------------------
-// V6.8.4 Step-up TOTP interceptor
+// V6.8.4 Step-up TOTP interceptor + Phase 1 auth-UX (B4 fix)
 //
-// apiMutate() wraps high-value fetch calls.  When the server returns
-// HTTP 401 with detail.error === "step_up_required", the interceptor:
-//   1. Shows a TOTP modal prompting the admin to enter their current code.
-//   2. POSTs the code to /auth/stepup.
-//   3. On 200, retries the original request automatically.
-//   4. On failure, shows an error inside the modal.
+// apiMutate() wraps high-value fetch calls.
+//
+// 401 handling:
+//   - detail.error === "step_up_required": show TOTP step-up modal + retry.
+//   - detail.error === "session_expired_or_invalid": explicit re-login prompt,
+//     NOT a silent redirect (B4 fix — prevents confusing mid-action bounces).
+//   - Generic 401: redirect to /admin/login with a clear re-auth message.
+//
+// 403 handling (B4 fix — Phase 1 / 2.25.5-auth-ingress):
+//   - Previously: apiMutate returned the resp and callers checked resp.ok, but
+//     403 was not handled specially — the caller rendered it as a generic error.
+//     The *real* B4 bounce happened because the OWUI/catch-all Caddy route saw
+//     a 403 from /auth/verify (admin session on data plane) and redirected to
+//     /admin/ — which *looked* like a login bounce.  The fix is on the Caddy
+//     side (route the 403 to an explicit error page, not a login redirect) plus
+//     here: surfacing the 403 body as a readable error instead of null.
+//   - detail.error present: return the resp so the caller can render errMsg().
+//   - This ensures a non-admin user hitting an admin-only action gets a clean
+//     "Not authorized" message, not a silent bounce or blank response.
 //
 // Usage: var resp = await apiMutate(path, options);
-// Returns the final Response object (or null on abort/error).
+// Returns the final Response object (or null on abort/network error).
 // ---------------------------------------------------------------------------
 
 var _stepupQueue = null;  // Pending {resolve, reject, path, options} while modal is open
@@ -494,14 +507,45 @@ async function apiMutate(path, options) {
                     _showStepUpModal();
                 });
             }
-            // Generic 401 — redirect to login
+            if (body && body.detail && body.detail.error === 'session_expired_or_invalid') {
+                // B4 fix: session expired mid-action — explicit prompt, not silent bounce.
+                // Show a message so the admin knows what happened, then redirect.
+                _showAuthzError('Your session has expired. Please sign in again.', '/admin/login');
+                return null;
+            }
+            // Generic 401 — session gone or unauthenticated; redirect to login.
             window.location.href = '/admin/login';
             return null;
+        }
+        if (resp.status === 403) {
+            // B4 fix: return the response so the caller can render errMsg() rather
+            // than silently returning null.  Callers already check resp.ok and render
+            // the error; returning null here caused a "Request failed" message instead
+            // of the actual authorization error from the server.
+            return resp;
         }
         return resp;
     } catch(err) {
         console.error('apiMutate failed: ' + path + ' — ' + err.message);
         return null;
+    }
+}
+
+// _showAuthzError — display a clear authorization/session error to the admin.
+// Used by the B4 fix to surface session-expiry + 403 errors gracefully.
+// msg: human-readable message; redirectTo: optional URL to navigate to after a delay.
+function _showAuthzError(msg, redirectTo) {
+    // Try to show in a visible location on the page.
+    var banner = document.getElementById('msg-box') || document.getElementById('status-msg');
+    if (banner) {
+        banner.className = (banner.className || '') + ' msg error visible';
+        banner.textContent = msg;
+    } else {
+        // Fallback: browser alert (last resort).
+        alert(msg);
+    }
+    if (redirectTo) {
+        setTimeout(function() { window.location.href = redirectTo; }, 2500);
     }
 }
 

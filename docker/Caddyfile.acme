@@ -491,6 +491,47 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── /app/webui — user path (Phase 1 placeholder; Phase 2 wires OWUI here)
+    # See Caddyfile.selfsigned for full commentary.  Su to review/own.
+    handle /app/webui* {
+        request_header -X-Forwarded-User
+        request_header -X-Forwarded-Name
+        request_header -X-Forwarded-Groups
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        import strip-orchestration-headers
+
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-user
+            copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
+
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /login?next={http.request.uri} 302
+            }
+
+            @admin_on_user_path status 403
+            handle_response @admin_on_user_path {
+                redir * /admin/ 302
+            }
+        }
+
+        # Phase 1 placeholder → Phase 2: change to open-webui:8080
+        reverse_proxy https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
+            header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
+            header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+        }
+    }
+
     # ── Prometheus federation — admin-authenticated ─────────────────────────
     handle /metrics-federate* {
         basic_auth {
