@@ -82,9 +82,9 @@
       "id": 11, "type": "timeseries", "title": "Inspection Pipeline Latency",
       "gridPos": {"x":0,"y":25,"w":12,"h":6},
       "targets": [
-        {"expr":"histogram_quantile(0.50, rate(yashigani_inspection_duration_seconds_bucket[5m]))","legendFormat":"p50"},
-        {"expr":"histogram_quantile(0.95, rate(yashigani_inspection_duration_seconds_bucket[5m]))","legendFormat":"p95"},
-        {"expr":"histogram_quantile(0.99, rate(yashigani_inspection_duration_seconds_bucket[5m]))","legendFormat":"p99"}
+        {"expr":"histogram_quantile(0.50, rate(yashigani_classifier_latency_ms_bucket[5m])) / 1000","legendFormat":"p50"},
+        {"expr":"histogram_quantile(0.95, rate(yashigani_classifier_latency_ms_bucket[5m])) / 1000","legendFormat":"p95"},
+        {"expr":"histogram_quantile(0.99, rate(yashigani_classifier_latency_ms_bucket[5m])) / 1000","legendFormat":"p99"}
       ],
       "fieldConfig": {"defaults":{"unit":"s"}}
     },

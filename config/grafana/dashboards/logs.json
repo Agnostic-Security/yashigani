@@ -80,7 +80,8 @@
         "name": "DS_LOKI",
         "type": "datasource",
         "query": "loki",
-        "hide": 0
+        "hide": 0,
+        "current": {"text": "Loki", "value": "loki"}
       }
     ]
   }
