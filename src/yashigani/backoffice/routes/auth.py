@@ -808,8 +808,6 @@ async def verify_user_session(request: Request):
     # Admin sessions MUST NOT access user paths.
     # This is the /app/webui-side mirror of SoD-003 (which blocks admin on /auth/verify).
     if session.account_tier == "admin":
-        _client_ip = request.client.host if request.client else "unknown"
-        from yashigani.auth.session import _mask_ip as _verify_mask_ip
         _log.warning(
             "verify-user: rejected admin session account_id=%s — "
             "admins cannot access user paths (/app/webui)",
