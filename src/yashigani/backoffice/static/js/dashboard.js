@@ -7,6 +7,32 @@ function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) { return HTML_ESCAPES[c]; });
 }
 
+// 2.25.5 — populate a <select> from a list of {value,label} (or strings),
+// preserving the current selection if it still exists. `leading` is an optional
+// array of {value,label} prepended (e.g. an explicit "All" wildcard option).
+// All values are escaped — built via DOM, never innerHTML — CSP-safe, no styles.
+function fillSelect(id, items, leading) {
+    var sel = document.getElementById(id);
+    if (!sel) return;
+    var prev = sel.value;
+    var opts = (leading || []).concat(items || []);
+    sel.replaceChildren();
+    opts.forEach(function(it) {
+        var value = (typeof it === 'string') ? it : it.value;
+        var label = (typeof it === 'string') ? it : (it.label != null ? it.label : it.value);
+        var o = document.createElement('option');
+        o.value = (value == null ? '' : String(value));
+        o.textContent = (label == null ? '' : String(label));
+        sel.appendChild(o);
+    });
+    // Restore prior selection if still present.
+    if (prev) {
+        for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === prev) { sel.value = prev; break; }
+        }
+    }
+}
+
 // Navigation
 function showPage(name, triggerEl) {
     document.querySelectorAll('.page').forEach(function(p) { p.className = 'page'; });
@@ -27,6 +53,7 @@ function showPage(name, triggerEl) {
     if (name === 'models') { loadModels(); loadCloudOverride(); }
     if (name === 'sensitivity') loadSensitivity();
     if (name === 'policies') loadPolicies();
+    if (name === 'audit') loadAuditFacets();  // R19/R20 — populate verdict + source-type filters
     if (name === 'settings') loadSettings();
     if (name === 'backup') loadBackup();
     // PKI panel — loadPkiStatus is defined in pki.js (loaded defer).
@@ -192,9 +219,48 @@ async function generatePolicy() {
 }
 
 // ── #16 client-policy bindings (parity with the /admin/policies/bind* API) ──
+// R11(a): populate the "Policy name" dropdown from the policies loaded in OPA.
+// Only client policies (clients/<name>) are bindable, so prefer those; fall back
+// to all names if no client policies exist yet.
+async function loadBindablePolicies() {
+    var data = await api('/admin/policies');
+    var pols = (data && data.policies) ? data.policies : [];
+    // A bindable client policy has package clients.<name>; its name is <name>.
+    var clientPols = pols.filter(function(p) {
+        return (p.package && p.package.indexOf('clients') === 0) ||
+               (p.id && (p.id.indexOf('clients/') === 0 || p.id.indexOf('/clients/') >= 0));
+    });
+    var src = clientPols.length ? clientPols : pols;
+    var opts = src.map(function(p) { return { value: p.name, label: p.name }; });
+    fillSelect('bind-policy-name', opts, [{ value: '', label: opts.length ? 'Select a policy…' : 'No bindable policies' }]);
+}
+
+// R11(b): populate the "Subject ID" dropdown for the selected subject kind, with
+// an explicit "All (wildcard)" option instead of an implicit blank.
+async function loadBindSubjects() {
+    var kindSel = document.getElementById('bind-scope-kind');
+    if (!kindSel) return;
+    var kind = kindSel.value;
+    var leading = [{ value: '*', label: 'All (wildcard)' }];
+    var items = [];
+    if (kind === 'agent') {
+        var agents = await api('/admin/agents');
+        items = (agents || []).map(function(a) { return { value: a.agent_id, label: a.name + ' (' + a.agent_id + ')' }; });
+    } else if (kind === 'human') {
+        var t = await api('/admin/models/allocation-targets?target_type=user');
+        items = (t && t.targets) ? t.targets : [];
+    }
+    // service / api_client / mcp_server: no enumerable registry surfaced here —
+    // wildcard "All" plus free identifiers are handled by the explicit All option.
+    fillSelect('bind-scope-id', items, leading);
+}
+
 async function loadBindings() {
     var c = document.getElementById('bindings-container');
     if (!c) return;
+    // R11: refresh the policy + subject dropdowns alongside the bindings table.
+    loadBindablePolicies();
+    loadBindSubjects();
     c.innerHTML = '<span class="loading">Loading…</span>';
     var data = await api('/admin/policies/bindings');
     if (!data || !data.bindings) { c.innerHTML = '<p class="txt-note">No bindings (or failed to load).</p>'; return; }
@@ -217,8 +283,11 @@ async function bindPolicy() {
     var name = (document.getElementById('bind-policy-name').value || '').trim();
     var kind = document.getElementById('bind-scope-kind').value;
     var sid = (document.getElementById('bind-scope-id').value || '').trim();
+    // R11: explicit "All" wildcard is the "*" option — the backend stores an
+    // empty scope_id as the wildcard, so normalise "*" -> "".
+    if (sid === '*') sid = '';
     var dir = document.getElementById('bind-direction').value;
-    if (!name) { alert('Enter a client policy name (clients/<name>).'); return; }
+    if (!name) { alert('Select a client policy to bind.'); return; }
     var resp = await apiMutate('/admin/policies/bind', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -676,7 +745,18 @@ async function loadAgents() {
         for (var i = 0; i < agents.length; i++) {
             var a = agents[i];
             var statusBadge = a.status === 'active' ? 'badge-green' : 'badge-red';
-            var actions = '<button data-action="rotateAgentToken" data-agent-id="' + escapeHtml(a.agent_id) + '" data-agent-name="' + escapeHtml(a.name) + '" class="btn-tbl btn-tbl--blue">Rotate Token</button>';
+            // R6: Edit button — carries the editable agent fields (groups/caller-groups
+            // are arrays; join with commas for the text inputs).
+            var aGroups = (a.groups || []).join(',');
+            var aCaller = (a.allowed_caller_groups || []).join(',');
+            var actions = '<button data-action="editAgent"'
+                + ' data-agent-id="' + escapeHtml(a.agent_id) + '"'
+                + ' data-agent-name="' + escapeHtml(a.name) + '"'
+                + ' data-agent-url="' + escapeHtml(a.upstream_url || '') + '"'
+                + ' data-agent-groups="' + escapeHtml(aGroups) + '"'
+                + ' data-agent-caller-groups="' + escapeHtml(aCaller) + '"'
+                + ' class="btn-tbl btn-tbl--blue">Edit</button>';
+            actions += ' <button data-action="rotateAgentToken" data-agent-id="' + escapeHtml(a.agent_id) + '" data-agent-name="' + escapeHtml(a.name) + '" class="btn-tbl btn-tbl--blue btn-tbl--ml">Rotate Token</button>';
             if (a.status === 'active') {
                 actions += ' <button data-action="deactivateAgent" data-agent-id="' + escapeHtml(a.agent_id) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Deactivate</button>';
             }
@@ -747,6 +827,50 @@ async function deactivateAgent(agentId) {
     else if (resp) { alert('Deactivation failed: ' + resp.status); }
 }
 
+// ── R6: edit an agent (name / url / groups / caller-groups) via PUT ─────────
+function editAgent(agentId, name, url, groups, callerGroups) {
+    document.getElementById('edit-agent-id').value = agentId;
+    document.getElementById('edit-agent-name').value = name || '';
+    document.getElementById('edit-agent-url').value = url || '';
+    document.getElementById('edit-agent-groups').value = groups || '';
+    document.getElementById('edit-agent-caller-groups').value = callerGroups || '';
+    document.getElementById('edit-agent-result').textContent = '';
+    document.getElementById('edit-agent-form').classList.add('is-open');
+}
+
+function cancelEditAgent() {
+    document.getElementById('edit-agent-form').classList.remove('is-open');
+}
+
+async function saveEditAgent() {
+    var agentId = document.getElementById('edit-agent-id').value;
+    var name = document.getElementById('edit-agent-name').value.trim();
+    var url = document.getElementById('edit-agent-url').value.trim();
+    var groups = document.getElementById('edit-agent-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var callerGroups = document.getElementById('edit-agent-caller-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var result = document.getElementById('edit-agent-result');
+    // Only send changed/non-empty fields — AgentUpdateRequest fields are all optional.
+    var body = {};
+    if (name) body.name = name;
+    if (url) body.upstream_url = url;
+    body.groups = groups;
+    body.allowed_caller_groups = callerGroups;
+    var resp = await apiMutate('/admin/agents/' + encodeURIComponent(agentId), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    if (resp.ok) {
+        result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('edit-agent-form').classList.remove('is-open');
+        loadAgents();
+    } else {
+        var err = await resp.json().catch(function() { return {}; });
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
+    }
+}
+
 // Accounts
 async function loadAccounts() {
     // Admin accounts
@@ -766,11 +890,13 @@ async function loadAccounts() {
                 ? '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="enable" class="btn-tbl btn-tbl--green">Enable</button>'
                 : '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="disable" class="btn-tbl btn-tbl--amber">Disable</button>';
             var deleteBtn = '<button data-action="deleteAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Delete</button>';
-            html += '<tr><td><strong>' + escapeHtml(acc.username) + '</strong></td><td><span class="badge ' + statusBadge + '">' + statusText + '</span></td><td><span class="badge ' + pwBadge + '">' + pwText + '</span></td><td><span class="badge ' + totpBadge + '">' + totpText + '</span></td><td>' + toggleBtn + deleteBtn + '</td></tr>';
+            // R5: Edit button — carries username/email/status for the inline edit form.
+            var editBtn = '<button data-action="editAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-email="' + escapeHtml(acc.email || '') + '" data-disabled="' + (acc.disabled ? '1' : '0') + '" class="btn-tbl btn-tbl--blue btn-tbl--ml">Edit</button>';
+            html += '<tr><td><strong>' + escapeHtml(acc.username) + '</strong></td><td class="td-xs">' + escapeHtml(acc.email || '—') + '</td><td><span class="badge ' + statusBadge + '">' + statusText + '</span></td><td><span class="badge ' + pwBadge + '">' + pwText + '</span></td><td><span class="badge ' + totpBadge + '">' + totpText + '</span></td><td>' + editBtn + toggleBtn + deleteBtn + '</td></tr>';
         }
         tbody.innerHTML = html;
     } else {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">No admin accounts found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No admin accounts found</td></tr>';
     }
 
     // User accounts
@@ -790,11 +916,13 @@ async function loadAccounts() {
                 ? '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="enable" class="btn-tbl btn-tbl--green">Enable</button>'
                 : '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="disable" class="btn-tbl btn-tbl--amber">Disable</button>';
             var deleteBtn = '<button data-action="deleteAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Delete</button>';
-            html += '<tr><td><strong>' + escapeHtml(u.username) + '</strong></td><td><span class="badge ' + sb + '">' + st + '</span></td><td><span class="badge ' + pb + '">' + pt + '</span></td><td><span class="badge ' + tb + '">' + tt + '</span></td><td>' + toggleBtn + deleteBtn + '</td></tr>';
+            // R5: Edit button — carries username/email/status for the inline edit form.
+            var editBtn = '<button data-action="editAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-email="' + escapeHtml(u.email || '') + '" data-disabled="' + (u.disabled ? '1' : '0') + '" class="btn-tbl btn-tbl--blue btn-tbl--ml">Edit</button>';
+            html += '<tr><td><strong>' + escapeHtml(u.username) + '</strong></td><td class="td-xs">' + escapeHtml(u.email || '—') + '</td><td><span class="badge ' + sb + '">' + st + '</span></td><td><span class="badge ' + pb + '">' + pt + '</span></td><td><span class="badge ' + tb + '">' + tt + '</span></td><td>' + editBtn + toggleBtn + deleteBtn + '</td></tr>';
         }
         utbody.innerHTML = html;
     } else {
-        utbody.innerHTML = '<tr><td colspan="5" class="empty">No user accounts — click + Add User to create one</td></tr>';
+        utbody.innerHTML = '<tr><td colspan="6" class="empty">No user accounts — click + Add User to create one</td></tr>';
     }
 }
 
@@ -891,6 +1019,45 @@ async function deleteAccount(type, username) {
     } else {
         var err = await resp.json().catch(function() { return {}; });
         alert('Failed: ' + (err.detail ? (err.detail.message || err.detail.error || JSON.stringify(err.detail)) : resp.status));
+    }
+}
+
+// ── R5: edit an account (email + status) via the inline edit form ───────────
+function editAccount(type, username, email, disabled) {
+    var pre = (type === 'admin') ? 'edit-admin-' : 'edit-user-';
+    document.getElementById(pre + 'username').value = username;
+    document.getElementById(pre + 'email').value = email || '';
+    document.getElementById(pre + 'status').value = (disabled === '1') ? 'disabled' : 'active';
+    document.getElementById(pre + 'result').textContent = '';
+    document.getElementById((type === 'admin' ? 'edit-admin-form' : 'edit-user-form')).classList.add('is-open');
+}
+
+function cancelEditAccount(type) {
+    document.getElementById((type === 'admin' ? 'edit-admin-form' : 'edit-user-form')).classList.remove('is-open');
+}
+
+async function saveEditAccount(type) {
+    var pre = (type === 'admin') ? 'edit-admin-' : 'edit-user-';
+    var username = document.getElementById(pre + 'username').value;
+    var email = document.getElementById(pre + 'email').value.trim();
+    var disabled = document.getElementById(pre + 'status').value === 'disabled';
+    var result = document.getElementById(pre + 'result');
+    var path = (type === 'admin') ? '/admin/accounts/' : '/admin/users/';
+    var body = { disabled: disabled };
+    if (email) body.email = email;
+    var resp = await apiMutate(path + encodeURIComponent(username), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    if (resp.ok) {
+        result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById((type === 'admin' ? 'edit-admin-form' : 'edit-user-form')).classList.remove('is-open');
+        loadAccounts();
+    } else {
+        var err = await resp.json().catch(function() { return {}; });
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
     }
 }
 
@@ -1013,8 +1180,24 @@ async function loadModels() {
         tbody.innerHTML = '<tr><td colspan="3" class="empty">No models available — check Ollama connection</td></tr>';
     }
 
+    // R3: populate the alias "Model" dropdown from the pulled-models list so an
+    // alias can never map to a non-existent model.
+    var modelOpts = (data && data.models ? data.models : []).map(function(m) {
+        return { value: m.name, label: m.name };
+    });
+    if (modelOpts.length === 0) {
+        fillSelect('alias-model', [], [{ value: '', label: 'No models pulled — pull one first' }]);
+    } else {
+        fillSelect('alias-model', modelOpts, [{ value: '', label: 'Select a model…' }]);
+    }
+
     // Aliases from API
     var aliases = await api('/admin/models');
+    // R4(a): populate the allocation "Model Alias" dropdown from all aliases.
+    var aliasOpts = (aliases && aliases.aliases ? aliases.aliases : []).map(function(a) {
+        return { value: a.alias, label: a.alias };
+    });
+    fillSelect('alloc-alias', aliasOpts, [{ value: '', label: aliasOpts.length ? 'Select an alias…' : 'No aliases yet' }]);
     var atbody = document.getElementById('aliases-tbody');
     if (aliases && aliases.aliases && aliases.aliases.length > 0) {
         var html = '';
@@ -1041,6 +1224,23 @@ async function loadModels() {
     } else {
         altbody.innerHTML = '<tr><td colspan="4" class="empty">No allocations — models available to all by default</td></tr>';
     }
+
+    // R4(b): populate the context-dependent Target ID dropdown for the current type.
+    await loadAllocTargets();
+}
+
+// R4(b): load the Target ID dropdown for the selected target type.
+//   user  -> non-admin users; org -> registered orgs; group -> non-admin groups.
+async function loadAllocTargets() {
+    var typeSel = document.getElementById('alloc-type');
+    if (!typeSel) return;
+    var tt = typeSel.value;
+    var data = await api('/admin/models/allocation-targets?target_type=' + encodeURIComponent(tt));
+    var targets = (data && data.targets) ? data.targets : [];
+    var placeholder = targets.length
+        ? { value: '', label: 'Select a ' + tt + '…' }
+        : { value: '', label: 'No ' + tt + ' targets available' };
+    fillSelect('alloc-target', targets, [placeholder]);
 }
 
 async function addAlias() {
@@ -1381,13 +1581,28 @@ async function logout() {
 
 // Audit log search
 var auditCursor = '';
+// R19/R20: load the Verdict + Source-type dropdown options from the audit model.
+async function loadAuditFacets() {
+    var data = await api('/admin/audit/facets');
+    if (!data) return;
+    // The first facet entry is the "* (All)" wildcard — use it as the leading option.
+    var verdicts = data.verdicts || [];
+    var sources = data.source_types || [];
+    fillSelect('audit-verdict', verdicts.slice(1), verdicts.slice(0, 1));
+    fillSelect('audit-source-type', sources.slice(1), sources.slice(0, 1));
+}
+
 async function searchAudit(cursor) {
     var params = new URLSearchParams();
     var et = document.getElementById('audit-event-type').value;
+    var verdict = document.getElementById('audit-verdict').value;
+    var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
     var text = document.getElementById('audit-text').value.trim();
     if (et) params.set('event_type', et);
+    if (verdict) params.set('verdict', verdict);
+    if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
     // free_text is a substring match, not a glob — treat a lone '*' as "match all".
@@ -1427,12 +1642,16 @@ async function searchAudit(cursor) {
 async function exportAudit() {
     var params = new URLSearchParams();
     var et = document.getElementById('audit-event-type').value;
+    var verdict = document.getElementById('audit-verdict').value;
+    var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
     if (et) params.set('event_type', et);
+    if (verdict) params.set('verdict', verdict);
+    if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
-    params.set('format', 'csv');
+    params.set('output_format', 'csv');
     window.open('/admin/audit/export?' + params.toString(), '_blank');
 }
 
@@ -1579,6 +1798,17 @@ setInterval(function() {
 // -------------------------------------------------------
 // Event delegation — replaces all inline onclick handlers
 // -------------------------------------------------------
+// R4(b): when the allocation Target Type changes, reload the Target ID dropdown.
+document.addEventListener('change', function(e) {
+    if (e.target && e.target.id === 'alloc-type') {
+        loadAllocTargets();
+    }
+    // R11(b): when the binding subject kind changes, reload the subject dropdown.
+    if (e.target && e.target.id === 'bind-scope-kind') {
+        loadBindSubjects();
+    }
+});
+
 document.addEventListener('click', function(e) {
     var target = e.target;
     // Walk up to find closest element with data-action
@@ -1625,6 +1855,21 @@ document.addEventListener('click', function(e) {
         case 'deactivateAgent':
             deactivateAgent(actionEl.getAttribute('data-agent-id'));
             break;
+        case 'editAgent':
+            editAgent(
+                actionEl.getAttribute('data-agent-id'),
+                actionEl.getAttribute('data-agent-name'),
+                actionEl.getAttribute('data-agent-url'),
+                actionEl.getAttribute('data-agent-groups'),
+                actionEl.getAttribute('data-agent-caller-groups')
+            );
+            break;
+        case 'saveEditAgent':
+            saveEditAgent();
+            break;
+        case 'cancelEditAgent':
+            cancelEditAgent();
+            break;
 
         // Account actions
         case 'createAdmin':
@@ -1638,6 +1883,20 @@ document.addEventListener('click', function(e) {
             break;
         case 'deleteAccount':
             deleteAccount(actionEl.getAttribute('data-account-type'), actionEl.getAttribute('data-username'));
+            break;
+        case 'editAccount':
+            editAccount(
+                actionEl.getAttribute('data-account-type'),
+                actionEl.getAttribute('data-username'),
+                actionEl.getAttribute('data-email'),
+                actionEl.getAttribute('data-disabled')
+            );
+            break;
+        case 'saveEditAccount':
+            saveEditAccount(actionEl.getAttribute('data-account-type'));
+            break;
+        case 'cancelEditAccount':
+            cancelEditAccount(actionEl.getAttribute('data-account-type'));
             break;
 
         // Alert actions
