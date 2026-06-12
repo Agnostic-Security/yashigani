@@ -10,14 +10,14 @@
     {
       "id": 1, "type": "stat", "title": "CREDENTIAL_EXFIL Detections (1h)",
       "gridPos": {"x":0,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_inspection_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1h])","legendFormat":"CREDENTIAL_EXFIL"}],
+      "targets": [{"expr":"increase(yashigani_classifier_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1h])","legendFormat":"CREDENTIAL_EXFIL"}],
       "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
       "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]},"mappings":[]}}
     },
     {
       "id": 2, "type": "stat", "title": "PROMPT_INJECTION Detections (1h)",
       "gridPos": {"x":6,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_inspection_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1h])","legendFormat":"INJECTION_ONLY"}],
+      "targets": [{"expr":"increase(yashigani_classifier_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1h])","legendFormat":"INJECTION_ONLY"}],
       "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
       "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":10}]},"mappings":[]}}
     },
@@ -39,9 +39,9 @@
       "id": 5, "type": "timeseries", "title": "Detection Rate (per minute)",
       "gridPos": {"x":0,"y":4,"w":12,"h":8},
       "targets": [
-        {"expr":"rate(yashigani_inspection_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1m])","legendFormat":"CREDENTIAL_EXFIL"},
-        {"expr":"rate(yashigani_inspection_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1m])","legendFormat":"INJECTION_ONLY"},
-        {"expr":"rate(yashigani_inspection_classifications_total{label=\"CLEAN\"}[1m])","legendFormat":"CLEAN"}
+        {"expr":"rate(yashigani_classifier_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1m])","legendFormat":"CREDENTIAL_EXFIL"},
+        {"expr":"rate(yashigani_classifier_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1m])","legendFormat":"INJECTION_ONLY"},
+        {"expr":"rate(yashigani_classifier_classifications_total{label=\"CLEAN\"}[1m])","legendFormat":"CLEAN"}
       ],
       "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
     },
@@ -71,7 +71,7 @@
     {
       "id": 9, "type": "stat", "title": "KSM Rotation Status",
       "gridPos": {"x":0,"y":18,"w":8,"h":4},
-      "targets": [{"expr":"time() - yashigani_kms_rotation_last_success_timestamp_seconds","legendFormat":"Seconds since last rotation"}],
+      "targets": [{"expr":"(time() - yashigani_kms_rotation_last_success_timestamp_seconds) and yashigani_kms_rotation_last_success_timestamp_seconds > 0","legendFormat":"Seconds since last rotation"}],
       "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
       "fieldConfig": {"defaults":{"unit":"s","thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":86400},{"color":"red","value":90000}]}}}
     },

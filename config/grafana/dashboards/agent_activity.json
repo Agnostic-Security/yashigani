@@ -56,7 +56,7 @@
       "id": 7, "type": "timeseries", "title": "Detection Rate by Agent",
       "gridPos": {"x":12,"y":12,"w":12,"h":7},
       "targets": [
-        {"expr":"rate(yashigani_inspection_classifications_total{label!=\"CLEAN\"}[1m])","legendFormat":"{{ label }}"}
+        {"expr":"rate(yashigani_classifier_classifications_total{label!=\"CLEAN\"}[1m])","legendFormat":"{{ label }}"}
       ],
       "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
     },
@@ -73,8 +73,8 @@
       "id": 9, "type": "timeseries", "title": "Inspection Pipeline Latency by Agent (p95)",
       "gridPos": {"x":12,"y":19,"w":12,"h":7},
       "targets": [
-        {"expr":"histogram_quantile(0.95, sum by (agent_id, le) (rate(yashigani_inspection_duration_seconds_bucket[5m])))","legendFormat":"{{ agent_id }} p95"},
-        {"expr":"histogram_quantile(0.50, sum by (agent_id, le) (rate(yashigani_inspection_duration_seconds_bucket[5m])))","legendFormat":"{{ agent_id }} p50"}
+        {"expr":"histogram_quantile(0.95, sum by (agent_id, le) (rate(yashigani_classifier_latency_ms_bucket[5m]))) / 1000","legendFormat":"{{ agent_id }} p95"},
+        {"expr":"histogram_quantile(0.50, sum by (agent_id, le) (rate(yashigani_classifier_latency_ms_bucket[5m]))) / 1000","legendFormat":"{{ agent_id }} p50"}
       ],
       "fieldConfig": {"defaults":{"unit":"s"}}
     },
