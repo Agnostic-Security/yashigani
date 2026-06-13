@@ -1,85 +1,405 @@
 {
   "uid": "yashigani-cicd",
-  "title": "Yashigani — CI/CD & Security Scanning",
-  "tags": ["yashigani", "cicd", "security"],
+  "title": "Yashigani \u2014 SDLC AI Supply Chain Security",
+  "tags": [
+    "yashigani",
+    "supply-chain",
+    "security",
+    "sdlc"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "5m",
-  "time": {"from": "now-7d", "to": "now"},
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "HIGH/CRITICAL CVEs — Gateway",
-      "gridPos": {"x":0,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_trivy_high_cve_count{image=\"gateway\"}","legendFormat":"CVEs"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]},"mappings":[]}}
+      "id": 11,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Supply chain security posture for Yashigani deployments \u2014 CVE counts by image, test coverage, security scan failures, image signature and SBOM integrity. Metrics are pushed by CI Trivy/Cosign jobs via Pushgateway."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "HIGH/CRITICAL CVEs — Backoffice",
-      "gridPos": {"x":6,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_trivy_high_cve_count{image=\"backoffice\"}","legendFormat":"CVEs"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]},"mappings":[]}}
-    },
-    {
-      "id": 3, "type": "stat", "title": "Test Coverage %",
-      "gridPos": {"x":12,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_test_coverage_percent","legendFormat":"Coverage"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"unit":"percent","thresholds":{"steps":[{"color":"red","value":null},{"color":"orange","value":70},{"color":"green","value":80}]},"mappings":[]}}
-    },
-    {
-      "id": 4, "type": "stat", "title": "Security Scan Failures (7d)",
-      "gridPos": {"x":18,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_security_scan_failures_total[7d])","legendFormat":"Failures"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]},"mappings":[]}}
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "CVE Trend (7d)",
-      "gridPos": {"x":0,"y":4,"w":12,"h":8},
+      "id": 1,
+      "type": "stat",
+      "title": "HIGH/CRITICAL CVEs \u2014 Gateway",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"yashigani_trivy_high_cve_count","legendFormat":"{{ image }}"}
+        {
+          "expr": "yashigani_trivy_high_cve_count{image=\"gateway\"}",
+          "legendFormat": "CVEs"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
     },
     {
-      "id": 6, "type": "timeseries", "title": "Test Coverage Trend (7d)",
-      "gridPos": {"x":12,"y":4,"w":12,"h":8},
+      "id": 2,
+      "type": "stat",
+      "title": "HIGH/CRITICAL CVEs \u2014 Backoffice",
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"yashigani_test_coverage_percent","legendFormat":"Coverage"}
+        {
+          "expr": "yashigani_trivy_high_cve_count{image=\"backoffice\"}",
+          "legendFormat": "CVEs"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"percent","custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
     },
     {
-      "id": 7, "type": "stat", "title": "Time Since Last Successful Build",
-      "gridPos": {"x":0,"y":12,"w":8,"h":4},
-      "targets": [{"expr":"time() - yashigani_ci_last_build_success_timestamp_seconds","legendFormat":"Age"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"unit":"s","thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":86400},{"color":"red","value":172800}]},"mappings":[]}}
-    },
-    {
-      "id": 8, "type": "stat", "title": "Image Signature Valid — Gateway",
-      "gridPos": {"x":8,"y":12,"w":8,"h":4},
-      "targets": [{"expr":"yashigani_image_signature_valid{image=\"gateway\"}","legendFormat":"Signature"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"red","value":null},{"color":"green","value":1}]},"mappings":[{"type":"value","options":{"1":{"text":"SIGNED","color":"green"},"0":{"text":"UNSIGNED","color":"red"}}}]}}
-    },
-    {
-      "id": 9, "type": "stat", "title": "SBOM Present — Gateway",
-      "gridPos": {"x":16,"y":12,"w":8,"h":4},
-      "targets": [{"expr":"yashigani_image_sbom_present{image=\"gateway\"}","legendFormat":"SBOM"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"red","value":null},{"color":"green","value":1}]},"mappings":[{"type":"value","options":{"1":{"text":"PRESENT","color":"green"},"0":{"text":"MISSING","color":"red"}}}]}}
-    },
-    {
-      "id": 10, "type": "table", "title": "Security Findings",
-      "gridPos": {"x":0,"y":16,"w":24,"h":8},
+      "id": 3,
+      "type": "stat",
+      "title": "Test Coverage %",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"yashigani_trivy_findings_total","legendFormat":"","instant":true}
+        {
+          "expr": "yashigani_test_coverage_percent",
+          "legendFormat": "Coverage"
+        }
       ],
-      "options": {"sortBy":[{"displayName":"Value","desc":true}]},
-      "fieldConfig": {"defaults":{"custom":{"displayMode":"auto"}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Security Scan Failures (7d)",
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_security_scan_failures_total[7d])",
+          "legendFormat": "Failures"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "CVE Trend (7d)",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "yashigani_trivy_high_cve_count",
+          "legendFormat": "{{ image }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Test Coverage Trend (7d)",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "yashigani_test_coverage_percent",
+          "legendFormat": "Coverage"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Image Signature Valid \u2014 Gateway",
+      "gridPos": {
+        "x": 8,
+        "y": 15,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_image_signature_valid{image=\"gateway\"}",
+          "legendFormat": "Signature"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "SIGNED",
+                  "color": "green"
+                },
+                "0": {
+                  "text": "UNSIGNED",
+                  "color": "red"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "SBOM Present \u2014 Gateway",
+      "gridPos": {
+        "x": 16,
+        "y": 15,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_image_sbom_present{image=\"gateway\"}",
+          "legendFormat": "SBOM"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "PRESENT",
+                  "color": "green"
+                },
+                "0": {
+                  "text": "MISSING",
+                  "color": "red"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Security Findings",
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "yashigani_trivy_findings_total",
+          "legendFormat": "",
+          "instant": true
+        }
+      ],
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "displayMode": "auto"
+          }
+        }
+      }
     }
   ]
 }
