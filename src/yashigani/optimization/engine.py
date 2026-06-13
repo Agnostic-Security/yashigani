@@ -24,7 +24,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
+from yashigani.optimization.sensitivity_classifier import (
+    SensitivityLevel,
+    SensitivityResult,
+    _LEVEL_TO_LEGACY_STRING,
+)
 from yashigani.optimization.complexity_scorer import ComplexityLevel, ComplexityResult
 from yashigani.billing.budget_enforcer import BudgetSignal, BudgetState
 
@@ -152,7 +156,7 @@ class OptimizationEngine:
                     model=ov["model"],
                     route="cloud",
                     rule="P1-OVERRIDE",
-                    reason=(f"Sensitivity {sensitivity.level.value} routed to cloud "
+                    reason=(f"Sensitivity {sensitivity.level} routed to cloud "
                             f"{ov['provider']}/{ov['model']} under dual-admin risk-accepted "
                             f"override (justification: {ov.get('justification','')[:80]})"),
                     sensitivity=sensitivity,
@@ -161,14 +165,19 @@ class OptimizationEngine:
                     start_ns=start,
                 )
             # Check if admin configured a trusted cloud provider for this level
-            trusted = self._trusted_cloud.get(sensitivity.level.value)
+            # _trusted_cloud is keyed by legacy string (e.g. "CONFIDENTIAL").
+            # Convert numeric level to legacy key for backward-compat lookup.
+            _level_key: str = _LEVEL_TO_LEGACY_STRING.get(
+                int(sensitivity.level), str(sensitivity.level)
+            )
+            trusted = self._trusted_cloud.get(_level_key)
             if trusted:
                 return self._decide(
                     provider=trusted,
                     model=self._default_cloud_model,
                     route="cloud",
                     rule="P1",
-                    reason=f"Sensitivity {sensitivity.level.value} — trusted cloud ({trusted})",
+                    reason=f"Sensitivity {sensitivity.level} — trusted cloud ({trusted})",
                     sensitivity=sensitivity,
                     complexity=complexity,
                     budget=budget,
@@ -179,7 +188,7 @@ class OptimizationEngine:
                 model=local_default,
                 route="local",
                 rule="P1",
-                reason=f"Sensitivity {sensitivity.level.value} — local only",
+                reason=f"Sensitivity {sensitivity.level} — local only",
                 sensitivity=sensitivity,
                 complexity=complexity,
                 budget=budget,
@@ -334,7 +343,7 @@ class OptimizationEngine:
             route=route,
             rule=rule,
             reason=reason,
-            sensitivity=sensitivity.level.value,
+            sensitivity=str(sensitivity.level),
             complexity=complexity.level.value,
             budget_signal=budget.signal.value,
             budget_pct=budget.pct,
@@ -360,7 +369,7 @@ class OptimizationEngine:
                 rule=rule, route=route
             ).inc()
             yashigani_sensitivity_detections_total.labels(
-                level=sensitivity.level.value
+                level=str(sensitivity.level)
             ).inc()
             yashigani_complexity_scores_total.labels(
                 level=complexity.level.value

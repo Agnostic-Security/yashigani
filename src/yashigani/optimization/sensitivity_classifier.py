@@ -194,8 +194,8 @@ class SensitivityClassifier:
         ollama_url: str = "http://ollama:11434",
         ollama_model: str = "qwen2.5:3b",
     ) -> None:
-        self._patterns = [
-            (re.compile(p, re.IGNORECASE), level, desc)
+        self._patterns: list[tuple[re.Pattern[str], int, str]] = [
+            (re.compile(p, re.IGNORECASE), int(level), desc)
             for p, level, desc in (patterns or _DEFAULT_PATTERNS)
         ]
         # Handle legacy keyword aliases with deprecation warnings
@@ -447,12 +447,12 @@ class SensitivityClassifier:
 
     def add_pattern(self, pattern: str, level: "SensitivityLevel | int", description: str) -> None:
         """Add a custom regex pattern at runtime."""
-        self._patterns.append((re.compile(pattern, re.IGNORECASE), level, description))
+        self._patterns.append((re.compile(pattern, re.IGNORECASE), int(level), description))
 
     def reload_patterns(self, patterns: list[tuple[str, "SensitivityLevel | int", str]]) -> None:
         """Replace all patterns (e.g. after admin updates via API)."""
         self._patterns = [
-            (re.compile(p, re.IGNORECASE), level, desc)
+            (re.compile(p, re.IGNORECASE), int(level), desc)
             for p, level, desc in patterns
         ]
         logger.info("SensitivityClassifier: reloaded %d patterns", len(self._patterns))

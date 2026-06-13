@@ -226,7 +226,7 @@ class StreamingInspector:
             return 1  # PUBLIC int level
 
     # Deprecated alias — kept for one release cycle (v2.26.0 removal).
-    def _run_fasttext(self, text: str) -> str:
+    def _run_fasttext(self, text: str) -> "str | int":
         """Deprecated alias for _run_classifier. Removed in v2.26.0."""
         return self._run_classifier(text)
 
