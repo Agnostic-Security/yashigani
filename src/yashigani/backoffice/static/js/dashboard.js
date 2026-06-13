@@ -1366,8 +1366,85 @@ async function deleteAllocation(id) {
     else { var err = await resp.json().catch(function(){return {};}); alert('Remove failed: ' + errMsg(err, resp.status)); }
 }
 
-// Sensitivity
-async function loadSensitivity() {
+// Sensitivity — R14/R15 (v2.25.5): taxonomy + patterns
+
+// Taxonomy cache used to enrich pattern classification column
+var _taxonomyCache = null;
+
+async function loadTaxonomy() {
+    var data = await api('/admin/sensitivity/taxonomy');
+    var tbody = document.getElementById('taxonomy-tbody');
+    if (!data || !data.taxonomy) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Failed to load taxonomy</td></tr>';
+        return;
+    }
+    _taxonomyCache = {};
+    var levels = data.taxonomy;
+    if (levels.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">No taxonomy configured (using defaults)</td></tr>';
+        return;
+    }
+    var html = '';
+    for (var i = 0; i < levels.length; i++) {
+        var t = levels[i];
+        _taxonomyCache[String(t.level)] = t.label;
+        var cc = escapeHtml(t.colour_class || 'sens-level-1');
+        html += '<tr><td>' + escapeHtml(String(t.level)) + '</td>';
+        html += '<td><span class="' + cc + '">' + escapeHtml(t.label) + '</span></td>';
+        html += '<td><span class="' + cc + '">' + escapeHtml(t.colour_class) + '</span></td>';
+        html += '<td><button data-action="deleteTaxonomyLevel" data-level="' + escapeHtml(String(t.level)) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
+    }
+    tbody.innerHTML = html;
+
+    // Update the Classification dropdown in the Add Pattern form with live taxonomy labels
+    var patClass = document.getElementById('pat-class');
+    if (patClass) {
+        var opts = '';
+        // Sort descending (highest first) for UX
+        var sorted = levels.slice().sort(function(a, b) { return b.level - a.level; });
+        for (var j = 0; j < sorted.length; j++) {
+            var lvl = sorted[j];
+            opts += '<option value="' + escapeHtml(String(lvl.level)) + '">' +
+                    escapeHtml(String(lvl.level)) + ' — ' + escapeHtml(lvl.label) + '</option>';
+        }
+        patClass.innerHTML = opts;
+    }
+}
+
+async function saveTaxonomyLevel() {
+    var result = document.getElementById('taxonomy-result');
+    var level = document.getElementById('tax-level').value.trim();
+    var label = document.getElementById('tax-label').value.trim();
+    var colour = document.getElementById('tax-colour').value;
+    if (!level || !label) { result.textContent = 'Level number and label are required.'; return; }
+    var lvlNum = parseInt(level, 10);
+    if (isNaN(lvlNum) || lvlNum < 1 || lvlNum > 10) { result.textContent = 'Level must be a number 1–10.'; return; }
+    var resp = await apiMutate('/admin/sensitivity/taxonomy/' + encodeURIComponent(lvlNum), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: label, colour_class: colour })
+    });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    if (resp.ok) {
+        result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('tax-level').value = '';
+        document.getElementById('tax-label').value = '';
+        loadTaxonomy();
+    } else {
+        var err = await resp.json().catch(function(){return {};});
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
+    }
+}
+
+async function deleteTaxonomyLevel(level) {
+    if (!confirm('Delete taxonomy level ' + level + '?')) return;
+    var resp = await apiMutate('/admin/sensitivity/taxonomy/' + encodeURIComponent(level), { method: 'DELETE' });
+    if (!resp) return;
+    if (resp.ok) loadTaxonomy();
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
+}
+
+async function initSensitivity() {
     // Pipeline status
     var data = await api('/admin/sensitivity/status');
     if (data) {
@@ -1377,17 +1454,29 @@ async function loadSensitivity() {
         document.getElementById('ollama-status').textContent = data.ollama_available ? 'Active' : 'Unavailable';
         document.getElementById('ollama-status').className = 'badge ' + (data.ollama_available ? 'badge-green' : 'badge-yellow');
     }
+    // Load taxonomy first (populates the pat-class dropdown), then patterns
+    await loadTaxonomy();
+    await loadPatterns();
+}
 
-    // Patterns from API
+// loadSensitivity is now an alias for initSensitivity (backward-compat for showPage call)
+async function loadSensitivity() { await initSensitivity(); }
+
+async function loadPatterns() {
     var patterns = await api('/admin/sensitivity/patterns');
     var tbody = document.getElementById('patterns-tbody');
     if (patterns && patterns.patterns && patterns.patterns.length > 0) {
         var html = '';
-        var classBadge = { 'RESTRICTED': 'badge-red', 'CONFIDENTIAL': 'badge-yellow', 'INTERNAL': 'badge-blue', 'PUBLIC': 'badge-green' };
+        // Level → CSS class map for numeric levels
+        var levelClass = { '5': 'sens-level-5', '4': 'sens-level-4', '3': 'sens-level-3', '2': 'sens-level-2', '1': 'sens-level-1' };
+        // Legacy string fallback
+        var legacyClass = { 'RESTRICTED': 'sens-level-4', 'CONFIDENTIAL': 'sens-level-3', 'INTERNAL': 'sens-level-2', 'PUBLIC': 'sens-level-1' };
         for (var i = 0; i < patterns.patterns.length; i++) {
             var p = patterns.patterns[i];
-            var cb = classBadge[p.classification] || 'badge-blue';
-            html += '<tr><td><span class="badge ' + cb + '">' + escapeHtml(p.classification) + '</span></td><td>' + escapeHtml(p.type) + '</td><td class="td-mono-xxs">' + escapeHtml(p.pattern) + '</td><td>' + escapeHtml(p.description) + '</td><td><button data-action="deletePattern" data-pattern-id="' + escapeHtml(p.id) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
+            var cls = levelClass[p.classification] || legacyClass[p.classification] || 'sens-level-1';
+            // Use classification_label if available (enriched by API), else use taxonomy cache, else raw value
+            var labelText = p.classification_label || (_taxonomyCache && _taxonomyCache[String(p.classification)]) || p.classification;
+            html += '<tr><td><span class="' + cls + '">' + escapeHtml(labelText) + '</span></td><td>' + escapeHtml(p.type) + '</td><td class="td-mono-xxs">' + escapeHtml(p.pattern) + '</td><td>' + escapeHtml(p.description) + '</td><td><button data-action="deletePattern" data-pattern-id="' + escapeHtml(p.id) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
         }
         tbody.innerHTML = html;
     } else {
@@ -1411,7 +1500,7 @@ async function addPattern() {
         })
     });
     if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
-    if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('pat-pattern').value = ''; document.getElementById('pat-desc').value = ''; loadSensitivity(); }
+    if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('pat-pattern').value = ''; document.getElementById('pat-desc').value = ''; await loadPatterns(); }
     else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
@@ -1419,7 +1508,7 @@ async function deletePattern(id) {
     if (!confirm('Delete this pattern?')) return;
     var resp = await apiMutate('/admin/sensitivity/patterns/' + id, { method: 'DELETE' });
     if (!resp) return;
-    if (resp.ok) loadSensitivity();
+    if (resp.ok) loadPatterns();
     else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
 }
 
@@ -1953,6 +2042,12 @@ document.addEventListener('click', function(e) {
             break;
         case 'testClassify':
             testClassify();
+            break;
+        case 'saveTaxonomyLevel':
+            saveTaxonomyLevel();
+            break;
+        case 'deleteTaxonomyLevel':
+            deleteTaxonomyLevel(actionEl.getAttribute('data-level'));
             break;
 
         // Audit actions
