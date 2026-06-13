@@ -506,6 +506,7 @@ data:
       # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
       # GET /docs (Swagger UI). Without explicit handles these fell through
       # to the Open WebUI catch-all and were functionally unreachable.
+      # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
       handle /openapi.json {
         import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
@@ -516,6 +517,15 @@ data:
         }
       }
       handle /docs {
+        import strip-orchestration-headers
+        reverse_proxy https://yashigani-gateway:8080 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-gateway
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      handle /redoc {
         import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}

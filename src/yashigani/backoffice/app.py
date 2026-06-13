@@ -1046,10 +1046,20 @@ def create_backoffice_app() -> FastAPI:
     async def admin_redoc_ui(
         session=Depends(require_admin_session),  # noqa: ARG001
     ) -> HTMLResponse:
-        """ReDoc UI — served from self-hosted assets (no CDN)."""
+        """ReDoc UI — served from self-hosted assets (no CDN).
+
+        redoc_js_url, redoc_favicon_url, and with_google_fonts=False are all
+        explicitly set so no request is made to cdn.jsdelivr.net, fastapi.tiangolo.com,
+        or fonts.googleapis.com.  Strict CSP (script-src 'self') requires all
+        scripts to be same-origin — the default FastAPI redoc_js_url is a CDN URL
+        that would be blocked without these overrides.
+        """
         return get_redoc_html(
             openapi_url="/admin/openapi.json",
             title="Yashigani Backoffice — API Reference (ReDoc)",
+            redoc_js_url="/static/swagger-ui/redoc.standalone.js",
+            redoc_favicon_url="/static/swagger-ui/favicon.png",
+            with_google_fonts=False,
         )
 
     # Admin UI — HTML pages
