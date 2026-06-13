@@ -2982,7 +2982,7 @@ async def gate_relaxed_final(
         try:
             _regex_triggers: list[str] = []
             classified = _state.sensitivity_classifier._scan_regex(
-                final_text, _regex_triggers).value
+                final_text, _regex_triggers).name
         except Exception as exc:
             # Fail-closed: a scan error on a candidate final must NOT pass.
             logger.warning(
