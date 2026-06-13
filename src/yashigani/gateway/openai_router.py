@@ -126,6 +126,79 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
         pass
 
 # ---------------------------------------------------------------------------
+# OWUI-friendly deny messages (R2 — fix/2.25.5-owui-deny-message)
+#
+# Open WebUI renders the upstream ``error.message`` field directly in the
+# chat UI.  Machine-code reasons from OPA (e.g. "identity_not_active",
+# "sensitivity_ceiling_exceeded") surface as raw opaque strings.  This map
+# translates every OPA + internal reason code to a concise, layman-readable
+# sentence that OWUI will display to the end user.
+#
+# Rules:
+#   • Never leak internal identifiers (identity IDs, policy names, stack traces).
+#   • Keep messages under ~120 chars so they fit the OWUI error pill.
+#   • Always explain WHAT was blocked and WHO to ask for help.
+# ---------------------------------------------------------------------------
+_OWUI_DENY_MESSAGES: dict[str, str] = {
+    # v1 ingress (OPA v1_routing.rego `reason`)
+    "identity_not_active":
+        "Your account is not active. Contact an administrator to restore access.",
+    "model_not_allowed":
+        "You are not allocated this model. Ask an administrator to grant access.",
+    "routing_unsafe_sensitive_to_cloud":
+        "This request contains sensitive content and cannot be sent to a cloud provider. Contact an administrator to adjust your routing policy.",
+    "sensitivity_ceiling_exceeded":
+        "This request exceeds your sensitivity clearance level. Contact an administrator.",
+    "model_not_allocated":
+        "You are not allocated this model. Ask an administrator to grant access.",
+    # response-path (OPA v1_routing.rego `response_reason`)
+    "denied_default_deny":
+        "Your request was denied by policy. Contact an administrator for details.",
+    "invalid_identity_ceiling":
+        "Your account's sensitivity clearance does not permit this response. Contact an administrator.",
+    "response_sensitivity_exceeds_ceiling":
+        "The response contains content that exceeds your sensitivity clearance level. Contact an administrator.",
+    "response_blocked_by_inspection":
+        "The response was blocked by the security inspection policy. Contact an administrator.",
+    # OPA infrastructure
+    "opa_unreachable":
+        "The security policy service is temporarily unavailable. Please try again shortly.",
+    "opa_response_check_failed":
+        "The security policy service is temporarily unavailable. Please try again shortly.",
+    "opa_not_configured":
+        "Gateway security policy is not configured. Contact an administrator.",
+    "response_policy_denied":
+        "Your request was denied by the response policy. Contact an administrator.",
+    "policy_denied":
+        "Your request was denied by policy. Contact an administrator for details.",
+    # PII
+    "pii_detected":
+        "Your message contains sensitive personal data that cannot be sent to this provider. Remove the personal information and try again.",
+    "pii_detected_encoded":
+        "Your message contains encoded personal data that cannot be safely redacted. Remove the personal information and try again.",
+    # client-policy
+    "client_policy_denied":
+        "Your request was denied by an access policy assigned to your account. Contact an administrator.",
+    # pool / agent
+    "pool_limit_exceeded":
+        "The maximum number of concurrent sessions for this agent has been reached. Please try again shortly.",
+    "pool_backend_unavailable":
+        "The agent's container backend is temporarily unavailable. Contact an administrator.",
+}
+
+_OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
+
+
+def _owui_deny_message(reason: str) -> str:
+    """Return a human-readable deny message for OWUI chat display.
+
+    Falls back to the generic message for any reason code not in the table.
+    Never leaks the raw reason code into the returned string.
+    """
+    return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+
+
+# ---------------------------------------------------------------------------
 # OPA fail-closed Prometheus counter (Path 1 + Path 3)
 #
 # yashigani_opa_response_check_failures_total — increments whenever the
@@ -1374,11 +1447,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 status_code=403,
                 content={
                     "error": {
-                        "message": (
-                            "Request denied by policy: you are not allocated this model. "
-                            "Request a model within your allocation or ask an administrator "
-                            "to allocate it to you."
-                        ),
+                        # R2: human-readable message so OWUI displays it in chat.
+                        "message": _owui_deny_message("model_not_allocated"),
                         "type": "policy_denied",
                         "code": "model_not_allocated",
                     }
@@ -1476,11 +1546,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": (
-                        "Request denied by policy: you are not allocated this model. "
-                        "Request a model within your allocation or ask an administrator "
-                        "to allocate it to you."
-                    ),
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -1512,7 +1579,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": f"Request denied by policy: {opa_reason}",
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
@@ -1551,11 +1619,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": (
-                        "Request denied by policy: you are not allocated this model. "
-                        "Request a model within your allocation or ask an administrator "
-                        "to allocate it to you."
-                    ),
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -1580,7 +1645,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _audit_client_policy("ingress", identity_id, _ce_scope_kind, identity_id, _ce_in)
         return JSONResponse(
             status_code=403,
-            content={"error": {"message": f"Request denied by client policy: {_ce_reason}",
+            # R2: human-readable message so OWUI displays it in chat.
+            # _ce_reason is a comma-joined set of machine deny codes; it is kept
+            # in `code` for operator tooling but never shown to the end user.
+            content={"error": {"message": _owui_deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_reason}},
             headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
         )
@@ -1641,20 +1709,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     _pii_audit(request_id, "request", _pii_result, _pii_result.action_taken, destination)
 
                     if _pii_result.action_taken == "blocked":
-                        raise HTTPException(
+                        # R2: return OpenAI error schema so OWUI displays the
+                        # human-readable message in chat (not FastAPI's {"detail":…}).
+                        return JSONResponse(
                             status_code=status.HTTP_403_FORBIDDEN,
-                            detail={
-                                "error": "pii_detected",
-                                "detail": (
-                                    "Request blocked: PII detected and PII mode is BLOCK "
-                                    "for cloud-routed requests. Configure PII mode to REDACT "
-                                    "or enable cloud bypass via the admin panel."
-                                ),
-                                "pii_types": [f.pii_type.value for f in _pii_result.findings],
-                                # F-RT1: surface that an encoded payload was the trigger.
-                                "matched_views": sorted(_pii_result.matched_views),
-                                "request_id": request_id,
+                            content={
+                                "error": {
+                                    "message": _owui_deny_message("pii_detected"),
+                                    "type": "pii_blocked",
+                                    "code": "pii_detected",
+                                    # Operator/diagnostic fields — not shown in OWUI chat.
+                                    "pii_types": [f.pii_type.value for f in _pii_result.findings],
+                                    "matched_views": sorted(_pii_result.matched_views),
+                                    "request_id": request_id,
+                                }
                             },
+                            headers={"X-Yashigani-Request-Id": request_id},
                         )
 
                     if _pii_result.action_taken == "redacted":
@@ -1668,19 +1738,20 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             if _msg.content:
                                 _msg_redacted, _msg_res = _state.pii_detector.process_decoded(_msg.content)
                                 if _msg_res.action_taken == "blocked":
-                                    raise HTTPException(
+                                    # R2: return OpenAI error schema so OWUI displays
+                                    # the human-readable message in chat.
+                                    return JSONResponse(
                                         status_code=status.HTTP_403_FORBIDDEN,
-                                        detail={
-                                            "error": "pii_detected_encoded",
-                                            "detail": (
-                                                "Request blocked: PII detected inside an "
-                                                "encoded payload that cannot be redacted in "
-                                                "place. Send the request without encoding or "
-                                                "enable cloud bypass via the admin panel."
-                                            ),
-                                            "matched_views": sorted(_msg_res.matched_views),
-                                            "request_id": request_id,
+                                        content={
+                                            "error": {
+                                                "message": _owui_deny_message("pii_detected_encoded"),
+                                                "type": "pii_blocked",
+                                                "code": "pii_detected_encoded",
+                                                "matched_views": sorted(_msg_res.matched_views),
+                                                "request_id": request_id,
+                                            }
                                         },
+                                        headers={"X-Yashigani-Request-Id": request_id},
                                     )
                                 _msg.content = _msg_redacted
                         prompt_text = "\n".join(
@@ -2237,7 +2308,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     status_code=403,
                     content={
                         "error": {
-                            "message": f"Response blocked by policy: {resp_opa_reason}",
+                            # R2: human-readable message so OWUI displays it in chat.
+                            "message": _owui_deny_message(resp_opa_reason),
                             "type": "response_policy_denied",
                             "code": resp_opa_reason,
                         }
@@ -2262,7 +2334,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _audit_client_policy("egress", identity_id, _ce_eg_kind, identity_id, _ce_eg)
         return JSONResponse(
             status_code=403,
-            content={"error": {"message": f"Response blocked by client policy: {_ce_eg_reason}",
+            # R2: human-readable message so OWUI displays it in chat.
+            content={"error": {"message": _owui_deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_eg_reason}},
             headers={"X-Yashigani-Request-Id": request_id,
                      "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
