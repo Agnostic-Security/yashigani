@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.24.1 — Docker Compose stack
+# Last updated: 2026-06-13T00:00:00+01:00 (fix(redis): B1 — enable AOF+volatile-lru on main redis; identities/agents/allocations survive --upgrade container recreate)
 # Last updated: 2026-05-24T12:00:00+01:00 (security(secrets): PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets mount removed; closes NICO-V241-001 + YSG-RISK-060)
 # Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
 # Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
@@ -703,6 +704,19 @@ services:
       WEBUI_AUTH: "false"
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "X-Forwarded-User"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "X-Forwarded-Name"
+      # Phase 2 / 2.25.5-auth-ingress: OWUI is now served under /app/webui.
+      # WEBUI_URL sets the canonical public URL so OWUI's SvelteKit build resolves
+      # _app/* assets, socket.io, and API calls under the subpath.
+      # WEBUI_BASE_URL is the path prefix for the SvelteKit router.
+      # Both must agree with the Caddy /app/webui* route.
+      WEBUI_URL: "/app/webui"
+      WEBUI_BASE_URL: "/app/webui"
+      # Single-logout: when the user clicks logout in OWUI, OWUI's signout API
+      # returns {"redirect_url": "/auth/logout-redirect"}.  The SvelteKit client
+      # navigates there; backoffice /auth/logout-redirect invalidates the
+      # Yashigani session cookie and redirects to /login.  Fixes the "no working
+      # end-user logout" trap.
+      WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "/auth/logout-redirect"
       ENABLE_SIGNUP: "true"
       # Track C (F-B): forward the authenticated OWUI user to the gateway on
       # every upstream call. OWUI v0.9.2 then emits X-OpenWebUI-User-Email /
@@ -939,10 +953,10 @@ services:
       --tls-ca-cert-file /run/secrets/ca_root.crt
       --tls-auth-clients yes
       --tls-protocols "TLSv1.2 TLSv1.3"
-      --save ""
-      --appendonly no
+      --appendonly yes
+      --appendfsync everysec
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
       --requirepass "$$(cat /run/secrets/redis_password)"'
     volumes:
       - redis_data:/data
@@ -1160,6 +1174,13 @@ services:
       # retro #83: enable TLS on Prometheus port 9090 (Pattern B mTLS).
       # Grafana datasource calls now use https://prometheus:9090 with mutual TLS.
       - "--web.config.file=/etc/prometheus/web-config.yml"
+      # B9: fix 302→/graph redirect misrouting under /admin/prometheus/ sub-path.
+      # Without --web.external-url Prometheus emits a bare /graph redirect which
+      # the browser resolves as the root, landing on the OWUI catch-all instead of
+      # the Prometheus UI. --web.route-prefix=/ keeps internal routing clean while
+      # --web.external-url tells Prometheus its public prefix for all redirects.
+      - "--web.external-url=https://${YASHIGANI_TLS_DOMAIN}/admin/prometheus/"
+      - "--web.route-prefix=/"
     # Internal security finding (EX-231-10 closure): Prometheus runs as uid 65534
     # (nobody) but needs to read prometheus_client.{crt,key} from /run/secrets.
     # Fix: add GID 1001 (yashigani app group) so Prometheus can read the
@@ -1561,6 +1582,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # PKI certs: promtail client cert for mTLS push to Loki.
       - ./secrets:/run/secrets:ro
+      # B8: persist positions file so re-tails from last offset on restart rather
+      # than from the start (which causes duplicate log ingestion into Loki).
+      # /tmp/positions.yaml was lost on every container restart. Named volume
+      # survives restarts and upgrades; promtail.yml points here too (see config).
+      - promtail_positions:/var/lib/promtail
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9080' || exit 1"]
       interval: 15s
@@ -1578,6 +1604,7 @@ services:
     tmpfs:
       # YSG-RISK-008 (v2.23.4): promtail has no data volume. Config + certs are
       # read-only mounts. Docker socket is read-only bind mount. /tmp for Go runtime.
+      # B8: positions are now persisted to promtail_positions named volume, not /tmp.
       - /tmp:size=32m,mode=1777
     # YSG-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
@@ -2144,12 +2171,15 @@ services:
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
     volumes:
       - openclaw_data:/home/node/.openclaw
-      - ./openclaw/openclaw.json:/etc/openclaw/openclaw.json:ro
+      # YSG-BUG-2255-002: mount the runtime copy (bearer substituted by install.sh step 8f),
+      # NOT the git-tracked placeholder. openclaw.runtime.json is written to WORK_DIR at
+      # install time and is gitignored so the real token never enters VCS.
+      - ./openclaw/openclaw.runtime.json:/etc/openclaw/openclaw.json:ro
     # PROBE-AG1 fix: NO /run/secrets mount at all for openclaw.
-    # openclaw reads yashigani_internal_bearer via openclaw.json (install.sh substitutes
-    # __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is baked into the config).
-    # No runtime secret file reads required. caddy_internal_hmac and ALL PKI material
-    # are NOT accessible to openclaw containers.
+    # openclaw reads yashigani_internal_bearer via openclaw.runtime.json (install.sh
+    # step 8f substitutes __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is
+    # baked into the runtime config). No runtime secret file reads required.
+    # caddy_internal_hmac and ALL PKI material are NOT accessible to openclaw containers.
     # openclaw also joins `edge` (internet-facing for Slack/Telegram webhooks) — the
     # absence of /run/secrets mount is the critical blast-radius reduction for PROBE-AG1.
     healthcheck:
@@ -2443,6 +2473,10 @@ volumes:
   alertmanager_data:
     driver: local
   loki_data:
+    driver: local
+  # B8: persist promtail read positions so container restart re-tails from
+  # the last offset, not from the start (prevents duplicate Loki ingestion).
+  promtail_positions:
     driver: local
   # Test IdP volume
   keycloak_data:

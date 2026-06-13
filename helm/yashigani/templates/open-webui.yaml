@@ -138,6 +138,17 @@ spec:
               value: {{ .Values.openWebui.env.webuiAuthTrustedEmailHeader | quote }}
             - name: WEBUI_AUTH_TRUSTED_NAME_HEADER
               value: {{ .Values.openWebui.env.webuiAuthTrustedNameHeader | quote }}
+            # Phase 2 / 2.25.5-auth-ingress: OWUI served under /app/webui.
+            # WEBUI_URL and WEBUI_BASE_URL tell SvelteKit the public subpath so
+            # _app/* assets, socket.io, and API calls resolve correctly.
+            - name: WEBUI_URL
+              value: {{ .Values.openWebui.env.webuiUrl | default "/app/webui" | quote }}
+            - name: WEBUI_BASE_URL
+              value: {{ .Values.openWebui.env.webuiBaseUrl | default "/app/webui" | quote }}
+            # Single-logout: redirect to /auth/logout-redirect after OWUI signout
+            # so the Yashigani session cookie is cleared.  See auth.py:logout_redirect.
+            - name: WEBUI_AUTH_SIGNOUT_REDIRECT_URL
+              value: {{ .Values.openWebui.env.webuiAuthSignoutRedirectUrl | default "/auth/logout-redirect" | quote }}
             - name: ENABLE_SIGNUP
               value: {{ .Values.openWebui.env.enableSignup | quote }}
             # Track C (F-B): emit X-OpenWebUI-User-* on upstream gateway calls

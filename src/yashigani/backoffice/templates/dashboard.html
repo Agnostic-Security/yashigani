@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-25T00:00:00+00:00 — v2.24.3 runtime-settings Phase 2 nav + page div + edit form + toast -->
+<!-- last-updated: 2026-06-13T00:00:00+01:00 — R25 dashboard redesign (semaphores/alerts/budget/security/traffic) + 2.25.5-ui-wiring (R8/R9/R10/R12/R13/R16/R23/R24/R26/N1) -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24,41 +24,95 @@
                 <button data-action="showPage" data-param="audit">Audit Log</button>
                 <button data-action="showPage" data-param="monitoring">Monitoring</button>
                 <button data-action="showPage" data-param="backup">Backup</button>
-                <button data-action="showPage" data-param="pki">PKI</button>
+                <button data-action="showPage" data-param="pki">PKI / Crypto</button>
                 <button data-action="showPage" data-param="settings">Settings</button>
                 <button data-action="showPage" data-param="runtime-settings">Runtime Settings</button>
             </div>
         </div>
         <div class="nav-right">
-            <span>v{{ yashigani_version }}</span>
+            <!-- R26: version badge — updated by loadVersionCheck() on DOMContentLoaded -->
+            <span id="version-badge" class="version-badge-none">v{{ yashigani_version }}</span>
             <button data-action="logout">Logout</button>
         </div>
     </nav>
 
     <main>
-        <!-- Dashboard Page -->
+        <!-- N1 — second-admin required banner (shown when action_required=true from GET /admin/accounts/enforcement) -->
+        <div id="n1-admin-banner" class="n1-banner">
+            <span class="n1-banner-text">
+                <strong>Action required:</strong> This deployment has fewer than 2 active administrators.
+                Add a second admin to meet NIST AC-2 / SOC 2 CC6.2 requirements.
+            </span>
+            <button class="n1-banner-btn" data-action="showPage" data-param="accounts">Add second admin</button>
+        </div>
+
+        <!-- Dashboard Page — R25 redesign -->
         <div class="page active" id="page-dashboard">
-            <!-- First-run onboarding checklist -->
-            <div id="onboarding-checklist" class="onboarding">
-                <h3 class="onboarding-title">Getting Started</h3>
-                <div class="onboarding-items">
-                    <label id="ob-password" class="onboarding-lbl" data-action="showPage" data-param="accounts"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" class="onboarding-lbl" data-action="showPage" data-param="agents"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" class="onboarding-lbl" data-action="showPage" data-param="budgets"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" class="onboarding-lbl" data-action="showPage" data-param="alerts"><input type="checkbox" disabled> Set up alert webhooks</label>
+
+            <!-- Row 1: service semaphores + active alerts semaphore -->
+            <div class="dash-row">
+
+                <!-- Widget 1: Per-service health semaphores + roll-up -->
+                <div class="dash-widget dash-widget--wide panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Service Health</span>
+                        <span id="dash-health-rollup" class="semaphore semaphore--loading" title="Overall health"></span>
+                    </div>
+                    <div class="panel-body" id="dash-services-body">
+                        <span class="loading">Loading…</span>
+                    </div>
                 </div>
-                <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
+
+                <!-- Widget 2: Active alerts semaphore (P1→P5, priority order) -->
+                <div class="dash-widget panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Active Alerts</span>
+                        <span class="dash-header-meta" id="dash-alerts-total"></span>
+                    </div>
+                    <div class="panel-body" id="dash-alerts-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
             </div>
 
-            <h2>System Health</h2>
-            <div id="health-cards" class="cards"><div class="card"><span class="loading">Loading...</span></div></div>
+            <!-- Row 2: Budget usage + Security story -->
+            <div class="dash-row">
 
-            <h2>Overview</h2>
-            <div class="cards">
-                <div class="card"><div class="card-label">Admin Accounts</div><div class="card-value" id="stat-accounts">-</div></div>
-                <div class="card"><div class="card-label">Registered Agents</div><div class="card-value" id="stat-agents">-</div></div>
-                <div class="card"><div class="card-label">License Tier</div><div class="card-value" id="stat-license">-</div></div>
+                <!-- Widget 3: Budget usage — used/cap gauge, 85% marker, cloud/local split -->
+                <div class="dash-widget panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Budget Usage</span>
+                        <span class="dash-header-meta" id="dash-budget-threshold-badge"></span>
+                    </div>
+                    <div class="panel-body" id="dash-budget-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
+                <!-- Widget 4: Security story — denials, blocks, sensitivity mix -->
+                <div class="dash-widget panel">
+                    <div class="panel-header">Security</div>
+                    <div class="panel-body" id="dash-security-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
             </div>
+
+            <!-- Row 3: Traffic, agent/MCP activity, recent audit -->
+            <div class="dash-row">
+                <div class="dash-widget dash-widget--full panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Traffic &amp; Activity</span>
+                        <button data-action="dashRefresh" class="btn-xs-add">Refresh</button>
+                    </div>
+                    <div class="panel-body" id="dash-traffic-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+            </div>
+
         </div>
 
         <!-- Agents Page -->
@@ -82,6 +136,22 @@
                         <button data-action="registerAgent" class="btn-sm-save">Register</button>
                     </div>
                     <div id="register-agent-result" class="form-result"></div>
+                </div>
+                <!-- R6: inline edit form (populated on Edit click) -->
+                <div id="edit-agent-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Agent ID</label><br><input id="edit-agent-id" type="text" readonly class="fi w-250"></div>
+                        <div><label class="lbl">Name</label><br><input id="edit-agent-name" type="text" placeholder="my-agent" class="fi w-150"></div>
+                        <div><label class="lbl">Upstream URL</label><br><input id="edit-agent-url" type="text" placeholder="http://agent:8000" class="fi w-250"></div>
+                    </div>
+                    <div class="form-row--mt">
+                        <div><label class="lbl">Groups (comma-separated)</label><br><input id="edit-agent-groups" type="text" placeholder="default,engineering" class="fi w-200"></div>
+                        <div><label class="lbl">Allowed caller groups</label><br><input id="edit-agent-caller-groups" type="text" placeholder="admins,operators" class="fi w-200"></div>
+                        <button data-action="saveEditAgent" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAgent" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Alias is derived from the agent name. Changing groups/caller-groups updates RBAC immediately.</p>
+                    <div id="edit-agent-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Name</th><th>Agent ID</th><th>Upstream URL</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
@@ -116,9 +186,21 @@
                     </div>
                     <div id="create-admin-result" class="form-result"></div>
                 </div>
+                <!-- R5: inline edit form (populated on Edit click) -->
+                <div id="edit-admin-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Username</label><br><input id="edit-admin-username" type="text" readonly class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="edit-admin-email" type="email" placeholder="admin@example.com" class="fi w-280"></div>
+                        <div><label class="lbl">Status</label><br><select id="edit-admin-status" class="fi"><option value="active">Active</option><option value="disabled">Disabled</option></select></div>
+                        <button data-action="saveEditAccount" data-account-type="admin" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAccount" data-account-type="admin" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Role/tier is fixed for an existing account (admin and user identities are kept strictly separate). To change tier, delete and recreate in the correct list.</p>
+                    <div id="edit-admin-result" class="form-result"></div>
+                </div>
                 <table>
-                    <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
-                    <tbody id="accounts-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                    <thead><tr><th>Username</th><th>Email</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
+                    <tbody id="accounts-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
                 </table>
             </div>
 
@@ -136,9 +218,21 @@
                     </div>
                     <div id="create-user-result" class="form-result"></div>
                 </div>
+                <!-- R5: inline edit form (populated on Edit click) -->
+                <div id="edit-user-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Username</label><br><input id="edit-user-username" type="text" readonly class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="edit-user-email" type="email" placeholder="user@example.com" class="fi w-280"></div>
+                        <div><label class="lbl">Status</label><br><select id="edit-user-status" class="fi"><option value="active">Active</option><option value="disabled">Disabled</option></select></div>
+                        <button data-action="saveEditAccount" data-account-type="user" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAccount" data-account-type="user" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Role/tier is fixed for an existing account (admin and user identities are kept strictly separate). To change tier, delete and recreate in the correct list.</p>
+                    <div id="edit-user-result" class="form-result"></div>
+                </div>
                 <table>
-                    <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
-                    <tbody id="users-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                    <thead><tr><th>Username</th><th>Email</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
+                    <tbody id="users-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
                 </table>
             </div>
 
@@ -255,7 +349,7 @@
                 </div>
                 <div id="add-group-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Group ID</label><br><input id="group-id" type="text" placeholder="engineering" class="fi w-150"></div>
+                        <div><label class="lbl">Group</label><br><select id="group-id" class="fi w-200"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Provider</label><br><select id="group-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
                         <div><label class="lbl">Token Budget</label><br><input id="group-tokens" type="number" min="1" value="500000" class="fi w-140"></div>
                         <div><label class="lbl">Period</label><br><select id="group-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
@@ -275,7 +369,7 @@
                 </div>
                 <div id="add-ind-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Identity ID</label><br><input id="ind-id" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">User</label><br><select id="ind-id" class="fi w-200"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Provider</label><br><select id="ind-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
                         <div><label class="lbl">Token Budget</label><br><input id="ind-tokens" type="number" min="1" value="100000" class="fi w-140"></div>
                         <div><label class="lbl">Period</label><br><select id="ind-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
@@ -313,10 +407,10 @@
                 </div>
                 <div id="add-alias-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Alias</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-120"></div>
-                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
-                        <div><label class="lbl">Model</label><br><input id="alias-model" type="text" placeholder="qwen2.5:3b" class="fi w-200"></div>
-                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi"><option value="true">Yes</option><option value="false">No</option></select></div>
+                        <div><label class="lbl">Alias name</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-160"></div>
+                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi w-120"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
+                        <div><label class="lbl">Model (from pulled list)</label><br><select id="alias-model" class="fi w-250"><option value="">Loading models…</option></select></div>
+                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi w-80"><option value="true">Yes</option><option value="false">No</option></select></div>
                         <button data-action="addAlias" class="btn-sm-save">Save</button>
                     </div>
                     <div id="alias-result" class="form-result"></div>
@@ -333,9 +427,9 @@
                 </div>
                 <div id="add-alloc-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Model Alias</label><br><input id="alloc-alias" type="text" placeholder="fast" class="fi w-120"></div>
+                        <div><label class="lbl">Model Alias</label><br><select id="alloc-alias" class="fi w-120"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Target Type</label><br><select id="alloc-type" class="fi"><option value="user">user</option><option value="group">group</option><option value="org">org</option></select></div>
-                        <div><label class="lbl">Target ID</label><br><input id="alloc-target" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">Target ID</label><br><select id="alloc-target" class="fi w-200"><option value="">Select a type…</option></select></div>
                         <button data-action="addAllocation" class="btn-sm-save">Allocate</button>
                     </div>
                     <div id="alloc-result" class="form-result"></div>
@@ -390,6 +484,62 @@
                     <span class="badge badge-green" id="ollama-status">Active</span>
                 </div>
             </div>
+            <!-- Taxonomy panel — rendered before Detection Patterns (R14/R15 v2.25.5) -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Sensitivity Taxonomy</span>
+                    <button data-action="toggleForm" data-form-id="add-taxonomy-form" class="btn-xs-add">+ Add Level</button>
+                </div>
+                <div id="add-taxonomy-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Level (number)</label><br><input id="tax-level" type="number" min="1" max="10" class="fi w-80"></div>
+                        <div><label class="lbl">Label</label><br><input id="tax-label" type="text" placeholder="e.g. Sensitive" class="fi w-150"></div>
+                        <div><label class="lbl">Colour</label><br>
+                            <select id="tax-colour" class="fi">
+                                <option value="sens-level-5">Red (highest)</option>
+                                <option value="sens-level-4">Orange</option>
+                                <option value="sens-level-3">Yellow</option>
+                                <option value="sens-level-2">Green</option>
+                                <option value="sens-level-1">Blue (lowest)</option>
+                            </select>
+                        </div>
+                        <button data-action="saveTaxonomyLevel" class="btn-sm-save">Save</button>
+                    </div>
+                    <div id="taxonomy-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>Level</th><th>Label</th><th>Colour</th><th>Actions</th></tr></thead>
+                    <tbody id="taxonomy-tbody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+                </table>
+            </div>
+            <!-- R16 — AI-generate detection pattern panel -->
+            <div class="panel">
+                <div class="panel-header">AI-generate Detection Pattern</div>
+                <div class="panel-body">
+                    <p class="txt-note">Describe a sensitive data type in plain English. The internal LLM
+                        generates a regex pattern + suggested sensitivity level. Review and accept to add it.</p>
+                    <div class="form-row">
+                        <div class="flex-1">
+                            <label class="lbl">Description</label><br>
+                            <input id="genpattern-desc" type="text" placeholder="e.g. UK government OFFICIAL-SENSITIVE markings"
+                                   class="fi w-full">
+                        </div>
+                        <button data-action="generatePattern" class="btn-sm-save">Generate</button>
+                    </div>
+                    <div id="genpattern-result" class="genpattern-result"></div>
+                    <!-- Preview box — shown after generation, hidden initially -->
+                    <div id="genpattern-preview" class="genpattern-preview is-hidden">
+                        <div class="form-row">
+                            <div><label class="lbl">Generated regex</label><br><code id="genpattern-regex-val" class="genpattern-regex"></code></div>
+                            <div><label class="lbl">Suggested level</label><br><span id="genpattern-level-val"></span></div>
+                            <div><label class="lbl">Description</label><br><span id="genpattern-desc-val"></span></div>
+                        </div>
+                        <button data-action="acceptGeneratedPattern" class="btn-genpattern-accept">Accept — add this pattern</button>
+                        <span id="genpattern-accept-result" class="pol-result"></span>
+                    </div>
+                </div>
+            </div>
+
             <div class="panel">
                 <div class="panel-header panel-header-flex">
                     <span>Detection Patterns</span>
@@ -397,7 +547,17 @@
                 </div>
                 <div id="add-pattern-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Classification</label><br><select id="pat-class" class="fi"><option value="RESTRICTED">RESTRICTED</option><option value="CONFIDENTIAL">CONFIDENTIAL</option><option value="INTERNAL">INTERNAL</option><option value="PUBLIC">PUBLIC</option></select></div>
+                        <div><label class="lbl">Classification</label><br>
+                            <select id="pat-class" class="fi">
+                                <!-- Static fallback options (numeric values, R14/R15 v2.25.5). -->
+                                <!-- JS loadTaxonomy() replaces these with live taxonomy labels. -->
+                                <option value="5">5 — Sensitive</option>
+                                <option value="4">4 — Confidential</option>
+                                <option value="3">3 — Internal</option>
+                                <option value="2">2 — Public</option>
+                                <option value="1">1 — Info</option>
+                            </select>
+                        </div>
                         <div><label class="lbl">Type</label><br><select id="pat-type" class="fi"><option value="regex">regex</option><option value="keyword">keyword</option></select></div>
                         <div><label class="lbl">Pattern</label><br><input id="pat-pattern" type="text" placeholder="\bpattern\b" class="fi w-250"></div>
                         <div><label class="lbl">Description</label><br><input id="pat-desc" type="text" placeholder="What it detects" class="fi w-180"></div>
@@ -428,6 +588,8 @@
                 <div class="panel-body">
                     <div class="form-row">
                         <div><label class="lbl">Event type</label><br><select id="audit-event-type" class="fi"><option value="">All</option><option value="login">Login</option><option value="agent_registered">Agent registered</option><option value="credential_exfil">Credential exfil</option><option value="policy_denied">Policy denied</option><option value="config_change">Config change</option></select></div>
+                        <div><label class="lbl">Verdict</label><br><select id="audit-verdict" class="fi"><option value="">* (All verdicts)</option></select></div>
+                        <div><label class="lbl">Source type</label><br><select id="audit-source-type" class="fi"><option value="">* (All sources)</option></select></div>
                         <div><label class="lbl">From</label><br><input id="audit-from" type="date" class="fi"></div>
                         <div><label class="lbl">To</label><br><input id="audit-to" type="date" class="fi"></div>
                         <div><label class="lbl">Free text</label><br><input id="audit-text" type="text" placeholder="search..." class="fi w-180"></div>
@@ -446,18 +608,53 @@
             </div>
         </div>
 
-        <!-- Policies Page — read-only view of the Rego modules loaded in OPA -->
+        <!-- Policies Page — R8/R9/R10/R12 wired to live endpoints -->
         <div class="page" id="page-policies">
             <h2>Policies (OPA)</h2>
             <div class="panel">
                 <div class="panel-header">Active policy modules</div>
                 <div class="panel-body">
-                    <p class="txt-note">Rego policy modules currently loaded in the OPA decision service. These
-                        are deployed declaratively (policy bundle / install-time load) and are read-only here —
-                        editing happens in the policy source, not the admin UI. "Example" modules are the loaded
-                        governance examples (GDPR, EU AI Act, HIPAA, PCI, data residency, …); "Core" are the
-                        gateway's own policies.</p>
+                    <p class="txt-note">Rego policy modules currently loaded in the OPA decision service.
+                        "Example" modules are immutable governance templates (duplicate to edit).
+                        "Core" policies are load-bearing gateway rules (danger-zone edit requires TOTP + confirmation).
+                        "Client" policies are editable copies under <code>clients/</code>.</p>
                     <div id="policies-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+
+            <!-- R10 — Lifecycle status panel (client policies only) -->
+            <div class="panel">
+                <div class="panel-header">Policy Lifecycle (client policies)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Client policies progress: <strong>Draft</strong> → <strong>Staging</strong> → <strong>Production</strong>.
+                        Only production policies can be bound to subjects. Promote requires TOTP step-up.</p>
+                    <div id="lifecycle-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+
+            <!-- R12 — Policy dry-run panel -->
+            <div class="panel">
+                <div class="panel-header">Policy Dry-run / Simulate</div>
+                <div class="panel-body">
+                    <p class="txt-note">Test a policy against a mock input scenario without applying any change.
+                        Returns block/allow verdict + deny codes + AI explanation.</p>
+                    <div class="form-row">
+                        <div class="flex-1">
+                            <label class="lbl">Policy ID (e.g. <code>clients/my_policy</code> or <code>examples/gdpr</code>)</label><br>
+                            <input id="sim-policy-id" type="text" placeholder="clients/my_policy" class="fi w-280">
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <div class="flex-1">
+                            <label class="lbl">Input scenario (JSON)</label><br>
+                            <textarea id="sim-input-json" class="sim-textarea" placeholder='{"identity":{"agent":"openclaw","role":"user"},"tool":"email.delete"}'></textarea>
+                        </div>
+                    </div>
+                    <div class="form-row--gap12">
+                        <button data-action="simulatePolicy" class="btn-sm-primary">Run dry-run</button>
+                        <label><input type="checkbox" id="sim-ai-explain" checked> AI explanation</label>
+                    </div>
+                    <div id="sim-result" class="dryrun-panel is-hidden"></div>
                 </div>
             </div>
             <div class="panel">
@@ -469,8 +666,9 @@
                         denials, never remove one. Wildcard = leave Subject ID empty (all subjects of that kind).</p>
                     <div class="form-row--wrap-mb">
                         <label class="lbl">Policy name<br>
-                            <input id="bind-policy-name" type="text" placeholder="e.g. secrets_egress"
-                                   class="fi-sm"></label>
+                            <select id="bind-policy-name" class="fi-sm">
+                                <option value="">Loading policies…</option>
+                            </select></label>
                         <label class="lbl">Subject kind<br>
                             <select id="bind-scope-kind" class="fi-sm">
                                 <option value="human">human</option>
@@ -479,9 +677,10 @@
                                 <option value="mcp_server">mcp_server</option>
                                 <option value="agent">agent</option>
                             </select></label>
-                        <label class="lbl">Subject ID (blank = all)<br>
-                            <input id="bind-scope-id" type="text" placeholder="(wildcard)"
-                                   class="fi-sm"></label>
+                        <label class="lbl">Subject ID<br>
+                            <select id="bind-scope-id" class="fi-sm">
+                                <option value="*">All (wildcard)</option>
+                            </select></label>
                         <label class="lbl">Direction<br>
                             <select id="bind-direction" class="fi-sm">
                                 <option value="ingress">ingress</option>
@@ -516,7 +715,12 @@
                 <div class="panel-body">
                     <textarea id="policy-view-src" readonly spellcheck="false" class="pol-src"></textarea>
                     <div id="policy-edit-controls" class="pol-row">
+                        <!-- R8: "Create editable copy" (Save-As) — for example/template policies -->
                         <button class="btn btn-sm" data-action="policyEditCopy">Create editable copy</button>
+                        <!-- R8: "Duplicate" template → POST /admin/policies/templates/duplicate -->
+                        <button class="btn btn-sm btn-sm-save" id="btn-duplicate-template" data-action="duplicateTemplate">Duplicate to client policy</button>
+                        <!-- R9: "Edit core policy" — danger-zone, only shown for core policies -->
+                        <button class="btn btn-sm btn-sm-danger" id="btn-edit-core" data-action="editCorePolicy">Edit core policy (dangerous)</button>
                         <span id="policy-saveas" class="pol-saveas">
                             <label class="pol-lbl">Save as <code>clients.</code></label>
                             <input id="policy-copy-name" type="text" placeholder="my_org_gdpr" pattern="[a-z][a-z0-9_]*"
@@ -525,14 +729,37 @@
                         </span>
                         <span id="policy-save-result" class="pol-result"></span>
                     </div>
-                    <p class="txt-note mt-sm">Examples are <strong>immutable templates</strong>. "Create editable copy"
-                        lets you edit and save under a new name (<code>clients.&lt;name&gt;</code>) — validated by OPA and loaded immediately.
-                        To persist across a full redeploy, add it to your policy bundle. (Activate + ingress/egress enforcement is the next phase.)</p>
+                    <!-- R8: edit-rego controls (shown when editing an existing client policy's Rego directly) -->
+                    <div id="policy-editrego-controls" class="pol-row is-hidden">
+                        <span class="pol-lbl">Editing <code>clients.</code><span id="policy-editrego-name"></span></span>
+                        <button class="btn btn-sm btn-sm-save" data-action="saveCustomRegoEdit">Save Rego (PUT)</button>
+                        <button class="btn btn-sm btn-sm-secondary" data-action="cancelRegoEdit">Cancel</button>
+                        <span id="policy-editrego-result" class="pol-result"></span>
+                    </div>
+                    <!-- R9: danger-zone confirmation (shown when editing a core policy) -->
+                    <div id="core-danger-zone" class="danger-zone is-hidden">
+                        <div class="danger-zone-title">Core policy edit — danger zone</div>
+                        <div class="danger-zone-desc">You are editing a load-bearing core gateway policy.
+                            An error here can disrupt ALL traffic through the gateway.
+                            This edit is audited. A TOTP step-up is required to save.</div>
+                        <div class="danger-confirm-row">
+                            <input id="core-danger-reason" type="text" placeholder="Justification (ticket #, reason — required)"
+                                   class="danger-reason-input">
+                            <button class="btn-sm-danger-confirm" data-action="saveCorePolicyEdit">Save core policy (confirm danger)</button>
+                            <button class="btn btn-sm btn-sm-secondary" data-action="cancelCorePolicyEdit">Cancel</button>
+                        </div>
+                        <div id="core-danger-result" class="pol-result"></div>
+                    </div>
+                    <p class="txt-note mt-sm">Examples are <strong>immutable templates</strong>.
+                        "Duplicate" fast-copies the Rego to a new <code>clients.&lt;name&gt;</code> policy via the API (R8).
+                        Client policies can be edited directly via "Edit Rego" (R8).
+                        Core policies require danger-zone confirmation + TOTP (R9).
+                        To persist across a full redeploy, add it to your policy bundle.</p>
                 </div>
             </div>
         </div>
 
-        <!-- Access (RBAC) Page — wires the existing /admin/rbac group-management API -->
+        <!-- Access (RBAC) Page — R13: path dropdown from /admin/rbac/sources/paths + method descriptions -->
         <div class="page" id="page-rbac">
             <h2>Access (RBAC Groups)</h2>
             <div class="panel">
@@ -544,11 +771,29 @@
                     <div class="form-row">
                         <div><label class="lbl">Display name</label><br><input id="rbac-group-name" type="text" placeholder="e.g. Support team" class="fi w-200"></div>
                     </div>
-                    <p class="txt-note mt-sm">Allowed resources (method + path glob). Add one or more rows; blank rows are ignored.</p>
+                    <p class="txt-note mt-sm">Allowed resources (method + path). Select from the catalogues or type a custom path; blank rows are ignored.</p>
                     <div id="rbac-resource-rows">
+                        <!-- R13: first row uses dropdowns populated from /admin/rbac/sources/paths + /methods -->
                         <div class="form-row rbac-resource-row">
-                            <div><label class="lbl">Method</label><br><select class="fi rbac-res-method"><option value="*">*</option><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option><option value="DELETE">DELETE</option></select></div>
-                            <div><label class="lbl">Path glob</label><br><input type="text" placeholder="/mcp/**" class="fi w-250 rbac-res-path"></div>
+                            <div>
+                                <label class="lbl">Method</label><br>
+                                <select class="fi rbac-res-method" data-action="rbacMethodChanged">
+                                    <option value="*">* (all methods)</option>
+                                    <option value="GET">GET — Read</option>
+                                    <option value="POST">POST — Create / invoke</option>
+                                    <option value="PUT">PUT — Update (replace)</option>
+                                    <option value="DELETE">DELETE — Delete</option>
+                                </select>
+                                <div class="rbac-method-help" id="rbac-method-help-0"></div>
+                            </div>
+                            <div>
+                                <label class="lbl">Path</label><br>
+                                <select class="fi w-250 rbac-res-path-select" data-action="rbacPathSelectChanged">
+                                    <option value="">Loading paths…</option>
+                                </select>
+                                <input type="text" placeholder="or type a custom path glob" class="fi w-250 rbac-res-path is-hidden">
+                                <div class="rbac-method-help rbac-path-desc" id="rbac-path-desc-0"></div>
+                            </div>
                         </div>
                     </div>
                     <div class="form-row--mt">
@@ -653,9 +898,9 @@
             </div>
         </div>
 
-        <!-- PKI Admin Page — v2.23.3 (#51 + #53) -->
+        <!-- PKI / Cryptography Admin Page — R24: merged Crypto into PKI -->
         <div class="page" id="page-pki">
-            <h2>PKI Certificate Management</h2>
+            <h2>PKI / Cryptography</h2>
 
             <!-- Status Overview -->
             <div class="panel">
@@ -704,6 +949,18 @@
                     </p>
                 </div>
             </div>
+
+            <!-- R24 — Cryptography merged here (was Settings > Cryptography) -->
+            <div class="panel">
+                <div class="panel-header">Cryptography (ASVS v5 V11)</div>
+                <div class="panel-body">
+                    <p class="pki-crypto-note">Cryptographic algorithm inventory. Lists all algorithms in use,
+                        deprecated ciphers, and post-quantum readiness. Consolidated here alongside PKI
+                        to provide a single "PKI / Cryptography" view (R24 IA).</p>
+                    <div id="crypto-inventory"><span class="loading">Loading...</span></div>
+                    <button data-action="exportCryptoJson" class="btn-export">Export JSON</button>
+                </div>
+            </div>
         </div>
 
         <!-- Settings Page -->
@@ -744,6 +1001,15 @@
                 <div class="panel-header">License</div>
                 <div class="panel-body" id="license-info"><span class="loading">Loading...</span></div>
             </div>
+            <!-- R23 — license entitlements (tier-gated features) -->
+            <div class="panel">
+                <div class="panel-header">Feature Entitlements</div>
+                <div class="panel-body">
+                    <p class="txt-note">Features available on your current license tier. Locked features are shown
+                        as disabled configuration — upgrade to unlock them.</p>
+                    <div id="entitlements-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
             <div class="panel">
                 <div class="panel-header">Identity Providers</div>
                 <div class="panel-body">
@@ -758,8 +1024,9 @@
                             <span class="badge badge-yellow" id="saml-status">Not configured</span>
                         </div>
                     </div>
-                    <div class="idp-config-box">
-                        <p><strong>OIDC Configuration</strong></p>
+                    <!-- R23: entitlement-lock overlay is applied by loadEntitlements() in JS -->
+                    <div class="idp-config-box" id="idp-config-box">
+                        <p><strong>OIDC Configuration</strong> <span id="oidc-entitlement-badge"></span></p>
                         <div class="idp-grid">
                             <label class="lbl">Issuer URL</label>
                             <input id="oidc-issuer" type="text" placeholder="https://idp.example.com/realms/yashigani" class="fi-sm">
@@ -770,7 +1037,7 @@
                         </div>
                         <button data-action="saveIdpConfig" data-idp-type="oidc" class="btn-xs-primary txt-mt8">Save OIDC Config</button>
                         <span id="oidc-save-result" class="idp-result"></span>
-                        <p class="idp-section-mt"><strong>SAML v2 Configuration</strong></p>
+                        <p class="idp-section-mt"><strong>SAML v2 Configuration</strong> <span id="saml-entitlement-badge"></span></p>
                         <div class="idp-grid">
                             <label class="lbl">Metadata URL</label>
                             <input id="saml-metadata" type="text" placeholder="https://idp.example.com/saml/metadata" class="fi-sm">
@@ -788,14 +1055,7 @@
                     <p class="txt-version">Version: {{ yashigani_version }} | Runtime: Podman/Docker | TLS: Self-signed</p>
                 </div>
             </div>
-            <div class="panel">
-                <div class="panel-header">Cryptography</div>
-                <div class="panel-body">
-                    <p class="txt-body">Cryptographic algorithm inventory (OWASP ASVS v5 V11). Lists all algorithms in use, deprecated ciphers, and post-quantum readiness.</p>
-                    <div id="crypto-inventory"><span class="loading">Loading...</span></div>
-                    <button data-action="exportCryptoJson" class="btn-export">Export JSON</button>
-                </div>
-            </div>
+            <!-- R24: Cryptography moved to PKI page ("PKI / Cryptography") — see page-pki below. -->
 
             <!-- Authentication > HIBP — v2.23.3 (#59) -->
             <div class="panel">

@@ -52,6 +52,10 @@ from yashigani.backoffice.routes.me import router as me_router
 from yashigani.backoffice.routes.manifest_history import router as manifest_history_router
 # v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
 from yashigani.backoffice.routes.runtime_settings import router as runtime_settings_router
+# v2.25.5 — R13: RBAC group source paths + method catalogue
+from yashigani.backoffice.routes.rbac_sources import router as rbac_sources_router
+# v2.25.5 — R26: version check endpoint
+from yashigani.backoffice.routes.version_check import router as version_check_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -91,4 +95,10 @@ __all__ = [
     "manifest_history_router",
     # v2.24.1 — admin-surfaces-all-runtime-settings
     "runtime_settings_router",
+    # service management
+    "services_router",
+    # v2.25.5 — R13: RBAC sources
+    "rbac_sources_router",
+    # v2.25.5 — R26: version check
+    "version_check_router",
 ]

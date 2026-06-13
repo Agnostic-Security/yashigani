@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from yashigani.api_docs import swagger_ui_html as _swagger_ui_html, redoc_html as _redoc_html
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -97,6 +97,9 @@ from yashigani.backoffice.routes import (
     manifest_history_router,
     # v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
     runtime_settings_router,
+    # v2.25.5 — R13: RBAC sources / R26: version check
+    rbac_sources_router,
+    version_check_router,
 )
 
 
@@ -746,6 +749,26 @@ async def lifespan(app: FastAPI):
             "return agent_not_found until the registry is restored", _areconcile_exc
         )
 
+    # B1 follow-on (2.25.5) — IdentityDurableStore startup reconcile.
+    # Re-hydrates identities from Postgres into Redis db/3 if they are absent.
+    # Protects against volume-deletion (beyond Su's AOF recreate fix).
+    try:
+        _id_reg = getattr(backoffice_state, "identity_registry", None)
+        _id_durable = getattr(_id_reg, "_durable", None) if _id_reg else None
+        if _id_reg is not None and _id_durable is not None:
+            from yashigani.identity.durable_store import reconcile_identities_from_durable
+            reconcile_identities_from_durable(_id_reg, _id_durable)
+        else:
+            _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                "IDENTITY-RECONCILE: identity_registry or durable store not wired — "
+                "identities will NOT auto-restore after a volume-deletion"
+            )
+    except Exception as _ireconcile_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "IDENTITY-RECONCILE: startup reconcile FAILED (%s) — identities may be "
+            "absent from Redis until restored manually", _ireconcile_exc
+        )
+
     yield
 
     # Shutdown
@@ -851,10 +874,16 @@ def create_backoffice_app() -> FastAPI:
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Referrer-Policy"] = "no-referrer"
-        # CSP: strict for all pages — no inline scripts or styles allowed
-        # ASVS 3.4.3: object-src 'none' + base-uri 'none'; 3.4.7: report-uri
-        _csp = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; report-uri /admin/csp-report; report-to default"
-        response.headers["Content-Security-Policy"] = _csp
+        # CSP: strict for all pages — no inline scripts or styles allowed.
+        # ASVS 3.4.3: object-src 'none' + base-uri 'none'; 3.4.7: report-uri.
+        # N2 (2.25.5): some routes (ReDoc) need a scoped CSP that adds
+        # worker-src blob: and style-src 'unsafe-inline' for Redoc's Web Worker
+        # and Shadow DOM inline styles.  Those routes set their CSP directly on
+        # the response.  If a per-route CSP is already present, preserve it
+        # rather than overwriting it with the strict default.
+        _strict_csp = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; report-uri /admin/csp-report; report-to default"
+        if "content-security-policy" not in response.headers:
+            response.headers["Content-Security-Policy"] = _strict_csp
         return response
 
     # Per-endpoint body-size limits (ASVS 4.3.1).
@@ -1013,23 +1042,42 @@ def create_backoffice_app() -> FastAPI:
     async def admin_swagger_ui(
         session=Depends(require_admin_session),  # noqa: ARG001
     ) -> HTMLResponse:
-        """Swagger UI — served from self-hosted assets (no CDN)."""
-        return get_swagger_ui_html(
-            openapi_url="/admin/openapi.json",
-            title="Yashigani Backoffice — API Reference",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
-            swagger_favicon_url="/static/swagger-ui/favicon.png",
+        """Swagger UI — CSP-clean, no inline script (N2 fix).
+
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        Init logic lives in swagger-ui-init.js (same-origin), replacing the
+        inline <script>const ui = SwaggerUIBundle({...})</script> that
+        FastAPI's get_swagger_ui_html() emits and that strict CSP blocks.
+        """
+        return HTMLResponse(
+            _swagger_ui_html(
+                openapi_url="/admin/openapi.json",
+                title="Yashigani Backoffice — API Reference",
+                swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url="/static/swagger-ui/swagger-ui.css",
+                swagger_init_js_url="/static/swagger-ui/swagger-ui-init.js",
+                favicon_url="/static/swagger-ui/favicon.png",
+            )
         )
 
     @app.get("/admin/api-redoc", include_in_schema=False)
     async def admin_redoc_ui(
         session=Depends(require_admin_session),  # noqa: ARG001
     ) -> HTMLResponse:
-        """ReDoc UI — served from self-hosted assets (no CDN)."""
-        return get_redoc_html(
+        """ReDoc UI — CSP-clean, no inline script or style (N2 fix).
+
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        The <redoc spec-url="..."> web-component attribute replaces any inline
+        init call.  The response carries a scoped Content-Security-Policy that
+        adds 'worker-src blob: child-src blob:' because Redoc spawns a Web
+        Worker internally via blob: URL.  All other admin routes retain the
+        strict CSP unchanged.
+        """
+        return _redoc_html(
             openapi_url="/admin/openapi.json",
             title="Yashigani Backoffice — API Reference (ReDoc)",
+            redoc_js_url="/static/swagger-ui/redoc.standalone.js",
+            favicon_url="/static/swagger-ui/favicon.png",
         )
 
     # Admin UI — HTML pages
@@ -1049,6 +1097,10 @@ def create_backoffice_app() -> FastAPI:
         async def admin_login_page(request: Request):
             return _templates.TemplateResponse(request, "login.html")
 
+        # Phase 2 / 2.25.5-auth-ingress: /app/webui is now served directly by
+        # Open WebUI (OWUI).  Caddy routes /app/webui* to open-webui:8080 behind
+        # forward_auth → /auth/verify-user.  The backoffice placeholder endpoint
+        # has been removed; OWUI handles all /app/webui/* requests.
         @app.get("/admin/", include_in_schema=False)
         async def admin_dashboard_page(request: Request):
             # Server-side session-presence check before serving the dashboard HTML.
@@ -1184,5 +1236,9 @@ def create_backoffice_app() -> FastAPI:
     # v0.9.0 — Phase 7: Operator Visibility
     app.include_router(events_router, prefix="/admin/events", tags=["events"])
     app.include_router(audit_search_router, prefix="/admin/audit", tags=["audit-search"])
+    # v2.25.5 — R13: RBAC group source paths + HTTP method catalogue
+    app.include_router(rbac_sources_router, prefix="/admin/rbac", tags=["rbac"])
+    # v2.25.5 — R26: version check (opt-in egress)
+    app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
 
     return app

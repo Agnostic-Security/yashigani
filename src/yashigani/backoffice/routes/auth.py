@@ -1,14 +1,32 @@
 """
 Yashigani Backoffice — Authentication routes.
-POST /auth/login                   — username + password + TOTP
-POST /auth/logout                  — invalidate session
+POST /auth/login                   — username + password + TOTP (returns redirect_to for role routing)
+POST /auth/logout                  — invalidate session (any session tier — single-logout fix)
+GET  /auth/logout-redirect         — browser-navigable single-logout (Phase 2: OWUI signout redirect target)
 GET  /auth/status                  — check session validity
+GET  /auth/verify                  — Caddy forward_auth for data-plane (user sessions only)
+GET  /auth/verify-admin            — Caddy forward_auth for /admin/* (admin sessions only)
+GET  /auth/verify-user             — Caddy forward_auth for /app/webui and user paths (user sessions only; rejects admin)
 POST /auth/password/change         — forced change on first login
 POST /auth/totp/provision          — TOTP + recovery codes provisioning
 POST /auth/stepup                  — V6.8.4 step-up TOTP verification for high-value flows
 GET  /auth/post-login-redirect     — server-side next= validator + redirect (drift audit #6)
 
-Last updated: 2026-05-25T00:00:00+00:00
+Phase 1 changes (2026-06-12, feat/2.25.5-auth-ingress):
+  - login() now returns redirect_to ("/admin/" for admin, "/app/webui" for user) so the
+    login JS can navigate role-appropriately without a separate server roundtrip.
+  - logout() changed from AdminSession → AnySession: user-tier sessions were trapped
+    because the admin-only guard prevented logout (the "no end-user logout" bug).
+  - verify-user endpoint added: accepts user-tier sessions, explicitly rejects admin
+    sessions.  Caddy uses it for the /app/webui forward_auth leg.
+  - Both /auth/verify and /auth/verify-user reject admin sessions (SoD-003 preserved).
+
+Phase 2 changes (2026-06-13, feat/2.25.5-auth-ingress):
+  - logout-redirect endpoint added: GET version of logout for browser navigation.
+    OWUI's WEBUI_AUTH_SIGNOUT_REDIRECT_URL points here so its logout button clears
+    the Yashigani session cookie.  See Phase 2 notes.
+
+Last updated: 2026-06-13T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -350,6 +368,11 @@ async def login(body: LoginRequest, request: Request, response: Response):
     if not success:
         _record_auth_failure(client_ip)
         state.audit_writer.write(_make_login_event(body.username, "failure", reason))
+        try:
+            from yashigani.metrics.registry import auth_login_attempts_total
+            auth_login_attempts_total.labels(outcome="failure").inc()
+        except Exception:  # noqa: BLE001 — metric must never break auth
+            pass
         # QA Wave 2 Issue 7 — do NOT disclose server_time to unauthenticated
         # callers. TOTP drift diagnostics only belong in authenticated flows
         # (/auth/password/change, /auth/totp/provision/confirm) where the
@@ -441,31 +464,118 @@ async def login(body: LoginRequest, request: Request, response: Response):
     )
 
     state.audit_writer.write(_make_login_event(body.username, "success", None, account_tier=record.account_tier))
+    try:
+        from yashigani.metrics.registry import auth_login_attempts_total
+        auth_login_attempts_total.labels(outcome="success").inc()
+    except Exception:  # noqa: BLE001 — metric must never break auth
+        pass
+
+    # Phase 1 / 2.25.5-auth-ingress: single portal, role-based redirect.
+    # admin → /admin/  (admin console)
+    # user  → /app/webui  (placeholder until Phase 2 re-paths OWUI)
+    # Any other tier (totp_provisioning is handled above) → / as safe fallback.
+    if record.account_tier == "admin":
+        redirect_to = "/admin/"
+    elif record.account_tier == "user":
+        redirect_to = "/app/webui"
+    else:
+        redirect_to = "/"
 
     _set_session_cookie(response, session.token, record.account_tier)
     return {
         "status": "ok",
         "force_password_change": record.force_password_change,
         "force_totp_provision": record.force_totp_provision,
+        # role-based redirect destination for the login JS; validated server-side
+        # by /auth/post-login-redirect when following the normal login flow.
+        "redirect_to": redirect_to,
     }
 
 
 @router.post("/logout")
 async def logout(
-    session: AdminSession,
+    session: AnySession,  # Phase 1 fix: was AdminSession — user-tier sessions were trapped (no end-user logout bug)
     response: Response,
     store=Depends(get_session_store),
 ):
+    """
+    Single-logout endpoint.  Clears the session regardless of tier (admin or user).
+
+    Phase 1 / 2.25.5-auth-ingress: changed from AdminSession → AnySession so
+    user-tier accounts can reach this endpoint.  Previously a user-tier session
+    received HTTP 403 from require_admin_session and was permanently trapped
+    (no working end-user logout).
+
+    Security: the session token is invalidated in Redis and BOTH cookies
+    (__Host-yashigani_admin_session and __Host-yashigani_session) are cleared.
+    An expired/invalidated session calling this endpoint returns HTTP 401 from
+    require_any_session before reaching this handler — no unauthenticated
+    session-clearing is possible.
+    """
     store.invalidate(session.token)
     response.delete_cookie(_SESSION_COOKIE, path="/")
     response.delete_cookie(_USER_SESSION_COOKIE, path="/")
     # AU.L2-3.3.1 / OWASP A09: emit audit event for every auth lifecycle action.
-    # All other auth outcomes (login success/failure, totp_provision, stepup,
-    # self_reset) are audited; logout was the only gap (yashigani-retro#95).
     state = backoffice_state
     if state.audit_writer is not None:
         state.audit_writer.write(_make_login_event(session.account_id, "logout", None, account_tier=session.account_tier))
     return {"status": "ok"}
+
+
+@router.get("/logout-redirect")
+async def logout_redirect(
+    request: Request,
+    response: Response,
+    store=Depends(get_session_store),
+):
+    """
+    Browser-navigable single-logout endpoint.
+
+    Phase 2 / 2.25.5-auth-ingress: OWUI (with WEBUI_AUTH=false) calls its own
+    /api/v1/auths/signout endpoint, which — when WEBUI_AUTH_SIGNOUT_REDIRECT_URL is
+    set — returns {"status": true, "redirect_url": "<url>"} to the SvelteKit client.
+    The client then navigates the browser to that URL.  We point it here so clicking
+    the logout button inside /app/webui actually clears the Yashigani session cookie.
+
+    Behaviour:
+      - Valid session (admin or user): invalidate in Redis, clear both cookies,
+        redirect to /login.
+      - No session / expired session: clear cookies defensively, redirect to /login.
+        (Not a security issue: if there is nothing to invalidate, forcing the user
+        back to /login is correct.)
+
+    Security: this is a GET handler that modifies state.  The CSRF risk is accepted
+    because:
+      1. Logging out is not a sensitive state change (worst-case: nuisance logout).
+      2. OWUI does NOT support submitting a POST form redirect via WEBUI_AUTH_SIGNOUT_REDIRECT_URL;
+         it only performs a browser navigation (window.location).
+      3. The action is idempotent — a forged logout just forces a re-login.
+    """
+    # Try to read the session token from either cookie name.
+    token = (
+        request.cookies.get(_USER_SESSION_COOKIE)
+        or request.cookies.get(_SESSION_COOKIE)
+    )
+
+    state = backoffice_state
+    if token:
+        try:
+            store.invalidate(token)
+            if state.audit_writer is not None:
+                # Resolve the account_id from the session if it is still valid.
+                session_data = store.get(token)
+                account_id = session_data.account_id if session_data else "unknown"
+                state.audit_writer.write(
+                    _make_login_event(account_id, "logout", None)
+                )
+        except Exception:
+            # Session already expired / gone — still clear the cookies.
+            pass
+
+    redirect = _RedirectResponse(url="/login", status_code=302)
+    redirect.delete_cookie(_SESSION_COOKIE, path="/")
+    redirect.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    return redirect
 
 
 @router.get("/status")
@@ -660,6 +770,94 @@ async def verify_admin_session(request: Request):
     record = await state.auth_service.get_account_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    from starlette.responses import Response as StarletteResponse
+
+    resp = StarletteResponse(status_code=200)
+    email = record.email or f"{record.username}@yashigani.local"
+    resp.headers["X-Forwarded-User"] = email
+    resp.headers["X-Forwarded-Name"] = record.username
+    resp.headers["X-Forwarded-Email"] = email
+    return resp
+
+
+@router.get("/verify-user")
+async def verify_user_session(request: Request):
+    """
+    Caddy forward_auth endpoint for USER paths (/app/webui and its sub-paths).
+
+    Phase 1 / 2.25.5-auth-ingress.  The split-verify pattern:
+      /auth/verify-admin → admin sessions only  (for /admin/*)
+      /auth/verify       → user sessions only   (existing data-plane / OWUI catch-all)
+      /auth/verify-user  → user sessions only   (this endpoint, for /app/webui)
+
+    Accepts any authenticated SESSION with account_tier == "user".
+    Rejects admin sessions with HTTP 403 (SoD preserved — admins never reach the
+    user/OWUI path, even if they have a valid session).
+    Rejects unauthenticated or expired sessions with HTTP 401.
+
+    On 200: sets X-Forwarded-User/Name/Email headers for OWUI trusted-header auth.
+    On 401: Caddy redirects to /login?next=<path>.
+    On 403: Caddy surfaces an authorization error (not a login redirect).
+
+    NIST AC-5 / ASVS V4.1.2 / design: auth-ingress-architecture-20260612.md
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    assert state.session_store is not None  # set unconditionally at startup
+
+    # Accept both user cookie and admin cookie names for flexibility; the tier
+    # check below enforces the actual restriction.
+    token = request.cookies.get(_USER_SESSION_COOKIE) or request.cookies.get(_SESSION_COOKIE)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    session = state.session_store.get(token)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # Admin sessions MUST NOT access user paths.
+    # This is the /app/webui-side mirror of SoD-003 (which blocks admin on /auth/verify).
+    if session.account_tier == "admin":
+        _log.warning(
+            "verify-user: rejected admin session account_id=%s — "
+            "admins cannot access user paths (/app/webui)",
+            session.account_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_session_not_allowed_user_path",
+                "message": (
+                    "Admin accounts cannot access user paths. "
+                    "Use your admin console at /admin/."
+                ),
+            },
+        )
+
+    # Reject provisioning-state sessions (must finish TOTP enrolment first).
+    if session.account_tier == "totp_provisioning":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "totp_provisioning_incomplete",
+                "message": "Complete TOTP enrolment before accessing this resource.",
+            },
+        )
+
+    # Only user-tier sessions proceed past this point.
+    if session.account_tier != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "insufficient_tier",
+                "message": "This path requires a user-tier session.",
+            },
+        )
+
+    record = await state.auth_service.get_account_by_id(session.account_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
     from starlette.responses import Response as StarletteResponse
 
     resp = StarletteResponse(status_code=200)
@@ -1803,21 +2001,18 @@ def _make_sessions_invalidated_event(
 #     migration.
 # ---------------------------------------------------------------------------
 
-_AUTH_SLUG_RE = re.compile(r"[^a-z0-9\-]")
-
-
 def _auth_email_to_slug(email: str) -> str:
     """
     Derive a stable registry slug from an email address.
-    Mirrors sso.py::_email_to_slug — kept separate to avoid coupling auth.py
-    to the SSO module, which has its own heavy import chain.
 
-    e.g. alice@example.com → alice-example-com
+    B5 (2.25.5): delegates to yashigani.identity.slug.email_to_slug — the single
+    canonical implementation.  All slug-derivation sites (auth.py, sso.py,
+    openai_router.py, users.py, me.py) produce the SAME slug for any given email.
+
+    e.g. dana.lee@example.com → dana-lee-example-com
     """
-    local, _, domain = email.partition("@")
-    raw = f"{local}-{domain}".lower()
-    slug = _AUTH_SLUG_RE.sub("-", raw).strip("-")
-    return slug[:64]
+    from yashigani.identity.slug import email_to_slug as _canonical_slug
+    return _canonical_slug(email)
 
 
 def _register_human_identity_on_login(record, state) -> None:

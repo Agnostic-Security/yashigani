@@ -302,6 +302,14 @@ class AuditLogWriter:
         if self._db_sink is not None:
             self._mirror_to_db_sink(event_dict)
 
+        # Prometheus counter — best-effort, never blocks the write path.
+        try:
+            from yashigani.metrics.registry import audit_events_total
+            _event_type = str(getattr(event, "event_type", "UNKNOWN"))
+            audit_events_total.labels(event_type=_event_type).inc()
+        except Exception:  # noqa: BLE001 — metric must never fail the audit write
+            pass
+
         # SIEM forwarding is fire-and-forget (never blocks volume write)
         if self._siem_targets:
             threading.Thread(

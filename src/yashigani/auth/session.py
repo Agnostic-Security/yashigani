@@ -166,6 +166,23 @@ class SessionStore:
                 })
         return result
 
+    def count_active_all(self) -> int:
+        """Return the number of currently active session keys in Redis.
+
+        Used by MetricsCollector to update yashigani_auth_active_sessions.
+        Performs a SCAN over yashigani:session:* keys — count is approximate
+        (eventual TTL expiry) but suitable for dashboard display.
+        Never raises: returns 0 on any Redis error.
+        """
+        try:
+            count = 0
+            pattern = f"{self._session_prefix}*"
+            for _ in self._redis.scan_iter(pattern, count=100):
+                count += 1
+            return count
+        except Exception:
+            return 0
+
     # -- Internal ------------------------------------------------------------
 
     def _save(self, session: Session) -> None:

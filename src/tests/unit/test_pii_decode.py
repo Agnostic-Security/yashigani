@@ -242,24 +242,27 @@ class TestClassifyDecoded:
         sc = _regex_only_classifier()
         enc = base64.b64encode(SSN_TEXT.encode()).decode()
         res = sc.classify_decoded(f"note {enc}")
-        # SSN regex maps to CONFIDENTIAL.
-        assert res.level == SensitivityLevel.CONFIDENTIAL
+        # R14/R15 (v2.25.5): SSN regex maps to RESTRICTED (level 4).
+        assert res.level == SensitivityLevel.RESTRICTED
 
-    def test_hex_credit_card_elevates_to_restricted(self):
+    def test_hex_credit_card_elevates_to_sensitive(self):
         sc = _regex_only_classifier()
         hx = CC_TEXT.encode().hex()
         res = sc.classify_decoded(f"data {hx}")
-        # Credit-card regex maps to RESTRICTED (highest).
-        assert res.level == SensitivityLevel.RESTRICTED
+        # R14/R15 (v2.25.5): credit-card regex maps to SENSITIVE (level 5).
+        assert res.level == SensitivityLevel.SENSITIVE
+        assert res.level >= SensitivityLevel.RESTRICTED
 
     def test_plaintext_unchanged_behaviour(self):
         sc = _regex_only_classifier()
         res = sc.classify_decoded(SSN_TEXT)
-        assert res.level == SensitivityLevel.CONFIDENTIAL
+        # R14/R15 (v2.25.5): SSN maps to RESTRICTED (level 4).
+        assert res.level == SensitivityLevel.RESTRICTED
 
-    def test_clean_text_public(self):
+    def test_clean_text_no_match(self):
         sc = _regex_only_classifier()
         res = sc.classify_decoded("good morning everyone")
+        # R14/R15 (v2.25.5): no patterns matched → PUBLIC (level 1, lowest).
         assert res.level == SensitivityLevel.PUBLIC
 
     def test_undecodable_blob_floors_at_confidential(self):

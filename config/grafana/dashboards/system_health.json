@@ -1,102 +1,462 @@
 {
   "uid": "yashigani-system-health",
-  "title": "Yashigani — System Health",
-  "tags": ["yashigani", "infrastructure"],
+  "title": "Yashigani \u2014 System Health",
+  "tags": [
+    "yashigani",
+    "infrastructure"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "15s",
-  "time": {"from": "now-30m", "to": "now"},
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "gauge", "title": "Resource Pressure Index",
-      "gridPos": {"x":0,"y":0,"w":6,"h":6},
-      "targets": [{"expr":"yashigani_resource_pressure_index","legendFormat":"RPI"}],
-      "options": {"reduceOptions":{"calcs":["lastNotNull"]},"minVizValue":0,"maxVizValue":1},
-      "fieldConfig": {"defaults":{"min":0,"max":1,"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":0.3},{"color":"orange","value":0.6},{"color":"red","value":0.8}]}}}
+      "id": 13,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Infrastructure health: Resource Pressure Index (composite CPU/RAM/GPU score), individual pressure gauges, GPU utilisation and memory, and service-level container metrics. Feeds the adaptive rate limiter."
+      }
     },
     {
-      "id": 2, "type": "gauge", "title": "Memory Pressure",
-      "gridPos": {"x":6,"y":0,"w":6,"h":6},
-      "targets": [{"expr":"yashigani_resource_memory_pressure","legendFormat":"Memory"}],
-      "fieldConfig": {"defaults":{"min":0,"max":1,"unit":"percentunit","thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":0.6},{"color":"orange","value":0.75},{"color":"red","value":0.9}]}}}
-    },
-    {
-      "id": 3, "type": "gauge", "title": "GPU Pressure",
-      "gridPos": {"x":12,"y":0,"w":6,"h":6},
-      "targets": [{"expr":"yashigani_resource_gpu_pressure","legendFormat":"GPU"}],
-      "fieldConfig": {"defaults":{"min":0,"max":1,"unit":"percentunit","thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":0.6},{"color":"orange","value":0.8},{"color":"red","value":0.95}]}}}
-    },
-    {
-      "id": 4, "type": "gauge", "title": "CPU Throttle",
-      "gridPos": {"x":18,"y":0,"w":6,"h":6},
-      "targets": [{"expr":"yashigani_resource_cpu_throttle","legendFormat":"CPU Throttle"}],
-      "fieldConfig": {"defaults":{"min":0,"max":1,"unit":"percentunit","thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":0.2},{"color":"orange","value":0.4},{"color":"red","value":0.7}]}}}
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "RPI Components Over Time",
-      "gridPos": {"x":0,"y":6,"w":24,"h":8},
+      "id": 1,
+      "type": "gauge",
+      "title": "Resource Pressure Index",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 6
+      },
       "targets": [
-        {"expr":"yashigani_resource_pressure_index","legendFormat":"RPI (composite)"},
-        {"expr":"yashigani_resource_memory_pressure","legendFormat":"Memory"},
-        {"expr":"yashigani_resource_cpu_throttle","legendFormat":"CPU Throttle"},
-        {"expr":"yashigani_resource_gpu_pressure","legendFormat":"GPU"}
+        {
+          "expr": "yashigani_resource_pressure_index",
+          "legendFormat": "RPI"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":5},"min":0,"max":1,"unit":"percentunit"}}
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "minVizValue": 0,
+        "maxVizValue": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.3
+              },
+              {
+                "color": "orange",
+                "value": 0.6
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 6, "type": "timeseries", "title": "GPU Utilisation per Device",
-      "gridPos": {"x":0,"y":14,"w":12,"h":7},
+      "id": 2,
+      "type": "gauge",
+      "title": "Memory Pressure",
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 6
+      },
       "targets": [
-        {"expr":"yashigani_resource_gpu_utilisation","legendFormat":"GPU {{ device_index }} ({{ device_name }}) [{{ backend }}]"}
+        {
+          "expr": "yashigani_resource_memory_pressure",
+          "legendFormat": "Memory"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"percentunit","min":0,"max":1}}
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.6
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 7, "type": "timeseries", "title": "GPU VRAM Pressure per Device",
-      "gridPos": {"x":12,"y":14,"w":12,"h":7},
+      "id": 3,
+      "type": "gauge",
+      "title": "GPU Pressure",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 6
+      },
       "targets": [
-        {"expr":"yashigani_resource_gpu_memory_pressure","legendFormat":"VRAM {{ device_index }} ({{ device_name }})"}
+        {
+          "expr": "yashigani_resource_gpu_pressure",
+          "legendFormat": "GPU"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"percentunit","min":0,"max":1}}
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.6
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.95
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 8, "type": "stat", "title": "CHS Active Handles",
-      "gridPos": {"x":0,"y":21,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_chs_handles_active","legendFormat":"Active"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}}
-    },
-    {
-      "id": 9, "type": "stat", "title": "CHS Current TTL",
-      "gridPos": {"x":6,"y":21,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_chs_current_ttl_seconds","legendFormat":"TTL (s)"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"unit":"s","thresholds":{"steps":[{"color":"red","value":null},{"color":"orange","value":300},{"color":"yellow","value":900},{"color":"green","value":1800}]}}}
-    },
-    {
-      "id": 10, "type": "timeseries", "title": "Memory Used (bytes)",
-      "gridPos": {"x":12,"y":21,"w":12,"h":4},
-      "targets": [{"expr":"yashigani_resource_memory_used_bytes","legendFormat":"Memory Used"}],
-      "fieldConfig": {"defaults":{"unit":"bytes"}}
-    },
-    {
-      "id": 11, "type": "timeseries", "title": "Inspection Pipeline Latency",
-      "gridPos": {"x":0,"y":25,"w":12,"h":6},
+      "id": 4,
+      "type": "gauge",
+      "title": "CPU Throttle",
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 6
+      },
       "targets": [
-        {"expr":"histogram_quantile(0.50, rate(yashigani_inspection_duration_seconds_bucket[5m]))","legendFormat":"p50"},
-        {"expr":"histogram_quantile(0.95, rate(yashigani_inspection_duration_seconds_bucket[5m]))","legendFormat":"p95"},
-        {"expr":"histogram_quantile(0.99, rate(yashigani_inspection_duration_seconds_bucket[5m]))","legendFormat":"p99"}
+        {
+          "expr": "yashigani_resource_cpu_throttle",
+          "legendFormat": "CPU Throttle"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"s"}}
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.2
+              },
+              {
+                "color": "orange",
+                "value": 0.4
+              },
+              {
+                "color": "red",
+                "value": 0.7
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 12, "type": "timeseries", "title": "Gateway Request Latency",
-      "gridPos": {"x":12,"y":25,"w":12,"h":6},
+      "id": 5,
+      "type": "timeseries",
+      "title": "RPI Components Over Time",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 8
+      },
       "targets": [
-        {"expr":"histogram_quantile(0.50, rate(yashigani_gateway_request_duration_seconds_bucket[5m]))","legendFormat":"p50"},
-        {"expr":"histogram_quantile(0.95, rate(yashigani_gateway_request_duration_seconds_bucket[5m]))","legendFormat":"p95"},
-        {"expr":"histogram_quantile(0.99, rate(yashigani_gateway_request_duration_seconds_bucket[5m]))","legendFormat":"p99"}
+        {
+          "expr": "yashigani_resource_pressure_index",
+          "legendFormat": "RPI (composite)"
+        },
+        {
+          "expr": "yashigani_resource_memory_pressure",
+          "legendFormat": "Memory"
+        },
+        {
+          "expr": "yashigani_resource_cpu_throttle",
+          "legendFormat": "CPU Throttle"
+        },
+        {
+          "expr": "yashigani_resource_gpu_pressure",
+          "legendFormat": "GPU"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"s"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "GPU Utilisation per Device",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "yashigani_resource_gpu_utilisation",
+          "legendFormat": "GPU {{ device_index }} ({{ device_name }}) [{{ backend }}]"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "GPU VRAM Pressure per Device",
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "yashigani_resource_gpu_memory_pressure",
+          "legendFormat": "VRAM {{ device_index }} ({{ device_name }})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "CHS Active Handles",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_chs_handles_active",
+          "legendFormat": "Active"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "CHS Current TTL",
+      "gridPos": {
+        "x": 6,
+        "y": 24,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_chs_current_ttl_seconds",
+          "legendFormat": "TTL (s)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 300
+              },
+              {
+                "color": "yellow",
+                "value": 900
+              },
+              {
+                "color": "green",
+                "value": 1800
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Memory Used (bytes)",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_resource_memory_used_bytes",
+          "legendFormat": "Memory Used"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Inspection Pipeline Latency",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(yashigani_classifier_latency_ms_bucket[5m])) / 1000",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yashigani_classifier_latency_ms_bucket[5m])) / 1000",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(yashigani_classifier_latency_ms_bucket[5m])) / 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Gateway Request Latency",
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(yashigani_gateway_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yashigani_gateway_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(yashigani_gateway_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
     }
   ]
 }

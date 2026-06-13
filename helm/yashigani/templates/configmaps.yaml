@@ -447,6 +447,13 @@ data:
         Cross-Origin-Opener-Policy "same-origin"
         -Server
       }
+      # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
+      # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
+      # to the two ReDoc routes; all other paths keep the default strict CSP above.
+      # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
+      # via its web component Shadow DOM at render time.
+      @redoc_ui path /admin/api-redoc /redoc
+      header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       handle /healthz {
         import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
@@ -506,6 +513,7 @@ data:
       # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
       # GET /docs (Swagger UI). Without explicit handles these fell through
       # to the Open WebUI catch-all and were functionally unreachable.
+      # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
       handle /openapi.json {
         import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
@@ -516,6 +524,15 @@ data:
         }
       }
       handle /docs {
+        import strip-orchestration-headers
+        reverse_proxy https://yashigani-gateway:8080 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-gateway
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      handle /redoc {
         import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}

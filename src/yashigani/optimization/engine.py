@@ -24,7 +24,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
+from yashigani.optimization.sensitivity_classifier import (
+    SensitivityLevel,
+    SensitivityResult,
+    _LEVEL_TO_LEGACY_STRING,
+)
 from yashigani.optimization.complexity_scorer import ComplexityLevel, ComplexityResult
 from yashigani.billing.budget_enforcer import BudgetSignal, BudgetState
 
@@ -138,8 +142,9 @@ class OptimizationEngine:
         # Resolve model alias
         provider, model, alias_force_local = self._resolve_alias(requested_model)
 
-        # P1: CONFIDENTIAL/RESTRICTED -> LOCAL (IMMUTABLE)
-        if sensitivity.level in (SensitivityLevel.CONFIDENTIAL, SensitivityLevel.RESTRICTED):
+        # P1: CONFIDENTIAL/RESTRICTED/SENSITIVE (levels 4–5) -> LOCAL (IMMUTABLE)
+        # R14/R15 (v2.25.5): level is now int 1–5; levels >= 4 are cloud-blocked.
+        if sensitivity.level >= SensitivityLevel.CONFIDENTIAL:
             # #25 risk-accepted cloud override (dual-admin, justified, TTL'd): if an
             # override is ACTIVE, the named cloud LLM may serve this sensitive request
             # instead of being pinned local. The customer has a cloud agreement and
@@ -151,7 +156,7 @@ class OptimizationEngine:
                     model=ov["model"],
                     route="cloud",
                     rule="P1-OVERRIDE",
-                    reason=(f"Sensitivity {sensitivity.level.value} routed to cloud "
+                    reason=(f"Sensitivity {sensitivity.level} routed to cloud "
                             f"{ov['provider']}/{ov['model']} under dual-admin risk-accepted "
                             f"override (justification: {ov.get('justification','')[:80]})"),
                     sensitivity=sensitivity,
@@ -160,14 +165,19 @@ class OptimizationEngine:
                     start_ns=start,
                 )
             # Check if admin configured a trusted cloud provider for this level
-            trusted = self._trusted_cloud.get(sensitivity.level.value)
+            # _trusted_cloud is keyed by legacy string (e.g. "CONFIDENTIAL").
+            # Convert numeric level to legacy key for backward-compat lookup.
+            _level_key: str = _LEVEL_TO_LEGACY_STRING.get(
+                int(sensitivity.level), str(sensitivity.level)
+            )
+            trusted = self._trusted_cloud.get(_level_key)
             if trusted:
                 return self._decide(
                     provider=trusted,
                     model=self._default_cloud_model,
                     route="cloud",
                     rule="P1",
-                    reason=f"Sensitivity {sensitivity.level.value} — trusted cloud ({trusted})",
+                    reason=f"Sensitivity {sensitivity.level} — trusted cloud ({trusted})",
                     sensitivity=sensitivity,
                     complexity=complexity,
                     budget=budget,
@@ -178,7 +188,7 @@ class OptimizationEngine:
                 model=local_default,
                 route="local",
                 rule="P1",
-                reason=f"Sensitivity {sensitivity.level.value} — local only",
+                reason=f"Sensitivity {sensitivity.level} — local only",
                 sensitivity=sensitivity,
                 complexity=complexity,
                 budget=budget,
@@ -327,13 +337,19 @@ class OptimizationEngine:
     ) -> RoutingDecision:
         elapsed_us = (time.monotonic_ns() - start_ns) // 1000
 
+        # R14/R15 (v2.25.5): SensitivityResult.level is int (1–5).
+        # str(int) produces "4" not "RESTRICTED"; use the legacy-string map so
+        # RoutingDecision.sensitivity and the Prometheus label keep the historical
+        # string form (audit records, dashboards, downstream consumers expect strings).
+        _sens_label: str = _LEVEL_TO_LEGACY_STRING.get(int(sensitivity.level), "RESTRICTED")
+
         decision = RoutingDecision(
             provider=provider,
             model=model,
             route=route,
             rule=rule,
             reason=reason,
-            sensitivity=sensitivity.level.value,
+            sensitivity=_sens_label,
             complexity=complexity.level.value,
             budget_signal=budget.signal.value,
             budget_pct=budget.pct,
@@ -347,6 +363,39 @@ class OptimizationEngine:
             "OE decision: %s/%s (%s) rule=%s reason=%s [%dus]",
             provider, model, route, rule, reason, elapsed_us,
         )
+
+        # Emit Prometheus metrics for every routing decision (best-effort).
+        try:
+            from yashigani.metrics.registry import (
+                yashigani_routing_decisions_total,
+                yashigani_sensitivity_detections_total,
+                yashigani_complexity_scores_total,
+                yashigani_budget_exhausted_total,
+                yashigani_routing_p1_events_info,
+            )
+            yashigani_routing_decisions_total.labels(
+                rule=rule, route=route
+            ).inc()
+            yashigani_sensitivity_detections_total.labels(
+                level=_sens_label
+            ).inc()
+            yashigani_complexity_scores_total.labels(
+                level=complexity.level.value
+            ).inc()
+            # P2 = cloud budget exhausted → forced local; increment the exhausted counter.
+            if rule == "P2":
+                yashigani_budget_exhausted_total.inc()
+            # P1 = OPA routing safety-net (sensitive data blocked from cloud).
+            # Update the info gauge so the "P1 Routing Events" dashboard table is populated.
+            if rule == "P1":
+                yashigani_routing_p1_events_info.labels(
+                    identity_id=str(budget.identity_id),
+                    provider=str(provider),
+                    sensitivity_level=str(sensitivity.level),
+                ).set(1)
+        except Exception:  # noqa: BLE001 — metric must never break routing
+            pass
+
         return decision
 
     def update_aliases(self, aliases: dict[str, tuple[str, str, bool]]) -> None:

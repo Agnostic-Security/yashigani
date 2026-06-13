@@ -126,6 +126,79 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
         pass
 
 # ---------------------------------------------------------------------------
+# OWUI-friendly deny messages (R2 — fix/2.25.5-owui-deny-message)
+#
+# Open WebUI renders the upstream ``error.message`` field directly in the
+# chat UI.  Machine-code reasons from OPA (e.g. "identity_not_active",
+# "sensitivity_ceiling_exceeded") surface as raw opaque strings.  This map
+# translates every OPA + internal reason code to a concise, layman-readable
+# sentence that OWUI will display to the end user.
+#
+# Rules:
+#   • Never leak internal identifiers (identity IDs, policy names, stack traces).
+#   • Keep messages under ~120 chars so they fit the OWUI error pill.
+#   • Always explain WHAT was blocked and WHO to ask for help.
+# ---------------------------------------------------------------------------
+_OWUI_DENY_MESSAGES: dict[str, str] = {
+    # v1 ingress (OPA v1_routing.rego `reason`)
+    "identity_not_active":
+        "Your account is not active. Contact an administrator to restore access.",
+    "model_not_allowed":
+        "You are not allocated this model. Ask an administrator to grant access.",
+    "routing_unsafe_sensitive_to_cloud":
+        "This request contains sensitive content and cannot be sent to a cloud provider. Contact an administrator to adjust your routing policy.",
+    "sensitivity_ceiling_exceeded":
+        "This request exceeds your sensitivity clearance level. Contact an administrator.",
+    "model_not_allocated":
+        "You are not allocated this model. Ask an administrator to grant access.",
+    # response-path (OPA v1_routing.rego `response_reason`)
+    "denied_default_deny":
+        "Your request was denied by policy. Contact an administrator for details.",
+    "invalid_identity_ceiling":
+        "Your account's sensitivity clearance does not permit this response. Contact an administrator.",
+    "response_sensitivity_exceeds_ceiling":
+        "The response contains content that exceeds your sensitivity clearance level. Contact an administrator.",
+    "response_blocked_by_inspection":
+        "The response was blocked by the security inspection policy. Contact an administrator.",
+    # OPA infrastructure
+    "opa_unreachable":
+        "The security policy service is temporarily unavailable. Please try again shortly.",
+    "opa_response_check_failed":
+        "The security policy service is temporarily unavailable. Please try again shortly.",
+    "opa_not_configured":
+        "Gateway security policy is not configured. Contact an administrator.",
+    "response_policy_denied":
+        "Your request was denied by the response policy. Contact an administrator.",
+    "policy_denied":
+        "Your request was denied by policy. Contact an administrator for details.",
+    # PII
+    "pii_detected":
+        "Your message contains sensitive personal data that cannot be sent to this provider. Remove the personal information and try again.",
+    "pii_detected_encoded":
+        "Your message contains encoded personal data that cannot be safely redacted. Remove the personal information and try again.",
+    # client-policy
+    "client_policy_denied":
+        "Your request was denied by an access policy assigned to your account. Contact an administrator.",
+    # pool / agent
+    "pool_limit_exceeded":
+        "The maximum number of concurrent sessions for this agent has been reached. Please try again shortly.",
+    "pool_backend_unavailable":
+        "The agent's container backend is temporarily unavailable. Contact an administrator.",
+}
+
+_OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
+
+
+def _owui_deny_message(reason: str) -> str:
+    """Return a human-readable deny message for OWUI chat display.
+
+    Falls back to the generic message for any reason code not in the table.
+    Never leaks the raw reason code into the returned string.
+    """
+    return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+
+
+# ---------------------------------------------------------------------------
 # OPA fail-closed Prometheus counter (Path 1 + Path 3)
 #
 # yashigani_opa_response_check_failures_total — increments whenever the
@@ -291,12 +364,19 @@ def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
         )
         return _baseline_owui_identity()
 
-    # Resolve candidate slug: explicit map override first, else email local-part.
+    # Resolve candidate slug: explicit map override first, else canonical email slug.
+    # B5 fix (2.25.5): previously used the email local-part with dots/underscores
+    # kept (e.g. "dana.lee"), which never matched the identity registered at login
+    # by _auth_email_to_slug ("dana-lee-example-com").  Now use the SAME canonical
+    # derivation (yashigani.identity.slug.email_to_slug) so both sides agree.
     slug = _OWUI_SLUG_MAP.get(email_l)
     if not slug:
-        local_part = email_l.split("@", 1)[0]
-        # Sanitise to the slug charset to avoid odd lookups; empty -> default.
-        slug = "".join(ch for ch in local_part if ch.isalnum() or ch in "-_.").strip(".")
+        try:
+            from yashigani.identity.slug import email_to_slug as _email_to_slug
+            slug = _email_to_slug(email_l)
+        except (ValueError, Exception) as _exc:
+            logger.warning("OWUI slug derivation failed for %r (%s) — baseline", email, _exc)
+            slug = ""
 
     identity = None
     if slug:
@@ -540,12 +620,27 @@ class ChatMessage(BaseModel):
     role: str = Field(description="Role: system, user, assistant, tool")
     # Nullable: assistant tool-call turns carry content=null.  Audit/PII code
     # joins with `if m.content` so None is treated as "" (build sheet §1.1 note).
-    content: Optional[str] = Field(default=None, description="Message content")
+    # OpenClaw and other clients (anthropic SDK compat) send content as a list of
+    # content blocks: [{"type": "text", "text": "..."}].  Accept both forms and
+    # flatten to str so downstream code stays unchanged.
+    content: Optional[str | list] = Field(default=None, description="Message content")
     name: Optional[str] = None
     # assistant → requests tool calls
     tool_calls: Optional[list[ToolCall]] = None
     # role:"tool" → which assistant tool_call this message answers
     tool_call_id: Optional[str] = None
+
+    def model_post_init(self, __context) -> None:
+        """Flatten list-format content blocks to a plain string."""
+        if isinstance(self.content, list):
+            parts = []
+            for block in self.content:
+                if isinstance(block, dict):
+                    # {"type": "text", "text": "..."} — the common case
+                    parts.append(block.get("text") or block.get("content") or "")
+                elif isinstance(block, str):
+                    parts.append(block)
+            self.content = "\n".join(p for p in parts if p) or None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -1137,7 +1232,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     s_result = None
     if _state.sensitivity_classifier:
         s_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
-        sensitivity_level = s_result.level.value
+        # R14/R15 (v2.25.5): SensitivityResult.level is int (not SensitivityLevel enum).
+        # Calling .value on an int raises AttributeError.  Convert via the legacy-string map
+        # so all downstream consumers (string comparisons, HTTP headers, OPA, audit) get
+        # the expected "PUBLIC"/"INTERNAL"/"CONFIDENTIAL"/"RESTRICTED" label.
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
         sensitivity_triggers = s_result.triggers
     if s_result is None:
         from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
@@ -1347,11 +1447,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 status_code=403,
                 content={
                     "error": {
-                        "message": (
-                            "Request denied by policy: you are not allocated this model. "
-                            "Request a model within your allocation or ask an administrator "
-                            "to allocate it to you."
-                        ),
+                        # R2: human-readable message so OWUI displays it in chat.
+                        "message": _owui_deny_message("model_not_allocated"),
                         "type": "policy_denied",
                         "code": "model_not_allocated",
                     }
@@ -1449,11 +1546,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": (
-                        "Request denied by policy: you are not allocated this model. "
-                        "Request a model within your allocation or ask an administrator "
-                        "to allocate it to you."
-                    ),
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -1485,7 +1579,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": f"Request denied by policy: {opa_reason}",
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
@@ -1524,11 +1619,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": (
-                        "Request denied by policy: you are not allocated this model. "
-                        "Request a model within your allocation or ask an administrator "
-                        "to allocate it to you."
-                    ),
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -1553,7 +1645,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _audit_client_policy("ingress", identity_id, _ce_scope_kind, identity_id, _ce_in)
         return JSONResponse(
             status_code=403,
-            content={"error": {"message": f"Request denied by client policy: {_ce_reason}",
+            # R2: human-readable message so OWUI displays it in chat.
+            # _ce_reason is a comma-joined set of machine deny codes; it is kept
+            # in `code` for operator tooling but never shown to the end user.
+            content={"error": {"message": _owui_deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_reason}},
             headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
         )
@@ -1614,20 +1709,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     _pii_audit(request_id, "request", _pii_result, _pii_result.action_taken, destination)
 
                     if _pii_result.action_taken == "blocked":
-                        raise HTTPException(
+                        # R2: return OpenAI error schema so OWUI displays the
+                        # human-readable message in chat (not FastAPI's {"detail":…}).
+                        return JSONResponse(
                             status_code=status.HTTP_403_FORBIDDEN,
-                            detail={
-                                "error": "pii_detected",
-                                "detail": (
-                                    "Request blocked: PII detected and PII mode is BLOCK "
-                                    "for cloud-routed requests. Configure PII mode to REDACT "
-                                    "or enable cloud bypass via the admin panel."
-                                ),
-                                "pii_types": [f.pii_type.value for f in _pii_result.findings],
-                                # F-RT1: surface that an encoded payload was the trigger.
-                                "matched_views": sorted(_pii_result.matched_views),
-                                "request_id": request_id,
+                            content={
+                                "error": {
+                                    "message": _owui_deny_message("pii_detected"),
+                                    "type": "pii_blocked",
+                                    "code": "pii_detected",
+                                    # Operator/diagnostic fields — not shown in OWUI chat.
+                                    "pii_types": [f.pii_type.value for f in _pii_result.findings],
+                                    "matched_views": sorted(_pii_result.matched_views),
+                                    "request_id": request_id,
+                                }
                             },
+                            headers={"X-Yashigani-Request-Id": request_id},
                         )
 
                     if _pii_result.action_taken == "redacted":
@@ -1641,19 +1738,20 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             if _msg.content:
                                 _msg_redacted, _msg_res = _state.pii_detector.process_decoded(_msg.content)
                                 if _msg_res.action_taken == "blocked":
-                                    raise HTTPException(
+                                    # R2: return OpenAI error schema so OWUI displays
+                                    # the human-readable message in chat.
+                                    return JSONResponse(
                                         status_code=status.HTTP_403_FORBIDDEN,
-                                        detail={
-                                            "error": "pii_detected_encoded",
-                                            "detail": (
-                                                "Request blocked: PII detected inside an "
-                                                "encoded payload that cannot be redacted in "
-                                                "place. Send the request without encoding or "
-                                                "enable cloud bypass via the admin panel."
-                                            ),
-                                            "matched_views": sorted(_msg_res.matched_views),
-                                            "request_id": request_id,
+                                        content={
+                                            "error": {
+                                                "message": _owui_deny_message("pii_detected_encoded"),
+                                                "type": "pii_blocked",
+                                                "code": "pii_detected_encoded",
+                                                "matched_views": sorted(_msg_res.matched_views),
+                                                "request_id": request_id,
+                                            }
                                         },
+                                        headers={"X-Yashigani-Request-Id": request_id},
                                     )
                                 _msg.content = _msg_redacted
                         prompt_text = "\n".join(
@@ -2210,7 +2308,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     status_code=403,
                     content={
                         "error": {
-                            "message": f"Response blocked by policy: {resp_opa_reason}",
+                            # R2: human-readable message so OWUI displays it in chat.
+                            "message": _owui_deny_message(resp_opa_reason),
                             "type": "response_policy_denied",
                             "code": resp_opa_reason,
                         }
@@ -2235,7 +2334,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _audit_client_policy("egress", identity_id, _ce_eg_kind, identity_id, _ce_eg)
         return JSONResponse(
             status_code=403,
-            content={"error": {"message": f"Response blocked by client policy: {_ce_eg_reason}",
+            # R2: human-readable message so OWUI displays it in chat.
+            content={"error": {"message": _owui_deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_eg_reason}},
             headers={"X-Yashigani-Request-Id": request_id,
                      "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
@@ -2934,40 +3034,61 @@ async def gate_relaxed_final(
     #     The ResponseInspectionPipeline above is an LLM inspector — it is
     #     NON-deterministic and MISSES a secret on ~10-15% of finals, which is
     #     precisely how a verbatim AWS_SECRET_ACCESS_KEY reached the user even with
-    #     the gate running.  So in ADDITION we run the SAME deterministic
-    #     sensitivity classifier the chat INGRESS leg uses (classify_decoded, which
-    #     fail-closes to RESTRICTED) over the final text, and feed OPA the STRICTER
-    #     of {inspection-sensitivity, deterministic-classified-sensitivity}.  A
-    #     final carrying a credential classifies CONFIDENTIAL/RESTRICTED every time
-    #     → OPA denies on the sensitivity ceiling → suppressed deterministically,
-    #     independent of the inspector's verdict.  This mirrors the chat path, whose
-    #     403 on the same secret comes from the deterministic classifier, not the
-    #     LLM inspector.
+    #     the gate running.  So in ADDITION we run the REGEX layer of the sensitivity
+    #     classifier over the final text and feed OPA the STRICTER of
+    #     {inspection-sensitivity, regex-classified-sensitivity}.  A final carrying a
+    #     known-pattern credential (API key, SSN, credit card, OFFICIAL-SENSITIVE,
+    #     etc.) classifies CONFIDENTIAL/RESTRICTED deterministically → OPA denies →
+    #     suppressed, independent of the LLM inspector.
+    #
+    #     B6 FIX (2.25.5): previously called classify_decoded() (full 3-layer
+    #     pipeline including Ollama).  The Ollama layer is an INGRESS classifier
+    #     trained on user prompts; running it on outbound prose summaries of CLEAN
+    #     tool results caused false-positive RESTRICTED classifications (e.g.
+    #     qwen2.5:3b marks "The tool returned: [query result]" as RESTRICTED), which
+    #     forced response_verdict="blocked" on every clean orchestration final.
+    #     The fix: use ONLY the REGEX layer here — it detects real credentials
+    #     deterministically and produces zero false-positives on plain prose.  The
+    #     scan_secrets() check (step 1a) already covers high-entropy key formats
+    #     missed by the regex set.  The combined (regex + scan_secrets) floor is
+    #     equivalent to the previous intent, without the Ollama false-positive.
+    #
+    #     INJECTION DEFENCE IS UNCHANGED: the cloud-9 / SYSTEM-OVERRIDE exfil
+    #     payloads contain literal API-key patterns (sk-... etc.) that fire the
+    #     regex CONFIDENTIAL/RESTRICTED → still blocked deterministically.
     if final_text and _state.sensitivity_classifier is not None:
         try:
-            classified = _state.sensitivity_classifier.classify_decoded(
-                final_text).level.value
+            _regex_triggers: list[str] = []
+            classified = _state.sensitivity_classifier._scan_regex(
+                final_text, _regex_triggers).name
         except Exception as exc:
-            # Fail-closed: an unclassifiable final must NOT pass on a clean verdict.
+            # Fail-closed: a scan error on a candidate final must NOT pass.
             logger.warning(
-                "gate_relaxed_final: content classify raised (%s) — treating "
+                "gate_relaxed_final: regex classify raised (%s) — treating "
                 "final as RESTRICTED (fail-closed)", exc)
             classified = "RESTRICTED"
         response_content_sensitivity = _stricter_sensitivity(
             response_content_sensitivity, classified)
-        # A brain final that deterministically classifies CONFIDENTIAL/RESTRICTED
-        # carries sensitive content (a secret, key, credential).  Such content must
-        # NOT egress in an orchestration final REGARDLESS of the caller's ceiling —
-        # the privileged internal-bearer service identity has a RESTRICTED ceiling,
-        # so the ceiling check alone would admit it.  Force a BLOCKED verdict so the
-        # response gate denies deterministically (the OPA response_decision denies
-        # on response_verdict=="blocked").  This is the deterministic leak-closure:
-        # it does not depend on the non-deterministic LLM inspector agreeing.
+        # A brain final that regex-classifies CONFIDENTIAL/RESTRICTED contains a
+        # hard credential pattern.  Force a BLOCKED verdict so the response gate
+        # denies deterministically.
         if classified in ("CONFIDENTIAL", "RESTRICTED"):
             logger.warning(
-                "gate_relaxed_final: final classifies %s (deterministic) — "
-                "BLOCKING egress of sensitive orchestration final", classified)
+                "gate_relaxed_final: final regex-classifies %s — "
+                "BLOCKING egress of sensitive orchestration final (triggers=%s)",
+                classified, _regex_triggers)
             response_verdict = "blocked"
+    # 1c) Deterministic block before OPA.  If step 1a (scan_secrets) or step 1b
+    #     (regex classifier) forced response_verdict="blocked", deny immediately
+    #     — independently of whether OPA is configured.  This ensures that
+    #     hard-pattern credentials are blocked even in YASHIGANI_OPA_OPTIONAL=true
+    #     deployments and in unit tests where OPA is not running.  This is the
+    #     single authoritative block point for deterministic denials.
+    if response_verdict == "blocked":
+        return False, (
+            "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's final "
+            "answer was identified as sensitive and was withheld; "
+            "the raw content was not delivered.")
     # 2) OPA response-leg gate (non-relaxed) — fail-closed on absent allow.
     if _state.opa_url:
         resp_opa = await _opa_response_check(

@@ -191,6 +191,33 @@ class BudgetEnforcer:
         if tokens <= 0:
             return
 
+        # Emit Prometheus budget metrics inline (fast — no Redis round-trip needed here).
+        # route is "cloud" for all providers except ollama/agent (which use the local path).
+        _route = "local" if provider in ("ollama", "agent") else "cloud"
+        try:
+            from yashigani.metrics.registry import (
+                yashigani_budget_tokens_total,
+                yashigani_budget_cost_usd_total,
+            )
+            yashigani_budget_tokens_total.labels(
+                provider=provider, kind="identity", route=_route, identity_id=identity_id
+            ).inc(tokens)
+            # Cost estimation: look up model pricing if possible (best-effort)
+            cost_usd = 0.0
+            try:
+                price_key = f"pricing:{provider}:per_1k_tokens"
+                price_val = self._r.get(price_key)
+                if price_val:
+                    cost_usd = (tokens / 1000.0) * float(price_val)
+            except Exception:  # noqa: BLE001
+                pass
+            if cost_usd > 0:
+                yashigani_budget_cost_usd_total.labels(
+                    provider=provider, identity_id=identity_id
+                ).inc(cost_usd)
+        except Exception:  # noqa: BLE001 — metric must never break the hot path
+            pass
+
         pk = _period_key(period)
         pipe = self._r.pipeline()
 
@@ -286,3 +313,54 @@ class BudgetEnforcer:
                 provider = parts[3]
                 result[provider] = int(self._r.get(key) or 0)
         return result
+
+    def list_group_utilisation(self, period: str = "monthly") -> dict[str, float]:
+        """Return {group_id: utilisation_pct} for all groups with active allocations.
+
+        Scans budget:allocation:group:* keys (set by set_group_allocation) to
+        discover group IDs, then divides current usage by allocation.  Groups
+        with zero allocation are reported as 0.0 (not 100%).
+
+        Used by MetricsCollector to update yashigani_budget_utilisation_pct{group_id}.
+        """
+        pk = _period_key(period)
+        result: dict[str, float] = {}
+        # Discover group IDs from allocation keys
+        for key in self._r.scan_iter("budget:allocation:group:*"):
+            key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+            # key format: budget:allocation:group:{group_id}:{provider}
+            parts = key_str.split(":")
+            if len(parts) < 5:
+                continue
+            group_id = parts[3]
+            provider = parts[4]
+            alloc_val = self._r.get(key)
+            allocation = int(alloc_val) if alloc_val else 0
+            if allocation <= 0:
+                result.setdefault(group_id, 0.0)
+                continue
+            usage_key = f"budget:group:{group_id}:{provider}:{pk}"
+            used = int(self._r.get(usage_key) or 0)
+            pct = min((used / allocation) * 100.0, 999.0)
+            # Use max across providers for the group
+            result[group_id] = max(result.get(group_id, 0.0), pct)
+        return result
+
+    def emit_identity_utilisation(
+        self,
+        identity_id: str,
+        provider: str,
+        pct: float,
+    ) -> None:
+        """Update the yashigani_budget_utilisation_pct metric for an identity.
+
+        Called inline at budget-check time (per-request) so the Grafana panel
+        always shows the current utilisation without waiting for the poll cycle.
+        """
+        try:
+            from yashigani.metrics.registry import yashigani_budget_utilisation_pct
+            yashigani_budget_utilisation_pct.labels(
+                identity_id=identity_id, group_id=""
+            ).set(pct)
+        except Exception:  # noqa: BLE001 — metric must never break the hot path
+            pass

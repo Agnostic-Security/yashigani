@@ -1,4 +1,4 @@
-// Last updated: 2026-05-03
+// Last updated: 2026-06-12 (Phase 1: role-based redirect via server-supplied redirect_to)
 document.addEventListener('DOMContentLoaded', function() {
     var savedPassword = '';
 
@@ -86,7 +86,11 @@ document.addEventListener('DOMContentLoaded', function() {
                 } else {
                     var params = new URLSearchParams(window.location.search);
                     var next = params.get('next');
-                    window.location.href = safeNext(next) || '/';
+                    // Phase 1 (2.25.5-auth-ingress) — role-based redirect.
+                    // data.redirect_to from server: "/app/webui" for user tier,
+                    // "/admin/" for admin.  Honour ?next= if present (Caddy bounce).
+                    var serverDefault = (data.redirect_to && safeNext(data.redirect_to)) || '/app/webui';
+                    window.location.href = (next && safeNext(next)) || serverDefault;
                 }
             } else {
                 showMsg('error', parseError(data));

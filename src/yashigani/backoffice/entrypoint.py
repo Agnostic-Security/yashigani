@@ -380,6 +380,33 @@ def _bootstrap():
             exc,
         )
 
+    # ── Budget configuration store (Redis db/3, prefix budget:config:*) ──────
+    # B3 fix (2.25.5): the budget admin routes (/admin/budget/*) were never
+    # wired to a store — budget.configure() was never called, so adding a cap
+    # returned 201 but persisted nothing and the lists always rendered empty.
+    # The Postgres BudgetStore can't be used directly because its tables carry
+    # RLS + FKs to tenants/rbac_groups/identities that the free-text admin UI
+    # values don't satisfy. A Redis db/3 config store (same durable admin store
+    # as allocations/bindings) persists + reads back correctly with no route or
+    # UI changes. configure() wires it into the budget router below.
+    budget_config_store = None
+    try:
+        import redis as _redis
+        from yashigani.billing.budget_config_store import BudgetConfigStore
+        from yashigani.backoffice.routes import budget as _budget_routes
+        redis_budget_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        budget_config_store = BudgetConfigStore(redis_client=redis_budget_client)
+        _budget_routes.configure(budget_store=budget_config_store)
+        logger.info("Budget config store initialised (Redis db/3) and wired to /admin/budget/*")
+    except Exception as exc:
+        logger.warning(
+            "Budget config store init failed (%s) — budget caps will not persist",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer
@@ -547,13 +574,25 @@ def _bootstrap():
         logger.warning("Identity broker init failed (%s) — SSO routes will return 503", exc)
 
     # v2.1 — Identity registry (Redis db/3, shared with RBAC)
+    # B1 follow-on (2.25.5): wire IdentityDurableStore so create/update/delete
+    # dual-write to Postgres and the startup reconciler can re-hydrate Redis
+    # after a volume-deletion.
     try:
         from yashigani.identity.registry import IdentityRegistry
+        from yashigani.identity.durable_store import IdentityDurableStore
         import redis as _redis
         redis_identity_url = _backoffice_redis_url(3)
         redis_identity_client = _redis.from_url(redis_identity_url, decode_responses=False)
-        backoffice_state.identity_registry = IdentityRegistry(redis_client=redis_identity_client)
-        logger.info("Identity registry initialised")
+        _id_durable_bo = None
+        try:
+            _id_durable_bo = IdentityDurableStore()
+        except Exception as _de_bo:
+            logger.warning("IdentityDurableStore unavailable (%s) — Redis-only mode", _de_bo)
+        backoffice_state.identity_registry = IdentityRegistry(
+            redis_client=redis_identity_client,
+            durable_store=_id_durable_bo,
+        )
+        logger.info("Identity registry initialised (durable_store=%s)", "wired" if _id_durable_bo else "off")
     except Exception as exc:
         logger.warning("Identity registry init failed (%s) — SSO identity resolution disabled", exc)
 
@@ -628,6 +667,8 @@ _collector = MetricsCollector(
     rbac_store=backoffice_state.rbac_store,
     agent_registry=backoffice_state.agent_registry,
     backend_registry=backoffice_state.backend_registry,
+    # session_store: powers yashigani_auth_active_sessions (Security Overview panel).
+    session_store=backoffice_state.session_store,
     poll_interval_seconds=15,
 )
 _collector.start()

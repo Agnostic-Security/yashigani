@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="2.25.4"
+YASHIGANI_VERSION="2.25.5"
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 YSG_INSTALL_DIR="${YSG_INSTALL_DIR:-$HOME/.yashigani}"
@@ -5485,7 +5485,18 @@ compose_up() {
     # Declared set of enabled optional-service profiles, for the backoffice
     # Optional Services panel (observational; the hardened container can't probe
     # Docker). Assemble from agent bundles + the per-flag opt-ins.
+    # B13 FIX: on --upgrade, seed from existing .env value first (see runtime-
+    # agnostic block below for the authoritative fix; this Podman-only block is
+    # updated for consistency).
     local _enabled_profiles=()
+    if [[ "${UPGRADE:-false}" == "true" ]]; then
+      local _existing_ep_podman
+      _existing_ep_podman="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$env_file" 2>/dev/null | sed 's/^YASHIGANI_ENABLED_PROFILES=//' || true)"
+      if [[ -n "$_existing_ep_podman" ]]; then
+        IFS=',' read -ra _existing_ep_podman_arr <<< "$_existing_ep_podman"
+        _enabled_profiles+=("${_existing_ep_podman_arr[@]}")
+      fi
+    fi
     [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _enabled_profiles+=("${COMPOSE_PROFILES[@]}")
     [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _enabled_profiles+=("openwebui")
     [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _enabled_profiles+=("wazuh")
@@ -5602,7 +5613,25 @@ compose_up() {
   fi
   export YASHIGANI_PUBLIC_URL="$_pub_url_rt"
 
+  # B13 FIX (2026-06-13): On --upgrade the operator does not re-pass --wazuh /
+  # --with-openwebui / --agent-bundles, so INSTALL_WAZUH/INSTALL_OPENWEBUI/
+  # COMPOSE_PROFILES are all empty/false here — the old code overwrote
+  # YASHIGANI_ENABLED_PROFILES with an empty value, making every deployed
+  # service appear as "Not Deployed" in the Optional Services panel.
+  # Fix: on --upgrade, seed the profile list from the existing .env value so the
+  # already-deployed set is preserved, then merge in any newly-selected profiles
+  # (idempotent; dedup handles duplicates). On fresh install the existing value
+  # is absent so the behaviour is unchanged.
   local _ep_rt=()
+  if [[ "${UPGRADE:-false}" == "true" ]]; then
+    local _existing_ep
+    _existing_ep="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$_env_file_rt" 2>/dev/null | sed 's/^YASHIGANI_ENABLED_PROFILES=//' || true)"
+    if [[ -n "$_existing_ep" ]]; then
+      IFS=',' read -ra _existing_ep_arr <<< "$_existing_ep"
+      _ep_rt+=("${_existing_ep_arr[@]}")
+      log_info "Upgrade: seeding enabled profiles from existing .env: ${_existing_ep}"
+    fi
+  fi
   [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _ep_rt+=("${COMPOSE_PROFILES[@]}")
   [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _ep_rt+=("openwebui")
   [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _ep_rt+=("wazuh")
@@ -13121,6 +13150,58 @@ main() {
     fi
 
     # Step 8: Optional agent bundle selection
+    # YSG-BUG-2255-006: On --upgrade without --agent-bundles the operator does
+    # not re-pass the agent bundle flags, so COMPOSE_PROFILES is empty here and
+    # every profile-gated deploy step (step 8d token placeholders, step 8e letta
+    # openapi pre-create, step 8f openclaw.runtime.json bearer substitution) is
+    # silently skipped — requiring Captain to hand-substitute the bearer on every
+    # upgrade.
+    #
+    # Fix: on --upgrade, seed COMPOSE_PROFILES from the persisted
+    # YASHIGANI_ENABLED_PROFILES value in docker/.env BEFORE select_agent_bundles
+    # (and before the other per-service steps) run.  select_agent_bundles already
+    # deduplicates, so any freshly-passed --agent-bundles entries merge cleanly.
+    # On a fresh install YASHIGANI_ENABLED_PROFILES does not exist yet, so the
+    # seed block is a no-op.  Only agent-bundle profiles (langflow, letta,
+    # openclaw) are seeded here; openwebui and wazuh are re-applied by their own
+    # steps further below and are idempotently re-added.
+    if [[ "${UPGRADE:-false}" == "true" ]]; then
+      local _seed_env_file="${WORK_DIR}/docker/.env"
+      local _seed_ep
+      _seed_ep="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$_seed_env_file" 2>/dev/null \
+                    | sed 's/^YASHIGANI_ENABLED_PROFILES=//' || true)"
+      if [[ -n "$_seed_ep" ]]; then
+        local _seed_ep_arr=()
+        IFS=',' read -ra _seed_ep_arr <<< "$_seed_ep"
+        local _agent_bundle_profiles=("langflow" "letta" "openclaw")
+        local _seeded=()
+        for _seed_p in "${_seed_ep_arr[@]}"; do
+          _seed_p="${_seed_p// /}"   # trim whitespace
+          [[ -z "$_seed_p" ]] && continue
+          # Only seed recognised agent-bundle profile names into COMPOSE_PROFILES;
+          # skip synthetic/non-compose names that may appear in ENABLED_PROFILES.
+          local _is_bundle=false
+          for _bp in "${_agent_bundle_profiles[@]}"; do
+            [[ "$_seed_p" == "$_bp" ]] && _is_bundle=true
+          done
+          [[ "$_is_bundle" == "false" ]] && continue
+          # Guard against duplicates already present (idempotent re-run).
+          local _already=false
+          for _existing in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+            [[ "$_existing" == "$_seed_p" ]] && _already=true
+          done
+          if [[ "$_already" == "false" ]]; then
+            COMPOSE_PROFILES+=("$_seed_p")
+            _seeded+=("$_seed_p")
+          fi
+        done
+        if [[ ${#_seeded[@]} -gt 0 ]]; then
+          log_info "Upgrade: seeded agent-bundle profiles from existing .env into COMPOSE_PROFILES: ${_seeded[*]} (YSG-BUG-2255-006)"
+        fi
+      fi
+      unset _seed_env_file _seed_ep _seed_ep_arr _seed_p _agent_bundle_profiles _seeded _is_bundle _already _bp _existing
+    fi
+
     select_agent_bundles
 
     # Step 8b-0: BYO Internal CA wizard — Q1 + Q1a (Tiago directive 2026-05-23).
@@ -13362,6 +13443,55 @@ main() {
       chmod 0666 "$_letta_openapi" \
         || log_warn "Could not chmod 0666 letta-runtime/openapi_letta.json — letta openapi bind-mount may fail"
       log_info "letta-runtime/openapi_letta.json placeholder: mode 0666 (DAC_OVERRIDE-free write)"
+    fi
+
+    # Step 8f: Substitute __YASHIGANI_INTERNAL_BEARER__ in openclaw.runtime.json.
+    # YSG-BUG-2255-002: the git-tracked docker/openclaw/openclaw.json contains a
+    # placeholder __YASHIGANI_INTERNAL_BEARER__ that was never substituted, so
+    # OpenClaw could not authenticate to the gateway out of the box.
+    #
+    # Fix: generate a deploy-time copy at docker/openclaw/openclaw.runtime.json
+    # with the real per-install bearer value substituted in. The compose volume
+    # mount was updated (YSG-BUG-2255-002) to use the runtime copy. The
+    # git-tracked source retains the placeholder and is NEVER modified here.
+    # openclaw.runtime.json is gitignored so the real token never enters VCS.
+    #
+    # Idempotent: always re-generate the runtime copy on fresh install and upgrade
+    # so a token rotation (--remove-volumes) is picked up correctly.
+    #
+    # Fail-loud: if the bearer secret is absent when openclaw is enabled, exit 1.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^openclaw$"; then
+      local _oc_src="${WORK_DIR}/docker/openclaw/openclaw.json"
+      local _oc_dst="${WORK_DIR}/docker/openclaw/openclaw.runtime.json"
+      local _oc_bearer_file="${WORK_DIR}/docker/secrets/yashigani_internal_bearer"
+      local _oc_bearer
+
+      # Read the bearer — support Podman rootless re-install where secrets_dir
+      # may be subuid-remapped (same _safe_read_secret pattern used throughout).
+      if ! _oc_bearer="$(_safe_read_secret "$_oc_bearer_file" "YASHIGANI_INTERNAL_BEARER" "${WORK_DIR}/docker/.env")"; then
+        log_error "openclaw is enabled but yashigani_internal_bearer could not be read from ${_oc_bearer_file} — cannot substitute OpenClaw config. Aborting. (YSG-BUG-2255-002)"
+        exit 1
+      fi
+      if [[ -z "$_oc_bearer" ]]; then
+        log_error "openclaw is enabled but yashigani_internal_bearer is empty — cannot substitute OpenClaw config. Aborting. (YSG-BUG-2255-002)"
+        exit 1
+      fi
+
+      # Write the substituted runtime config (mode 0644 — non-secret config file;
+      # _fix_config_perms sweep will apply o+rX; openclaw container runs as non-root
+      # and needs read access). Use atomic write: write to a temp file first, then mv.
+      local _oc_tmp
+      _oc_tmp="$(mktemp "${WORK_DIR}/docker/openclaw/.openclaw.runtime.XXXXXX")"
+      # shellcheck disable=SC2064 # variable is set at trap registration time, correct.
+      trap "rm -f '${_oc_tmp}'" EXIT
+      sed "s|__YASHIGANI_INTERNAL_BEARER__|${_oc_bearer}|g" "$_oc_src" > "$_oc_tmp" \
+        || { log_error "sed substitution for openclaw.runtime.json failed (YSG-BUG-2255-002)"; rm -f "$_oc_tmp"; exit 1; }
+      chmod 0644 "$_oc_tmp"
+      mv "$_oc_tmp" "$_oc_dst" \
+        || { log_error "Could not write openclaw.runtime.json to ${_oc_dst} (YSG-BUG-2255-002)"; exit 1; }
+      # Remove the trap now that the temp file is gone.
+      trap - EXIT
+      log_info "openclaw.runtime.json written with real bearer (placeholder substituted — git source unchanged) [YSG-BUG-2255-002]"
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load

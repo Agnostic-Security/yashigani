@@ -246,14 +246,21 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     # policy applies per request. @strict_ui = native admin plane AND NOT a
     # proxied sub-app subpath; @lenient_ui = the complement (sub-apps + OWUI root).
     @strict_ui {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
         not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
     }
-    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
     @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
+    # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
+    # to the two ReDoc routes; all other strict_ui paths keep the default CSP.
+    # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
+    # via its web component Shadow DOM at render time.
+    @redoc_ui path /admin/api-redoc /redoc
     header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
     header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
     header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+    header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
@@ -350,9 +357,10 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Gateway OpenAPI surface — /openapi.json + /docs ───────────────
+    # ── Gateway OpenAPI surface — /openapi.json + /docs + /redoc ────────
     # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
     # GET /docs (Swagger UI) via gateway identity-resolution middleware.
+    # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
     # Without explicit handles these requests fell through to the Open WebUI
     # catch-all and were functionally unreachable.
     handle /openapi.json {
@@ -366,6 +374,16 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /docs {
+        import strip-orchestration-headers
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /redoc {
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
@@ -541,72 +559,53 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    handle /metrics-federate* {
-        basic_auth {
-            {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
-        }
-        # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
-        # inject-caddy-verified: prometheus does not validate the header but
-        # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
-        reverse_proxy https://prometheus:9090 {
-            import internal-mtls
-            import inject-caddy-verified
-        }
-    }
-
-    # ── Open WebUI — catch-all (only active when --with-openwebui is used) ──
-    # When Open WebUI is not deployed, Caddy returns 502 on / which is
-    # acceptable — admin UI at /admin/ and API at /v1/ still work.
-    handle {
-        # Strip any externally-supplied identity headers (anti-spoofing)
+    # ── /app/webui — Open WebUI user path (Phase 2 / 2.25.5-auth-ingress) ────
+    #
+    # Phase 2: OWUI is served under /app/webui with WEBUI_URL=/app/webui so
+    # SvelteKit assets and API calls are all relative to that prefix.
+    # forward_auth → /auth/verify-user gates the path (user sessions only;
+    # admin sessions get 403 → redirected to /admin/).
+    #
+    # WebSocket (socket.io): OWUI streams tokens over a socket.io WS at
+    # /app/webui/ws/socket.io/.  The @owui_ws matcher handles the 101 upgrade
+    # separately to avoid the forward_auth handle_response wrapping breaking the
+    # upgrade — same fix as the legacy root-catch-all WS handler (F-WS fix, YSG-2253).
+    # Auth subrequest strips Connection/Upgrade so /auth/verify-user sees a
+    # plain GET; the main reverse_proxy retains the original upgrade headers.
+    #
+    # OWUI is plain HTTP on caddy_internal (no mTLS — OWUI is the upstream
+    # Open WebUI image; it does not terminate mTLS).  Do NOT use internal-mtls
+    # here.  inject-caddy-verified is applied for header uniformity but OWUI
+    # does not validate it.
+    handle /app/webui* {
+        # Strip anti-spoof headers before auth subrequest.
         request_header -X-Forwarded-User
         request_header -X-Forwarded-Name
         request_header -X-Forwarded-Groups
-        # Track C (F-B): also strip OWUI forwarded-user headers on the public
-        # path so a browser cannot smuggle them to OWUI (which would re-emit
-        # them upstream). Only OWUI's own authenticated session sets the user.
         request_header -X-OpenWebUI-User-Email
         request_header -X-OpenWebUI-User-Id
         request_header -X-OpenWebUI-User-Name
         request_header -X-OpenWebUI-User-Role
-        # Strip forged orchestration-context headers before they reach OWUI
-        # (which re-emits to gateway:8081 on the internal mesh). Same anti-spoof
-        # rationale as the OWUI user headers above — only the internal mesh path
-        # may carry X-Yashigani-Orchestration-*.
         import strip-orchestration-headers
 
-        # ── Open WebUI socket.io WebSocket — F-WS fix (YSG-2253) ───────────
-        # Open WebUI streams chat tokens over a socket.io WebSocket at
-        # /ws/socket.io/. A WebSocket upgrade carries `Connection: Upgrade` +
-        # `Upgrade: websocket`. Caddy's `forward_auth` directive copies the
-        # ENTIRE inbound request (upgrade headers included) into the auth
-        # subrequest to /auth/verify, then wraps the main proxy in a
-        # handle_response. That wrapping does NOT pass a hop-by-hop upgrade
-        # through cleanly: the handshake never reaches 101 and the (logged-in)
-        # browser saw a 302 instead — tokens never rendered.
-        #
-        # Fix: still gate the WS by the SAME session cookie, but on the auth
-        # SUBREQUEST only, strip the upgrade headers (`header_up -Connection`
-        # / `-Upgrade`) so /auth/verify sees a plain GET, validates the cookie,
-        # and returns 200/401/403 normally. The MAIN reverse_proxy then carries
-        # the original (un-stripped) request and performs the real 101 upgrade
-        # to open-webui:8080. Unauthenticated WS still gets a 401 (the browser
-        # WS client treats it as a failed handshake and the page redirect logic
-        # handles the HTTP login) — this is NOT an auth bypass.
+        # ── OWUI socket.io WebSocket (Phase 2 / F-WS fix pattern) ──────────
+        # Handles Connection: Upgrade + Upgrade: websocket requests under
+        # /app/webui/ws/*.  The forward_auth sub-request has the upgrade headers
+        # stripped so /auth/verify-user sees a plain GET and returns a clean
+        # status.  The main reverse_proxy keeps the original upgrade headers and
+        # performs the real 101 to open-webui:8080.
         @owui_ws {
             header Connection *Upgrade*
             header Upgrade websocket
-            path /ws/*
+            path /app/webui/ws/*
         }
         handle @owui_ws {
             forward_auth https://backoffice:8443 {
             import internal-mtls
             import inject-caddy-verified
-                uri /auth/verify
+                uri /auth/verify-user
                 copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-                # Strip the upgrade headers from the AUTH subrequest only so
-                # /auth/verify sees a normal GET and returns a clean status.
-                # The main reverse_proxy below keeps the original upgrade.
+                # Strip upgrade headers from the auth subrequest only.
                 header_up -Connection
                 header_up -Upgrade
 
@@ -614,8 +613,8 @@ Hiring: https://agnosticsec.com/careers
                 handle_response @unauthorized {
                     respond 401
                 }
-                @admin_on_dataplane status 403
-                handle_response @admin_on_dataplane {
+                @admin_on_user_path status 403
+                handle_response @admin_on_user_path {
                     respond 403
                 }
             }
@@ -629,45 +628,72 @@ Hiring: https://agnosticsec.com/careers
             }
         }
 
-        # ── Open WebUI HTTP (non-WS) — forward_auth + proxy ────────────────
-        # Forward auth: validate session cookie against backoffice.
-        # On 200: copies X-Forwarded-User/Name from response into the request.
-        # On 401: redirects to login page.
+        # ── OWUI HTTP (non-WS) ───────────────────────────────────────────────
         handle {
             forward_auth https://backoffice:8443 {
             import internal-mtls
             import inject-caddy-verified
-                uri /auth/verify
+                uri /auth/verify-user
                 copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
 
                 @unauthorized status 401
                 handle_response @unauthorized {
+                    # User not logged in → redirect to /login, preserving next=
                     redir * /login?next={http.request.uri} 302
                 }
 
-                # Admin sessions are blocked from the data plane (SoD). Instead of
-                # surfacing the raw {admin_session_not_allowed_data_plane} 403 JSON
-                # (confusing — looks broken; hit on /, /query, etc.), bounce them to
-                # the admin console.
-                @admin_on_dataplane status 403
-                handle_response @admin_on_dataplane {
+                @admin_on_user_path status 403
+                handle_response @admin_on_user_path {
+                    # Admin trying user path → send to admin console (NOT login page).
+                    # This is a clear authz boundary, not an auth failure.
                     redir * /admin/ 302
                 }
             }
 
-            # inject-caddy-verified: open-webui does not validate the header but
-            # we inject it uniformly across all reverse_proxy blocks. Auth is
-            # enforced by the forward_auth block above. Closes LU-231-10-A.
+            # Phase 2: proxy to open-webui:8080 (plain HTTP, no mTLS).
+            # OWUI is configured with WEBUI_URL=/app/webui so asset paths and
+            # API calls resolve under the subpath.  inject-caddy-verified is
+            # applied for uniformity; OWUI does not validate it.
             reverse_proxy open-webui:8080 {
                 import inject-caddy-verified
                 header_up X-Forwarded-Proto https
                 header_up X-Real-IP {remote_host}
-                # Explicitly pass the trusted identity headers from forward_auth
                 header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
                 header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
                 header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
+    }
+
+    handle /metrics-federate* {
+        basic_auth {
+            {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
+        }
+        # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
+        # inject-caddy-verified: prometheus does not validate the header but
+        # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
+        reverse_proxy https://prometheus:9090 {
+            import internal-mtls
+            import inject-caddy-verified
+        }
+    }
+
+    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
+    #
+    # Phase 2: OWUI has moved off root onto /app/webui.  Root (/) is now the
+    # portal: redirect unauthenticated visitors to /login and authenticated
+    # users to their role-appropriate surface via /login (which checks the
+    # session and issues a role-based redirect).  Using /login as the target
+    # is safe — if the user is already logged in, /login will detect the
+    # session and redirect them to /admin/ or /app/webui without re-prompting
+    # for credentials.
+    #
+    # This replaces the former OWUI catch-all (which owned root and caused
+    # the conflated-population + no-working-logout findings).  The explicit
+    # /app/webui* handle above owns all OWUI traffic; this catch-all is now
+    # purely a portal redirect guard.
+    handle {
+        redir * /login 302
     }
 }
 

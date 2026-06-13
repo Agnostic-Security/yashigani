@@ -17,20 +17,11 @@
 #   node-base  — Node.js runtime + MCP server install
 #   runtime    — Python + bridge + node runtime (minimal final image)
 #
-# Verified digests (2026-06-11):
+# Verified digests (2026-05-29):
 #   python:3.14.5-slim  amd64: sha256:7d8de339aa8619f9b25e7d474d687ae4f6ef9704adad90a136af0f485adeccb7
 #   python:3.14.5-slim  arm64: sha256:4701f9885ba369bf50a80ae4b5e1f637be3aa961dbb9b676d295e98fb2c01075
-#   node:26-slim        amd64: sha256:b6c39cc46f7787358285291d39324a8fd996689663097fe62926e259596022e3
-#   node:26-slim        arm64: sha256:290a2c506b95b22041abd8c4114a0be3780860b39060e83f417f6c6031a23da5
-#
-# node 26 base bump (was node:22): the node 26 binary dynamically links
-# libatomic.so.1, which the python-slim runtime base does NOT ship. We copy the
-# arch-correct libatomic from the node base into the runtime (see runtime stage).
-# Without it the bridge subprocess fails at exec with:
-#   node: error while loading shared libraries: libatomic.so.1: cannot open
-#   shared object file: No such file or directory
-# python:3.14.5-slim base bump (was 3.14.0): clears the stale-base OS CVEs and
-# matches the gateway/backoffice debian-13.5 runtime line.
+#   node:22-slim        amd64: sha256:32b9e321f262db540d55ac10dc529667cf4737546e097cdd36a843c62bcbf423
+#   node:22-slim        arm64: sha256:6710aea4dbb47f7d74f6b604b5e9e86ef39627121be69407b2c3552605f2033d
 #
 # @modelcontextprotocol/server-filesystem@2026.1.14
 #   npm dist-tags.latest: 2026.1.14 (verified 2026-05-29)
@@ -42,7 +33,7 @@
 # last-updated: 2026-05-29T00:00:00+01:00 (feat(p3): Dockerfile.filesystem-mcp — first-party bridge container; T2 topology)
 
 # ── Stage 1: Node.js base + MCP server install ───────────────────────────────
-# node:26-slim — index image; platform-specific via --platform build arg.
+# node:22-slim — index image; platform-specific via --platform build arg.
 # We copy only the runtime artifacts (node binary tree + MCP server) into
 # the final Python image, keeping the final layer count low.
 #
@@ -51,8 +42,8 @@
 # For single-arch local builds pass --build-arg TARGETARCH=amd64 or arm64.
 ARG TARGETARCH=amd64
 
-FROM node:26-slim@sha256:b6c39cc46f7787358285291d39324a8fd996689663097fe62926e259596022e3 AS node-amd64
-FROM node:26-slim@sha256:290a2c506b95b22041abd8c4114a0be3780860b39060e83f417f6c6031a23da5 AS node-arm64
+FROM node:22-slim@sha256:32b9e321f262db540d55ac10dc529667cf4737546e097cdd36a843c62bcbf423 AS node-amd64
+FROM node:22-slim@sha256:6710aea4dbb47f7d74f6b604b5e9e86ef39627121be69407b2c3552605f2033d AS node-arm64
 
 # Select the correct node stage based on TARGETARCH
 FROM node-${TARGETARCH} AS node-base
@@ -69,16 +60,6 @@ RUN npm install \
         --no-audit \
         @modelcontextprotocol/server-filesystem@2026.1.14 \
     && npm cache clean --force
-
-# node 26 links libatomic.so.1, which the python-slim runtime base does not ship.
-# Stage the arch-correct libatomic (and its versioned target + symlink) into a
-# fixed, arch-independent path so the runtime COPY needs no hardcoded arch dir.
-# The glob resolves to the single multiarch dir present in this base
-# (x86_64-linux-gnu on amd64, aarch64-linux-gnu on arm64). cp -P preserves the
-# libatomic.so.1 -> libatomic.so.1.x.y symlink so the runtime ldconfig resolves it.
-RUN mkdir -p /opt/libatomic \
- && cp -P /usr/lib/*-linux-gnu/libatomic.so.1* /opt/libatomic/ \
- && ls -l /opt/libatomic/
 
 
 # Python base stages — same arch-selector pattern as node above.
@@ -134,24 +115,6 @@ RUN groupadd --gid 10001 mcp-bridge \
 # attack surface.
 COPY --from=node-base /usr/local/bin/node  /usr/local/bin/node
 COPY --from=node-base /usr/local/lib/      /usr/local/lib/
-
-# node 26 runtime dependency: libatomic.so.1 (absent from python-slim base).
-# TARGETARCH (re-declared after FROM — ARGs do not cross stage boundaries) maps
-# to the Debian multiarch triplet so the lib lands on the loader's default search
-# path for this arch. ldconfig refreshes the cache so `ldd node` resolves it.
-ARG TARGETARCH=amd64
-COPY --from=node-base /opt/libatomic/ /tmp/libatomic/
-RUN case "${TARGETARCH}" in \
-        amd64) MULTIARCH=x86_64-linux-gnu ;; \
-        arm64) MULTIARCH=aarch64-linux-gnu ;; \
-        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac \
- && mkdir -p "/usr/lib/${MULTIARCH}" \
- && cp -P /tmp/libatomic/libatomic.so.1* "/usr/lib/${MULTIARCH}/" \
- && rm -rf /tmp/libatomic \
- && ldconfig \
- && ldd /usr/local/bin/node | grep -q 'libatomic.so.1 =>' \
- && echo "libatomic.so.1 resolved for node on ${TARGETARCH}"
 
 # Copy the installed MCP server package (not the whole node_modules root — only
 # the MCP server package tree is needed).

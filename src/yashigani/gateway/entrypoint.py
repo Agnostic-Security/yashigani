@@ -284,8 +284,17 @@ def _build_app(mesh_mode: bool = False):
     identity_registry = None
     try:
         from yashigani.identity import IdentityRegistry
+        from yashigani.identity.durable_store import IdentityDurableStore
         if redis_client_rbac:
-            identity_registry = IdentityRegistry(redis_client=redis_client_rbac)
+            _id_durable = None
+            try:
+                _id_durable = IdentityDurableStore()
+            except Exception as _de:
+                logger.warning("IdentityDurableStore unavailable (%s) — Redis-only mode", _de)
+            identity_registry = IdentityRegistry(
+                redis_client=redis_client_rbac,
+                durable_store=_id_durable,
+            )
     except Exception as exc:
         logger.warning("Identity registry unavailable (%s)", exc)
 
@@ -874,6 +883,8 @@ def _build_app(mesh_mode: bool = False):
         inspection_pipeline=pipeline,
         rbac_store=rbac_store,
         agent_registry=agent_registry,
+        pool_manager=pool_manager,
+        budget_enforcer=budget_enforcer,
         poll_interval_seconds=15,
     )
     collector.start()

@@ -151,10 +151,23 @@ def test_parse_non_relaxed_final_is_NOT_tagged():
 class _Sens:
     """Deterministic sensitivity classifier stub: PUBLIC unless the text carries a
     secret marker, then RESTRICTED — mirrors the real classifier's fail-closed
-    secret detection used by the chat ingress leg."""
+    secret detection used by the chat ingress leg.
+
+    B6 update: gate_relaxed_final now calls _scan_regex() (not classify_decoded())
+    for step 1b.  This stub implements both methods so existing tests that call
+    either path continue to work.
+    """
 
     def __init__(self, level="PUBLIC"):
         self._level = level
+
+    def _scan_regex(self, text, triggers):
+        """Stub regex layer: flags SECRET or AWS_SECRET as RESTRICTED."""
+        from yashigani.optimization.sensitivity_classifier import SensitivityLevel
+        if "AWS_SECRET" in text or "SECRET" in text:
+            triggers.append("regex:secret_marker")
+            return SensitivityLevel.RESTRICTED
+        return SensitivityLevel(self._level) if self._level != "PUBLIC" else SensitivityLevel.PUBLIC
 
     def classify_decoded(self, text):
         lvl = "RESTRICTED" if ("AWS_SECRET" in text or "SECRET" in text) else self._level
@@ -231,44 +244,34 @@ async def test_gate_blocks_secret_final_via_deterministic_classifier(monkeypatch
     """The exact live-leak shape: inspector returns CLEAN (verdict not blocked)
     and the caller has a RESTRICTED ceiling (OPA ceiling check would ALLOW), but
     the deterministic classifier rates the final RESTRICTED → the gate forces a
-    BLOCKED verdict → OPA denies → content suppressed.  This is the deterministic
+    BLOCKED verdict → content suppressed.  This is the deterministic
     classifier-floor (layer 1b) leak closure; it does NOT rely on the
     non-deterministic inspector.
 
-    NOTE: as of the LAURA-ORCH secret-detector pre-floor (layer 1a), an actual
-    high-entropy CREDENTIAL is intercepted EARLIER (and returns before OPA is
-    reached).  To exercise the CLASSIFIER floor in isolation here, the payload is
-    a sensitive-by-CLASS final (the classifier flags it RESTRICTED on the word
-    'SECRET') that carries NO high-entropy key material — so the secret detector
-    passes it through and the classifier floor is the layer under test."""
+    B6 update: step 1c now blocks BEFORE OPA when the regex classifier forces
+    response_verdict="blocked".  The gate returns early with allow=False without
+    calling OPA — OPA would have given the same answer but step 1c is cheaper and
+    makes the deterministic block explicit.  The payload "SECRET codename" fires
+    the stub classifier's _scan_regex → RESTRICTED → blocked.
+
+    NOTE: an actual high-entropy CREDENTIAL is intercepted EARLIER by layer 1a
+    (scan_secrets).  To exercise the CLASSIFIER floor (1b/1c) in isolation, the
+    payload carries NO high-entropy key material — just a sensitive-by-CLASS word."""
     st = _State()
     st.sensitivity_classifier = _Sens()  # flags 'SECRET' text as RESTRICTED
     monkeypatch.setattr(router, "_state", st)
 
-    seen = {}
-
-    async def opa(**k):
-        seen.update(k)
-        # Emulate the real rego: deny when response_verdict=="blocked", else allow
-        # (the caller's RESTRICTED ceiling would otherwise admit RESTRICTED content).
-        if k.get("response_verdict") == "blocked":
-            return {"allow": False, "reason": "response_blocked_by_inspection"}
-        return {"allow": True, "reason": "within_ceiling"}
-
-    monkeypatch.setattr(router, "_opa_response_check", opa)
-
     # Sensitive-by-CLASS but NOT a high-entropy secret (no key material) — so
-    # layer 1a (secret detector) passes and layer 1b (classifier) is exercised.
+    # layer 1a (secret detector) passes and layer 1b/1c (classifier + early block)
+    # is exercised.
     LEAK = "This final references the SECRET project codename in passing."
     allow, text = await router.gate_relaxed_final(
         identity={"identity_id": "internal", "kind": "service"},
         final_text=LEAK, prompt_sensitivity="PUBLIC")
 
-    assert seen.get("response_verdict") == "blocked", \
-        "deterministic RESTRICTED classification must force a blocked verdict"
-    assert seen.get("response_sensitivity") == "RESTRICTED"
-    assert allow is False
-    assert "BLOCKED BY YASHIGANI POLICY" in text
+    assert allow is False, "RESTRICTED regex classification must block the final"
+    # Step 1c returns before OPA; message comes from the deterministic block path.
+    assert "BLOCKED" in text.upper() and "withheld" in text.lower()
 
 
 @pytest.mark.asyncio
@@ -296,28 +299,29 @@ async def test_gate_does_not_block_benign_final_via_classifier(monkeypatch):
 @pytest.mark.asyncio
 async def test_gate_classifier_failure_is_fail_closed(monkeypatch):
     """A classifier that RAISES must be treated as RESTRICTED (fail-closed) so an
-    unclassifiable final cannot slip through on a clean inspector verdict."""
+    unclassifiable final cannot slip through on a clean inspector verdict.
+
+    B6 update: gate_relaxed_final now calls _scan_regex() in step 1b.  When
+    _scan_regex raises, the fail-closed path sets classified="RESTRICTED" →
+    step 1c blocks immediately before OPA.  OPA is never called; we just verify
+    allow=False (fail-closed outcome).
+    """
     st = _State()
 
     class _Boom:
+        def _scan_regex(self, text, triggers):
+            raise RuntimeError("classifier down")
+
         def classify_decoded(self, text):
             raise RuntimeError("classifier down")
 
     st.sensitivity_classifier = _Boom()
     monkeypatch.setattr(router, "_state", st)
 
-    seen = {}
-
-    async def opa(**k):
-        seen.update(k)
-        return {"allow": k.get("response_verdict") != "blocked", "reason": "x"}
-
-    monkeypatch.setattr(router, "_opa_response_check", opa)
-
     allow, text = await router.gate_relaxed_final(
         identity={"identity_id": "u1"}, final_text="anything",
         prompt_sensitivity="PUBLIC")
-    assert seen.get("response_verdict") == "blocked"
+    # Step 1c blocks before OPA — allow must be False (fail-closed).
     assert allow is False
 
 

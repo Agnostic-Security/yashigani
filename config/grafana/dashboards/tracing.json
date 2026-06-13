@@ -1,56 +1,249 @@
 {
   "uid": "yashigani-tracing",
-  "title": "Yashigani — Distributed Tracing",
-  "tags": ["yashigani", "tracing", "otel", "jaeger"],
+  "title": "Yashigani \u2014 Distributed Tracing",
+  "tags": [
+    "yashigani",
+    "tracing",
+    "otel",
+    "jaeger"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "Trace Volume (1h)",
-      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "increase(yashigani_trace_spans_total[1h])", "legendFormat": "Spans"}],
-      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "blue", "value": null}]}}}
+      "id": 7,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Distributed trace telemetry from OpenTelemetry/Jaeger: span volume, error spans, cache hit rate, JWT validation count, and request latency P50/P95/P99. Use to diagnose latency regressions across service hops."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "Error Spans (1h)",
-      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "increase(yashigani_trace_spans_total{status=\"error\"}[1h])", "legendFormat": "Error Spans"}],
-      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 10}]}}}
-    },
-    {
-      "id": 3, "type": "stat", "title": "Cache Hit Rate",
-      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "rate(yashigani_cache_hits_total[5m]) / (rate(yashigani_cache_hits_total[5m]) + rate(yashigani_cache_misses_total[5m]))", "legendFormat": "Hit Rate"}],
-      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"unit": "percentunit", "thresholds": {"steps": [{"color": "red", "value": null}, {"color": "orange", "value": 0.3}, {"color": "green", "value": 0.7}]}}}
-    },
-    {
-      "id": 4, "type": "stat", "title": "JWT Validations (1h)",
-      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "increase(yashigani_jwt_validations_total[1h])", "legendFormat": "{{result}}"}],
-      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}}
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "Request Latency P50/P95/P99 (ms)",
-      "gridPos": {"x": 0, "y": 4, "w": 16, "h": 8},
+      "id": 1,
+      "type": "stat",
+      "title": "Trace Volume (1h)",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr": "histogram_quantile(0.50, rate(yashigani_gateway_request_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p50"},
-        {"expr": "histogram_quantile(0.95, rate(yashigani_gateway_request_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p95"},
-        {"expr": "histogram_quantile(0.99, rate(yashigani_gateway_request_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p99"}
+        {
+          "expr": "increase(yashigani_trace_spans_total[1h])",
+          "legendFormat": "Spans"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "ms"}}
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 6, "type": "timeseries", "title": "Error Span Rate (per minute)",
-      "gridPos": {"x": 16, "y": 4, "w": 8, "h": 8},
+      "id": 2,
+      "type": "stat",
+      "title": "Error Spans (1h)",
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr": "rate(yashigani_trace_spans_total{status=\"error\"}[1m])", "legendFormat": "{{span_name}}"}
+        {
+          "expr": "increase(yashigani_trace_spans_total{status=\"error\"}[1h])",
+          "legendFormat": "Error Spans"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}, "unit": "reqps"}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cache Hit Rate",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_cache_hits_total[5m]) / (rate(yashigani_cache_hits_total[5m]) + rate(yashigani_cache_misses_total[5m]))",
+          "legendFormat": "Hit Rate"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.3
+              },
+              {
+                "color": "green",
+                "value": 0.7
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "JWT Validations (1h)",
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_jwt_validations_total[1h])",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request Latency P50/P95/P99 (ms)",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 16,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(yashigani_gateway_request_duration_seconds_bucket[5m])) * 1000",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yashigani_gateway_request_duration_seconds_bucket[5m])) * 1000",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(yashigani_gateway_request_duration_seconds_bucket[5m])) * 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "ms"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Error Span Rate (per minute)",
+      "gridPos": {
+        "x": 16,
+        "y": 7,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_trace_spans_total{status=\"error\"}[1m])",
+          "legendFormat": "{{span_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20
+          },
+          "unit": "reqps"
+        }
+      }
     }
   ]
 }

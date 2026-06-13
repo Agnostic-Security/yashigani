@@ -1,4 +1,4 @@
-// last-updated: 2026-05-09T00:00:00+01:00 (v2.23.3: add PKI loadPkiStatus() call in showPage)
+// last-updated: 2026-06-13T00:00:00+01:00 (2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1)
 // V1.2.1 — HTML output encoding helper (CWE-79 stored XSS prevention).
 // Every user-controlled value rendered into innerHTML MUST pass through
 // escapeHtml().  Stage B audit (§4.1) identified 10 sinks; all are fixed below.
@@ -7,14 +7,39 @@ function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) { return HTML_ESCAPES[c]; });
 }
 
+// 2.25.5 — populate a <select> from a list of {value,label} (or strings),
+// preserving the current selection if it still exists. `leading` is an optional
+// array of {value,label} prepended (e.g. an explicit "All" wildcard option).
+// All values are escaped — built via DOM, never innerHTML — CSP-safe, no styles.
+function fillSelect(id, items, leading) {
+    var sel = document.getElementById(id);
+    if (!sel) return;
+    var prev = sel.value;
+    var opts = (leading || []).concat(items || []);
+    sel.replaceChildren();
+    opts.forEach(function(it) {
+        var value = (typeof it === 'string') ? it : it.value;
+        var label = (typeof it === 'string') ? it : (it.label != null ? it.label : it.value);
+        var o = document.createElement('option');
+        o.value = (value == null ? '' : String(value));
+        o.textContent = (label == null ? '' : String(label));
+        sel.appendChild(o);
+    });
+    // Restore prior selection if still present.
+    if (prev) {
+        for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === prev) { sel.value = prev; break; }
+        }
+    }
+}
+
 // Navigation
 function showPage(name, triggerEl) {
     document.querySelectorAll('.page').forEach(function(p) { p.className = 'page'; });
     document.getElementById('page-' + name).className = 'page active';
     document.querySelectorAll('.nav-links button').forEach(function(b) { b.className = ''; });
     // Highlight the matching nav button by data-param — works whether triggered
-    // from the nav itself, the onboarding checklist, or programmatically (so a
-    // non-button trigger like an onboarding <label> doesn't lose its own class).
+    // from the nav itself or programmatically.
     var navBtn = (triggerEl && triggerEl.tagName === 'BUTTON' && triggerEl.closest && triggerEl.closest('.nav-links'))
         ? triggerEl
         : document.querySelector('.nav-links button[data-param="' + name + '"]');
@@ -22,27 +47,28 @@ function showPage(name, triggerEl) {
     // Load data for the page
     if (name === 'dashboard') loadDashboard();
     if (name === 'agents') loadAgents();
-    if (name === 'accounts') loadAccounts();
+    if (name === 'accounts') { loadAccounts(); loadEnforcementBanner(); }
     if (name === 'budgets') loadBudgets();
     if (name === 'models') { loadModels(); loadCloudOverride(); }
     if (name === 'sensitivity') loadSensitivity();
-    if (name === 'policies') loadPolicies();
-    if (name === 'settings') loadSettings();
+    if (name === 'policies') { loadPolicies(); loadLifecycle(); }
+    if (name === 'audit') loadAuditFacets();  // R19/R20 — populate verdict + source-type filters
+    if (name === 'settings') { loadSettings(); loadEntitlements(); }
     if (name === 'backup') loadBackup();
-    // PKI panel — loadPkiStatus is defined in pki.js (loaded defer).
-    // window.loadPkiStatus guard prevents ReferenceError if pki.js not yet parsed.
-    // Bug fix: v2.23.3 — showPage('pki') was missing the loadPkiStatus() call.
-    if (name === 'pki' && typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
+    // PKI / Crypto page — R24: also load crypto inventory when PKI tab is activated.
+    // loadPkiStatus is defined in pki.js (loaded defer).
+    if (name === 'pki') {
+        if (typeof window.loadPkiStatus === 'function') window.loadPkiStatus();
+        loadCryptoInventory();  // R24: crypto now lives under PKI
+    }
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
     if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
-    if (name === 'rbac') loadGroups();        // RBAC group management (parity with /admin/rbac API)
+    if (name === 'rbac') { loadGroups(); loadRbacSources(); }  // R13: populate path/method catalogues
 }
 
 // ---------------------------------------------------------------------------
-// Policies (OPA) — read-only viewer of the Rego modules loaded in OPA.
-// Example modules are IMMUTABLE templates; editable client copies + activation
-// + ingress/egress enforcement are phased features (opa_policy_management_design).
+// Policies (OPA) — R8/R9/R10 wired: duplicate, edit-rego, lifecycle badges.
 // ---------------------------------------------------------------------------
 async function loadPolicies() {
     var container = document.getElementById('policies-container');
@@ -53,26 +79,47 @@ async function loadPolicies() {
         container.innerHTML = '<p class="error">Could not load policies from the policy service.</p>';
         return;
     }
-    var catLabel = { example: 'Templates (immutable examples)', core: 'Core gateway policies', test: 'Test policies' };
+    var catLabel = {
+        example: 'Templates (immutable examples)',
+        core: 'Core gateway policies',
+        client: 'Client policies (editable)',
+        test: 'Test policies'
+    };
     var catBadge = {
         example: '<span class="badge badge-amber">template</span>',
         core: '<span class="badge badge-green">core</span>',
+        client: '<span class="badge badge-blue">client</span>',
         test: '<span class="badge badge-slate">test</span>'
     };
+    // Lifecycle badge helper — R10
+    function lcBadge(status) {
+        var cls = { draft: 'lc-badge-draft', staging: 'lc-badge-staging', production: 'lc-badge-production', archived: 'lc-badge-archived' };
+        return '<span class="' + (cls[status] || 'lc-badge-draft') + '">' + escapeHtml(status || 'draft') + '</span>';
+    }
     var groups = {};
     data.policies.forEach(function(p) { (groups[p.category] = groups[p.category] || []).push(p); });
     var html = '';
-    ['example', 'core', 'test'].forEach(function(cat) {
+    ['example', 'client', 'core', 'test'].forEach(function(cat) {
         var list = groups[cat];
         if (!list || !list.length) return;
         html += '<h3 class="h3-section">' + escapeHtml(catLabel[cat] || cat) + '</h3>';
-        html += '<table><thead><tr><th>Name</th><th>Package</th><th></th><th></th></tr></thead><tbody>';
+        html += '<table><thead><tr><th>Name</th><th>Package</th><th>Category</th><th>Lifecycle</th><th>Actions</th></tr></thead><tbody>';
         list.forEach(function(p) {
+            // R8: Duplicate button (example/core → duplicate to new client policy via POST /admin/policies/templates/duplicate)
+            // R8: Edit Rego button for client policies (→ PUT /admin/policies/custom/{name}/rego)
+            var dupBtn = (cat === 'example' || cat === 'core')
+                ? '<button class="btn btn-sm btn-xs-add" data-action="duplicateTemplateRow" data-id="' + escapeHtml(p.id) + '" data-name="' + escapeHtml(p.name) + '">Duplicate</button> '
+                : '';
+            var editRegoBtn = (cat === 'client')
+                ? '<button class="btn btn-sm" data-action="editClientRego" data-id="' + escapeHtml(p.id) + '" data-name="' + escapeHtml(p.name) + '">Edit Rego</button> '
+                : '';
+            var viewBtn = '<button class="btn btn-sm" data-action="policyView" data-id="' + escapeHtml(p.id) + '" data-cat="' + escapeHtml(p.category) + '">View</button>';
             html += '<tr>'
                 + '<td class="td-mono">' + escapeHtml(p.name) + '</td>'
                 + '<td class="td-pkg">' + escapeHtml(p.package || '—') + '</td>'
                 + '<td>' + (catBadge[p.category] || '') + '</td>'
-                + '<td><button class="btn btn-sm" data-action="policyView" data-id="' + escapeHtml(p.id) + '" data-cat="' + escapeHtml(p.category) + '">View</button></td>'
+                + '<td>' + lcBadge(p.lifecycle_status) + '</td>'
+                + '<td>' + dupBtn + editRegoBtn + viewBtn + '</td>'
                 + '</tr>';
         });
         html += '</tbody></table>';
@@ -81,23 +128,43 @@ async function loadPolicies() {
         escapeHtml(String(data.count)) + ' policy modules loaded in OPA (' + escapeHtml(data.opa_url || '') + ').</p>';
 }
 
+// Track the currently viewed policy id + cat for R8/R9 actions
+var _viewedPolicyId = '';
+var _viewedPolicyCat = '';
+
 async function viewPolicy(id, cat) {
     var panel = document.getElementById('policy-view-panel');
     var ta = document.getElementById('policy-view-src');
     var title = document.getElementById('policy-view-title');
     var badge = document.getElementById('policy-view-badge');
     if (!panel || !ta) return;
+    _viewedPolicyId = id;
+    _viewedPolicyCat = cat;
     title.textContent = id;
-    badge.innerHTML = (cat === 'example')
-        ? '<span class="badge badge-template">immutable template</span>'
-        : (cat === 'client' ? '<span class="badge badge-green">client copy</span>' : '');
+    var catLabels = {
+        example: '<span class="badge badge-template">immutable template</span>',
+        client: '<span class="badge badge-blue">client copy</span>',
+        core: '<span class="badge badge-green">core (load-bearing)</span>'
+    };
+    badge.innerHTML = catLabels[cat] || '';
     // Reset to view (read-only) state each time.
     ta.readOnly = true;
     var sa = document.getElementById('policy-saveas'); if (sa) sa.classList.remove('is-open');
-    var ec = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ec) ec.classList.remove('is-hidden');
+    var ecopy = document.querySelector('#policy-edit-controls [data-action="policyEditCopy"]'); if (ecopy) ecopy.classList.remove('is-hidden');
     var res = document.getElementById('policy-save-result'); if (res) res.innerHTML = '';
     var nm = document.getElementById('policy-copy-name');
     if (nm) nm.value = (id.split('/').pop().replace(/\.rego$/, '') + '_copy').toLowerCase().replace(/[^a-z0-9_]/g, '');
+
+    // R8/R9: show/hide the correct action buttons depending on category
+    var btnDup = document.getElementById('btn-duplicate-template');
+    var btnCore = document.getElementById('btn-edit-core');
+    var editRegoCtrl = document.getElementById('policy-editrego-controls');
+    var dangerZone = document.getElementById('core-danger-zone');
+    if (btnDup) btnDup.classList.toggle('is-hidden', cat !== 'example' && cat !== 'core');
+    if (btnCore) btnCore.classList.toggle('is-hidden', cat !== 'core');
+    if (editRegoCtrl) editRegoCtrl.classList.add('is-hidden');
+    if (dangerZone) dangerZone.classList.add('is-hidden');
+
     ta.value = 'Loading…';
     panel.classList.remove('is-hidden');
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -192,9 +259,48 @@ async function generatePolicy() {
 }
 
 // ── #16 client-policy bindings (parity with the /admin/policies/bind* API) ──
+// R11(a): populate the "Policy name" dropdown from the policies loaded in OPA.
+// Only client policies (clients/<name>) are bindable, so prefer those; fall back
+// to all names if no client policies exist yet.
+async function loadBindablePolicies() {
+    var data = await api('/admin/policies');
+    var pols = (data && data.policies) ? data.policies : [];
+    // A bindable client policy has package clients.<name>; its name is <name>.
+    var clientPols = pols.filter(function(p) {
+        return (p.package && p.package.indexOf('clients') === 0) ||
+               (p.id && (p.id.indexOf('clients/') === 0 || p.id.indexOf('/clients/') >= 0));
+    });
+    var src = clientPols.length ? clientPols : pols;
+    var opts = src.map(function(p) { return { value: p.name, label: p.name }; });
+    fillSelect('bind-policy-name', opts, [{ value: '', label: opts.length ? 'Select a policy…' : 'No bindable policies' }]);
+}
+
+// R11(b): populate the "Subject ID" dropdown for the selected subject kind, with
+// an explicit "All (wildcard)" option instead of an implicit blank.
+async function loadBindSubjects() {
+    var kindSel = document.getElementById('bind-scope-kind');
+    if (!kindSel) return;
+    var kind = kindSel.value;
+    var leading = [{ value: '*', label: 'All (wildcard)' }];
+    var items = [];
+    if (kind === 'agent') {
+        var agents = await api('/admin/agents');
+        items = (agents || []).map(function(a) { return { value: a.agent_id, label: a.name + ' (' + a.agent_id + ')' }; });
+    } else if (kind === 'human') {
+        var t = await api('/admin/models/allocation-targets?target_type=user');
+        items = (t && t.targets) ? t.targets : [];
+    }
+    // service / api_client / mcp_server: no enumerable registry surfaced here —
+    // wildcard "All" plus free identifiers are handled by the explicit All option.
+    fillSelect('bind-scope-id', items, leading);
+}
+
 async function loadBindings() {
     var c = document.getElementById('bindings-container');
     if (!c) return;
+    // R11: refresh the policy + subject dropdowns alongside the bindings table.
+    loadBindablePolicies();
+    loadBindSubjects();
     c.innerHTML = '<span class="loading">Loading…</span>';
     var data = await api('/admin/policies/bindings');
     if (!data || !data.bindings) { c.innerHTML = '<p class="txt-note">No bindings (or failed to load).</p>'; return; }
@@ -217,8 +323,11 @@ async function bindPolicy() {
     var name = (document.getElementById('bind-policy-name').value || '').trim();
     var kind = document.getElementById('bind-scope-kind').value;
     var sid = (document.getElementById('bind-scope-id').value || '').trim();
+    // R11: explicit "All" wildcard is the "*" option — the backend stores an
+    // empty scope_id as the wildcard, so normalise "*" -> "".
+    if (sid === '*') sid = '';
     var dir = document.getElementById('bind-direction').value;
-    if (!name) { alert('Enter a client policy name (clients/<name>).'); return; }
+    if (!name) { alert('Select a client policy to bind.'); return; }
     var resp = await apiMutate('/admin/policies/bind', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -465,17 +574,30 @@ async function api(path) {
 }
 
 // ---------------------------------------------------------------------------
-// V6.8.4 Step-up TOTP interceptor
+// V6.8.4 Step-up TOTP interceptor + Phase 1 auth-UX (B4 fix)
 //
-// apiMutate() wraps high-value fetch calls.  When the server returns
-// HTTP 401 with detail.error === "step_up_required", the interceptor:
-//   1. Shows a TOTP modal prompting the admin to enter their current code.
-//   2. POSTs the code to /auth/stepup.
-//   3. On 200, retries the original request automatically.
-//   4. On failure, shows an error inside the modal.
+// apiMutate() wraps high-value fetch calls.
+//
+// 401 handling:
+//   - detail.error === "step_up_required": show TOTP step-up modal + retry.
+//   - detail.error === "session_expired_or_invalid": explicit re-login prompt,
+//     NOT a silent redirect (B4 fix — prevents confusing mid-action bounces).
+//   - Generic 401: redirect to /admin/login with a clear re-auth message.
+//
+// 403 handling (B4 fix — Phase 1 / 2.25.5-auth-ingress):
+//   - Previously: apiMutate returned the resp and callers checked resp.ok, but
+//     403 was not handled specially — the caller rendered it as a generic error.
+//     The *real* B4 bounce happened because the OWUI/catch-all Caddy route saw
+//     a 403 from /auth/verify (admin session on data plane) and redirected to
+//     /admin/ — which *looked* like a login bounce.  The fix is on the Caddy
+//     side (route the 403 to an explicit error page, not a login redirect) plus
+//     here: surfacing the 403 body as a readable error instead of null.
+//   - detail.error present: return the resp so the caller can render errMsg().
+//   - This ensures a non-admin user hitting an admin-only action gets a clean
+//     "Not authorized" message, not a silent bounce or blank response.
 //
 // Usage: var resp = await apiMutate(path, options);
-// Returns the final Response object (or null on abort/error).
+// Returns the final Response object (or null on abort/network error).
 // ---------------------------------------------------------------------------
 
 var _stepupQueue = null;  // Pending {resolve, reject, path, options} while modal is open
@@ -494,14 +616,45 @@ async function apiMutate(path, options) {
                     _showStepUpModal();
                 });
             }
-            // Generic 401 — redirect to login
+            if (body && body.detail && body.detail.error === 'session_expired_or_invalid') {
+                // B4 fix: session expired mid-action — explicit prompt, not silent bounce.
+                // Show a message so the admin knows what happened, then redirect.
+                _showAuthzError('Your session has expired. Please sign in again.', '/admin/login');
+                return null;
+            }
+            // Generic 401 — session gone or unauthenticated; redirect to login.
             window.location.href = '/admin/login';
             return null;
+        }
+        if (resp.status === 403) {
+            // B4 fix: return the response so the caller can render errMsg() rather
+            // than silently returning null.  Callers already check resp.ok and render
+            // the error; returning null here caused a "Request failed" message instead
+            // of the actual authorization error from the server.
+            return resp;
         }
         return resp;
     } catch(err) {
         console.error('apiMutate failed: ' + path + ' — ' + err.message);
         return null;
+    }
+}
+
+// _showAuthzError — display a clear authorization/session error to the admin.
+// Used by the B4 fix to surface session-expiry + 403 errors gracefully.
+// msg: human-readable message; redirectTo: optional URL to navigate to after a delay.
+function _showAuthzError(msg, redirectTo) {
+    // Try to show in a visible location on the page.
+    var banner = document.getElementById('msg-box') || document.getElementById('status-msg');
+    if (banner) {
+        banner.className = (banner.className || '') + ' msg error visible';
+        banner.textContent = msg;
+    } else {
+        // Fallback: browser alert (last resort).
+        alert(msg);
+    }
+    if (redirectTo) {
+        setTimeout(function() { window.location.href = redirectTo; }, 2500);
     }
 }
 
@@ -588,39 +741,300 @@ document.addEventListener('DOMContentLoaded', function() {
             if (e.key === 'Enter') { e.preventDefault(); submitStepUp(); }
         });
     }
+    // R26: version badge — fires immediately on page load, before any page section is shown
+    loadVersionCheck();
+    // N1: second-admin enforcement banner — fires on load; re-fires when accounts page is shown
+    loadEnforcementBanner();
 });
 
 // Dashboard
 async function loadDashboard() {
-    var data = await api('/dashboard/health');
-    var container = document.getElementById('health-cards');
-    if (data && data.components) {
-        var html = '';
-        for (var name in data.components) {
-            var comp = data.components[name];
-            var status = comp.status || 'unknown';
-            var badge = status === 'ok' ? 'badge-green' : status === 'degraded' ? 'badge-yellow' : 'badge-red';
-            html += '<div class="card"><div class="card-label">' + name + '</div><span class="badge ' + badge + '">' + status + '</span></div>';
-        }
-        container.innerHTML = html;
+    // R25: orchestrate all five dashboard widgets in parallel for fast render.
+    await Promise.all([
+        loadDashServicesHealth(),
+        loadDashAlerts(),
+        loadDashBudget(),
+        loadDashSecurity(),
+        loadDashTraffic(),
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 1 — Per-service health semaphores + roll-up
+// ---------------------------------------------------------------------------
+
+// Map a service status string to a semaphore CSS class (R25 palette).
+function _svcSemaphoreClass(status) {
+    if (status === 'ok' || status === 'community' || status === 'not_configured') return 'semaphore--ok';
+    if (status === 'degraded' || status === 'warning' || status === 'stopped') return 'semaphore--degraded';
+    return 'semaphore--critical';
+}
+
+// Map an overall roll-up value to a semaphore CSS class.
+function _rollupSemaphoreClass(rollup) {
+    if (rollup === 'ok') return 'semaphore--ok';
+    if (rollup === 'degraded') return 'semaphore--degraded';
+    return 'semaphore--critical';
+}
+
+async function loadDashServicesHealth() {
+    var bodyEl = document.getElementById('dash-services-body');
+    var rollupEl = document.getElementById('dash-health-rollup');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/services-health');
+    if (!data || !data.services) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading service health</span>';
+        return;
+    }
+
+    // Update roll-up semaphore
+    if (rollupEl) {
+        rollupEl.className = 'semaphore ' + _rollupSemaphoreClass(data.rollup);
+        rollupEl.title = 'Overall: ' + escapeHtml(data.rollup);
+    }
+
+    // Build service table
+    var rows = '';
+    (data.services || []).forEach(function(svc) {
+        var semCls = _svcSemaphoreClass(svc.status);
+        var critTag = svc.criticality
+            ? '<span class="svc-crit-tag">critical</span>'
+            : '<span class="svc-noncrit-tag">non-critical</span>';
+        rows += '<tr>'
+            + '<td class="svc-semaphore-cell"><span class="semaphore ' + semCls + '" title="' + escapeHtml(svc.status) + '"></span></td>'
+            + '<td class="svc-name">' + escapeHtml(svc.name) + '</td>'
+            + '<td>' + critTag + '</td>'
+            + '<td class="svc-detail">' + escapeHtml(svc.detail || svc.status) + '</td>'
+            + '</tr>';
+    });
+    bodyEl.innerHTML = '<table class="svc-table"><tbody>' + rows + '</tbody></table>';
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 2 — Active alerts semaphore (P1–P5, priority order)
+// ---------------------------------------------------------------------------
+
+async function loadDashAlerts() {
+    var bodyEl = document.getElementById('dash-alerts-body');
+    var totalEl = document.getElementById('dash-alerts-total');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/security-metrics');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading alerts</span>';
+        return;
+    }
+
+    var counts = data.recent_alerts_by_priority || {};
+    var total = (counts.P1 || 0) + (counts.P2 || 0) + (counts.P3 || 0) + (counts.P4 || 0) + (counts.P5 || 0);
+
+    if (totalEl) totalEl.textContent = total + ' in buffer';
+
+    // Priority rows P1 (most urgent) → P5 (informational)
+    var priorities = [
+        { key: 'P1', label: 'P1 Critical',      cls: 'semaphore--p1' },
+        { key: 'P2', label: 'P2 High',           cls: 'semaphore--p2' },
+        { key: 'P3', label: 'P3 Medium',         cls: 'semaphore--p3' },
+        { key: 'P4', label: 'P4 Low',            cls: 'semaphore--p4' },
+        { key: 'P5', label: 'P5 Informational',  cls: 'semaphore--p5' },
+    ];
+
+    var items = '';
+    priorities.forEach(function(p) {
+        var n = counts[p.key] || 0;
+        var cntCls = n === 0 ? 'alert-priority-count--zero' : '';
+        items += '<li class="alert-priority-item">'
+            + '<span class="semaphore ' + p.cls + '"></span>'
+            + '<span class="alert-priority-label">' + escapeHtml(p.label) + '</span>'
+            + '<span class="alert-priority-count ' + cntCls + '">' + n + '</span>'
+            + '</li>';
+    });
+    bodyEl.innerHTML = '<ul class="alert-priority-list">' + items + '</ul>';
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 3 — Budget usage: used/cap gauge, 85% marker, split
+// ---------------------------------------------------------------------------
+
+async function loadDashBudget() {
+    var bodyEl = document.getElementById('dash-budget-body');
+    var badgeEl = document.getElementById('dash-budget-threshold-badge');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/budget-summary');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading budget data</span>';
+        return;
+    }
+
+    var threshold = data.budget_threshold_pct || 85;
+    var alertEnabled = data.threshold_alert_enabled !== false;
+
+    if (badgeEl) {
+        badgeEl.textContent = alertEnabled ? ('Alert at ' + threshold + '%') : 'Alert off';
+    }
+
+    var cloud = data.tokens_by_route ? (data.tokens_by_route.cloud || 0) : 0;
+    var local = data.tokens_by_route ? (data.tokens_by_route.local || 0) : 0;
+    var total = data.tokens_by_route ? (data.tokens_by_route.total || 0) : 0;
+
+    // Gauge: cloud as % of total (if any tokens consumed)
+    var cloudPct = total > 0 ? Math.round((cloud / total) * 100) : 0;
+    var fillCls = cloudPct >= 100 ? 'budget-gauge-fill--danger'
+                : cloudPct >= threshold ? 'budget-gauge-fill--warn'
+                : 'budget-gauge-fill--ok';
+
+    // CSP-safe: no inline style= in HTML. Width is set via .style.width after DOM insertion.
+    var gaugeHtml = '<div class="budget-gauge-wrap">'
+        + '<div class="budget-gauge-label"><span>Cloud token usage</span><span>' + cloudPct + '%</span></div>'
+        + '<div class="budget-gauge-bar">'
+        + '<div class="budget-gauge-fill ' + fillCls + '" id="dash-budget-gauge-fill"></div>'
+        + '<div class="budget-gauge-marker budget-gauge-marker--85" title="85% threshold"></div>'
+        + '</div>'
+        + '</div>';
+
+    // Cloud / local split
+    var splitHtml = '<div class="budget-split">'
+        + '<div class="budget-split-item"><div class="budget-split-label">Cloud tokens</div><div class="budget-split-value">' + _fmtTokens(cloud) + '</div></div>'
+        + '<div class="budget-split-item"><div class="budget-split-label">Local tokens</div><div class="budget-split-value">' + _fmtTokens(local) + '</div></div>'
+        + '<div class="budget-split-item"><div class="budget-split-label">Total</div><div class="budget-split-value">' + _fmtTokens(total) + '</div></div>'
+        + '</div>';
+
+    // Budget config counts
+    var countsHtml = '<div class="budget-counts">'
+        + '<div class="budget-count-item"><div class="budget-count-label">Org caps</div><div class="budget-count-value">' + (data.org_caps_count || 0) + '</div></div>'
+        + '<div class="budget-count-item"><div class="budget-count-label">Groups</div><div class="budget-count-value">' + (data.group_budgets_count || 0) + '</div></div>'
+        + '<div class="budget-count-item"><div class="budget-count-label">Individuals</div><div class="budget-count-value">' + (data.individual_budgets_count || 0) + '</div></div>'
+        + '</div>';
+
+    bodyEl.innerHTML = gaugeHtml + splitHtml + countsHtml;
+
+    // CSP-safe: set gauge fill width via CSSOM after DOM insertion (not inline style= in HTML).
+    var fillEl = document.getElementById('dash-budget-gauge-fill');
+    if (fillEl) fillEl.style.width = Math.min(cloudPct, 100) + '%';
+}
+
+// Format token count: K/M suffix for readability
+function _fmtTokens(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 4 — Security story
+// ---------------------------------------------------------------------------
+
+async function loadDashSecurity() {
+    var bodyEl = document.getElementById('dash-security-body');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/security-metrics');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading security data</span>';
+        return;
+    }
+
+    var rows = '<div class="sec-row"><span class="sec-label">OPA safety blocks (lifetime)</span><span class="sec-value">' + (data.opa_blocks_total || 0) + '</span></div>';
+
+    // Sensitivity mix bar
+    var sens = data.sensitivity_detections || {};
+    var sensTotal = 0;
+    ['RESTRICTED', 'CONFIDENTIAL', 'SENSITIVE', 'INTERNAL', 'PUBLIC'].forEach(function(l) { sensTotal += (sens[l] || 0); });
+
+    if (sensTotal > 0) {
+        var segMap = {
+            'RESTRICTED': { cls: 'sensbar-seg-5', dotCls: 'sensbar-dot-5' },
+            'SENSITIVE':  { cls: 'sensbar-seg-4', dotCls: 'sensbar-dot-4' },
+            'CONFIDENTIAL':{ cls: 'sensbar-seg-3', dotCls: 'sensbar-dot-3' },
+            'INTERNAL':   { cls: 'sensbar-seg-2', dotCls: 'sensbar-dot-2' },
+            'PUBLIC':     { cls: 'sensbar-seg-1', dotCls: 'sensbar-dot-1' },
+        };
+        // CSP-safe: build segment refs array; set widths via CSSOM after DOM insertion.
+        var segRefs = []; // [{id, pct}]
+        var segs = '';
+        var legend = '';
+        var segIdx = 0;
+        ['RESTRICTED', 'SENSITIVE', 'CONFIDENTIAL', 'INTERNAL', 'PUBLIC'].forEach(function(l) {
+            var n = sens[l] || 0;
+            if (n === 0) return;
+            var pct = Math.round((n / sensTotal) * 100);
+            var m = segMap[l] || { cls: 'sensbar-seg-1', dotCls: 'sensbar-dot-1' };
+            var segId = 'dash-sensbar-seg-' + segIdx;
+            segRefs.push({ id: segId, pct: pct });
+            segs += '<span id="' + segId + '" class="' + m.cls + '"></span>';
+            legend += '<span class="sensbar-key"><span class="sensbar-dot ' + m.dotCls + '"></span>' + escapeHtml(l) + ' ' + n + '</span>';
+            segIdx++;
+        });
+        rows += '<div class="sensbar-wrap">'
+            + '<div class="sensbar-label">Sensitivity traffic mix (' + sensTotal + ' detections)</div>'
+            + '<div class="sensbar-track">' + segs + '</div>'
+            + '<div class="sensbar-legend">' + legend + '</div>'
+            + '</div>';
+        bodyEl.innerHTML = rows;
+        // CSP-safe: set sensbar segment widths via CSSOM after DOM insertion.
+        segRefs.forEach(function(ref) {
+            var el = document.getElementById(ref.id);
+            if (el) el.style.width = ref.pct + '%';
+        });
+        return;
     } else {
-        container.innerHTML = '<div class="card"><span class="badge badge-red">Error loading health data</span></div>';
+        rows += '<div class="sec-row"><span class="sec-label">Sensitivity detections</span><span class="sec-value">0</span></div>';
     }
 
-    // Accounts count
-    var accounts = await api('/admin/accounts');
-    if (accounts && accounts.accounts) {
-        document.getElementById('stat-accounts').textContent = accounts.accounts.length;
+    bodyEl.innerHTML = rows;
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 5 — Traffic, agent/MCP activity, recent audit
+// ---------------------------------------------------------------------------
+
+async function loadDashTraffic() {
+    var bodyEl = document.getElementById('dash-traffic-body');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/traffic-metrics');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading traffic data</span>';
+        return;
     }
 
-    // Agents count
-    var agents = await api('/admin/agents');
-    if (agents) {
-        document.getElementById('stat-agents').textContent = Array.isArray(agents) ? agents.length : 0;
+    var statsHtml = '<div class="traffic-grid">'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.gateway_requests_total || 0) + '</div><div class="traffic-stat-label">Gateway requests</div></div>'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.agent_calls_total || 0) + '</div><div class="traffic-stat-label">Agent calls</div></div>'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.inspection_requests_total || 0) + '</div><div class="traffic-stat-label">Inspections</div></div>'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.ratelimit_violations_total || 0) + '</div><div class="traffic-stat-label">Rate-limit events</div></div>'
+        + '</div>';
+
+    // Recent audit events mini-table
+    var recent = data.recent_audit_events || [];
+    var tableHtml = '';
+    if (recent.length > 0) {
+        var auditRows = recent.map(function(e) {
+            var who = e.admin_account || e.user || e.user_handle || e.agent_id || '-';
+            var verdict = e.verdict || e.outcome || '-';
+            var blocked = /block|deni|reject|fail/i.test(verdict);
+            return '<tr>'
+                + '<td class="td-xxs">' + escapeHtml((e.timestamp || e.received_at || '').substring(0, 19)) + '</td>'
+                + '<td>' + escapeHtml(e.event_type || '-') + '</td>'
+                + '<td>' + escapeHtml(who) + '</td>'
+                + '<td><span class="badge ' + (blocked ? 'badge-red' : 'badge-green') + '">' + escapeHtml(verdict) + '</span></td>'
+                + '</tr>';
+        }).join('');
+        tableHtml = '<table class="audit-mini-table">'
+            + '<thead><tr><th>Time</th><th>Event</th><th>Who</th><th>Verdict</th></tr></thead>'
+            + '<tbody>' + auditRows + '</tbody>'
+            + '</table>';
+    } else {
+        tableHtml = '<p class="txt-note">No recent audit events in buffer.</p>';
     }
 
-    // License
-    document.getElementById('stat-license').textContent = 'Community';
+    bodyEl.innerHTML = statsHtml + tableHtml;
+}
+
+function dashRefresh() {
+    loadDashboard();
 }
 
 // Agents
@@ -632,7 +1046,18 @@ async function loadAgents() {
         for (var i = 0; i < agents.length; i++) {
             var a = agents[i];
             var statusBadge = a.status === 'active' ? 'badge-green' : 'badge-red';
-            var actions = '<button data-action="rotateAgentToken" data-agent-id="' + escapeHtml(a.agent_id) + '" data-agent-name="' + escapeHtml(a.name) + '" class="btn-tbl btn-tbl--blue">Rotate Token</button>';
+            // R6: Edit button — carries the editable agent fields (groups/caller-groups
+            // are arrays; join with commas for the text inputs).
+            var aGroups = (a.groups || []).join(',');
+            var aCaller = (a.allowed_caller_groups || []).join(',');
+            var actions = '<button data-action="editAgent"'
+                + ' data-agent-id="' + escapeHtml(a.agent_id) + '"'
+                + ' data-agent-name="' + escapeHtml(a.name) + '"'
+                + ' data-agent-url="' + escapeHtml(a.upstream_url || '') + '"'
+                + ' data-agent-groups="' + escapeHtml(aGroups) + '"'
+                + ' data-agent-caller-groups="' + escapeHtml(aCaller) + '"'
+                + ' class="btn-tbl btn-tbl--blue">Edit</button>';
+            actions += ' <button data-action="rotateAgentToken" data-agent-id="' + escapeHtml(a.agent_id) + '" data-agent-name="' + escapeHtml(a.name) + '" class="btn-tbl btn-tbl--blue btn-tbl--ml">Rotate Token</button>';
             if (a.status === 'active') {
                 actions += ' <button data-action="deactivateAgent" data-agent-id="' + escapeHtml(a.agent_id) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Deactivate</button>';
             }
@@ -703,6 +1128,50 @@ async function deactivateAgent(agentId) {
     else if (resp) { alert('Deactivation failed: ' + resp.status); }
 }
 
+// ── R6: edit an agent (name / url / groups / caller-groups) via PUT ─────────
+function editAgent(agentId, name, url, groups, callerGroups) {
+    document.getElementById('edit-agent-id').value = agentId;
+    document.getElementById('edit-agent-name').value = name || '';
+    document.getElementById('edit-agent-url').value = url || '';
+    document.getElementById('edit-agent-groups').value = groups || '';
+    document.getElementById('edit-agent-caller-groups').value = callerGroups || '';
+    document.getElementById('edit-agent-result').textContent = '';
+    document.getElementById('edit-agent-form').classList.add('is-open');
+}
+
+function cancelEditAgent() {
+    document.getElementById('edit-agent-form').classList.remove('is-open');
+}
+
+async function saveEditAgent() {
+    var agentId = document.getElementById('edit-agent-id').value;
+    var name = document.getElementById('edit-agent-name').value.trim();
+    var url = document.getElementById('edit-agent-url').value.trim();
+    var groups = document.getElementById('edit-agent-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var callerGroups = document.getElementById('edit-agent-caller-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var result = document.getElementById('edit-agent-result');
+    // Only send changed/non-empty fields — AgentUpdateRequest fields are all optional.
+    var body = {};
+    if (name) body.name = name;
+    if (url) body.upstream_url = url;
+    body.groups = groups;
+    body.allowed_caller_groups = callerGroups;
+    var resp = await apiMutate('/admin/agents/' + encodeURIComponent(agentId), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    if (resp.ok) {
+        result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('edit-agent-form').classList.remove('is-open');
+        loadAgents();
+    } else {
+        var err = await resp.json().catch(function() { return {}; });
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
+    }
+}
+
 // Accounts
 async function loadAccounts() {
     // Admin accounts
@@ -722,11 +1191,13 @@ async function loadAccounts() {
                 ? '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="enable" class="btn-tbl btn-tbl--green">Enable</button>'
                 : '<button data-action="toggleAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-toggle-action="disable" class="btn-tbl btn-tbl--amber">Disable</button>';
             var deleteBtn = '<button data-action="deleteAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Delete</button>';
-            html += '<tr><td><strong>' + escapeHtml(acc.username) + '</strong></td><td><span class="badge ' + statusBadge + '">' + statusText + '</span></td><td><span class="badge ' + pwBadge + '">' + pwText + '</span></td><td><span class="badge ' + totpBadge + '">' + totpText + '</span></td><td>' + toggleBtn + deleteBtn + '</td></tr>';
+            // R5: Edit button — carries username/email/status for the inline edit form.
+            var editBtn = '<button data-action="editAccount" data-account-type="admin" data-username="' + escapeHtml(acc.username) + '" data-email="' + escapeHtml(acc.email || '') + '" data-disabled="' + (acc.disabled ? '1' : '0') + '" class="btn-tbl btn-tbl--blue btn-tbl--ml">Edit</button>';
+            html += '<tr><td><strong>' + escapeHtml(acc.username) + '</strong></td><td class="td-xs">' + escapeHtml(acc.email || '—') + '</td><td><span class="badge ' + statusBadge + '">' + statusText + '</span></td><td><span class="badge ' + pwBadge + '">' + pwText + '</span></td><td><span class="badge ' + totpBadge + '">' + totpText + '</span></td><td>' + editBtn + toggleBtn + deleteBtn + '</td></tr>';
         }
         tbody.innerHTML = html;
     } else {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">No admin accounts found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No admin accounts found</td></tr>';
     }
 
     // User accounts
@@ -746,11 +1217,13 @@ async function loadAccounts() {
                 ? '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="enable" class="btn-tbl btn-tbl--green">Enable</button>'
                 : '<button data-action="toggleAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-toggle-action="disable" class="btn-tbl btn-tbl--amber">Disable</button>';
             var deleteBtn = '<button data-action="deleteAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" class="btn-tbl btn-tbl--red btn-tbl--ml">Delete</button>';
-            html += '<tr><td><strong>' + escapeHtml(u.username) + '</strong></td><td><span class="badge ' + sb + '">' + st + '</span></td><td><span class="badge ' + pb + '">' + pt + '</span></td><td><span class="badge ' + tb + '">' + tt + '</span></td><td>' + toggleBtn + deleteBtn + '</td></tr>';
+            // R5: Edit button — carries username/email/status for the inline edit form.
+            var editBtn = '<button data-action="editAccount" data-account-type="user" data-username="' + escapeHtml(u.username) + '" data-email="' + escapeHtml(u.email || '') + '" data-disabled="' + (u.disabled ? '1' : '0') + '" class="btn-tbl btn-tbl--blue btn-tbl--ml">Edit</button>';
+            html += '<tr><td><strong>' + escapeHtml(u.username) + '</strong></td><td class="td-xs">' + escapeHtml(u.email || '—') + '</td><td><span class="badge ' + sb + '">' + st + '</span></td><td><span class="badge ' + pb + '">' + pt + '</span></td><td><span class="badge ' + tb + '">' + tt + '</span></td><td>' + editBtn + toggleBtn + deleteBtn + '</td></tr>';
         }
         utbody.innerHTML = html;
     } else {
-        utbody.innerHTML = '<tr><td colspan="5" class="empty">No user accounts — click + Add User to create one</td></tr>';
+        utbody.innerHTML = '<tr><td colspan="6" class="empty">No user accounts — click + Add User to create one</td></tr>';
     }
 }
 
@@ -850,8 +1323,69 @@ async function deleteAccount(type, username) {
     }
 }
 
+// ── R5: edit an account (email + status) via the inline edit form ───────────
+function editAccount(type, username, email, disabled) {
+    var pre = (type === 'admin') ? 'edit-admin-' : 'edit-user-';
+    document.getElementById(pre + 'username').value = username;
+    document.getElementById(pre + 'email').value = email || '';
+    document.getElementById(pre + 'status').value = (disabled === '1') ? 'disabled' : 'active';
+    document.getElementById(pre + 'result').textContent = '';
+    document.getElementById((type === 'admin' ? 'edit-admin-form' : 'edit-user-form')).classList.add('is-open');
+}
+
+function cancelEditAccount(type) {
+    document.getElementById((type === 'admin' ? 'edit-admin-form' : 'edit-user-form')).classList.remove('is-open');
+}
+
+async function saveEditAccount(type) {
+    var pre = (type === 'admin') ? 'edit-admin-' : 'edit-user-';
+    var username = document.getElementById(pre + 'username').value;
+    var email = document.getElementById(pre + 'email').value.trim();
+    var disabled = document.getElementById(pre + 'status').value === 'disabled';
+    var result = document.getElementById(pre + 'result');
+    var path = (type === 'admin') ? '/admin/accounts/' : '/admin/users/';
+    var body = { disabled: disabled };
+    if (email) body.email = email;
+    var resp = await apiMutate(path + encodeURIComponent(username), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    if (resp.ok) {
+        result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById((type === 'admin' ? 'edit-admin-form' : 'edit-user-form')).classList.remove('is-open');
+        loadAccounts();
+    } else {
+        var err = await resp.json().catch(function() { return {}; });
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
+    }
+}
+
+// B3: populate the group and individual budget target dropdowns from the
+// allocation-targets endpoint (same source as model allocations R4).
+async function loadBudgetTargets() {
+    // Group dropdown: non-admin RBAC groups
+    var gd = await api('/admin/models/allocation-targets?target_type=group');
+    var gItems = (gd && gd.targets) ? gd.targets : [];
+    var gPlaceholder = gItems.length
+        ? { value: '', label: 'Select a group…' }
+        : { value: '', label: 'No groups available' };
+    fillSelect('group-id', gItems, [gPlaceholder]);
+
+    // Individual dropdown: non-admin users
+    var ud = await api('/admin/models/allocation-targets?target_type=user');
+    var uItems = (ud && ud.targets) ? ud.targets : [];
+    var uPlaceholder = uItems.length
+        ? { value: '', label: 'Select a user…' }
+        : { value: '', label: 'No users available' };
+    fillSelect('ind-id', uItems, [uPlaceholder]);
+}
+
 // Budgets
 async function loadBudgets() {
+    // Refresh target dropdowns alongside the budget data.
+    loadBudgetTargets();
     var caps = await api('/admin/budget/org-caps');
     var tbody = document.getElementById('orgcaps-tbody');
     if (caps && caps.org_caps && caps.org_caps.length > 0) {
@@ -918,7 +1452,7 @@ async function addOrgCap() {
 async function addGroupBudget() {
     var result = document.getElementById('group-result');
     var groupId = document.getElementById('group-id').value.trim();
-    if (!groupId) { result.textContent = 'Group ID is required.'; return; }
+    if (!groupId) { result.textContent = 'Select a group.'; return; }
     var resp = await fetch('/admin/budget/groups', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -936,7 +1470,7 @@ async function addGroupBudget() {
 async function addIndBudget() {
     var result = document.getElementById('ind-result');
     var indId = document.getElementById('ind-id').value.trim();
-    if (!indId) { result.textContent = 'Identity ID is required.'; return; }
+    if (!indId) { result.textContent = 'Select a user.'; return; }
     var resp = await fetch('/admin/budget/individuals', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -969,8 +1503,24 @@ async function loadModels() {
         tbody.innerHTML = '<tr><td colspan="3" class="empty">No models available — check Ollama connection</td></tr>';
     }
 
+    // R3: populate the alias "Model" dropdown from the pulled-models list so an
+    // alias can never map to a non-existent model.
+    var modelOpts = (data && data.models ? data.models : []).map(function(m) {
+        return { value: m.name, label: m.name };
+    });
+    if (modelOpts.length === 0) {
+        fillSelect('alias-model', [], [{ value: '', label: 'No models pulled — pull one first' }]);
+    } else {
+        fillSelect('alias-model', modelOpts, [{ value: '', label: 'Select a model…' }]);
+    }
+
     // Aliases from API
     var aliases = await api('/admin/models');
+    // R4(a): populate the allocation "Model Alias" dropdown from all aliases.
+    var aliasOpts = (aliases && aliases.aliases ? aliases.aliases : []).map(function(a) {
+        return { value: a.alias, label: a.alias };
+    });
+    fillSelect('alloc-alias', aliasOpts, [{ value: '', label: aliasOpts.length ? 'Select an alias…' : 'No aliases yet' }]);
     var atbody = document.getElementById('aliases-tbody');
     if (aliases && aliases.aliases && aliases.aliases.length > 0) {
         var html = '';
@@ -997,6 +1547,23 @@ async function loadModels() {
     } else {
         altbody.innerHTML = '<tr><td colspan="4" class="empty">No allocations — models available to all by default</td></tr>';
     }
+
+    // R4(b): populate the context-dependent Target ID dropdown for the current type.
+    await loadAllocTargets();
+}
+
+// R4(b): load the Target ID dropdown for the selected target type.
+//   user  -> non-admin users; org -> registered orgs; group -> non-admin groups.
+async function loadAllocTargets() {
+    var typeSel = document.getElementById('alloc-type');
+    if (!typeSel) return;
+    var tt = typeSel.value;
+    var data = await api('/admin/models/allocation-targets?target_type=' + encodeURIComponent(tt));
+    var targets = (data && data.targets) ? data.targets : [];
+    var placeholder = targets.length
+        ? { value: '', label: 'Select a ' + tt + '…' }
+        : { value: '', label: 'No ' + tt + ' targets available' };
+    fillSelect('alloc-target', targets, [placeholder]);
 }
 
 async function addAlias() {
@@ -1122,8 +1689,85 @@ async function deleteAllocation(id) {
     else { var err = await resp.json().catch(function(){return {};}); alert('Remove failed: ' + errMsg(err, resp.status)); }
 }
 
-// Sensitivity
-async function loadSensitivity() {
+// Sensitivity — R14/R15 (v2.25.5): taxonomy + patterns
+
+// Taxonomy cache used to enrich pattern classification column
+var _taxonomyCache = null;
+
+async function loadTaxonomy() {
+    var data = await api('/admin/sensitivity/taxonomy');
+    var tbody = document.getElementById('taxonomy-tbody');
+    if (!data || !data.taxonomy) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Failed to load taxonomy</td></tr>';
+        return;
+    }
+    _taxonomyCache = {};
+    var levels = data.taxonomy;
+    if (levels.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">No taxonomy configured (using defaults)</td></tr>';
+        return;
+    }
+    var html = '';
+    for (var i = 0; i < levels.length; i++) {
+        var t = levels[i];
+        _taxonomyCache[String(t.level)] = t.label;
+        var cc = escapeHtml(t.colour_class || 'sens-level-1');
+        html += '<tr><td>' + escapeHtml(String(t.level)) + '</td>';
+        html += '<td><span class="' + cc + '">' + escapeHtml(t.label) + '</span></td>';
+        html += '<td><span class="' + cc + '">' + escapeHtml(t.colour_class) + '</span></td>';
+        html += '<td><button data-action="deleteTaxonomyLevel" data-level="' + escapeHtml(String(t.level)) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
+    }
+    tbody.innerHTML = html;
+
+    // Update the Classification dropdown in the Add Pattern form with live taxonomy labels
+    var patClass = document.getElementById('pat-class');
+    if (patClass) {
+        var opts = '';
+        // Sort descending (highest first) for UX
+        var sorted = levels.slice().sort(function(a, b) { return b.level - a.level; });
+        for (var j = 0; j < sorted.length; j++) {
+            var lvl = sorted[j];
+            opts += '<option value="' + escapeHtml(String(lvl.level)) + '">' +
+                    escapeHtml(String(lvl.level)) + ' — ' + escapeHtml(lvl.label) + '</option>';
+        }
+        patClass.innerHTML = opts;
+    }
+}
+
+async function saveTaxonomyLevel() {
+    var result = document.getElementById('taxonomy-result');
+    var level = document.getElementById('tax-level').value.trim();
+    var label = document.getElementById('tax-label').value.trim();
+    var colour = document.getElementById('tax-colour').value;
+    if (!level || !label) { result.textContent = 'Level number and label are required.'; return; }
+    var lvlNum = parseInt(level, 10);
+    if (isNaN(lvlNum) || lvlNum < 1 || lvlNum > 10) { result.textContent = 'Level must be a number 1–10.'; return; }
+    var resp = await apiMutate('/admin/sensitivity/taxonomy/' + encodeURIComponent(lvlNum), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: label, colour_class: colour })
+    });
+    if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    if (resp.ok) {
+        result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('tax-level').value = '';
+        document.getElementById('tax-label').value = '';
+        loadTaxonomy();
+    } else {
+        var err = await resp.json().catch(function(){return {};});
+        result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status));
+    }
+}
+
+async function deleteTaxonomyLevel(level) {
+    if (!confirm('Delete taxonomy level ' + level + '?')) return;
+    var resp = await apiMutate('/admin/sensitivity/taxonomy/' + encodeURIComponent(level), { method: 'DELETE' });
+    if (!resp) return;
+    if (resp.ok) loadTaxonomy();
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
+}
+
+async function initSensitivity() {
     // Pipeline status
     var data = await api('/admin/sensitivity/status');
     if (data) {
@@ -1133,17 +1777,29 @@ async function loadSensitivity() {
         document.getElementById('ollama-status').textContent = data.ollama_available ? 'Active' : 'Unavailable';
         document.getElementById('ollama-status').className = 'badge ' + (data.ollama_available ? 'badge-green' : 'badge-yellow');
     }
+    // Load taxonomy first (populates the pat-class dropdown), then patterns
+    await loadTaxonomy();
+    await loadPatterns();
+}
 
-    // Patterns from API
+// loadSensitivity is now an alias for initSensitivity (backward-compat for showPage call)
+async function loadSensitivity() { await initSensitivity(); }
+
+async function loadPatterns() {
     var patterns = await api('/admin/sensitivity/patterns');
     var tbody = document.getElementById('patterns-tbody');
     if (patterns && patterns.patterns && patterns.patterns.length > 0) {
         var html = '';
-        var classBadge = { 'RESTRICTED': 'badge-red', 'CONFIDENTIAL': 'badge-yellow', 'INTERNAL': 'badge-blue', 'PUBLIC': 'badge-green' };
+        // Level → CSS class map for numeric levels
+        var levelClass = { '5': 'sens-level-5', '4': 'sens-level-4', '3': 'sens-level-3', '2': 'sens-level-2', '1': 'sens-level-1' };
+        // Legacy string fallback
+        var legacyClass = { 'RESTRICTED': 'sens-level-4', 'CONFIDENTIAL': 'sens-level-3', 'INTERNAL': 'sens-level-2', 'PUBLIC': 'sens-level-1' };
         for (var i = 0; i < patterns.patterns.length; i++) {
             var p = patterns.patterns[i];
-            var cb = classBadge[p.classification] || 'badge-blue';
-            html += '<tr><td><span class="badge ' + cb + '">' + escapeHtml(p.classification) + '</span></td><td>' + escapeHtml(p.type) + '</td><td class="td-mono-xxs">' + escapeHtml(p.pattern) + '</td><td>' + escapeHtml(p.description) + '</td><td><button data-action="deletePattern" data-pattern-id="' + escapeHtml(p.id) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
+            var cls = levelClass[p.classification] || legacyClass[p.classification] || 'sens-level-1';
+            // Use classification_label if available (enriched by API), else use taxonomy cache, else raw value
+            var labelText = p.classification_label || (_taxonomyCache && _taxonomyCache[String(p.classification)]) || p.classification;
+            html += '<tr><td><span class="' + cls + '">' + escapeHtml(labelText) + '</span></td><td>' + escapeHtml(p.type) + '</td><td class="td-mono-xxs">' + escapeHtml(p.pattern) + '</td><td>' + escapeHtml(p.description) + '</td><td><button data-action="deletePattern" data-pattern-id="' + escapeHtml(p.id) + '" class="btn-tbl btn-tbl--red">Delete</button></td></tr>';
         }
         tbody.innerHTML = html;
     } else {
@@ -1167,7 +1823,7 @@ async function addPattern() {
         })
     });
     if (!resp) { result.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
-    if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('pat-pattern').value = ''; document.getElementById('pat-desc').value = ''; loadSensitivity(); }
+    if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; document.getElementById('pat-pattern').value = ''; document.getElementById('pat-desc').value = ''; await loadPatterns(); }
     else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(err, resp.status)); }
 }
 
@@ -1175,8 +1831,87 @@ async function deletePattern(id) {
     if (!confirm('Delete this pattern?')) return;
     var resp = await apiMutate('/admin/sensitivity/patterns/' + id, { method: 'DELETE' });
     if (!resp) return;
-    if (resp.ok) loadSensitivity();
+    if (resp.ok) loadPatterns();
     else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + errMsg(err, resp.status)); }
+}
+
+// ── R16: AI-generate detection pattern ──────────────────────────────────────
+// Stores the last generated pattern so "Accept" can pre-fill the add-pattern form.
+var _lastGeneratedPattern = null;
+
+async function generatePattern() {
+    var desc = (document.getElementById('genpattern-desc').value || '').trim();
+    var res = document.getElementById('genpattern-result');
+    var preview = document.getElementById('genpattern-preview');
+    if (!desc || desc.length < 5) {
+        res.innerHTML = '<span class="badge badge-red">Error</span> Describe the data type first (min 5 chars)';
+        return;
+    }
+    res.innerHTML = '<span class="loading">Asking the LLM… (can take ~20–60s)</span>';
+    if (preview) preview.classList.add('is-hidden');
+    var resp = await apiMutate('/admin/sensitivity/generate-pattern', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: desc })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (!resp.ok) {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+        return;
+    }
+    if (d.parse_error) {
+        res.innerHTML = '<span class="badge badge-yellow">Warning</span> LLM response could not be parsed — raw: '
+            + escapeHtml((d.raw_llm_response || '').substring(0, 200));
+        return;
+    }
+    _lastGeneratedPattern = d;
+    res.innerHTML = '<span class="badge badge-green">Generated</span> (model: ' + escapeHtml(d.model || '') + ')';
+    // Show preview
+    if (preview) {
+        var levelClass = { 5: 'sens-level-5', 4: 'sens-level-4', 3: 'sens-level-3', 2: 'sens-level-2', 1: 'sens-level-1' };
+        var lvl = d.suggested_level || 3;
+        var regexEl = document.getElementById('genpattern-regex-val');
+        var levelEl = document.getElementById('genpattern-level-val');
+        var descEl = document.getElementById('genpattern-desc-val');
+        var acceptRes = document.getElementById('genpattern-accept-result');
+        if (regexEl) regexEl.textContent = d.generated_regex || '';
+        if (levelEl) levelEl.innerHTML = '<span class="' + (levelClass[lvl] || 'sens-level-3') + '">' + escapeHtml(String(lvl)) + '</span>';
+        if (descEl) descEl.textContent = d.generated_description || desc;
+        if (acceptRes) acceptRes.innerHTML = '';
+        preview.classList.remove('is-hidden');
+    }
+}
+
+async function acceptGeneratedPattern() {
+    var res = document.getElementById('genpattern-accept-result');
+    if (!_lastGeneratedPattern || !_lastGeneratedPattern.generated_regex) {
+        if (res) res.innerHTML = '<span class="badge badge-red">Error</span> No generated pattern to accept';
+        return;
+    }
+    var p = _lastGeneratedPattern;
+    var resp = await apiMutate('/admin/sensitivity/patterns', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            classification: String(p.suggested_level || 3),
+            type: 'regex',
+            pattern: p.generated_regex,
+            description: p.generated_description || p.description
+        })
+    });
+    if (!resp) { if (res) res.innerHTML = '<span class="badge badge-red">Error</span> Request failed'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok') {
+        if (res) res.innerHTML = '<span class="badge badge-green">Added — pattern id ' + escapeHtml(String(d.pattern && d.pattern.id || '')) + '</span>';
+        _lastGeneratedPattern = null;
+        document.getElementById('genpattern-desc').value = '';
+        document.getElementById('genpattern-result').innerHTML = '';
+        document.getElementById('genpattern-preview').classList.add('is-hidden');
+        await loadPatterns();
+    } else {
+        if (res) res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+    }
 }
 
 // Test classifier
@@ -1197,6 +1932,429 @@ async function testClassify() {
     var badge = data.is_injection ? 'badge-red' : 'badge-green';
     var label = data.is_injection ? 'INJECTION DETECTED' : 'CLEAN';
     result.innerHTML = '<span class="badge ' + badge + '">' + label + '</span> — confidence: ' + ((data.confidence || 0) * 100).toFixed(1) + '%';
+}
+
+// ── R8: Duplicate template → POST /admin/policies/templates/duplicate ────────
+// Called from the table row button (duplicateTemplateRow).
+async function duplicateTemplateRow(id, name) {
+    var newName = prompt('New client policy name (lowercase, start with letter, a-z0-9_):', (name || '').replace(/[^a-z0-9_]/gi, '_').toLowerCase() + '_copy');
+    if (!newName) return;
+    newName = newName.trim().toLowerCase();
+    if (!/^[a-z][a-z0-9_]{1,40}$/.test(newName)) {
+        alert('Invalid name: lowercase letters/digits/underscore, start with a letter (max 41 chars).');
+        return;
+    }
+    var resp = await apiMutate('/admin/policies/templates/duplicate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template_id: id, new_name: newName })
+    });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok') {
+        alert('Duplicated as clients/' + newName + ' (lifecycle: draft). You can now edit and promote it.');
+        loadPolicies();
+        loadLifecycle();
+    } else {
+        alert('Duplicate failed: ' + errMsg(d, resp.status));
+    }
+}
+
+// R8: from the view-panel "Duplicate" button (current viewed policy)
+async function duplicateTemplate() {
+    if (!_viewedPolicyId) return;
+    duplicateTemplateRow(_viewedPolicyId, _viewedPolicyId.split('/').pop());
+}
+
+// R8: open the Rego editor for an existing client policy from the table row.
+async function editClientRego(id, name) {
+    await viewPolicy(id, 'client');
+    // Switch into edit mode for the rego
+    var ta = document.getElementById('policy-view-src');
+    var editCtrl = document.getElementById('policy-editrego-controls');
+    var editName = document.getElementById('policy-editrego-name');
+    if (!ta || !editCtrl) return;
+    ta.readOnly = false;
+    ta.focus();
+    if (editName) editName.textContent = escapeHtml(name || id.split('/').pop());
+    editCtrl.classList.remove('is-hidden');
+}
+
+// R8: PUT /admin/policies/custom/{name}/rego
+async function saveCustomRegoEdit() {
+    var ta = document.getElementById('policy-view-src');
+    var nameEl = document.getElementById('policy-editrego-name');
+    var res = document.getElementById('policy-editrego-result');
+    if (!ta || !nameEl || !res) return;
+    var name = nameEl.textContent.trim();
+    if (!name || !/^[a-z][a-z0-9_]{1,40}$/.test(name)) {
+        res.innerHTML = '<span class="badge badge-red">Error</span> Invalid policy name';
+        return;
+    }
+    res.innerHTML = '<span class="loading">Saving…</span>';
+    var resp = await apiMutate('/admin/policies/custom/' + encodeURIComponent(name) + '/rego', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rego: ta.value, check_only: false })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok') {
+        res.innerHTML = '<span class="badge badge-green">Saved</span> — lifecycle reset to draft';
+        ta.readOnly = true;
+        document.getElementById('policy-editrego-controls').classList.add('is-hidden');
+        loadPolicies();
+        loadLifecycle();
+    } else {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+    }
+}
+
+function cancelRegoEdit() {
+    var ta = document.getElementById('policy-view-src');
+    var editCtrl = document.getElementById('policy-editrego-controls');
+    if (ta) ta.readOnly = true;
+    if (editCtrl) editCtrl.classList.add('is-hidden');
+}
+
+// R9: show the danger-zone for core policy editing
+function editCorePolicy() {
+    var dangerZone = document.getElementById('core-danger-zone');
+    var ta = document.getElementById('policy-view-src');
+    if (!dangerZone || !ta) return;
+    ta.readOnly = false;
+    ta.focus();
+    dangerZone.classList.remove('is-hidden');
+    document.getElementById('core-danger-result').innerHTML = '';
+    document.getElementById('core-danger-reason').value = '';
+}
+
+// R9: PUT /admin/policies/core/{policy_id} with confirm_danger=true + reason
+async function saveCorePolicyEdit() {
+    var ta = document.getElementById('policy-view-src');
+    var reasonEl = document.getElementById('core-danger-reason');
+    var res = document.getElementById('core-danger-result');
+    if (!ta || !reasonEl || !res) return;
+    var reason = (reasonEl.value || '').trim();
+    if (!reason) {
+        res.innerHTML = '<span class="badge badge-red">Error</span> A justification reason is required';
+        return;
+    }
+    var policyId = _viewedPolicyId.replace(/^\//, '');
+    res.innerHTML = '<span class="loading">Saving (step-up required)…</span>';
+    var resp = await apiMutate('/admin/policies/core/' + policyId.split('/').map(encodeURIComponent).join('/'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rego: ta.value, confirm_danger: true, reason: reason })
+    });
+    if (!resp) { res.innerHTML = '<span class="badge badge-red">Error</span> Request failed or was cancelled'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok && d.status === 'ok') {
+        res.innerHTML = '<span class="badge badge-green">Core policy updated</span> — ' + escapeHtml(d.message || '');
+        ta.readOnly = true;
+        document.getElementById('core-danger-zone').classList.add('is-hidden');
+        loadPolicies();
+    } else {
+        res.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+    }
+}
+
+function cancelCorePolicyEdit() {
+    var ta = document.getElementById('policy-view-src');
+    var dangerZone = document.getElementById('core-danger-zone');
+    if (ta) ta.readOnly = true;
+    if (dangerZone) dangerZone.classList.add('is-hidden');
+}
+
+// R10: GET /admin/policies/lifecycle — show status badges + Promote/Archive buttons
+async function loadLifecycle() {
+    var c = document.getElementById('lifecycle-container');
+    if (!c) return;
+    c.innerHTML = '<span class="loading">Loading…</span>';
+    var data = await api('/admin/policies/lifecycle');
+    if (!data || !data.lifecycle) {
+        c.innerHTML = '<p class="txt-note">No client policies tracked yet. Save a policy first.</p>';
+        return;
+    }
+    if (!data.lifecycle.length) {
+        c.innerHTML = '<p class="txt-note">No client policies tracked yet. Save or duplicate a policy first.</p>';
+        return;
+    }
+    var lcBadge = function(s) {
+        var cls = { draft: 'lc-badge-draft', staging: 'lc-badge-staging', production: 'lc-badge-production', archived: 'lc-badge-archived' };
+        return '<span class="' + (cls[s] || 'lc-badge-draft') + '">' + escapeHtml(s || 'draft') + '</span>';
+    };
+    // Disambiguate "Test policies" label per R10: draft/staging are not production
+    var html = '<table><thead><tr><th>Policy</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody>';
+    data.lifecycle.forEach(function(entry) {
+        var status = entry.status || 'draft';
+        // Show promote button unless at production or archived
+        var promoteBtn = (status !== 'production' && status !== 'archived')
+            ? '<button class="btn btn-sm btn-sm-save" data-action="promotePolicy" data-name="' + escapeHtml(entry.name) + '">Promote</button> '
+            : '';
+        var archiveBtn = (status !== 'archived')
+            ? '<button class="btn btn-sm btn-sm-secondary" data-action="archivePolicy" data-name="' + escapeHtml(entry.name) + '">Archive</button>'
+            : '';
+        var updAt = entry.updated_at ? entry.updated_at.substring(0, 16).replace('T', ' ') : '—';
+        html += '<tr>'
+            + '<td class="td-mono">' + escapeHtml(entry.name) + '</td>'
+            + '<td>' + lcBadge(status) + '</td>'
+            + '<td class="td-muted">' + escapeHtml(updAt) + '</td>'
+            + '<td>' + promoteBtn + archiveBtn + '</td>'
+            + '</tr>';
+    });
+    c.innerHTML = html + '</tbody></table>'
+        + '<p class="txt-note txt-mt8">Draft/Staging policies exist in OPA but are not bound. Production = bindable and enforced.</p>';
+}
+
+// R10: POST /admin/policies/lifecycle/{name}/promote
+async function promotePolicy(name) {
+    var resp = await apiMutate('/admin/policies/lifecycle/' + encodeURIComponent(name) + '/promote', { method: 'POST' });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok) {
+        loadLifecycle();
+        loadPolicies();
+    } else {
+        alert('Promote failed: ' + errMsg(d, resp.status));
+    }
+}
+
+// R10: POST /admin/policies/lifecycle/{name}/archive
+async function archivePolicy(name) {
+    if (!confirm('Archive policy "' + name + '"? It will no longer be bindable.')) return;
+    var resp = await apiMutate('/admin/policies/lifecycle/' + encodeURIComponent(name) + '/archive', { method: 'POST' });
+    if (!resp) return;
+    var d = await resp.json().catch(function() { return {}; });
+    if (resp.ok) { loadLifecycle(); loadPolicies(); }
+    else { alert('Archive failed: ' + errMsg(d, resp.status)); }
+}
+
+// R12: POST /admin/policies/simulate
+async function simulatePolicy() {
+    var pidEl = document.getElementById('sim-policy-id');
+    var inputEl = document.getElementById('sim-input-json');
+    var aiEl = document.getElementById('sim-ai-explain');
+    var resEl = document.getElementById('sim-result');
+    if (!pidEl || !inputEl || !resEl) return;
+    var pid = (pidEl.value || '').trim();
+    var inputRaw = (inputEl.value || '').trim();
+    if (!pid) { resEl.className = 'dryrun-panel'; resEl.innerHTML = '<span class="badge badge-red">Error</span> Enter a policy ID'; return; }
+    var inputJson;
+    try { inputJson = inputRaw ? JSON.parse(inputRaw) : {}; }
+    catch (e) { resEl.className = 'dryrun-panel'; resEl.innerHTML = '<span class="badge badge-red">Error</span> Input JSON invalid: ' + escapeHtml(e.message); return; }
+    resEl.className = 'dryrun-panel';
+    resEl.innerHTML = '<span class="loading">Running dry-run… (may take ~10–30s with AI explanation)</span>';
+    var resp = await apiMutate('/admin/policies/simulate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            policy_id: pid,
+            input_scenario: inputJson,
+            ai_explain: aiEl ? aiEl.checked : true
+        })
+    });
+    if (!resp) { resEl.innerHTML = '<span class="badge badge-red">Error</span> Request failed'; return; }
+    var d = await resp.json().catch(function() { return {}; });
+    if (!resp.ok) {
+        resEl.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(errMsg(d, resp.status));
+        return;
+    }
+    var verdict = d.verdict || 'undefined';
+    var cls = verdict === 'allow' ? 'dryrun-result-allow' : (verdict === 'deny' ? 'dryrun-result-deny' : 'dryrun-result-undef');
+    var verdictIcon = verdict === 'allow' ? 'ALLOW' : (verdict === 'deny' ? 'DENY' : 'UNDEFINED');
+    var html = '<div class="' + cls + '">' + escapeHtml(verdictIcon) + '</div>';
+    if (d.deny && d.deny.length) {
+        html += '<div class="dryrun-codes">Deny codes: ' + escapeHtml(d.deny.join(', ')) + '</div>';
+    }
+    if (d.obligations && d.obligations.length) {
+        html += '<div class="dryrun-codes">Obligations: ' + escapeHtml(d.obligations.join(', ')) + '</div>';
+    }
+    if (d.explanation) {
+        html += '<div class="dryrun-codes">' + escapeHtml(d.explanation) + '</div>';
+    }
+    if (d.ai_explanation) {
+        html += '<div class="dryrun-ai"><strong>AI:</strong> ' + escapeHtml(d.ai_explanation) + '</div>';
+    }
+    resEl.innerHTML = html;
+}
+
+// ── R13: RBAC group sources (paths + methods catalogues) ─────────────────────
+var _rbacSourcePaths = [];
+var _rbacSourceMethods = [];
+
+async function loadRbacSources() {
+    var pathsData = await api('/admin/rbac/sources/paths');
+    var methodsData = await api('/admin/rbac/sources/methods');
+    _rbacSourcePaths = (pathsData && pathsData.paths) ? pathsData.paths : [];
+    _rbacSourceMethods = (methodsData && methodsData.methods) ? methodsData.methods : [];
+    // Populate all path-select dropdowns currently in the form
+    _rbacUpdatePathDropdowns();
+    // Populate all method-select dropdowns with descriptions
+    _rbacUpdateMethodDropdowns();
+}
+
+function _rbacUpdatePathDropdowns() {
+    var opts = [{ value: '', label: 'Select a path…' }]
+        .concat(_rbacSourcePaths.map(function(p) {
+            return { value: p.glob, label: '[' + (p.category || '').toUpperCase() + '] ' + p.label + ' — ' + p.glob };
+        }))
+        .concat([{ value: '__custom__', label: 'Custom path (type below)…' }]);
+    document.querySelectorAll('.rbac-res-path-select').forEach(function(sel) {
+        fillSelect(sel.id || null, opts.slice(1), [opts[0]]);
+        // If no id, fill manually
+        if (!sel.id) {
+            sel.replaceChildren();
+            opts.forEach(function(o) {
+                var opt = document.createElement('option');
+                opt.value = o.value || '';
+                opt.textContent = o.label || o.value;
+                sel.appendChild(opt);
+            });
+        }
+    });
+}
+
+function _rbacUpdateMethodDropdowns() {
+    // The method dropdown already has static options; enrich with descriptions
+    // by adding a data-description helper that rbacMethodChanged() can read.
+    _rbacSourceMethods.forEach(function(m) {
+        document.querySelectorAll('.rbac-res-method').forEach(function(sel) {
+            for (var i = 0; i < sel.options.length; i++) {
+                // Match on the option value (the bare method like "GET")
+                if (sel.options[i].value === m.method || sel.options[i].value === m.method + ' — ' + m.label) {
+                    sel.options[i].setAttribute('data-description', m.description || '');
+                    // Also tidy the label to just "<method> — <label>"
+                    sel.options[i].textContent = m.method + ' — ' + m.label;
+                    sel.options[i].value = m.method;
+                }
+            }
+        });
+    });
+}
+
+// R13: show a description for the selected method below the dropdown
+function rbacMethodChanged(selectEl) {
+    var selected = (selectEl ? selectEl.value : '');
+    var helpEl = selectEl ? selectEl.parentElement.querySelector('.rbac-method-help') : null;
+    if (!helpEl) return;
+    var methodDef = _rbacSourceMethods.find(function(m) { return m.method === selected; });
+    helpEl.textContent = methodDef ? methodDef.description : '';
+}
+
+// R13: show a description for the selected path; handle custom path toggle
+function rbacPathSelectChanged(selectEl) {
+    var val = selectEl ? selectEl.value : '';
+    var descEl = selectEl ? selectEl.parentElement.querySelector('.rbac-path-desc') : null;
+    var customInput = selectEl ? selectEl.parentElement.querySelector('.rbac-res-path') : null;
+    if (val === '__custom__') {
+        if (customInput) { customInput.classList.remove('is-hidden'); customInput.focus(); }
+        if (descEl) descEl.textContent = 'Enter any path glob (e.g. /my-tool/**)';
+        return;
+    }
+    if (customInput) customInput.classList.add('is-hidden');
+    var pathDef = _rbacSourcePaths.find(function(p) { return p.glob === val; });
+    if (descEl) descEl.textContent = pathDef ? '[' + (pathDef.risk || '?') + ' risk] ' + (pathDef.description || '') : '';
+}
+
+// ── R23: License entitlements (GET /admin/license/entitlements) ──────────────
+async function loadEntitlements() {
+    var c = document.getElementById('entitlements-container');
+    if (!c) return;
+    c.innerHTML = '<span class="loading">Loading…</span>';
+    var data = await api('/admin/license/entitlements');
+    if (!data || !data.entitlements) {
+        c.innerHTML = '<p class="txt-note">Could not load entitlements.</p>';
+        return;
+    }
+    var html = '<p class="txt-note">Current tier: <strong>' + escapeHtml(data.current_tier_label || data.current_tier || 'Community') + '</strong></p>';
+    html += '<div>';
+    data.entitlements.forEach(function(e) {
+        var badge = e.available
+            ? '<span class="entitlement-available-badge">Available</span>'
+            : '<span class="entitlement-locked-badge">Requires ' + escapeHtml(e.required_tier_label || e.required_tier || '') + '</span>';
+        var upgradeLink = (!e.available && e.upgrade_url)
+            ? '<a href="' + escapeHtml(e.upgrade_url) + '" target="_blank" class="entitlement-upgrade-link">Upgrade to unlock</a>'
+            : '';
+        html += '<div class="entitlement-row">'
+            + '<div class="flex-1"><div class="entitlement-label">' + escapeHtml(e.label) + '</div>'
+            + '<div class="entitlement-desc">' + escapeHtml(e.description || '') + '</div></div>'
+            + '<div class="entitlement-locked">' + badge + upgradeLink + '</div>'
+            + '</div>';
+    });
+    html += '</div>';
+    c.innerHTML = html;
+
+    // R23: Lock the OIDC/SAML config forms if not available
+    _applyIdpEntitlementLocks(data.entitlements);
+}
+
+function _applyIdpEntitlementLocks(entitlements) {
+    var oidcEnt = entitlements.find(function(e) { return e.feature === 'oidc'; });
+    var samlEnt = entitlements.find(function(e) { return e.feature === 'saml'; });
+    function applyLock(badgeId, inputIds, btnId, entitlement) {
+        var badge = document.getElementById(badgeId);
+        if (!entitlement) return;
+        if (!entitlement.available) {
+            var lockMsg = 'Not available — requires ' + (entitlement.required_tier_label || entitlement.required_tier);
+            if (badge) badge.innerHTML = '<span class="entitlement-locked-badge">' + escapeHtml(lockMsg) + '</span>';
+            // Disable the inputs and save button
+            inputIds.forEach(function(id) {
+                var el = document.getElementById(id);
+                if (el) { el.disabled = true; el.placeholder = lockMsg; }
+            });
+            if (btnId) {
+                var btn = document.querySelector('[data-action="saveIdpConfig"][data-idp-type="' + btnId + '"]');
+                if (btn) btn.disabled = true;
+            }
+        } else {
+            if (badge) badge.innerHTML = '<span class="entitlement-available-badge">Available</span>';
+        }
+    }
+    applyLock('oidc-entitlement-badge', ['oidc-issuer', 'oidc-client-id', 'oidc-client-secret'], 'oidc', oidcEnt);
+    applyLock('saml-entitlement-badge', ['saml-metadata', 'saml-entity'], 'saml', samlEnt);
+}
+
+// ── R26: Version check (GET /admin/version) ──────────────────────────────────
+async function loadVersionCheck() {
+    var badge = document.getElementById('version-badge');
+    if (!badge) return;
+    var data = await api('/admin/version');
+    if (!data) return;
+    if (data.check_skipped || !data.update_available) {
+        badge.className = 'version-badge-none';
+        badge.textContent = 'v' + (data.running_version || '');
+        return;
+    }
+    // Update is available — classify it
+    var utype = data.update_type || 'patch';
+    var cls = {
+        patch: 'version-badge-patch',
+        minor: 'version-badge-minor',
+        major: 'version-badge-major',
+        security: 'version-badge-security'
+    };
+    badge.className = cls[utype] || 'version-badge-patch';
+    var label = utype === 'security' ? ' update — SECURITY' : (' ' + utype + ' update');
+    if (data.release_url) {
+        badge.innerHTML = 'v' + escapeHtml(data.running_version || '')
+            + ' → <a href="' + escapeHtml(data.release_url) + '" target="_blank" class="version-badge-link">'
+            + 'v' + escapeHtml(data.latest_version || '') + label + '</a>';
+    } else {
+        badge.textContent = 'v' + (data.running_version || '') + ' → v' + (data.latest_version || '') + label;
+    }
+}
+
+// ── N1: second-admin enforcement banner ──────────────────────────────────────
+async function loadEnforcementBanner() {
+    var data = await api('/admin/accounts/enforcement');
+    var banner = document.getElementById('n1-admin-banner');
+    if (!banner) return;
+    if (data && data.action_required) {
+        banner.classList.add('is-open');
+    } else {
+        banner.classList.remove('is-open');
+    }
 }
 
 // Settings
@@ -1223,8 +2381,7 @@ async function loadSettings() {
     } else {
         container.innerHTML = '<p class="prose-sm"><strong>Tier:</strong> Community Edition — no license required.<br><span class="faint">To use other features please add a license for your preferred tier.</span></p>';
     }
-    // Crypto inventory (ASVS 11.1.3)
-    loadCryptoInventory();
+    // R24: crypto inventory now lives on the PKI / Crypto page, not here.
     // v2.23.3 (#59) — HIBP API key status panel
     if (typeof window.loadHibpStatus === 'function') {
         window.loadHibpStatus();
@@ -1337,13 +2494,28 @@ async function logout() {
 
 // Audit log search
 var auditCursor = '';
+// R19/R20: load the Verdict + Source-type dropdown options from the audit model.
+async function loadAuditFacets() {
+    var data = await api('/admin/audit/facets');
+    if (!data) return;
+    // The first facet entry is the "* (All)" wildcard — use it as the leading option.
+    var verdicts = data.verdicts || [];
+    var sources = data.source_types || [];
+    fillSelect('audit-verdict', verdicts.slice(1), verdicts.slice(0, 1));
+    fillSelect('audit-source-type', sources.slice(1), sources.slice(0, 1));
+}
+
 async function searchAudit(cursor) {
     var params = new URLSearchParams();
     var et = document.getElementById('audit-event-type').value;
+    var verdict = document.getElementById('audit-verdict').value;
+    var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
     var text = document.getElementById('audit-text').value.trim();
     if (et) params.set('event_type', et);
+    if (verdict) params.set('verdict', verdict);
+    if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
     // free_text is a substring match, not a glob — treat a lone '*' as "match all".
@@ -1383,12 +2555,16 @@ async function searchAudit(cursor) {
 async function exportAudit() {
     var params = new URLSearchParams();
     var et = document.getElementById('audit-event-type').value;
+    var verdict = document.getElementById('audit-verdict').value;
+    var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
     if (et) params.set('event_type', et);
+    if (verdict) params.set('verdict', verdict);
+    if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
-    params.set('format', 'csv');
+    params.set('output_format', 'csv');
     window.open('/admin/audit/export?' + params.toString(), '_blank');
 }
 
@@ -1444,11 +2620,6 @@ async function removeAllowedIp(ip) {
 }
 
 // Dismiss helpers
-function dismissOnboarding() {
-    document.getElementById('onboarding-checklist').classList.remove('is-open');
-    localStorage.setItem('ysg_onboarding_dismissed', '1');
-}
-
 function dismissAgentToken() {
     document.getElementById('agent-token-panel').classList.remove('is-open');
 }
@@ -1463,36 +2634,6 @@ function extendSession() {
     sessionWarned = false;
     sessionStart = Date.now();
 }
-
-// First-run onboarding checklist
-async function checkOnboarding() {
-    if (localStorage.getItem('ysg_onboarding_dismissed') === '1') return;
-    var show = false;
-    // Check password change status
-    var status = await api('/auth/status');
-    // Check agents
-    var agents = await api('/admin/agents');
-    var agentCount = (agents && agents.agents) ? agents.agents.length : 0;
-    // Check alerts
-    var alerts = await api('/admin/alerts/config');
-    var hasWebhook = alerts && alerts.config && (alerts.config.slack_webhook_url || alerts.config.teams_webhook_url);
-
-    var obEl = document.getElementById('onboarding-checklist');
-    var pwCb = document.querySelector('#ob-password input');
-    var agCb = document.querySelector('#ob-agent input');
-    var alCb = document.querySelector('#ob-alerts input');
-
-    if (pwCb) pwCb.checked = true; // They logged in, so password was changed
-    if (agCb) agCb.checked = agentCount > 0;
-    if (alCb) alCb.checked = !!hasWebhook;
-
-    // Show if any item unchecked
-    if (!agCb.checked || !alCb.checked) {
-        show = true;
-    }
-    if (show) obEl.classList.add('is-open');
-}
-checkOnboarding();
 
 // Session timeout warning — check every 60s, warn at 10 min remaining
 var sessionStart = Date.now();
@@ -1535,6 +2676,24 @@ setInterval(function() {
 // -------------------------------------------------------
 // Event delegation — replaces all inline onclick handlers
 // -------------------------------------------------------
+// R4(b): when the allocation Target Type changes, reload the Target ID dropdown.
+document.addEventListener('change', function(e) {
+    if (e.target && e.target.id === 'alloc-type') {
+        loadAllocTargets();
+    }
+    // R11(b): when the binding subject kind changes, reload the subject dropdown.
+    if (e.target && e.target.id === 'bind-scope-kind') {
+        loadBindSubjects();
+    }
+    // R13: RBAC source catalogues — select change (change event, not click)
+    if (e.target && e.target.classList.contains('rbac-res-method')) {
+        rbacMethodChanged(e.target);
+    }
+    if (e.target && e.target.classList.contains('rbac-res-path-select')) {
+        rbacPathSelectChanged(e.target);
+    }
+});
+
 document.addEventListener('click', function(e) {
     var target = e.target;
     // Walk up to find closest element with data-action
@@ -1552,10 +2711,12 @@ document.addEventListener('click', function(e) {
             logout();
             break;
 
-        // Dismiss panels
-        case 'dismissOnboarding':
-            dismissOnboarding();
+        // R25 — Dashboard refresh button
+        case 'dashRefresh':
+            dashRefresh();
             break;
+
+        // Dismiss panels
         case 'dismissAgentToken':
             dismissAgentToken();
             break;
@@ -1581,6 +2742,21 @@ document.addEventListener('click', function(e) {
         case 'deactivateAgent':
             deactivateAgent(actionEl.getAttribute('data-agent-id'));
             break;
+        case 'editAgent':
+            editAgent(
+                actionEl.getAttribute('data-agent-id'),
+                actionEl.getAttribute('data-agent-name'),
+                actionEl.getAttribute('data-agent-url'),
+                actionEl.getAttribute('data-agent-groups'),
+                actionEl.getAttribute('data-agent-caller-groups')
+            );
+            break;
+        case 'saveEditAgent':
+            saveEditAgent();
+            break;
+        case 'cancelEditAgent':
+            cancelEditAgent();
+            break;
 
         // Account actions
         case 'createAdmin':
@@ -1594,6 +2770,20 @@ document.addEventListener('click', function(e) {
             break;
         case 'deleteAccount':
             deleteAccount(actionEl.getAttribute('data-account-type'), actionEl.getAttribute('data-username'));
+            break;
+        case 'editAccount':
+            editAccount(
+                actionEl.getAttribute('data-account-type'),
+                actionEl.getAttribute('data-username'),
+                actionEl.getAttribute('data-email'),
+                actionEl.getAttribute('data-disabled')
+            );
+            break;
+        case 'saveEditAccount':
+            saveEditAccount(actionEl.getAttribute('data-account-type'));
+            break;
+        case 'cancelEditAccount':
+            cancelEditAccount(actionEl.getAttribute('data-account-type'));
             break;
 
         // Alert actions
@@ -1650,6 +2840,12 @@ document.addEventListener('click', function(e) {
             break;
         case 'testClassify':
             testClassify();
+            break;
+        case 'saveTaxonomyLevel':
+            saveTaxonomyLevel();
+            break;
+        case 'deleteTaxonomyLevel':
+            deleteTaxonomyLevel(actionEl.getAttribute('data-level'));
             break;
 
         // Audit actions
@@ -1789,6 +2985,63 @@ document.addEventListener('click', function(e) {
             break;
         case 'policyClose':
             closePolicyView();
+            break;
+
+        // R8 — template duplicate + client rego editor
+        case 'duplicateTemplate':
+            duplicateTemplate();
+            break;
+        case 'duplicateTemplateRow':
+            duplicateTemplateRow(actionEl.getAttribute('data-id'), actionEl.getAttribute('data-name'));
+            break;
+        case 'editClientRego':
+            editClientRego(actionEl.getAttribute('data-id'), actionEl.getAttribute('data-name'));
+            break;
+        case 'saveCustomRegoEdit':
+            saveCustomRegoEdit();
+            break;
+        case 'cancelRegoEdit':
+            cancelRegoEdit();
+            break;
+
+        // R9 — core policy danger-zone edit
+        case 'editCorePolicy':
+            editCorePolicy();
+            break;
+        case 'saveCorePolicyEdit':
+            saveCorePolicyEdit();
+            break;
+        case 'cancelCorePolicyEdit':
+            cancelCorePolicyEdit();
+            break;
+
+        // R10 — lifecycle promote / archive
+        case 'promotePolicy':
+            promotePolicy(actionEl.getAttribute('data-name'));
+            break;
+        case 'archivePolicy':
+            archivePolicy(actionEl.getAttribute('data-name'));
+            break;
+
+        // R12 — policy dry-run
+        case 'simulatePolicy':
+            simulatePolicy();
+            break;
+
+        // R13 — RBAC source catalogues
+        case 'rbacMethodChanged':
+            rbacMethodChanged(actionEl);
+            break;
+        case 'rbacPathSelectChanged':
+            rbacPathSelectChanged(actionEl);
+            break;
+
+        // R16 — AI-generate sensitivity pattern (already wired; kept for completeness)
+        case 'generatePattern':
+            generatePattern();
+            break;
+        case 'acceptGeneratedPattern':
+            acceptGeneratedPattern();
             break;
     }
 });

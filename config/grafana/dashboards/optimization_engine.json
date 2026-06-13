@@ -1,67 +1,310 @@
 {
   "uid": "yashigani-oe",
-  "title": "Yashigani — Optimization Engine",
-  "tags": ["yashigani", "routing", "optimization"],
+  "title": "Yashigani \u2014 Optimization Engine",
+  "tags": [
+    "yashigani",
+    "routing",
+    "optimization"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "piechart", "title": "Routing Distribution (1h)",
-      "gridPos": {"x":0,"y":0,"w":8,"h":8},
-      "targets": [{"expr":"sum by (rule) (increase(yashigani_routing_decisions_total[1h]))","legendFormat":"{{rule}}"}],
-      "options": {"legend":{"displayMode":"table","placement":"right"}}
+      "id": 10,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Surfaces Optimization Engine routing decisions: local vs cloud split, sensitive data detections (data stays on-prem), OPA safety-net blocks, decision latency, and classification conflicts requiring manual review."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "Sensitive Data Detected (1h)",
-      "gridPos": {"x":8,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_sensitivity_detections_total{level=~\"CONFIDENTIAL|RESTRICTED\"}[1h]))","legendFormat":"Detections"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":10}]}}}
+      "id": 1,
+      "type": "piechart",
+      "title": "Routing Distribution (1h)",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (rule) (increase(yashigani_routing_decisions_total[1h]))",
+          "legendFormat": "{{rule}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right"
+        }
+      }
     },
     {
-      "id": 3, "type": "stat", "title": "OPA Safety Net Blocks (1h)",
-      "gridPos": {"x":12,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_opa_safety_blocks_total[1h]))","legendFormat":"Blocks"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]}}}
+      "id": 2,
+      "type": "stat",
+      "title": "Sensitive Data Detected (1h)",
+      "gridPos": {
+        "x": 8,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_sensitivity_detections_total{level=~\"CONFIDENTIAL|RESTRICTED\"}[1h]))",
+          "legendFormat": "Detections"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 4, "type": "stat", "title": "Avg Decision Time",
-      "gridPos": {"x":16,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"histogram_quantile(0.95, rate(yashigani_oe_decision_duration_seconds_bucket[5m]))","legendFormat":"P95"}],
-      "fieldConfig": {"defaults":{"unit":"s","thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":0.001},{"color":"red","value":0.01}]}}}
+      "id": 3,
+      "type": "stat",
+      "title": "OPA Safety Net Blocks (1h)",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_opa_safety_blocks_total[1h]))",
+          "legendFormat": "Blocks"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 5, "type": "stat", "title": "Classification Conflicts (1h)",
-      "gridPos": {"x":20,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_sensitivity_conflicts_total[1h]))","legendFormat":"Conflicts"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":1},{"color":"red","value":5}]}}}
+      "id": 4,
+      "type": "stat",
+      "title": "Avg Decision Time",
+      "gridPos": {
+        "x": 16,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(yashigani_oe_decision_duration_seconds_bucket[5m]))",
+          "legendFormat": "P95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.001
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 6, "type": "timeseries", "title": "Routing Decisions by Rule",
-      "gridPos": {"x":0,"y":8,"w":12,"h":8},
-      "targets": [{"expr":"sum by (rule) (rate(yashigani_routing_decisions_total[5m]))","legendFormat":"{{rule}}"}],
-      "options": {"legend":{"displayMode":"table","placement":"bottom"}}
+      "id": 5,
+      "type": "stat",
+      "title": "Classification Conflicts (1h)",
+      "gridPos": {
+        "x": 20,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_sensitivity_conflicts_total[1h]))",
+          "legendFormat": "Conflicts"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 7, "type": "timeseries", "title": "Sensitivity Detections by Level",
-      "gridPos": {"x":12,"y":8,"w":12,"h":8},
-      "targets": [{"expr":"sum by (level) (rate(yashigani_sensitivity_detections_total[5m]))","legendFormat":"{{level}}"}],
-      "options": {"legend":{"displayMode":"table","placement":"bottom"}}
+      "id": 6,
+      "type": "timeseries",
+      "title": "Routing Decisions by Rule",
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (rule) (rate(yashigani_routing_decisions_total[5m]))",
+          "legendFormat": "{{rule}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
-      "id": 8, "type": "timeseries", "title": "Complexity Score Distribution",
-      "gridPos": {"x":0,"y":16,"w":12,"h":6},
-      "targets": [{"expr":"sum by (level) (rate(yashigani_complexity_scores_total[5m]))","legendFormat":"{{level}}"}]
+      "id": 7,
+      "type": "timeseries",
+      "title": "Sensitivity Detections by Level",
+      "gridPos": {
+        "x": 12,
+        "y": 11,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (level) (rate(yashigani_sensitivity_detections_total[5m]))",
+          "legendFormat": "{{level}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
-      "id": 9, "type": "table", "title": "Recent P1 Routing Events",
-      "gridPos": {"x":12,"y":16,"w":12,"h":6},
-      "targets": [{"expr":"yashigani_routing_p1_events_info","legendFormat":"","format":"table","instant":true}],
-      "options": {"showHeader":true}
+      "id": 8,
+      "type": "timeseries",
+      "title": "Complexity Score Distribution",
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum by (level) (rate(yashigani_complexity_scores_total[5m]))",
+          "legendFormat": "{{level}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Recent P1 Routing Events",
+      "gridPos": {
+        "x": 12,
+        "y": 19,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "yashigani_routing_p1_events_info",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
     }
   ]
 }

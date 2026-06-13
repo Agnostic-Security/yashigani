@@ -150,6 +150,9 @@ spec:
             # Grafana datasource calls now use https://yashigani-prometheus:9090.
             - "--web.config.file=/etc/prometheus/web-config.yml"
             {{- end }}
+            {{- /* B9: fix 302→/graph redirect misrouting under /admin/prometheus/ sub-path. */}}
+            - "--web.external-url=https://{{ .Values.global.tlsDomain }}/admin/prometheus/"
+            - "--web.route-prefix=/"
           ports:
             - name: http
               containerPort: 9090

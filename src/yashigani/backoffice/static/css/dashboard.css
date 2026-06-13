@@ -1,4 +1,4 @@
-/* last-updated: 2026-05-13T00:00:00+01:00 — v2.23.4 CSP-INLINE-STYLE-SPA */
+/* last-updated: 2026-06-13T00:00:00+01:00 — 2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1 */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f1f5f9; }
 nav { background: #0f172a; color: #fff; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
@@ -102,8 +102,6 @@ tr:hover { background: #f8fafc; }
 .btn-xs-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
 /* crypto export button */
 .btn-export { margin-top: 12px; padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-/* dismiss (outline-blue) */
-.btn-dismiss-outline { margin-top: 10px; padding: 4px 12px; background: transparent; border: 1px solid #93c5fd; border-radius: 4px; cursor: pointer; font-size: 0.8rem; color: #3b82f6; }
 /* dismiss secondary */
 .btn-dismiss { margin-top: 8px; padding: 6px 16px; background: #64748b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* pki close button */
@@ -122,12 +120,6 @@ tr:hover { background: #f8fafc; }
 .btn-stepup-cancel { flex: 1; padding: 10px; background: #f1f5f9; color: #334155; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
 /* allowlist add (green) */
 .btn-allowlist-add { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
-
-/* ── Onboarding checklist ───────────────────────────────────── */
-.onboarding { display: none; margin-bottom: 20px; padding: 16px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; }
-.onboarding-title { margin: 0 0 12px; font-size: 1rem; color: #1e40af; }
-.onboarding-items { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; }
-.onboarding-lbl { color: #64748b; cursor: pointer; }
 
 /* ── Credentials / token panels ────────────────────────────── */
 /* hidden until shown once */
@@ -284,7 +276,6 @@ tr:hover { background: #f8fafc; }
    already declares `display:none`; the `is-open` modifier reveals it. */
 .form-panel.is-open { display: block; }
 .once-panel.is-open { display: block; }
-.onboarding.is-open { display: block; }
 .stepup-overlay.is-open { display: flex; }
 .backup-verify-result.is-open { display: block; }
 .pki-rotate-result.is-open { display: block; }
@@ -349,3 +340,193 @@ tr:hover { background: #f8fafc; }
 
 /* Policy table cells */
 .td-pkg { font-size: 0.8rem; color: #475569; }
+
+/* ── 2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1 ──────────────
+   All new CSS classes added here (append-only). NO inline style= anywhere.  */
+
+/* N1 — second-admin required banner */
+.n1-banner { background: #fff7ed; border: 1px solid #fdba74; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; display: none; }
+.n1-banner.is-open { display: flex; align-items: center; gap: 12px; }
+.n1-banner-text { flex: 1; font-size: 0.85rem; color: #92400e; }
+.n1-banner-btn { padding: 6px 14px; background: #ea580c; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; white-space: nowrap; }
+
+/* R26 — version badge in nav */
+.version-badge-none { font-size: 0.8rem; color: #64748b; }
+.version-badge-patch { font-size: 0.8rem; color: #1d4ed8; font-weight: 600; }
+.version-badge-minor { font-size: 0.8rem; color: #7c3aed; font-weight: 600; }
+.version-badge-major { font-size: 0.8rem; color: #d97706; font-weight: 600; }
+.version-badge-security { font-size: 0.8rem; color: #dc2626; font-weight: 700; animation: version-pulse 1.5s ease-in-out infinite; }
+@keyframes version-pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+.version-badge-link { color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }
+
+/* R9 — danger-zone panel */
+.danger-zone { border: 1px solid #fca5a5; border-radius: 6px; padding: 12px; background: #fef2f2; margin-top: 8px; }
+.danger-zone-title { font-size: 0.85rem; font-weight: 600; color: #b91c1c; margin-bottom: 6px; }
+.danger-zone-desc { font-size: 0.8rem; color: #7f1d1d; margin-bottom: 10px; }
+.danger-confirm-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.danger-reason-input { padding: 6px 8px; border: 1px solid #fca5a5; border-radius: 4px; font-size: 0.85rem; flex: 1; min-width: 200px; }
+.btn-sm-danger-confirm { padding: 6px 16px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+
+/* R10 — lifecycle status badges */
+.lc-badge-draft { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #f1f5f9; color: #475569; }
+.lc-badge-staging { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #fef3c7; color: #92400e; }
+.lc-badge-production { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #dcfce7; color: #166534; }
+.lc-badge-archived { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #f8fafc; color: #94a3b8; }
+
+/* R12 — policy dry-run panel */
+.dryrun-panel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px 16px; margin-top: 12px; }
+.dryrun-result-allow { font-size: 0.85rem; color: #166534; font-weight: 600; margin-bottom: 4px; }
+.dryrun-result-deny { font-size: 0.85rem; color: #dc2626; font-weight: 600; margin-bottom: 4px; }
+.dryrun-result-undef { font-size: 0.85rem; color: #92400e; font-weight: 600; margin-bottom: 4px; }
+.dryrun-codes { font-size: 0.8rem; color: #475569; font-family: monospace; }
+.dryrun-ai { font-size: 0.82rem; color: #334155; margin-top: 8px; font-style: italic; }
+.sim-textarea { width: 100%; min-height: 80px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.82rem; font-family: ui-monospace, monospace; resize: vertical; }
+
+/* R16 — AI-generate pattern panel */
+.genpattern-result { margin-top: 10px; font-size: 0.85rem; }
+.genpattern-preview { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 10px 12px; margin-top: 8px; font-size: 0.82rem; }
+.genpattern-regex { font-family: monospace; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; user-select: all; }
+.genpattern-ai { font-size: 0.8rem; color: #475569; margin-top: 6px; font-style: italic; }
+.btn-genpattern-accept { padding: 6px 14px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; margin-top: 6px; }
+
+/* R13 — RBAC method/path dropdowns with descriptions */
+.rbac-method-help { font-size: 0.75rem; color: #64748b; margin-top: 2px; max-width: 320px; }
+.rbac-path-group { font-size: 0.72rem; color: #94a3b8; }
+.rbac-path-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; max-width: 320px; }
+
+/* R23 — entitlement rows (locked features) */
+.entitlement-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+.entitlement-row:last-child { border-bottom: none; }
+.entitlement-label { font-size: 0.85rem; font-weight: 500; flex: 1; }
+.entitlement-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; }
+.entitlement-locked { font-size: 0.8rem; color: #64748b; text-align: right; }
+.entitlement-locked-badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+.entitlement-upgrade-link { font-size: 0.75rem; color: #2563eb; text-decoration: none; margin-top: 2px; display: block; }
+.entitlement-available-badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; background: #dcfce7; color: #166534; }
+
+/* R24 — PKI / Cryptography merged section note */
+.pki-crypto-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; background: #f8fafc; padding: 8px 12px; border-radius: 4px; }
+
+/* ── Sensitivity taxonomy level badge colours (R14/R15 v2.25.5) ─────────── */
+/* CSP-safe: pure CSS classes, no inline style= attributes.                  */
+/* Palette: red (highest) → orange → yellow → green → blue (lowest).        */
+.sens-level-5 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #fef2f2; color: #dc2626; }  /* red */
+.sens-level-4 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #fff7ed; color: #ea580c; }  /* orange */
+.sens-level-3 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #fefce8; color: #a16207; }  /* yellow */
+.sens-level-2 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #dcfce7; color: #166534; }  /* green */
+.sens-level-1 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #dbeafe; color: #1d4ed8; }  /* blue */
+
+/* ── R25 Dashboard redesign — widget layout ──────────────────────────────── */
+/* Strict CSP: classes only, no inline style= attributes.                     */
+
+/* Dashboard rows — fluid two-column grid on wide screens, stacked on mobile */
+.dash-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 768px) { .dash-row { grid-template-columns: 1fr; } }
+
+/* Widget modifiers */
+.dash-widget { }
+.dash-widget--wide { grid-column: span 1; }
+.dash-widget--full { grid-column: 1 / -1; }
+
+/* Widget header with right-aligned meta/badge */
+.dash-widget-header { display: flex; justify-content: space-between; align-items: center; }
+.dash-header-meta { font-size: 0.75rem; color: #64748b; font-weight: 400; }
+
+/* ── Semaphore circles — R25 health/alert indicators ─────────────────────── */
+/* Palette: 🔴>🟠>🟡>🟢>🔵 as CSS classes                                    */
+.semaphore {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    vertical-align: middle;
+    flex-shrink: 0;
+}
+/* Status colours */
+.semaphore--ok       { background: #22c55e; box-shadow: 0 0 0 2px #dcfce7; }
+.semaphore--degraded { background: #f59e0b; box-shadow: 0 0 0 2px #fef3c7; }
+.semaphore--critical { background: #ef4444; box-shadow: 0 0 0 2px #fee2e2; }
+.semaphore--loading  { background: #cbd5e1; }
+/* Palette labels for alert priority */
+.semaphore--p1 { background: #ef4444; box-shadow: 0 0 0 2px #fee2e2; }
+.semaphore--p2 { background: #f97316; box-shadow: 0 0 0 2px #ffedd5; }
+.semaphore--p3 { background: #eab308; box-shadow: 0 0 0 2px #fef9c3; }
+.semaphore--p4 { background: #22c55e; box-shadow: 0 0 0 2px #dcfce7; }
+.semaphore--p5 { background: #3b82f6; box-shadow: 0 0 0 2px #dbeafe; }
+
+/* ── Service health table ─────────────────────────────────────────────────── */
+.svc-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.svc-table td { padding: 6px 8px; border-bottom: 1px solid #f1f5f9; }
+.svc-table tr:last-child td { border-bottom: none; }
+.svc-name { font-weight: 500; color: #1e293b; }
+.svc-detail { font-size: 0.75rem; color: #64748b; }
+.svc-crit-tag { font-size: 0.7rem; font-weight: 600; padding: 1px 5px; border-radius: 3px; background: #fef2f2; color: #b91c1c; }
+.svc-noncrit-tag { font-size: 0.7rem; color: #94a3b8; }
+.svc-semaphore-cell { width: 22px; text-align: center; }
+
+/* ── Alert priority list ─────────────────────────────────────────────────── */
+.alert-priority-list { list-style: none; padding: 0; margin: 0; }
+.alert-priority-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f1f5f9; font-size: 0.85rem; }
+.alert-priority-item:last-child { border-bottom: none; }
+.alert-priority-label { flex: 1; font-weight: 600; }
+.alert-priority-count { font-size: 0.85rem; font-weight: 700; color: #1e293b; min-width: 24px; text-align: right; }
+.alert-priority-count--zero { color: #94a3b8; font-weight: 400; }
+
+/* ── Budget widget ───────────────────────────────────────────────────────── */
+.budget-gauge-wrap { margin-bottom: 12px; }
+.budget-gauge-label { font-size: 0.75rem; color: #64748b; margin-bottom: 3px; display: flex; justify-content: space-between; }
+.budget-gauge-bar { background: #e2e8f0; border-radius: 4px; height: 10px; width: 100%; overflow: hidden; position: relative; }
+.budget-gauge-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
+.budget-gauge-fill--ok     { background: #22c55e; }
+.budget-gauge-fill--warn   { background: #f59e0b; }
+.budget-gauge-fill--danger { background: #ef4444; }
+/* 85% threshold marker — pure CSS, no inline style */
+.budget-gauge-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: #dc2626; opacity: 0.7; }
+.budget-gauge-marker--85 { left: 85%; }
+
+/* Budget split row: cloud vs local */
+.budget-split { display: flex; gap: 16px; margin-top: 10px; }
+.budget-split-item { flex: 1; text-align: center; }
+.budget-split-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+.budget-split-value { font-size: 1.1rem; font-weight: 700; color: #1e293b; }
+
+/* Budget summary counts */
+.budget-counts { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.budget-count-item { background: #f8fafc; border-radius: 6px; padding: 6px 12px; text-align: center; min-width: 64px; }
+.budget-count-label { font-size: 0.7rem; color: #64748b; }
+.budget-count-value { font-size: 1rem; font-weight: 700; color: #1e293b; }
+
+/* ── Security widget ─────────────────────────────────────────────────────── */
+.sec-row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #f1f5f9; font-size: 0.83rem; }
+.sec-row:last-child { border-bottom: none; }
+.sec-label { color: #475569; }
+.sec-value { font-weight: 700; color: #1e293b; }
+
+/* Sensitivity mini-bars (traffic mix) */
+.sensbar-wrap { margin-top: 10px; }
+.sensbar-label { font-size: 0.72rem; color: #64748b; margin-bottom: 4px; }
+.sensbar-track { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #e2e8f0; }
+.sensbar-seg-5 { background: #ef4444; }
+.sensbar-seg-4 { background: #f97316; }
+.sensbar-seg-3 { background: #eab308; }
+.sensbar-seg-2 { background: #22c55e; }
+.sensbar-seg-1 { background: #3b82f6; }
+.sensbar-legend { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.sensbar-key { font-size: 0.7rem; color: #475569; display: flex; align-items: center; gap: 3px; }
+.sensbar-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.sensbar-dot-5 { background: #ef4444; }
+.sensbar-dot-4 { background: #f97316; }
+.sensbar-dot-3 { background: #eab308; }
+.sensbar-dot-2 { background: #22c55e; }
+.sensbar-dot-1 { background: #3b82f6; }
+
+/* ── Traffic widget ──────────────────────────────────────────────────────── */
+.traffic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.traffic-stat { text-align: center; }
+.traffic-stat-value { font-size: 1.4rem; font-weight: 700; color: #1e293b; }
+.traffic-stat-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* Recent audit mini-table */
+.audit-mini-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+.audit-mini-table th { text-align: left; padding: 4px 8px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+.audit-mini-table td { padding: 4px 8px; border-bottom: 1px solid #f1f5f9; color: #334155; }
+.audit-mini-table tr:last-child td { border-bottom: none; }

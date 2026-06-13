@@ -8,6 +8,35 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [v2.25.5] — 2026-06-13
+
+Theme: **Auth/ingress rebuild + the full admin-UX refinement layer** — a single authenticated portal with role-based routing, and a top-to-bottom pass over the back-office admin experience.
+
+### Added
+
+- **feat(auth): single auth portal with role-based routing** — one login portal routes admins to `/admin` and end users to `/app/webui`, with working end-user logout. Deny-by-default is preserved throughout.
+- **feat(backoffice): admin UX refinement layer (R1–R26)** — full working CRUD across the back office: agent edit, admin/user account edit with an email column, model-alias dropdowns of pulled models, allocation and budget dropdowns with persistence, and client-policy binding dropdowns with an explicit "All". Policy management gains template duplicate / edit / save-as, a server-enforced danger-confirm on core-policy edits, a draft→staging→production lifecycle with promote/archive, and an **AI policy dry-run** (admin input → block/allow + rationale). New: **generate detection patterns from plain English** using the install-default model; RBAC path/method dropdowns with plain-language help; budget alerts at a default-on ≥85% threshold plus full custom-alert CRUD; audit verdict / entity / source-type filters; description panels across all monitoring dashboards; license-gating of enterprise authentication (OIDC/SAML surface a "requires [tier]" notice); Cryptography consolidated under PKI; an opt-in "new version available" check that distinguishes major vs. security updates.
+- **feat(backoffice): dashboard redesign (R25)** — criticality-weighted per-service health semaphore, a five-level alert semaphore, a budget gauge (cloud/local with an 85% marker), and security + traffic widgets, on a unified palette.
+- **feat(sensitivity): numeric canonical taxonomy** — sensitivity levels are canonical numbers with a per-tenant label/colour mapping; the OPA shim accepts both the numeric levels and the legacy string levels; `OFFICIAL-SENSITIVE` is built in.
+- **feat(admin): second-admin enforcement (N1)** — a minimum of two admins is enforced; deleting or disabling the last remaining admin is blocked (`409`), with an `/admin/accounts/enforcement` status endpoint and a back-office banner.
+- **feat(api): OpenAPI / API map (N2)** — self-hosted, auth-gated API documentation: Swagger UI at `/admin/api-docs`, ReDoc at `/admin/api-redoc`, and `/admin/openapi.json`, plus gateway `/docs` and `/redoc`. Assets are served locally and render under the strict CSP.
+- **feat(identity): durable identity store** — a Postgres-backed durable mirror of the identity registry with a startup reconcile, so identities are re-hydrated if the Redis volume is lost.
+- **feat(backup): signed + encrypted backup** — install-time and on-demand backups are signed and encrypted.
+
+### Fixed
+
+- **fix(install): preserve deployed profiles on `--upgrade`** — an `--upgrade` that does not re-pass `--wazuh` / `--with-openwebui` / `--agent-bundles` no longer resets the enabled-services set to empty (which made deployed services show as "Not Deployed"); the profile list is now seeded from the existing `.env` value and merged idempotently with any newly selected profiles.
+- **fix(install): substitute the OpenClaw internal bearer at deploy time** — the OpenClaw runtime config is generated at install time with the real per-install bearer substituted in, so OpenClaw authenticates to the gateway out of the box (no manual step on upgrade).
+- **fix(observability): metrics + log/metric routing** — ~40 metrics instrumented across services, with Loki and Prometheus wiring corrected.
+- **fix(sensitivity): clean-result over-block regression** — a clean result is no longer over-classified; alias resolution corrected.
+- **fix(deploy): assorted upgrade/demo fixes** — backup admin DSN, list-content schema, a durable-store array column type, and the MCP OpenTelemetry span processor.
+
+### Known issues
+
+- The raw Prometheus expression-browser UI has a rendering quirk under the `/admin/prometheus` subpath; data and the API are unaffected, and **Grafana is the supported dashboard surface**.
+
+---
+
 ## [v2.25.4] — 2026-06-12
 
 Theme: **Gateway-mediated agent/tool orchestration + model-allocation RBAC actually enforced**.

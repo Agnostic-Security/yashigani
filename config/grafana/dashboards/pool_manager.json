@@ -1,77 +1,353 @@
 {
   "uid": "yashigani-pool",
-  "title": "Yashigani — Pool Manager",
-  "tags": ["yashigani", "containers", "pool"],
+  "title": "Yashigani \u2014 Pool Manager",
+  "tags": [
+    "yashigani",
+    "containers",
+    "pool"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "15s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "Active Containers",
-      "gridPos": {"x":0,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"yashigani_pool_containers_active","legendFormat":"Active"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":50},{"color":"red","value":100}]}}}
+      "id": 11,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Tracks isolated container pool lifecycle \u2014 active containers, creation/replacement/teardown rates, tier-limit rejections, and wait times. High replacement rate may indicate instability; rejections indicate capacity pressure."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "Containers Created (1h)",
-      "gridPos": {"x":4,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_pool_containers_created_total[1h]))","legendFormat":"Created"}],
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"blue","value":null}]}}}
-    },
-    {
-      "id": 3, "type": "stat", "title": "Replacements (1h)",
-      "gridPos": {"x":8,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_pool_containers_replaced_total[1h]))","legendFormat":"Replaced"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":3},{"color":"red","value":10}]}}}
-    },
-    {
-      "id": 4, "type": "stat", "title": "Idle Teardowns (1h)",
-      "gridPos": {"x":12,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_pool_containers_idle_teardown_total[1h]))","legendFormat":"Idle"}],
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"blue","value":null}]}}}
-    },
-    {
-      "id": 5, "type": "stat", "title": "Tier Limit Rejections (1h)",
-      "gridPos": {"x":16,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_pool_limit_exceeded_total[1h]))","legendFormat":"Rejected"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]}}}
-    },
-    {
-      "id": 6, "type": "stat", "title": "Postmortems Collected (1h)",
-      "gridPos": {"x":20,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_pool_postmortems_total[1h]))","legendFormat":"Postmortems"}],
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"blue","value":null}]}}}
-    },
-    {
-      "id": 7, "type": "timeseries", "title": "Active Containers by Service",
-      "gridPos": {"x":0,"y":4,"w":12,"h":8},
-      "targets": [{"expr":"sum by (service) (yashigani_pool_containers_active_by_service)","legendFormat":"{{service}}"}],
-      "options": {"legend":{"displayMode":"table","placement":"bottom"}}
-    },
-    {
-      "id": 8, "type": "timeseries", "title": "Container Lifecycle Events",
-      "gridPos": {"x":12,"y":4,"w":12,"h":8},
+      "id": 1,
+      "type": "stat",
+      "title": "Active Containers",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
       "targets": [
-        {"expr":"sum(rate(yashigani_pool_containers_created_total[5m]))","legendFormat":"Created"},
-        {"expr":"sum(rate(yashigani_pool_containers_replaced_total[5m]))","legendFormat":"Replaced"},
-        {"expr":"sum(rate(yashigani_pool_containers_idle_teardown_total[5m]))","legendFormat":"Idle Teardown"}
+        {
+          "expr": "yashigani_pool_containers_active",
+          "legendFormat": "Active"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Containers Created (1h)",
+      "gridPos": {
+        "x": 4,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_pool_containers_created_total[1h]))",
+          "legendFormat": "Created"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Replacements (1h)",
+      "gridPos": {
+        "x": 8,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_pool_containers_replaced_total[1h]))",
+          "legendFormat": "Replaced"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Idle Teardowns (1h)",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_pool_containers_idle_teardown_total[1h]))",
+          "legendFormat": "Idle"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Tier Limit Rejections (1h)",
+      "gridPos": {
+        "x": 16,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_pool_limit_exceeded_total[1h]))",
+          "legendFormat": "Rejected"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Postmortems Collected (1h)",
+      "gridPos": {
+        "x": 20,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_pool_postmortems_total[1h]))",
+          "legendFormat": "Postmortems"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Active Containers by Service",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (service) (yashigani_pool_containers_active_by_service)",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Container Lifecycle Events",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(yashigani_pool_containers_created_total[5m]))",
+          "legendFormat": "Created"
+        },
+        {
+          "expr": "sum(rate(yashigani_pool_containers_replaced_total[5m]))",
+          "legendFormat": "Replaced"
+        },
+        {
+          "expr": "sum(rate(yashigani_pool_containers_idle_teardown_total[5m]))",
+          "legendFormat": "Idle Teardown"
+        }
       ]
     },
     {
-      "id": 9, "type": "timeseries", "title": "Ollama Instances",
-      "gridPos": {"x":0,"y":12,"w":12,"h":6},
-      "targets": [{"expr":"yashigani_pool_ollama_instances","legendFormat":"Ollama Instances"}],
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":3}]}}}
+      "id": 9,
+      "type": "timeseries",
+      "title": "Ollama Instances",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "yashigani_pool_ollama_instances",
+          "legendFormat": "Ollama Instances"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 10, "type": "table", "title": "Active Containers",
-      "gridPos": {"x":12,"y":12,"w":12,"h":6},
-      "targets": [{"expr":"yashigani_pool_container_info","format":"table","instant":true}],
-      "options": {"showHeader":true}
+      "id": 10,
+      "type": "table",
+      "title": "Active Containers",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "yashigani_pool_container_info",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
     }
   ]
 }

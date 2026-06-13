@@ -14,11 +14,34 @@ import future.keywords.contains
 # callers whose ceiling is below a hypothetical rank-4 level (i.e., everyone).
 # ASVS V4.1.3: access control must default-deny on input validation failure.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# sensitivity_rank — R14/R15 (v2.25.5): duplicated from v1_routing.rego.
+# Accepts BOTH legacy string names AND new numeric integer levels.
+#
+# Numeric input: the level number IS the rank (1–5+).
+# String input: maps legacy names to rank for backward-compat.
+# Unknown string: rank 5 (above RESTRICTED=3, fail-closed).
+#
+# Existing test fixtures using string values continue to work unchanged.
+# ---------------------------------------------------------------------------
+
+# R14/R15 shim: numeric level input
+sensitivity_rank(level) := level if {
+    is_number(level)
+    level >= 1
+}
+
+# Legacy string map
 sensitivity_rank(level) := 0 if level == "PUBLIC"
 sensitivity_rank(level) := 1 if level == "INTERNAL"
 sensitivity_rank(level) := 2 if level == "CONFIDENTIAL"
 sensitivity_rank(level) := 3 if level == "RESTRICTED"
-sensitivity_rank(level) := 4 if {
+
+# GAP-1 catch-all — unknown string → rank 5 (fail-closed, above RESTRICTED).
+# R14/R15: updated rank from 4→5 so numeric level 4 (RESTRICTED) is a valid
+# content rank without collision with the unknown-string sentinel.
+sensitivity_rank(level) := 5 if {
+    not is_number(level)
     not level in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}
 }
 
@@ -26,18 +49,26 @@ sensitivity_rank(level) := 4 if {
 # _ceiling_rank — rank helper for the CEILING operand (an identity's declared
 # clearance), NOT for content sensitivity.
 #
-# sensitivity_rank maps an UNKNOWN string to rank 4 ("treat unknown CONTENT as
+# sensitivity_rank maps an UNKNOWN string to rank 5 ("treat unknown CONTENT as
 # the most sensitive" — correct fail-closed for the data operand). But applying
 # that same mapping to the CEILING operand is PERMISSIVE: a garbage ceiling
-# string becomes rank 4 (the HIGHEST ceiling), so RESTRICTED content (rank 3)
+# string becomes rank 5 (the HIGHEST ceiling), so RESTRICTED content (rank 3)
 # would satisfy `content <= garbage_ceiling` and be ALLOWED — the opposite of
 # fail-closed. (Laura residual, 2.25.2 — currently unreachable because consumers
 # validate the ceiling, but closed here for defence-in-depth.)
 #
-# _ceiling_rank is defined ONLY for the canonical four levels. An unknown ceiling
-# string leaves it UNDEFINED → the `<=` comparison is undefined → the positive
-# allow rule does not fire → default-deny. ASVS V4.1.3.
+# R14/R15 (v2.25.5): _ceiling_rank now also accepts numeric levels 1–4.
+# Numeric ceiling: level number IS rank. Unknown ceiling string → UNDEFINED
+# → fail-closed deny. ASVS V4.1.3.
 # ---------------------------------------------------------------------------
+
+# R14/R15 shim: numeric ceiling
+_ceiling_rank(level) := level if {
+    is_number(level)
+    level >= 1
+}
+
+# Legacy string ceiling map
 _ceiling_rank(level) := 0 if level == "PUBLIC"
 _ceiling_rank(level) := 1 if level == "INTERNAL"
 _ceiling_rank(level) := 2 if level == "CONFIDENTIAL"

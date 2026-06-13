@@ -11,7 +11,11 @@ server:
   log_level: warn
 
 positions:
-  filename: /tmp/positions.yaml
+  # B8: persist positions to a named volume so they survive container restarts.
+  # Previously /tmp/positions.yaml was lost on restart → promtail re-tailed
+  # from the start of every log file → duplicate ingestion into Loki.
+  # docker-compose.yml mounts promtail_positions:/var/lib/promtail (rw, named vol).
+  filename: /var/lib/promtail/positions.yaml
 
 clients:
   - url: https://loki:3100/loki/api/v1/push

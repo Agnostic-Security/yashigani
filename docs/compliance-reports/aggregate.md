@@ -33,7 +33,7 @@
 > original 81 product-line-N/A FAILs resolved to either:
 > (a) **PASS** with corrected citation (38 controls — ACS regex misses against
 >     files genuinely present in the scanned tag `4ff2dd5`; ACS pattern-fix retro
->     items filed for Ogen's PR #14 / PR #25 follow-on PR), or
+>     items filed for the scanner PR #14 / PR #25 follow-on PR), or
 > (b) **N/A** with documented out-of-scope reason (36 controls — CDE/PAN/government-
 >     banner/BAA/SSP-POAM/FIPS-CMVP/financial-entity obligations that do not apply
 >     to a self-hosted MCP gateway product).
@@ -45,9 +45,9 @@
 >
 > The other 57 FAILs (in technical frameworks ASVS-adjacent / API Top 10 / Web
 > Top 10 / ISO 27001 / SOC 2 / NIST CSF / NIST 800-53 / EU AI Act / NIS 2 /
-> Infrastructure / GDPR) are deferred until Ogen's PR #14 (scanner OOS fix) and
+> Infrastructure / GDPR) are deferred until the scanner PR #14 (scanner OOS fix) and
 > PR #25 (SSRF/TLS exclude_paths) merge and a fresh ACS scan runs. Those FAILs
-> are predominantly the same regex-pattern-miss class addressed by Ogen's PRs.
+> are predominantly the same regex-pattern-miss class addressed by those scanner PRs.
 
 ## Per-framework breakdown
 

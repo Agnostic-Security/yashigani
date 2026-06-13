@@ -11,6 +11,6 @@ Modules:
   yashigani.auth        — Local auth: Argon2id passwords, TOTP, session store
   yashigani.sso         — SAMLv2 and OIDC identity provider integration
 """
-# Last updated: 2026-05-16T00:00:00+01:00 (v2.23.4: align __version__ with pyproject.toml — pre-existing drift from be38110)
+# Last updated: 2026-06-13T00:00:00+01:00 (v2.25.5: bump version)
 
-__version__ = "2.25.4"
+__version__ = "2.25.5"

@@ -43,7 +43,7 @@ from typing import Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.openapi.docs import get_swagger_ui_html
+from yashigani.api_docs import swagger_ui_html as _swagger_ui_html, redoc_html as _redoc_html
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from yashigani.auth.spiffe import require_spiffe_id
@@ -364,15 +364,42 @@ def create_gateway_app(
     async def gateway_swagger_ui(
         identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
     ) -> HTMLResponse:
-        """Swagger UI — gated behind identity resolution (Bearer / SSO).
+        """Swagger UI — CSP-clean, no inline script (N2 fix).
 
-        Assets self-hosted from /static/swagger-ui/ (no CDN).
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        Init logic lives in swagger-ui-init.js (same-origin), replacing the
+        inline <script>const ui = SwaggerUIBundle({...})</script> that
+        FastAPI's get_swagger_ui_html() emits and that strict CSP blocks.
         """
-        return get_swagger_ui_html(
+        return HTMLResponse(
+            _swagger_ui_html(
+                openapi_url="/openapi.json",
+                title="Yashigani Gateway — API Reference",
+                swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url="/static/swagger-ui/swagger-ui.css",
+                swagger_init_js_url="/static/swagger-ui/swagger-ui-init.js",
+                favicon_url="/static/swagger-ui/favicon.png",
+            )
+        )
+
+    @app.get("/redoc", include_in_schema=False)
+    async def gateway_redoc_ui(
+        identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
+    ) -> HTMLResponse:
+        """ReDoc UI — CSP-clean, no inline script or style (N2 fix).
+
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        The <redoc spec-url="..."> web-component attribute replaces any inline
+        init call.  The response carries a scoped Content-Security-Policy that
+        adds 'worker-src blob: child-src blob:' because Redoc spawns a Web
+        Worker internally via blob: URL.  All other gateway routes retain the
+        strict CSP unchanged.
+        """
+        return _redoc_html(
             openapi_url="/openapi.json",
-            title="Yashigani Gateway — API Reference",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
+            title="Yashigani Gateway — API Reference (ReDoc)",
+            redoc_js_url="/static/swagger-ui/redoc.standalone.js",
+            favicon_url="/static/swagger-ui/favicon.png",
         )
 
     # Catch-all reverse proxy route
@@ -641,6 +668,13 @@ async def _proxy_request_body(
         _audit_request(audit_writer, request_id, "BLOCKED", "body_too_large", request, path)
         return _error_response(request_id, 413, "REQUEST_BODY_TOO_LARGE")
 
+    # Observe inference payload size (best-effort — never block on metric failure)
+    try:
+        from yashigani.metrics.registry import inference_payload_bytes
+        inference_payload_bytes.observe(len(body_bytes))
+    except Exception:
+        pass
+
     # 2. Extract session / API key identity
     session_id, agent_id, user_id = _extract_identity(request)
     # Prefer JWT sub over header-provided user_id
@@ -762,6 +796,11 @@ async def _proxy_request_body(
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)
+        try:
+            from yashigani.metrics.registry import yashigani_opa_safety_blocks_total
+            yashigani_opa_safety_blocks_total.inc()
+        except Exception:  # noqa: BLE001 — metric must never break the request path
+            pass
         # #4 OPA decision contract: enrich the deny with the policy's self-description
         # (policy_id + layman user_message + HTTP code). Best-effort; the gate above
         # (_opa_check) is the authority and is left untouched.
@@ -1257,8 +1296,14 @@ def _proxy_response_sensitivity(
         # ResponseInspectionPipeline when a SensitivityClassifier is wired.
         # Attribute is absent on older pipeline versions — getattr is safe.
         sens = getattr(result, "response_sensitivity", None)
-        if sens and isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
-            return sens
+        # R14/R15 (v2.25.5): pipeline now emits legacy string (via _LEVEL_TO_LEGACY_STRING).
+        # Accept both legacy strings and numeric levels as a safety net.
+        if sens is not None:
+            if isinstance(sens, int) and 1 <= sens <= 5:
+                from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+                return _LEVEL_TO_LEGACY_STRING.get(sens, "RESTRICTED")
+            if isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
+                return sens
     except Exception as exc:
         logger.debug(
             "proxy: response sensitivity classification failed (request_id=%s): %s",

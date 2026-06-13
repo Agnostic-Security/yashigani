@@ -437,6 +437,13 @@ cicd_image_sbom_present = _G(
     ["image"],
 )
 
+cicd_trivy_findings_total = _C(
+    "yashigani_trivy_findings_total",
+    "Cumulative Trivy vulnerability findings by image, severity, and CVE ID. "
+    "Pushed by the CI Trivy scan job via Pushgateway.",
+    ["image", "severity", "vuln_id"],
+)
+
 
 # ---------------------------------------------------------------------------
 # v0.5.0 — PostgreSQL / audit queue / SIEM metrics
@@ -451,6 +458,13 @@ repeated_small_calls_total = _C(
 inference_payload_log_queue_depth = _G(
     "yashigani_inference_payload_log_queue_depth",
     "Current depth of the async inference payload write queue.",
+)
+
+inference_payload_bytes = _H(
+    "yashigani_inference_payload_bytes",
+    "Distribution of inference request payload sizes in bytes. "
+    "Tracks prompt + context window sizes; feeds the Anomaly dashboard.",
+    buckets=[512, 2048, 8192, 32768, 131072, 524288, 2097152],
 )
 
 cache_hits_total = _C(
@@ -613,6 +627,18 @@ yashigani_routing_decisions_total = _C(
     ["rule", "route"],
 )
 
+# P1 safety-net info gauge — updated whenever an OPA routing safety block fires
+# (rule=P1: sensitive data heading to cloud).  Grafana "P1 Routing Events" table
+# panel (instant query, format=table) reads this metric.
+# Labels: identity_id, provider, sensitivity_level.
+yashigani_routing_p1_events_info = _G(
+    "yashigani_routing_p1_events_info",
+    "Info gauge: OPA routing safety-net P1 events. "
+    "Set to 1 per {identity_id, provider, sensitivity_level} when P1 triggers. "
+    "Powers the Optimization Engine dashboard P1 Routing Events table.",
+    ["identity_id", "provider", "sensitivity_level"],
+)
+
 yashigani_oe_decision_duration_seconds = _H(
     "yashigani_oe_decision_duration_seconds",
     "Optimization Engine decision latency",
@@ -622,8 +648,16 @@ yashigani_oe_decision_duration_seconds = _H(
 # Budget
 yashigani_budget_tokens_total = _C(
     "yashigani_budget_tokens_total",
-    "Cloud tokens consumed by provider and identity kind",
-    ["provider", "kind", "route"],
+    "Cloud tokens consumed by route, provider, and identity. "
+    "route ∈ cloud|local; identity_id is the yashigani identity slug.",
+    ["provider", "kind", "route", "identity_id"],
+)
+
+yashigani_budget_cost_usd_total = _C(
+    "yashigani_budget_cost_usd_total",
+    "Cumulative estimated cost in USD (cloud tokens × per-1k-token price). "
+    "Labelled by provider and identity_id so cost can be attributed.",
+    ["provider", "identity_id"],
 )
 
 yashigani_budget_exhausted_total = _C(
@@ -633,14 +667,43 @@ yashigani_budget_exhausted_total = _C(
 
 yashigani_budget_utilisation_pct = _G(
     "yashigani_budget_utilisation_pct",
-    "Budget utilisation percentage by identity",
-    ["identity_id"],
+    "Budget utilisation percentage. identity_id OR group_id label present "
+    "(use group_id='' for identity rows, identity_id='' for group rows).",
+    ["identity_id", "group_id"],
+)
+
+# Complexity scoring
+yashigani_complexity_scores_total = _C(
+    "yashigani_complexity_scores_total",
+    "Complexity scorer outcomes by level (LOW|MEDIUM|HIGH). "
+    "Powers the R25 cloud-vs-local widget.",
+    ["level"],
 )
 
 # Pool Manager
 yashigani_pool_containers_active = _G(
     "yashigani_pool_containers_active",
-    "Currently active managed containers",
+    "Currently active managed containers (total across all services)",
+)
+
+yashigani_pool_containers_active_by_service = _G(
+    "yashigani_pool_containers_active_by_service",
+    "Currently active managed containers grouped by service slug. "
+    "Powers the Pool Manager dashboard per-service panel.",
+    ["service"],
+)
+
+yashigani_pool_ollama_instances = _G(
+    "yashigani_pool_ollama_instances",
+    "Number of Ollama container instances currently managed by the Pool Manager. "
+    "Horizontal-scale indicator.",
+)
+
+yashigani_pool_container_info = _G(
+    "yashigani_pool_container_info",
+    "Per-container presence gauge (value=1). Labels carry container metadata. "
+    "Use absent() or == 0 to detect departed containers.",
+    ["container_id", "service", "agent_id", "status"],
 )
 
 yashigani_pool_containers_created_total = _C(

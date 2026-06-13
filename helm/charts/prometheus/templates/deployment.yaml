@@ -45,6 +45,11 @@ spec:
             - "--storage.tsdb.retention.time={{ .Values.retention }}"
             - "--web.enable-remote-write-receiver"
             - "--web.listen-address=0.0.0.0:9090"
+            {{- /* B9: fix 302→/graph redirect misrouting under /admin/prometheus/ sub-path.
+                   externalUrl tells Prometheus its public prefix; route-prefix=/ keeps
+                   internal routing clean. tlsDomain comes from global.tlsDomain. */}}
+            - "--web.external-url=https://{{ .Values.global.tlsDomain }}/admin/prometheus/"
+            - "--web.route-prefix=/"
           ports:
             - containerPort: 9090
               protocol: TCP

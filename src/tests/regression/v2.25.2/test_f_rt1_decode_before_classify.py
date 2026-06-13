@@ -62,8 +62,9 @@ def test_f_rt1_encoded_payload_elevates_sensitivity():
     # Pre-fix behaviour: classify() on the raw blob => PUBLIC.
     assert sc.classify(enc).level == SensitivityLevel.PUBLIC
 
-    # Post-fix: classify_decoded() sees the SSN => CONFIDENTIAL.
-    assert sc.classify_decoded(enc).level == SensitivityLevel.CONFIDENTIAL
+    # Post-fix: classify_decoded() sees the SSN => RESTRICTED (level 4).
+    # R14/R15 (v2.25.5): SSN maps to RESTRICTED (level 4, was CONFIDENTIAL in old model).
+    assert sc.classify_decoded(enc).level == SensitivityLevel.RESTRICTED
 
 
 def test_f_rt1_undecodable_blob_is_not_a_silent_pass():

@@ -403,7 +403,11 @@ def _classify_sensitivity(text: str) -> str:
     if classifier is None:
         return "RESTRICTED"
     try:
-        return classifier.classify_decoded(text).level.value
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        result = classifier.classify_decoded(text)
+        # R14/R15 (v2.25.5): SensitivityResult.level is int; .value would raise AttributeError.
+        # Use _LEVEL_TO_LEGACY_STRING to convert to the legacy string OPA/callers expect.
+        return _LEVEL_TO_LEGACY_STRING.get(int(result.level), "RESTRICTED")
     except Exception as exc:
         logger.warning("orchestration: args sensitivity classify failed: %s — RESTRICTED", exc)
         return "RESTRICTED"
@@ -803,7 +807,10 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
     sensitivity_level = "PUBLIC"
     if _state.sensitivity_classifier and prompt_text:
         try:
-            sensitivity_level = _state.sensitivity_classifier.classify_decoded(prompt_text).level.value
+            from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+            _sens_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
+            # R14/R15 (v2.25.5): SensitivityResult.level is int; .value raises AttributeError.
+            sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(_sens_result.level), "RESTRICTED")
         except Exception as exc:
             logger.error("orchestration seed: sensitivity classify failed: %s — denying", exc)
             return _seed_denied(request_id, "seed_sensitivity_classify_failed", sensitivity_level)
@@ -1465,10 +1472,27 @@ def _intersect_catalog(catalog, requested_names: set[str]):
 def _orchestrator_model(body) -> str:
     """The brain model.  Use the caller's `model` if it is a concrete local model;
     otherwise default to qwen2.5:3b (the deterministic tool-calling brain, Design B).
+
+    B7 fix (2.25.5): resolve model aliases before returning.  Previously an alias
+    like "qwen25-3b" was passed verbatim to Ollama, which does not recognise aliases
+    (only concrete model names) and returns an error.  Now look up the alias in the
+    model_alias_store and return the concrete target model name.  If the alias store
+    is unavailable or the name is not an alias, return the name unchanged (backward
+    compatible).
     """
     from yashigani.gateway.openai_router import _state
     m = (body.model or "").strip()
     if m and not m.startswith("@"):
+        # Attempt alias resolution — fail-safe: if the store is absent or lookup
+        # fails, return the name as-is (concrete model names pass through unchanged).
+        alias_store = getattr(_state, "model_alias_store", None)
+        if alias_store is not None:
+            try:
+                entry = alias_store.get(m)
+                if entry is not None and entry.model:
+                    return entry.model
+            except Exception as exc:
+                logger.warning("_orchestrator_model: alias lookup failed for %r (%s) — using as-is", m, exc)
         return m
     return _state.default_model or "qwen2.5:3b"
 
