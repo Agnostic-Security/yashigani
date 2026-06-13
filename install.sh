@@ -13393,6 +13393,55 @@ main() {
       log_info "letta-runtime/openapi_letta.json placeholder: mode 0666 (DAC_OVERRIDE-free write)"
     fi
 
+    # Step 8f: Substitute __YASHIGANI_INTERNAL_BEARER__ in openclaw.runtime.json.
+    # YSG-BUG-2255-002: the git-tracked docker/openclaw/openclaw.json contains a
+    # placeholder __YASHIGANI_INTERNAL_BEARER__ that was never substituted, so
+    # OpenClaw could not authenticate to the gateway out of the box.
+    #
+    # Fix: generate a deploy-time copy at docker/openclaw/openclaw.runtime.json
+    # with the real per-install bearer value substituted in. The compose volume
+    # mount was updated (YSG-BUG-2255-002) to use the runtime copy. The
+    # git-tracked source retains the placeholder and is NEVER modified here.
+    # openclaw.runtime.json is gitignored so the real token never enters VCS.
+    #
+    # Idempotent: always re-generate the runtime copy on fresh install and upgrade
+    # so a token rotation (--remove-volumes) is picked up correctly.
+    #
+    # Fail-loud: if the bearer secret is absent when openclaw is enabled, exit 1.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^openclaw$"; then
+      local _oc_src="${WORK_DIR}/docker/openclaw/openclaw.json"
+      local _oc_dst="${WORK_DIR}/docker/openclaw/openclaw.runtime.json"
+      local _oc_bearer_file="${WORK_DIR}/docker/secrets/yashigani_internal_bearer"
+      local _oc_bearer
+
+      # Read the bearer — support Podman rootless re-install where secrets_dir
+      # may be subuid-remapped (same _safe_read_secret pattern used throughout).
+      if ! _oc_bearer="$(_safe_read_secret "$_oc_bearer_file" "YASHIGANI_INTERNAL_BEARER" "${WORK_DIR}/docker/.env")"; then
+        log_error "openclaw is enabled but yashigani_internal_bearer could not be read from ${_oc_bearer_file} — cannot substitute OpenClaw config. Aborting. (YSG-BUG-2255-002)"
+        exit 1
+      fi
+      if [[ -z "$_oc_bearer" ]]; then
+        log_error "openclaw is enabled but yashigani_internal_bearer is empty — cannot substitute OpenClaw config. Aborting. (YSG-BUG-2255-002)"
+        exit 1
+      fi
+
+      # Write the substituted runtime config (mode 0644 — non-secret config file;
+      # _fix_config_perms sweep will apply o+rX; openclaw container runs as non-root
+      # and needs read access). Use atomic write: write to a temp file first, then mv.
+      local _oc_tmp
+      _oc_tmp="$(mktemp "${WORK_DIR}/docker/openclaw/.openclaw.runtime.XXXXXX")"
+      # shellcheck disable=SC2064 # variable is set at trap registration time, correct.
+      trap "rm -f '${_oc_tmp}'" EXIT
+      sed "s|__YASHIGANI_INTERNAL_BEARER__|${_oc_bearer}|g" "$_oc_src" > "$_oc_tmp" \
+        || { log_error "sed substitution for openclaw.runtime.json failed (YSG-BUG-2255-002)"; rm -f "$_oc_tmp"; exit 1; }
+      chmod 0644 "$_oc_tmp"
+      mv "$_oc_tmp" "$_oc_dst" \
+        || { log_error "Could not write openclaw.runtime.json to ${_oc_dst} (YSG-BUG-2255-002)"; exit 1; }
+      # Remove the trap now that the temp file is gone.
+      trap - EXIT
+      log_info "openclaw.runtime.json written with real bearer (placeholder substituted — git source unchanged) [YSG-BUG-2255-002]"
+    fi
+
     # Step 9: docker compose pull — OR air-gap bundle load
     if [[ "$AIR_GAP" == "true" ]]; then
       load_airgap_bundle

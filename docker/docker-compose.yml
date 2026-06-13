@@ -2171,12 +2171,15 @@ services:
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
     volumes:
       - openclaw_data:/home/node/.openclaw
-      - ./openclaw/openclaw.json:/etc/openclaw/openclaw.json:ro
+      # YSG-BUG-2255-002: mount the runtime copy (bearer substituted by install.sh step 8f),
+      # NOT the git-tracked placeholder. openclaw.runtime.json is written to WORK_DIR at
+      # install time and is gitignored so the real token never enters VCS.
+      - ./openclaw/openclaw.runtime.json:/etc/openclaw/openclaw.json:ro
     # PROBE-AG1 fix: NO /run/secrets mount at all for openclaw.
-    # openclaw reads yashigani_internal_bearer via openclaw.json (install.sh substitutes
-    # __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is baked into the config).
-    # No runtime secret file reads required. caddy_internal_hmac and ALL PKI material
-    # are NOT accessible to openclaw containers.
+    # openclaw reads yashigani_internal_bearer via openclaw.runtime.json (install.sh
+    # step 8f substitutes __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is
+    # baked into the runtime config). No runtime secret file reads required.
+    # caddy_internal_hmac and ALL PKI material are NOT accessible to openclaw containers.
     # openclaw also joins `edge` (internet-facing for Slack/Telegram webhooks) — the
     # absence of /run/secrets mount is the critical blast-radius reduction for PROBE-AG1.
     healthcheck:
