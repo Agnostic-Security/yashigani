@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-25T00:00:00+00:00 — v2.24.3 runtime-settings Phase 2 nav + page div + edit form + toast -->
+<!-- last-updated: 2026-06-13T00:00:00+01:00 — 2.25.5-uifix: R7 remove onboarding; B3 budget dropdowns; R3 alias layout -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -38,18 +38,6 @@
     <main>
         <!-- Dashboard Page -->
         <div class="page active" id="page-dashboard">
-            <!-- First-run onboarding checklist -->
-            <div id="onboarding-checklist" class="onboarding">
-                <h3 class="onboarding-title">Getting Started</h3>
-                <div class="onboarding-items">
-                    <label id="ob-password" class="onboarding-lbl" data-action="showPage" data-param="accounts"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" class="onboarding-lbl" data-action="showPage" data-param="agents"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" class="onboarding-lbl" data-action="showPage" data-param="budgets"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" class="onboarding-lbl" data-action="showPage" data-param="alerts"><input type="checkbox" disabled> Set up alert webhooks</label>
-                </div>
-                <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
-            </div>
-
             <h2>System Health</h2>
             <div id="health-cards" class="cards"><div class="card"><span class="loading">Loading...</span></div></div>
 
@@ -295,7 +283,7 @@
                 </div>
                 <div id="add-group-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Group ID</label><br><input id="group-id" type="text" placeholder="engineering" class="fi w-150"></div>
+                        <div><label class="lbl">Group</label><br><select id="group-id" class="fi w-200"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Provider</label><br><select id="group-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
                         <div><label class="lbl">Token Budget</label><br><input id="group-tokens" type="number" min="1" value="500000" class="fi w-140"></div>
                         <div><label class="lbl">Period</label><br><select id="group-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
@@ -315,7 +303,7 @@
                 </div>
                 <div id="add-ind-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Identity ID</label><br><input id="ind-id" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">User</label><br><select id="ind-id" class="fi w-200"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Provider</label><br><select id="ind-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
                         <div><label class="lbl">Token Budget</label><br><input id="ind-tokens" type="number" min="1" value="100000" class="fi w-140"></div>
                         <div><label class="lbl">Period</label><br><select id="ind-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
@@ -353,10 +341,10 @@
                 </div>
                 <div id="add-alias-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Alias</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-120"></div>
-                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
-                        <div><label class="lbl">Model</label><br><select id="alias-model" class="fi w-200"><option value="">Loading models…</option></select></div>
-                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi"><option value="true">Yes</option><option value="false">No</option></select></div>
+                        <div><label class="lbl">Alias name</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-160"></div>
+                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi w-120"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
+                        <div><label class="lbl">Model (from pulled list)</label><br><select id="alias-model" class="fi w-250"><option value="">Loading models…</option></select></div>
+                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi w-80"><option value="true">Yes</option><option value="false">No</option></select></div>
                         <button data-action="addAlias" class="btn-sm-save">Save</button>
                     </div>
                     <div id="alias-result" class="form-result"></div>

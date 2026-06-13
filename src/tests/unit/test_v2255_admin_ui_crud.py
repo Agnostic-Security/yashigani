@@ -440,3 +440,46 @@ class TestDropdownSourceContracts:
             assert isinstance(body[key], list) and body[key]
             for entry in body[key]:
                 assert "value" in entry and "label" in entry
+
+    def test_budget_group_dropdown_source(self):
+        """B3 UI: budget group-id dropdown re-uses allocation-targets?target_type=group.
+        Verify the endpoint returns {id, label} entries consumable by fillSelect().
+        Admin-related groups must be excluded."""
+        rbac = MagicMock()
+        rbac.list_groups = MagicMock(return_value=[
+            SimpleNamespace(id="g-eng", display_name="Engineering"),
+            SimpleNamespace(id="g-admins", display_name="Administrators"),
+        ])
+        app = _models_app(rbac_store=rbac)
+
+        async def go():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+                return await c.get("/admin/models/allocation-targets?target_type=group")
+
+        body = asyncio.run(go()).json()
+        assert "targets" in body
+        ids = [t["id"] for t in body["targets"]]
+        assert "g-eng" in ids, "Engineering group must appear in budget group dropdown"
+        assert "g-admins" not in ids, "Admin group must be excluded from budget group dropdown"
+        # Every entry has both id and label (required by fillSelect)
+        for t in body["targets"]:
+            assert "id" in t and "label" in t
+
+    def test_budget_individual_dropdown_source(self):
+        """B3 UI: budget ind-id dropdown re-uses allocation-targets?target_type=user.
+        Non-admin users must appear; admin accounts must be excluded."""
+        auth = MagicMock()
+        auth.list_accounts = AsyncMock(return_value=[
+            SimpleNamespace(username="alice", email="alice@x.com", account_tier="user"),
+            SimpleNamespace(username="adminroot", email="adminroot@x.com", account_tier="admin"),
+        ])
+        app = _models_app(auth_service=auth)
+
+        async def go():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+                return await c.get("/admin/models/allocation-targets?target_type=user")
+
+        body = asyncio.run(go()).json()
+        ids = [t["id"] for t in body["targets"]]
+        assert "alice@x.com" in ids, "User alice must appear in budget individual dropdown"
+        assert "adminroot@x.com" not in ids, "Admin must be excluded from individual dropdown"
