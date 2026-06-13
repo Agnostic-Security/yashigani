@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from yashigani.api_docs import swagger_ui_html as _swagger_ui_html, redoc_html as _redoc_html
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -874,10 +874,16 @@ def create_backoffice_app() -> FastAPI:
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Referrer-Policy"] = "no-referrer"
-        # CSP: strict for all pages — no inline scripts or styles allowed
-        # ASVS 3.4.3: object-src 'none' + base-uri 'none'; 3.4.7: report-uri
-        _csp = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; report-uri /admin/csp-report; report-to default"
-        response.headers["Content-Security-Policy"] = _csp
+        # CSP: strict for all pages — no inline scripts or styles allowed.
+        # ASVS 3.4.3: object-src 'none' + base-uri 'none'; 3.4.7: report-uri.
+        # N2 (2.25.5): some routes (ReDoc) need a scoped CSP that adds
+        # worker-src blob: and style-src 'unsafe-inline' for Redoc's Web Worker
+        # and Shadow DOM inline styles.  Those routes set their CSP directly on
+        # the response.  If a per-route CSP is already present, preserve it
+        # rather than overwriting it with the strict default.
+        _strict_csp = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; report-uri /admin/csp-report; report-to default"
+        if "content-security-policy" not in response.headers:
+            response.headers["Content-Security-Policy"] = _strict_csp
         return response
 
     # Per-endpoint body-size limits (ASVS 4.3.1).
@@ -1036,33 +1042,42 @@ def create_backoffice_app() -> FastAPI:
     async def admin_swagger_ui(
         session=Depends(require_admin_session),  # noqa: ARG001
     ) -> HTMLResponse:
-        """Swagger UI — served from self-hosted assets (no CDN)."""
-        return get_swagger_ui_html(
-            openapi_url="/admin/openapi.json",
-            title="Yashigani Backoffice — API Reference",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
-            swagger_favicon_url="/static/swagger-ui/favicon.png",
+        """Swagger UI — CSP-clean, no inline script (N2 fix).
+
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        Init logic lives in swagger-ui-init.js (same-origin), replacing the
+        inline <script>const ui = SwaggerUIBundle({...})</script> that
+        FastAPI's get_swagger_ui_html() emits and that strict CSP blocks.
+        """
+        return HTMLResponse(
+            _swagger_ui_html(
+                openapi_url="/admin/openapi.json",
+                title="Yashigani Backoffice — API Reference",
+                swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url="/static/swagger-ui/swagger-ui.css",
+                swagger_init_js_url="/static/swagger-ui/swagger-ui-init.js",
+                favicon_url="/static/swagger-ui/favicon.png",
+            )
         )
 
     @app.get("/admin/api-redoc", include_in_schema=False)
     async def admin_redoc_ui(
         session=Depends(require_admin_session),  # noqa: ARG001
     ) -> HTMLResponse:
-        """ReDoc UI — served from self-hosted assets (no CDN).
+        """ReDoc UI — CSP-clean, no inline script or style (N2 fix).
 
-        redoc_js_url, redoc_favicon_url, and with_google_fonts=False are all
-        explicitly set so no request is made to cdn.jsdelivr.net, fastapi.tiangolo.com,
-        or fonts.googleapis.com.  Strict CSP (script-src 'self') requires all
-        scripts to be same-origin — the default FastAPI redoc_js_url is a CDN URL
-        that would be blocked without these overrides.
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        The <redoc spec-url="..."> web-component attribute replaces any inline
+        init call.  The response carries a scoped Content-Security-Policy that
+        adds 'worker-src blob: child-src blob:' because Redoc spawns a Web
+        Worker internally via blob: URL.  All other admin routes retain the
+        strict CSP unchanged.
         """
-        return get_redoc_html(
+        return _redoc_html(
             openapi_url="/admin/openapi.json",
             title="Yashigani Backoffice — API Reference (ReDoc)",
             redoc_js_url="/static/swagger-ui/redoc.standalone.js",
-            redoc_favicon_url="/static/swagger-ui/favicon.png",
-            with_google_fonts=False,
+            favicon_url="/static/swagger-ui/favicon.png",
         )
 
     # Admin UI — HTML pages

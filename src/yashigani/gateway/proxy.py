@@ -43,7 +43,7 @@ from typing import Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from yashigani.api_docs import swagger_ui_html as _swagger_ui_html, redoc_html as _redoc_html
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from yashigani.auth.spiffe import require_spiffe_id
@@ -364,34 +364,42 @@ def create_gateway_app(
     async def gateway_swagger_ui(
         identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
     ) -> HTMLResponse:
-        """Swagger UI — gated behind identity resolution (Bearer / SSO).
+        """Swagger UI — CSP-clean, no inline script (N2 fix).
 
-        Assets self-hosted from /static/swagger-ui/ (no CDN).
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        Init logic lives in swagger-ui-init.js (same-origin), replacing the
+        inline <script>const ui = SwaggerUIBundle({...})</script> that
+        FastAPI's get_swagger_ui_html() emits and that strict CSP blocks.
         """
-        return get_swagger_ui_html(
-            openapi_url="/openapi.json",
-            title="Yashigani Gateway — API Reference",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
-            swagger_favicon_url="/static/swagger-ui/favicon.png",
+        return HTMLResponse(
+            _swagger_ui_html(
+                openapi_url="/openapi.json",
+                title="Yashigani Gateway — API Reference",
+                swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url="/static/swagger-ui/swagger-ui.css",
+                swagger_init_js_url="/static/swagger-ui/swagger-ui-init.js",
+                favicon_url="/static/swagger-ui/favicon.png",
+            )
         )
 
     @app.get("/redoc", include_in_schema=False)
     async def gateway_redoc_ui(
         identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
     ) -> HTMLResponse:
-        """ReDoc UI — gated behind identity resolution (Bearer / SSO).
+        """ReDoc UI — CSP-clean, no inline script or style (N2 fix).
 
-        redoc_js_url, redoc_favicon_url, and with_google_fonts=False ensure no
-        request is made to cdn.jsdelivr.net, fastapi.tiangolo.com, or
-        fonts.googleapis.com — required for strict CSP (script-src 'self').
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        The <redoc spec-url="..."> web-component attribute replaces any inline
+        init call.  The response carries a scoped Content-Security-Policy that
+        adds 'worker-src blob: child-src blob:' because Redoc spawns a Web
+        Worker internally via blob: URL.  All other gateway routes retain the
+        strict CSP unchanged.
         """
-        return get_redoc_html(
+        return _redoc_html(
             openapi_url="/openapi.json",
             title="Yashigani Gateway — API Reference (ReDoc)",
             redoc_js_url="/static/swagger-ui/redoc.standalone.js",
-            redoc_favicon_url="/static/swagger-ui/favicon.png",
-            with_google_fonts=False,
+            favicon_url="/static/swagger-ui/favicon.png",
         )
 
     # Catch-all reverse proxy route
