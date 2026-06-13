@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-06-13T00:00:00+01:00 — 2.25.5-uifix: R7 remove onboarding; B3 budget dropdowns; R3 alias layout -->
+<!-- last-updated: 2026-06-13T00:00:00+01:00 — R25 dashboard redesign: semaphores, alerts, budget, security, traffic -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -36,17 +36,73 @@
     </nav>
 
     <main>
-        <!-- Dashboard Page -->
+        <!-- Dashboard Page — R25 redesign -->
         <div class="page active" id="page-dashboard">
-            <h2>System Health</h2>
-            <div id="health-cards" class="cards"><div class="card"><span class="loading">Loading...</span></div></div>
 
-            <h2>Overview</h2>
-            <div class="cards">
-                <div class="card"><div class="card-label">Admin Accounts</div><div class="card-value" id="stat-accounts">-</div></div>
-                <div class="card"><div class="card-label">Registered Agents</div><div class="card-value" id="stat-agents">-</div></div>
-                <div class="card"><div class="card-label">License Tier</div><div class="card-value" id="stat-license">-</div></div>
+            <!-- Row 1: service semaphores + active alerts semaphore -->
+            <div class="dash-row">
+
+                <!-- Widget 1: Per-service health semaphores + roll-up -->
+                <div class="dash-widget dash-widget--wide panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Service Health</span>
+                        <span id="dash-health-rollup" class="semaphore semaphore--loading" title="Overall health"></span>
+                    </div>
+                    <div class="panel-body" id="dash-services-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
+                <!-- Widget 2: Active alerts semaphore (P1→P5, priority order) -->
+                <div class="dash-widget panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Active Alerts</span>
+                        <span class="dash-header-meta" id="dash-alerts-total"></span>
+                    </div>
+                    <div class="panel-body" id="dash-alerts-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
             </div>
+
+            <!-- Row 2: Budget usage + Security story -->
+            <div class="dash-row">
+
+                <!-- Widget 3: Budget usage — used/cap gauge, 85% marker, cloud/local split -->
+                <div class="dash-widget panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Budget Usage</span>
+                        <span class="dash-header-meta" id="dash-budget-threshold-badge"></span>
+                    </div>
+                    <div class="panel-body" id="dash-budget-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
+                <!-- Widget 4: Security story — denials, blocks, sensitivity mix -->
+                <div class="dash-widget panel">
+                    <div class="panel-header">Security</div>
+                    <div class="panel-body" id="dash-security-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Row 3: Traffic, agent/MCP activity, recent audit -->
+            <div class="dash-row">
+                <div class="dash-widget dash-widget--full panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Traffic &amp; Activity</span>
+                        <button data-action="dashRefresh" class="btn-xs-add">Refresh</button>
+                    </div>
+                    <div class="panel-body" id="dash-traffic-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+            </div>
+
         </div>
 
         <!-- Agents Page -->
