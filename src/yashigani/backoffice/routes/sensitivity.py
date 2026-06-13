@@ -4,7 +4,8 @@ Yashigani Backoffice — Sensitivity pattern management + taxonomy routes.
 # Last updated: 2026-06-13T00:00:00+00:00
 
 CRUD for detection patterns used by the sensitivity classifier pipeline,
-plus taxonomy config for R14/R15 (v2.25.5).
+plus taxonomy config for R14/R15 (v2.25.5) and AI-assisted pattern generation
+for R16 (v2.25.5).
 
   GET     /admin/sensitivity/patterns            — List all patterns
   POST    /admin/sensitivity/patterns            — Create a pattern (step-up required)
@@ -17,6 +18,10 @@ plus taxonomy config for R14/R15 (v2.25.5).
   DELETE  /admin/sensitivity/taxonomy/{level}    — Delete a level (step-up required)
   GET     /admin/sensitivity/taxonomy/defaults   — Return canonical defaults
 
+  POST    /admin/sensitivity/generate-pattern    — R16: AI-generate a detection pattern
+                                                    from plain-English description,
+                                                    using the install-default model.
+
 LF-STEPUP-AGENT-CREATE (2026-04-27): POST and DELETE /patterns added step-up
 gate — DLP rule mutation is a policy-sensitive operation; a hijacked admin
 session must not bypass TOTP to neutralise detection patterns.
@@ -24,10 +29,21 @@ session must not bypass TOTP to neutralise detection patterns.
 R14/R15 (v2.25.5): taxonomy endpoints added with step-up gate for write
 operations; PatternRequest.classification now accepts numeric strings (1–5)
 in addition to the legacy string names.
+
+R16 (v2.25.5): AI-generate detection pattern endpoint added. Admin describes
+a data type in plain English; the install-default LLM returns a regex + suggested
+sensitivity level. Uses the same model-resolution path as the OPA policy generator
+(YASHIGANI_OPA_ASSISTANT_MODEL / OLLAMA_MODEL / first available model).
 """
 from __future__ import annotations
 
+import json as _json
 import logging
+import os
+import re as _re
+
+import httpx as _httpx
+from fastapi import HTTPException as _HTTPException
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -285,3 +301,133 @@ async def delete_taxonomy_level(level: int, session: StepUpAdminSession):
     except Exception as exc:
         logger.warning("delete_taxonomy_level failed level=%d: %s", level, exc)
         raise HTTPException(status_code=500, detail={"error": "taxonomy_delete_failed"}) from exc
+
+
+# ── R16: AI-generate detection pattern ───────────────────────────────────────
+
+# Few-shot examples that calibrate the LLM to the expected output format.
+# The OFFICIAL-SENSITIVE example is the documented worked example from the brief.
+_PATTERN_GEN_SYSTEM = """You are a detection-pattern engineer for an AI security gateway's DLP pipeline.
+Given a plain-English description of a sensitive data type, produce:
+1. A single Python-compatible regular expression that detects it.
+2. A suggested sensitivity level from 1 (least sensitive) to 5 (most sensitive).
+3. A short description (max 80 chars).
+
+Output ONLY a JSON object with these keys: "regex", "level" (integer 1-5), "description".
+No prose, no markdown fences, no explanation.
+
+Example input: "UK government OFFICIAL-SENSITIVE document markings"
+Example output: {"regex": "\\\\bOFFICIAL[\\\\s-]SENSITIVE\\\\b", "level": 4, "description": "UK OFFICIAL-SENSITIVE classification marking"}
+
+Example input: "credit card numbers (Visa, Mastercard, Amex)"
+Example output: {"regex": "\\\\b(?:\\\\d[ -]*?){13,19}\\\\b", "level": 4, "description": "Credit/debit card number"}
+
+Example input: "US Social Security Numbers"
+Example output: {"regex": "\\\\b\\\\d{3}-\\\\d{2}-\\\\d{4}\\\\b", "level": 4, "description": "US SSN"}
+
+Now produce the JSON for:"""
+
+
+class GeneratePatternRequest(BaseModel):
+    description: str = Field(
+        min_length=5, max_length=500,
+        description="Plain-English description of the sensitive data type to detect, "
+                    "e.g. 'credit-card numbers' or 'OFFICIAL-SENSITIVE marking'."
+    )
+
+
+@router.post("/generate-pattern")
+async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):  # noqa: ARG001
+    """R16 — AI-generate a detection pattern from a plain-English description.
+
+    POST a description of a sensitive data type → returns a generated regex,
+    suggested sensitivity level (1–5), and short description. Uses the
+    install-default model (resolved via YASHIGANI_OPA_ASSISTANT_MODEL /
+    OLLAMA_MODEL / first available Ollama model).
+
+    The returned pattern is a DRAFT — the admin reviews and creates it via
+    POST /admin/sensitivity/patterns. Nothing is auto-applied.
+
+    Worked example: "UK government OFFICIAL-SENSITIVE document markings"
+    → regex matching OFFICIAL-SENSITIVE → level 4.
+    """
+    from yashigani.backoffice.state import backoffice_state as _state
+
+    ollama_url = str(
+        getattr(_state, "ollama_url", None)
+        or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+    ).rstrip("/")
+
+    # Resolve install-default model
+    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL")
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            tags_resp = await c.get(ollama_url + "/api/tags")
+            avail = [m.get("name") for m in tags_resp.json().get("models", []) if m.get("name")]
+    except Exception:
+        avail = []
+    model = pref if (pref and pref in avail) else (avail[0] if avail else (pref or "qwen2.5:3b"))
+
+    prompt = f"{_PATTERN_GEN_SYSTEM} {body.description}\nJSON output:"
+
+    try:
+        async with _httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                ollama_url + "/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+            )
+            resp.raise_for_status()
+            raw = (resp.json().get("response") or "").strip()
+    except _httpx.HTTPError as exc:
+        logger.warning("generate_pattern: LLM error: %s", exc)
+        raise _HTTPException(
+            status_code=503,
+            detail={"error": "llm_unavailable",
+                    "message": "Could not reach the pattern-generation LLM. "
+                               "Ensure the Ollama service is running."},
+        )
+
+    # Strip markdown fences if any
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines[1:]).strip()
+
+    # Parse JSON — best-effort; return raw on parse failure
+    generated_regex: str = ""
+    suggested_level: int = 3
+    generated_description: str = body.description[:80]
+    parse_error: str | None = None
+
+    try:
+        # Find the first {...} block in case the LLM added preamble
+        m = _re.search(r"\{[^{}]+\}", raw, _re.DOTALL)
+        payload = _json.loads(m.group(0) if m else raw)
+        generated_regex = str(payload.get("regex", "")).strip()
+        raw_level = payload.get("level", 3)
+        try:
+            suggested_level = max(1, min(5, int(raw_level)))
+        except (TypeError, ValueError):
+            suggested_level = 3
+        generated_description = str(payload.get("description", body.description))[:80]
+    except Exception as exc:
+        parse_error = f"LLM response could not be parsed as JSON: {exc}. Raw: {raw[:300]}"
+        logger.warning("generate_pattern: parse error: %s", parse_error)
+
+    return {
+        "status": "ok" if not parse_error else "parse_error",
+        "description": body.description,
+        "model": model,
+        "generated_regex": generated_regex,
+        "suggested_level": suggested_level,
+        "generated_description": generated_description,
+        "parse_error": parse_error,
+        "raw_llm_response": raw if parse_error else None,
+        "note": (
+            "AI-generated draft — review the regex before applying. "
+            "To create the pattern: POST /admin/sensitivity/patterns with "
+            "{'classification': '<level>', 'type': 'regex', "
+            "'pattern': '<regex>', 'description': '<desc>'}."
+        ),
+    }
