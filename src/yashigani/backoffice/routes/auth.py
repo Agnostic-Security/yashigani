@@ -368,6 +368,11 @@ async def login(body: LoginRequest, request: Request, response: Response):
     if not success:
         _record_auth_failure(client_ip)
         state.audit_writer.write(_make_login_event(body.username, "failure", reason))
+        try:
+            from yashigani.metrics.registry import auth_login_attempts_total
+            auth_login_attempts_total.labels(outcome="failure").inc()
+        except Exception:  # noqa: BLE001 — metric must never break auth
+            pass
         # QA Wave 2 Issue 7 — do NOT disclose server_time to unauthenticated
         # callers. TOTP drift diagnostics only belong in authenticated flows
         # (/auth/password/change, /auth/totp/provision/confirm) where the
@@ -459,6 +464,11 @@ async def login(body: LoginRequest, request: Request, response: Response):
     )
 
     state.audit_writer.write(_make_login_event(body.username, "success", None, account_tier=record.account_tier))
+    try:
+        from yashigani.metrics.registry import auth_login_attempts_total
+        auth_login_attempts_total.labels(outcome="success").inc()
+    except Exception:  # noqa: BLE001 — metric must never break auth
+        pass
 
     # Phase 1 / 2.25.5-auth-ingress: single portal, role-based redirect.
     # admin → /admin/  (admin console)

@@ -364,6 +364,8 @@ class OptimizationEngine:
                 yashigani_routing_decisions_total,
                 yashigani_sensitivity_detections_total,
                 yashigani_complexity_scores_total,
+                yashigani_budget_exhausted_total,
+                yashigani_routing_p1_events_info,
             )
             yashigani_routing_decisions_total.labels(
                 rule=rule, route=route
@@ -374,6 +376,17 @@ class OptimizationEngine:
             yashigani_complexity_scores_total.labels(
                 level=complexity.level.value
             ).inc()
+            # P2 = cloud budget exhausted → forced local; increment the exhausted counter.
+            if rule == "P2":
+                yashigani_budget_exhausted_total.inc()
+            # P1 = OPA routing safety-net (sensitive data blocked from cloud).
+            # Update the info gauge so the "P1 Routing Events" dashboard table is populated.
+            if rule == "P1":
+                yashigani_routing_p1_events_info.labels(
+                    identity_id=str(budget.identity_id),
+                    provider=str(provider),
+                    sensitivity_level=str(sensitivity.level),
+                ).set(1)
         except Exception:  # noqa: BLE001 — metric must never break routing
             pass
 

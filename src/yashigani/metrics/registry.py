@@ -627,6 +627,18 @@ yashigani_routing_decisions_total = _C(
     ["rule", "route"],
 )
 
+# P1 safety-net info gauge — updated whenever an OPA routing safety block fires
+# (rule=P1: sensitive data heading to cloud).  Grafana "P1 Routing Events" table
+# panel (instant query, format=table) reads this metric.
+# Labels: identity_id, provider, sensitivity_level.
+yashigani_routing_p1_events_info = _G(
+    "yashigani_routing_p1_events_info",
+    "Info gauge: OPA routing safety-net P1 events. "
+    "Set to 1 per {identity_id, provider, sensitivity_level} when P1 triggers. "
+    "Powers the Optimization Engine dashboard P1 Routing Events table.",
+    ["identity_id", "provider", "sensitivity_level"],
+)
+
 yashigani_oe_decision_duration_seconds = _H(
     "yashigani_oe_decision_duration_seconds",
     "Optimization Engine decision latency",
