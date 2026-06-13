@@ -97,6 +97,9 @@ from yashigani.backoffice.routes import (
     manifest_history_router,
     # v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
     runtime_settings_router,
+    # v2.25.5 — R13: RBAC sources / R26: version check
+    rbac_sources_router,
+    version_check_router,
 )
 
 
@@ -1218,5 +1221,9 @@ def create_backoffice_app() -> FastAPI:
     # v0.9.0 — Phase 7: Operator Visibility
     app.include_router(events_router, prefix="/admin/events", tags=["events"])
     app.include_router(audit_search_router, prefix="/admin/audit", tags=["audit-search"])
+    # v2.25.5 — R13: RBAC group source paths + HTTP method catalogue
+    app.include_router(rbac_sources_router, prefix="/admin/rbac", tags=["rbac"])
+    # v2.25.5 — R26: version check (opt-in egress)
+    app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
 
     return app

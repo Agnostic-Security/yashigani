@@ -4,12 +4,13 @@ Yashigani Backoffice — License admin routes.
 All routes require an active admin session.
 
 Routes:
-  GET    /admin/license          — current license status + usage across all dimensions
-  GET    /api/v1/license/status  — machine-readable expiry status (authenticated admin)
-  POST   /admin/license/activate — activate a new license key
-  DELETE /admin/license          — revert to community license
+  GET    /admin/license                — current license status + usage across all dimensions
+  GET    /admin/license/status         — machine-readable expiry status (authenticated admin)
+  GET    /admin/license/entitlements   — R23: tier-gated features + current tier entitlements
+  POST   /admin/license/activate       — activate a new license key
+  DELETE /admin/license                — revert to community license
 """
-# Last updated: 2026-05-07T00:00:00+01:00 (v2.23.3 expiry UX: /api/v1/license/status + banner_context)
+# Last updated: 2026-06-13T00:00:00+01:00 (v2.25.5 R23: /admin/license/entitlements)
 from __future__ import annotations
 
 import logging
@@ -67,7 +68,7 @@ def get_license_banner_context(now: Optional[datetime] = None) -> dict:
     """
     try:
         from yashigani.licensing import get_license
-        from yashigani.licensing.model import LicenseExpiryMode, WARN_ORANGE_DAYS, WARN_YELLOW_DAYS
+        from yashigani.licensing.model import LicenseExpiryMode  # noqa: F401 — used in _build_banner
     except ImportError:
         return _banner_defaults()
 
@@ -277,6 +278,147 @@ async def get_license_expiry_status(session=Depends(require_admin_session)):
         "days_remaining": days,
         "grace_period_active": grace_period_active,
         "mode": mode.value,
+    }
+
+
+@license_router.get("/entitlements", summary="R23: Tier-gated features and current tier entitlements")
+async def get_license_entitlements(session=Depends(require_admin_session)):
+    """
+    GET /admin/license/entitlements
+
+    R23 — Returns which features are tier-gated and whether the current tier
+    grants them. Suitable for UI feature-lock / upgrade-prompt logic.
+
+    Response shape:
+      {
+        "current_tier": str,              # e.g. "community"
+        "entitlements": [
+          {
+            "feature": str,               # feature key, e.g. "oidc"
+            "label": str,                 # human-readable name
+            "description": str,           # what the feature enables
+            "available": bool,            # true if current tier includes it
+            "required_tier": str,         # minimum tier that unlocks it
+            "required_tier_label": str,   # display name for the required tier
+            "upgrade_url": str | null,    # upgrade URL when not available
+          },
+          ...
+        ]
+      }
+
+    Sources from licensing/enforcer.py and licensing/model.py — the single
+    source of truth for tier/feature gating.
+    """
+    from yashigani.licensing import get_license
+    from yashigani.licensing.model import LicenseTier
+
+    lic = get_license()
+
+    # Canonical feature catalogue: (feature_key, label, description, min_tier)
+    # Ordered by tier requirement (lowest first).
+    _FEATURE_CATALOGUE = [
+        (
+            "oidc",
+            "OIDC / OAuth2 SSO",
+            (
+                "Single Sign-On via OpenID Connect or OAuth2 identity providers "
+                "(e.g. Google Workspace, Microsoft Entra, Okta). Lets users log "
+                "in to the gateway via their corporate IdP."
+            ),
+            LicenseTier.STARTER,
+        ),
+        (
+            "saml",
+            "SAML 2.0 SSO",
+            (
+                "Enterprise Single Sign-On via SAML 2.0 identity providers. "
+                "Required for organisations using on-premises IdPs such as "
+                "Active Directory Federation Services (ADFS)."
+            ),
+            LicenseTier.PROFESSIONAL,
+        ),
+        (
+            "scim",
+            "SCIM User Provisioning",
+            (
+                "Automated user and group provisioning via SCIM 2.0. Allows your "
+                "IdP to push user lifecycle events (create / update / deprovision) "
+                "directly to Yashigani without manual admin intervention."
+            ),
+            LicenseTier.PROFESSIONAL,
+        ),
+        (
+            "pii_log",
+            "PII Detection (Log mode)",
+            (
+                "Detects personally identifiable information in LLM payloads and "
+                "records findings in the audit log. Payloads are not modified; "
+                "this is an observability-only mode for compliance reporting."
+            ),
+            LicenseTier.PROFESSIONAL_PLUS,
+        ),
+        (
+            "pii_redact",
+            "PII Redaction / Blocking",
+            (
+                "Detects PII in LLM payloads and either redacts sensitive fields "
+                "before forwarding to the model, or blocks the request entirely. "
+                "Requires pii_log to be available on the same tier."
+            ),
+            LicenseTier.PROFESSIONAL_PLUS,
+        ),
+    ]
+
+    # Tier ordering for the 'available' check (lower index = lower tier)
+    _TIER_ORDER = [
+        LicenseTier.COMMUNITY,
+        LicenseTier.IGNITER,
+        LicenseTier.STARTER,
+        LicenseTier.PROFESSIONAL,
+        LicenseTier.PROFESSIONAL_PLUS,
+        LicenseTier.ENTERPRISE,
+        LicenseTier.ACADEMIC_NONPROFIT,
+    ]
+
+    def _tier_gte(current: LicenseTier, required: LicenseTier) -> bool:
+        """True if current tier is >= required tier."""
+        # Enterprise and academic_nonprofit always qualify
+        if current in (LicenseTier.ENTERPRISE, LicenseTier.ACADEMIC_NONPROFIT):
+            return True
+        try:
+            return _TIER_ORDER.index(current) >= _TIER_ORDER.index(required)
+        except ValueError:
+            return False
+
+    _TIER_DISPLAY: dict[LicenseTier, str] = {
+        LicenseTier.COMMUNITY:          "Community",
+        LicenseTier.IGNITER:            "Igniter",
+        LicenseTier.STARTER:            "Starter",
+        LicenseTier.PROFESSIONAL:       "Professional",
+        LicenseTier.PROFESSIONAL_PLUS:  "Professional Plus",
+        LicenseTier.ENTERPRISE:         "Enterprise",
+        LicenseTier.ACADEMIC_NONPROFIT: "Academic / Non-profit",
+        LicenseTier.CANARY:             "Canary (internal)",
+    }
+
+    entitlements = []
+    for feature_key, label, description, required_tier in _FEATURE_CATALOGUE:
+        available = lic.has_feature(feature_key) or _tier_gte(lic.tier, required_tier)
+        entitlements.append({
+            "feature": feature_key,
+            "label": label,
+            "description": description,
+            "available": available,
+            "required_tier": required_tier.value,
+            "required_tier_label": _TIER_DISPLAY.get(required_tier, required_tier.value),
+            "upgrade_url": None if available else "https://agnosticsec.com/pricing",
+        })
+
+    return {
+        "current_tier": lic.tier.value,
+        "current_tier_label": _TIER_DISPLAY.get(lic.tier, lic.tier.value),
+        "entitlements": entitlements,
+        "upgrade_url": "https://agnosticsec.com/pricing",
     }
 
 
