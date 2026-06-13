@@ -390,6 +390,34 @@
                     <span class="badge badge-green" id="ollama-status">Active</span>
                 </div>
             </div>
+            <!-- Taxonomy panel — rendered before Detection Patterns (R14/R15 v2.25.5) -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Sensitivity Taxonomy</span>
+                    <button data-action="toggleForm" data-form-id="add-taxonomy-form" class="btn-xs-add">+ Add Level</button>
+                </div>
+                <div id="add-taxonomy-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Level (number)</label><br><input id="tax-level" type="number" min="1" max="10" class="fi w-80"></div>
+                        <div><label class="lbl">Label</label><br><input id="tax-label" type="text" placeholder="e.g. Sensitive" class="fi w-150"></div>
+                        <div><label class="lbl">Colour</label><br>
+                            <select id="tax-colour" class="fi">
+                                <option value="sens-level-5">Red (highest)</option>
+                                <option value="sens-level-4">Orange</option>
+                                <option value="sens-level-3">Yellow</option>
+                                <option value="sens-level-2">Green</option>
+                                <option value="sens-level-1">Blue (lowest)</option>
+                            </select>
+                        </div>
+                        <button data-action="saveTaxonomyLevel" class="btn-sm-save">Save</button>
+                    </div>
+                    <div id="taxonomy-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>Level</th><th>Label</th><th>Colour</th><th>Actions</th></tr></thead>
+                    <tbody id="taxonomy-tbody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+                </table>
+            </div>
             <div class="panel">
                 <div class="panel-header panel-header-flex">
                     <span>Detection Patterns</span>
@@ -397,7 +425,17 @@
                 </div>
                 <div id="add-pattern-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Classification</label><br><select id="pat-class" class="fi"><option value="RESTRICTED">RESTRICTED</option><option value="CONFIDENTIAL">CONFIDENTIAL</option><option value="INTERNAL">INTERNAL</option><option value="PUBLIC">PUBLIC</option></select></div>
+                        <div><label class="lbl">Classification</label><br>
+                            <select id="pat-class" class="fi">
+                                <!-- Static fallback options (numeric values, R14/R15 v2.25.5). -->
+                                <!-- JS loadTaxonomy() replaces these with live taxonomy labels. -->
+                                <option value="5">5 — Sensitive</option>
+                                <option value="4">4 — Confidential</option>
+                                <option value="3">3 — Internal</option>
+                                <option value="2">2 — Public</option>
+                                <option value="1">1 — Info</option>
+                            </select>
+                        </div>
                         <div><label class="lbl">Type</label><br><select id="pat-type" class="fi"><option value="regex">regex</option><option value="keyword">keyword</option></select></div>
                         <div><label class="lbl">Pattern</label><br><input id="pat-pattern" type="text" placeholder="\bpattern\b" class="fi w-250"></div>
                         <div><label class="lbl">Description</label><br><input id="pat-desc" type="text" placeholder="What it detects" class="fi w-180"></div>
