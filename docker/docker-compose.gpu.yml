@@ -1,16 +1,39 @@
-# GPU overlay — wire the host NVIDIA GPU into ollama (Docker compose mode).
+# GPU overlay — wire the host NVIDIA GPU into ollama (Docker compose mode) via CDI.
 #
-# Without this, ollama runs CPU-only: the base ollama service's GPU reservation is
-# commented out and the nvidia runtime is registered in daemon.json but is NOT the
-# daemon default-runtime, so no device is attached (ollama logs `inference compute
-# id=cpu`). install.sh adds this overlay to compose_files when an NVIDIA GPU is
-# detected (YSG_GPU_TYPE=nvidia) on the Docker runtime.
+# WHY CDI (not `runtime: nvidia` + NVIDIA_VISIBLE_DEVICES):
+#   The legacy `runtime: nvidia` path only attaches a device when the nvidia
+#   runtime is actually selected for the container AND a device is requested.
+#   Setting NVIDIA_VISIBLE_DEVICES=all on a container that ends up on the default
+#   `runc` runtime is INERT — the env var is read by the nvidia hook, which never
+#   runs, so ollama logs `inference compute id=cpu` and pins a CPU core at 100%
+#   while the GPUs sit idle (Laura finding, 2026-06-11). CDI device references
+#   (`nvidia.com/gpu=<id>`) are injected by Docker Engine's built-in CDI support
+#   regardless of the container runtime, so the card is wired deterministically.
+#   This is also the SAME mechanism Podman uses (docker-compose.gpu-podman.yml),
+#   giving Docker↔Podman parity from a single device syntax.
 #
-# Pin a specific card with YSG_GPU_UUID (e.g. GPU-xxxxxxxx for a multi-GPU host);
-# defaults to all visible GPUs.
+# REQUIREMENTS (provisioned by install.sh GPU step / host setup):
+#   - nvidia-container-toolkit installed; CDI spec generated at
+#     /etc/cdi/nvidia.yaml or /var/run/cdi/nvidia.yaml
+#     (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`).
+#   - Docker Engine >= 25 (CDI device refs in `devices:` supported natively;
+#     this box runs Engine 29.x). No `runtime: nvidia` / default-runtime change
+#     required, and no daemon.json `features.cdi` flag needed for explicit
+#     `nvidia.com/gpu=<id>` device refs on modern Engine.
+#
+# CARD SELECTION (YSG_GPU_CDI):
+#   Defaults to all visible GPUs (portable shipped default, parity with
+#   docker-compose.gpu-podman.yml). On a multi-GPU host, pin a specific card in
+#   the deploy .env — by UUID for stability across PCI re-enumeration/reboots,
+#   e.g. YSG_GPU_CDI=nvidia.com/gpu=GPU-xxxxxxxx — or by index nvidia.com/gpu=1.
+#   The model mix (gemma3:4b general, etc.; ~50 users/RTX3060 per the capacity
+#   findings) needs >3 GB VRAM, so on hosts with a small card alongside a large
+#   one, pin the larger card (the GTX 1060 3 GB is too small for the default
+#   model set). install.sh adds this overlay to compose_files when an NVIDIA GPU
+#   is detected (YSG_GPU_TYPE=nvidia) on the Docker runtime.
 services:
   ollama:
-    runtime: nvidia
+    devices:
+      - "${YSG_GPU_CDI:-nvidia.com/gpu=all}"
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${YSG_GPU_UUID:-all}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility

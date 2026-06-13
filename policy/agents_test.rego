@@ -570,9 +570,12 @@ test_edge_both_empty_deny_reason_is_caller_group if {
 #   7d. Empty string is also caught by the catch-all (rank 4 → block)
 # ---------------------------------------------------------------------------
 
-# 7a. Unknown sensitivity string gets rank 4
+# 7a. Unknown sensitivity string gets rank 5
+# R14/R15 (v2.25.5): GAP-1 catch-all updated from rank 4 → rank 5 so numeric
+# level 4 (RESTRICTED) is a valid content rank without collision with the
+# unknown-string sentinel. Unknown strings still fail-closed (rank 5 > all ceilings).
 test_sensitivity_rank_unknown_string_is_4 if {
-    data.yashigani.v1.sensitivity_rank("FOO_BAR") == 4
+    data.yashigani.v1.sensitivity_rank("FOO_BAR") == 5
 }
 
 # 7b. Unknown sensitivity → DENY for INTERNAL-ceiling identity

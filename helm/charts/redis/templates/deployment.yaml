@@ -44,10 +44,10 @@ spec:
             - -c
             - |
               redis-server \
-                --save "" \
-                --appendonly no \
+                --appendonly yes \
+                --appendfsync everysec \
                 --maxmemory 256mb \
-                --maxmemory-policy allkeys-lru \
+                --maxmemory-policy volatile-lru \
                 --requirepass "$(cat /run/secrets/redis_password)"
           ports:
             - containerPort: 6379

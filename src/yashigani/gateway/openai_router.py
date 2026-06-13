@@ -53,11 +53,13 @@ Streaming limitations
 # Last updated: 2026-06-09T00:00:00+00:00
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from typing import Optional
@@ -73,12 +75,17 @@ from yashigani.audit.schema import (
     ClientPolicyDeniedEvent,
     EncodedPayloadDetectedEvent,
     OpaResponseCheckFailedEvent,
+    OrchestrationBrainReasoningRelaxedEvent,
     PIIDetectedEvent,
     PoolBackendUnavailableEvent,
     ResponseInjectionDetectedEvent,
     StreamTerminatedEvent,
 )
 from yashigani.gateway._client_enforce import evaluate_client_policies, scope_kind_for
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from yashigani.models.effective import EffectiveModels
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +124,79 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
             ))
     except Exception:  # pragma: no cover — audit must never break the request path
         pass
+
+# ---------------------------------------------------------------------------
+# OWUI-friendly deny messages (R2 — fix/2.25.5-owui-deny-message)
+#
+# Open WebUI renders the upstream ``error.message`` field directly in the
+# chat UI.  Machine-code reasons from OPA (e.g. "identity_not_active",
+# "sensitivity_ceiling_exceeded") surface as raw opaque strings.  This map
+# translates every OPA + internal reason code to a concise, layman-readable
+# sentence that OWUI will display to the end user.
+#
+# Rules:
+#   • Never leak internal identifiers (identity IDs, policy names, stack traces).
+#   • Keep messages under ~120 chars so they fit the OWUI error pill.
+#   • Always explain WHAT was blocked and WHO to ask for help.
+# ---------------------------------------------------------------------------
+_OWUI_DENY_MESSAGES: dict[str, str] = {
+    # v1 ingress (OPA v1_routing.rego `reason`)
+    "identity_not_active":
+        "Your account is not active. Contact an administrator to restore access.",
+    "model_not_allowed":
+        "You are not allocated this model. Ask an administrator to grant access.",
+    "routing_unsafe_sensitive_to_cloud":
+        "This request contains sensitive content and cannot be sent to a cloud provider. Contact an administrator to adjust your routing policy.",
+    "sensitivity_ceiling_exceeded":
+        "This request exceeds your sensitivity clearance level. Contact an administrator.",
+    "model_not_allocated":
+        "You are not allocated this model. Ask an administrator to grant access.",
+    # response-path (OPA v1_routing.rego `response_reason`)
+    "denied_default_deny":
+        "Your request was denied by policy. Contact an administrator for details.",
+    "invalid_identity_ceiling":
+        "Your account's sensitivity clearance does not permit this response. Contact an administrator.",
+    "response_sensitivity_exceeds_ceiling":
+        "The response contains content that exceeds your sensitivity clearance level. Contact an administrator.",
+    "response_blocked_by_inspection":
+        "The response was blocked by the security inspection policy. Contact an administrator.",
+    # OPA infrastructure
+    "opa_unreachable":
+        "The security policy service is temporarily unavailable. Please try again shortly.",
+    "opa_response_check_failed":
+        "The security policy service is temporarily unavailable. Please try again shortly.",
+    "opa_not_configured":
+        "Gateway security policy is not configured. Contact an administrator.",
+    "response_policy_denied":
+        "Your request was denied by the response policy. Contact an administrator.",
+    "policy_denied":
+        "Your request was denied by policy. Contact an administrator for details.",
+    # PII
+    "pii_detected":
+        "Your message contains sensitive personal data that cannot be sent to this provider. Remove the personal information and try again.",
+    "pii_detected_encoded":
+        "Your message contains encoded personal data that cannot be safely redacted. Remove the personal information and try again.",
+    # client-policy
+    "client_policy_denied":
+        "Your request was denied by an access policy assigned to your account. Contact an administrator.",
+    # pool / agent
+    "pool_limit_exceeded":
+        "The maximum number of concurrent sessions for this agent has been reached. Please try again shortly.",
+    "pool_backend_unavailable":
+        "The agent's container backend is temporarily unavailable. Contact an administrator.",
+}
+
+_OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
+
+
+def _owui_deny_message(reason: str) -> str:
+    """Return a human-readable deny message for OWUI chat display.
+
+    Falls back to the generic message for any reason code not in the table.
+    Never leaks the raw reason code into the returned string.
+    """
+    return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+
 
 # ---------------------------------------------------------------------------
 # OPA fail-closed Prometheus counter (Path 1 + Path 3)
@@ -163,6 +243,174 @@ def _load_internal_bearer() -> str:
 
 # Cached at module load — fails fast if env-var is absent.
 _INTERNAL_BEARER: str = _load_internal_bearer()
+
+
+# ---------------------------------------------------------------------------
+# Track C (F-B) — per-user identity through Open WebUI.
+#
+# THE GAP: Open WebUI (OWUI) authenticates to the gateway's internal mesh port
+# (8081) with the shared `yashigani_internal_bearer`. Historically the resolver
+# mapped that bearer to a flat `internal` service identity (RESTRICTED, empty
+# allowed_models) BEFORE any per-user path, so every OWUI user shared one
+# identity and per-user/group/org RBAC (models, agents, sensitivity ceiling)
+# NEVER applied to OWUI traffic.
+#
+# THE FIX (trusted-forwarder model): the internal bearer establishes OWUI as a
+# TRUSTED FORWARDER — exactly the same trust anchor already used for the
+# orchestration-principal header. When (and ONLY when) a request carries the
+# internal bearer, the gateway honours OWUI's forwarded-user headers
+# (X-OpenWebUI-User-Email etc., emitted when ENABLE_FORWARD_USER_INFO_HEADERS=
+# true on the OWUI service) and resolves the ACTUAL per-user Yashigani identity.
+#
+# MAPPING (email -> Yashigani identity), in priority order:
+#   1. The forwarded email's local-part is matched as an identity SLUG
+#      (alice@corp.example -> slug "alice"); if a registered identity exists,
+#      that identity (with its own groups/allowed_models/sensitivity_ceiling)
+#      is used. Operators provision OWUI users by creating a Yashigani identity
+#      whose slug equals the user's email local-part.
+#   2. Optionally, an explicit slug override map (YASHIGANI_OWUI_SLUG_MAP, JSON
+#      object "email": "slug") lets an operator pin specific emails to slugs.
+#   3. No match / missing / malformed email -> the configurable baseline
+#      OWUI-users default identity (YASHIGANI_OWUI_DEFAULT_SLUG, default
+#      "owui-users"). If that slug is not registered either, fall back to a
+#      synthetic baseline-RESTRICTED identity (NEVER a higher privilege).
+#
+# SPOOFING DEFENSE (load-bearing): the forwarded-user header is honoured ONLY
+# under the internal bearer. A direct/external caller WITHOUT the bearer can set
+# X-OpenWebUI-User-* freely and it is IGNORED — the resolver never consults it
+# off the internal-bearer path. Caddy also strips inbound X-OpenWebUI-User-* /
+# X-Forwarded-User on the public path (defence in depth). Fail-closed: under the
+# bearer, an unmatched/missing/malformed forwarded user resolves to the
+# baseline-restricted default, NEVER to elevated privilege.
+# ---------------------------------------------------------------------------
+_OWUI_FORWARD_ENABLED: bool = (
+    os.environ.get("YASHIGANI_OWUI_FORWARD_USER", "true").strip().lower() == "true"
+)
+_OWUI_DEFAULT_SLUG: str = os.environ.get(
+    "YASHIGANI_OWUI_DEFAULT_SLUG", "owui-users"
+).strip()
+_OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
+
+
+def _load_owui_slug_map() -> dict[str, str]:
+    """Parse YASHIGANI_OWUI_SLUG_MAP (JSON object email->slug). Fail-safe: {}."""
+    raw = os.environ.get("YASHIGANI_OWUI_SLUG_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {str(k).strip().lower(): str(v).strip() for k, v in parsed.items() if v}
+    except Exception as exc:  # malformed map must not break startup
+        logger.warning("YASHIGANI_OWUI_SLUG_MAP is not valid JSON (%s) — ignoring", exc)
+    return {}
+
+
+_OWUI_SLUG_MAP: dict[str, str] = _load_owui_slug_map()
+
+
+def _baseline_owui_identity() -> dict:
+    """Synthetic fail-closed baseline for OWUI users with no registered identity.
+
+    RESTRICTED ceiling, empty allowed_models — strictly the LOWEST privilege.
+    Used only when neither the per-user slug NOR the configured default slug
+    resolves to a registered identity. kind="service" keeps it out of the
+    end-user seat count while still being subject to OPA RBAC. It is NEVER the
+    `internal` identity_id, so the brain-reasoning marker cannot be tripped by
+    an OWUI user (that marker keys on identity_id == "internal").
+    """
+    return {
+        "identity_id": _OWUI_DEFAULT_SLUG or "owui-users",
+        "status": "active",
+        "kind": "service",
+        "groups": ["owui-users"],
+        "allowed_models": [],
+        "sensitivity_ceiling": "RESTRICTED",
+        "_owui_forwarded": True,
+        "_owui_baseline": True,
+    }
+
+
+def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
+    """Resolve the ACTUAL OWUI user identity from forwarded headers.
+
+    CALLED ONLY from the internal-bearer fast-path — i.e. the request is already
+    proven to come from the trusted forwarder (OWUI). The forwarded-user header
+    is therefore trustworthy at this point and never consulted elsewhere, which
+    is the whole spoofing defence.
+
+    Returns a registered identity dict (per-user RBAC applies) when the email
+    maps to one; otherwise the configured default-slug identity; otherwise the
+    synthetic baseline-RESTRICTED identity. NEVER returns None and NEVER returns
+    a privilege higher than the matched identity — fail-closed by construction.
+    Returns None only to signal "no forwarded user present" so the caller can
+    fall through to the flat `internal` service identity (preserves the
+    orchestration / brain path, which carries NO forwarded-user header).
+    """
+    if not _OWUI_FORWARD_ENABLED:
+        return None
+    email = request.headers.get(_OWUI_USER_EMAIL_HEADER, "").strip()
+    if not email:
+        # No forwarded user -> not an OWUI per-user call (e.g. brain self-call,
+        # in-mesh agent). Caller falls back to flat `internal`.
+        return None
+    email_l = email.lower()
+
+    # Registry unavailable -> fail-closed to baseline (NEVER internal/elevated).
+    if _state.identity_registry is None:
+        logger.warning(
+            "OWUI forwarded user %r present but identity_registry unavailable — "
+            "baseline-RESTRICTED", email,
+        )
+        return _baseline_owui_identity()
+
+    # Resolve candidate slug: explicit map override first, else canonical email slug.
+    # B5 fix (2.25.5): previously used the email local-part with dots/underscores
+    # kept (e.g. "dana.lee"), which never matched the identity registered at login
+    # by _auth_email_to_slug ("dana-lee-example-com").  Now use the SAME canonical
+    # derivation (yashigani.identity.slug.email_to_slug) so both sides agree.
+    slug = _OWUI_SLUG_MAP.get(email_l)
+    if not slug:
+        try:
+            from yashigani.identity.slug import email_to_slug as _email_to_slug
+            slug = _email_to_slug(email_l)
+        except (ValueError, Exception) as _exc:
+            logger.warning("OWUI slug derivation failed for %r (%s) — baseline", email, _exc)
+            slug = ""
+
+    identity = None
+    if slug:
+        try:
+            identity = _state.identity_registry.get_by_slug(slug)
+        except Exception as exc:  # registry blip — fail-closed to baseline
+            logger.warning("OWUI slug lookup failed for %r (%s) — baseline", slug, exc)
+            identity = None
+
+    if identity:
+        identity = dict(identity)
+        identity["_owui_forwarded"] = True
+        identity["_owui_email"] = email
+        return identity
+
+    # No per-user match -> configured default-slug identity if registered.
+    if _OWUI_DEFAULT_SLUG:
+        try:
+            default_ident = _state.identity_registry.get_by_slug(_OWUI_DEFAULT_SLUG)
+        except Exception:
+            default_ident = None
+        if default_ident:
+            default_ident = dict(default_ident)
+            default_ident["_owui_forwarded"] = True
+            default_ident["_owui_email"] = email
+            default_ident["_owui_default"] = True
+            return default_ident
+
+    # Nothing registered -> synthetic baseline-RESTRICTED.
+    logger.info(
+        "OWUI user %r mapped to baseline (no identity for slug %r, no default %r)",
+        email, slug, _OWUI_DEFAULT_SLUG,
+    )
+    return _baseline_owui_identity()
 
 
 # ---------------------------------------------------------------------------
@@ -219,16 +467,180 @@ def _service_account_full_list_enabled() -> bool:
     _SA_FULL_LIST_CACHE["ts"] = now
     return value
 
+def is_orchestration_self_call(request) -> bool:
+    """True when this request is an in-flight orchestration sub-hop.
+
+    The executor (orchestrator.py) stamps X-Yashigani-Orchestration-Depth on
+    every gateway self-call.  A present header (depth >= 1) means we are already
+    inside an orchestration loop, so the /v1 handler must NOT re-enter the
+    executor — it must run the hop as a normal chat/agent call.  This is the
+    guard that makes the self-call loop terminate (build sheet §3.1/§6).
+    """
+    return bool(request.headers.get("x-yashigani-orchestration-depth"))
+
+
+# ---------------------------------------------------------------------------
+# G-ORCH-OPA-3 — brain-REASONING-leg marker (server-minted, UNFORGEABLE).
+#
+# Problem: when @letta is the orchestrating brain, its OWN reasoning *about* a
+# security task ("test the boundaries / threat-model / cloud 9") trips the
+# response classifier (0.95–1.0) → the response-leg OPA gate 403s → the loop
+# finalizes gracefully and the requested threat-model cognition is SUPPRESSED.
+# But the brain→LLM (A→L) leg is the orchestrator's OWN cognition — it is
+# consumed ONLY by the gateway loop to pick the next GATED hop, never delivered
+# to a human and never used as a tool result.  We therefore "evaluate-not-
+# suppress" that ONE leg: compute the verdict + OPA decision and AUDIT them
+# (relaxation_applied=true), but relax only the 403/substitute ACTION.
+#
+# THE MARKER IS NOT A HEADER.  letta calls the gateway's LLM endpoint
+# autonomously via OPENAI_API_BASE with a static internal bearer + static model;
+# it adds no per-request headers and cannot be trusted to.  So the marker is
+# PROCESS-LOCAL gateway state: the executor brackets each brain round-trip
+# (`_letta_send`) with begin()/end() on a counter held in THIS module.  letta
+# cannot read, set, clear, or forge that counter — it is not derived from model
+# name, content, or any letta-controllable input.  The inbound LLM call that
+# arrives WHILE a brain round-trip is open, from the internal-bearer identity,
+# on the brain model, IS the brain-reasoning leg.
+#
+# CONCURRENCY / MISLABEL SAFETY: a concurrent NON-brain letta chat whose LLM
+# call happens to overlap an open brain round-trip could be mislabelled as a
+# reasoning leg and have its 403-action relaxed.  This is NOT exploitable: the
+# load-bearing leak guard (condition 4) routes ANY relaxed completion that
+# parses to a final/prose answer back through the STANDARD (non-relaxed) egress
+# gate before it can reach a human.  A relaxed completion may only ever resolve
+# to a `call_tool` decision re-entering the full gate.  Mislabelling can at most
+# let an INTERNAL reasoning turn through to the brain loop — never to a user.
+# ---------------------------------------------------------------------------
+# Brain model id letta uses for its own reasoning (compose: LETTA_LLM_MODEL).
+# The marker requires BOTH an open round-trip AND this model, so an unrelated
+# internal-bearer caller on a different model is never relaxed.
+_BRAIN_REASONING_MODEL = os.environ.get("LETTA_LLM_MODEL", "qwen2.5:3b").strip()
+_brain_reasoning_lock = threading.Lock()
+_brain_reasoning_active = 0  # count of open brain round-trips (supports nesting)
+# Set True when a would-have-blocked verdict was RELAXED while a round-trip was
+# open; read+reset by brain_reasoning_leg_end so the executor learns the brain
+# turn it just ran was relaxed (condition 4 — route a relaxed final through the
+# NON-relaxed gate before it can reach the user).
+_brain_reasoning_relaxed_pending = False
+
+
+def brain_reasoning_leg_begin() -> None:
+    """Open a brain-reasoning round-trip (called by the executor around _letta_send).
+
+    Increments the process-local active counter.  letta cannot reach this state;
+    it is the SERVER minting the scope marker, never inferred from letta input.
+    """
+    global _brain_reasoning_active, _brain_reasoning_relaxed_pending
+    with _brain_reasoning_lock:
+        _brain_reasoning_active += 1
+        # Clear any stale relaxation flag at the start of a fresh round-trip.
+        if _brain_reasoning_active == 1:
+            _brain_reasoning_relaxed_pending = False
+
+
+def brain_reasoning_leg_end() -> bool:
+    """Close a brain-reasoning round-trip; return True iff it was RELAXED.
+
+    Always called (even on error).  The boolean lets the executor route a relaxed
+    final/prose answer back through the NON-relaxed egress gate (condition 4).
+    """
+    global _brain_reasoning_active, _brain_reasoning_relaxed_pending
+    with _brain_reasoning_lock:
+        if _brain_reasoning_active > 0:
+            _brain_reasoning_active -= 1
+        relaxed = _brain_reasoning_relaxed_pending
+        if _brain_reasoning_active == 0:
+            _brain_reasoning_relaxed_pending = False
+        return relaxed
+
+
+def _mark_brain_reasoning_relaxed() -> None:
+    """Record that a would-have-blocked verdict was relaxed on the current leg."""
+    global _brain_reasoning_relaxed_pending
+    with _brain_reasoning_lock:
+        _brain_reasoning_relaxed_pending = True
+
+
+def _brain_reasoning_active_now() -> bool:
+    with _brain_reasoning_lock:
+        return _brain_reasoning_active > 0
+
+
+def is_brain_reasoning_leg(identity, model: str) -> bool:
+    """True iff this inbound /v1 call is letta's OWN reasoning (A→L) leg.
+
+    ALL of the following must hold — every condition is SERVER-determined, none
+    is letta-controllable:
+      • a brain round-trip is currently open (process-local counter > 0), AND
+      • the caller is the internal-bearer service identity (mesh-port only), AND
+      • the requested model is the configured brain model.
+
+    A normal chat caller, an external caller, or any call when no brain round-trip
+    is open returns False → the response gate runs BYTE-FOR-BYTE unchanged.
+    """
+    if not _brain_reasoning_active_now():
+        return False
+    if not identity or identity.get("identity_id") != "internal":
+        return False
+    return (model or "").strip() == _BRAIN_REASONING_MODEL
+
+
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
 
 # ── Request/Response Models ──────────────────────────────────────────────
 
 
+# ── Tool-calling schema (orchestration, 2.25.4) ──────────────────────────
+# OpenAI-compatible function-tool shapes.  All additive + Optional so plain
+# chat callers (Open WebUI) are byte-for-byte unchanged when `tools` is absent.
+# Build sheet §1.1/§1.2 (orchestration-buildsheet-20260610).
+
+
+class ToolCallFunction(BaseModel):
+    name: str
+    # JSON-encoded string per OpenAI semantics.  The orchestrator/Ollama
+    # translation layer (orchestrator.py) serialises Ollama's object form here.
+    arguments: str = ""
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
+class ToolDef(BaseModel):
+    type: str = "function"
+    function: dict  # {name, description, parameters: JSON-Schema}
+
+
 class ChatMessage(BaseModel):
-    role: str = Field(description="Role: system, user, assistant")
-    content: str = Field(description="Message content")
+    # system | user | assistant | tool  (+"tool" now valid)
+    role: str = Field(description="Role: system, user, assistant, tool")
+    # Nullable: assistant tool-call turns carry content=null.  Audit/PII code
+    # joins with `if m.content` so None is treated as "" (build sheet §1.1 note).
+    # OpenClaw and other clients (anthropic SDK compat) send content as a list of
+    # content blocks: [{"type": "text", "text": "..."}].  Accept both forms and
+    # flatten to str so downstream code stays unchanged.
+    content: Optional[str | list] = Field(default=None, description="Message content")
     name: Optional[str] = None
+    # assistant → requests tool calls
+    tool_calls: Optional[list[ToolCall]] = None
+    # role:"tool" → which assistant tool_call this message answers
+    tool_call_id: Optional[str] = None
+
+    def model_post_init(self, __context) -> None:
+        """Flatten list-format content blocks to a plain string."""
+        if isinstance(self.content, list):
+            parts = []
+            for block in self.content:
+                if isinstance(block, dict):
+                    # {"type": "text", "text": "..."} — the common case
+                    parts.append(block.get("text") or block.get("content") or "")
+                elif isinstance(block, str):
+                    parts.append(block)
+            self.content = "\n".join(p for p in parts if p) or None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -241,11 +653,19 @@ class ChatCompletionRequest(BaseModel):
     # Yashigani extensions
     force_local: Optional[bool] = None
     force_cloud: Optional[bool] = None
+    # ── Orchestration (2.25.4, build sheet §1.2) ──────────────────────────
+    tools: Optional[list[ToolDef]] = None
+    # "auto" | "none" | "required" | {"type":"function","function":{"name":...}}
+    tool_choice: Optional[str | dict] = None
+    # Yashigani opt-in orchestration flag (§3.5 routing).  When tools is present
+    # OR orchestrate is True, /v1/chat/completions delegates to run_orchestration.
+    orchestrate: Optional[bool] = None
 
 
 class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: ChatMessage
+    # finish_reason gains "tool_calls" for assistant turns that request tools.
     finish_reason: str = "stop"
 
 
@@ -293,6 +713,10 @@ class OpenAIRouterState:
         self.default_model: str = "qwen2.5:3b"
         self.available_models: list[dict] = []
         self.agent_registry = None
+        # Track B1 (model-RBAC): durable allocation store + alias store, read on
+        # the request path to compute effective-allowed-models for the caller.
+        self.model_allocation_store = None   # ModelAllocationStore | None
+        self.model_alias_store = None        # ModelAliasStore | None
         self.response_inspection_pipeline = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
@@ -345,6 +769,8 @@ def configure(
     opa_url: str = "https://policy:8181",
     content_relay_detector=None,
     pool_manager=None,    # v2.4.1 — PoolManager | None
+    model_allocation_store=None,  # Track B1 — ModelAllocationStore | None
+    model_alias_store=None,       # Track B1 — ModelAliasStore | None
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -376,6 +802,8 @@ def configure(
     _state.opa_url = opa_url
     _state.content_relay_detector = content_relay_detector
     _state.pool_manager = pool_manager  # v2.4.1
+    _state.model_allocation_store = model_allocation_store  # Track B1
+    _state.model_alias_store = model_alias_store            # Track B1
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -504,6 +932,41 @@ def _pii_audit(request_id: str, direction: str, pii_result, action: str, destina
         )
     except Exception as exc:
         logger.warning("PII audit write failed (request_id=%s): %s", request_id, exc)
+
+
+def _audit_brain_reasoning_relaxation(
+    *, request_id: str, identity_id: str, verdict: str, confidence: float,
+    content: str, opa_reason: str, sensitivity: str,
+) -> None:
+    """G-ORCH-OPA-3 — record a RELAXED brain-reasoning-leg response-OPA block.
+
+    Writes an OrchestrationBrainReasoningRelaxedEvent with relaxation_applied=True
+    so a would-have-blocked reasoning turn is ALWAYS greppable.  Raw content is
+    never stored — only its SHA-256 hash.  Never raises (audit must not break the
+    relaxation path).
+    """
+    if _state.audit_writer is None:
+        return
+    try:
+        content_hash = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+        _state.audit_writer.write(
+            OrchestrationBrainReasoningRelaxedEvent(
+                request_id=request_id,
+                identity_id=identity_id,
+                session_id=identity_id,
+                verdict=verdict,
+                confidence=float(confidence),
+                content_hash=content_hash,
+                opa_reason=opa_reason,
+                sensitivity=sensitivity,
+                relaxation_applied=True,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "G-ORCH-OPA-3 relaxation audit write failed (request_id=%s): %s",
+            request_id, exc,
+        )
 
 
 def _encoded_payload_audit(
@@ -689,6 +1152,56 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             },
         )
 
+    # ── 1c. Orchestration delegation (2.25.4, build sheet §3.1/§3.5) ──────
+    # When the caller supplies `tools` (or opts in via `orchestrate=true`), the
+    # request is a tool-calling orchestration, not a plain chat.  Delegate to the
+    # gateway-side ReAct executor, which runs every tool hop as a self-call that
+    # re-enters THIS full pipeline (OPA ingress + egress + ResponseInspection per
+    # hop, §0.1 invariant).  Orchestration self-calls do NOT carry `tools`, so
+    # they take the normal path below — there is no recursion through this branch.
+    #
+    # PHASE 2 (Design A, build sheet §4.2): when the user names @letta as the
+    # ORCHESTRATING BRAIN with orchestration intent (it names other @agents/@models
+    # or the MCP), letta drives the loop but the gateway is STILL the executor —
+    # every tool letta names runs through the SAME gated self-call path.  Letta has
+    # no network route to upstreams (UA-10 bridge isolation), so the gateway is the
+    # only path.  is_letta_orchestration() promotes the call to the executor with
+    # brain="letta"; a bare "@letta hello" stays a normal single-hop agent chat.
+    # IMPORTANT: orchestration must NOT fire on the mere PRESENCE of `tools`.  An
+    # agent framework whose LLM backend IS this gateway (e.g. letta:
+    # OPENAI_API_BASE=http://gateway:8081/v1) sends its own `tools` on every plain
+    # completion call — those are normal chat completions, not user-initiated
+    # orchestration.  So the qwen-brain executor fires only on the EXPLICIT
+    # `orchestrate=true` opt-in (build-sheet §3.5; all Phase-1 callers set it), and
+    # the letta-brain executor fires only when @letta is named as the orchestrating
+    # brain with orchestration intent.  A letta LLM-backend call carries neither,
+    # so it correctly takes the normal chat path below.
+    if not is_orchestration_self_call(request):
+        from yashigani.gateway.letta_brain import is_letta_orchestration
+        letta_brain = is_letta_orchestration(body.model, body)
+        if body.orchestrate or letta_brain:
+            from yashigani.gateway.orchestrator import run_orchestration
+            return await run_orchestration(
+                body=body,
+                identity=identity,
+                request=request,
+                request_id=request_id,
+                brain="letta" if letta_brain else "qwen",
+            )
+
+    # ── 1d. Brain-REASONING-leg detection (G-ORCH-OPA-3, server-minted) ──
+    # Computed ONCE here from server-only state (the process-local brain
+    # round-trip counter + the internal-bearer identity + the brain model).  It
+    # is NOT derived from any letta-controllable input.  When False, every gate
+    # below behaves BYTE-FOR-BYTE as before; the marker is consulted at exactly
+    # ONE place — the response-leg OPA action (step 8c) — to relax the 403/
+    # substitute ACTION while STILL evaluating + auditing the verdict.
+    brain_reasoning_leg = is_brain_reasoning_leg(identity, body.model)
+    # Set True ONLY when a would-have-blocked verdict was relaxed on this leg —
+    # surfaced as a response header so the brain loop can route a relaxed
+    # final/prose answer back through the NON-relaxed gate (condition 4).
+    brain_reasoning_relaxed = False
+
     # ── 2. Extract prompt text for classification ─────────────────────
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
 
@@ -719,7 +1232,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     s_result = None
     if _state.sensitivity_classifier:
         s_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
-        sensitivity_level = s_result.level.value
+        # R14/R15 (v2.25.5): SensitivityResult.level is int (not SensitivityLevel enum).
+        # Calling .value on an int raises AttributeError.  Convert via the legacy-string map
+        # so all downstream consumers (string comparisons, HTTP headers, OPA, audit) get
+        # the expected "PUBLIC"/"INTERNAL"/"CONFIDENTIAL"/"RESTRICTED" label.
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
         sensitivity_triggers = s_result.triggers
     if s_result is None:
         from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
@@ -872,7 +1390,93 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
 
+    # ── Track B1 (model-RBAC): compute the caller's EFFECTIVE allowed-models ──
+    # once, BEFORE optimisation, and reuse it for (a) the OPA model_allowed check
+    # and (b) the optimiser-binding re-check below. effective.allowed carries both
+    # the alias names AND the concrete models behind allocated aliases, so it
+    # matches whatever form (alias or concrete) the optimiser ultimately selects.
+    _effective = _effective_allowed_models(identity) if not is_agent_call else None
+    _eff_opa_list = _effective.to_opa_allowed_models() if _effective is not None else None
+
+    # ── LAURA-B1-OBS-A: EXPLICIT-pin deny is VISIBLE (403), not silent-substitute ─
+    # Two distinct intents must be distinguished, and only ONE may be silently
+    # rerouted by the OBS-1 fallback:
+    #   • EXPLICIT request — the caller PINNED a concrete model in the request body
+    #     (``body.model`` truthy) that they are NOT allocated.  A security product
+    #     MUST be honest: deny VISIBLY with 403 model_not_allocated, byte-for-byte
+    #     the same verdict the orchestrate-seed path returns.  Silently serving an
+    #     allocated substitute (HTTP 200) would MASK enforcement.
+    #   • OPTIMISER/DEFAULT AUTO-selection — the caller did NOT pin a model
+    #     (``body.model`` falsy → the global default was used) OR the optimiser
+    #     later re-selects a model (P1 local pin, budget reroute, …).  Here the
+    #     caller never asked for the denied model, so the OBS-1 fallback below
+    #     substitutes a model they ARE allocated (preserved, no 403).
+    # The discriminator is purely "did the CALLER pin the model" (``body.model``),
+    # which is forgery-proof: it is the caller's own request body, and a deny only
+    # ever REMOVES access — no over-grant.  The security bar is unchanged: no
+    # non-allocated model is ever served on EITHER branch (auto-path falls back to
+    # an allocated model or is denied by the alloc-bind re-check downstream).
+    # brain_reasoning_leg stays exempt (server-minted, holds no allocation) exactly
+    # as the alloc-bind re-check below.
+    if (
+        body.model  # caller PINNED a model explicitly (vs default/auto)
+        and not is_agent_call
+        and not brain_reasoning_leg
+        and _effective is not None
+    ):
+        _pinned_denied = _effective.is_model_denied(body.model)
+        if not _pinned_denied and _state.optimization_engine is not None:
+            # Resolve the pinned alias to its concrete model and re-check, so a
+            # pin of an ALIAS whose concrete is denied is also caught (mirrors the
+            # downstream alloc-bind, which runs on the resolved concrete).
+            try:
+                _, _pinned_concrete, _ = _state.optimization_engine._resolve_alias(body.model)
+                _pinned_denied = _effective.is_model_denied(_pinned_concrete)
+            except Exception as exc:  # noqa: BLE001 — never fail-open the route
+                logger.warning(
+                    "B1-OBS-A pinned-alias resolution failed (%s) — relying on "
+                    "name-level + downstream alloc-bind checks", exc,
+                )
+        if _pinned_denied:
+            logger.warning(
+                "MODEL-RBAC DENIED (explicit-pin, B1-OBS-A): identity=%s "
+                "pinned=%s NOT allocated — visible 403 (no silent substitute)",
+                identity_id, body.model,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        # R2: human-readable message so OWUI displays it in chat.
+                        "message": _owui_deny_message("model_not_allocated"),
+                        "type": "policy_denied",
+                        "code": "model_not_allocated",
+                    }
+                },
+                headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+            )
+
     if _state.optimization_engine and _state.sensitivity_classifier and _state.complexity_scorer and not is_agent_call:
+        # LAURA-B1-OBS-1: if the engine's global local default would be DENIED to
+        # this caller (restricted/gated), resolve a LOCAL model the caller IS
+        # allocated and hand it to the optimiser as the local-fallback substitute.
+        # None ⇒ caller is entitled to the global default (legacy behaviour); None
+        # ALSO when no allowed local model exists ⇒ the optimiser keeps the (denied)
+        # global default so the alloc-bind re-check below DENIES the truly-
+        # unallocated request (deny-by-default preserved, no over-grant).
+        _allowed_local_default = None
+        if _effective is not None:
+            try:
+                _allowed_local_default = _effective.pick_allowed_local_default(
+                    _state.model_alias_store,
+                    _state.optimization_engine._default_model,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail-open the route
+                logger.warning(
+                    "B1-OBS-1 allowed-local-default resolution failed (%s) — "
+                    "using global default", exc,
+                )
+                _allowed_local_default = None
         decision = _state.optimization_engine.route(
             requested_model=selected_model,
             sensitivity=s_result,
@@ -880,6 +1484,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             budget=budget_state,
             force_local=body.force_local or False,
             force_cloud=body.force_cloud or False,
+            allowed_local_default=_allowed_local_default,
         )
         selected_provider = decision.provider
         selected_model = decision.model
@@ -891,10 +1496,70 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         if sensitivity_level in ("CONFIDENTIAL", "RESTRICTED"):
             route_reason = "sensitivity_local"
 
+    # ── Track B1: BIND the FINALLY-SELECTED model to the allocation ──────
+    # Runs on the model that will ACTUALLY be served (after optimisation OR the
+    # fallback path), so the optimiser cannot escape the allocation by
+    # re-selecting a model the caller is not allocated. Denies when the model is
+    # outside a restricted caller's allowlist OR is globally allocation-gated and
+    # not allocated to this caller (so a user NOT in the allocated group is denied
+    # a model allocated only to that group). Fail-closed, deny-by-default.
+    #
+    # MUST-FIX-1 (Iris BLOCKER — B1 breaks orchestration): EXEMPT the server-
+    # determined brain/internal cognition leg from this alloc-bind re-check.  The
+    # letta brain's A→L reasoning hop arrives as a FRESH inbound request from
+    # the `internal` service identity (groups[], no org, allowed_models[]) on the
+    # brain model (LETTA_LLM_MODEL=qwen2.5:3b).  That model is allocation-gated the
+    # instant any alias resolving to it is allocated to some group → `internal`
+    # holds no allocation → is_model_denied() returns True → the brain's cognition
+    # leg 403s → orchestration dies.  The exemption opens NO bypass for real users:
+    # ``brain_reasoning_leg`` is SERVER-MINTED + UNFORGEABLE — it requires a
+    # process-local brain round-trip to be OPEN *and* the internal-bearer identity
+    # *and* the brain model (is_brain_reasoning_leg, line 1104) — letta cannot read,
+    # set, or forge the round-trip counter.
+    #
+    # SECURITY — LAURA-B1R-001 (model-hop bypass, v2.25.4): the exemption is the
+    # SERVER-MINTED brain-reasoning leg ONLY.  It MUST NOT include the
+    # ``_orchestration_self_call`` identity flag: a principal-bearing orchestration
+    # self-call (a model/agent TOOL HOP) resolves to the REAL caller's identity
+    # WITH their real allocations, so the real caller's allocation MUST be enforced
+    # on the hop.  Exempting on ``_orchestration_self_call`` let a model tool-hop
+    # reach a non-allocated model (fastuser → model__qwen2_5_3b → served).  We now
+    # gate the hop too: only the genuine internal-identity brain leg (which carries
+    # NO principal) is exempt; the model hop re-enters here and is DENIED if the
+    # real caller is not allocated the concrete model.  The raw client header
+    # X-Yashigani-Orchestration-Depth (is_orchestration_self_call) is NEVER
+    # consulted — it is forgeable.  Real external/user traffic carries no
+    # server-minted marker, so this re-check runs BYTE-FOR-BYTE unchanged for them.
+    _model_rbac_exempt = brain_reasoning_leg
+    if (
+        _effective is not None
+        and not _model_rbac_exempt
+        and _effective.is_model_denied(selected_model)
+    ):
+        logger.warning(
+            "MODEL-RBAC DENIED (alloc-bind): identity=%s requested=%s served=%s "
+            "NOT permitted (allowed=%s gated=%s restricted=%s) — denying",
+            identity_id, body.model, selected_model,
+            sorted(_effective.allowed), sorted(_effective.gated), _effective.has_restriction,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message("model_not_allocated"),
+                    "type": "policy_denied",
+                    "code": "model_not_allocated",
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+        )
+
     # ── 6a. OPA policy check (v2.2 — all /v1 traffic) ─────────────────
     # Evaluates v1_routing.rego: identity active, model allowed, routing
     # safety (CONFIDENTIAL never to untrusted cloud), sensitivity ceiling.
-    # Fail-closed: any OPA error → deny.
+    # Fail-closed: any OPA error → deny. Track B1: feed the effective
+    # allowed-models so OPA's model_allowed denies non-allocated models too.
     opa_decision = await _opa_v1_check(
         identity=identity,
         selected_model=selected_model,
@@ -902,6 +1567,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         sensitivity_level=sensitivity_level,
         route_reason=route_reason,
         request_path="/v1/chat/completions",
+        effective_allowed_models=_eff_opa_list,
     )
     if not opa_decision.get("allow", False):
         opa_reason = opa_decision.get("reason", "policy_denied")
@@ -913,12 +1579,53 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": f"Request denied by policy: {opa_reason}",
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
             },
             headers={"X-Yashigani-OPA-Reason": opa_reason},
+        )
+
+    # ── 6a-model. OPA model_allowed backstop (belt-and-braces, v2.25.4) ──
+    # The gate above checks only opa_decision["allow"] (allow_v1 = identity
+    # active).  It does NOT consult opa_decision["model_allowed"], so before
+    # this the alloc-bind re-check above was the SOLE model-RBAC enforcement
+    # point at /v1 — a single point that the Laura+Iris bypass disabled by
+    # forging the orchestration-depth header.  We now ALSO enforce OPA's
+    # independent positive-allowlist verdict here, making effective.py's
+    # docstring ("OPA enforces the positive allowlist") actually true and
+    # giving a SECOND enforcement layer behind the alloc-bind.
+    #
+    # The OPA input already carries the effective allowed_models (B1,
+    # effective_allowed_models=_eff_opa_list above), so model_allowed is the
+    # true positive-allowlist decision for this caller.
+    #
+    # Same exemption as the alloc-bind: the SERVER-MINTED brain-reasoning leg
+    # ONLY (internal holds no allocation → the brain model is gated for it).  A
+    # principal-bearing model tool-hop is NOT exempt — the real caller's
+    # allocation is enforced.  The forgeable depth header is NEVER consulted.
+    if (
+        not _model_rbac_exempt
+        and not opa_decision.get("model_allowed", False)
+    ):
+        logger.warning(
+            "OPA DENIED /v1 request (model_allowed backstop): identity=%s "
+            "model=%s served=%s — model not in positive allowlist",
+            identity_id, body.model, selected_model,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    # R2: human-readable message so OWUI displays it in chat.
+                    "message": _owui_deny_message("model_not_allocated"),
+                    "type": "policy_denied",
+                    "code": "model_not_allocated",
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
         )
 
     # ── 6a-bind. Client-policy enforcement — INGRESS (#16, OPA Phase 2) ──
@@ -938,7 +1645,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _audit_client_policy("ingress", identity_id, _ce_scope_kind, identity_id, _ce_in)
         return JSONResponse(
             status_code=403,
-            content={"error": {"message": f"Request denied by client policy: {_ce_reason}",
+            # R2: human-readable message so OWUI displays it in chat.
+            # _ce_reason is a comma-joined set of machine deny codes; it is kept
+            # in `code` for operator tooling but never shown to the end user.
+            content={"error": {"message": _owui_deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_reason}},
             headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
         )
@@ -999,20 +1709,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     _pii_audit(request_id, "request", _pii_result, _pii_result.action_taken, destination)
 
                     if _pii_result.action_taken == "blocked":
-                        raise HTTPException(
+                        # R2: return OpenAI error schema so OWUI displays the
+                        # human-readable message in chat (not FastAPI's {"detail":…}).
+                        return JSONResponse(
                             status_code=status.HTTP_403_FORBIDDEN,
-                            detail={
-                                "error": "pii_detected",
-                                "detail": (
-                                    "Request blocked: PII detected and PII mode is BLOCK "
-                                    "for cloud-routed requests. Configure PII mode to REDACT "
-                                    "or enable cloud bypass via the admin panel."
-                                ),
-                                "pii_types": [f.pii_type.value for f in _pii_result.findings],
-                                # F-RT1: surface that an encoded payload was the trigger.
-                                "matched_views": sorted(_pii_result.matched_views),
-                                "request_id": request_id,
+                            content={
+                                "error": {
+                                    "message": _owui_deny_message("pii_detected"),
+                                    "type": "pii_blocked",
+                                    "code": "pii_detected",
+                                    # Operator/diagnostic fields — not shown in OWUI chat.
+                                    "pii_types": [f.pii_type.value for f in _pii_result.findings],
+                                    "matched_views": sorted(_pii_result.matched_views),
+                                    "request_id": request_id,
+                                }
                             },
+                            headers={"X-Yashigani-Request-Id": request_id},
                         )
 
                     if _pii_result.action_taken == "redacted":
@@ -1026,19 +1738,20 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             if _msg.content:
                                 _msg_redacted, _msg_res = _state.pii_detector.process_decoded(_msg.content)
                                 if _msg_res.action_taken == "blocked":
-                                    raise HTTPException(
+                                    # R2: return OpenAI error schema so OWUI displays
+                                    # the human-readable message in chat.
+                                    return JSONResponse(
                                         status_code=status.HTTP_403_FORBIDDEN,
-                                        detail={
-                                            "error": "pii_detected_encoded",
-                                            "detail": (
-                                                "Request blocked: PII detected inside an "
-                                                "encoded payload that cannot be redacted in "
-                                                "place. Send the request without encoding or "
-                                                "enable cloud bypass via the admin panel."
-                                            ),
-                                            "matched_views": sorted(_msg_res.matched_views),
-                                            "request_id": request_id,
+                                        content={
+                                            "error": {
+                                                "message": _owui_deny_message("pii_detected_encoded"),
+                                                "type": "pii_blocked",
+                                                "code": "pii_detected_encoded",
+                                                "matched_views": sorted(_msg_res.matched_views),
+                                                "request_id": request_id,
+                                            }
                                         },
+                                        headers={"X-Yashigani-Request-Id": request_id},
                                     )
                                 _msg.content = _msg_redacted
                         prompt_text = "\n".join(
@@ -1083,7 +1796,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
             ollama_body = {
                 "model": selected_model,
-                "messages": [{"role": m.role, "content": m.content} for m in body.messages],
+                "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
                 "stream": True,
             }
             if body.temperature is not None:
@@ -1195,7 +1908,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
         # ── 7b. Buffered path (agent calls + stream=False + streaming disabled) ──
         if is_agent_call and agent_upstream:
-            agent_messages = [{"role": m.role, "content": m.content} for m in body.messages]
+            agent_messages = [{"role": m.role, "content": m.content or ""} for m in body.messages]
 
             if agent_protocol == "letta":
                 from yashigani.gateway.letta_client import letta_chat
@@ -1337,7 +2050,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # Standard Ollama routing (buffered)
             ollama_body = {
                 "model": selected_model if not is_agent_call else _state.default_model,
-                "messages": [{"role": m.role, "content": m.content} for m in body.messages],
+                "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
                 "stream": False,
             }
             if body.temperature is not None:
@@ -1555,24 +2268,57 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         # v2.23.4 fail-closed posture — closes LAURA-V243-001 / YSG-RISK-071.
         if not resp_opa.get("allow", False):
             resp_opa_reason = resp_opa.get("reason", "response_policy_denied")
-            logger.warning(
-                "OPA BLOCKED response delivery: identity=%s sensitivity=%s reason=%s",
-                identity_id, sensitivity_level, resp_opa_reason,
-            )
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": {
-                        "message": f"Response blocked by policy: {resp_opa_reason}",
-                        "type": "response_policy_denied",
-                        "code": resp_opa_reason,
-                    }
-                },
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
-                },
-            )
+            # ── G-ORCH-OPA-3: evaluate-AND-LOG on the brain-REASONING leg ───
+            # When (and ONLY when) this is the server-minted brain-reasoning
+            # leg, the would-have-blocked verdict is STILL computed (above) and
+            # AUDITED here with relaxation_applied=true, but the 403/substitute
+            # ACTION is relaxed so the brain can complete its OWN cognition.
+            # The completion never reaches a human directly: it returns to the
+            # gateway loop, which re-gates the next hop, and (condition 4) any
+            # final/prose answer the brain emits goes back through THIS gate
+            # NON-relaxed before delivery.  For NON-marked traffic this branch
+            # is never taken and the gate is byte-for-byte unchanged.
+            if brain_reasoning_leg:
+                brain_reasoning_relaxed = True
+                _mark_brain_reasoning_relaxed()
+                _audit_brain_reasoning_relaxation(
+                    request_id=request_id,
+                    identity_id=identity_id,
+                    verdict=response_verdict,
+                    confidence=response_inspection_confidence,
+                    content=assistant_content,
+                    opa_reason=resp_opa_reason,
+                    sensitivity=sensitivity_level,
+                )
+                logger.warning(
+                    "G-ORCH-OPA-3: response-leg OPA would-block RELAXED for brain-"
+                    "reasoning leg (evaluate-and-log): identity=%s verdict=%s "
+                    "reason=%s relaxation_applied=true request_id=%s",
+                    identity_id, response_verdict, resp_opa_reason, request_id,
+                )
+                # Fall through: deliver the reasoning completion to the brain
+                # loop (NOT to a human).  Stamp a header so the leg is greppable
+                # in transport too.  Do NOT 403.
+            else:
+                logger.warning(
+                    "OPA BLOCKED response delivery: identity=%s sensitivity=%s reason=%s",
+                    identity_id, sensitivity_level, resp_opa_reason,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            # R2: human-readable message so OWUI displays it in chat.
+                            "message": _owui_deny_message(resp_opa_reason),
+                            "type": "response_policy_denied",
+                            "code": resp_opa_reason,
+                        }
+                    },
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
+                    },
+                )
 
     # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
     # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
@@ -1588,7 +2334,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         _audit_client_policy("egress", identity_id, _ce_eg_kind, identity_id, _ce_eg)
         return JSONResponse(
             status_code=403,
-            content={"error": {"message": f"Response blocked by client policy: {_ce_eg_reason}",
+            # R2: human-readable message so OWUI displays it in chat.
+            content={"error": {"message": _owui_deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_eg_reason}},
             headers={"X-Yashigani-Request-Id": request_id,
                      "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
@@ -1631,6 +2378,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         "X-Yashigani-Generated-Content": "true",
         "X-Yashigani-Response-Inspection-Confidence": f"{response_inspection_confidence:.4f}",
     }
+    # G-ORCH-OPA-3: signal a relaxed brain-reasoning turn so the orchestration
+    # loop routes any relaxed final/prose answer through the NON-relaxed egress
+    # gate (the load-bearing leak guard, condition 4).  Present ONLY on a leg
+    # that was actually relaxed; absent on all normal traffic.
+    if brain_reasoning_relaxed:
+        headers["X-Yashigani-Brain-Reasoning-Relaxed"] = "true"
     # F-T10-001: low-confidence step-up signal.
     # Emitted when inspection confidence is below threshold AND the prompt
     # sensitivity is CONFIDENTIAL or RESTRICTED — the combination that most
@@ -1868,16 +2621,85 @@ def _resolve_identity(request: Request) -> Optional[dict]:
         key = auth[7:]
         if hmac.compare_digest(key, _INTERNAL_BEARER):
             # Internal service-to-service calls (Open WebUI, agents)
-            # Treated as authenticated internal identity — same OPA rules apply
+            # Treated as authenticated internal identity — same OPA rules apply.
+            #
+            # ── Orchestration confused-deputy guard (build sheet §6 / §7.2) ──
+            # When an orchestration self-call carries X-Yashigani-Orchestration-
+            # Principal, OPA must evaluate the REAL caller's authorisation, not the
+            # internal service account.  We resolve that principal from the registry
+            # so every per-hop ingress/egress OPA decision (§0.1) names the true
+            # identity.  The header is only honoured on the internal-bearer path
+            # (mesh port 8081, network-isolated), so an external caller cannot set
+            # it to impersonate another principal.  Fail-closed: an unknown/empty
+            # principal falls back to the internal service identity (no privilege
+            # escalation — internal is RESTRICTED).
+            orch_principal = request.headers.get("x-yashigani-orchestration-principal", "").strip()
+            if orch_principal and _state.identity_registry is not None:
+                try:
+                    real = _state.identity_registry.get_by_slug(orch_principal)
+                except Exception:  # registry blip — fall back to internal
+                    real = None
+                if real:
+                    real = dict(real)
+                    real["_orchestration_self_call"] = True
+                    return real
+
+            # ── Track C (F-B): OWUI trusted-forwarder per-user resolution ──
+            # The internal bearer establishes OWUI as a TRUSTED FORWARDER. Only
+            # here — having proven the bearer — do we honour OWUI's forwarded
+            # user header (X-OpenWebUI-User-Email) and resolve the ACTUAL
+            # per-user Yashigani identity so per-user/group/org RBAC applies.
+            #
+            # ORDERING: this runs AFTER the orchestration-principal check (which
+            # is the brain/orchestration self-call path) and is gated on the
+            # forwarded-user header being present. The brain reasoning leg and
+            # in-mesh agent self-calls carry NO X-OpenWebUI-User-* header, so
+            # they return None here and fall through to the flat `internal`
+            # identity below — the brain-reasoning marker (keys on identity_id
+            # == "internal") is preserved byte-for-byte.
+            #
+            # SPOOFING DEFENSE: because we are inside the proven-internal-bearer
+            # branch, an external caller without the bearer never reaches this
+            # code, so it can never set X-OpenWebUI-User-* to impersonate a user.
+            owui_identity = _resolve_owui_forwarded_user(request)
+            if owui_identity is not None:
+                return owui_identity
+
             return {"identity_id": "internal", "status": "active", "kind": "service",
-                    "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
+                    "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
+                    "_orchestration_self_call": bool(orch_principal)}
 
     if not _state.identity_registry:
         return None
 
-    # SSO headers (from Caddy)
+    # ── SSO headers (from Caddy) ── LAURA-OBS-B: trust-gate X-Forwarded-User ──
+    # X-Forwarded-User is the SSO identity Caddy's forward_auth re-injects AFTER
+    # the backoffice has verified the session (the copy_headers X-Forwarded-User
+    # in the forward_auth blocks).  Caddy ALSO strips any inbound X-Forwarded-User
+    # at the public edge AND injects X-Caddy-Verified-Secret (the per-install
+    # caddy_internal_hmac) on every reverse_proxy hop to the gateway.
+    #
+    # ASYMMETRY CLOSED: X-OpenWebUI-User-* is honoured ONLY inside the proven
+    # internal-bearer branch above, but X-Forwarded-User was previously honoured
+    # here UNCONDITIONALLY.  On the mesh listener (8081) CaddyVerifiedMiddleware is
+    # NOT active (mesh_entrypoint: "N/A for direct mesh calls"), so a raw in-mesh
+    # caller (e.g. OWUI's own network) could set `X-Forwarded-User: coderuser` and
+    # be served coderuser's identity — an in-mesh identity-reassignment primitive.
+    # Caddy strips it at the public edge so it is not edge-exploitable today, but
+    # the latent asymmetry is closed here.
+    #
+    # FIX: honour X-Forwarded-User ONLY when the request carries a VALID
+    # X-Caddy-Verified-Secret — the SAME cryptographic trust proof that anchors the
+    # legitimate Caddy forward_auth/SSO path.  A genuine SSO request (proxied
+    # through Caddy 8080) always carries it, so the per-user API/SSO path is
+    # preserved byte-for-byte.  A raw mesh caller without the secret is IGNORED
+    # (falls through to API-key auth below).  validate_caddy_secret fail-closes
+    # when the secret is unloaded (returns False), so this never fail-opens.
+    from yashigani.auth.caddy_verified import validate_caddy_secret
     forwarded_user = request.headers.get("X-Forwarded-User")
-    if forwarded_user:
+    if forwarded_user and validate_caddy_secret(
+        request.headers.get("X-Caddy-Verified-Secret", "")
+    ):
         identity = _state.identity_registry.get_by_slug(forwarded_user)
         if identity:
             return identity
@@ -1934,6 +2756,60 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     return None
 
 
+def _effective_allowed_models(identity: dict | None) -> "EffectiveModels":
+    """Compute the caller's EFFECTIVE allowed-models (Track B1 model-RBAC).
+
+    Combines the identity's own ``allowed_models`` with the models allocated to
+    its org / groups / user via the durable allocation store, expanding each
+    allocated alias to {alias name, concrete model}. Returns an EffectiveModels
+    with deny-by-default / fail-closed semantics (see models.effective).
+
+    Resolved once per request and reused for BOTH the OPA input AND the
+    optimiser-binding re-check, so the two cannot disagree.
+    """
+    from yashigani.models.effective import resolve_effective_allowed_models
+    # getattr-guard: a partially-configured _state (e.g. allocation stores not
+    # wired in a minimal test/dev harness) degrades to "no allocation enforcement"
+    # rather than crashing the request path — the resolver already treats a None
+    # alloc_store as own-allowed_models only (fail-safe, never fail-open).
+    return resolve_effective_allowed_models(
+        identity,
+        getattr(_state, "model_allocation_store", None),
+        getattr(_state, "model_alias_store", None),
+    )
+
+
+def model_denied_for_caller(
+    identity: dict | None,
+    model: str,
+    *,
+    brain_leg: bool = False,
+) -> tuple[bool, "EffectiveModels"]:
+    """THE gateway-side model-RBAC CHOKE POINT (Track B1 — single authority).
+
+    Every model-selection path in the gateway — chat egress, orchestration-seed
+    brain choice, tool-catalog projection, and the model-tool hop — consults THIS
+    one function to decide whether a (caller, model) pair is denied.  It pulls the
+    live allocation + alias stores from ``_state`` and delegates to
+    ``models.effective.model_denied_for_caller`` (the cross-module authority).
+
+    ``brain_leg`` MUST be the SERVER-MINTED ``is_brain_reasoning_leg`` marker only
+    (process-local round-trip + internal identity + brain model).  It is the lone
+    exemption: the internal cognition leg holds no allocation and would otherwise
+    be denied the gated brain model.  A principal-bearing orchestration self-call
+    (a model/agent tool hop) is NEVER passed brain_leg=True — it carries the real
+    caller's allocations, which are enforced.  Fail-closed; never raises.
+    """
+    from yashigani.models.effective import model_denied_for_caller as _authority
+    return _authority(
+        identity,
+        model,
+        _state.model_allocation_store,
+        _state.model_alias_store,
+        brain_leg=brain_leg,
+    )
+
+
 async def _opa_v1_check(
     identity: dict | None,
     selected_model: str,
@@ -1941,6 +2817,7 @@ async def _opa_v1_check(
     sensitivity_level: str,
     route_reason: str,
     request_path: str,
+    effective_allowed_models: list[str] | None = None,
 ) -> dict:
     """
     Query OPA v1_routing policy for allow/deny + reason.
@@ -1969,7 +2846,15 @@ async def _opa_v1_check(
                 "allowing request without policy check (dev opt-in)",
                 _ysg_env,
             )
-            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+            # Dev-opt-in: OPA is intentionally bypassed, so EVERY sub-decision is
+            # bypassed consistently — including model_allowed.  Without this, the
+            # B1 model_allowed backstop (which reads opa_decision["model_allowed"])
+            # would fail-closed on the .get(...,False) default and 403 every dev
+            # request even though policy was deliberately skipped.  Production never
+            # reaches this branch (startup guard requires YASHIGANI_OPA_URL).
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in",
+                    "model_allowed": True, "routing_safe": True,
+                    "sensitivity_allowed": True}
         logger.error(
             "OPA not configured and fail-closed triggered (env=%s, opa_optional=%s)",
             _ysg_env, _opa_optional,
@@ -1979,11 +2864,21 @@ async def _opa_v1_check(
         ).inc()
         return {"allow": False, "reason": "opa_not_configured"}
 
+    # Track B1: when the caller has an effective-allowed-models set computed from
+    # allocations, it OVERRIDES the identity's own allowed_models in the OPA input
+    # so `model_allowed` denies any model outside the union of own + allocated.
+    # None means "not computed" → fall back to the identity's own list (unchanged
+    # behaviour for callers/paths with no allocation enforcement).
+    if effective_allowed_models is not None:
+        _allowed_models_doc = effective_allowed_models
+    else:
+        _allowed_models_doc = identity.get("allowed_models", []) if identity else []
+
     identity_doc = {
         "status": identity.get("status", "active") if identity else "anonymous",
         "kind": identity.get("kind", "unknown") if identity else "unknown",
         "groups": identity.get("groups", []) if identity else [],
-        "allowed_models": identity.get("allowed_models", []) if identity else [],
+        "allowed_models": _allowed_models_doc,
         "sensitivity_ceiling": identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC",
     }
 
@@ -2025,6 +2920,194 @@ async def _opa_v1_check(
     except Exception as exc:
         logger.error("OPA v1 check failed: %s — denying (fail-closed)", exc)
         return {"allow": False, "reason": "opa_unreachable"}
+
+
+_SENSITIVITY_RANK = {"PUBLIC": 0, "INTERNAL": 1, "CONFIDENTIAL": 2, "RESTRICTED": 3}
+
+
+def _stricter_sensitivity(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """Return the higher-ranked (stricter) of two sensitivity labels.
+
+    Used to combine the LLM inspector's response sensitivity with the
+    deterministic classifier's verdict so the OPA ceiling check sees the
+    strictest signal (LAURA-ORCH leakfix).  None is treated as the lowest rank
+    (absence of signal never lowers the floor below the other input).
+    """
+    ra = _SENSITIVITY_RANK.get((a or "").upper(), -1)
+    rb = _SENSITIVITY_RANK.get((b or "").upper(), -1)
+    if ra < 0 and rb < 0:
+        return a if a is not None else b
+    return a if ra >= rb else b
+
+
+async def gate_relaxed_final(
+    *, identity: dict | None, final_text: str, prompt_sensitivity: str,
+) -> tuple[bool, str]:
+    """G-ORCH-OPA-3 condition 4 — re-gate a RELAXED brain final through the
+    STANDARD (NON-relaxed) response egress gate before it can reach the user.
+
+    A relaxed brain-reasoning turn may have parsed to a ``final`` answer.  That
+    answer must NOT be delivered to the human on the relaxed verdict — it must be
+    re-adjudicated by the same response inspection + OPA response gate that normal
+    chat traffic faces, with NO relaxation.  This is THE leak guard.
+
+    Returns ``(allow, text)``:
+      • allow=True  → the final passed the non-relaxed gate; deliver ``text``.
+      • allow=False → the gate would block; ``text`` is a neutral substitute
+        notice (the raw reasoning is SUPPRESSED, never delivered).
+
+    Runs entirely outside any open brain round-trip (the executor calls this AFTER
+    the round-trip closed), so ``is_brain_reasoning_leg`` is False here and the
+    gate behaves exactly as for external traffic — fail-closed.
+    """
+    request_id = f"relaxed-final-{uuid.uuid4().hex[:12]}"
+    # 1) Response inspection on the candidate final text (non-relaxed).
+    response_verdict = "clean"
+    response_content_sensitivity: Optional[str] = None
+    if _state.response_inspection_pipeline is not None and final_text:
+        try:
+            rid = identity.get("identity_id", request_id) if identity else request_id
+            aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
+            resp_result = _state.response_inspection_pipeline.inspect(
+                response_body=final_text, content_type="text/plain",
+                request_id=request_id, session_id=rid, agent_id=aid,
+            )
+            if not resp_result.skipped:
+                response_verdict = resp_result.verdict.lower()
+                response_content_sensitivity = resp_result.response_sensitivity
+        except Exception as exc:
+            # Fail-closed: an inspection error on a relaxed final must NOT pass.
+            logger.warning("gate_relaxed_final: inspection raised (%s) — denying", exc)
+            return False, (
+                "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's final "
+                "answer could not be cleared for delivery and was withheld.")
+    # 1a) DETERMINISTIC secret/credential PRE-FLOOR (LAURA-ORCH leakfix).
+    #     The classifier floor below (1b) catches sensitivity by CLASS (SSN,
+    #     credit card, sk- keys) but MISSED a verbatim AWS_SECRET_ACCESS_KEY
+    #     (no 40-char AWS pattern in its regex set; the suspicious-blob guard
+    #     misses because trailing "KEY=" breaks the bare 40-char token) and is
+    #     entirely defeated by a SPLIT-TOKEN payload ("First wJalr... then a
+    #     slash then K7MDENG ..."), which classifies PUBLIC on every layer
+    #     including ollama.  Both were live-proven by Laura.  The deterministic
+    #     secret detector (pure-python, no LLM, fail-closed) normalises +
+    #     de-obfuscates split forms, reassembles, and tests known key formats +
+    #     an entropy floor.  A hit FORCES response_verdict="blocked" REGARDLESS
+    #     of the LLM inspector verdict AND regardless of the caller's ceiling —
+    #     deterministic, not ceiling-gated.  This is the headline leak-closure.
+    if final_text:
+        try:
+            from yashigani.inspection import scan_secrets
+            secret_verdict = scan_secrets(final_text)
+        except Exception as exc:
+            # Fail-closed: a scan error on a candidate final must NOT pass.
+            logger.warning(
+                "gate_relaxed_final: secret detector raised (%s) — denying "
+                "(fail-closed)", exc)
+            return False, (
+                "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's "
+                "final answer could not be cleared for delivery and was withheld.")
+        if secret_verdict.is_secret:
+            logger.warning(
+                "gate_relaxed_final: DETERMINISTIC secret detector BLOCKED egress "
+                "— detector=%s reassembled=%s span_hash=%s (ollama-inspector "
+                "verdict was '%s'; deterministic block overrides it)",
+                secret_verdict.detector, secret_verdict.reassembled,
+                secret_verdict.span_hash, response_verdict)
+            try:
+                _metric_counter(
+                    "yashigani_orchestration_secret_blocks_total",
+                    "Deterministic secret-detector blocks on orchestration finals "
+                    "(distinct from the ollama inspector). detector labels which "
+                    "format/heuristic fired; reassembled=1 for split-token defeats.",
+                    ["detector", "reassembled"],
+                ).labels(
+                    detector=secret_verdict.detector or "unknown",
+                    reassembled=str(secret_verdict.reassembled).lower(),
+                ).inc()
+            except Exception:  # noqa: BLE001 — metric must never break the gate
+                pass
+            return False, (
+                "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's "
+                "final answer contained credential material and was withheld; "
+                "the raw content was not delivered.")
+    # 1b) DETERMINISTIC content-sensitivity floor (LAURA-ORCH leakfix, N2 pattern).
+    #     The ResponseInspectionPipeline above is an LLM inspector — it is
+    #     NON-deterministic and MISSES a secret on ~10-15% of finals, which is
+    #     precisely how a verbatim AWS_SECRET_ACCESS_KEY reached the user even with
+    #     the gate running.  So in ADDITION we run the REGEX layer of the sensitivity
+    #     classifier over the final text and feed OPA the STRICTER of
+    #     {inspection-sensitivity, regex-classified-sensitivity}.  A final carrying a
+    #     known-pattern credential (API key, SSN, credit card, OFFICIAL-SENSITIVE,
+    #     etc.) classifies CONFIDENTIAL/RESTRICTED deterministically → OPA denies →
+    #     suppressed, independent of the LLM inspector.
+    #
+    #     B6 FIX (2.25.5): previously called classify_decoded() (full 3-layer
+    #     pipeline including Ollama).  The Ollama layer is an INGRESS classifier
+    #     trained on user prompts; running it on outbound prose summaries of CLEAN
+    #     tool results caused false-positive RESTRICTED classifications (e.g.
+    #     qwen2.5:3b marks "The tool returned: [query result]" as RESTRICTED), which
+    #     forced response_verdict="blocked" on every clean orchestration final.
+    #     The fix: use ONLY the REGEX layer here — it detects real credentials
+    #     deterministically and produces zero false-positives on plain prose.  The
+    #     scan_secrets() check (step 1a) already covers high-entropy key formats
+    #     missed by the regex set.  The combined (regex + scan_secrets) floor is
+    #     equivalent to the previous intent, without the Ollama false-positive.
+    #
+    #     INJECTION DEFENCE IS UNCHANGED: the cloud-9 / SYSTEM-OVERRIDE exfil
+    #     payloads contain literal API-key patterns (sk-... etc.) that fire the
+    #     regex CONFIDENTIAL/RESTRICTED → still blocked deterministically.
+    if final_text and _state.sensitivity_classifier is not None:
+        try:
+            _regex_triggers: list[str] = []
+            classified = _state.sensitivity_classifier._scan_regex(
+                final_text, _regex_triggers).name
+        except Exception as exc:
+            # Fail-closed: a scan error on a candidate final must NOT pass.
+            logger.warning(
+                "gate_relaxed_final: regex classify raised (%s) — treating "
+                "final as RESTRICTED (fail-closed)", exc)
+            classified = "RESTRICTED"
+        response_content_sensitivity = _stricter_sensitivity(
+            response_content_sensitivity, classified)
+        # A brain final that regex-classifies CONFIDENTIAL/RESTRICTED contains a
+        # hard credential pattern.  Force a BLOCKED verdict so the response gate
+        # denies deterministically.
+        if classified in ("CONFIDENTIAL", "RESTRICTED"):
+            logger.warning(
+                "gate_relaxed_final: final regex-classifies %s — "
+                "BLOCKING egress of sensitive orchestration final (triggers=%s)",
+                classified, _regex_triggers)
+            response_verdict = "blocked"
+    # 1c) Deterministic block before OPA.  If step 1a (scan_secrets) or step 1b
+    #     (regex classifier) forced response_verdict="blocked", deny immediately
+    #     — independently of whether OPA is configured.  This ensures that
+    #     hard-pattern credentials are blocked even in YASHIGANI_OPA_OPTIONAL=true
+    #     deployments and in unit tests where OPA is not running.  This is the
+    #     single authoritative block point for deterministic denials.
+    if response_verdict == "blocked":
+        return False, (
+            "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's final "
+            "answer was identified as sensitive and was withheld; "
+            "the raw content was not delivered.")
+    # 2) OPA response-leg gate (non-relaxed) — fail-closed on absent allow.
+    if _state.opa_url:
+        resp_opa = await _opa_response_check(
+            identity=identity,
+            response_sensitivity=response_content_sensitivity,
+            prompt_sensitivity=prompt_sensitivity,
+            response_verdict=response_verdict,
+            pii_detected=False,
+        )
+        if not resp_opa.get("allow", False):
+            reason = resp_opa.get("reason", "response_policy_denied")
+            logger.warning(
+                "gate_relaxed_final: relaxed brain final BLOCKED by non-relaxed "
+                "response gate reason=%s — substituting neutral notice", reason)
+            return False, (
+                "[BLOCKED BY YASHIGANI POLICY] The orchestrator's final answer was "
+                f"withheld by the response policy ({reason}); the raw content was "
+                "not delivered.")
+    return True, final_text
 
 
 async def _opa_response_check(

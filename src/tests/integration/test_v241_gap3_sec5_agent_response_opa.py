@@ -27,6 +27,33 @@ from unittest.mock import MagicMock, AsyncMock, patch
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _noop_client_enforce(monkeypatch):
+    """No-op the #16 deny-only client-policy enforce gate for these tests.
+
+    agent_router runs evaluate_client_policies (clients_aggregate.rego) at INGRESS
+    (after the agent_call_allowed gate) and EGRESS (after the response-leg
+    agent_response_decision gate).  That gate takes the real-OPA branch, which
+    builds an mTLS internal_httpx_client and fail-closes with
+    'YASHIGANI_SERVICE_NAME is not set' in the unit/integration environment —
+    yielding deny code 'client_enforce_unavailable' before the response-leg OPA
+    decision under test is ever reached.
+
+    These tests exercise the GAP-3 / SEC-5 response-leg OPA logic specifically;
+    the client-policy aggregator has its own coverage.  Patch the gate to its
+    no-op allow shape so the response-leg decision is what is asserted.  This
+    mirrors the autouse _noop_client_enforce fixture in test_v250_p1_mcp_broker.
+
+    NOTE: agent_router imports evaluate_client_policies into its OWN namespace at
+    module load (top-level `from ... import evaluate_client_policies`), so the
+    patch target is the agent_router binding, not the _client_enforce source.
+    """
+    async def _allow(*_a, **_kw):
+        return {"allow": True, "deny": [], "obligations": []}
+    monkeypatch.setattr(
+        "yashigani.gateway.agent_router.evaluate_client_policies", _allow,
+        raising=True)
+
 def _make_registry(
     caller_agent_id: str,
     target_agent_id: str,

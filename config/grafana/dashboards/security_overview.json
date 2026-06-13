@@ -1,143 +1,666 @@
 {
   "uid": "yashigani-security",
-  "title": "Yashigani — Security Overview",
-  "tags": ["yashigani", "security"],
+  "title": "Yashigani \u2014 Security Overview",
+  "tags": [
+    "yashigani",
+    "security"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "CREDENTIAL_EXFIL Detections (1h)",
-      "gridPos": {"x":0,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_inspection_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1h])","legendFormat":"CREDENTIAL_EXFIL"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]},"mappings":[]}}
+      "id": 19,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Real-time security event feed: credential exfiltration detections, prompt injection hits, rate limit violations, OPA denials, auth failures, and audit chain integrity. First dashboard to open during a security incident."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "PROMPT_INJECTION Detections (1h)",
-      "gridPos": {"x":6,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_inspection_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1h])","legendFormat":"INJECTION_ONLY"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":10}]},"mappings":[]}}
-    },
-    {
-      "id": 3, "type": "stat", "title": "Rate Limit Violations (1h)",
-      "gridPos": {"x":12,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_ratelimit_violations_total[1h])","legendFormat":"Violations"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":10},{"color":"red","value":100}]},"mappings":[]}}
-    },
-    {
-      "id": 4, "type": "stat", "title": "OPA DENIED (1h)",
-      "gridPos": {"x":18,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_gateway_requests_total{action=\"DENIED\"}[1h])","legendFormat":"OPA Denied"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":5},{"color":"red","value":20}]},"mappings":[]}}
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "Detection Rate (per minute)",
-      "gridPos": {"x":0,"y":4,"w":12,"h":8},
+      "id": 1,
+      "type": "stat",
+      "title": "CREDENTIAL_EXFIL Detections (1h)",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_inspection_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1m])","legendFormat":"CREDENTIAL_EXFIL"},
-        {"expr":"rate(yashigani_inspection_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1m])","legendFormat":"INJECTION_ONLY"},
-        {"expr":"rate(yashigani_inspection_classifications_total{label=\"CLEAN\"}[1m])","legendFormat":"CLEAN"}
+        {
+          "expr": "increase(yashigani_classifier_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1h])",
+          "legendFormat": "CREDENTIAL_EXFIL"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
     },
     {
-      "id": 6, "type": "timeseries", "title": "Rate Limit Violations by Dimension",
-      "gridPos": {"x":12,"y":4,"w":12,"h":8},
+      "id": 2,
+      "type": "stat",
+      "title": "PROMPT_INJECTION Detections (1h)",
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_ratelimit_violations_total[1m])","legendFormat":"{{ dimension }}"}
+        {
+          "expr": "increase(yashigani_classifier_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1h])",
+          "legendFormat": "INJECTION_ONLY"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
     },
     {
-      "id": 7, "type": "timeseries", "title": "Admin Login Attempts",
-      "gridPos": {"x":0,"y":12,"w":12,"h":6},
+      "id": 3,
+      "type": "stat",
+      "title": "Rate Limit Violations (1h)",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_auth_login_attempts_total{outcome=\"success\"}[1m])","legendFormat":"Success"},
-        {"expr":"rate(yashigani_auth_login_attempts_total{outcome=\"failure\"}[1m])","legendFormat":"Failure"}
+        {
+          "expr": "increase(yashigani_ratelimit_violations_total[1h])",
+          "legendFormat": "Violations"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "OPA DENIED (1h)",
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_gateway_requests_total{action=\"DENIED\"}[1h])",
+          "legendFormat": "OPA Denied"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Detection Rate (per minute)",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_classifier_classifications_total{label=\"CREDENTIAL_EXFIL\"}[1m])",
+          "legendFormat": "CREDENTIAL_EXFIL"
+        },
+        {
+          "expr": "rate(yashigani_classifier_classifications_total{label=\"PROMPT_INJECTION_ONLY\"}[1m])",
+          "legendFormat": "INJECTION_ONLY"
+        },
+        {
+          "expr": "rate(yashigani_classifier_classifications_total{label=\"CLEAN\"}[1m])",
+          "legendFormat": "CLEAN"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Rate Limit Violations by Dimension",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_ratelimit_violations_total[1m])",
+          "legendFormat": "{{ dimension }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Admin Login Attempts",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_auth_login_attempts_total{outcome=\"success\"}[1m])",
+          "legendFormat": "Success"
+        },
+        {
+          "expr": "rate(yashigani_auth_login_attempts_total{outcome=\"failure\"}[1m])",
+          "legendFormat": "Failure"
+        }
       ]
     },
     {
-      "id": 8, "type": "timeseries", "title": "Audit Events by Type",
-      "gridPos": {"x":12,"y":12,"w":12,"h":6},
+      "id": 8,
+      "type": "timeseries",
+      "title": "Audit Events by Type",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
       "targets": [
-        {"expr":"rate(yashigani_audit_events_total[1m])","legendFormat":"{{ event_type }}"}
+        {
+          "expr": "rate(yashigani_audit_events_total[1m])",
+          "legendFormat": "{{ event_type }}"
+        }
       ]
     },
     {
-      "id": 9, "type": "stat", "title": "KSM Rotation Status",
-      "gridPos": {"x":0,"y":18,"w":8,"h":4},
-      "targets": [{"expr":"time() - yashigani_kms_rotation_last_success_timestamp_seconds","legendFormat":"Seconds since last rotation"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"unit":"s","thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":86400},{"color":"red","value":90000}]}}}
+      "id": 9,
+      "type": "stat",
+      "title": "KSM Rotation Status",
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "(time() - yashigani_kms_rotation_last_success_timestamp_seconds) and yashigani_kms_rotation_last_success_timestamp_seconds > 0",
+          "legendFormat": "Seconds since last rotation"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 86400
+              },
+              {
+                "color": "red",
+                "value": 90000
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 10, "type": "stat", "title": "KSM Rotation Failures (24h)",
-      "gridPos": {"x":8,"y":18,"w":8,"h":4},
-      "targets": [{"expr":"increase(yashigani_kms_rotations_total{outcome=\"failure\"}[24h])","legendFormat":"Failures"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]}}}
+      "id": 10,
+      "type": "stat",
+      "title": "KSM Rotation Failures (24h)",
+      "gridPos": {
+        "x": 8,
+        "y": 21,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_kms_rotations_total{outcome=\"failure\"}[24h])",
+          "legendFormat": "Failures"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 11, "type": "stat", "title": "Active Admin Sessions",
-      "gridPos": {"x":16,"y":18,"w":8,"h":4},
-      "targets": [{"expr":"yashigani_auth_active_sessions","legendFormat":"Sessions"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}}
+      "id": 11,
+      "type": "stat",
+      "title": "Active Admin Sessions",
+      "gridPos": {
+        "x": 16,
+        "y": 21,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_auth_active_sessions",
+          "legendFormat": "Sessions"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
-      "id": 12, "type": "row", "title": "Agent Security",
-      "gridPos": {"x":0,"y":22,"w":24,"h":1},
+      "id": 12,
+      "type": "row",
+      "title": "Agent Security",
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
       "collapsed": false
     },
     {
-      "id": 13, "type": "stat", "title": "Agent Auth Failures (24h)",
-      "gridPos": {"x":0,"y":23,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_agent_auth_failures_total[24h])","legendFormat":"Auth Failures"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"red","value":1}]},"mappings":[]}}
-    },
-    {
-      "id": 14, "type": "stat", "title": "Agent Calls Denied by RBAC (24h)",
-      "gridPos": {"x":6,"y":23,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_agent_calls_total{outcome=\"denied_rbac\"}[24h])","legendFormat":"RBAC Denied"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":10}]},"mappings":[]}}
-    },
-    {
-      "id": 15, "type": "stat", "title": "Agent Calls Denied by Inspection (24h)",
-      "gridPos": {"x":12,"y":23,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_agent_calls_total{outcome=\"denied_inspection\"}[24h])","legendFormat":"Inspection Denied"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}]},"mappings":[]}}
-    },
-    {
-      "id": 16, "type": "stat", "title": "Active Registered Agents",
-      "gridPos": {"x":18,"y":23,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_agent_registry_size{status=\"active\"}","legendFormat":"Active"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"blue","value":null}]}}}
-    },
-    {
-      "id": 17, "type": "timeseries", "title": "Agent Auth Failures (by reason)",
-      "gridPos": {"x":0,"y":27,"w":12,"h":6},
+      "id": 13,
+      "type": "stat",
+      "title": "Agent Auth Failures (24h)",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_agent_auth_failures_total[1m])","legendFormat":"{{ reason }}"}
+        {
+          "expr": "increase(yashigani_agent_auth_failures_total[24h])",
+          "legendFormat": "Auth Failures"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
     },
     {
-      "id": 18, "type": "timeseries", "title": "Agent Call Deny Rate (RBAC vs Inspection)",
-      "gridPos": {"x":12,"y":27,"w":12,"h":6},
+      "id": 14,
+      "type": "stat",
+      "title": "Agent Calls Denied by RBAC (24h)",
+      "gridPos": {
+        "x": 6,
+        "y": 26,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_agent_calls_total{outcome=\"denied_rbac\"}[1m])","legendFormat":"RBAC Denied"},
-        {"expr":"rate(yashigani_agent_calls_total{outcome=\"denied_inspection\"}[1m])","legendFormat":"Inspection Denied"},
-        {"expr":"rate(yashigani_agent_calls_total{outcome=\"allowed\"}[1m])","legendFormat":"Allowed"}
+        {
+          "expr": "increase(yashigani_agent_calls_total{outcome=\"denied_rbac\"}[24h])",
+          "legendFormat": "RBAC Denied"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10},"unit":"reqps"}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Agent Calls Denied by Inspection (24h)",
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_agent_calls_total{outcome=\"denied_inspection\"}[24h])",
+          "legendFormat": "Inspection Denied"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Active Registered Agents",
+      "gridPos": {
+        "x": 18,
+        "y": 26,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_agent_registry_size{status=\"active\"}",
+          "legendFormat": "Active"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Agent Auth Failures (by reason)",
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_agent_auth_failures_total[1m])",
+          "legendFormat": "{{ reason }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Agent Call Deny Rate (RBAC vs Inspection)",
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_agent_calls_total{outcome=\"denied_rbac\"}[1m])",
+          "legendFormat": "RBAC Denied"
+        },
+        {
+          "expr": "rate(yashigani_agent_calls_total{outcome=\"denied_inspection\"}[1m])",
+          "legendFormat": "Inspection Denied"
+        },
+        {
+          "expr": "rate(yashigani_agent_calls_total{outcome=\"allowed\"}[1m])",
+          "legendFormat": "Allowed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        }
+      }
     }
   ]
 }

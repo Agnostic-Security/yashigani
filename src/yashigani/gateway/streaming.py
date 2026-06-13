@@ -62,9 +62,12 @@ class StreamingInspector:
     and all chunks are forwarded.
     """
 
-    # Sensitivity levels that trigger stream termination (string values from
-    # SensitivityLevel enum — compared as strings to avoid circular imports).
+    # Sensitivity levels that trigger stream termination.
+    # R14/R15 (v2.25.5): internal levels are now ints 1–5; blocking threshold
+    # is level >= 3 (CONFIDENTIAL in the new model, equivalent to old CONFIDENTIAL/RESTRICTED).
+    # Legacy string names are kept for backward-compat with the helper methods.
     _BLOCKING_LEVELS = {"CONFIDENTIAL", "RESTRICTED"}
+    _BLOCKING_LEVEL_NUM = 3  # >= 3 triggers termination (CONFIDENTIAL, RESTRICTED, SENSITIVE)
 
     def __init__(
         self,
@@ -117,7 +120,11 @@ class StreamingInspector:
         # Layer 1: regex — always, on the new chunk text alone (fast enough)
         if self._classifier is not None:
             regex_level = self._run_regex(chunk_text)
-            if regex_level in self._BLOCKING_LEVELS:
+            _regex_blocks = (
+                (isinstance(regex_level, int) and regex_level >= self._BLOCKING_LEVEL_NUM)
+                or regex_level in self._BLOCKING_LEVELS
+            )
+            if _regex_blocks:
                 self._trigger_termination(f"regex:{regex_level}", chunk_text)
                 return False
 
@@ -127,7 +134,11 @@ class StreamingInspector:
             and self._chars_since_last_check >= self._interval
         ):
             ft_level = self._run_classifier(self._window)
-            if ft_level in self._BLOCKING_LEVELS:
+            _clf_blocks = (
+                (isinstance(ft_level, int) and ft_level >= self._BLOCKING_LEVEL_NUM)
+                or ft_level in self._BLOCKING_LEVELS
+            )
+            if _clf_blocks:
                 self._trigger_termination(f"classifier:{ft_level}", self._window)
                 return False
 
@@ -166,8 +177,10 @@ class StreamingInspector:
             # working.
             _classify = getattr(self._classifier, "classify_decoded", self._classifier.classify)
             result = _classify(self._full_text)
-            level = result.level.value
-            if level in self._BLOCKING_LEVELS:
+            # R14/R15 (v2.25.5): result.level is now int 1–5.
+            raw_level = result.level
+            level = raw_level if isinstance(raw_level, int) else raw_level.value
+            if (isinstance(level, int) and level >= self._BLOCKING_LEVEL_NUM) or level in self._BLOCKING_LEVELS:
                 self._trigger_termination(f"final:{level}", self._full_text[:200])
                 return False
         except Exception as exc:
@@ -182,28 +195,38 @@ class StreamingInspector:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _run_regex(self, text: str) -> str:
-        """Run Layer 1 regex scan. Returns level string (e.g. 'RESTRICTED')."""
+    def _run_regex(self, text: str) -> "str | int":
+        """Run Layer 1 regex scan. Returns level (int or legacy string).
+
+        R14/R15 (v2.25.5): _scan_regex now returns int; legacy callers that
+        compared the return value against _BLOCKING_LEVELS (string set) are
+        guarded by the updated check_chunk logic which handles both int and str.
+        """
         triggers: list[str] = []
         try:
             level = self._classifier._scan_regex(text, triggers)
-            return level.value
+            # _scan_regex returns int in v2.25.5+; return it directly.
+            if isinstance(level, int):
+                return level
+            return level.value  # backward-compat for old classifiers
         except Exception as exc:
             logger.debug("StreamingInspector regex scan error: %s", exc)
-            return "PUBLIC"
+            return 1  # PUBLIC int level
 
-    def _run_classifier(self, text: str) -> str:
-        """Run Layer 2 classifier scan. Returns level string."""
+    def _run_classifier(self, text: str) -> "str | int":
+        """Run Layer 2 classifier scan. Returns level (int or legacy string)."""
         triggers: list[str] = []
         try:
             level = self._classifier._scan_classifier(text, triggers)
-            return level.value
+            if isinstance(level, int):
+                return level
+            return level.value  # backward-compat for old classifiers
         except Exception as exc:
             logger.debug("StreamingInspector classifier scan error: %s", exc)
-            return "PUBLIC"
+            return 1  # PUBLIC int level
 
     # Deprecated alias — kept for one release cycle (v2.26.0 removal).
-    def _run_fasttext(self, text: str) -> str:
+    def _run_fasttext(self, text: str) -> "str | int":
         """Deprecated alias for _run_classifier. Removed in v2.26.0."""
         return self._run_classifier(text)
 

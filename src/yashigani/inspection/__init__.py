@@ -10,6 +10,11 @@ from yashigani.inspection.semantic_intent import (
     INTENT_INJECTION,
     INTENT_INDETERMINATE,
 )
+from yashigani.inspection.secret_detector import (
+    SecretVerdict,
+    scan as scan_secrets,
+    is_secret,
+)
 from yashigani.inspection.pipeline import (
     InspectionPipeline,
     PipelineResult,
@@ -24,6 +29,8 @@ from yashigani.inspection.pipeline import (
 __all__ = [
     "PromptInjectionClassifier", "ClassifierResult",
     "sanitize", "SanitizationResult",
+    # Deterministic secret/credential detector (LAURA-ORCH leakfix)
+    "SecretVerdict", "scan_secrets", "is_secret",
     "InspectionPipeline", "PipelineResult",
     # v2.26 — YSG-RISK-057 semantic-intent sidecar (content-filter v2)
     "SemanticIntentSidecar",

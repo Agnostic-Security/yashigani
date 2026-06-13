@@ -24,7 +24,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
+from yashigani.optimization.sensitivity_classifier import (
+    SensitivityLevel,
+    SensitivityResult,
+    _LEVEL_TO_LEGACY_STRING,
+)
 from yashigani.optimization.complexity_scorer import ComplexityLevel, ComplexityResult
 from yashigani.billing.budget_enforcer import BudgetSignal, BudgetState
 
@@ -98,6 +102,7 @@ class OptimizationEngine:
         budget: BudgetState,
         force_local: bool = False,
         force_cloud: bool = False,
+        allowed_local_default: str | None = None,
     ) -> RoutingDecision:
         """
         Evaluate all routing rules and return the optimal backend.
@@ -109,17 +114,37 @@ class OptimizationEngine:
             budget: Current budget state from BudgetEnforcer
             force_local: Identity-level override
             force_cloud: Identity-level override
+            allowed_local_default: LAURA-B1-OBS-1 — the local model the engine
+                must substitute for ``self._default_model`` whenever a local-route
+                rule (P1/P2/P3/P4/P7/P9) falls back to the local default.  The
+                router resolves this to a LOCAL model the caller is ACTUALLY
+                allocated (or to None when the caller is unrestricted/entitled to
+                the global default).  Without this, a caller allocated only a
+                NON-default local model (e.g. ``phi3.5``) — or a cloud-only caller
+                with no force_cloud — gets rewritten to the global ``default_local``
+                (``qwen2.5:3b``) and then DENIED by the B1 alloc-bind re-check for a
+                model they never asked for.  Over-restriction, not over-grant (the
+                security bar holds: we only ever substitute a model the caller is
+                allocated), but broken UX.  Substituting the caller's OWN allowed
+                local model serves them a model they are entitled to.  When None,
+                behaviour is BYTE-FOR-BYTE the legacy global-default path.
 
         Returns:
             RoutingDecision with provider, model, and full reasoning
         """
         start = time.monotonic_ns()
 
+        # LAURA-B1-OBS-1: the local default this caller may actually be served.
+        # Falls back to the global default for unrestricted/entitled callers
+        # (allowed_local_default=None) — legacy behaviour unchanged.
+        local_default = allowed_local_default or self._default_model
+
         # Resolve model alias
         provider, model, alias_force_local = self._resolve_alias(requested_model)
 
-        # P1: CONFIDENTIAL/RESTRICTED -> LOCAL (IMMUTABLE)
-        if sensitivity.level in (SensitivityLevel.CONFIDENTIAL, SensitivityLevel.RESTRICTED):
+        # P1: CONFIDENTIAL/RESTRICTED/SENSITIVE (levels 4–5) -> LOCAL (IMMUTABLE)
+        # R14/R15 (v2.25.5): level is now int 1–5; levels >= 4 are cloud-blocked.
+        if sensitivity.level >= SensitivityLevel.CONFIDENTIAL:
             # #25 risk-accepted cloud override (dual-admin, justified, TTL'd): if an
             # override is ACTIVE, the named cloud LLM may serve this sensitive request
             # instead of being pinned local. The customer has a cloud agreement and
@@ -131,7 +156,7 @@ class OptimizationEngine:
                     model=ov["model"],
                     route="cloud",
                     rule="P1-OVERRIDE",
-                    reason=(f"Sensitivity {sensitivity.level.value} routed to cloud "
+                    reason=(f"Sensitivity {sensitivity.level} routed to cloud "
                             f"{ov['provider']}/{ov['model']} under dual-admin risk-accepted "
                             f"override (justification: {ov.get('justification','')[:80]})"),
                     sensitivity=sensitivity,
@@ -140,14 +165,19 @@ class OptimizationEngine:
                     start_ns=start,
                 )
             # Check if admin configured a trusted cloud provider for this level
-            trusted = self._trusted_cloud.get(sensitivity.level.value)
+            # _trusted_cloud is keyed by legacy string (e.g. "CONFIDENTIAL").
+            # Convert numeric level to legacy key for backward-compat lookup.
+            _level_key: str = _LEVEL_TO_LEGACY_STRING.get(
+                int(sensitivity.level), str(sensitivity.level)
+            )
+            trusted = self._trusted_cloud.get(_level_key)
             if trusted:
                 return self._decide(
                     provider=trusted,
                     model=self._default_cloud_model,
                     route="cloud",
                     rule="P1",
-                    reason=f"Sensitivity {sensitivity.level.value} — trusted cloud ({trusted})",
+                    reason=f"Sensitivity {sensitivity.level} — trusted cloud ({trusted})",
                     sensitivity=sensitivity,
                     complexity=complexity,
                     budget=budget,
@@ -155,10 +185,10 @@ class OptimizationEngine:
                 )
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P1",
-                reason=f"Sensitivity {sensitivity.level.value} — local only",
+                reason=f"Sensitivity {sensitivity.level} — local only",
                 sensitivity=sensitivity,
                 complexity=complexity,
                 budget=budget,
@@ -169,7 +199,7 @@ class OptimizationEngine:
         if budget.signal == BudgetSignal.EXHAUSTED:
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P2",
                 reason=f"Cloud budget exhausted ({budget.pct}%) — local only",
@@ -183,7 +213,7 @@ class OptimizationEngine:
         if budget.signal == BudgetSignal.WARN:
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P3",
                 reason=f"Budget warning ({budget.pct}%) — prefer local",
@@ -197,7 +227,7 @@ class OptimizationEngine:
         if force_local or alias_force_local:
             return self._decide(
                 provider="ollama",
-                model=model if provider == "ollama" else self._default_model,
+                model=model if provider == "ollama" else local_default,
                 route="local",
                 rule="P4",
                 reason="Identity or alias force_local",
@@ -239,7 +269,7 @@ class OptimizationEngine:
         if complexity.level == ComplexityLevel.LOW:
             return self._decide(
                 provider="ollama",
-                model=self._default_model,
+                model=local_default,
                 route="local",
                 rule="P7",
                 reason="Complexity LOW — prefer local",
@@ -266,7 +296,7 @@ class OptimizationEngine:
         # P9: Fallback -> LOCAL
         return self._decide(
             provider="ollama",
-            model=self._default_model,
+            model=local_default,
             route="local",
             rule="P9",
             reason="Fallback — local default",
@@ -307,13 +337,19 @@ class OptimizationEngine:
     ) -> RoutingDecision:
         elapsed_us = (time.monotonic_ns() - start_ns) // 1000
 
+        # R14/R15 (v2.25.5): SensitivityResult.level is int (1–5).
+        # str(int) produces "4" not "RESTRICTED"; use the legacy-string map so
+        # RoutingDecision.sensitivity and the Prometheus label keep the historical
+        # string form (audit records, dashboards, downstream consumers expect strings).
+        _sens_label: str = _LEVEL_TO_LEGACY_STRING.get(int(sensitivity.level), "RESTRICTED")
+
         decision = RoutingDecision(
             provider=provider,
             model=model,
             route=route,
             rule=rule,
             reason=reason,
-            sensitivity=sensitivity.level.value,
+            sensitivity=_sens_label,
             complexity=complexity.level.value,
             budget_signal=budget.signal.value,
             budget_pct=budget.pct,
@@ -327,6 +363,39 @@ class OptimizationEngine:
             "OE decision: %s/%s (%s) rule=%s reason=%s [%dus]",
             provider, model, route, rule, reason, elapsed_us,
         )
+
+        # Emit Prometheus metrics for every routing decision (best-effort).
+        try:
+            from yashigani.metrics.registry import (
+                yashigani_routing_decisions_total,
+                yashigani_sensitivity_detections_total,
+                yashigani_complexity_scores_total,
+                yashigani_budget_exhausted_total,
+                yashigani_routing_p1_events_info,
+            )
+            yashigani_routing_decisions_total.labels(
+                rule=rule, route=route
+            ).inc()
+            yashigani_sensitivity_detections_total.labels(
+                level=_sens_label
+            ).inc()
+            yashigani_complexity_scores_total.labels(
+                level=complexity.level.value
+            ).inc()
+            # P2 = cloud budget exhausted → forced local; increment the exhausted counter.
+            if rule == "P2":
+                yashigani_budget_exhausted_total.inc()
+            # P1 = OPA routing safety-net (sensitive data blocked from cloud).
+            # Update the info gauge so the "P1 Routing Events" dashboard table is populated.
+            if rule == "P1":
+                yashigani_routing_p1_events_info.labels(
+                    identity_id=str(budget.identity_id),
+                    provider=str(provider),
+                    sensitivity_level=str(sensitivity.level),
+                ).set(1)
+        except Exception:  # noqa: BLE001 — metric must never break routing
+            pass
+
         return decision
 
     def update_aliases(self, aliases: dict[str, tuple[str, str, bool]]) -> None:

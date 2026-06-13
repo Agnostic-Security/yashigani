@@ -1,183 +1,776 @@
 {
   "uid": "yashigani-agent-activity",
-  "title": "Yashigani — Agent Activity",
-  "tags": ["yashigani", "agents"],
+  "title": "Yashigani \u2014 Agent Activity",
+  "tags": [
+    "yashigani",
+    "agents"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "Total Requests (1h)",
-      "gridPos": {"x":0,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_gateway_requests_total[1h])","legendFormat":"Requests"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}}
+      "id": 22,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Tracks every AI agent request through the gateway \u2014 volume, allow/deny decisions, per-agent breakdown, latency. Use this to see which agents are most active and whether policy is working as expected."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "Allowed (1h)",
-      "gridPos": {"x":6,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_gateway_requests_total{action=\"ALLOWED\"}[1h])","legendFormat":"Allowed"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null}]}}}
-    },
-    {
-      "id": 3, "type": "stat", "title": "Denied (1h)",
-      "gridPos": {"x":12,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_gateway_requests_total{action=\"DENIED\"}[1h])","legendFormat":"Denied"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":5},{"color":"red","value":20}]}}}
-    },
-    {
-      "id": 4, "type": "stat", "title": "Rate Limited (1h)",
-      "gridPos": {"x":18,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_gateway_requests_total{action=\"RATE_LIMITED\"}[1h])","legendFormat":"Rate Limited"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":10},{"color":"red","value":100}]}}}
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "Request Rate by Agent",
-      "gridPos": {"x":0,"y":4,"w":24,"h":8},
+      "id": 1,
+      "type": "stat",
+      "title": "Total Requests (1h)",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_gateway_requests_total[1m])","legendFormat":"{{ agent_id }} [{{ action }}]"}
+        {
+          "expr": "increase(yashigani_gateway_requests_total[1h])",
+          "legendFormat": "Requests"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":5}}}
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
-      "id": 6, "type": "timeseries", "title": "Request Throughput — Allowed vs Denied",
-      "gridPos": {"x":0,"y":12,"w":12,"h":7},
+      "id": 2,
+      "type": "stat",
+      "title": "Allowed (1h)",
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"sum(rate(yashigani_gateway_requests_total{action=\"ALLOWED\"}[1m]))","legendFormat":"Allowed"},
-        {"expr":"sum(rate(yashigani_gateway_requests_total{action=\"DENIED\"}[1m]))","legendFormat":"Denied"},
-        {"expr":"sum(rate(yashigani_gateway_requests_total{action=\"RATE_LIMITED\"}[1m]))","legendFormat":"Rate Limited"}
+        {
+          "expr": "increase(yashigani_gateway_requests_total{action=\"ALLOWED\"}[1h])",
+          "legendFormat": "Allowed"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10},"unit":"reqps"}}
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 7, "type": "timeseries", "title": "Detection Rate by Agent",
-      "gridPos": {"x":12,"y":12,"w":12,"h":7},
+      "id": 3,
+      "type": "stat",
+      "title": "Denied (1h)",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_inspection_classifications_total{label!=\"CLEAN\"}[1m])","legendFormat":"{{ label }}"}
+        {
+          "expr": "increase(yashigani_gateway_requests_total{action=\"DENIED\"}[1h])",
+          "legendFormat": "Denied"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10}}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 8, "type": "timeseries", "title": "Gateway Latency by Agent (p95)",
-      "gridPos": {"x":0,"y":19,"w":12,"h":7},
+      "id": 4,
+      "type": "stat",
+      "title": "Rate Limited (1h)",
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"histogram_quantile(0.95, sum by (agent_id, le) (rate(yashigani_gateway_request_duration_seconds_bucket[5m])))","legendFormat":"{{ agent_id }} p95"},
-        {"expr":"histogram_quantile(0.50, sum by (agent_id, le) (rate(yashigani_gateway_request_duration_seconds_bucket[5m])))","legendFormat":"{{ agent_id }} p50"}
+        {
+          "expr": "increase(yashigani_gateway_requests_total{action=\"RATE_LIMITED\"}[1h])",
+          "legendFormat": "Rate Limited"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"s"}}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 9, "type": "timeseries", "title": "Inspection Pipeline Latency by Agent (p95)",
-      "gridPos": {"x":12,"y":19,"w":12,"h":7},
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request Rate by Agent",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 8
+      },
       "targets": [
-        {"expr":"histogram_quantile(0.95, sum by (agent_id, le) (rate(yashigani_inspection_duration_seconds_bucket[5m])))","legendFormat":"{{ agent_id }} p95"},
-        {"expr":"histogram_quantile(0.50, sum by (agent_id, le) (rate(yashigani_inspection_duration_seconds_bucket[5m])))","legendFormat":"{{ agent_id }} p50"}
+        {
+          "expr": "rate(yashigani_gateway_requests_total[1m])",
+          "legendFormat": "{{ agent_id }} [{{ action }}]"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"s"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        }
+      }
     },
     {
-      "id": 10, "type": "timeseries", "title": "Block Rate per Agent (% of requests)",
-      "gridPos": {"x":0,"y":26,"w":12,"h":6},
+      "id": 6,
+      "type": "timeseries",
+      "title": "Request Throughput \u2014 Allowed vs Denied",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 7
+      },
       "targets": [
-        {"expr":"sum by (agent_id) (rate(yashigani_gateway_requests_total{action=~\"DENIED|RATE_LIMITED\"}[5m])) / sum by (agent_id) (rate(yashigani_gateway_requests_total[5m]))","legendFormat":"{{ agent_id }}"}
+        {
+          "expr": "sum(rate(yashigani_gateway_requests_total{action=\"ALLOWED\"}[1m]))",
+          "legendFormat": "Allowed"
+        },
+        {
+          "expr": "sum(rate(yashigani_gateway_requests_total{action=\"DENIED\"}[1m]))",
+          "legendFormat": "Denied"
+        },
+        {
+          "expr": "sum(rate(yashigani_gateway_requests_total{action=\"RATE_LIMITED\"}[1m]))",
+          "legendFormat": "Rate Limited"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"percentunit","min":0,"max":1,"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":5}}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        }
+      }
     },
     {
-      "id": 11, "type": "timeseries", "title": "Request Body Size Distribution",
-      "gridPos": {"x":12,"y":26,"w":12,"h":6},
+      "id": 7,
+      "type": "timeseries",
+      "title": "Detection Rate by Agent",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 7
+      },
       "targets": [
-        {"expr":"histogram_quantile(0.50, rate(yashigani_gateway_request_body_bytes_bucket[5m]))","legendFormat":"p50"},
-        {"expr":"histogram_quantile(0.95, rate(yashigani_gateway_request_body_bytes_bucket[5m]))","legendFormat":"p95"},
-        {"expr":"histogram_quantile(0.99, rate(yashigani_gateway_request_body_bytes_bucket[5m]))","legendFormat":"p99"}
+        {
+          "expr": "rate(yashigani_classifier_classifications_total{label!=\"CLEAN\"}[1m])",
+          "legendFormat": "{{ label }}"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"bytes"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
     },
     {
-      "id": 12, "type": "table", "title": "Top Agents — Last 5 min",
-      "gridPos": {"x":0,"y":32,"w":24,"h":6},
+      "id": 8,
+      "type": "timeseries",
+      "title": "Gateway Latency by Agent (p95)",
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 12,
+        "h": 7
+      },
       "targets": [
-        {"expr":"topk(10, sum by (agent_id) (increase(yashigani_gateway_requests_total[5m])))","legendFormat":"{{ agent_id }}","instant":true}
+        {
+          "expr": "histogram_quantile(0.95, sum by (agent_id, le) (rate(yashigani_gateway_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{ agent_id }} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (agent_id, le) (rate(yashigani_gateway_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{ agent_id }} p50"
+        }
       ],
-      "options": {"sortBy":[{"displayName":"Value","desc":true}]},
-      "transformations": [{"id":"organize","options":{"renameByName":{"agent_id":"Agent","Value":"Requests (5m)"}}}]
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
     },
     {
-      "id": 13, "type": "row", "title": "Agent-to-Agent Communication",
-      "gridPos": {"x":0,"y":38,"w":24,"h":1},
+      "id": 9,
+      "type": "timeseries",
+      "title": "Inspection Pipeline Latency by Agent (p95)",
+      "gridPos": {
+        "x": 12,
+        "y": 22,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (agent_id, le) (rate(yashigani_classifier_latency_ms_bucket[5m]))) / 1000",
+          "legendFormat": "{{ agent_id }} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (agent_id, le) (rate(yashigani_classifier_latency_ms_bucket[5m]))) / 1000",
+          "legendFormat": "{{ agent_id }} p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Block Rate per Agent (% of requests)",
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum by (agent_id) (rate(yashigani_gateway_requests_total{action=~\"DENIED|RATE_LIMITED\"}[5m])) / sum by (agent_id) (rate(yashigani_gateway_requests_total[5m]))",
+          "legendFormat": "{{ agent_id }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Request Body Size Distribution",
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(yashigani_gateway_request_body_bytes_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yashigani_gateway_request_body_bytes_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(yashigani_gateway_request_body_bytes_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Top Agents \u2014 Last 5 min",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (agent_id) (increase(yashigani_gateway_requests_total[5m])))",
+          "legendFormat": "{{ agent_id }}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "agent_id": "Agent",
+              "Value": "Requests (5m)"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Agent-to-Agent Communication",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
       "collapsed": false
     },
     {
-      "id": 14, "type": "stat", "title": "Agent Registry Size (Active)",
-      "gridPos": {"x":0,"y":39,"w":6,"h":4},
-      "targets": [{"expr":"yashigani_agent_registry_size{status=\"active\"}","legendFormat":"Active Agents"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"blue","value":null}]}}}
-    },
-    {
-      "id": 15, "type": "stat", "title": "Agent Auth Failures (1h)",
-      "gridPos": {"x":6,"y":39,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_agent_auth_failures_total[1h])","legendFormat":"Auth Failures"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":3},{"color":"red","value":10}]}}}
-    },
-    {
-      "id": 16, "type": "stat", "title": "Agent Calls Allowed (1h)",
-      "gridPos": {"x":12,"y":39,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_agent_calls_total{outcome=\"allowed\"}[1h])","legendFormat":"Allowed"}],
-      "options": {"colorMode":"value","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null}]}}}
-    },
-    {
-      "id": 17, "type": "stat", "title": "Agent Calls Denied (1h)",
-      "gridPos": {"x":18,"y":39,"w":6,"h":4},
-      "targets": [{"expr":"increase(yashigani_agent_calls_total{outcome=~\"denied_rbac|denied_inspection\"}[1h])","legendFormat":"Denied"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":10}]}}}
-    },
-    {
-      "id": 18, "type": "timeseries", "title": "Agent-to-Agent Call Volume",
-      "gridPos": {"x":0,"y":43,"w":16,"h":8},
+      "id": 14,
+      "type": "stat",
+      "title": "Agent Registry Size (Active)",
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"sum by (caller_agent_id, target_agent_id) (rate(yashigani_agent_calls_total[1m]))","legendFormat":"{{ caller_agent_id }} → {{ target_agent_id }}"}
+        {
+          "expr": "yashigani_agent_registry_size{status=\"active\"}",
+          "legendFormat": "Active Agents"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10},"unit":"reqps"}}
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 19, "type": "piechart", "title": "Agent Call Disposition Breakdown",
-      "gridPos": {"x":16,"y":43,"w":8,"h":8},
+      "id": 15,
+      "type": "stat",
+      "title": "Agent Auth Failures (1h)",
+      "gridPos": {
+        "x": 6,
+        "y": 42,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"sum by (outcome) (increase(yashigani_agent_calls_total[1h]))","legendFormat":"{{ outcome }}","instant":true}
+        {
+          "expr": "increase(yashigani_agent_auth_failures_total[1h])",
+          "legendFormat": "Auth Failures"
+        }
       ],
-      "options": {"pieType":"donut","displayLabels":["name","percent"]},
-      "fieldConfig": {"overrides":[
-        {"matcher":{"id":"byName","options":"allowed"},"properties":[{"id":"color","value":{"fixedColor":"green","mode":"fixed"}}]},
-        {"matcher":{"id":"byName","options":"denied_rbac"},"properties":[{"id":"color","value":{"fixedColor":"red","mode":"fixed"}}]},
-        {"matcher":{"id":"byName","options":"denied_inspection"},"properties":[{"id":"color","value":{"fixedColor":"orange","mode":"fixed"}}]}
-      ]}
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 20, "type": "timeseries", "title": "Agent Call Latency p95 / p50 (by caller → target)",
-      "gridPos": {"x":0,"y":51,"w":12,"h":7},
+      "id": 16,
+      "type": "stat",
+      "title": "Agent Calls Allowed (1h)",
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"histogram_quantile(0.95, sum by (caller_agent_id, target_agent_id, le) (rate(yashigani_agent_call_duration_seconds_bucket[5m])))","legendFormat":"{{ caller_agent_id }}→{{ target_agent_id }} p95"},
-        {"expr":"histogram_quantile(0.50, sum by (caller_agent_id, target_agent_id, le) (rate(yashigani_agent_call_duration_seconds_bucket[5m])))","legendFormat":"{{ caller_agent_id }}→{{ target_agent_id }} p50"}
+        {
+          "expr": "increase(yashigani_agent_calls_total{outcome=\"allowed\"}[1h])",
+          "legendFormat": "Allowed"
+        }
       ],
-      "fieldConfig": {"defaults":{"unit":"s","custom":{"drawStyle":"line","lineWidth":2}}}
+      "options": {
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
     },
     {
-      "id": 21, "type": "timeseries", "title": "Agent Auth Failures Rate (by reason)",
-      "gridPos": {"x":12,"y":51,"w":12,"h":7},
+      "id": 17,
+      "type": "stat",
+      "title": "Agent Calls Denied (1h)",
+      "gridPos": {
+        "x": 18,
+        "y": 42,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"rate(yashigani_agent_auth_failures_total[1m])","legendFormat":"{{ reason }}"}
+        {
+          "expr": "increase(yashigani_agent_calls_total{outcome=~\"denied_rbac|denied_inspection\"}[1h])",
+          "legendFormat": "Denied"
+        }
       ],
-      "fieldConfig": {"defaults":{"custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":10},"unit":"reqps"}},
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Agent-to-Agent Call Volume",
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 16,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (caller_agent_id, target_agent_id) (rate(yashigani_agent_calls_total[1m]))",
+          "legendFormat": "{{ caller_agent_id }} \u2192 {{ target_agent_id }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "piechart",
+      "title": "Agent Call Disposition Breakdown",
+      "gridPos": {
+        "x": 16,
+        "y": 46,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(yashigani_agent_calls_total[1h]))",
+          "legendFormat": "{{ outcome }}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "pieType": "donut",
+        "displayLabels": [
+          "name",
+          "percent"
+        ]
+      },
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "allowed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "denied_rbac"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "denied_inspection"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Agent Call Latency p95 / p50 (by caller \u2192 target)",
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (caller_agent_id, target_agent_id, le) (rate(yashigani_agent_call_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{ caller_agent_id }}\u2192{{ target_agent_id }} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (caller_agent_id, target_agent_id, le) (rate(yashigani_agent_call_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{ caller_agent_id }}\u2192{{ target_agent_id }} p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Agent Auth Failures Rate (by reason)",
+      "gridPos": {
+        "x": 12,
+        "y": 54,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "rate(yashigani_agent_auth_failures_total[1m])",
+          "legendFormat": "{{ reason }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        }
+      },
       "alert": {
         "name": "Agent Auth Failure Spike",
-        "conditions": [{"type":"query","query":{"params":["A","5m","now"]},"reducer":{"type":"avg"},"evaluator":{"type":"gt","params":[0.5]}}],
+        "conditions": [
+          {
+            "type": "query",
+            "query": {
+              "params": [
+                "A",
+                "5m",
+                "now"
+              ]
+            },
+            "reducer": {
+              "type": "avg"
+            },
+            "evaluator": {
+              "type": "gt",
+              "params": [
+                0.5
+              ]
+            }
+          }
+        ],
         "executionErrorState": "alerting",
         "noDataState": "ok",
         "frequency": "1m"

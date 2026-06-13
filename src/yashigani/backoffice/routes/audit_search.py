@@ -37,6 +37,59 @@ _EXPORT_ROW_CAP = 10_000
 
 
 # ---------------------------------------------------------------------------
+# Facets — source values for the audit-search dropdown filters (R19 / R20).
+#
+# These are sourced from the audit model's emitted verdict/outcome strings and
+# actor kinds (audit/schema.py): inspection verdicts (CLEAN/FLAGGED/BLOCKED),
+# OPA decisions (allow/deny/redact), auth outcomes (attempt/success/failure),
+# masking actions (logged/redacted/blocked), error outcomes (exception/
+# not_configured/undefined), and the pseudonymization/masking pipeline. Each
+# entry is {value, label}; the leading "*" = All is the explicit wildcard so the
+# UI never relies on an implicit blank.
+#
+# Kept as a curated constant (not a live log scan) so the dropdown is complete
+# and stable even on a fresh deployment with an empty audit log. The verdict
+# filter matches case-insensitively as a substring (see _Filters.matches_record),
+# so these canonical tokens cover the variants the gateway emits.
+# ---------------------------------------------------------------------------
+
+_VERDICT_FACETS: list[dict] = [
+    {"value": "", "label": "* (All verdicts)"},
+    {"value": "allow", "label": "Allow"},
+    {"value": "deny", "label": "Deny"},
+    {"value": "blocked", "label": "Blocked"},
+    {"value": "redact", "label": "Redact / Pseudonymize"},
+    {"value": "clean", "label": "Clean"},
+    {"value": "flagged", "label": "Flagged"},
+    {"value": "attempt", "label": "Attempt"},
+    {"value": "success", "label": "Success"},
+    {"value": "failure", "label": "Failure"},
+    {"value": "exception", "label": "Exception / Error"},
+    {"value": "forwarded", "label": "Forwarded"},
+    {"value": "discarded", "label": "Discarded"},
+]
+
+# R20 — actor / source-type. Each entry carries the substring matched against the
+# event_type so the filter is honest about what the audit model actually emits.
+_SOURCE_TYPE_FACETS: list[dict] = [
+    {"value": "", "label": "* (All sources)"},
+    {"value": "USER", "label": "User"},
+    {"value": "AGENT", "label": "Agent"},
+    {"value": "MCP", "label": "MCP server"},
+    {"value": "API", "label": "API client"},
+    {"value": "ORCHESTRATION", "label": "Orchestration"},
+    {"value": "ADMIN", "label": "Admin"},
+]
+
+
+@router.get("/facets")
+async def audit_facets(session: AdminSession) -> dict:  # noqa: ARG001 — auth gate
+    """Source values for the audit-search Verdict (R19) and source-type (R20)
+    dropdown filters. Stable + complete on a fresh deployment."""
+    return {"verdicts": _VERDICT_FACETS, "source_types": _SOURCE_TYPE_FACETS}
+
+
+# ---------------------------------------------------------------------------
 # Search endpoint
 # ---------------------------------------------------------------------------
 
@@ -66,6 +119,11 @@ async def search_audit_log(
     verdict: Optional[str] = Query(
         default=None,
         description="Inspection verdict (FORWARDED, DISCARDED, DENIED, BLOCKED)",
+        max_length=64,
+    ),
+    source_type: Optional[str] = Query(
+        default=None,
+        description="R20 — actor/source type substring match on event_type (USER, AGENT, MCP, API, …)",
         max_length=64,
     ),
     user: Optional[str] = Query(
@@ -102,6 +160,7 @@ async def search_audit_log(
         event_type=event_type,
         agent_id=agent_id,
         verdict=verdict,
+        source_type=source_type,
         user=user,
         free_text=free_text,
     )
@@ -138,6 +197,7 @@ async def export_filtered_audit_log(
     event_type: Optional[str] = Query(default=None, max_length=128),
     agent_id: Optional[str] = Query(default=None, max_length=256),
     verdict: Optional[str] = Query(default=None, max_length=64),
+    source_type: Optional[str] = Query(default=None, max_length=64),
     user: Optional[str] = Query(default=None, max_length=256),
     free_text: Optional[str] = Query(default=None, max_length=256),
 ) -> StreamingResponse:
@@ -159,6 +219,7 @@ async def export_filtered_audit_log(
         event_type=event_type,
         agent_id=agent_id,
         verdict=verdict,
+        source_type=source_type,
         user=user,
         free_text=free_text,
     )
@@ -186,7 +247,7 @@ async def export_filtered_audit_log(
 class _Filters:
     __slots__ = (
         "date_from", "date_to", "event_type", "agent_id",
-        "verdict", "user", "free_text",
+        "verdict", "source_type", "user", "free_text",
     )
 
     def __init__(
@@ -198,12 +259,16 @@ class _Filters:
         verdict: Optional[str],
         user: Optional[str],
         free_text: Optional[str],
+        source_type: Optional[str] = None,
     ) -> None:
         self.date_from = date_from[:10] if date_from else None
         self.date_to = date_to[:10] if date_to else None
         self.event_type = event_type
         self.agent_id = agent_id
         self.verdict = verdict
+        # R20 — actor/source-type: matched case-insensitively as a substring of
+        # the event_type (e.g. "AGENT" matches AGENT_CALL_ALLOWED). "*" or "" = all.
+        self.source_type = source_type if (source_type and source_type != "*") else None
         self.user = user
         self.free_text = free_text.lower() if free_text else None
 
@@ -231,8 +296,19 @@ class _Filters:
                 return False
 
         if self.verdict:
-            rec_verdict = record.get("action", record.get("verdict", ""))
+            # Search several fields the audit model uses for verdict/outcome so
+            # the R19 dropdown tokens (allow/deny/blocked/redact/clean/flagged/
+            # attempt/failure/exception/…) match wherever they're emitted.
+            rec_verdict = " ".join(str(record.get(k, "")) for k in (
+                "action", "verdict", "outcome", "opa_decision", "decision",
+                "inspection_verdict", "response_inspection_verdict", "action_taken",
+            ))
             if self.verdict.upper() not in rec_verdict.upper():
+                return False
+
+        if self.source_type:
+            # Match the actor/source kind against the event_type token.
+            if self.source_type.upper() not in str(record.get("event_type", "")).upper():
                 return False
 
         if self.user:

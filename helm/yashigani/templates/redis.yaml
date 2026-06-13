@@ -70,10 +70,10 @@ spec:
                 --tls-ca-cert-file /run/secrets/ca_bundle.crt \
                 --tls-auth-clients yes \
                 --tls-protocols "TLSv1.2 TLSv1.3" \
-                --save "" \
-                --appendonly no \
+                --appendonly yes \
+                --appendfsync everysec \
                 --maxmemory 256mb \
-                --maxmemory-policy allkeys-lru \
+                --maxmemory-policy volatile-lru \
                 --requirepass "$(REDIS_PASSWORD)"
           ports:
             - name: redis-tls
@@ -85,10 +85,10 @@ spec:
             - "-c"
             - |
               redis-server \
-                --save "" \
-                --appendonly no \
+                --appendonly yes \
+                --appendfsync everysec \
                 --maxmemory 256mb \
-                --maxmemory-policy allkeys-lru \
+                --maxmemory-policy volatile-lru \
                 --requirepass "$(REDIS_PASSWORD)"
           ports:
             - name: redis

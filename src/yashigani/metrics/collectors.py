@@ -41,6 +41,9 @@ class MetricsCollector:
         rbac_store=None,
         agent_registry=None,
         backend_registry=None,
+        pool_manager=None,
+        budget_enforcer=None,
+        session_store=None,
         poll_interval_seconds: int = 15,
     ) -> None:
         self._monitor = resource_monitor
@@ -51,6 +54,9 @@ class MetricsCollector:
         self._rbac_store = rbac_store
         self._agent_registry = agent_registry
         self._backend_registry = backend_registry
+        self._pool_manager = pool_manager
+        self._budget_enforcer = budget_enforcer
+        self._session_store = session_store
         self._interval = poll_interval_seconds
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -195,3 +201,66 @@ class MetricsCollector:
                 )
             except Exception as exc:
                 logger.debug("Agent registry metrics error: %s", exc)
+
+        # ── Pool Manager ─────────────────────────────────────────────────────
+        if self._pool_manager is not None:
+            try:
+                from yashigani.metrics.registry import (
+                    yashigani_pool_containers_active,
+                    yashigani_pool_containers_active_by_service,
+                    yashigani_pool_ollama_instances,
+                    yashigani_pool_container_info,
+                )
+                containers = self._pool_manager.list_all()
+                yashigani_pool_containers_active.set(len(containers))
+
+                # Per-service counts
+                svc_counts: dict[str, int] = {}
+                for cinfo in containers:
+                    svc = getattr(cinfo, "service_slug", "unknown")
+                    svc_counts[svc] = svc_counts.get(svc, 0) + 1
+                for svc, cnt in svc_counts.items():
+                    yashigani_pool_containers_active_by_service.labels(service=svc).set(cnt)
+
+                # Ollama instance count
+                ollama_count = sum(
+                    1 for c in containers
+                    if "ollama" in getattr(c, "service_slug", "").lower()
+                )
+                yashigani_pool_ollama_instances.set(ollama_count)
+
+                # Per-container info gauge
+                for cinfo in containers:
+                    yashigani_pool_container_info.labels(
+                        container_id=getattr(cinfo, "container_id", "")[:32],
+                        service=getattr(cinfo, "service_slug", ""),
+                        agent_id=getattr(cinfo, "identity_id", ""),
+                        status=getattr(cinfo, "status", ""),
+                    ).set(1)
+            except Exception as exc:
+                logger.debug("Pool Manager metrics error: %s", exc)
+
+        # ── Budget utilisation (group-level) ─────────────────────────────────
+        # Identity-level utilisation is updated inline by the budget enforcer.
+        # We poll group-level utilisation here (periodic, not per-request).
+        if self._budget_enforcer is not None:
+            try:
+                from yashigani.metrics.registry import yashigani_budget_utilisation_pct
+                groups = self._budget_enforcer.list_group_utilisation()
+                for group_id, pct in groups.items():
+                    yashigani_budget_utilisation_pct.labels(
+                        identity_id="", group_id=group_id
+                    ).set(pct)
+            except Exception as exc:
+                logger.debug("Budget group utilisation metrics error: %s", exc)
+
+        # ── Active sessions ───────────────────────────────────────────────────
+        # Polls the session store for a live count of valid Redis session keys.
+        # Wires yashigani_auth_active_sessions used by the Security Overview
+        # dashboard "Active Sessions" stat panel.
+        if self._session_store is not None:
+            try:
+                from yashigani.metrics.registry import auth_active_sessions
+                auth_active_sessions.set(self._session_store.count_active_all())
+            except Exception as exc:
+                logger.debug("Session store active-sessions metrics error: %s", exc)

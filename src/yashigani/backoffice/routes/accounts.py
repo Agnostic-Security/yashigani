@@ -8,10 +8,17 @@ BOPLA note (issue #90): list_admins and create_admin use explicit
 response_model= declarations backed by AdminAccountPublic /
 AdminCreateResponse to guarantee that password_hash, totp_secret,
 recovery_codes, and lockout counters are never leaked in list responses.
+
+N1 enforcement (2.25.5): GET /admin/accounts/enforcement exposes the live
+admin-count state and whether the system is below the minimum floor.
+The UI consumes this to surface "you must add a second admin" banners.
+All mutation guards (delete, disable, PUT disable) are also wired here.
 """
 
-# Last updated: 2026-05-09T00:00:00+01:00
+# Last updated: 2026-06-13T00:00:00+01:00
 from __future__ import annotations
+
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -34,6 +41,68 @@ class CreateAdminRequest(BaseModel):
 
 class ForceResetRequest(BaseModel):
     action: str = Field(pattern=r"^(password_reset|totp_reprovision)$")
+
+
+class UpdateAdminRequest(BaseModel):
+    """R5 (2.25.5): editable admin-account fields.
+
+    email   — admin usernames are emails; this updates the contact/email column
+              (used as the Grafana alert contact). Optional; omit to leave as-is.
+    disabled — set the active/disabled status. Optional; omit to leave as-is.
+               Honours the same min-active guard as POST /{username}/disable.
+
+    NOTE (SoD-001): account_tier / role is deliberately NOT editable here. Admin
+    and user identities are strictly separate by design (separate stores +
+    collision guards in create_admin/create_user); flipping a tier in place would
+    collapse that boundary. A tier change must go through delete + recreate in the
+    correct store. Flagged for design review if in-place role change is wanted.
+    """
+    email: Optional[str] = Field(
+        default=None,
+        min_length=5,
+        max_length=254,
+        pattern=r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$",
+    )
+    disabled: Optional[bool] = None
+
+
+@router.get("/enforcement")
+async def get_enforcement_status(session: AdminSession):
+    """N1 (2.25.5): Return the live admin-count enforcement state.
+
+    Designed to be polled by the UI on login and on the Accounts page to surface
+    the 'you must add a second admin' banner when total < min_total.
+
+    Response fields:
+      total          — total admin accounts (enabled + disabled)
+      active         — active (non-disabled) admin accounts
+      min_total      — hard floor for total admins (delete guard threshold)
+      min_active     — hard floor for active admins (disable guard threshold)
+      soft_target    — recommended target for separation of duties
+      below_minimum  — True when total < min_total (system is not safe to operate)
+      below_active_minimum — True when active < min_active
+      below_soft_target    — True when total < soft_target (advisory, not enforced)
+      action_required      — True when any hard minimum is unmet
+
+    NIST AC-2, NIST AC-5 / SOC 2 CC6.2 / ASVS V2.1.
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    total = await state.auth_service.total_admin_count()
+    active = await state.auth_service.active_admin_count()
+    below_minimum = total < state.admin_min_total
+    below_active_minimum = active < state.admin_min_active
+    return {
+        "total": total,
+        "active": active,
+        "min_total": state.admin_min_total,
+        "min_active": state.admin_min_active,
+        "soft_target": state.admin_soft_target,
+        "below_minimum": below_minimum,
+        "below_active_minimum": below_active_minimum,
+        "below_soft_target": total < state.admin_soft_target,
+        "action_required": below_minimum or below_active_minimum,
+    }
 
 
 @router.get("")
@@ -289,6 +358,75 @@ async def force_reset(username: str, body: ForceResetRequest, session: StepUpAdm
 
     state.audit_writer.write(_config_event(session.account_id, f"admin_{body.action}", username, "forced", account_tier=session.account_tier))
     return {"status": "ok"}
+
+
+@router.put("/{username}")
+async def update_admin(username: str, body: UpdateAdminRequest, session: StepUpAdminSession):
+    """R5 (2.25.5): edit an admin account's email and/or active status.
+
+    Step-up (TOTP) gated, modelled on the other mutating admin routes
+    (delete/disable/force-reset). Status changes honour the min-active guard.
+    Tier/role is NOT editable here (SoD-001 — see UpdateAdminRequest docstring).
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    assert state.session_store is not None  # set unconditionally at startup
+    assert state.audit_writer is not None  # set unconditionally at startup
+    record = await state.auth_service.get_account(username)
+    if record is None or record.account_tier != "admin":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    changed: list[str] = []
+
+    # Email update — guard against colliding with an existing user-tier identity
+    # (SoD-001: admin/user identities must stay disjoint).
+    if body.email is not None and body.email != getattr(record, "email", None):
+        try:
+            collision = await state.auth_service.get_account_by_email(body.email)
+        except Exception:
+            collision = None
+        if collision is not None and collision.account_tier == "user":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "admin_user_collision",
+                    "message": "A user-tier account already uses this email. "
+                               "Admin and user identities must be strictly separate.",
+                },
+            )
+        await state.auth_service.set_email(username, body.email)
+        state.audit_writer.write(_config_event(session.account_id, "admin_email_changed", getattr(record, "email", "") or "", body.email, account_tier=session.account_tier))
+        changed.append("email")
+
+    # Status update — reuse the enable/disable paths + min-active guard.
+    if body.disabled is not None and body.disabled != record.disabled:
+        if body.disabled:
+            if await state.auth_service.active_admin_count() <= state.admin_min_active:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "ADMIN_ACTIVE_MINIMUM_VIOLATION",
+                        "message": f"Cannot disable: minimum {state.admin_min_active} active admin accounts required",
+                    },
+                )
+            await state.auth_service.disable(username)
+            state.session_store.invalidate_all_for_account(record.account_id)
+            _suspend_identity_registry_for_account(record.account_id)
+            state.audit_writer.write(_config_event(session.account_id, "admin_account_disabled", username, "disabled", account_tier=session.account_tier))
+        else:
+            from yashigani.licensing.enforcer import check_admin_seat_limit, LicenseLimitExceeded
+            try:
+                check_admin_seat_limit(await state.auth_service.total_admin_count())
+            except LicenseLimitExceeded as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={"error": "admin_seat_limit_exceeded", "limit": exc.max_val, "current": exc.current},
+                )
+            await state.auth_service.enable(username)
+            state.audit_writer.write(_config_event(session.account_id, "admin_account_enabled", username, "enabled", account_tier=session.account_tier))
+        changed.append("disabled")
+
+    return {"status": "ok", "changed": changed}
 
 
 def _suspend_identity_registry_for_account(account_id: str) -> None:

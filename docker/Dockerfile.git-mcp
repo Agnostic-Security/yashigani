@@ -18,8 +18,8 @@
 #   runtime  — Python + bridge + mcp-server-git + git binary (minimal final image)
 #
 # Verified digests (2026-05-30):
-#   python:3.14.0-slim  amd64: sha256:5af4c7f950774a1abf3fd4e8e3fc95f4d0fe684c7fdc1eb10777fc5a017371c7
-#   python:3.14.0-slim  arm64: sha256:d4c6c639f80b11b7fb0f682bdd93c054f58e748aba354d7fbe92689e04dff2d0
+#   python:3.14.5-slim  amd64: sha256:7d8de339aa8619f9b25e7d474d687ae4f6ef9704adad90a136af0f485adeccb7
+#   python:3.14.5-slim  arm64: sha256:4701f9885ba369bf50a80ae4b5e1f637be3aa961dbb9b676d295e98fb2c01075
 #
 # Python package pins (verified 2026-05-30 against PyPI):
 #   mcp-server-git==2026.1.14
@@ -39,8 +39,8 @@
 # InvalidBaseImagePlatform warning under emulation.
 ARG TARGETARCH=amd64
 
-FROM python:3.14.0-slim@sha256:5af4c7f950774a1abf3fd4e8e3fc95f4d0fe684c7fdc1eb10777fc5a017371c7 AS python-amd64
-FROM python:3.14.0-slim@sha256:d4c6c639f80b11b7fb0f682bdd93c054f58e748aba354d7fbe92689e04dff2d0 AS python-arm64
+FROM python:3.14.5-slim@sha256:7d8de339aa8619f9b25e7d474d687ae4f6ef9704adad90a136af0f485adeccb7 AS python-amd64
+FROM python:3.14.5-slim@sha256:4701f9885ba369bf50a80ae4b5e1f637be3aa961dbb9b676d295e98fb2c01075 AS python-arm64
 
 # Select the correct python stage based on TARGETARCH.
 FROM python-${TARGETARCH} AS python-base

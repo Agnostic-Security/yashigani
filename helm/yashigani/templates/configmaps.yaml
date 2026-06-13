@@ -389,6 +389,26 @@ data:
       # Caddyfile during #58c — fixed at b85aad1 closure (2026-04-30).
       header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
     }
+    # ────────────────────────────────────────────────────────────────────────
+    # Strip orchestration-context headers at the public edge (LAURA/IRIS drift).
+    # X-Yashigani-Orchestration-* carry the agent-orchestration identity context
+    # (depth, principal, root-request-id) the gateway uses for model-RBAC. A real
+    # external user proved they can FORGE X-Yashigani-Orchestration-Depth at the
+    # public edge to bypass model-RBAC. These headers are LEGITIMATE only on the
+    # internal mesh self-call path (gateway:8081), exactly like X-OpenWebUI-User-*.
+    # Imported into EVERY public handle that reaches the gateway (direct or via
+    # the OWUI catch-all). Single-source snippet = no per-handle drift.
+    # CRITICAL: this MUST stay byte-parity with the docker/Caddyfile.* renders —
+    # the un-patched render (esp. this K8s one) is where the bypass persists.
+    # Pairs with Tom's gateway-side identity-gate (the two halves ship together).
+    # ────────────────────────────────────────────────────────────────────────
+    (strip-orchestration-headers) {
+      request_header -X-Yashigani-Orchestration-Depth
+      request_header -X-Yashigani-Orchestration-Principal
+      request_header -X-Yashigani-Orchestration-Root-Request-Id
+      # Defence-in-depth catch for any future X-Yashigani-Orchestration-* header.
+      request_header -X-Yashigani-Orchestration-*
+    }
     # Bind on :443 (any Host) so port-forward / NodePort / IP-based tests
     # work regardless of how the cluster operator routes the public domain.
     # Internal K8s integration finding: use explicit PKI cert (caddy_client.crt/key)
@@ -431,7 +451,15 @@ data:
         Cross-Origin-Opener-Policy "same-origin"
         -Server
       }
+      # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
+      # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
+      # to the two ReDoc routes; all other paths keep the default strict CSP above.
+      # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
+      # via its web component Shadow DOM at render time.
+      @redoc_ui path /admin/api-redoc /redoc
+      header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       handle /healthz {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -447,6 +475,16 @@ data:
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         {{- end }}
+        # Track C (F-B) anti-spoof: strip any client-supplied forwarded-user
+        # identity headers on the public /v1 path so an external caller cannot
+        # impersonate an OWUI user. ONLY OWUI (internal, via gateway:8081) may
+        # set these; the gateway honours them solely under the internal bearer.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -459,6 +497,7 @@ data:
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         {{- end }}
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -467,6 +506,7 @@ data:
         }
       }
       handle /mcp/* {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -477,7 +517,9 @@ data:
       # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
       # GET /docs (Swagger UI). Without explicit handles these fell through
       # to the Open WebUI catch-all and were functionally unreachable.
+      # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
       handle /openapi.json {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -486,6 +528,16 @@ data:
         }
       }
       handle /docs {
+        import strip-orchestration-headers
+        reverse_proxy https://yashigani-gateway:8080 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-gateway
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      handle /redoc {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -576,6 +628,18 @@ data:
         request_header -X-Forwarded-User
         request_header -X-Forwarded-Name
         request_header -X-Forwarded-Groups
+        # Track C (F-B): also strip OWUI forwarded-user headers on the public
+        # path so a browser cannot smuggle them to OWUI (which would re-emit
+        # them upstream). Only OWUI's own authenticated session sets the user.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        # Strip forged orchestration-context headers before they reach OWUI
+        # (which re-emits to gateway:8081 on the internal mesh). Same anti-spoof
+        # rationale as the OWUI user headers above — only the internal mesh path
+        # may carry X-Yashigani-Orchestration-*.
+        import strip-orchestration-headers
 
         # Forward auth: validate session cookie against backoffice.
         # On 200: copies X-Forwarded-User/Name/Email from auth response.

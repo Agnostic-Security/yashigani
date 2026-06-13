@@ -23,38 +23,44 @@ def classifier():
 
 class TestSensitivityClassifier:
     def test_public_text(self, classifier):
+        # No regex patterns matched → PUBLIC (level 1), lowest.
         result = classifier.classify("What is the weather today?")
         assert result.level == SensitivityLevel.PUBLIC
         assert len(result.triggers) == 0
 
     def test_detects_ssn(self, classifier):
         result = classifier.classify("My SSN is 123-45-6789")
-        assert result.level == SensitivityLevel.CONFIDENTIAL
+        # R14/R15 (v2.25.5): SSN → RESTRICTED (level 4)
+        assert result.level == SensitivityLevel.RESTRICTED
         assert any("SSN" in t for t in result.triggers)
 
     def test_detects_credit_card(self, classifier):
+        # R14/R15 (v2.25.5): credit cards → SENSITIVE (level 5).
         result = classifier.classify("Card number: 4111 1111 1111 1111")
-        assert result.level == SensitivityLevel.RESTRICTED
+        assert result.level == SensitivityLevel.SENSITIVE
         assert any("card" in t.lower() for t in result.triggers)
 
     def test_detects_email(self, classifier):
         result = classifier.classify("Contact alice@company.com for details")
-        assert result.level == SensitivityLevel.INTERNAL
+        # R14/R15 (v2.25.5): email → CONFIDENTIAL (level 3)
+        assert result.level == SensitivityLevel.CONFIDENTIAL
         assert any("Email" in t for t in result.triggers)
 
     def test_detects_api_key(self, classifier):
+        # R14/R15 (v2.25.5): API keys → SENSITIVE (level 5).
         result = classifier.classify("Use key sk-ant-abc123def456ghi789jkl012mno345")
-        assert result.level == SensitivityLevel.RESTRICTED
+        assert result.level == SensitivityLevel.SENSITIVE
         assert any("API key" in t for t in result.triggers)
 
     def test_detects_classification_marker(self, classifier):
+        # R14/R15 (v2.25.5): classification markers → SENSITIVE (level 5).
         result = classifier.classify("CONFIDENTIAL: Q3 revenue projections")
-        assert result.level == SensitivityLevel.RESTRICTED
+        assert result.level == SensitivityLevel.SENSITIVE
 
     def test_highest_level_wins(self, classifier):
-        # Contains both email (INTERNAL) and SSN (CONFIDENTIAL)
+        # Contains both email (CONFIDENTIAL=3) and SSN (RESTRICTED=4)
         result = classifier.classify("alice@co.com SSN 123-45-6789")
-        assert result.level == SensitivityLevel.CONFIDENTIAL
+        assert result.level == SensitivityLevel.RESTRICTED
 
     def test_multiple_triggers(self, classifier):
         result = classifier.classify("SSN 123-45-6789 card 4111111111111111")
@@ -69,7 +75,7 @@ class TestSensitivityClassifier:
         classifier.reload_patterns([
             (r"\bFOO\b", SensitivityLevel.CONFIDENTIAL, "Custom"),
         ])
-        # Old patterns gone
+        # Old patterns gone — no match → PUBLIC (level 1)
         result = classifier.classify("123-45-6789")
         assert result.level == SensitivityLevel.PUBLIC
         # New pattern works

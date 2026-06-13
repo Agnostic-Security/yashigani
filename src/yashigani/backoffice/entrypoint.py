@@ -372,6 +372,78 @@ def _bootstrap():
             exc,
         )
 
+    # ── Model allocation store (Redis db/3, key prefix model:alloc:*) ──────
+    # Track B1: durable model-RBAC allocations (org/group/user -> alias). Shares
+    # Redis db/3 with the RBAC + agent registry stores (disjoint namespace).
+    # Fail-closed: if Redis is down the store stays None and the allocation
+    # admin API returns 503 rather than silently dropping a grant.
+    model_allocation_store = None
+    try:
+        import redis as _redis
+        from yashigani.models.allocation_store import ModelAllocationStore
+        redis_alloc_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        # Wire the Postgres durable mirror so allocations survive a redis
+        # recreate/restart (Redis db/3 has no persistence). Constructed only when
+        # a usable (non-templated) DSN is present; otherwise Redis-only.
+        _durable_alloc_store = None
+        try:
+            from yashigani.models.allocation_durable_store import (
+                AllocationDurableStore, _direct_dsn as _alloc_dsn,
+            )
+            if _alloc_dsn() and "${POSTGRES_PASSWORD}" not in _alloc_dsn():
+                _durable_alloc_store = AllocationDurableStore()
+                logger.info("Allocation durable store (Postgres mirror) wired")
+            else:
+                logger.warning(
+                    "Allocation durable store NOT wired — no usable Postgres DSN; "
+                    "allocations will NOT survive a redis recreate"
+                )
+        except Exception as _ads_exc:
+            logger.warning("Allocation durable store init skipped (%s)", _ads_exc)
+        model_allocation_store = ModelAllocationStore(
+            redis_client=redis_alloc_client,
+            durable_store=_durable_alloc_store,
+        )
+        logger.info(
+            "Model allocation store initialised: %d allocation(s) loaded from Redis",
+            len(model_allocation_store.list_all()),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Model allocation store init failed (%s) — model allocations disabled",
+            exc,
+        )
+
+    # ── Budget configuration store (Redis db/3, prefix budget:config:*) ──────
+    # B3 fix (2.25.5): the budget admin routes (/admin/budget/*) were never
+    # wired to a store — budget.configure() was never called, so adding a cap
+    # returned 201 but persisted nothing and the lists always rendered empty.
+    # The Postgres BudgetStore can't be used directly because its tables carry
+    # RLS + FKs to tenants/rbac_groups/identities that the free-text admin UI
+    # values don't satisfy. A Redis db/3 config store (same durable admin store
+    # as allocations/bindings) persists + reads back correctly with no route or
+    # UI changes. configure() wires it into the budget router below.
+    budget_config_store = None
+    try:
+        import redis as _redis
+        from yashigani.billing.budget_config_store import BudgetConfigStore
+        from yashigani.backoffice.routes import budget as _budget_routes
+        redis_budget_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        budget_config_store = BudgetConfigStore(redis_client=redis_budget_client)
+        _budget_routes.configure(budget_store=budget_config_store)
+        logger.info("Budget config store initialised (Redis db/3) and wired to /admin/budget/*")
+    except Exception as exc:
+        logger.warning(
+            "Budget config store init failed (%s) — budget caps will not persist",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer
@@ -459,6 +531,7 @@ def _bootstrap():
     backoffice_state.response_cache = response_cache
     backoffice_state.license_state = license_state
     backoffice_state.model_alias_store = model_alias_store
+    backoffice_state.model_allocation_store = model_allocation_store
 
     # v0.9.0 — WebAuthn + EventBus (optional, graceful degradation if unavailable)
     try:
@@ -541,13 +614,25 @@ def _bootstrap():
         logger.warning("Identity broker init failed (%s) — SSO routes will return 503", exc)
 
     # v2.1 — Identity registry (Redis db/3, shared with RBAC)
+    # B1 follow-on (2.25.5): wire IdentityDurableStore so create/update/delete
+    # dual-write to Postgres and the startup reconciler can re-hydrate Redis
+    # after a volume-deletion.
     try:
         from yashigani.identity.registry import IdentityRegistry
+        from yashigani.identity.durable_store import IdentityDurableStore
         import redis as _redis
         redis_identity_url = _backoffice_redis_url(3)
         redis_identity_client = _redis.from_url(redis_identity_url, decode_responses=False)
-        backoffice_state.identity_registry = IdentityRegistry(redis_client=redis_identity_client)
-        logger.info("Identity registry initialised")
+        _id_durable_bo = None
+        try:
+            _id_durable_bo = IdentityDurableStore()
+        except Exception as _de_bo:
+            logger.warning("IdentityDurableStore unavailable (%s) — Redis-only mode", _de_bo)
+        backoffice_state.identity_registry = IdentityRegistry(
+            redis_client=redis_identity_client,
+            durable_store=_id_durable_bo,
+        )
+        logger.info("Identity registry initialised (durable_store=%s)", "wired" if _id_durable_bo else "off")
     except Exception as exc:
         logger.warning("Identity registry init failed (%s) — SSO identity resolution disabled", exc)
 
@@ -622,6 +707,8 @@ _collector = MetricsCollector(
     rbac_store=backoffice_state.rbac_store,
     agent_registry=backoffice_state.agent_registry,
     backend_registry=backoffice_state.backend_registry,
+    # session_store: powers yashigani_auth_active_sessions (Security Overview panel).
+    session_store=backoffice_state.session_store,
     poll_interval_seconds=15,
 )
 _collector.start()

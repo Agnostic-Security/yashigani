@@ -205,13 +205,12 @@ def _email_hash(email: str, org_id: str = "") -> str:
 def _email_to_slug(email: str) -> str:
     """
     Derive a registry slug from an email address.
+    B5 (2.25.5): delegates to the canonical implementation in identity.slug
+    so all slug-derivation sites produce the same result.
     e.g. alice@example.com -> alice-example-com
     """
-    local, _, domain = email.partition("@")
-    raw = f"{local}-{domain}".lower()
-    slug = _SLUG_RE.sub("-", raw).strip("-")
-    # Trim to 64 chars — IdentityRegistry slug limit.
-    return slug[:64]
+    from yashigani.identity.slug import email_to_slug as _canonical
+    return _canonical(email)
 
 
 def _resolve_or_create_identity(

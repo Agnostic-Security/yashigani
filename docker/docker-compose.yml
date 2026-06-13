@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.24.1 — Docker Compose stack
+# Last updated: 2026-06-13T00:00:00+01:00 (fix(redis): B1 — enable AOF+volatile-lru on main redis; identities/agents/allocations survive --upgrade container recreate)
 # Last updated: 2026-05-24T12:00:00+01:00 (security(secrets): PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets mount removed; closes NICO-V241-001 + YSG-RISK-060)
 # Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
 # Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
@@ -387,6 +388,40 @@ services:
       #   docker compose -f docker/docker-compose.yml up --no-deps -d gateway
       # P3 broker E2E gate (2026-05-30): must be declared here so compose passes it into container.
       YASHIGANI_MCP_SERVERS: ${YASHIGANI_MCP_SERVERS:-[]}
+      # ----------------------------------------------------------------------
+      # Orchestration caps (build-sheet §9 — operator-tunable, read by
+      # gateway/orchestrator.py + configure_openai_router). Defaults mirror the
+      # code defaults; written to docker/.env by install.sh so an operator can
+      # tune them without editing source.
+      #   MAX_DEPTH=9 is the §0.1 9-level hop invariant — do NOT lower below 9.
+      #   MAX_ITERS is floored at 9 in code so a 9-deep chain isn't truncated.
+      #   DEADLINE_S is the orchestration wall-clock budget (seconds).
+      #   MAX_FANOUT caps parallel sub-calls per level.
+      YASHIGANI_ORCH_MAX_DEPTH: ${YASHIGANI_ORCH_MAX_DEPTH:-9}
+      YASHIGANI_ORCH_MAX_ITERS: ${YASHIGANI_ORCH_MAX_ITERS:-9}
+      YASHIGANI_ORCH_DEADLINE_S: ${YASHIGANI_ORCH_DEADLINE_S:-300}
+      YASHIGANI_ORCH_MAX_FANOUT: ${YASHIGANI_ORCH_MAX_FANOUT:-4}
+      # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
+      # derives from prior tool-RESULT content (injection-originated hops). An
+      # over-budget result-steered hop is REFUSED so a result-steering injection
+      # loop cannot amplify. Keep low (default 2); raise only with care.
+      YASHIGANI_ORCH_INJECTION_BUDGET: ${YASHIGANI_ORCH_INJECTION_BUDGET:-2}
+      # ORCH-PHASE2 (Design A, letta-as-brain): a single letta agentic turn does
+      # multi-step reasoning + its own LLM call back through the gateway and takes
+      # ~2 min on the 3B brain. Per-turn HTTP timeout for the letta brain round-trip
+      # (seconds); must sit above the per-turn latency and below DEADLINE_S so the
+      # whole-loop deadline, not the per-turn timeout, governs the overall bound.
+      YASHIGANI_ORCH_LETTA_TURN_TIMEOUT_S: ${YASHIGANI_ORCH_LETTA_TURN_TIMEOUT_S:-240}
+      # Optional orchestration overrides.
+      #   SELFCALL_BASE — internal mesh self-call target (port 8081, no Caddy,
+      #     internal bearer, network-isolated). Default mirrors the code default;
+      #     orchestrator._mesh_base() reads the key directly (empty string would
+      #     NOT fall through to the code default), so we set the real value here.
+      #   MCP_SERVERS — JSON {name: url}. Empty default lets tool_catalog fall
+      #     back to the UPSTREAM_MCP_URL demo-mcp path (the headline "cloud 9"
+      #     demo upstream); _resolve_mcp_servers() treats unset/empty as fallback.
+      YASHIGANI_ORCH_SELFCALL_BASE: ${YASHIGANI_ORCH_SELFCALL_BASE:-http://127.0.0.1:8081}
+      YASHIGANI_ORCH_MCP_SERVERS: ${YASHIGANI_ORCH_MCP_SERVERS:-}
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -696,7 +731,30 @@ services:
       WEBUI_AUTH: "false"
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "X-Forwarded-User"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "X-Forwarded-Name"
+      # Phase 2 / 2.25.5-auth-ingress: OWUI is now served under /app/webui.
+      # WEBUI_URL sets the canonical public URL so OWUI's SvelteKit build resolves
+      # _app/* assets, socket.io, and API calls under the subpath.
+      # WEBUI_BASE_URL is the path prefix for the SvelteKit router.
+      # Both must agree with the Caddy /app/webui* route.
+      WEBUI_URL: "/app/webui"
+      WEBUI_BASE_URL: "/app/webui"
+      # Single-logout: when the user clicks logout in OWUI, OWUI's signout API
+      # returns {"redirect_url": "/auth/logout-redirect"}.  The SvelteKit client
+      # navigates there; backoffice /auth/logout-redirect invalidates the
+      # Yashigani session cookie and redirects to /login.  Fixes the "no working
+      # end-user logout" trap.
+      WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "/auth/logout-redirect"
       ENABLE_SIGNUP: "true"
+      # Track C (F-B): forward the authenticated OWUI user to the gateway on
+      # every upstream call. OWUI v0.9.2 then emits X-OpenWebUI-User-Email /
+      # X-OpenWebUI-User-Id / X-OpenWebUI-User-Name / X-OpenWebUI-User-Role on
+      # its requests to gateway:8081/v1. The gateway's trusted-forwarder
+      # resolver maps X-OpenWebUI-User-Email -> the actual per-user Yashigani
+      # identity so per-user/group/org RBAC (models, agents, sensitivity
+      # ceiling) applies to OWUI traffic instead of the flat `internal`
+      # service identity. The header is honoured ONLY under the internal
+      # bearer (trusted-forwarder anchor); a direct caller cannot spoof it.
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
       # Secret key for JWT signing — allows programmatic API access.
       # Fail-closed: MUST be set in docker/.env (install.sh generates it).
       WEBUI_SECRET_KEY: ${OWUI_SECRET_KEY:?OWUI_SECRET_KEY must be set in docker/.env — run install.sh to generate}
@@ -922,10 +980,10 @@ services:
       --tls-ca-cert-file /run/secrets/ca_root.crt
       --tls-auth-clients yes
       --tls-protocols "TLSv1.2 TLSv1.3"
-      --save ""
-      --appendonly no
+      --appendonly yes
+      --appendfsync everysec
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
       --requirepass "$$(cat /run/secrets/redis_password)"'
     volumes:
       - redis_data:/data
@@ -991,6 +1049,12 @@ services:
       - ollama_data:/root/.ollama
     environment:
       OLLAMA_HOST: "0.0.0.0"
+      # WARMUP-001: keep models resident in VRAM indefinitely (idle-eviction disabled).
+      # Ollama default keep-alive is 5 minutes; after eviction the next request pays the
+      # cold-load penalty (qwen2.5:3b=37s, llama3.2:3b=46s), which exceeds both the
+      # classifier 10s timeout (fail-closes to RESTRICTED) and the Caddy 30s write
+      # timeout (client-visible hang). -1 = never evict. Configurable via .env.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
     healthcheck:
       # ollama image has no curl/wget — use bash /dev/tcp to check port
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/11434' 2>/dev/null"]
@@ -1137,6 +1201,13 @@ services:
       # retro #83: enable TLS on Prometheus port 9090 (Pattern B mTLS).
       # Grafana datasource calls now use https://prometheus:9090 with mutual TLS.
       - "--web.config.file=/etc/prometheus/web-config.yml"
+      # B9: fix 302→/graph redirect misrouting under /admin/prometheus/ sub-path.
+      # Without --web.external-url Prometheus emits a bare /graph redirect which
+      # the browser resolves as the root, landing on the OWUI catch-all instead of
+      # the Prometheus UI. --web.route-prefix=/ keeps internal routing clean while
+      # --web.external-url tells Prometheus its public prefix for all redirects.
+      - "--web.external-url=https://${YASHIGANI_TLS_DOMAIN}/admin/prometheus/"
+      - "--web.route-prefix=/"
     # Internal security finding (EX-231-10 closure): Prometheus runs as uid 65534
     # (nobody) but needs to read prometheus_client.{crt,key} from /run/secrets.
     # Fix: add GID 1001 (yashigani app group) so Prometheus can read the
@@ -1538,6 +1609,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # PKI certs: promtail client cert for mTLS push to Loki.
       - ./secrets:/run/secrets:ro
+      # B8: persist positions file so re-tails from last offset on restart rather
+      # than from the start (which causes duplicate log ingestion into Loki).
+      # /tmp/positions.yaml was lost on every container restart. Named volume
+      # survives restarts and upgrades; promtail.yml points here too (see config).
+      - promtail_positions:/var/lib/promtail
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9080' || exit 1"]
       interval: 15s
@@ -1555,6 +1631,7 @@ services:
     tmpfs:
       # YSG-RISK-008 (v2.23.4): promtail has no data volume. Config + certs are
       # read-only mounts. Docker socket is read-only bind mount. /tmp for Go runtime.
+      # B8: positions are now persisted to promtail_positions named volume, not /tmp.
       - /tmp:size=32m,mode=1777
     # YSG-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
@@ -1994,7 +2071,17 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec /app/letta/server/startup.sh'
+      # ORCH-PHASE2-REDIS (2026-06-10): letta 0.16.7 startup.sh launches its
+      # bundled redis with the DEFAULT dir, which resolves to /app — a read-only
+      # rootfs layer (read_only:true is load-bearing for the openapi write-path
+      # fix above). bgsave then fails and redis sets stop-writes-on-bgsave-error,
+      # which DISABLES writes and 500s every /v1/agents/.../messages call. That is
+      # what blocks letta-as-orchestrating-brain (Design A): the brain cannot take
+      # a turn. Fix (codified, fail-safe): pre-launch redis OURSELVES on a writable
+      # persistent path (the letta_data volume at /root/.letta) with bgsave-errors
+      # made non-fatal, then export LETTA_REDIS_HOST=localhost so startup.sh sees
+      # "external redis" and does NOT relaunch its own with the bad dir.
+      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && mkdir -p /root/.letta/redis && redis-server --daemonize yes --bind 127.0.0.1 --dir /root/.letta/redis --stop-writes-on-bgsave-error no && export LETTA_REDIS_HOST=localhost && export LETTA_REDIS_PORT=6379 && exec /app/letta/server/startup.sh'
     environment:
       # Route LLM calls through Yashigani gateway (OpenAI-compatible)
       # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route letta
@@ -2111,12 +2198,15 @@ services:
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
     volumes:
       - openclaw_data:/home/node/.openclaw
-      - ./openclaw/openclaw.json:/etc/openclaw/openclaw.json:ro
+      # YSG-BUG-2255-002: mount the runtime copy (bearer substituted by install.sh step 8f),
+      # NOT the git-tracked placeholder. openclaw.runtime.json is written to WORK_DIR at
+      # install time and is gitignored so the real token never enters VCS.
+      - ./openclaw/openclaw.runtime.json:/etc/openclaw/openclaw.json:ro
     # PROBE-AG1 fix: NO /run/secrets mount at all for openclaw.
-    # openclaw reads yashigani_internal_bearer via openclaw.json (install.sh substitutes
-    # __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is baked into the config).
-    # No runtime secret file reads required. caddy_internal_hmac and ALL PKI material
-    # are NOT accessible to openclaw containers.
+    # openclaw reads yashigani_internal_bearer via openclaw.runtime.json (install.sh
+    # step 8f substitutes __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is
+    # baked into the runtime config). No runtime secret file reads required.
+    # caddy_internal_hmac and ALL PKI material are NOT accessible to openclaw containers.
     # openclaw also joins `edge` (internet-facing for Slack/Telegram webhooks) — the
     # absence of /run/secrets mount is the critical blast-radius reduction for PROBE-AG1.
     healthcheck:
@@ -2410,6 +2500,10 @@ volumes:
   alertmanager_data:
     driver: local
   loki_data:
+    driver: local
+  # B8: persist promtail read positions so container restart re-tails from
+  # the last offset, not from the start (prevents duplicate Loki ingestion).
+  promtail_positions:
     driver: local
   # Test IdP volume
   keycloak_data:

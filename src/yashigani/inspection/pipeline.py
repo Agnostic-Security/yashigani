@@ -554,7 +554,16 @@ class ResponseInspectionPipeline:
                     self._sensitivity_classifier.classify,
                 )
                 sens_result = _classify(response_body)
-                response_sensitivity_value = sens_result.level.value
+                # R14/R15 (v2.25.5): SensitivityResult.level is now int (1–5).
+                # Convert to legacy OPA string for backward-compat.
+                # Legacy callers (OPA, audit, existing tests) expect the string form.
+                _raw_level = sens_result.level
+                if isinstance(_raw_level, int):
+                    from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+                    response_sensitivity_value = _LEVEL_TO_LEGACY_STRING.get(_raw_level, "RESTRICTED")
+                else:
+                    # Backward-compat: old SensitivityLevel str enum still has .value
+                    response_sensitivity_value = getattr(_raw_level, "value", str(_raw_level))
             except Exception as exc:
                 logger.warning(
                     "ResponseInspectionPipeline: sensitivity_classifier failed "
