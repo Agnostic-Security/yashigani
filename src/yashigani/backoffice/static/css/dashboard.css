@@ -1,4 +1,4 @@
-/* last-updated: 2026-05-13T00:00:00+01:00 — v2.23.4 CSP-INLINE-STYLE-SPA */
+/* last-updated: 2026-06-13T00:00:00+01:00 — 2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1 */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f1f5f9; }
 nav { background: #0f172a; color: #fff; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
@@ -340,6 +340,72 @@ tr:hover { background: #f8fafc; }
 
 /* Policy table cells */
 .td-pkg { font-size: 0.8rem; color: #475569; }
+
+/* ── 2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1 ──────────────
+   All new CSS classes added here (append-only). NO inline style= anywhere.  */
+
+/* N1 — second-admin required banner */
+.n1-banner { background: #fff7ed; border: 1px solid #fdba74; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; display: none; }
+.n1-banner.is-open { display: flex; align-items: center; gap: 12px; }
+.n1-banner-text { flex: 1; font-size: 0.85rem; color: #92400e; }
+.n1-banner-btn { padding: 6px 14px; background: #ea580c; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; white-space: nowrap; }
+
+/* R26 — version badge in nav */
+.version-badge-none { font-size: 0.8rem; color: #64748b; }
+.version-badge-patch { font-size: 0.8rem; color: #1d4ed8; font-weight: 600; }
+.version-badge-minor { font-size: 0.8rem; color: #7c3aed; font-weight: 600; }
+.version-badge-major { font-size: 0.8rem; color: #d97706; font-weight: 600; }
+.version-badge-security { font-size: 0.8rem; color: #dc2626; font-weight: 700; animation: version-pulse 1.5s ease-in-out infinite; }
+@keyframes version-pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+.version-badge-link { color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }
+
+/* R9 — danger-zone panel */
+.danger-zone { border: 1px solid #fca5a5; border-radius: 6px; padding: 12px; background: #fef2f2; margin-top: 8px; }
+.danger-zone-title { font-size: 0.85rem; font-weight: 600; color: #b91c1c; margin-bottom: 6px; }
+.danger-zone-desc { font-size: 0.8rem; color: #7f1d1d; margin-bottom: 10px; }
+.danger-confirm-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.danger-reason-input { padding: 6px 8px; border: 1px solid #fca5a5; border-radius: 4px; font-size: 0.85rem; flex: 1; min-width: 200px; }
+.btn-sm-danger-confirm { padding: 6px 16px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+
+/* R10 — lifecycle status badges */
+.lc-badge-draft { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #f1f5f9; color: #475569; }
+.lc-badge-staging { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #fef3c7; color: #92400e; }
+.lc-badge-production { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #dcfce7; color: #166534; }
+.lc-badge-archived { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #f8fafc; color: #94a3b8; }
+
+/* R12 — policy dry-run panel */
+.dryrun-panel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px 16px; margin-top: 12px; }
+.dryrun-result-allow { font-size: 0.85rem; color: #166534; font-weight: 600; margin-bottom: 4px; }
+.dryrun-result-deny { font-size: 0.85rem; color: #dc2626; font-weight: 600; margin-bottom: 4px; }
+.dryrun-result-undef { font-size: 0.85rem; color: #92400e; font-weight: 600; margin-bottom: 4px; }
+.dryrun-codes { font-size: 0.8rem; color: #475569; font-family: monospace; }
+.dryrun-ai { font-size: 0.82rem; color: #334155; margin-top: 8px; font-style: italic; }
+.sim-textarea { width: 100%; min-height: 80px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.82rem; font-family: ui-monospace, monospace; resize: vertical; }
+
+/* R16 — AI-generate pattern panel */
+.genpattern-result { margin-top: 10px; font-size: 0.85rem; }
+.genpattern-preview { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 10px 12px; margin-top: 8px; font-size: 0.82rem; }
+.genpattern-regex { font-family: monospace; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; user-select: all; }
+.genpattern-ai { font-size: 0.8rem; color: #475569; margin-top: 6px; font-style: italic; }
+.btn-genpattern-accept { padding: 6px 14px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; margin-top: 6px; }
+
+/* R13 — RBAC method/path dropdowns with descriptions */
+.rbac-method-help { font-size: 0.75rem; color: #64748b; margin-top: 2px; max-width: 320px; }
+.rbac-path-group { font-size: 0.72rem; color: #94a3b8; }
+.rbac-path-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; max-width: 320px; }
+
+/* R23 — entitlement rows (locked features) */
+.entitlement-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+.entitlement-row:last-child { border-bottom: none; }
+.entitlement-label { font-size: 0.85rem; font-weight: 500; flex: 1; }
+.entitlement-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; }
+.entitlement-locked { font-size: 0.8rem; color: #64748b; text-align: right; }
+.entitlement-locked-badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+.entitlement-upgrade-link { font-size: 0.75rem; color: #2563eb; text-decoration: none; margin-top: 2px; display: block; }
+.entitlement-available-badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; background: #dcfce7; color: #166534; }
+
+/* R24 — PKI / Cryptography merged section note */
+.pki-crypto-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; background: #f8fafc; padding: 8px 12px; border-radius: 4px; }
 
 /* ── Sensitivity taxonomy level badge colours (R14/R15 v2.25.5) ─────────── */
 /* CSP-safe: pure CSS classes, no inline style= attributes.                  */
