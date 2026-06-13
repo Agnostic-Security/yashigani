@@ -8,6 +8,29 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [v2.25.4] — 2026-06-12
+
+Theme: **Gateway-mediated agent/tool orchestration + model-allocation RBAC actually enforced**.
+
+### Added
+
+- **feat(orchestration): gateway-mediated agent & tool orchestration (Phase 1 + Phase 2)** — multi-agent and tool-calling flows are routed *through* the gateway so every inter-entity hop (agent↔agent, agent↔tool/MCP, agent↔LLM) is policy-adjudicated at ingress and egress rather than going direct. Phase 2 adds a "brain" reasoning leg (Letta) with deterministic exfiltration defence, plus Helm parity for the four orchestration capabilities (Kubernetes leg). Regression coverage under `src/tests/unit/test_v2254_orchestration_phase1.py` and `…_phase2_letta.py`.
+- **feat(rbac): model-allocation RBAC enforced (Track B1)** — model allocations granted to an identity are now enforced on the inference path, backed by a durable allocation store (migration `0019_model_allocations`) and pushed into OPA. An admin **Access** panel in the back office manages per-identity allocations.
+- **feat(rbac): per-user identity through Open WebUI (Track C)** — requests arriving via Open WebUI carry the real end-user identity through to the gateway for per-user policy and allocation decisions, instead of collapsing to a single service principal.
+- **feat(inspection): secret detector** — a content secret-detector module for the inspection pipeline.
+
+### Security
+
+- **security(rbac): visible model-pin deny + identity-header trust gate** — an explicit model pin that is not permitted now returns a visible `403` rather than silently substituting an allowed model, and the forwarded end-user identity header is only trusted when presented behind the authenticated reverse-proxy boundary (trust-gated), closing a header-spoofing path.
+- **fix(caddy): restore public TLS edge** — default/fallback SNI handling on the client-cert-optional listener so the public TLS edge serves correctly alongside mTLS.
+
+### Fixed
+
+- **fix(gpu): wire Ollama to the GPU via CDI** — the bundled inference runtime now binds to the GPU (was running on CPU with idle GPUs).
+- **perf(deploy): model warmup + keep-alive** — `OLLAMA_KEEP_ALIVE=-1`, a post-deploy model warmup step, and an increased Caddy write timeout eliminate first-request cold-load latency on the classifier/inference path (compose + Helm + installer parity).
+
+---
+
 ## [v2.25.3.1] — 2026-06-08
 
 Theme: **Durable agent registry + service-account model-listing control**.
