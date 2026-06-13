@@ -39,13 +39,17 @@ logger = logging.getLogger(__name__)
 
 _PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
 
-# Fields persisted to / restored from Postgres (must match IdentityRecord + schema).
-# JSON-serialised list/dict fields are stored as TEXT in Postgres.
-_JSON_FIELDS = frozenset({
-    "expertise", "container_config", "capabilities",
-    "allowed_tools", "allowed_models", "groups",
-    "allowed_callers", "allowed_paths", "allowed_cidrs",
+# Column type map for the ``identities`` table (migration-0005 + migration-0020).
+# Drives serialization in upsert() — psycopg2 adapts Python lists to text[] natively;
+# jsonb columns must receive a JSON string (json.dumps / psycopg2 Json adapter).
+#
+# text[] columns — pass a Python list directly:
+_TEXT_ARRAY_FIELDS = frozenset({
+    "expertise", "capabilities", "allowed_tools", "allowed_models",
+    "groups", "allowed_callers", "allowed_paths", "allowed_cidrs",
 })
+# jsonb columns — pass json.dumps(value):
+_JSONB_FIELDS = frozenset({"container_config"})
 
 
 def _direct_dsn() -> str:
@@ -98,10 +102,41 @@ class IdentityDurableStore:
         if not identity_id:
             raise ValueError("IdentityDurableStore.upsert: missing identity_id")
 
-        def _j(v) -> str:
-            if isinstance(v, (list, dict)):
-                return json.dumps(v)
-            return str(v) if v is not None else "[]"
+        def _pg_array(v) -> list:
+            """Return a Python list for text[] columns.
+
+            psycopg2 adapts a Python list to a Postgres array literal natively.
+            Passing json.dumps(v) produced a JSON string (e.g. '["users"]') which
+            Postgres rejects as 'malformed array literal' (2255-005).
+
+            Handles three cases that appear in practice:
+            - Already a list   → pass through (normal dual-write path).
+            - A JSON string    → parse back to list (back-fill from Redis stores
+                                 lists as JSON strings in Redis hashes).
+            - None / empty str → empty list (maps to '{}' in Postgres).
+            """
+            if isinstance(v, list):
+                return v
+            if isinstance(v, str):
+                if not v or v == "[]":
+                    return []
+                try:
+                    parsed = json.loads(v)
+                    return parsed if isinstance(parsed, list) else []
+                except (json.JSONDecodeError, ValueError):
+                    return []
+            return []
+
+        def _pg_jsonb(v) -> str:
+            """Return a JSON string for jsonb columns."""
+            if isinstance(v, str):
+                # Already a JSON string (e.g. from Redis hash back-fill).
+                try:
+                    json.loads(v)  # validate
+                    return v
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return json.dumps(v if v is not None else {})
 
         conn = self._connect()
         try:
@@ -123,7 +158,7 @@ class IdentityDurableStore:
                         %s::uuid, %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s,
+                        %s::jsonb, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s,
@@ -169,21 +204,24 @@ class IdentityDurableStore:
                         identity.get("name", ""),
                         identity.get("slug", ""),
                         identity.get("description", ""),
-                        _j(identity.get("expertise", [])),
+                        # text[] columns — pass Python list; psycopg2 adapts to Postgres array
+                        _pg_array(identity.get("expertise", [])),
                         identity.get("system_prompt", ""),
                         identity.get("model_preference", ""),
                         identity.get("sensitivity_ceiling", "PUBLIC"),
                         identity.get("upstream_url", ""),
                         identity.get("container_image", ""),
-                        _j(identity.get("container_config", {})),
-                        _j(identity.get("capabilities", [])),
-                        _j(identity.get("allowed_tools", [])),
-                        _j(identity.get("allowed_models", [])),
+                        # jsonb column — pass JSON string
+                        _pg_jsonb(identity.get("container_config", {})),
+                        # text[] columns (cont.)
+                        _pg_array(identity.get("capabilities", [])),
+                        _pg_array(identity.get("allowed_tools", [])),
+                        _pg_array(identity.get("allowed_models", [])),
                         identity.get("icon_url", ""),
-                        _j(identity.get("groups", [])),
-                        _j(identity.get("allowed_callers", [])),
-                        _j(identity.get("allowed_paths", [])),
-                        _j(identity.get("allowed_cidrs", [])),
+                        _pg_array(identity.get("groups", [])),
+                        _pg_array(identity.get("allowed_callers", [])),
+                        _pg_array(identity.get("allowed_paths", [])),
+                        _pg_array(identity.get("allowed_cidrs", [])),
                         identity.get("org_id", "") or _PLATFORM_TENANT_ID,
                         identity.get("bound_spiffe_uri", ""),
                         identity.get("api_key_hash", ""),
@@ -485,8 +523,6 @@ def _backfill_durable_from_redis(registry, durable: IdentityDurableStore) -> int
     a failure on one identity is logged and skipped rather than aborting the
     entire back-fill.
     """
-    import json as _json
-
     try:
         all_ids = registry._decode_set(registry._r.smembers("identity:index:all"))
     except Exception as exc:
