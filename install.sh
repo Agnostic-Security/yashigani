@@ -13150,6 +13150,58 @@ main() {
     fi
 
     # Step 8: Optional agent bundle selection
+    # YSG-BUG-2255-006: On --upgrade without --agent-bundles the operator does
+    # not re-pass the agent bundle flags, so COMPOSE_PROFILES is empty here and
+    # every profile-gated deploy step (step 8d token placeholders, step 8e letta
+    # openapi pre-create, step 8f openclaw.runtime.json bearer substitution) is
+    # silently skipped — requiring Captain to hand-substitute the bearer on every
+    # upgrade.
+    #
+    # Fix: on --upgrade, seed COMPOSE_PROFILES from the persisted
+    # YASHIGANI_ENABLED_PROFILES value in docker/.env BEFORE select_agent_bundles
+    # (and before the other per-service steps) run.  select_agent_bundles already
+    # deduplicates, so any freshly-passed --agent-bundles entries merge cleanly.
+    # On a fresh install YASHIGANI_ENABLED_PROFILES does not exist yet, so the
+    # seed block is a no-op.  Only agent-bundle profiles (langflow, letta,
+    # openclaw) are seeded here; openwebui and wazuh are re-applied by their own
+    # steps further below and are idempotently re-added.
+    if [[ "${UPGRADE:-false}" == "true" ]]; then
+      local _seed_env_file="${WORK_DIR}/docker/.env"
+      local _seed_ep
+      _seed_ep="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$_seed_env_file" 2>/dev/null \
+                    | sed 's/^YASHIGANI_ENABLED_PROFILES=//' || true)"
+      if [[ -n "$_seed_ep" ]]; then
+        local _seed_ep_arr=()
+        IFS=',' read -ra _seed_ep_arr <<< "$_seed_ep"
+        local _agent_bundle_profiles=("langflow" "letta" "openclaw")
+        local _seeded=()
+        for _seed_p in "${_seed_ep_arr[@]}"; do
+          _seed_p="${_seed_p// /}"   # trim whitespace
+          [[ -z "$_seed_p" ]] && continue
+          # Only seed recognised agent-bundle profile names into COMPOSE_PROFILES;
+          # skip synthetic/non-compose names that may appear in ENABLED_PROFILES.
+          local _is_bundle=false
+          for _bp in "${_agent_bundle_profiles[@]}"; do
+            [[ "$_seed_p" == "$_bp" ]] && _is_bundle=true
+          done
+          [[ "$_is_bundle" == "false" ]] && continue
+          # Guard against duplicates already present (idempotent re-run).
+          local _already=false
+          for _existing in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+            [[ "$_existing" == "$_seed_p" ]] && _already=true
+          done
+          if [[ "$_already" == "false" ]]; then
+            COMPOSE_PROFILES+=("$_seed_p")
+            _seeded+=("$_seed_p")
+          fi
+        done
+        if [[ ${#_seeded[@]} -gt 0 ]]; then
+          log_info "Upgrade: seeded agent-bundle profiles from existing .env into COMPOSE_PROFILES: ${_seeded[*]} (YSG-BUG-2255-006)"
+        fi
+      fi
+      unset _seed_env_file _seed_ep _seed_ep_arr _seed_p _agent_bundle_profiles _seeded _is_bundle _already _bp _existing
+    fi
+
     select_agent_bundles
 
     # Step 8b-0: BYO Internal CA wizard — Q1 + Q1a (Tiago directive 2026-05-23).
