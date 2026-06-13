@@ -528,7 +528,17 @@ async def backup_create(session: StepUpAdminSession):
     import shutil
     import subprocess
 
-    dsn = os.getenv("YASHIGANI_DB_DSN_DIRECT") or os.getenv("YASHIGANI_DB_DSN")
+    # YSG-BUG-2255-001: pg_dump must run with full read privileges over every
+    # object (incl. sequences like manifest_registrations_id_seq).  The app role
+    # (DSN_DIRECT / DSN) is least-privilege post the 2.25.2 role split and trips
+    # "permission denied for sequence ..." → pg_dump rc=1 → pg_dump_failed.  Use
+    # the admin-direct DSN (yashigani_admin) for backups; fall back for older
+    # installs that only wire the app DSN.
+    dsn = (
+        os.getenv("YASHIGANI_DB_DSN_ADMIN_DIRECT")
+        or os.getenv("YASHIGANI_DB_DSN_DIRECT")
+        or os.getenv("YASHIGANI_DB_DSN")
+    )
     if not dsn:
         raise HTTPException(status_code=503, detail={"error": "db_dsn_unavailable"})
     if shutil.which("pg_dump") is None:
