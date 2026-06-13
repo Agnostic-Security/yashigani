@@ -246,10 +246,10 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     # policy applies per request. @strict_ui = native admin plane AND NOT a
     # proxied sub-app subpath; @lenient_ui = the complement (sub-apps + OWUI root).
     @strict_ui {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
         not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
     }
-    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
     @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
     header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
     header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
@@ -350,9 +350,10 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Gateway OpenAPI surface — /openapi.json + /docs ───────────────
+    # ── Gateway OpenAPI surface — /openapi.json + /docs + /redoc ────────
     # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
     # GET /docs (Swagger UI) via gateway identity-resolution middleware.
+    # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
     # Without explicit handles these requests fell through to the Open WebUI
     # catch-all and were functionally unreachable.
     handle /openapi.json {
@@ -366,6 +367,16 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /docs {
+        import strip-orchestration-headers
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /redoc {
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
