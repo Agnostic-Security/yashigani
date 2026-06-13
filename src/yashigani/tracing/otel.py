@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import yashigani
 
@@ -25,10 +24,31 @@ _tracer = None
 _tracer_provider = None
 
 
-class _PrometheusSpanProcessor:
+def _span_processor_base():
+    """Return opentelemetry.sdk.trace.SpanProcessor if available, else object.
+
+    Using a function avoids a module-level import failure when the OTel SDK is
+    not installed (the class definition would still succeed in that case, but
+    the SDK won't call _on_ending on it either — so the fallback to ``object``
+    is safe).
+    """
+    try:
+        from opentelemetry.sdk.trace import SpanProcessor  # type: ignore[attr-defined]
+        return SpanProcessor
+    except Exception:
+        return object
+
+
+class _PrometheusSpanProcessor(_span_processor_base()):  # type: ignore[misc]
     """Lightweight span processor that increments yashigani_trace_spans_total
     on every span that ends.  Runs synchronously in on_end() — single counter
     increment only; never blocks the export pipeline.
+
+    Inherits from ``opentelemetry.sdk.trace.SpanProcessor`` so that the SDK's
+    ``SynchronousMultiSpanProcessor`` can call ``_on_ending`` (added in OTel
+    SDK ≥ 1.26) without raising ``AttributeError``.  The base class provides
+    ``_on_ending`` as a no-op; we do not need to override it because the span
+    counter is emitted in ``on_end``, which fires after ``_on_ending``.
 
     status_code → status label mapping:
       STATUS_CODE_OK        → "ok"
