@@ -380,6 +380,33 @@ def _bootstrap():
             exc,
         )
 
+    # ── Budget configuration store (Redis db/3, prefix budget:config:*) ──────
+    # B3 fix (2.25.5): the budget admin routes (/admin/budget/*) were never
+    # wired to a store — budget.configure() was never called, so adding a cap
+    # returned 201 but persisted nothing and the lists always rendered empty.
+    # The Postgres BudgetStore can't be used directly because its tables carry
+    # RLS + FKs to tenants/rbac_groups/identities that the free-text admin UI
+    # values don't satisfy. A Redis db/3 config store (same durable admin store
+    # as allocations/bindings) persists + reads back correctly with no route or
+    # UI changes. configure() wires it into the budget router below.
+    budget_config_store = None
+    try:
+        import redis as _redis
+        from yashigani.billing.budget_config_store import BudgetConfigStore
+        from yashigani.backoffice.routes import budget as _budget_routes
+        redis_budget_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        budget_config_store = BudgetConfigStore(redis_client=redis_budget_client)
+        _budget_routes.configure(budget_store=budget_config_store)
+        logger.info("Budget config store initialised (Redis db/3) and wired to /admin/budget/*")
+    except Exception as exc:
+        logger.warning(
+            "Budget config store init failed (%s) — budget caps will not persist",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer

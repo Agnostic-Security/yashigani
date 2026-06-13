@@ -83,6 +83,22 @@
                     </div>
                     <div id="register-agent-result" class="form-result"></div>
                 </div>
+                <!-- R6: inline edit form (populated on Edit click) -->
+                <div id="edit-agent-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Agent ID</label><br><input id="edit-agent-id" type="text" readonly class="fi w-250"></div>
+                        <div><label class="lbl">Name</label><br><input id="edit-agent-name" type="text" placeholder="my-agent" class="fi w-150"></div>
+                        <div><label class="lbl">Upstream URL</label><br><input id="edit-agent-url" type="text" placeholder="http://agent:8000" class="fi w-250"></div>
+                    </div>
+                    <div class="form-row--mt">
+                        <div><label class="lbl">Groups (comma-separated)</label><br><input id="edit-agent-groups" type="text" placeholder="default,engineering" class="fi w-200"></div>
+                        <div><label class="lbl">Allowed caller groups</label><br><input id="edit-agent-caller-groups" type="text" placeholder="admins,operators" class="fi w-200"></div>
+                        <button data-action="saveEditAgent" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAgent" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Alias is derived from the agent name. Changing groups/caller-groups updates RBAC immediately.</p>
+                    <div id="edit-agent-result" class="form-result"></div>
+                </div>
                 <table>
                     <thead><tr><th>Name</th><th>Agent ID</th><th>Upstream URL</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
                     <tbody id="agents-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
@@ -116,9 +132,21 @@
                     </div>
                     <div id="create-admin-result" class="form-result"></div>
                 </div>
+                <!-- R5: inline edit form (populated on Edit click) -->
+                <div id="edit-admin-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Username</label><br><input id="edit-admin-username" type="text" readonly class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="edit-admin-email" type="email" placeholder="admin@example.com" class="fi w-280"></div>
+                        <div><label class="lbl">Status</label><br><select id="edit-admin-status" class="fi"><option value="active">Active</option><option value="disabled">Disabled</option></select></div>
+                        <button data-action="saveEditAccount" data-account-type="admin" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAccount" data-account-type="admin" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Role/tier is fixed for an existing account (admin and user identities are kept strictly separate). To change tier, delete and recreate in the correct list.</p>
+                    <div id="edit-admin-result" class="form-result"></div>
+                </div>
                 <table>
-                    <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
-                    <tbody id="accounts-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                    <thead><tr><th>Username</th><th>Email</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
+                    <tbody id="accounts-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
                 </table>
             </div>
 
@@ -136,9 +164,21 @@
                     </div>
                     <div id="create-user-result" class="form-result"></div>
                 </div>
+                <!-- R5: inline edit form (populated on Edit click) -->
+                <div id="edit-user-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Username</label><br><input id="edit-user-username" type="text" readonly class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="edit-user-email" type="email" placeholder="user@example.com" class="fi w-280"></div>
+                        <div><label class="lbl">Status</label><br><select id="edit-user-status" class="fi"><option value="active">Active</option><option value="disabled">Disabled</option></select></div>
+                        <button data-action="saveEditAccount" data-account-type="user" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAccount" data-account-type="user" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Role/tier is fixed for an existing account (admin and user identities are kept strictly separate). To change tier, delete and recreate in the correct list.</p>
+                    <div id="edit-user-result" class="form-result"></div>
+                </div>
                 <table>
-                    <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
-                    <tbody id="users-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                    <thead><tr><th>Username</th><th>Email</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
+                    <tbody id="users-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
                 </table>
             </div>
 
@@ -315,7 +355,7 @@
                     <div class="form-row">
                         <div><label class="lbl">Alias</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-120"></div>
                         <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
-                        <div><label class="lbl">Model</label><br><input id="alias-model" type="text" placeholder="qwen2.5:3b" class="fi w-200"></div>
+                        <div><label class="lbl">Model</label><br><select id="alias-model" class="fi w-200"><option value="">Loading models…</option></select></div>
                         <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi"><option value="true">Yes</option><option value="false">No</option></select></div>
                         <button data-action="addAlias" class="btn-sm-save">Save</button>
                     </div>
@@ -333,9 +373,9 @@
                 </div>
                 <div id="add-alloc-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Model Alias</label><br><input id="alloc-alias" type="text" placeholder="fast" class="fi w-120"></div>
+                        <div><label class="lbl">Model Alias</label><br><select id="alloc-alias" class="fi w-120"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Target Type</label><br><select id="alloc-type" class="fi"><option value="user">user</option><option value="group">group</option><option value="org">org</option></select></div>
-                        <div><label class="lbl">Target ID</label><br><input id="alloc-target" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">Target ID</label><br><select id="alloc-target" class="fi w-200"><option value="">Select a type…</option></select></div>
                         <button data-action="addAllocation" class="btn-sm-save">Allocate</button>
                     </div>
                     <div id="alloc-result" class="form-result"></div>
@@ -428,6 +468,8 @@
                 <div class="panel-body">
                     <div class="form-row">
                         <div><label class="lbl">Event type</label><br><select id="audit-event-type" class="fi"><option value="">All</option><option value="login">Login</option><option value="agent_registered">Agent registered</option><option value="credential_exfil">Credential exfil</option><option value="policy_denied">Policy denied</option><option value="config_change">Config change</option></select></div>
+                        <div><label class="lbl">Verdict</label><br><select id="audit-verdict" class="fi"><option value="">* (All verdicts)</option></select></div>
+                        <div><label class="lbl">Source type</label><br><select id="audit-source-type" class="fi"><option value="">* (All sources)</option></select></div>
                         <div><label class="lbl">From</label><br><input id="audit-from" type="date" class="fi"></div>
                         <div><label class="lbl">To</label><br><input id="audit-to" type="date" class="fi"></div>
                         <div><label class="lbl">Free text</label><br><input id="audit-text" type="text" placeholder="search..." class="fi w-180"></div>
@@ -469,8 +511,9 @@
                         denials, never remove one. Wildcard = leave Subject ID empty (all subjects of that kind).</p>
                     <div class="form-row--wrap-mb">
                         <label class="lbl">Policy name<br>
-                            <input id="bind-policy-name" type="text" placeholder="e.g. secrets_egress"
-                                   class="fi-sm"></label>
+                            <select id="bind-policy-name" class="fi-sm">
+                                <option value="">Loading policies…</option>
+                            </select></label>
                         <label class="lbl">Subject kind<br>
                             <select id="bind-scope-kind" class="fi-sm">
                                 <option value="human">human</option>
@@ -479,9 +522,10 @@
                                 <option value="mcp_server">mcp_server</option>
                                 <option value="agent">agent</option>
                             </select></label>
-                        <label class="lbl">Subject ID (blank = all)<br>
-                            <input id="bind-scope-id" type="text" placeholder="(wildcard)"
-                                   class="fi-sm"></label>
+                        <label class="lbl">Subject ID<br>
+                            <select id="bind-scope-id" class="fi-sm">
+                                <option value="*">All (wildcard)</option>
+                            </select></label>
                         <label class="lbl">Direction<br>
                             <select id="bind-direction" class="fi-sm">
                                 <option value="ingress">ingress</option>

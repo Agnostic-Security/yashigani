@@ -205,6 +205,72 @@ async def pull_model(body: PullModelRequest, session: StepUpAdminSession):
     return {"status": "ok", "model": name, "ollama_status": last.get("status", "success")}
 
 
+def _is_admin_group(group: dict) -> bool:
+    """R4: a group is 'admin-related' (excluded from allocation targets) if
+    'admin' appears in its id or display_name (case-insensitive)."""
+    hay = (str(group.get("id", "")) + " " + str(group.get("display_name", ""))).lower()
+    return "admin" in hay
+
+
+@router.get("/allocation-targets")
+async def list_allocation_targets(target_type: str, session: AdminSession):
+    """R4 (2.25.5): context-dependent dropdown source for Model Allocations.
+
+      target_type=user  -> all NON-admin user accounts (identity_id = email/username)
+      target_type=org   -> registered orgs (org_ids that have a budget cap, + 'default')
+      target_type=group -> all groups EXCEPT admin-related groups
+
+    Filtering is done server-side so the 'non-admin' / 'except admin groups'
+    rules are enforced + unit-testable in one place. Admin-session gated (read).
+    """
+    tt = (target_type or "").strip().lower()
+    if tt not in ("user", "group", "org"):
+        raise HTTPException(status_code=400, detail={"error": "invalid_target_type"})
+
+    state = backoffice_state
+
+    if tt == "user":
+        if state.auth_service is None:
+            return {"target_type": tt, "targets": []}
+        accounts = await state.auth_service.list_accounts()
+        targets = [
+            {"id": (getattr(r, "email", None) or r.username), "label": r.username}
+            for r in accounts
+            if r.account_tier == "user"
+        ]
+        return {"target_type": tt, "targets": targets}
+
+    if tt == "group":
+        store = state.rbac_store
+        if store is None:
+            return {"target_type": tt, "targets": []}
+        targets = []
+        for g in store.list_groups():
+            gd = {"id": g.id, "display_name": g.display_name}
+            if _is_admin_group(gd):
+                continue
+            targets.append({"id": g.id, "label": g.display_name})
+        return {"target_type": tt, "targets": targets}
+
+    # org — sourced from the org_ids that have a budget cap (the only place orgs
+    # are 'registered'), plus the implicit 'default' org. Deduped, sorted.
+    org_ids = {"default"}
+    try:
+        from yashigani.backoffice.routes import budget as _budget_routes
+        bstate = getattr(_budget_routes, "_state", None)
+        bstore = getattr(bstate, "budget_store", None) if bstate else None
+        if bstore is not None:
+            caps = await bstore.get_org_caps("00000000-0000-0000-0000-000000000000")
+            for c in caps:
+                oid = c.get("org_id")
+                if oid:
+                    org_ids.add(str(oid))
+    except Exception as exc:
+        logger.warning("allocation-targets org lookup failed: %s", exc)
+    targets = [{"id": o, "label": o} for o in sorted(org_ids)]
+    return {"target_type": tt, "targets": targets}
+
+
 @router.get("/allocations")
 async def list_allocations(session: AdminSession):
     store = _alloc_store()
