@@ -769,6 +769,11 @@ async def _proxy_request_body(
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)
+        try:
+            from yashigani.metrics.registry import yashigani_opa_safety_blocks_total
+            yashigani_opa_safety_blocks_total.inc()
+        except Exception:  # noqa: BLE001 — metric must never break the request path
+            pass
         # #4 OPA decision contract: enrich the deny with the policy's self-description
         # (policy_id + layman user_message + HTTP code). Best-effort; the gate above
         # (_opa_check) is the authority and is left untouched.
