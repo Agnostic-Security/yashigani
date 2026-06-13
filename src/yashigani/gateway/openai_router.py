@@ -547,12 +547,27 @@ class ChatMessage(BaseModel):
     role: str = Field(description="Role: system, user, assistant, tool")
     # Nullable: assistant tool-call turns carry content=null.  Audit/PII code
     # joins with `if m.content` so None is treated as "" (build sheet §1.1 note).
-    content: Optional[str] = Field(default=None, description="Message content")
+    # OpenClaw and other clients (anthropic SDK compat) send content as a list of
+    # content blocks: [{"type": "text", "text": "..."}].  Accept both forms and
+    # flatten to str so downstream code stays unchanged.
+    content: Optional[str | list] = Field(default=None, description="Message content")
     name: Optional[str] = None
     # assistant → requests tool calls
     tool_calls: Optional[list[ToolCall]] = None
     # role:"tool" → which assistant tool_call this message answers
     tool_call_id: Optional[str] = None
+
+    def model_post_init(self, __context) -> None:
+        """Flatten list-format content blocks to a plain string."""
+        if isinstance(self.content, list):
+            parts = []
+            for block in self.content:
+                if isinstance(block, dict):
+                    # {"type": "text", "text": "..."} — the common case
+                    parts.append(block.get("text") or block.get("content") or "")
+                elif isinstance(block, str):
+                    parts.append(block)
+            self.content = "\n".join(p for p in parts if p) or None
 
 
 class ChatCompletionRequest(BaseModel):
