@@ -1,4 +1,4 @@
-// last-updated: 2026-05-09T00:00:00+01:00 (v2.23.3: add PKI loadPkiStatus() call in showPage)
+// last-updated: 2026-06-13T00:00:00+01:00 (2.25.5-uifix: R7 remove onboarding; B3 budget dropdowns; R3 alias layout)
 // V1.2.1 — HTML output encoding helper (CWE-79 stored XSS prevention).
 // Every user-controlled value rendered into innerHTML MUST pass through
 // escapeHtml().  Stage B audit (§4.1) identified 10 sinks; all are fixed below.
@@ -39,8 +39,7 @@ function showPage(name, triggerEl) {
     document.getElementById('page-' + name).className = 'page active';
     document.querySelectorAll('.nav-links button').forEach(function(b) { b.className = ''; });
     // Highlight the matching nav button by data-param — works whether triggered
-    // from the nav itself, the onboarding checklist, or programmatically (so a
-    // non-button trigger like an onboarding <label> doesn't lose its own class).
+    // from the nav itself or programmatically.
     var navBtn = (triggerEl && triggerEl.tagName === 'BUTTON' && triggerEl.closest && triggerEl.closest('.nav-links'))
         ? triggerEl
         : document.querySelector('.nav-links button[data-param="' + name + '"]');
@@ -1061,8 +1060,30 @@ async function saveEditAccount(type) {
     }
 }
 
+// B3: populate the group and individual budget target dropdowns from the
+// allocation-targets endpoint (same source as model allocations R4).
+async function loadBudgetTargets() {
+    // Group dropdown: non-admin RBAC groups
+    var gd = await api('/admin/models/allocation-targets?target_type=group');
+    var gItems = (gd && gd.targets) ? gd.targets : [];
+    var gPlaceholder = gItems.length
+        ? { value: '', label: 'Select a group…' }
+        : { value: '', label: 'No groups available' };
+    fillSelect('group-id', gItems, [gPlaceholder]);
+
+    // Individual dropdown: non-admin users
+    var ud = await api('/admin/models/allocation-targets?target_type=user');
+    var uItems = (ud && ud.targets) ? ud.targets : [];
+    var uPlaceholder = uItems.length
+        ? { value: '', label: 'Select a user…' }
+        : { value: '', label: 'No users available' };
+    fillSelect('ind-id', uItems, [uPlaceholder]);
+}
+
 // Budgets
 async function loadBudgets() {
+    // Refresh target dropdowns alongside the budget data.
+    loadBudgetTargets();
     var caps = await api('/admin/budget/org-caps');
     var tbody = document.getElementById('orgcaps-tbody');
     if (caps && caps.org_caps && caps.org_caps.length > 0) {
@@ -1129,7 +1150,7 @@ async function addOrgCap() {
 async function addGroupBudget() {
     var result = document.getElementById('group-result');
     var groupId = document.getElementById('group-id').value.trim();
-    if (!groupId) { result.textContent = 'Group ID is required.'; return; }
+    if (!groupId) { result.textContent = 'Select a group.'; return; }
     var resp = await fetch('/admin/budget/groups', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -1147,7 +1168,7 @@ async function addGroupBudget() {
 async function addIndBudget() {
     var result = document.getElementById('ind-result');
     var indId = document.getElementById('ind-id').value.trim();
-    if (!indId) { result.textContent = 'Identity ID is required.'; return; }
+    if (!indId) { result.textContent = 'Select a user.'; return; }
     var resp = await fetch('/admin/budget/individuals', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -1796,11 +1817,6 @@ async function removeAllowedIp(ip) {
 }
 
 // Dismiss helpers
-function dismissOnboarding() {
-    document.getElementById('onboarding-checklist').classList.remove('is-open');
-    localStorage.setItem('ysg_onboarding_dismissed', '1');
-}
-
 function dismissAgentToken() {
     document.getElementById('agent-token-panel').classList.remove('is-open');
 }
@@ -1815,36 +1831,6 @@ function extendSession() {
     sessionWarned = false;
     sessionStart = Date.now();
 }
-
-// First-run onboarding checklist
-async function checkOnboarding() {
-    if (localStorage.getItem('ysg_onboarding_dismissed') === '1') return;
-    var show = false;
-    // Check password change status
-    var status = await api('/auth/status');
-    // Check agents
-    var agents = await api('/admin/agents');
-    var agentCount = (agents && agents.agents) ? agents.agents.length : 0;
-    // Check alerts
-    var alerts = await api('/admin/alerts/config');
-    var hasWebhook = alerts && alerts.config && (alerts.config.slack_webhook_url || alerts.config.teams_webhook_url);
-
-    var obEl = document.getElementById('onboarding-checklist');
-    var pwCb = document.querySelector('#ob-password input');
-    var agCb = document.querySelector('#ob-agent input');
-    var alCb = document.querySelector('#ob-alerts input');
-
-    if (pwCb) pwCb.checked = true; // They logged in, so password was changed
-    if (agCb) agCb.checked = agentCount > 0;
-    if (alCb) alCb.checked = !!hasWebhook;
-
-    // Show if any item unchecked
-    if (!agCb.checked || !alCb.checked) {
-        show = true;
-    }
-    if (show) obEl.classList.add('is-open');
-}
-checkOnboarding();
 
 // Session timeout warning — check every 60s, warn at 10 min remaining
 var sessionStart = Date.now();
@@ -1916,9 +1902,6 @@ document.addEventListener('click', function(e) {
             break;
 
         // Dismiss panels
-        case 'dismissOnboarding':
-            dismissOnboarding();
-            break;
         case 'dismissAgentToken':
             dismissAgentToken();
             break;

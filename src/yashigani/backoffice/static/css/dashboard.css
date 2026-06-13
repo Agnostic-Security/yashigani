@@ -102,8 +102,6 @@ tr:hover { background: #f8fafc; }
 .btn-xs-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
 /* crypto export button */
 .btn-export { margin-top: 12px; padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-/* dismiss (outline-blue) */
-.btn-dismiss-outline { margin-top: 10px; padding: 4px 12px; background: transparent; border: 1px solid #93c5fd; border-radius: 4px; cursor: pointer; font-size: 0.8rem; color: #3b82f6; }
 /* dismiss secondary */
 .btn-dismiss { margin-top: 8px; padding: 6px 16px; background: #64748b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* pki close button */
@@ -122,12 +120,6 @@ tr:hover { background: #f8fafc; }
 .btn-stepup-cancel { flex: 1; padding: 10px; background: #f1f5f9; color: #334155; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
 /* allowlist add (green) */
 .btn-allowlist-add { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
-
-/* ── Onboarding checklist ───────────────────────────────────── */
-.onboarding { display: none; margin-bottom: 20px; padding: 16px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; }
-.onboarding-title { margin: 0 0 12px; font-size: 1rem; color: #1e40af; }
-.onboarding-items { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; }
-.onboarding-lbl { color: #64748b; cursor: pointer; }
 
 /* ── Credentials / token panels ────────────────────────────── */
 /* hidden until shown once */
@@ -284,7 +276,6 @@ tr:hover { background: #f8fafc; }
    already declares `display:none`; the `is-open` modifier reveals it. */
 .form-panel.is-open { display: block; }
 .once-panel.is-open { display: block; }
-.onboarding.is-open { display: block; }
 .stepup-overlay.is-open { display: flex; }
 .backup-verify-result.is-open { display: block; }
 .pki-rotate-result.is-open { display: block; }
