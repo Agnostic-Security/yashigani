@@ -704,35 +704,292 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // Dashboard
 async function loadDashboard() {
-    var data = await api('/dashboard/health');
-    var container = document.getElementById('health-cards');
-    if (data && data.components) {
-        var html = '';
-        for (var name in data.components) {
-            var comp = data.components[name];
-            var status = comp.status || 'unknown';
-            var badge = status === 'ok' ? 'badge-green' : status === 'degraded' ? 'badge-yellow' : 'badge-red';
-            html += '<div class="card"><div class="card-label">' + name + '</div><span class="badge ' + badge + '">' + status + '</span></div>';
-        }
-        container.innerHTML = html;
+    // R25: orchestrate all five dashboard widgets in parallel for fast render.
+    await Promise.all([
+        loadDashServicesHealth(),
+        loadDashAlerts(),
+        loadDashBudget(),
+        loadDashSecurity(),
+        loadDashTraffic(),
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 1 — Per-service health semaphores + roll-up
+// ---------------------------------------------------------------------------
+
+// Map a service status string to a semaphore CSS class (R25 palette).
+function _svcSemaphoreClass(status) {
+    if (status === 'ok' || status === 'community' || status === 'not_configured') return 'semaphore--ok';
+    if (status === 'degraded' || status === 'warning' || status === 'stopped') return 'semaphore--degraded';
+    return 'semaphore--critical';
+}
+
+// Map an overall roll-up value to a semaphore CSS class.
+function _rollupSemaphoreClass(rollup) {
+    if (rollup === 'ok') return 'semaphore--ok';
+    if (rollup === 'degraded') return 'semaphore--degraded';
+    return 'semaphore--critical';
+}
+
+async function loadDashServicesHealth() {
+    var bodyEl = document.getElementById('dash-services-body');
+    var rollupEl = document.getElementById('dash-health-rollup');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/services-health');
+    if (!data || !data.services) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading service health</span>';
+        return;
+    }
+
+    // Update roll-up semaphore
+    if (rollupEl) {
+        rollupEl.className = 'semaphore ' + _rollupSemaphoreClass(data.rollup);
+        rollupEl.title = 'Overall: ' + escapeHtml(data.rollup);
+    }
+
+    // Build service table
+    var rows = '';
+    (data.services || []).forEach(function(svc) {
+        var semCls = _svcSemaphoreClass(svc.status);
+        var critTag = svc.criticality
+            ? '<span class="svc-crit-tag">critical</span>'
+            : '<span class="svc-noncrit-tag">non-critical</span>';
+        rows += '<tr>'
+            + '<td class="svc-semaphore-cell"><span class="semaphore ' + semCls + '" title="' + escapeHtml(svc.status) + '"></span></td>'
+            + '<td class="svc-name">' + escapeHtml(svc.name) + '</td>'
+            + '<td>' + critTag + '</td>'
+            + '<td class="svc-detail">' + escapeHtml(svc.detail || svc.status) + '</td>'
+            + '</tr>';
+    });
+    bodyEl.innerHTML = '<table class="svc-table"><tbody>' + rows + '</tbody></table>';
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 2 — Active alerts semaphore (P1–P5, priority order)
+// ---------------------------------------------------------------------------
+
+async function loadDashAlerts() {
+    var bodyEl = document.getElementById('dash-alerts-body');
+    var totalEl = document.getElementById('dash-alerts-total');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/security-metrics');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading alerts</span>';
+        return;
+    }
+
+    var counts = data.recent_alerts_by_priority || {};
+    var total = (counts.P1 || 0) + (counts.P2 || 0) + (counts.P3 || 0) + (counts.P4 || 0) + (counts.P5 || 0);
+
+    if (totalEl) totalEl.textContent = total + ' in buffer';
+
+    // Priority rows P1 (most urgent) → P5 (informational)
+    var priorities = [
+        { key: 'P1', label: 'P1 Critical',      cls: 'semaphore--p1' },
+        { key: 'P2', label: 'P2 High',           cls: 'semaphore--p2' },
+        { key: 'P3', label: 'P3 Medium',         cls: 'semaphore--p3' },
+        { key: 'P4', label: 'P4 Low',            cls: 'semaphore--p4' },
+        { key: 'P5', label: 'P5 Informational',  cls: 'semaphore--p5' },
+    ];
+
+    var items = '';
+    priorities.forEach(function(p) {
+        var n = counts[p.key] || 0;
+        var cntCls = n === 0 ? 'alert-priority-count--zero' : '';
+        items += '<li class="alert-priority-item">'
+            + '<span class="semaphore ' + p.cls + '"></span>'
+            + '<span class="alert-priority-label">' + escapeHtml(p.label) + '</span>'
+            + '<span class="alert-priority-count ' + cntCls + '">' + n + '</span>'
+            + '</li>';
+    });
+    bodyEl.innerHTML = '<ul class="alert-priority-list">' + items + '</ul>';
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 3 — Budget usage: used/cap gauge, 85% marker, split
+// ---------------------------------------------------------------------------
+
+async function loadDashBudget() {
+    var bodyEl = document.getElementById('dash-budget-body');
+    var badgeEl = document.getElementById('dash-budget-threshold-badge');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/budget-summary');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading budget data</span>';
+        return;
+    }
+
+    var threshold = data.budget_threshold_pct || 85;
+    var alertEnabled = data.threshold_alert_enabled !== false;
+
+    if (badgeEl) {
+        badgeEl.textContent = alertEnabled ? ('Alert at ' + threshold + '%') : 'Alert off';
+    }
+
+    var cloud = data.tokens_by_route ? (data.tokens_by_route.cloud || 0) : 0;
+    var local = data.tokens_by_route ? (data.tokens_by_route.local || 0) : 0;
+    var total = data.tokens_by_route ? (data.tokens_by_route.total || 0) : 0;
+
+    // Gauge: cloud as % of total (if any tokens consumed)
+    var cloudPct = total > 0 ? Math.round((cloud / total) * 100) : 0;
+    var fillCls = cloudPct >= 100 ? 'budget-gauge-fill--danger'
+                : cloudPct >= threshold ? 'budget-gauge-fill--warn'
+                : 'budget-gauge-fill--ok';
+
+    // CSP-safe: no inline style= in HTML. Width is set via .style.width after DOM insertion.
+    var gaugeHtml = '<div class="budget-gauge-wrap">'
+        + '<div class="budget-gauge-label"><span>Cloud token usage</span><span>' + cloudPct + '%</span></div>'
+        + '<div class="budget-gauge-bar">'
+        + '<div class="budget-gauge-fill ' + fillCls + '" id="dash-budget-gauge-fill"></div>'
+        + '<div class="budget-gauge-marker budget-gauge-marker--85" title="85% threshold"></div>'
+        + '</div>'
+        + '</div>';
+
+    // Cloud / local split
+    var splitHtml = '<div class="budget-split">'
+        + '<div class="budget-split-item"><div class="budget-split-label">Cloud tokens</div><div class="budget-split-value">' + _fmtTokens(cloud) + '</div></div>'
+        + '<div class="budget-split-item"><div class="budget-split-label">Local tokens</div><div class="budget-split-value">' + _fmtTokens(local) + '</div></div>'
+        + '<div class="budget-split-item"><div class="budget-split-label">Total</div><div class="budget-split-value">' + _fmtTokens(total) + '</div></div>'
+        + '</div>';
+
+    // Budget config counts
+    var countsHtml = '<div class="budget-counts">'
+        + '<div class="budget-count-item"><div class="budget-count-label">Org caps</div><div class="budget-count-value">' + (data.org_caps_count || 0) + '</div></div>'
+        + '<div class="budget-count-item"><div class="budget-count-label">Groups</div><div class="budget-count-value">' + (data.group_budgets_count || 0) + '</div></div>'
+        + '<div class="budget-count-item"><div class="budget-count-label">Individuals</div><div class="budget-count-value">' + (data.individual_budgets_count || 0) + '</div></div>'
+        + '</div>';
+
+    bodyEl.innerHTML = gaugeHtml + splitHtml + countsHtml;
+
+    // CSP-safe: set gauge fill width via CSSOM after DOM insertion (not inline style= in HTML).
+    var fillEl = document.getElementById('dash-budget-gauge-fill');
+    if (fillEl) fillEl.style.width = Math.min(cloudPct, 100) + '%';
+}
+
+// Format token count: K/M suffix for readability
+function _fmtTokens(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 4 — Security story
+// ---------------------------------------------------------------------------
+
+async function loadDashSecurity() {
+    var bodyEl = document.getElementById('dash-security-body');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/security-metrics');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading security data</span>';
+        return;
+    }
+
+    var rows = '<div class="sec-row"><span class="sec-label">OPA safety blocks (lifetime)</span><span class="sec-value">' + (data.opa_blocks_total || 0) + '</span></div>';
+
+    // Sensitivity mix bar
+    var sens = data.sensitivity_detections || {};
+    var sensTotal = 0;
+    ['RESTRICTED', 'CONFIDENTIAL', 'SENSITIVE', 'INTERNAL', 'PUBLIC'].forEach(function(l) { sensTotal += (sens[l] || 0); });
+
+    if (sensTotal > 0) {
+        var segMap = {
+            'RESTRICTED': { cls: 'sensbar-seg-5', dotCls: 'sensbar-dot-5' },
+            'SENSITIVE':  { cls: 'sensbar-seg-4', dotCls: 'sensbar-dot-4' },
+            'CONFIDENTIAL':{ cls: 'sensbar-seg-3', dotCls: 'sensbar-dot-3' },
+            'INTERNAL':   { cls: 'sensbar-seg-2', dotCls: 'sensbar-dot-2' },
+            'PUBLIC':     { cls: 'sensbar-seg-1', dotCls: 'sensbar-dot-1' },
+        };
+        // CSP-safe: build segment refs array; set widths via CSSOM after DOM insertion.
+        var segRefs = []; // [{id, pct}]
+        var segs = '';
+        var legend = '';
+        var segIdx = 0;
+        ['RESTRICTED', 'SENSITIVE', 'CONFIDENTIAL', 'INTERNAL', 'PUBLIC'].forEach(function(l) {
+            var n = sens[l] || 0;
+            if (n === 0) return;
+            var pct = Math.round((n / sensTotal) * 100);
+            var m = segMap[l] || { cls: 'sensbar-seg-1', dotCls: 'sensbar-dot-1' };
+            var segId = 'dash-sensbar-seg-' + segIdx;
+            segRefs.push({ id: segId, pct: pct });
+            segs += '<span id="' + segId + '" class="' + m.cls + '"></span>';
+            legend += '<span class="sensbar-key"><span class="sensbar-dot ' + m.dotCls + '"></span>' + escapeHtml(l) + ' ' + n + '</span>';
+            segIdx++;
+        });
+        rows += '<div class="sensbar-wrap">'
+            + '<div class="sensbar-label">Sensitivity traffic mix (' + sensTotal + ' detections)</div>'
+            + '<div class="sensbar-track">' + segs + '</div>'
+            + '<div class="sensbar-legend">' + legend + '</div>'
+            + '</div>';
+        bodyEl.innerHTML = rows;
+        // CSP-safe: set sensbar segment widths via CSSOM after DOM insertion.
+        segRefs.forEach(function(ref) {
+            var el = document.getElementById(ref.id);
+            if (el) el.style.width = ref.pct + '%';
+        });
+        return;
     } else {
-        container.innerHTML = '<div class="card"><span class="badge badge-red">Error loading health data</span></div>';
+        rows += '<div class="sec-row"><span class="sec-label">Sensitivity detections</span><span class="sec-value">0</span></div>';
     }
 
-    // Accounts count
-    var accounts = await api('/admin/accounts');
-    if (accounts && accounts.accounts) {
-        document.getElementById('stat-accounts').textContent = accounts.accounts.length;
+    bodyEl.innerHTML = rows;
+}
+
+// ---------------------------------------------------------------------------
+// R25 Dashboard Widget 5 — Traffic, agent/MCP activity, recent audit
+// ---------------------------------------------------------------------------
+
+async function loadDashTraffic() {
+    var bodyEl = document.getElementById('dash-traffic-body');
+    if (!bodyEl) return;
+
+    var data = await api('/dashboard/traffic-metrics');
+    if (!data) {
+        bodyEl.innerHTML = '<span class="badge badge-red">Error loading traffic data</span>';
+        return;
     }
 
-    // Agents count
-    var agents = await api('/admin/agents');
-    if (agents) {
-        document.getElementById('stat-agents').textContent = Array.isArray(agents) ? agents.length : 0;
+    var statsHtml = '<div class="traffic-grid">'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.gateway_requests_total || 0) + '</div><div class="traffic-stat-label">Gateway requests</div></div>'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.agent_calls_total || 0) + '</div><div class="traffic-stat-label">Agent calls</div></div>'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.inspection_requests_total || 0) + '</div><div class="traffic-stat-label">Inspections</div></div>'
+        + '<div class="traffic-stat"><div class="traffic-stat-value">' + (data.ratelimit_violations_total || 0) + '</div><div class="traffic-stat-label">Rate-limit events</div></div>'
+        + '</div>';
+
+    // Recent audit events mini-table
+    var recent = data.recent_audit_events || [];
+    var tableHtml = '';
+    if (recent.length > 0) {
+        var auditRows = recent.map(function(e) {
+            var who = e.admin_account || e.user || e.user_handle || e.agent_id || '-';
+            var verdict = e.verdict || e.outcome || '-';
+            var blocked = /block|deni|reject|fail/i.test(verdict);
+            return '<tr>'
+                + '<td class="td-xxs">' + escapeHtml((e.timestamp || e.received_at || '').substring(0, 19)) + '</td>'
+                + '<td>' + escapeHtml(e.event_type || '-') + '</td>'
+                + '<td>' + escapeHtml(who) + '</td>'
+                + '<td><span class="badge ' + (blocked ? 'badge-red' : 'badge-green') + '">' + escapeHtml(verdict) + '</span></td>'
+                + '</tr>';
+        }).join('');
+        tableHtml = '<table class="audit-mini-table">'
+            + '<thead><tr><th>Time</th><th>Event</th><th>Who</th><th>Verdict</th></tr></thead>'
+            + '<tbody>' + auditRows + '</tbody>'
+            + '</table>';
+    } else {
+        tableHtml = '<p class="txt-note">No recent audit events in buffer.</p>';
     }
 
-    // License
-    document.getElementById('stat-license').textContent = 'Community';
+    bodyEl.innerHTML = statsHtml + tableHtml;
+}
+
+function dashRefresh() {
+    loadDashboard();
 }
 
 // Agents
@@ -1899,6 +2156,11 @@ document.addEventListener('click', function(e) {
             break;
         case 'logout':
             logout();
+            break;
+
+        // R25 — Dashboard refresh button
+        case 'dashRefresh':
+            dashRefresh();
             break;
 
         // Dismiss panels
