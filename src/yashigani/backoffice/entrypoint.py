@@ -667,6 +667,8 @@ _collector = MetricsCollector(
     rbac_store=backoffice_state.rbac_store,
     agent_registry=backoffice_state.agent_registry,
     backend_registry=backoffice_state.backend_registry,
+    # session_store: powers yashigani_auth_active_sessions (Security Overview panel).
+    session_store=backoffice_state.session_store,
     poll_interval_seconds=15,
 )
 _collector.start()

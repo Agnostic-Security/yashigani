@@ -43,6 +43,7 @@ class MetricsCollector:
         backend_registry=None,
         pool_manager=None,
         budget_enforcer=None,
+        session_store=None,
         poll_interval_seconds: int = 15,
     ) -> None:
         self._monitor = resource_monitor
@@ -55,6 +56,7 @@ class MetricsCollector:
         self._backend_registry = backend_registry
         self._pool_manager = pool_manager
         self._budget_enforcer = budget_enforcer
+        self._session_store = session_store
         self._interval = poll_interval_seconds
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -251,3 +253,14 @@ class MetricsCollector:
                     ).set(pct)
             except Exception as exc:
                 logger.debug("Budget group utilisation metrics error: %s", exc)
+
+        # ── Active sessions ───────────────────────────────────────────────────
+        # Polls the session store for a live count of valid Redis session keys.
+        # Wires yashigani_auth_active_sessions used by the Security Overview
+        # dashboard "Active Sessions" stat panel.
+        if self._session_store is not None:
+            try:
+                from yashigani.metrics.registry import auth_active_sessions
+                auth_active_sessions.set(self._session_store.count_active_all())
+            except Exception as exc:
+                logger.debug("Session store active-sessions metrics error: %s", exc)
