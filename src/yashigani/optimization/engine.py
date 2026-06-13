@@ -138,8 +138,9 @@ class OptimizationEngine:
         # Resolve model alias
         provider, model, alias_force_local = self._resolve_alias(requested_model)
 
-        # P1: CONFIDENTIAL/RESTRICTED -> LOCAL (IMMUTABLE)
-        if sensitivity.level in (SensitivityLevel.CONFIDENTIAL, SensitivityLevel.RESTRICTED):
+        # P1: CONFIDENTIAL/RESTRICTED/SENSITIVE (levels 4–5) -> LOCAL (IMMUTABLE)
+        # R14/R15 (v2.25.5): level is now int 1–5; levels >= 4 are cloud-blocked.
+        if sensitivity.level >= SensitivityLevel.CONFIDENTIAL:
             # #25 risk-accepted cloud override (dual-admin, justified, TTL'd): if an
             # override is ACTIVE, the named cloud LLM may serve this sensitive request
             # instead of being pinned local. The customer has a cloud agreement and

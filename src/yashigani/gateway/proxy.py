@@ -1264,8 +1264,14 @@ def _proxy_response_sensitivity(
         # ResponseInspectionPipeline when a SensitivityClassifier is wired.
         # Attribute is absent on older pipeline versions — getattr is safe.
         sens = getattr(result, "response_sensitivity", None)
-        if sens and isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
-            return sens
+        # R14/R15 (v2.25.5): pipeline now emits legacy string (via _LEVEL_TO_LEGACY_STRING).
+        # Accept both legacy strings and numeric levels as a safety net.
+        if sens is not None:
+            if isinstance(sens, int) and 1 <= sens <= 5:
+                from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+                return _LEVEL_TO_LEGACY_STRING.get(sens, "RESTRICTED")
+            if isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
+                return sens
     except Exception as exc:
         logger.debug(
             "proxy: response sensitivity classification failed (request_id=%s): %s",
