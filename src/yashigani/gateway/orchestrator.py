@@ -403,7 +403,11 @@ def _classify_sensitivity(text: str) -> str:
     if classifier is None:
         return "RESTRICTED"
     try:
-        return classifier.classify_decoded(text).level.value
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        result = classifier.classify_decoded(text)
+        # R14/R15 (v2.25.5): SensitivityResult.level is int; .value would raise AttributeError.
+        # Use _LEVEL_TO_LEGACY_STRING to convert to the legacy string OPA/callers expect.
+        return _LEVEL_TO_LEGACY_STRING.get(int(result.level), "RESTRICTED")
     except Exception as exc:
         logger.warning("orchestration: args sensitivity classify failed: %s — RESTRICTED", exc)
         return "RESTRICTED"
@@ -803,7 +807,10 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
     sensitivity_level = "PUBLIC"
     if _state.sensitivity_classifier and prompt_text:
         try:
-            sensitivity_level = _state.sensitivity_classifier.classify_decoded(prompt_text).level.value
+            from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+            _sens_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
+            # R14/R15 (v2.25.5): SensitivityResult.level is int; .value raises AttributeError.
+            sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(_sens_result.level), "RESTRICTED")
         except Exception as exc:
             logger.error("orchestration seed: sensitivity classify failed: %s — denying", exc)
             return _seed_denied(request_id, "seed_sensitivity_classify_failed", sensitivity_level)

@@ -337,13 +337,19 @@ class OptimizationEngine:
     ) -> RoutingDecision:
         elapsed_us = (time.monotonic_ns() - start_ns) // 1000
 
+        # R14/R15 (v2.25.5): SensitivityResult.level is int (1–5).
+        # str(int) produces "4" not "RESTRICTED"; use the legacy-string map so
+        # RoutingDecision.sensitivity and the Prometheus label keep the historical
+        # string form (audit records, dashboards, downstream consumers expect strings).
+        _sens_label: str = _LEVEL_TO_LEGACY_STRING.get(int(sensitivity.level), "RESTRICTED")
+
         decision = RoutingDecision(
             provider=provider,
             model=model,
             route=route,
             rule=rule,
             reason=reason,
-            sensitivity=str(sensitivity.level),
+            sensitivity=_sens_label,
             complexity=complexity.level.value,
             budget_signal=budget.signal.value,
             budget_pct=budget.pct,
@@ -371,7 +377,7 @@ class OptimizationEngine:
                 rule=rule, route=route
             ).inc()
             yashigani_sensitivity_detections_total.labels(
-                level=str(sensitivity.level)
+                level=_sens_label
             ).inc()
             yashigani_complexity_scores_total.labels(
                 level=complexity.level.value

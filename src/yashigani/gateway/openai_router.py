@@ -1159,7 +1159,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     s_result = None
     if _state.sensitivity_classifier:
         s_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
-        sensitivity_level = s_result.level.value
+        # R14/R15 (v2.25.5): SensitivityResult.level is int (not SensitivityLevel enum).
+        # Calling .value on an int raises AttributeError.  Convert via the legacy-string map
+        # so all downstream consumers (string comparisons, HTTP headers, OPA, audit) get
+        # the expected "PUBLIC"/"INTERNAL"/"CONFIDENTIAL"/"RESTRICTED" label.
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
         sensitivity_triggers = s_result.triggers
     if s_result is None:
         from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
