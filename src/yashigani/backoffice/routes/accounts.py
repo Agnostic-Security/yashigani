@@ -8,9 +8,14 @@ BOPLA note (issue #90): list_admins and create_admin use explicit
 response_model= declarations backed by AdminAccountPublic /
 AdminCreateResponse to guarantee that password_hash, totp_secret,
 recovery_codes, and lockout counters are never leaked in list responses.
+
+N1 enforcement (2.25.5): GET /admin/accounts/enforcement exposes the live
+admin-count state and whether the system is below the minimum floor.
+The UI consumes this to surface "you must add a second admin" banners.
+All mutation guards (delete, disable, PUT disable) are also wired here.
 """
 
-# Last updated: 2026-05-09T00:00:00+01:00
+# Last updated: 2026-06-13T00:00:00+01:00
 from __future__ import annotations
 
 from typing import Optional
@@ -59,6 +64,45 @@ class UpdateAdminRequest(BaseModel):
         pattern=r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$",
     )
     disabled: Optional[bool] = None
+
+
+@router.get("/enforcement")
+async def get_enforcement_status(session: AdminSession):
+    """N1 (2.25.5): Return the live admin-count enforcement state.
+
+    Designed to be polled by the UI on login and on the Accounts page to surface
+    the 'you must add a second admin' banner when total < min_total.
+
+    Response fields:
+      total          — total admin accounts (enabled + disabled)
+      active         — active (non-disabled) admin accounts
+      min_total      — hard floor for total admins (delete guard threshold)
+      min_active     — hard floor for active admins (disable guard threshold)
+      soft_target    — recommended target for separation of duties
+      below_minimum  — True when total < min_total (system is not safe to operate)
+      below_active_minimum — True when active < min_active
+      below_soft_target    — True when total < soft_target (advisory, not enforced)
+      action_required      — True when any hard minimum is unmet
+
+    NIST AC-2, NIST AC-5 / SOC 2 CC6.2 / ASVS V2.1.
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    total = await state.auth_service.total_admin_count()
+    active = await state.auth_service.active_admin_count()
+    below_minimum = total < state.admin_min_total
+    below_active_minimum = active < state.admin_min_active
+    return {
+        "total": total,
+        "active": active,
+        "min_total": state.admin_min_total,
+        "min_active": state.admin_min_active,
+        "soft_target": state.admin_soft_target,
+        "below_minimum": below_minimum,
+        "below_active_minimum": below_active_minimum,
+        "below_soft_target": total < state.admin_soft_target,
+        "action_required": below_minimum or below_active_minimum,
+    }
 
 
 @router.get("")

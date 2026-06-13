@@ -1,19 +1,23 @@
 """
 Yashigani Backoffice — Model & Alias management routes.
 
-# Last updated: 2026-05-02T09:00:00+01:00
+# Last updated: 2026-06-13T00:00:00+01:00
 
 CRUD for model aliases and model allocation to users/groups/orgs.
   GET     /admin/models                  — List all model aliases
   POST    /admin/models                  — Create a model alias (step-up required)
   DELETE  /admin/models/{alias}          — Delete a model alias (step-up required)
   GET     /admin/models/available        — List models from Ollama
+  POST    /admin/models/pull             — Pull a model from Ollama + auto-add alias (step-up)
   GET     /admin/models/allocations      — List all model allocations
   POST    /admin/models/allocations      — Allocate a model to user/group/org (step-up required)
   DELETE  /admin/models/allocations/{id} — Remove an allocation (step-up required)
 
 LF-STEPUP-AGENT-CREATE (2026-04-27): mutation endpoints now require step-up auth.
 Model alias and allocation changes affect routing policy and sensitivity ceilings.
+
+R1 (2.25.5): POST /admin/models/pull now auto-adds an alias for the pulled model
+in a single atomic action — idempotent (no-op if the alias already exists).
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
@@ -170,11 +174,42 @@ def _ollama_base() -> str:
             or "http://ollama:11434").rstrip("/")
 
 
+def _model_name_to_alias(name: str) -> str:
+    """Derive a safe alias name from a model name string.
+
+    Ollama model names look like 'llama3:8b', 'qwen2.5:3b', 'gemma3:4b', etc.
+    The alias is lowercased and non-alphanumeric characters (except '-' and '_')
+    are replaced with '-' so they fit the alias field pattern.
+    Truncated to 64 chars (alias max_length).
+
+    Examples:
+      'llama3:8b'       -> 'llama3-8b'
+      'qwen2.5-coder:7b'-> 'qwen2-5-coder-7b'
+      'my/model:latest' -> 'my-model-latest'
+    """
+    import re
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", name.lower())
+    # Collapse consecutive dashes
+    safe = re.sub(r"-{2,}", "-", safe).strip("-")
+    return safe[:64] or "model"
+
+
 @router.post("/pull", status_code=202)
 async def pull_model(body: PullModelRequest, session: StepUpAdminSession):
-    """#25: pull an Ollama model into the local model store (operational complement
-    to GET /available). Step-up gated. Consumes Ollama's NDJSON pull stream to
-    completion and returns the final status; fail-closed on any error/unreachable."""
+    """R1 (2.25.5): pull an Ollama model and auto-add it to the available-models alias
+    list in a single action.
+
+    Behaviour:
+    - Streams Ollama's NDJSON pull to completion (fail-closed on error/unreachable).
+    - On success, upserts an alias in ModelAliasStore for the pulled model so it
+      immediately appears in GET /admin/models without a separate create step.
+    - Idempotent: if an alias for this model name already exists, it is left unchanged
+      (alias_created=False in the response).
+    - If the alias store is unavailable, the pull still succeeds — alias_created=False
+      is returned and a warning is logged (non-fatal; operator can create alias manually).
+
+    Step-up gated (#25 / LF-STEPUP-AGENT-CREATE).
+    """
     import httpx
     import json as _json
     name = body.name.strip()
@@ -201,8 +236,41 @@ async def pull_model(body: PullModelRequest, session: StepUpAdminSession):
         logger.warning("model pull failed for %s: %s", name, exc)
         raise HTTPException(status_code=503,
                             detail={"error": "ollama_unreachable", "message": "Could not reach Ollama."})
+
     logger.info("Admin %s pulled model %s (status=%s)", session.account_id, name, last.get("status"))
-    return {"status": "ok", "model": name, "ollama_status": last.get("status", "success")}
+
+    # R1: auto-add alias — idempotent (skip if already registered)
+    alias_name = _model_name_to_alias(name)
+    alias_created = False
+    alias_existed = False
+    try:
+        store = _alias_store()
+        if store.get(alias_name) is not None:
+            alias_existed = True
+            logger.debug("pull_model: alias %r already exists for %s — skipping create", alias_name, name)
+        else:
+            store.set(alias_name, ModelAlias(
+                alias=alias_name,
+                provider="ollama",
+                model=name,
+                force_local=True,
+            ))
+            alias_created = True
+            logger.info("pull_model: auto-created alias %r for %s (admin=%s)", alias_name, name, session.account_id)
+    except HTTPException:
+        # Alias store unavailable (503) — pull succeeded, alias deferred.
+        logger.warning("pull_model: alias store unavailable after pull of %s — alias not created", name)
+    except Exception as exc:
+        logger.warning("pull_model: alias auto-create failed for %s: %s — alias not created", name, exc)
+
+    return {
+        "status": "ok",
+        "model": name,
+        "ollama_status": last.get("status", "success"),
+        "alias": alias_name,
+        "alias_created": alias_created,
+        "alias_existed": alias_existed,
+    }
 
 
 def _is_admin_group(group: dict) -> bool:
