@@ -1,65 +1,315 @@
 {
   "uid": "yashigani-budget",
-  "title": "Yashigani — Budget Usage",
-  "tags": ["yashigani", "budget", "billing"],
+  "title": "Yashigani \u2014 Budget Usage",
+  "tags": [
+    "yashigani",
+    "budget",
+    "billing"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-24h", "to": "now"},
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "Total Cloud Tokens Used (24h)",
-      "gridPos": {"x":0,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_budget_tokens_total{route=\"cloud\"}[24h]))","legendFormat":"Cloud Tokens"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":100000},{"color":"red","value":500000}]}}}
+      "id": 9,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Monitors token spend and cost by model provider and tenant. Tracks cloud vs local routing split, budget exhaustion events, and estimated cloud cost. Critical for cost governance and overspend alerts."
+      }
     },
     {
-      "id": 2, "type": "stat", "title": "Total Local Tokens (24h)",
-      "gridPos": {"x":6,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_budget_tokens_total{route=\"local\"}[24h]))","legendFormat":"Local Tokens"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"blue","value":null}]}}}
-    },
-    {
-      "id": 3, "type": "stat", "title": "Budget Exhausted Events (24h)",
-      "gridPos": {"x":12,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_budget_exhausted_total[24h]))","legendFormat":"Exhausted"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":10}]}}}
-    },
-    {
-      "id": 4, "type": "stat", "title": "Cloud Cost Estimate (24h)",
-      "gridPos": {"x":18,"y":0,"w":6,"h":4},
-      "targets": [{"expr":"sum(increase(yashigani_budget_cost_usd_total[24h]))","legendFormat":"USD"}],
-      "options": {"colorMode":"background","reduceOptions":{"calcs":["lastNotNull"]}},
-      "fieldConfig": {"defaults":{"unit":"currencyUSD","thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":50},{"color":"red","value":200}]}}}
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "Token Usage by Provider",
-      "gridPos": {"x":0,"y":4,"w":12,"h":8},
-      "targets": [{"expr":"sum by (provider) (rate(yashigani_budget_tokens_total[5m]))","legendFormat":"{{provider}}"}],
-      "options": {"legend":{"displayMode":"table","placement":"bottom"}}
-    },
-    {
-      "id": 6, "type": "timeseries", "title": "Token Usage by Identity (Top 10)",
-      "gridPos": {"x":12,"y":4,"w":12,"h":8},
-      "targets": [{"expr":"topk(10, sum by (identity_id) (rate(yashigani_budget_tokens_total[5m])))","legendFormat":"{{identity_id}}"}],
-      "options": {"legend":{"displayMode":"table","placement":"bottom"}}
-    },
-    {
-      "id": 7, "type": "bargauge", "title": "Budget Utilisation by Group",
-      "gridPos": {"x":0,"y":12,"w":12,"h":6},
-      "targets": [{"expr":"yashigani_budget_utilisation_pct","legendFormat":"{{group_id}}"}],
-      "options": {"orientation":"horizontal","displayMode":"gradient"},
-      "fieldConfig": {"defaults":{"thresholds":{"steps":[{"color":"green","value":null},{"color":"yellow","value":80},{"color":"red","value":100}]},"max":100,"unit":"percent"}}
-    },
-    {
-      "id": 8, "type": "timeseries", "title": "Local vs Cloud Routing (requests/s)",
-      "gridPos": {"x":12,"y":12,"w":12,"h":6},
+      "id": 1,
+      "type": "stat",
+      "title": "Total Cloud Tokens Used (24h)",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
-        {"expr":"sum(rate(yashigani_routing_decisions_total{route=\"local\"}[5m]))","legendFormat":"Local"},
-        {"expr":"sum(rate(yashigani_routing_decisions_total{route=\"cloud\"}[5m]))","legendFormat":"Cloud"}
+        {
+          "expr": "sum(increase(yashigani_budget_tokens_total{route=\"cloud\"}[24h]))",
+          "legendFormat": "Cloud Tokens"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100000
+              },
+              {
+                "color": "red",
+                "value": 500000
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Local Tokens (24h)",
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_budget_tokens_total{route=\"local\"}[24h]))",
+          "legendFormat": "Local Tokens"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Budget Exhausted Events (24h)",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_budget_exhausted_total[24h]))",
+          "legendFormat": "Exhausted"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Cloud Cost Estimate (24h)",
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(yashigani_budget_cost_usd_total[24h]))",
+          "legendFormat": "USD"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 200
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Token Usage by Provider",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider) (rate(yashigani_budget_tokens_total[5m]))",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Token Usage by Identity (Top 10)",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (identity_id) (rate(yashigani_budget_tokens_total[5m])))",
+          "legendFormat": "{{identity_id}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "bargauge",
+      "title": "Budget Utilisation by Group",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "yashigani_budget_utilisation_pct",
+          "legendFormat": "{{group_id}}"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "max": 100,
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Local vs Cloud Routing (requests/s)",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(yashigani_routing_decisions_total{route=\"local\"}[5m]))",
+          "legendFormat": "Local"
+        },
+        {
+          "expr": "sum(rate(yashigani_routing_decisions_total{route=\"cloud\"}[5m]))",
+          "legendFormat": "Cloud"
+        }
       ]
     }
   ]
