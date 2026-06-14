@@ -125,15 +125,6 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
     if ctx is None:
         return
 
-    # Install-path service account — seeded INDEPENDENTLY of the human-admin
-    # guard below. It must exist on every deployment (fresh OR existing/upgrade),
-    # because its whole purpose is making programmatic admin-API re-runs robust
-    # on a long-lived stack (e.g. re-registering agents after a redis recreate
-    # wipes the registry). If it were gated behind total_admin_count()==0 it
-    # would never appear on an upgraded stack — defeating the fix. Its own
-    # existence check makes it idempotent across restarts.
-    await _bootstrap_service_account(auth_service, ctx["secrets_dir"], _log)
-
     if await auth_service.total_admin_count() != 0:
         _log.info("Bootstrap: admin accounts already present — skipping seed")
         return
@@ -177,62 +168,6 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
                     _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret")
             _log.info("Bootstrap: backup admin account created — %s", admin2_username)
 
-
-async def _bootstrap_service_account(auth_service, secrets_dir, _log) -> None:
-    """Seed the install-path service account (idempotent, guard-independent).
-
-    ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): register_agent_bundles()
-    previously authenticated as admin1 using docker/secrets/admin1_password.
-    After the human admin's forced first-login rotation, admin1_password on
-    disk is intentionally stale (the rotation control writes the new hash to
-    Postgres only — never back to disk). Any post-rotation re-run of agent
-    registration (e.g. the Redis-durability re-registration after a redis
-    recreate wipes the agent registry) then authenticated with a dead password
-    and broke; Iris had to fall back to a saved creds file.
-
-    Fix (option a): a dedicated NON-INTERACTIVE service admin whose credential
-    is never subject to human rotation. force_password_change=False so its
-    on-disk secret stays valid indefinitely; force_totp_provision=False (TOTP is
-    pre-provisioned from the installer secret). The human admin's forced
-    first-login rotation is UNCHANGED — admin1 still has
-    force_password_change=True. This account exists solely for install.sh's
-    programmatic admin-API calls and is never advertised for human login.
-
-    Seeded here (NOT under the total_admin_count()==0 first-boot guard) so it
-    appears on existing/upgraded stacks too, where the re-registration need is
-    most acute. The _fetch_by_username existence check makes it idempotent.
-    """
-    import os as _os
-
-    svc_user_file = _os.path.join(secrets_dir, "svc_admin_username")
-    svc_pwd_file = _os.path.join(secrets_dir, "svc_admin_password")
-    if not (_os.path.exists(svc_user_file) and _os.path.exists(svc_pwd_file)):
-        return
-    svc_username = open(svc_user_file).read().strip()
-    svc_password = open(svc_pwd_file).read().strip()
-    if not (svc_username and svc_password):
-        return
-
-    # Idempotent: skip if the row already exists (restart / upgrade re-run).
-    existing = await auth_service.get_account(svc_username)
-    if existing is not None:
-        _log.info("Bootstrap: install-path service account already present — %s", svc_username)
-        return
-
-    await auth_service.create_admin(
-        username=svc_username,
-        auto_generate=False,
-        plaintext_password=svc_password,
-        force_password_change=False,
-        force_totp_provision=False,
-    )
-    svc_totp_file = _os.path.join(secrets_dir, "svc_admin_totp_secret")
-    if _os.path.exists(svc_totp_file):
-        svc_totp_secret = open(svc_totp_file).read().strip()
-        if svc_totp_secret:
-            await auth_service.set_totp_secret_direct(svc_username, svc_totp_secret)
-            _log.info("Bootstrap: service-account TOTP pre-provisioned from installer secret")
-    _log.info("Bootstrap: install-path service account created — %s", svc_username)
 
 
 @asynccontextmanager

@@ -7584,216 +7584,91 @@ register_agent_bundles() {
   local reg_exit=0
   reg_output="$("${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T -e AGENTS_JSON="${agents_json}" backoffice \
     python3 -c '
-import json, os, ssl, sys, time, urllib.request
-
-secrets = "/run/secrets"
-# MI-6: per-instance SPIFFE trust domain. This Python runs INSIDE the backoffice
-# container (compose exec), so it inherits YASHIGANI_SPIFFE_TRUST_DOMAIN from
-# x-common-env. The self-call below must assert the per-instance backoffice
-# identity, or the app-side SPIFFE validator (which pins this instance trust
-# domain) will reject it. Legacy default preserves yashigani.internal.
-_trust_domain = os.environ.get("YASHIGANI_SPIFFE_TRUST_DOMAIN", "yashigani.internal")
-def read_secret(name):
-    try:
-        return open(os.path.join(secrets, name)).read().strip()
-    except:
-        return ""
-
-# v2.23.1: backoffice serves mTLS on :8443. Present the client cert on every
-# call (same chain used by the Dockerfile HEALTHCHECK).
-# Pattern A for Python ssl: trust anchor is the PUBLIC ca_root.crt. Python
-# 3.12/OpenSSL 3.0/Ubuntu 24.04 strict chain validation rejects intermediate-
-# only anchors (gate #58a evidence, 2026-04-28). Private ca_root.key never
-# enters a workload container.
-_ctx = ssl.create_default_context(cafile=os.path.join(secrets, "ca_root.crt"))
-_ctx.load_cert_chain(
-    os.path.join(secrets, "backoffice_client.crt"),
-    os.path.join(secrets, "backoffice_client.key"),
-)
-
-# ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): authenticate as the NON-INTERACTIVE
-# install-path service account (svc_admin_*), NOT admin1. admin1_password goes
-# stale the moment the human completes the forced first-login rotation (the
-# rotation control writes the new hash to Postgres only — never back to disk),
-# which broke every post-rotation re-run of this flow (notably the Redis-
-# durability agent re-registration after a redis recreate wipes the registry).
-# The service account is seeded with force_password_change=false /
-# force_totp_provision=false (backoffice/app.py _bootstrap_admin_accounts), so
-# its on-disk credential is never rotated by a human and re-runs always work.
-# Fall back to admin1_* only if svc_admin_* is absent (upgrade from a stack
-# installed before this fix, where no service account was seeded) — that legacy
-# path still works pre-rotation and matches prior behaviour.
-user = read_secret("svc_admin_username")
-pw = read_secret("svc_admin_password")
-totp_secret = read_secret("svc_admin_totp_secret")
-if not all([user, pw, totp_secret]):
-    user = read_secret("admin1_username")
-    pw = read_secret("admin1_password")
-    totp_secret = read_secret("admin1_totp_secret")
-    print("WARNING:svc_admin_secrets_absent_falling_back_to_admin1", file=sys.stderr)
-caddy_hmac = read_secret("caddy_internal_hmac")
-if not all([user, pw, totp_secret, caddy_hmac]):
-    print("ERROR:missing_secrets", file=sys.stderr)
-    sys.exit(1)
-
-# Compute TOTP using pyotp with SHA-1 (RFC 6238 default, same as backoffice).
-import pyotp
-totp_code = pyotp.TOTP(totp_secret).now()
-
-# Login — Layer B: X-Caddy-Verified-Secret required on every direct backoffice call
-login_data = json.dumps({"username": user, "password": pw, "totp_code": totp_code}).encode()
-req = urllib.request.Request("https://localhost:8443/auth/login", data=login_data,
-                             headers={"Content-Type": "application/json",
-                                      "X-Caddy-Verified-Secret": caddy_hmac})
-try:
-    resp = urllib.request.urlopen(req, context=_ctx)
-except Exception as e:
-    print(f"ERROR:login_failed:{e}", file=sys.stderr)
-    sys.exit(1)
-
-session = ""
-cookie = resp.headers.get("Set-Cookie", "")
-for part in cookie.split(";"):
-    part = part.strip()
-    if part.startswith("__Host-yashigani_admin_session="):
-        session = part.split("=", 1)[1]
-        break
-
-if not session:
-    print("ERROR:no_session_cookie", file=sys.stderr)
-    sys.exit(1)
-
-# Step-up — POST /admin/agents requires StepUpAdminSession (assert_fresh_stepup).
-# A single stepup covers all agent registrations within the 300 s TTL.
+# SEC-001 (2026-06-14): register agent bundles via the NO-ADMIN-API durable
+# path — mirrors agents/reconciler.py. Writes directly to Postgres
+# (AgentDurableStore) + Redis db/3 (AgentRegistry). No admin login, no TOTP,
+# no step-up, no install_svc service account. Eliminates LAURA-2255-001 (human
+# admin bootstrap regression) and the install_svc standing-admin backdoor.
 #
-# ISSUE-020 (2026-05-19): login and stepup both call pyotp.TOTP(...).now().  If
-# both calls land in the same 30 s TOTP window the Postgres-backed replay
-# cache already holds that window code (inserted by login) and rejects
-# the stepup with invalid_totp_code → session last_totp_verified_at never set
-# → POST /admin/agents returns 401 step_up_required on every attempt.
-#
-# Fix: sleep until the start of the NEXT 30 s TOTP window before computing the
-# stepup code.  Worst-case latency: 30 s; best-case: ~1 s (called at window
-# boundary).  Acceptable in an already-long install path.
-_remaining = 30 - (int(time.time()) % 30)
-# Add 1 s margin so the new window is firmly established before we compute.
-time.sleep(_remaining + 1)
-stepup_code = pyotp.TOTP(totp_secret).now()
-stepup_data = json.dumps({"totp_code": stepup_code}).encode()
-req = urllib.request.Request("https://localhost:8443/auth/stepup", data=stepup_data,
-                             headers={"Content-Type": "application/json",
-                                      "X-Caddy-Verified-Secret": caddy_hmac,
-                                      "Cookie": f"__Host-yashigani_admin_session={session}"})
-# Hard-fail on stepup failure.  A successful stepup is required before any
-# POST /admin/agents call.  The server updates last_totp_verified_at in the
-# existing session (no new cookie is issued) so the same session cookie is
-# valid for the subsequent POSTs.
-try:
-    stepup_resp = urllib.request.urlopen(req, context=_ctx)
-    stepup_body = json.loads(stepup_resp.read())
-    if not stepup_body.get("stepup_verified"):
-        print(f"ERROR:stepup_not_verified:{stepup_body}", file=sys.stderr)
-        sys.exit(1)
-except urllib.error.HTTPError as e:
-    detail = e.read().decode()[:200]
-    print(f"ERROR:stepup_failed:{e.code}:{detail}", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f"ERROR:stepup_failed:{e}", file=sys.stderr)
-    sys.exit(1)
+# Security: this Python runs INSIDE the backoffice container (compose exec),
+# which is mesh-isolated (data-network only). We use the same env vars
+# (YASHIGANI_DB_DSN, REDIS_USE_TLS, etc.) that the in-process app uses.
+# The HTTP stack is not touched — no admin session, no TOTP, no HMAC secret.
+import json, os, sys, secrets as _sec_mod
+sys.path.insert(0, "/app/src")
 
-# YSG-AGENT-REG-001: query the live registry before registering.
-# GET /admin/agents returns all agents currently in Redis. This is the
-# authoritative source — token files on disk can diverge from the registry
-# when secrets_dir is preserved across a re-install that wiped volumes.
-# Agents already in the registry are skipped (idempotent); agents absent
-# from the registry are registered even if a stale token file exists.
-registered_names = set()
-try:
-    req = urllib.request.Request("https://localhost:8443/admin/agents",
-                                 headers={"X-Caddy-Verified-Secret": caddy_hmac,
-                                          "Cookie": f"__Host-yashigani_admin_session={session}"})
-    resp = urllib.request.urlopen(req, context=_ctx)
-    existing = json.loads(resp.read())
-    registered_names = {a.get("name", "") for a in existing}
-except Exception as e:
-    # Non-fatal: if list fails, attempt registration for all agents.
-    # Worst case: duplicate registration attempt → 409 Conflict (handled below).
-    print(f"WARNING:list_agents_failed:{e}", file=sys.stderr)
-
-# Register agents
-agents = json.loads(os.environ.get("AGENTS_JSON", "[]"))
+agents_spec = json.loads(os.environ.get("AGENTS_JSON", "[]"))
 results = []
-for agent in agents:
-    profile = agent["profile"]
-    aname = agent["name"]
-    # Skip if agent is already registered in the live registry (idempotent).
-    # This check uses registry state, not token-file existence, so it correctly
-    # handles: fresh install (registry empty → register), upgrade (registry has
-    # agent → skip), re-install with wiped volumes (registry empty, stale token
-    # file → register and overwrite stale token).
-    if aname in registered_names:
-        results.append("SKIP:" + aname + ":" + profile)
-        continue
-    reg_data = json.dumps({"name": aname, "upstream_url": agent["url"], "protocol": agent.get("protocol", "openai")}).encode()
-    # ISSUE-019 (2026-05-19): POST /admin/agents requires a SPIFFE ID
-    # (require_spiffe_id gate, YSG-RISK-012b / ASVS V10.3.5).  install.sh runs
-    # inside the backoffice container and calls localhost:8443 directly (not via
-    # Caddy), so Caddy cannot inject X-SPIFFE-ID from the TLS peer cert.
-    # SpiffePeerCertMiddleware cannot extract the peer cert via the ASGI TLS
-    # extension because uvicorn does not expose it (confirmed 0.39.0 / 0.46.0).
-    # We inject the backoffice identity explicitly.  Trust anchor: this code
-    # runs inside the backoffice container, which is the only entity that holds
-    # backoffice_client.crt.  CaddyVerifiedMiddleware Layer B (X-Caddy-Verified-
-    # Secret HMAC) prevents an external attacker from reaching this route.
-    req = urllib.request.Request("https://localhost:8443/admin/agents", data=reg_data,
-                                 headers={"Content-Type": "application/json",
-                                          "X-Caddy-Verified-Secret": caddy_hmac,
-                                          "X-SPIFFE-ID": "spiffe://%s/backoffice" % _trust_domain,
-                                          "Cookie": f"__Host-yashigani_admin_session={session}"})
+
+for agent_spec in agents_spec:
+    profile = agent_spec["profile"]
+    aname   = agent_spec["name"]
+    aurl    = agent_spec["url"]
+    aproto  = agent_spec.get("protocol", "openai")
+
     try:
-        resp = urllib.request.urlopen(req, context=_ctx)
-        body = json.loads(resp.read())
-        token = body.get("token", "")
-        if token:
-            token_path = os.path.join(secrets, profile + "_token")
+        from yashigani.agents.registry import AgentRegistry
+        from yashigani.agents.durable_store import AgentDurableStore
+        from yashigani.gateway._redis_url import build_redis_url
+        import redis as _redis
+
+        _redis_url = build_redis_url(
+            3,
+            use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+            secrets_dir="/run/secrets",
+            client_cert_name="backoffice_client",
+        )
+        _rc = _redis.from_url(_redis_url, decode_responses=True)
+        registry = AgentRegistry(_rc)
+        durable  = AgentDurableStore()
+
+        # Skip if agent is already registered by name (idempotent; preserves token)
+        existing_names = {a.get("name", "") for a in registry.list_all()}
+        if aname in existing_names:
+            results.append("SKIP:" + aname + ":" + profile)
+            continue
+
+        # Generate PSK token + bcrypt hash (mirrors POST /admin/agents)
+        import bcrypt as _bcrypt
+        raw_token = "ysg-" + _sec_mod.token_hex(32)
+        token_hash = _bcrypt.hashpw(raw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
+        agent_id = "agnt_" + _sec_mod.token_hex(8)
+
+        agent_data = {
+            "agent_id": agent_id,
+            "name": aname,
+            "upstream_url": aurl,
+            "protocol": aproto,
+            "status": "active",
+            "groups": [],
+            "allowed_caller_groups": [],
+            "allowed_paths": [],
+            "allowed_cidrs": [],
+        }
+
+        # 1. Durable write (Postgres) — survives redis recreate
+        durable.upsert(agent_data, token_hash=token_hash)
+        # 2. Fast write (Redis db/3) — request-time source of truth
+        registry.restore_from_durable(agent_data, token_hash)
+        # 3. Token file for gateway
+        token_path = os.path.join("/run/secrets", profile + "_token")
+        try:
+            with open(token_path, "w") as _tf:
+                _tf.write(raw_token)
             try:
-                with open(token_path, "w") as f:
-                    f.write(token)
-                try:
-                    # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read at
-                    # runtime when installer wrote the file as a different UID.
-                    os.chmod(token_path, 0o640)
-                except OSError as _chmod_err:
-                    # best-effort; host-side chmod applied below.
-                    # Log so the issue is visible in install.log (e.g. owner mismatch
-                    # on Podman rootless where file owner is UID 101000 inside the
-                    # container but a different UID on the host).
-                    print(f"WARNING:chmod_640_failed:{token_path}:{_chmod_err}", file=sys.stderr)
-            except PermissionError:
-                pass  # token printed below for host-side capture
-            results.append("OK:" + aname + ":" + profile + ":" + token)
-        else:
-            results.append("FAIL:" + aname + ":no_token")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()[:100]
-        results.append("FAIL:" + aname + ":" + str(e.code) + ":" + detail)
+                # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read
+                os.chmod(token_path, 0o640)
+            except OSError as _ce:
+                print(f"WARNING:chmod_640_failed:{token_path}:{_ce}", file=sys.stderr)
+        except PermissionError:
+            pass  # printed below for host-side capture
+        results.append("OK:" + aname + ":" + profile + ":" + raw_token)
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
 
 for r in results:
     print(r)
 ' 2>&1)" || reg_exit=$?
-
-  # Hard-fail on stepup errors (Python sys.exit(1); output contains ERROR:stepup_*).
-  # Per ISSUE-020: stepup failure means NO agent can be registered; continuing is
-  # misleading and violates [[feedback_test_harness_no_fake_green]] applied to
-  # install scripts — an advertised flag that silently fails is a fake-green class.
-  if [[ $reg_exit -ne 0 ]] && echo "$reg_output" | grep -qE '^ERROR:stepup'; then
-    log_error "Agent registration aborted: stepup failed"
-    echo "$reg_output" | grep '^ERROR:stepup' >&2
-    return 1
-  fi
 
   # Parse results
   local any_registered=false
@@ -8576,6 +8451,34 @@ _do_chmod_0640() {
   return 0
 }
 
+# _secret_is_valid — F-001 self-heal predicate
+#
+# Returns 0 (true) if a CSPRNG secret file is present, non-empty, AND does not
+# contain a placeholder comment line ("# ...").  Returns 1 in all other cases:
+# file absent, zero-length, or contains only a placeholder/comment.
+#
+# Usage: _secret_is_valid <file>
+#
+# Rationale: install.sh writes placeholder strings (e.g. "# placeholder —
+# auto-generated at first bootstrap") into new secret slots before the PKI
+# bootstrap chowns secrets_dir.  A stale/partial install can leave those
+# placeholders on disk.  The old guard `[[ -s "$f" ]]` only checks non-zero
+# size, so a placeholder file is treated as a valid secret and preserved — then
+# envsubst substitution in the OpenClaw config receives the literal comment
+# string instead of a token (F-001 abort).  This predicate closes that gap.
+#
+# F-001 / fix/medlow-findings (Su, 2026-06-14)
+_secret_is_valid() {
+  local _sv_file="$1"
+  # Must exist and be non-empty
+  [[ -s "$_sv_file" ]] || return 1
+  # Must not start with a comment/placeholder marker
+  local _sv_first
+  _sv_first="$(head -c 1 "$_sv_file" 2>/dev/null)" || return 1
+  [[ "$_sv_first" == "#" ]] && return 1
+  return 0
+}
+
 # _safe_read_secret — BUG-B+-004: Podman-rootless-aware secret file reader
 #
 # On Podman rootless, secrets are owned by subuid-remapped UIDs that the host
@@ -8791,7 +8694,8 @@ generate_secrets() {
     # Fix: check + generate each new secret independently, regardless of whether
     # core secrets (postgres/redis) already exist.
     local hmac_file="${secrets_dir}/caddy_internal_hmac"
-    if [[ ! -s "$hmac_file" ]] || [[ "${REINSTALL:-false}" == "true" ]]; then
+    # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
+    if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
       local _hmac_secret
       if command -v openssl >/dev/null 2>&1; then
         _hmac_secret="$(openssl rand -hex 32)"
@@ -8823,9 +8727,12 @@ generate_secrets() {
     fi
 
     # Bucket-C finding (Captain gitleaks baseline 2026-05-17): per-install
-    # YASHIGANI_INTERNAL_BEARER — generate if absent on upgrade path.
+    # YASHIGANI_INTERNAL_BEARER — generate if absent OR placeholder on upgrade path.
+    # F-001 self-heal: _secret_is_valid rejects placeholder files so a stale
+    # partial install that left a "# placeholder" string is treated as missing and
+    # regenerated instead of being synced verbatim into .env (fix/medlow-findings).
     local _bearer_file_up="${secrets_dir}/yashigani_internal_bearer"
-    if [[ ! -s "$_bearer_file_up" ]]; then
+    if ! _secret_is_valid "$_bearer_file_up"; then
       local _bearer_up
       _bearer_up="$(_gen_password)"
       printf "%s" "$_bearer_up" > "$_bearer_file_up"
@@ -8838,6 +8745,10 @@ generate_secrets() {
     # BUG-B+-004: use _safe_read_secret — direct cat fails on Podman rootless (subuid owner).
     local _bearer_val_up
     if _bearer_val_up="$(_safe_read_secret "$_bearer_file_up" "YASHIGANI_INTERNAL_BEARER" "$env_file")"; then
+      if [[ -z "$_bearer_val_up" ]] || [[ "$_bearer_val_up" == \#* ]]; then
+        log_error "F-001: yashigani_internal_bearer was just generated but read back empty or as placeholder — inconsistent state in ${secrets_dir}. Check permissions on docker/secrets/."
+        return 1
+      fi
       if grep -q "^YASHIGANI_INTERNAL_BEARER=" "$env_file" 2>/dev/null; then
         local tmp_env; tmp_env="$(mktemp)"
         sed "s|^YASHIGANI_INTERNAL_BEARER=.*|YASHIGANI_INTERNAL_BEARER=${_bearer_val_up}|" "$env_file" > "$tmp_env"
@@ -8923,78 +8834,6 @@ generate_secrets() {
     # backup tools, process env) and is intentionally avoided.
     # END YSG-P3-MCP-SIGKEY-UPGRADE
 
-    # BEGIN ISSUE-AGENT-REG-STALE-PW-UPGRADE-BACKFILL
-    # Install-path service account (svc_admin_*) on the UPGRADE path.
-    #
-    # The fresh-install svc_admin_* block lives below the `return 0` that ends
-    # this upgrade short-circuit, so on an already-rotated stack (postgres+redis
-    # present) the three svc_admin_* secrets were NEVER created. That is exactly
-    # the stack where a redis-wipe forces agent re-registration: with svc_admin_*
-    # absent, backoffice _bootstrap_service_account early-returns (no service
-    # account) and register_agent_bundles() falls back to the STALE admin1
-    # password (post forced-first-login rotation) → ISSUE-AGENT-REG-STALE-PW.
-    #
-    # Fix mirrors the caddy_internal_hmac / yashigani_internal_bearer upgrade
-    # backfills above: generate each secret only if its file is absent/empty
-    # (idempotent — never rotates an existing svc credential). The static
-    # username `install_svc` matches the fresh-install value exactly so a
-    # previously-seeded service account keeps the same identity.
-    #
-    # No .env sync: backoffice reads svc_admin_* from /run/secrets (file-tier),
-    # same as the fresh case.
-    #
-    # UID-1001 OWNERSHIP MUST BE APPLIED HERE — NOT deferred to
-    # _pki_chown_client_keys(). On the DOMINANT Docker-rootful upgrade (certs
-    # current, no SAN drift / not expired), bootstrap_internal_pki takes the
-    # no-rotation branch (~L10855) which EXPLICITLY SKIPS _pki_chown_client_keys
-    # under the upgrade no-touch rule (GATE5-BUG-01); it only re-chowns in the
-    # podman-rootless exception. So although svc_admin_* ARE listed in the
-    # _uid1001_secrets set, that set never runs on this path — the backfilled
-    # files would stay root:root 0600. Backoffice (UID 1001, cap_drop:[ALL], no
-    # DAC_OVERRIDE) then EACCESes on open() → _bootstrap_service_account
-    # early-returns → register_agent_bundles() falls back to the stale admin1
-    # password = ISSUE-AGENT-REG-STALE-PW, reproduced on the no-rotation path.
-    # Mirror the pgbouncer_authenticator_password backfill above (L8114): chown
-    # to the consumer UID at creation time so fresh and upgrade converge to the
-    # same owner:mode (UID 1001, 0600 — matching _uid1001_secrets + fresh block).
-    #
-    # This credential is NON-INTERACTIVE (seeded force_password_change=false,
-    # force_totp_provision=false) — never subject to human rotation. The human
-    # admin's forced first-login rotation control is UNCHANGED.
-    local _svc_user_file_up="${secrets_dir}/svc_admin_username"
-    local _svc_pw_file_up="${secrets_dir}/svc_admin_password"
-    local _svc_totp_file_up="${secrets_dir}/svc_admin_totp_secret"
-
-    if [[ ! -s "$_svc_user_file_up" ]]; then
-      printf "%s" "install_svc" > "$_svc_user_file_up"
-      chmod 600 "$_svc_user_file_up"
-      _do_chown "1001" "$_svc_user_file_up" "svc_admin_username" "" "${secrets_dir}" || true
-      log_info "Generated svc_admin_username → ${_svc_user_file_up} (mode 0600 uid 1001, upgrade path)"
-    else
-      log_info "svc_admin_username already present — preserving (upgrade path)"
-    fi
-    if [[ ! -s "$_svc_pw_file_up" ]]; then
-      local _svc_pw_up
-      _svc_pw_up="$(_gen_password)"
-      printf "%s" "$_svc_pw_up" > "$_svc_pw_file_up"
-      chmod 600 "$_svc_pw_file_up"
-      _do_chown "1001" "$_svc_pw_file_up" "svc_admin_password" "" "${secrets_dir}" || true
-      log_info "Generated svc_admin_password → ${_svc_pw_file_up} (mode 0600 uid 1001, upgrade path)"
-    else
-      log_info "svc_admin_password already present — preserving (upgrade path)"
-    fi
-    if [[ ! -s "$_svc_totp_file_up" ]]; then
-      local _svc_totp_up
-      _svc_totp_up="$(_gen_totp_secret)"
-      printf "%s" "$_svc_totp_up" > "$_svc_totp_file_up"
-      chmod 600 "$_svc_totp_file_up"
-      _do_chown "1001" "$_svc_totp_file_up" "svc_admin_totp_secret" "" "${secrets_dir}" || true
-      log_info "Generated svc_admin_totp_secret → ${_svc_totp_file_up} (mode 0600 uid 1001, upgrade path)"
-    else
-      log_info "svc_admin_totp_secret already present — preserving (upgrade path)"
-    fi
-    # END ISSUE-AGENT-REG-STALE-PW-UPGRADE-BACKFILL
-
     return 0
   fi
 
@@ -9056,29 +8895,6 @@ generate_secrets() {
   printf "%s" "$GEN_ADMIN2_TOTP_SECRET" > "${secrets_dir}/admin2_totp_secret"
   chmod 600 "${secrets_dir}/admin2_totp_secret"
   GEN_ADMIN2_TOTP_URI="$(_gen_totp_uri "$GEN_ADMIN2_USERNAME" "$GEN_ADMIN2_TOTP_SECRET")"
-
-  # --- Install-path service account (non-interactive bootstrap operations) ---
-  #
-  # ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): register_agent_bundles() used
-  # admin1_password, which goes stale after the human's forced first-login
-  # rotation (the rotation control writes the new hash to Postgres only — never
-  # back to disk). Post-rotation re-runs (e.g. Redis-durability re-registration
-  # after a redis recreate wipes the agent registry) then broke on a dead
-  # password. This service account is NON-INTERACTIVE: seeded by the backoffice
-  # bootstrap with force_password_change=false + force_totp_provision=false (see
-  # backoffice/app.py _bootstrap_admin_accounts), so its on-disk credential is
-  # never subject to human rotation and re-runs always authenticate. The human
-  # admin's forced first-login rotation is UNCHANGED. This credential is never
-  # printed for or used by a human login.
-  GEN_SVC_ADMIN_USERNAME="install_svc"
-  printf "%s" "$GEN_SVC_ADMIN_USERNAME" > "${secrets_dir}/svc_admin_username"
-  chmod 600 "${secrets_dir}/svc_admin_username"
-  GEN_SVC_ADMIN_PASSWORD="$(_gen_password)"
-  printf "%s" "$GEN_SVC_ADMIN_PASSWORD" > "${secrets_dir}/svc_admin_password"
-  chmod 600 "${secrets_dir}/svc_admin_password"
-  GEN_SVC_ADMIN_TOTP_SECRET="$(_gen_totp_secret)"
-  printf "%s" "$GEN_SVC_ADMIN_TOTP_SECRET" > "${secrets_dir}/svc_admin_totp_secret"
-  chmod 600 "${secrets_dir}/svc_admin_totp_secret"
 
   # --- PostgreSQL ---
   GEN_POSTGRES_PASSWORD="$(_gen_password)"
@@ -9170,7 +8986,8 @@ generate_secrets() {
   # On --upgrade this block regenerates the secret. All three containers must
   # be restarted to pick it up (install.sh --upgrade restarts them).
   local hmac_file="${secrets_dir}/caddy_internal_hmac"
-  if [[ ! -s "$hmac_file" ]] || [[ "${REINSTALL:-false}" == "true" ]]; then
+  # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
+  if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
     local _hmac_secret
     if command -v openssl >/dev/null 2>&1; then
       _hmac_secret="$(openssl rand -hex 32)"
@@ -9209,19 +9026,31 @@ generate_secrets() {
   # guarantees — per feedback_password_charset.md.
   # Mode 0600: only the install user can read it; Captain wires it into
   # docker-compose.yml as a Docker/Podman secret (Captain's scope).
-  # Idempotent: file already exists with non-empty content → preserve.
+  # Idempotent: valid secret already on disk → preserve.
+  #
+  # F-001 self-heal (fix/medlow-findings): use _secret_is_valid (not -s) so a
+  # stale placeholder file ("# placeholder — auto-generated at first bootstrap")
+  # left by a partial install is treated as absent and regenerated.  A plain -s
+  # check passes for any non-zero file, so placeholders were silently propagated
+  # into .env and then into the OpenClaw envsubst step, causing the abort
+  # "yashigani_internal_bearer could not be read".
   local _bearer_file="${secrets_dir}/yashigani_internal_bearer"
-  if [[ ! -s "$_bearer_file" ]]; then
-    local _bearer_token
+  local _bearer_token
+  if ! _secret_is_valid "$_bearer_file"; then
     _bearer_token="$(_gen_password)"
     printf "%s" "$_bearer_token" > "$_bearer_file"
     chmod 0600 "$_bearer_file"
     log_info "Generated yashigani_internal_bearer → ${_bearer_file} (mode 0600)"
   else
     log_info "yashigani_internal_bearer already present — preserving (use --remove-volumes to rotate)"
-    local _bearer_token
     # BUG-B+-004 (sweep): safe read — may be subuid-owned on Podman rootless re-install.
     _bearer_token="$(_safe_read_secret "$_bearer_file" "YASHIGANI_INTERNAL_BEARER" "$env_file" || true)"
+  fi
+  # Fail-closed: if the token is still empty or a comment after generation,
+  # there is a genuine inconsistency (e.g. write failure on an EACCES secrets_dir).
+  if [[ -z "$_bearer_token" ]] || [[ "$_bearer_token" == \#* ]]; then
+    log_error "F-001: yashigani_internal_bearer could not be generated or read back — check permissions on ${secrets_dir}. If docker/secrets/ is owned by a subuid-remapped UID, wipe it and re-run."
+    return 1
   fi
   # Sync YASHIGANI_INTERNAL_BEARER into .env for Compose interpolation.
   if grep -q "^YASHIGANI_INTERNAL_BEARER=" "$env_file" 2>/dev/null; then
