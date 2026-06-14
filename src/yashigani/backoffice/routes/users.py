@@ -19,7 +19,7 @@ from typing import Optional
 import re as _re
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
@@ -299,12 +299,22 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     ).model_dump()
 
 
+# CONF-001 (2026-06-14): valid sensitivity ceiling values — the TEXT enum enforced
+# by the DB CHECK constraint on the identities table AND the identity registry.
+_VALID_SENSITIVITY_CEILINGS: frozenset[str] = frozenset(
+    {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}
+)
+
+
 class UpdateUserRequest(BaseModel):
     """R5 (2.25.5): editable user-account fields.
 
-    email    — the canonical identity for a user-tier account. Optional; omit to
-               leave unchanged.
-    disabled — set active/disabled status. Optional; omit to leave unchanged.
+    email               — the canonical identity for a user-tier account.
+    disabled            — active/disabled status.
+    sensitivity_ceiling — CONF-001: maximum sensitivity classification this user
+                          may see/send. One of: PUBLIC, INTERNAL, CONFIDENTIAL,
+                          RESTRICTED. Written to the HUMAN identity entry in the
+                          identity registry. Omit to leave unchanged.
 
     NOTE (SoD-002): tier/role is NOT editable here — user and admin identities
     are strictly separate by design. Promoting a user to admin must go through
@@ -312,14 +322,41 @@ class UpdateUserRequest(BaseModel):
     """
     email: Optional[EmailStr] = None
     disabled: Optional[bool] = None
+    sensitivity_ceiling: Optional[str] = Field(
+        default=None,
+        description=(
+            "Maximum sensitivity classification for this user. "
+            "One of: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED."
+        ),
+    )
+
+    @field_validator("sensitivity_ceiling")
+    @classmethod
+    def _validate_sensitivity_ceiling(cls, v: Optional[str]) -> Optional[str]:
+        """CONF-001: validate sensitivity_ceiling against the taxonomy enum."""
+        if v is None:
+            return v
+        normalised = v.strip().upper()
+        if normalised not in _VALID_SENSITIVITY_CEILINGS:
+            raise ValueError(
+                f"sensitivity_ceiling must be one of "
+                f"{sorted(_VALID_SENSITIVITY_CEILINGS)!r}; got {v!r}"
+            )
+        return normalised
 
 
 @router.put("/{username}")
 async def update_user(username: str, body: UpdateUserRequest, session: StepUpAdminSession):
-    """R5 (2.25.5): edit a user account's email and/or active status.
+    """R5 (2.25.5) + CONF-001 (2026-06-14): edit a user account's email, active status,
+    and/or sensitivity_ceiling.
 
     Step-up (TOTP) gated, modelled on delete_user / disable_user. Tier/role is
     NOT editable here (SoD-002 — see UpdateUserRequest docstring).
+
+    CONF-001: sensitivity_ceiling is written to the HUMAN identity entry in the
+    identity registry. If the user has no registered identity yet (has never
+    logged in) the field is silently skipped — a 409 is not raised because the
+    user account itself exists and the other fields may still be updated.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -369,6 +406,45 @@ async def update_user(username: str, body: UpdateUserRequest, session: StepUpAdm
             await state.auth_service.enable(username)
             state.audit_writer.write(_config_event(session.account_id, "user_account_enabled", username, "enabled", account_tier=session.account_tier))
         changed.append("disabled")
+
+    # CONF-001 (2026-06-14): write sensitivity_ceiling to the user's HUMAN identity
+    # in the identity registry.  Validation is done by the Pydantic model_validator
+    # (_validate_sensitivity_ceiling) — only normalised, enum-legal values reach here.
+    if body.sensitivity_ceiling is not None:
+        registry = getattr(state, "identity_registry", None)
+        if registry is not None:
+            from yashigani.backoffice.routes.auth import _auth_email_to_slug
+            email_for_slug = getattr(record, "email", None) or f"{record.username}@yashigani.local"
+            slug = _auth_email_to_slug(email_for_slug)
+            identity = registry.get_by_slug(slug)
+            if identity is not None:
+                old_ceiling = identity.get("sensitivity_ceiling", "PUBLIC")
+                if old_ceiling != body.sensitivity_ceiling:
+                    registry.update(identity["identity_id"], sensitivity_ceiling=body.sensitivity_ceiling)
+                    state.audit_writer.write(
+                        _config_event(
+                            session.account_id,
+                            "user_sensitivity_ceiling_changed",
+                            old_ceiling,
+                            body.sensitivity_ceiling,
+                            account_tier=session.account_tier,
+                        )
+                    )
+                    changed.append("sensitivity_ceiling")
+            else:
+                # User has not yet logged in — no HUMAN identity exists in the registry yet.
+                # Log the attempt; do not error so the other fields are still updated.
+                _log.info(
+                    "CONF-001: sensitivity_ceiling update skipped for %r — no HUMAN identity "
+                    "in registry yet (user has not logged in)",
+                    username,
+                )
+        else:
+            _log.warning(
+                "CONF-001: identity_registry not available — sensitivity_ceiling update "
+                "skipped for user %r",
+                username,
+            )
 
     return {"status": "ok", "changed": changed}
 
