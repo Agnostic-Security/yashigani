@@ -456,27 +456,23 @@ async def delete_taxonomy_level(level: int, session: StepUpAdminSession):
 
 # ── R16: AI-generate detection pattern ───────────────────────────────────────
 
-# Few-shot examples that calibrate the LLM to the expected output format.
-# The OFFICIAL-SENSITIVE example is the documented worked example from the brief.
-_PATTERN_GEN_SYSTEM = """You are a detection-pattern engineer for an AI security gateway's DLP pipeline.
-Given a plain-English description of a sensitive data type, produce:
-1. A single Python-compatible regular expression that detects it.
-2. A suggested sensitivity level from 1 (least sensitive) to 5 (most sensitive).
-3. A short description (max 80 chars).
-
-Output ONLY a JSON object with these keys: "regex", "level" (integer 1-5), "description".
-No prose, no markdown fences, no explanation.
-
-Example input: "UK government OFFICIAL-SENSITIVE document markings"
-Example output: {"regex": "\\\\bOFFICIAL[\\\\s-]SENSITIVE\\\\b", "level": 4, "description": "UK OFFICIAL-SENSITIVE classification marking"}
-
-Example input: "credit card numbers (Visa, Mastercard, Amex)"
-Example output: {"regex": "\\\\b(?:\\\\d[ -]*?){13,19}\\\\b", "level": 4, "description": "Credit/debit card number"}
-
-Example input: "US Social Security Numbers"
-Example output: {"regex": "\\\\b\\\\d{3}-\\\\d{2}-\\\\d{4}\\\\b", "level": 4, "description": "US SSN"}
-
-Now produce the JSON for:"""
+# LAURA-2255-003 / 30-008: use chat API with separate system + user roles.
+# The description is passed as a USER message only — never concatenated into
+# the system prompt. format:json ensures structured output. The system prompt
+# is fixed operator-controlled text; the user-supplied description cannot
+# override instructions in a different role.
+_PATTERN_GEN_SYSTEM_MSG = (
+    "You are a detection-pattern engineer for an AI security gateway's DLP pipeline. "
+    "Given a plain-English description of a sensitive data type, produce:\n"
+    "1. A single Python-compatible regular expression that detects it.\n"
+    "2. A suggested sensitivity level from 1 (least sensitive) to 5 (most sensitive).\n"
+    "3. A short description (max 80 chars).\n\n"
+    "Output ONLY a JSON object with exactly these keys: "
+    '"regex" (string), "level" (integer 1-5), "description" (string). '
+    "No prose, no markdown fences, no explanation.\n\n"
+    'Example: {"regex": "\\\\bOFFICIAL[\\\\s-]SENSITIVE\\\\b", "level": 4, '
+    '"description": "UK OFFICIAL-SENSITIVE classification marking"}'
+)
 
 
 class GeneratePatternRequest(BaseModel):
@@ -501,6 +497,9 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
 
     Worked example: "UK government OFFICIAL-SENSITIVE document markings"
     → regex matching OFFICIAL-SENSITIVE → level 4.
+
+    LAURA-2255-003 hardening: uses chat API (system+user roles), format:json,
+    and does NOT return the raw LLM response to the client.
     """
     from yashigani.backoffice.state import backoffice_state as _state
 
@@ -519,16 +518,24 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
         avail = []
     model = pref if (pref and pref in avail) else (avail[0] if avail else (pref or "qwen2.5:3b"))
 
-    prompt = f"{_PATTERN_GEN_SYSTEM} {body.description}\nJSON output:"
-
+    # LAURA-2255-003: chat API with separate system + user roles.
+    # description is the user message — not concatenated into the system prompt.
     try:
         async with _httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                ollama_url + "/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False},
+                ollama_url + "/api/chat",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": _PATTERN_GEN_SYSTEM_MSG},
+                        {"role": "user", "content": body.description},
+                    ],
+                    "format": "json",
+                    "stream": False,
+                },
             )
             resp.raise_for_status()
-            raw = (resp.json().get("response") or "").strip()
+            raw = (resp.json().get("message", {}).get("content") or "").strip()
     except _httpx.HTTPError as exc:
         logger.warning("generate_pattern: LLM error: %s", exc)
         raise _HTTPException(
@@ -538,21 +545,13 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
                                "Ensure the Ollama service is running."},
         )
 
-    # Strip markdown fences if any
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        raw = "\n".join(lines[1:]).strip()
-
-    # Parse JSON — best-effort; return raw on parse failure
+    # Parse JSON — best-effort; log failures server-side only (never expose raw to client)
     generated_regex: str = ""
     suggested_level: int = 3
     generated_description: str = body.description[:80]
-    parse_error: str | None = None
+    parse_ok: bool = False
 
     try:
-        # Find the first {...} block in case the LLM added preamble
         m = _re.search(r"\{[^{}]+\}", raw, _re.DOTALL)
         payload = _json.loads(m.group(0) if m else raw)
         generated_regex = str(payload.get("regex", "")).strip()
@@ -562,9 +561,23 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
         except (TypeError, ValueError):
             suggested_level = 3
         generated_description = str(payload.get("description", body.description))[:80]
+        parse_ok = True
     except Exception as exc:
-        parse_error = f"LLM response could not be parsed as JSON: {exc}. Raw: {raw[:300]}"
-        logger.warning("generate_pattern: parse error: %s", parse_error)
+        # Log server-side only — never expose raw LLM output to client
+        logger.warning("generate_pattern: parse error (logged server-side only): %s | raw=%r", exc, raw[:300])
+
+    # Validate the AI-generated regex for safety before returning it
+    if generated_regex:
+        try:
+            _validate_regex_safety(generated_regex)
+        except _HTTPException:
+            # Generated regex is unsafe; clear it and report as a draft problem
+            logger.warning(
+                "generate_pattern: AI-generated regex failed safety validation "
+                "(unsafe pattern suppressed): %r", generated_regex,
+            )
+            generated_regex = ""
+            parse_ok = False
 
     # AUDIT-GAP-001: emit AI-generation event to the hash-chain ledger.
     if backoffice_state.audit_writer is not None:
@@ -576,21 +589,21 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
                     model=model,
                     generated_regex_hash=_sha256_hex(generated_regex) if generated_regex else "",
                     suggested_level=suggested_level,
-                    parse_ok=parse_error is None,
+                    parse_ok=parse_ok,
                 )
             )
         except Exception as _exc:
             logger.error("Failed to write SensitivityPatternAIGeneratedEvent: %s", _exc)
 
+    # LAURA-2255-003: raw_llm_response is NEVER returned to the client.
+    # Log it server-side above; the client gets only the structured fields.
     return {
-        "status": "ok" if not parse_error else "parse_error",
+        "status": "ok" if parse_ok else "parse_error",
         "description": body.description,
         "model": model,
         "generated_regex": generated_regex,
         "suggested_level": suggested_level,
         "generated_description": generated_description,
-        "parse_error": parse_error,
-        "raw_llm_response": raw if parse_error else None,
         "note": (
             "AI-generated draft — review the regex before applying. "
             "To create the pattern: POST /admin/sensitivity/patterns with "
