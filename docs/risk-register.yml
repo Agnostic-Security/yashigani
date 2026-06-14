@@ -1661,6 +1661,49 @@ risks:
       other service. Evidence: testing_runs/captain_bug_c7_001_scram_fix_20260525/.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
+- id: YSG-RISK-078
+  description: >-
+    TOTP algorithm change: SHA-256 → SHA-1 (RFC 6238 default). Yashigani previously
+    used HMAC-SHA-256 for TOTP (digest=hashlib.sha256, per maintainer directive
+    2026-05-01 / P0-10 "SHA-256 minimum policy"). 19 of 20 testers' authenticator
+    apps (Google Authenticator, Microsoft Authenticator, and others) either do not
+    support SHA-256 TOTP or silently ignore the algorithm= URI parameter and default
+    to SHA-1, producing codes that never match. This was a critical usability blocker
+    for fresh installs and operator on-boarding. Decision (Tiago Rosado, 2026-06-14):
+    revert to HMAC-SHA1 (RFC 6238 standard default). HMAC-SHA1 is cryptographically
+    secure for 6-digit OTP generation: SHA-1 collision attacks (SHAttered, 2017) are
+    Merkle-Damgård prefix-collision attacks on digital signatures, not HMAC; RFC 2104
+    HMAC-SHA1 has no known exploitable weaknesses in the OTP context; NIST SP 800-63B
+    and FIPS 140-2 both permit HMAC-SHA1 for TOTP. Compensating controls: per-account
+    secrets (ASVS V2.8), replay prevention (Postgres-backed used_totp_codes, ASVS
+    V2.8.3), ±1 window with TOTP backoff, account lockout after 5 failures.
+    RE-ENROLLMENT IMPACT: any TOTP secrets enrolled under SHA-256 (deployed stacks
+    running v2.23.1–v2.25.5 with P0-10 applied) will cease verifying after upgrade
+    because the server now generates SHA-1 codes but the enrolled secret produced
+    SHA-256 codes. Fresh installs are unaffected. In-place upgrades require full
+    TOTP re-enrollment for all admin accounts (force_totp_provision=true). A
+    dual-verify transition path (try SHA-1, fall back to SHA-256 for one window)
+    has not been implemented; escalate to Nico if required for a specific deployment.
+  severity: low
+  controls_impacted:
+  - ASVS V2.8 (TOTP algorithm)
+  compensating_controls:
+  - Per-account TOTP secrets (ASVS V2.8.1)
+  - Postgres-backed replay cache (ASVS V2.8.3, AVA-A006 fix)
+  - TOTP backoff + account lockout (5 failures)
+  - HMAC-SHA1 unaffected by SHA-1 collision attacks (RFC 2104)
+  - NIST SP 800-63B and FIPS 140-2 permit HMAC-SHA1 for OTP
+  status: accepted
+  accepted_by: Tiago Rosado
+  accepted_at: '2026-06-14'
+  review_by: '2027-06-14'
+  closure_evidence: []
+  last_threat_model_review: '2026-06-14'
+  nico_review_required: true
+  notes: >-
+    Nico (crypto) should sanity-check this posture at next crypto review.
+    If a dual-verify SHA-256→SHA-1 transition window is needed for in-place
+    upgrade deployments, raise with Nico before implementing.
 - id: YSG-RISK-077
   description: 'BUG-C7-001: pgbouncer 1.25.1 (edoburu image) has a SCRAM-SHA-256 client-side computation bug on
     ARM64 Linux. When acting as SASL client (auth_user authenticating to postgres), it computes incorrect SCRAM

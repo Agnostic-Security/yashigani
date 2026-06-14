@@ -1,29 +1,25 @@
 """
-Regression test: install.sh _gen_totp_uri must include algorithm=SHA256.
+Regression test: install.sh _gen_totp_uri must use HMAC-SHA1 (RFC 6238 default)
+for universal authenticator-app compatibility.
 
-P0-10 / SHA-256 minimum policy (maintainer directive 2026-05-01):
-pyotp uses digest=hashlib.sha256. Without algorithm=SHA256 in the otpauth URI,
-authenticator apps (Google Authenticator, Authy, 1Password, etc.) default to
-SHA-1 and generate codes that never match. This test FAILS against pre-fix
-install.sh (no algorithm parameter) and PASSES after the fix.
-
-Last updated: 2026-05-01T13:00:00+01:00
+Decision (2026-06-14, YSG-RISK-078): reverted from SHA-256 (P0-10 / maintainer
+directive 2026-05-01) to SHA-1 because 19/20 test users' authenticator apps do not
+support SHA-256 TOTP. HMAC-SHA1 is cryptographically secure for OTP (SHA-1 collision
+attacks do not affect HMAC). SHA-1 is the RFC 6238 default and is universally supported.
 
 Coverage:
-- install.sh _gen_totp_uri emits algorithm=SHA256
+- install.sh _gen_totp_uri does NOT emit algorithm=SHA256
+- install.sh _gen_totp_uri either emits algorithm=SHA1 or omits the parameter
+  (omitting = SHA1 default, per otpauth:// spec)
 - install.sh _gen_totp_uri emits digits=6
 - install.sh _gen_totp_uri emits period=30
-- install.sh _gen_totp_uri does NOT emit algorithm=SHA1
-- pyotp provisioning_uri with digest=hashlib.sha256 also emits algorithm=SHA256
-  (parity check: both URIs agree on algorithm)
-- oathtool / pyotp code parity (SHA256 codes match)
+- pyotp provisioning_uri with default digest also uses SHA-1 (parity check)
+- A standard SHA-1 authenticator code verifies against pyotp TOTP (no digest arg)
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -40,27 +36,14 @@ def _source_and_run(bash_snippet: str) -> str:
     """
     Source _gen_totp_uri from install.sh (without executing the installer)
     and run the provided bash snippet, returning stdout.
-
-    We source only the lines up to and including the function definition
-    to avoid running any installer logic.
     """
     if not INSTALL_SH.exists():
         pytest.skip(f"install.sh not found at {INSTALL_SH}")
 
-    # Extract lines up to and including the closing brace of _gen_totp_uri.
-    # Strategy: source the whole file with --norc in a subshell that only
-    # runs our snippet — install.sh is guarded by function definitions and
-    # a main() call pattern, so sourcing it is safe for function extraction.
-    # We use YASHIGANI_DRY_RUN=1 and a fake BASH_SOURCE check to prevent
-    # any top-level code from executing.
     script = (
         "set -euo pipefail\n"
-        # Stub out everything that would execute on source
         "YASHIGANI_DRY_RUN=1\n"
         "_main() { :; }\n"
-        # Source the function definitions from install.sh
-        # We parse only the _gen_totp_uri function to avoid running any
-        # installer logic. Safe: we grep the function body directly.
         + _extract_function("_gen_totp_uri")
         + "\n"
         + bash_snippet
@@ -80,10 +63,7 @@ def _source_and_run(bash_snippet: str) -> str:
 
 
 def _extract_function(func_name: str) -> str:
-    """
-    Extract a single bash function definition from install.sh by name.
-    Returns the full function body as a string.
-    """
+    """Extract a single bash function definition from install.sh by name."""
     lines = INSTALL_SH.read_text().splitlines()
     in_func = False
     depth = 0
@@ -91,7 +71,6 @@ def _extract_function(func_name: str) -> str:
 
     for line in lines:
         if not in_func:
-            # Match: func_name() { or func_name () {
             if re.match(rf"^{re.escape(func_name)}\s*\(\)", line):
                 in_func = True
                 depth = 0
@@ -114,30 +93,35 @@ def _extract_function(func_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TestInstallShTotpUri:
-    """Verify _gen_totp_uri produces a URI that authenticator apps will parse correctly."""
+    """Verify _gen_totp_uri produces a URI compatible with all authenticator apps."""
 
     def _get_uri(self, username: str = "testadmin", secret: str = "JBSWY3DPEHPK3PXP") -> str:
         return _source_and_run(f'_gen_totp_uri "{username}" "{secret}"')
 
-    def test_contains_algorithm_sha256(self):
+    def test_does_not_contain_algorithm_sha256(self):
         """
-        REGRESSION TEST (P0-10): URI must contain algorithm=SHA256.
-        Without this, authenticator apps default to SHA-1 → codes never match pyotp.
-        This test FAILS against pre-fix install.sh.
+        REGRESSION TEST (YSG-RISK-078): URI must NOT contain algorithm=SHA256.
+        SHA-256 TOTP was a usability blocker — 19/20 test users' apps did not
+        support it and silently produced wrong codes. Reverted 2026-06-14.
         """
         uri = self._get_uri()
-        assert "algorithm=SHA256" in uri, (
-            f"P0-10: otpauth URI missing algorithm=SHA256 → authenticator apps will use SHA-1.\n"
+        assert "algorithm=SHA256" not in uri, (
+            f"YSG-RISK-078: otpauth URI must not use algorithm=SHA256 — reverted to "
+            f"HMAC-SHA1 (RFC 6238 default) for universal authenticator-app compatibility.\n"
             f"URI was: {uri}"
         )
 
-    def test_does_not_contain_algorithm_sha1(self):
-        """URI must not contain algorithm=SHA1 (neither explicit nor as a default remnant)."""
+    def test_algorithm_is_sha1_or_omitted(self):
+        """
+        URI must either omit algorithm (= SHA1 by RFC 6238 default) or
+        explicitly state algorithm=SHA1. Both are equivalent and universally supported.
+        """
         uri = self._get_uri()
-        assert "algorithm=SHA1" not in uri, (
-            f"P0-10: URI contains algorithm=SHA1 — this is forbidden (feedback_sha256_minimum_pqr).\n"
-            f"URI was: {uri}"
-        )
+        # Acceptable: no algorithm param at all, or algorithm=SHA1
+        if "algorithm=" in uri:
+            assert "algorithm=SHA1" in uri, (
+                f"If algorithm param is present, it must be SHA1: {uri}"
+            )
 
     def test_contains_digits_6(self):
         uri = self._get_uri()
@@ -163,12 +147,12 @@ class TestInstallShTotpUri:
         assert "admin1" in uri1
         assert "admin2" in uri2
 
-    def test_both_admin_uris_contain_algorithm_sha256(self):
-        """Explicit check that BOTH admin URIs include the algorithm parameter."""
+    def test_both_admin_uris_do_not_contain_sha256(self):
+        """Both admin URIs must not specify SHA-256 (usability blocker — YSG-RISK-078)."""
         uri1 = self._get_uri(username="admin1", secret="JBSWY3DPEHPK3PXP")
         uri2 = self._get_uri(username="admin2", secret="MFRA2YLNMFRA2YLN")
-        assert "algorithm=SHA256" in uri1, f"admin1 URI missing algorithm=SHA256: {uri1}"
-        assert "algorithm=SHA256" in uri2, f"admin2 URI missing algorithm=SHA256: {uri2}"
+        assert "algorithm=SHA256" not in uri1, f"admin1 URI must not use SHA256: {uri1}"
+        assert "algorithm=SHA256" not in uri2, f"admin2 URI must not use SHA256: {uri2}"
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +161,9 @@ class TestInstallShTotpUri:
 
 class TestShellUriMatchesPyotp:
     """
-    Verify that the algorithm parameter in the shell-emitted URI matches what
-    pyotp.TOTP(digest=hashlib.sha256).provisioning_uri() emits.
-    Both must declare algorithm=SHA256 so authenticator apps and pyotp agree.
+    Verify that the algorithm in the shell-emitted URI matches what
+    pyotp.TOTP() (no digest kwarg = SHA-1 default) emits.
+    Both must use SHA-1 so authenticator apps and pyotp agree.
     """
 
     def test_algorithm_matches_pyotp_uri(self):
@@ -189,48 +173,48 @@ class TestShellUriMatchesPyotp:
             pytest.skip("pyotp not installed")
 
         secret = "JBSWY3DPEHPK3PXP"
+        # pyotp default (no digest kwarg) = SHA-1 per RFC 6238
         pyotp_uri = pyotp.TOTP(
-            secret, issuer="Yashigani", digest=hashlib.sha256
+            secret, issuer="Yashigani"
         ).provisioning_uri(name="testadmin", issuer_name="Yashigani")
 
         shell_uri = _source_and_run(f'_gen_totp_uri "testadmin" "{secret}"')
 
-        # Both must contain algorithm=SHA256
-        assert "algorithm=SHA256" in pyotp_uri, (
-            f"pyotp URI unexpectedly missing algorithm=SHA256: {pyotp_uri}"
+        # Neither URI should specify SHA256
+        assert "algorithm=SHA256" not in pyotp_uri, (
+            f"pyotp URI unexpectedly contains algorithm=SHA256: {pyotp_uri}"
         )
-        assert "algorithm=SHA256" in shell_uri, (
-            f"shell URI missing algorithm=SHA256: {shell_uri}"
+        assert "algorithm=SHA256" not in shell_uri, (
+            f"shell URI must not contain algorithm=SHA256: {shell_uri}"
         )
 
-    def test_codes_match_between_pyotp_and_oathtool(self):
+    def test_sha1_code_verifies_against_default_pyotp(self):
         """
-        End-to-end parity: a code generated by pyotp with SHA-256 must also
-        be accepted by pyotp verify (trivially true) and must NOT match a
-        SHA-1 TOTP for the same secret (confirms SHA-256 ≠ SHA-1 codes).
+        End-to-end parity: a code generated by default pyotp (SHA-1)
+        must verify against pyotp.TOTP() with no digest argument.
+        Also confirms SHA-1 and SHA-256 codes differ for the same secret.
         """
         try:
             import pyotp
+            import hashlib
         except ImportError:
             pytest.skip("pyotp not installed")
 
         secret = pyotp.random_base32()
 
+        totp_sha1 = pyotp.TOTP(secret)           # RFC 6238 default: SHA-1
         totp_sha256 = pyotp.TOTP(secret, digest=hashlib.sha256)
-        totp_sha1 = pyotp.TOTP(secret)  # default: SHA-1
 
-        code_sha256 = totp_sha256.now()
         code_sha1 = totp_sha1.now()
 
-        # SHA-256 code must verify against SHA-256 TOTP
-        assert totp_sha256.verify(code_sha256), "SHA-256 code must verify with SHA-256 TOTP"
+        # SHA-1 code must verify against SHA-1 TOTP
+        assert totp_sha1.verify(code_sha1), "SHA-1 code must verify with SHA-1 TOTP"
 
-        # SHA-1 code must NOT verify against SHA-256 TOTP (in virtually all cases;
-        # a collision at this instant is astronomically unlikely but theoretically
-        # possible — skip gracefully if codes happen to match)
-        if code_sha256 == code_sha1:
-            pytest.skip("SHA-256 and SHA-1 codes collided for this secret/window — retry")
+        # In virtually all cases SHA-1 and SHA-256 codes differ (prove they are
+        # distinct algorithms for the same secret). Skip gracefully on collision.
+        code_sha256 = totp_sha256.now()
+        if code_sha1 == code_sha256:
+            pytest.skip("SHA-1 and SHA-256 codes collided for this secret/window — retry")
         assert not totp_sha256.verify(code_sha1), (
-            "SHA-1 code must NOT verify against SHA-256 TOTP — "
-            "authenticators using SHA-1 would silently produce wrong codes"
+            "SHA-1 code must NOT verify against SHA-256 TOTP — confirms algorithm isolation"
         )

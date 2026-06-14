@@ -7636,9 +7636,9 @@ if not all([user, pw, totp_secret, caddy_hmac]):
     print("ERROR:missing_secrets", file=sys.stderr)
     sys.exit(1)
 
-# Compute TOTP using pyotp with SHA-256 (same as backoffice)
-import pyotp, hashlib
-totp_code = pyotp.TOTP(totp_secret, digest=hashlib.sha256).now()
+# Compute TOTP using pyotp with SHA-1 (RFC 6238 default, same as backoffice).
+import pyotp
+totp_code = pyotp.TOTP(totp_secret).now()
 
 # Login — Layer B: X-Caddy-Verified-Secret required on every direct backoffice call
 login_data = json.dumps({"username": user, "password": pw, "totp_code": totp_code}).encode()
@@ -7678,7 +7678,7 @@ if not session:
 _remaining = 30 - (int(time.time()) % 30)
 # Add 1 s margin so the new window is firmly established before we compute.
 time.sleep(_remaining + 1)
-stepup_code = pyotp.TOTP(totp_secret, digest=hashlib.sha256).now()
+stepup_code = pyotp.TOTP(totp_secret).now()
 stepup_data = json.dumps({"totp_code": stepup_code}).encode()
 req = urllib.request.Request("https://localhost:8443/auth/stepup", data=stepup_data,
                              headers={"Content-Type": "application/json",
@@ -8008,14 +8008,17 @@ _gen_totp_secret() {
 }
 
 _gen_totp_uri() {
-  # otpauth://totp/Yashigani:username?secret=SECRET&issuer=Yashigani&algorithm=SHA256&digits=6&period=30
-  # algorithm=SHA256 is mandatory — pyotp uses digest=hashlib.sha256.
-  # Without this parameter, authenticator apps default to SHA-1 → codes never match.
-  # P0-10 / SHA-256 minimum policy (maintainer directive 2026-05-01).
+  # otpauth://totp/Yashigani:username?secret=SECRET&issuer=Yashigani&digits=6&period=30
+  # RFC 6238 default algorithm is SHA-1. Omitting the algorithm parameter ensures
+  # universal compatibility — all authenticator apps (Google Authenticator, Authy,
+  # Microsoft Authenticator, Aegis, 1Password, etc.) default to SHA-1 TOTP.
+  # Supersedes P0-10 / SHA-256 minimum policy (reverted 2026-06-14, see YSG-RISK-078):
+  # HMAC-SHA1 TOTP is cryptographically secure; SHA-1 collision attacks do not
+  # affect HMAC. SHA-256 was a usability blocker (19/20 test users' apps unsupported).
   local username="$1"
   local secret="$2"
   local issuer="${DOMAIN:-Yashigani}"
-  echo "otpauth://totp/Yashigani:${username}?secret=${secret}&issuer=${issuer}&algorithm=SHA256&digits=6&period=30"
+  echo "otpauth://totp/Yashigani:${username}?secret=${secret}&issuer=${issuer}&digits=6&period=30"
 }
 
 # Generate two distinct admin usernames from curated word lists
@@ -9532,7 +9535,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_TOTP_SECRET}"
-  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-256 (NOT SHA-1) — set on manual entry"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
   if [[ -n "$GEN_ADMIN1_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN1_TOTP_URI}"
@@ -9542,7 +9545,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_TOTP_SECRET}"
-  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-256 (NOT SHA-1) — set on manual entry"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
   if [[ -n "$GEN_ADMIN2_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN2_TOTP_URI}"
@@ -9615,7 +9618,7 @@ print_completion_summary() {
   # --- Next steps ---
   printf "  ${C_BOLD}Next steps:${C_RESET}\n"
   printf "    1. Save ALL credentials above in a password manager\n"
-  printf "    2. Scan the TOTP QR URIs into a SHA-256-compatible authenticator app (Authy, 1Password, Aegis).\n       Note: Google Authenticator may not work on iOS or older Android — Yashigani uses HMAC-SHA-256\n       per the SHA-256 minimum policy. Apps that ignore the algorithm parameter default to SHA-1\n       and will silently produce wrong codes.\n"
+  printf "    2. Scan the TOTP QR URIs into any authenticator app (Google Authenticator, Authy, Aegis,\n       1Password, Microsoft Authenticator, etc.) — Yashigani uses standard HMAC-SHA-1 TOTP\n       (RFC 6238 default), compatible with all authenticator apps.\n"
   printf "    3. Log in to the backoffice as '%s' and change the default password\n" "${GEN_ADMIN1_USERNAME}"
   printf "    4. Store '%s' credentials in a safe/vault (break-glass backup)\n" "${GEN_ADMIN2_USERNAME}"
   printf "    5. Register your first AI agent\n"

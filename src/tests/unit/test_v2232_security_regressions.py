@@ -10,7 +10,6 @@ Last updated: 2026-05-03T00:00:00+01:00
 from __future__ import annotations
 
 import ast
-import hashlib
 import importlib.util
 import sys
 import time
@@ -207,12 +206,11 @@ class TestTotpReplayAvaA006:
         must be rejected on the second attempt.
         """
         verify_totp, generate_totp_secret, pyotp = self._import_verify_totp()
-        import hashlib
 
         secret = generate_totp_secret()
         cache: set[str] = set()
 
-        totp = pyotp.TOTP(secret, digest=hashlib.sha256)
+        totp = pyotp.TOTP(secret)  # RFC 6238 default: HMAC-SHA1
         code = totp.now()
 
         first = verify_totp(secret_b32=secret, code=code, used_codes_cache=cache)
@@ -233,14 +231,13 @@ class TestTotpReplayAvaA006:
         not just the current window.
         """
         verify_totp, generate_totp_secret, pyotp = self._import_verify_totp()
-        import hashlib
 
         secret = generate_totp_secret()
 
         # Generate the code for window T−1 (30 seconds ago)
         now_ts = int(time.time())
         prev_window_ts = now_ts - 30
-        totp = pyotp.TOTP(secret, digest=hashlib.sha256)
+        totp = pyotp.TOTP(secret)  # RFC 6238 default: HMAC-SHA1
         prev_code = totp.at(prev_window_ts)
 
         # Only test if the code is still in the acceptance window (±1)
@@ -305,7 +302,6 @@ class TestTotpReplayAvaA006:
         We simulate the cross-window scenario by patching time.time() for the two calls.
         """
         verify_totp, generate_totp_secret, pyotp = self._import_verify_totp()
-        import hashlib
         from unittest.mock import patch
 
         secret = generate_totp_secret()
@@ -318,7 +314,7 @@ class TestTotpReplayAvaA006:
         window_T = (int(real_now) // window_size) * window_size + window_size  # next boundary
         window_T1 = window_T - window_size  # previous window
 
-        totp = pyotp.TOTP(secret, digest=hashlib.sha256)
+        totp = pyotp.TOTP(secret)  # RFC 6238 default: HMAC-SHA1
         code_at_T1 = totp.at(window_T1)
 
         # Step 1: simulate request at T-1 → code is "current" (offset 0 in T-1 window)

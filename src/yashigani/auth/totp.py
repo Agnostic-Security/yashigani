@@ -1,10 +1,19 @@
 """
 Yashigani Auth — TOTP (RFC 6238) + 8-code recovery system.
 OWASP ASVS V2.8: per-account seeds, replay prevention, one-time display.
-Uses HMAC-SHA256 (upgraded from SHA1 for post-quantum resilience).
+Uses HMAC-SHA1 per RFC 6238 default for universal authenticator-app
+compatibility (Google Authenticator, Authy, Microsoft Authenticator, Aegis,
+1Password, etc.). HMAC-SHA1 is cryptographically secure for OTP use: SHA-1
+collision attacks (SHAttered, 2017) apply to Merkle-Damgård prefix collisions
+in signed certificates, not to HMAC. RFC 2104 HMAC with SHA-1 has no known
+exploitable weaknesses for 6-digit OTP generation. NIST SP 800-63B and
+FIPS 140-2 permit HMAC-SHA1 for TOTP. The prior SHA-256 implementation was
+a usability blocker: 19/20 test users' OTP apps either silently defaulted to
+SHA-1 (producing non-matching codes) or did not support SHA-256 TOTP at all.
+See YSG-RISK-078.
 All code comparisons use hmac.compare_digest (ASVS 11.2.4).
 
-Last updated: 2026-04-30T04:50:00+01:00
+Last updated: 2026-06-14T00:00:00+01:00
 AVA-A006 fix (2026-04-30): window_key now encodes the MATCHED window (not
 always the current window). Without this, a code used at window T−1 inserted
 key T−1 into the replay cache, but a replay at window T checked key T (not
@@ -15,7 +24,6 @@ replays. ASVS V2.8.3.
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac as _hmac_mod
 import io
 import secrets
@@ -81,7 +89,7 @@ def generate_provisioning(
     """
     pyotp = _import_pyotp()
     secret = existing_secret or generate_totp_secret()
-    totp = pyotp.TOTP(secret, issuer=issuer, digest=hashlib.sha256)
+    totp = pyotp.TOTP(secret, issuer=issuer)
     uri = totp.provisioning_uri(name=account_name, issuer_name=issuer)
 
     qr_b64 = _generate_qr_b64(uri)
@@ -122,7 +130,7 @@ def verify_totp(secret_b32: str, code: str, used_codes_cache: set[str]) -> bool:
       already in the cache → replay is correctly rejected.
     """
     pyotp = _import_pyotp()
-    totp = pyotp.TOTP(secret_b32, digest=hashlib.sha256)
+    totp = pyotp.TOTP(secret_b32)
     # Generate expected codes for the valid window (±1) and check replay cache
     # using the MATCHED window's key (not always current window).
     now_ts = int(time.time())

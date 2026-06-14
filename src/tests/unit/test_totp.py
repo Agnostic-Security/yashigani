@@ -129,8 +129,8 @@ class TestVerifyTotp:
 
         (_, _, _, _, _, generate_totp_secret, _, _, verify_totp, *_) = _import_totp()
         secret = generate_totp_secret()
-        import hashlib
-        totp = pyotp.TOTP(secret, digest=hashlib.sha256)
+        # pyotp default (no digest kwarg) = HMAC-SHA1 per RFC 6238, matching backoffice
+        totp = pyotp.TOTP(secret)
         current_code = totp.now()
         assert verify_totp(secret_b32=secret, code=current_code, used_codes_cache=set()) is True
 
