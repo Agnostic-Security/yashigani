@@ -248,6 +248,11 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     @strict_ui {
         path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
         not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+        # LAURA-2255-006 / LAURA-30-009: exclude ReDoc paths so @redoc_ui is the
+        # sole CSP source for those two routes. Without this, both @strict_ui and
+        # @redoc_ui set a CSP header, producing two headers on every /admin/api-redoc
+        # and /redoc response. Browsers intersect; not exploitable but a config defect.
+        not path /admin/api-redoc /redoc
     }
     @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
     @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
