@@ -132,8 +132,8 @@
                         <div><label class="lbl">Protocol</label><br><select id="agent-protocol" class="fi"><option value="openai">openai</option><option value="letta">letta</option><option value="langflow">langflow</option></select></div>
                     </div>
                     <div class="form-row--mt">
-                        <div><label class="lbl">Groups (comma-separated)</label><br><input id="agent-groups" type="text" placeholder="default,engineering" class="fi w-200"></div>
-                        <div><label class="lbl">Allowed caller groups</label><br><input id="agent-caller-groups" type="text" placeholder="admins,operators" class="fi w-200"></div>
+                        <div><label class="lbl">Groups <span class="txt-hint">(Ctrl/Cmd+click to multi-select)</span></label><br><select id="agent-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
+                        <div><label class="lbl">Allowed caller groups <span class="txt-hint">(Ctrl/Cmd+click)</span></label><br><select id="agent-caller-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
                         <div><label class="lbl">Allowed CIDRs</label><br><input id="agent-cidrs" type="text" placeholder="10.0.0.0/8" class="fi w-160"></div>
                         <button data-action="registerAgent" class="btn-sm-save">Register</button>
                     </div>
@@ -147,8 +147,8 @@
                         <div><label class="lbl">Upstream URL</label><br><input id="edit-agent-url" type="text" placeholder="http://agent:8000" class="fi w-250"></div>
                     </div>
                     <div class="form-row--mt">
-                        <div><label class="lbl">Groups (comma-separated)</label><br><input id="edit-agent-groups" type="text" placeholder="default,engineering" class="fi w-200"></div>
-                        <div><label class="lbl">Allowed caller groups</label><br><input id="edit-agent-caller-groups" type="text" placeholder="admins,operators" class="fi w-200"></div>
+                        <div><label class="lbl">Groups <span class="txt-hint">(Ctrl/Cmd+click to multi-select)</span></label><br><select id="edit-agent-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
+                        <div><label class="lbl">Allowed caller groups <span class="txt-hint">(Ctrl/Cmd+click)</span></label><br><select id="edit-agent-caller-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
                         <button data-action="saveEditAgent" class="btn-sm-save">Save</button>
                         <button data-action="cancelEditAgent" class="btn-sm-secondary">Cancel</button>
                     </div>

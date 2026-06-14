@@ -154,6 +154,9 @@ tr:hover { background: #f8fafc; }
 .txt-muted { font-size: 0.8rem; color: #64748b; }
 .txt-muted-sm { font-size: 0.75rem; color: #64748b; }
 .txt-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; }
+/* UX-001 (2026-06-14): group multi-select dropdowns */
+.select-multi { overflow-y: auto; }
+.txt-hint { font-size: 0.72rem; color: #94a3b8; font-weight: normal; }
 .txt-note-sm { font-size: 0.75rem; color: #94a3b8; margin-bottom: 8px; }
 .txt-body { font-size: 0.85rem; color: #334155; margin-bottom: 12px; }
 .txt-body-mb8 { font-size: 0.85rem; color: #334155; margin-bottom: 8px; }

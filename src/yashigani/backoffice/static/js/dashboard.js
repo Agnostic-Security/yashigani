@@ -1041,8 +1041,66 @@ function dashRefresh() {
     loadDashboard();
 }
 
+// ── UX-001 (2026-06-14): group multi-select population ───────────────────────
+// Well-known groups with human-readable labels.
+var _GROUP_LABELS = {
+    'users':      'users — API access (programmatic)',
+    'owui-users': 'owui-users — Open WebUI (human)',
+};
+
+// IDs of the four group multi-selects.
+var _GROUP_SELECT_IDS = ['agent-groups', 'agent-caller-groups', 'edit-agent-groups', 'edit-agent-caller-groups'];
+
+// Fetch RBAC groups and populate all four multi-selects.
+// Preserves current selections so calling again after a group is created/deleted
+// keeps the existing state.
+async function populateGroupSelects() {
+    var data = await api('/admin/rbac/groups');
+    var groups = (data && data.groups) ? data.groups : [];
+    // Always include the two baseline groups even if they aren't in the RBAC store yet.
+    var knownIds = new Set(groups.map(function(g) { return g.id; }));
+    if (!knownIds.has('users'))      { groups.unshift({ id: 'users',      display_name: 'users' }); }
+    if (!knownIds.has('owui-users')) { groups.unshift({ id: 'owui-users', display_name: 'owui-users' }); }
+
+    _GROUP_SELECT_IDS.forEach(function(selId) {
+        var sel = document.getElementById(selId);
+        if (!sel) return;
+        // Save current selections so they survive the rebuild.
+        var selected = new Set(Array.from(sel.options).filter(function(o) { return o.selected; }).map(function(o) { return o.value; }));
+        sel.innerHTML = '';
+        groups.forEach(function(g) {
+            var label = _GROUP_LABELS[g.id] || (g.id + (g.display_name && g.display_name !== g.id ? ' — ' + g.display_name : ''));
+            var opt = document.createElement('option');
+            opt.value = g.id;
+            opt.textContent = label;
+            opt.selected = selected.has(g.id);
+            sel.appendChild(opt);
+        });
+    });
+}
+
+// Read selected values from a multi-select by element id.
+function _getSelectedGroups(selId) {
+    var sel = document.getElementById(selId);
+    if (!sel) return [];
+    return Array.from(sel.options).filter(function(o) { return o.selected; }).map(function(o) { return o.value; });
+}
+
+// Pre-select the given comma-separated group string in a multi-select.
+function _setSelectedGroups(selId, csvOrArray) {
+    var sel = document.getElementById(selId);
+    if (!sel) return;
+    var active = new Set(typeof csvOrArray === 'string'
+        ? csvOrArray.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
+        : (csvOrArray || []));
+    Array.from(sel.options).forEach(function(o) {
+        o.selected = active.has(o.value);
+    });
+}
+
 // Agents
 async function loadAgents() {
+    populateGroupSelects();   // UX-001: ensure dropdowns are populated when Agents tab loads
     var agents = await api('/admin/agents');
     var tbody = document.getElementById('agents-tbody');
     if (agents && agents.length > 0) {
@@ -1077,8 +1135,8 @@ async function registerAgent() {
     var name = document.getElementById('agent-name').value.trim();
     var url = document.getElementById('agent-url').value.trim();
     var protocol = document.getElementById('agent-protocol').value;
-    var groups = document.getElementById('agent-groups').value.trim().split(',').filter(Boolean);
-    var callerGroups = document.getElementById('agent-caller-groups').value.trim().split(',').filter(Boolean);
+    var groups = _getSelectedGroups('agent-groups');           // UX-001: multi-select
+    var callerGroups = _getSelectedGroups('agent-caller-groups'); // UX-001: multi-select
     var cidrs = document.getElementById('agent-cidrs').value.trim().split(',').filter(Boolean);
     var result = document.getElementById('register-agent-result');
     if (!name || !url) { result.textContent = 'Name and URL are required.'; return; }
@@ -1150,8 +1208,8 @@ function editAgent(agentId, name, url, groups, callerGroups) {
     document.getElementById('edit-agent-id').value = agentId;
     document.getElementById('edit-agent-name').value = name || '';
     document.getElementById('edit-agent-url').value = url || '';
-    document.getElementById('edit-agent-groups').value = groups || '';
-    document.getElementById('edit-agent-caller-groups').value = callerGroups || '';
+    _setSelectedGroups('edit-agent-groups', groups || '');         // UX-001: multi-select
+    _setSelectedGroups('edit-agent-caller-groups', callerGroups || ''); // UX-001: multi-select
     document.getElementById('edit-agent-result').textContent = '';
     document.getElementById('edit-agent-form').classList.add('is-open');
 }
@@ -1164,8 +1222,8 @@ async function saveEditAgent() {
     var agentId = document.getElementById('edit-agent-id').value;
     var name = document.getElementById('edit-agent-name').value.trim();
     var url = document.getElementById('edit-agent-url').value.trim();
-    var groups = document.getElementById('edit-agent-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
-    var callerGroups = document.getElementById('edit-agent-caller-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var groups = _getSelectedGroups('edit-agent-groups');              // UX-001: multi-select
+    var callerGroups = _getSelectedGroups('edit-agent-caller-groups'); // UX-001: multi-select
     var result = document.getElementById('edit-agent-result');
     // Only send changed/non-empty fields — AgentUpdateRequest fields are all optional.
     var body = {};
