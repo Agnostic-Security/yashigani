@@ -347,26 +347,9 @@ async def get_license_entitlements(session=Depends(require_admin_session)):
             ),
             LicenseTier.PROFESSIONAL,
         ),
-        (
-            "pii_log",
-            "PII Detection (Log mode)",
-            (
-                "Detects personally identifiable information in LLM payloads and "
-                "records findings in the audit log. Payloads are not modified; "
-                "this is an observability-only mode for compliance reporting."
-            ),
-            LicenseTier.PROFESSIONAL_PLUS,
-        ),
-        (
-            "pii_redact",
-            "PII Redaction / Blocking",
-            (
-                "Detects PII in LLM payloads and either redacts sensitive fields "
-                "before forwarding to the model, or blocks the request entirely. "
-                "Requires pii_log to be available on the same tier."
-            ),
-            LicenseTier.PROFESSIONAL_PLUS,
-        ),
+        # ENT-001 (2026-06-14): pii_log and pii_redact removed from this catalogue.
+        # PII detection is available on ALL tiers (including Community); it is not a
+        # tier-gated feature.  See enforcer.py _ALWAYS_AVAILABLE_FEATURES.
     ]
 
     # Tier ordering for the 'available' check (lower index = lower tier)
