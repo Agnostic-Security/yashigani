@@ -1704,6 +1704,40 @@ risks:
     Nico (crypto) should sanity-check this posture at next crypto review.
     If a dual-verify SHA-256→SHA-1 transition window is needed for in-place
     upgrade deployments, raise with Nico before implementing.
+- id: YSG-RISK-079
+  description: >-
+    PII detection/redaction wrongly license-gated (ENT-001). LicenseFeature.PII_LOG /
+    PII_REDACT gated PII to "Professional Plus" (introduced v2.2, commit 78de59f,
+    2026-04-05, when PII detection first shipped as a paid feature). This contradicted
+    (1) README §8 Feature Matrix — the stated source of truth, "mirrors agnosticsec.com/
+    pricing" — which gates only OIDC/SAML/SCIM, NOT PII; (2) the README narrative ("PII
+    filtering runs on both request and response paths, on all traffic, by default");
+    (3) the open-source / free=Enterprise model. The entitlements UI faithfully rendered
+    the (stale) code, showing PII as "requires Professional Plus". Decision (Tiago Rosado,
+    2026-06-14): ungate — PII detection + all three modes (LOG / REDACT / BLOCK) are
+    available on ALL tiers including Community/free, aligning code to README §8. Fix
+    (commit 5a7cac4): _ALWAYS_AVAILABLE_FEATURES guard in enforcer.py (require_feature
+    short-circuits pii_log/pii_redact unconditionally) + removed from the /admin/license/
+    entitlements catalogue and per-tier feature sets; OIDC/SAML/SCIM gating untouched;
+    enum values retained for license-payload back-compat (never enforced — existing Pro+
+    tokens deserialise fine, no re-issue needed).
+  severity: low
+  controls_impacted:
+  - N/A (commercial/usability alignment — was OVER-gating a core feature; no security impact)
+  compensating_controls:
+  - PII detection/redaction is a core always-on capability (three-layer sensitivity pipeline)
+  - Ungating widens availability; it does not weaken any control
+  status: accepted
+  accepted_by: Tiago Rosado
+  accepted_at: '2026-06-14'
+  review_by: '2027-06-14'
+  closure_evidence:
+  - commit: 5a7cac4
+    rationale: PII ungated on all tiers; entitlements catalogue + tier feature sets updated; tests added.
+  last_threat_model_review: '2026-06-14'
+  notes: >-
+    Nora to confirm the pricing page / feature-comparison messaging (remove "PII Detection"
+    from the Pro+ paid-feature row to match agnosticsec.com/pricing ↔ README §8 ↔ code).
 - id: YSG-RISK-077
   description: 'BUG-C7-001: pgbouncer 1.25.1 (edoburu image) has a SCRAM-SHA-256 client-side computation bug on
     ARM64 Linux. When acting as SASL client (auth_user authenticating to postgres), it computes incorrect SCRAM
