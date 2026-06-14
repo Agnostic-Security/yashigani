@@ -130,6 +130,21 @@ path_blocked if {
     startswith(input.path, "/.well-known/internal")
 }
 
+# ---------------------------------------------------------------------------
+# LAURA-30-006 — JWKS endpoint: anonymous GET allowed (public key material).
+#
+# External MCP validators and relying parties need to fetch the gateway's
+# public JWKS without possessing a session or agent identity.  This is a
+# well-known pattern (RFC 8414 / OAuth 2.0 server metadata).  Only the exact
+# path and GET method are widened; all other /.well-known/* paths remain
+# gated by the default-deny rule.
+# ---------------------------------------------------------------------------
+
+allow if {
+    input.method == "GET"
+    input.path == "/.well-known/yashigani-mcp-jwks.json"
+}
+
 path_blocked if {
     input.path == "/metrics"
 }

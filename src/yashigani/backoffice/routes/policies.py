@@ -177,6 +177,11 @@ async def list_policies(session: AdminSession):  # noqa: ARG001 — auth gate
         policies.append(
             {
                 "id": pid,
+                # AVA-2255-04 / AVA-30-005: policy_id mirrors id for schema
+                # alignment with other resource schemas (agents, patterns, etc.).
+                # id is kept for backwards compatibility; consumers should use
+                # policy_id going forward.
+                "policy_id": pid,
                 "name": name,
                 "package": pkg,
                 "category": cat,

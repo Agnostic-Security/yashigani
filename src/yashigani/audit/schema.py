@@ -320,6 +320,15 @@ class EventType(str, Enum):
     MCP_ENVELOPE_BLOCKED = "MCP_ENVELOPE_BLOCKED"
     # Shared privileged-mutation gate fired (envelope re-approval / #4 / #5).
     PRIVILEGED_MUTATION = "PRIVILEGED_MUTATION"
+    # AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config changes.
+    # These are compliance/legal-relevant decision points: a sensitivity pattern
+    # controls what data the gateway flags and blocks.  Changes MUST be in the
+    # SHA-384 hash chain + signed checkpoint ledger so tampering is detectable.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    SENSITIVITY_PATTERN_CREATED = "SENSITIVITY_PATTERN_CREATED"
+    SENSITIVITY_PATTERN_DELETED = "SENSITIVITY_PATTERN_DELETED"
+    SENSITIVITY_PATTERN_AI_GENERATED = "SENSITIVITY_PATTERN_AI_GENERATED"
+    TAXONOMY_LEVEL_CHANGED = "TAXONOMY_LEVEL_CHANGED"
 
 
 # ---------------------------------------------------------------------------
@@ -2846,3 +2855,103 @@ class EgressAllowUsedEvent(AuditEvent):
     path_truncated: str = ""     # request path, max 128 chars, query stripped
     upstream_status: Optional[int] = None
     elapsed_ms: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config audit events.
+#
+# Sensitivity patterns control what data the gateway flags and blocks.
+# Changes are compliance/legal-relevant and MUST be in the tamper-evident
+# hash chain (SHA-384 prev_hash links + daily ECDSA-signed Merkle-root
+# checkpoint).  An admin or an injected AI-generated pattern installed
+# without an audit record is not acceptable.
+#
+# Security invariants (all four classes):
+#   - The raw regex pattern is never stored in full in the audit record;
+#     only its SHA-256 is stored (pattern_hash) alongside its length and
+#     description.  This prevents the audit log from becoming a secondary
+#     source of potentially malicious patterns.
+#   - masking_applied is always True (admin email is a PII field).
+#   - admin_account = session.account_id from the StepUpAdminSession.
+#
+# NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SensitivityPatternCreatedEvent(AuditEvent):
+    """Emitted when an admin creates a new sensitivity / DLP pattern.
+
+    Security invariant: the raw regex is hashed (SHA-256) — never stored raw.
+    step_up_verified is always True (create requires StepUpAdminSession).
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_CREATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    pattern_id: str = ""          # auto-assigned numeric id
+    classification: str = ""      # numeric level "1"–"5"
+    pattern_type: str = ""        # regex | keyword | classifier | fasttext | ollama
+    pattern_hash: str = ""        # SHA-256 of raw pattern (pattern itself not stored)
+    description: str = ""         # user-supplied description (max 256 chars)
+    step_up_verified: bool = True  # always True — create requires step-up
+
+
+@dataclass
+class SensitivityPatternDeletedEvent(AuditEvent):
+    """Emitted when an admin deletes a sensitivity / DLP pattern.
+
+    Security invariant: the raw regex is hashed (SHA-256) — never stored raw.
+    step_up_verified is always True (delete requires StepUpAdminSession).
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_DELETED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    pattern_id: str = ""          # the deleted pattern's id
+    step_up_verified: bool = True  # always True — delete requires step-up
+
+
+@dataclass
+class SensitivityPatternAIGeneratedEvent(AuditEvent):
+    """Emitted when the AI generate-pattern endpoint is called.
+
+    Note: this records the GENERATION call (the draft produced by the LLM).
+    The admin still reviews and must call POST /patterns to actually create it
+    (which emits SensitivityPatternCreatedEvent).  Both records together provide
+    a complete chain: generated-by-AI → reviewed-by-admin → created.
+
+    Security invariant: raw AI-generated regex is hashed (SHA-256), not stored.
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_AI_GENERATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    description_length: int = 0   # length of user description (not the text itself)
+    model: str = ""               # Ollama model that generated the pattern
+    generated_regex_hash: str = ""  # SHA-256 of generated regex (raw not stored)
+    suggested_level: int = 0      # AI-suggested sensitivity level 1–5
+    parse_ok: bool = False        # True if the LLM response parsed cleanly
+
+
+@dataclass
+class TaxonomyLevelChangedEvent(AuditEvent):
+    """Emitted when an admin upserts or deletes a taxonomy level.
+
+    The taxonomy defines human-readable labels for sensitivity levels 1–5.
+    Changes affect how the UI and reports describe classifications.
+    step_up_verified is always True (write taxonomy ops require StepUpAdminSession).
+    """
+
+    event_type: str = EventType.TAXONOMY_LEVEL_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    level: int = 0                 # taxonomy level number (1–10)
+    change_type: str = ""          # "upsert" | "delete"
+    label: str = ""                # new label (empty on delete)
+    colour_class: str = ""         # new colour_class (empty on delete)
+    step_up_verified: bool = True  # always True — write ops require step-up

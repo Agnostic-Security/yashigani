@@ -37,6 +37,7 @@ sensitivity level. Uses the same model-resolution path as the OPA policy generat
 """
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json as _json
 import logging
 import os
@@ -52,10 +53,101 @@ from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
 from yashigani.optimization.taxonomy_store import TaxonomyStore, DEFAULT_TAXONOMY
+from yashigani.audit.schema import (
+    SensitivityPatternCreatedEvent,
+    SensitivityPatternDeletedEvent,
+    SensitivityPatternAIGeneratedEvent,
+    TaxonomyLevelChangedEvent,
+)
+
+# ---------------------------------------------------------------------------
+# LAURA-2255-005: ReDoS protection helpers (AUDIT-GAP-001: also used below
+# in create_pattern and generate_pattern to validate AI-generated regexes).
+#
+# Strategy: structural heuristic (no re2/recheck dependency).  Patterns that
+# would require re2 for full linear-time guarantees are already rejected here
+# because the heuristic flags all catastrophic-backtracking structures
+# (nested quantifiers on variable-length groups) and trivially-overbroad
+# patterns (bare .*) that the ReDoS finding specifically calls out.
+# ---------------------------------------------------------------------------
+
+# Heuristic patterns that flag potential catastrophic backtracking.
+# Covers the canonical evil forms: (a+)+, (a*)+, (a+)*, (a|a)+, etc.
+_REDOS_NESTED_RE = _re.compile(
+    r"""
+    # nested quantifiers: (...+)+ / (...*)+ / (...+)* etc.
+    \(          # opening group paren
+    [^)]*       # any group content (lazy — we care about the structure)
+    [+*]        # inner quantifier on whatever is inside the group
+    [^)]*       # possibly more content after inner quantifier
+    \)          # closing paren
+    [+*]        # outer quantifier on the group itself
+    """,
+    _re.VERBOSE,
+)
+
+# Trivially-overbroad single-element patterns: bare .* or .+ (no anchors,
+# no surrounding context) — useless for DLP and cause performance issues.
+_OVERBROAD_RE = _re.compile(r"^\.\*$|^\.\+$|^\(\.\*\)$|^\(\.\+\)$")
+
+
+def _validate_regex_safety(pattern: str) -> None:
+    """Validate a pattern string for ReDoS risk and compilability.
+
+    Raises HTTPException 422 on:
+      - Patterns that fail to compile (invalid regex).
+      - Patterns with nested quantifiers on variable-length groups
+        (catastrophic backtracking risk).
+      - Trivially-overbroad patterns (bare .* / .+) with no context.
+    """
+    # 1. Compilability guard — reject syntactically invalid regexes.
+    try:
+        _re.compile(pattern)
+    except _re.error as exc:
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_regex",
+                "message": f"Pattern is not a valid regular expression: {exc}",
+            },
+        )
+
+    # 2. Trivially-overbroad check.
+    if _OVERBROAD_RE.match(pattern):
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "overbroad_pattern",
+                "message": (
+                    "Pattern '.*' or '.*' alone matches everything — it provides no "
+                    "discrimination and would flag every message.  Provide a more "
+                    "specific pattern."
+                ),
+            },
+        )
+
+    # 3. Nested-quantifier heuristic (catastrophic backtracking).
+    if _REDOS_NESTED_RE.search(pattern):
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "redos_risk",
+                "message": (
+                    "Pattern contains nested quantifiers on a variable-length group "
+                    "(e.g. (a+)+) which can cause catastrophic backtracking.  "
+                    "Rewrite without nesting quantifiers, e.g. use 'a+' instead of '(a+)+'."
+                ),
+            },
+        )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _sha256_hex(text: str) -> str:
+    """SHA-256 hex digest of a UTF-8 string (for audit records — raw value not stored)."""
+    return _hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # Shared taxonomy store instance (no DB connection in constructor)
 _taxonomy_store = TaxonomyStore()
@@ -141,6 +233,9 @@ async def list_patterns(session: AdminSession):
 @router.post("/patterns", status_code=201)
 async def create_pattern(body: PatternRequest, session: StepUpAdminSession):
     global _pattern_counter
+    # LAURA-2255-005: reject unsafe regex patterns at the create boundary.
+    if body.type == "regex":
+        _validate_regex_safety(body.pattern)
     _pattern_counter += 1
     # Normalise legacy string names to numeric
     classification = _normalise_classification(body.classification)
@@ -152,6 +247,23 @@ async def create_pattern(body: PatternRequest, session: StepUpAdminSession):
         "description": body.description,
     }
     _patterns.append(pattern)
+
+    # AUDIT-GAP-001: emit to the SHA-384 hash-chain ledger.
+    if backoffice_state.audit_writer is not None:
+        try:
+            backoffice_state.audit_writer.write(
+                SensitivityPatternCreatedEvent(
+                    admin_account=session.account_id,
+                    pattern_id=str(_pattern_counter),
+                    classification=classification,
+                    pattern_type=body.type,
+                    pattern_hash=_sha256_hex(body.pattern),
+                    description=body.description,
+                )
+            )
+        except Exception as _exc:
+            logger.error("Failed to write SensitivityPatternCreatedEvent: %s", _exc)
+
     return {"status": "ok", "pattern": pattern}
 
 
@@ -162,6 +274,19 @@ async def delete_pattern(pattern_id: str, session: StepUpAdminSession):
     _patterns = [p for p in _patterns if p["id"] != pattern_id]
     if len(_patterns) == before:
         raise HTTPException(status_code=404, detail={"error": "pattern_not_found"})
+
+    # AUDIT-GAP-001: emit to the SHA-384 hash-chain ledger.
+    if backoffice_state.audit_writer is not None:
+        try:
+            backoffice_state.audit_writer.write(
+                SensitivityPatternDeletedEvent(
+                    admin_account=session.account_id,
+                    pattern_id=pattern_id,
+                )
+            )
+        except Exception as _exc:
+            logger.error("Failed to write SensitivityPatternDeletedEvent: %s", _exc)
+
     return {"status": "ok"}
 
 
@@ -282,6 +407,20 @@ async def upsert_taxonomy_level(
             label=body.label,
             colour_class=body.colour_class,
         )
+        # AUDIT-GAP-001: emit to the SHA-384 hash-chain ledger.
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(
+                    TaxonomyLevelChangedEvent(
+                        admin_account=session.account_id,
+                        level=level,
+                        change_type="upsert",
+                        label=body.label,
+                        colour_class=body.colour_class,
+                    )
+                )
+            except Exception as _exc:
+                logger.error("Failed to write TaxonomyLevelChangedEvent (upsert): %s", _exc)
         return {"status": "ok", "level": level, "label": body.label, "colour_class": body.colour_class}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "invalid_colour_class", "message": str(exc)}) from exc
@@ -295,6 +434,18 @@ async def delete_taxonomy_level(level: int, session: StepUpAdminSession):
     """Delete a taxonomy level for the default tenant."""
     try:
         await _taxonomy_store.delete_level(tenant_id="default", level_number=level)
+        # AUDIT-GAP-001: emit to the SHA-384 hash-chain ledger.
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(
+                    TaxonomyLevelChangedEvent(
+                        admin_account=session.account_id,
+                        level=level,
+                        change_type="delete",
+                    )
+                )
+            except Exception as _exc:
+                logger.error("Failed to write TaxonomyLevelChangedEvent (delete): %s", _exc)
         return {"status": "ok", "level": level}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "delete_not_allowed", "message": str(exc)}) from exc
@@ -414,6 +565,22 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
     except Exception as exc:
         parse_error = f"LLM response could not be parsed as JSON: {exc}. Raw: {raw[:300]}"
         logger.warning("generate_pattern: parse error: %s", parse_error)
+
+    # AUDIT-GAP-001: emit AI-generation event to the hash-chain ledger.
+    if backoffice_state.audit_writer is not None:
+        try:
+            backoffice_state.audit_writer.write(
+                SensitivityPatternAIGeneratedEvent(
+                    admin_account=session.account_id,
+                    description_length=len(body.description),
+                    model=model,
+                    generated_regex_hash=_sha256_hex(generated_regex) if generated_regex else "",
+                    suggested_level=suggested_level,
+                    parse_ok=parse_error is None,
+                )
+            )
+        except Exception as _exc:
+            logger.error("Failed to write SensitivityPatternAIGeneratedEvent: %s", _exc)
 
     return {
         "status": "ok" if not parse_error else "parse_error",

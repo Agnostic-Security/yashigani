@@ -1118,6 +1118,19 @@ async function rotateAgentToken(agentId, name) {
         document.getElementById('agent-token-name').textContent = name;
         document.getElementById('agent-token-value').textContent = data.token;
         document.getElementById('agent-token-panel').classList.add('is-open');
+    } else if (resp && resp.status === 401) {
+        // AVA-30-003: token rotation requires a SPIFFE mTLS client certificate
+        // (X-Yashigani-Spiffe-Id header injected by Caddy on mTLS connections).
+        // Browser-session callers don't present a client cert, so this endpoint
+        // always returns 401 from the browser.  Show a clear, actionable message
+        // rather than a generic "Token rotation failed: 401".
+        alert(
+            'Token rotation requires a SPIFFE mTLS client certificate.\n\n' +
+            'This action cannot be performed from a browser session. ' +
+            'Use the Yashigani API directly with your service SPIFFE certificate:\n\n' +
+            '  curl --cert <leaf.crt> --key <leaf.key> --cacert <ca.crt> \\\n' +
+            '       -X POST https://<host>/admin/agents/' + agentId + '/token/rotate'
+        );
     } else if (resp) {
         alert('Token rotation failed: ' + resp.status);
     }
