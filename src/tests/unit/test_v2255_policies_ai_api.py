@@ -592,12 +592,16 @@ class TestGeneratePattern:
         return _j.dumps({"regex": regex, "level": level, "description": description})
 
     def test_generate_returns_regex_and_level(self):
+        # LAURA-2255-003: endpoint now uses chat API (/api/chat), not /api/generate.
+        # Response shape: {"message": {"content": "<json>"}} (not {"response": "..."}).
         mock_llm_resp = MagicMock()
         mock_llm_resp.status_code = 200
         mock_llm_resp.json = MagicMock(return_value={
-            "response": self._llm_json_response(
-                r"\bOFFICIAL[\s-]SENSITIVE\b", 4, "UK OFFICIAL-SENSITIVE marking"
-            )
+            "message": {
+                "content": self._llm_json_response(
+                    r"\bOFFICIAL[\s-]SENSITIVE\b", 4, "UK OFFICIAL-SENSITIVE marking"
+                )
+            }
         })
         mock_llm_resp.raise_for_status = MagicMock()
 
@@ -624,14 +628,20 @@ class TestGeneratePattern:
         assert data["generated_regex"] == r"\bOFFICIAL[\s-]SENSITIVE\b"
         assert data["suggested_level"] == 4
         assert data["model"] == "gemma3:4b"
-        assert data["parse_error"] is None
+        # LAURA-2255-003: raw_llm_response is never returned to the client
+        assert "raw_llm_response" not in data
 
     def test_generate_clamps_level_to_valid_range(self):
-        """LLM returning level=99 should be clamped to 5."""
+        """LLM returning level=99 should be clamped to 5.
+
+        LAURA-2255-003: uses chat API response shape {"message": {"content": ...}}.
+        """
         mock_llm_resp = MagicMock()
         mock_llm_resp.status_code = 200
         mock_llm_resp.json = MagicMock(return_value={
-            "response": self._llm_json_response(r"\d+", 99, "numbers")
+            "message": {
+                "content": self._llm_json_response(r"\d+", 99, "numbers")
+            }
         })
         mock_llm_resp.raise_for_status = MagicMock()
 
@@ -701,12 +711,22 @@ class TestGeneratePattern:
         # Pydantic validation rejects <5 chars
         assert resp.status_code == 422
 
-    def test_generate_parse_error_returns_raw(self):
-        """If LLM returns non-JSON, parse_error is set and raw is included."""
+    def test_generate_parse_error_raw_not_exposed(self):
+        """If LLM returns non-JSON, parse_error status is set BUT raw is NOT returned to client.
+
+        LAURA-2255-003 security improvement: raw LLM output is logged server-side only.
+        Returning raw model output to the client was a data-exposure risk (prompt echo,
+        injection reflection). The client receives status="parse_error" and no regex —
+        it never sees the raw string the model produced.
+
+        LAURA-2255-003: chat API response shape {"message": {"content": ...}}.
+        """
         mock_llm_resp = MagicMock()
         mock_llm_resp.status_code = 200
         mock_llm_resp.json = MagicMock(return_value={
-            "response": "Sorry, I cannot generate that pattern."
+            "message": {
+                "content": "Sorry, I cannot generate that pattern."
+            }
         })
         mock_llm_resp.raise_for_status = MagicMock()
 
@@ -729,9 +749,12 @@ class TestGeneratePattern:
 
         assert resp.status_code == 200
         data = resp.json()
+        # Parse error state is signalled
         assert data["status"] == "parse_error"
-        assert data["parse_error"] is not None
-        assert data["raw_llm_response"] is not None
+        # Security: raw LLM output MUST NOT reach the client
+        assert "raw_llm_response" not in data
+        # No usable regex is returned when parse fails
+        assert data["generated_regex"] == ""
 
 
 # ---------------------------------------------------------------------------
