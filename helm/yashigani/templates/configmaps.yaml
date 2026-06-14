@@ -41,6 +41,14 @@ data:
 {{ .Files.Get "files/policy/document.rego" | indent 4 }}
   clients_aggregate.rego: |
 {{ .Files.Get "files/policy/clients_aggregate.rego" | indent 4 }}
+  # LAURA-30-001 (2026-06-14): OPA management-API authorisation policy.
+  # Loaded by OPA as package system.authz (--authorization=basic). Stored under
+  # a flat ConfigMap key (system-authz.rego) and subPath-mounted at the path
+  # OPA recurses at startup (/policies/system/authz.rego). The system/ subdir
+  # is preserved in the mountPath so OPA loads it as data.system.authz
+  # (package name must match directory path for OPA's bundle loader).
+  system-authz.rego: |
+{{ .Files.Get "files/policy/system/authz.rego" | indent 4 }}
 {{- end }}
 
 {{- if .Values.otelCollector.enabled }}

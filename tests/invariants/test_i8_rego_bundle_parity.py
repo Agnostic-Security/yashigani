@@ -30,11 +30,22 @@ HELM_BUNDLE_DIR = REPO_ROOT / "helm" / "yashigani" / "files" / "policy"
 
 
 def _runtime_regos(d: Path) -> dict[str, Path]:
-    """Runtime policy regos only (exclude *_test.rego unit policies)."""
+    """Enforcement policy regos — top-level AND enforcement subdirectories.
+
+    Keys are relative paths (e.g. 'yashigani.rego', 'system/authz.rego') so
+    the dict captures the directory structure. Compose mounts the whole policy/
+    tree; Helm must mirror the same tree in files/policy/.
+
+    Excluded: *_test.rego unit tests; policy/examples/ (user-facing sample
+    policies loaded at runtime via Policy manager, intentionally absent from
+    Helm — not startup-enforcement policies).
+    """
+    _excluded_subdirs = {"examples"}
     return {
-        p.name: p
-        for p in sorted(d.glob("*.rego"))
+        str(p.relative_to(d)): p
+        for p in sorted(d.rglob("*.rego"))
         if not p.name.endswith("_test.rego")
+        and p.relative_to(d).parts[0] not in _excluded_subdirs
     }
 
 
@@ -86,3 +97,24 @@ def test_load_bearing_3_0_policies_present_in_both() -> None:
     for required in ("document.rego", "mcp.rego", "v1_routing.rego", "agents.rego"):
         assert (CANONICAL_DIR / required).exists(), f"canonical {required} missing"
         assert (HELM_BUNDLE_DIR / required).exists(), f"helm {required} missing"
+
+
+def test_system_authz_rego_present_in_both() -> None:
+    """LAURA-30-001: system/authz.rego must be present in BOTH canonical and Helm
+    bundles. Its absence from Helm would leave OPA on K8s with --authorization=basic
+    but no system.authz policy — every management API call would 403 (fail closed),
+    breaking backoffice policy push + gateway eval on K8s silently.
+    """
+    authz_canon = CANONICAL_DIR / "system" / "authz.rego"
+    authz_helm = HELM_BUNDLE_DIR / "system" / "authz.rego"
+    assert authz_canon.is_file(), (
+        f"policy/system/authz.rego missing — LAURA-30-001 regression"
+    )
+    assert authz_helm.is_file(), (
+        f"helm/yashigani/files/policy/system/authz.rego missing — "
+        f"K8s OPA would not load system.authz → all management calls 403"
+    )
+    assert _sha256(authz_canon) == _sha256(authz_helm), (
+        "system/authz.rego DRIFTED between canonical and Helm bundle — "
+        "K8s OPA would enforce different authz rules than compose"
+    )

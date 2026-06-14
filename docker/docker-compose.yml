@@ -918,6 +918,29 @@ services:
     # v2.23.2: OPA now serves mTLS on port 8181 using its own leaf cert
     # (policy_client.crt / policy_client.key signed by the internal CA).
     # All Python callers updated to use internal_httpx_client (EX-231-01 closed).
+    #
+    # LAURA-30-001 (2026-06-14): add --authentication=tls + --authorization=basic.
+    #   L1 --authentication=tls  — OPA now requires every client to present a cert
+    #      signed by ca_root.crt (Go VerifyClientCertAlways). No-cert connections
+    #      are rejected at the TLS handshake (HTTP 401). Mesh clients already present
+    #      their leaf cert via internal_httpx_client (EX-231-01). DAST-confirmed fix
+    #      for the no-client-cert GET /v1/policies → HTTP 200 bypass.
+    #   L2 --authorization=basic — OPA evaluates data.system.authz.allow on every
+    #      management API request. policy/system/authz.rego is a strict ALLOWLIST:
+    #        backoffice identity  → PUT/PATCH/DELETE /v1/policies/* + /v1/data/*
+    #                              + GET/POST (list, dry-run, sandbox sanity)
+    #        gateway identity     → POST /v1/data/yashigani/* + client_enforce/*
+    #        unauthenticated      → GET /health ONLY (K8s kubelet probe, :8282)
+    #        all other identities → DENY (agents, MCPs, APIs are SUBJECTS of OPA,
+    #                               never OPA admins; approval grants mesh access,
+    #                               never OPA management-API access)
+    #   Client-cert audit (all paths verified present certs):
+    #     gateway  proxy.py/_client_enforce.py/agent_router.py → internal_httpx_client
+    #     backoffice routes/policies.py/opa_assistant/sanity.py → internal_httpx_client
+    #     backoffice rbac/documents/models/policy_bindings opa_push.py
+    #              → internal_httpx_sync_client
+    #   All six callers use internal_httpx_client/sync_client which calls
+    #   pki.client.client_ssl_context → loads the service leaf cert + ca_root.crt.
     command:
       - "run"
       - "--server"
@@ -927,6 +950,8 @@ services:
       - "--tls-cert-file=/run/secrets/policy_client.crt"
       - "--tls-private-key-file=/run/secrets/policy_client.key"
       - "--tls-ca-cert-file=/run/secrets/ca_root.crt"
+      - "--authentication=tls"
+      - "--authorization=basic"
       - "/policies"
     volumes:
       - ../policy:/policies:ro
