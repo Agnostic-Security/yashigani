@@ -1216,4 +1216,39 @@ def create_backoffice_app() -> FastAPI:
     # v2.25.5 — R26: version check (opt-in egress)
     app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
 
+    # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
+    # OpenAPI schema and annotate all /scim/v2/* paths with the scheme reference.
+    # Previously SCIM routes showed security:[] — they always required an admin session
+    # but the requirement was invisible in the schema.  This is a cosmetic (schema-only)
+    # fix; the actual enforcement is unchanged (require_admin_session dependency).
+    _orig_openapi = app.openapi
+
+    def _openapi_with_scim_security() -> dict:
+        schema = _orig_openapi()
+        # Inject the AdminSessionCookie security scheme into components once.
+        components = schema.setdefault("components", {})
+        security_schemes = components.setdefault("securitySchemes", {})
+        security_schemes.setdefault("AdminSessionCookie", {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": "__Host-yashigani_admin_session",
+            "description": (
+                "Yashigani admin session cookie. Issued by POST /auth/session "
+                "(admin-tier credentials + TOTP). All /admin/* and /scim/v2/* "
+                "endpoints require this cookie."
+            ),
+        })
+        # Add the security requirement to all SCIM paths.
+        scim_security = [{"AdminSessionCookie": []}]
+        for path, path_item in schema.get("paths", {}).items():
+            if path.startswith("/scim/v2/"):
+                for _method, operation in path_item.items():
+                    if isinstance(operation, dict):
+                        operation.setdefault("security", scim_security)
+        # Cache the augmented schema so subsequent calls don't re-compute.
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = _openapi_with_scim_security  # type: ignore[method-assign]
+
     return app
