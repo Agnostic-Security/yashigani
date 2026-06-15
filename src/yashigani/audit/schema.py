@@ -503,6 +503,9 @@ class EventType(str, Enum):
     # An INERT pending registry record was written (no leaf, no grant, no envelope).
     # Surfaces in nhi-approvals.js as "discovered — pending admin approval".
     LANGFLOW_FLOW_DISCOVERED = "LANGFLOW_FLOW_DISCOVERED"
+    # v3.0 — licence hardening (T11)
+    LICENSE_INTEGRITY_VIOLATION = "LICENSE_INTEGRITY_VIOLATION"
+    LICENSE_STATE_SET = "LICENSE_STATE_SET"
 
 
 # ---------------------------------------------------------------------------
@@ -3370,6 +3373,8 @@ class EgressAllowUsedEvent(AuditEvent):
 #   - admin_account = session.account_id from the StepUpAdminSession.
 #
 # NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+#
+# v3.0 — Licence hardening typed events (T11)
 # ---------------------------------------------------------------------------
 
 
@@ -4411,3 +4416,52 @@ class LangflowFlowDiscoveredEvent(AuditEvent):
         "All flows under this instance share the union egress grant. "
         "Per-flow isolation requires per-instance containers (Track 3+)."
     )
+
+
+@dataclass
+class LicenceIntegrityViolationEvent(AuditEvent):
+    """
+    Emitted when a licence integrity check fails (T6/T7/T1/T2/T3/T4).
+
+    DG-02: _internal_classification is excluded from to_dict() so it never
+    reaches the operator-visible audit export or the Merkle chain serialisation.
+    The field value is only meaningful to Yashigani incident-response personnel
+    reading the live Python object.
+
+    check_type: self_hash | cross_hash | bundle_sig | kdf_token
+    expected_hash / actual_hash: first 16 hex chars only (no full hash exposure).
+    """
+
+    event_type: str = field(default=EventType.LICENSE_INTEGRITY_VIOLATION)
+    account_tier: str = field(default="system")
+    masking_applied: bool = False   # never masked — integrity events are exempt
+    module: str = ""
+    check_type: str = ""           # self_hash | cross_hash | bundle_sig | kdf_token
+    expected_hash: str = ""        # first 16 hex chars only
+    actual_hash: str = ""          # first 16 hex chars only
+    _internal_classification: str = field(default="", repr=False)
+
+    def to_dict(self) -> dict:
+        """Exclude _internal_classification from operator-visible export (DG-02)."""
+        import dataclasses
+        d = dataclasses.asdict(self)
+        d.pop("_internal_classification", None)
+        return d
+
+
+@dataclass
+class LicenceStateSetEvent(AuditEvent):
+    """
+    Emitted on every set_license() call (T8).
+
+    Records the tier, org_domain, license_id, and calling module so the
+    audit trail captures every licence state transition at startup and on reload.
+    """
+
+    event_type: str = field(default=EventType.LICENSE_STATE_SET)
+    account_tier: str = field(default="system")
+    masking_applied: bool = False
+    tier: str = ""
+    org_domain: str = ""
+    license_id: str = ""
+    caller_module: str = ""
