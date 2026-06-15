@@ -5706,6 +5706,7 @@ _fix_config_perms() {
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
     -not \( -path "${work_dir}/backups" -prune \) \
+    -not \( -path "${work_dir}/docker/openclaw/openclaw.runtime.json" -prune \) \
     -exec chmod o+rX {} + 2>/dev/null \
     || log_warn "chmod o+rX sweep had partial failures (non-fatal — secrets/ not touched)"
 
