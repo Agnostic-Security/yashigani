@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+sign_bundle.py — Build-pipeline helper: sign the canonical hash-bundle.
+
+Usage:
+    python scripts/sign_bundle.py \\
+        --key  /path/to/yashigani_counter_private.pem \\
+        --bundle-str "AGENTS_REGISTRY_HASH=<hex>\\n..."
+
+    Or pass --bundle-str via stdin with "-":
+        echo "$BUNDLE_STR" | python scripts/sign_bundle.py --key /path/to/private.pem --bundle-str -
+
+Output:
+    A standard base64-encoded ECDSA P-256 signature printed to stdout — the
+    HASH_BUNDLE_SIG constant to embed in _integrity.py.
+
+Signature construction (must match verifier._check_hash_bundle_attestation()):
+    digest     = SHA-256(canonical_bundle_string.encode("utf-8"))   [32 bytes]
+    sig_bytes  = ECDSA_P256_sign(private_key, digest)               [DER-encoded]
+    HASH_BUNDLE_SIG = base64.b64encode(sig_bytes).decode("ascii")
+
+Verification (self-check before emitting):
+    This script verifies the produced signature against the public key derived
+    from the private key before printing.  Abort with non-zero if verification
+    fails — never emit an unverified signature.
+
+Security notes:
+    - Private key path is read from the argument; key material is never printed.
+    - Key file must be chmod 0400 or 0600 — abort if world-readable.
+    - Output is standard base64 (NOT base64url).  verifier.py decodes with
+      base64.b64decode(sig + "==") so standard base64 is the correct encoding.
+    - The ECDSA operation is performed by the cryptography library (OpenSSL
+      backend); on FIPS systems the OpenSSL FIPS provider is used automatically.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import os
+import stat
+import sys
+
+
+def _check_key_permissions(key_path: str) -> None:
+    """Abort if the private key file is world- or group-readable (S1 / CWE-732)."""
+    mode = os.stat(key_path).st_mode
+    if mode & (stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH):
+        print(
+            f"ERROR: private key {key_path!r} has group/world read or write bits set "
+            f"(mode={oct(mode)}) — refusing to use (CWE-732).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def sign_bundle(private_key_path: str, bundle_str: str) -> str:
+    """
+    Sign the canonical bundle string and return the standard-base64 signature.
+
+    Verifies the signature against the derived public key before returning.
+    Raises SystemExit(1) on any failure.
+    """
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric.ec import (
+        ECDSA,
+        EllipticCurvePrivateKey,
+        SECP256R1,
+    )
+    from cryptography.hazmat.primitives.hashes import SHA256 as CryptoSHA256
+    from cryptography.exceptions import InvalidSignature
+
+    _check_key_permissions(private_key_path)
+
+    try:
+        key_pem = open(private_key_path, "rb").read()
+    except OSError as exc:
+        print(f"ERROR: cannot read private key {private_key_path!r}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        private_key = load_pem_private_key(key_pem, password=None)
+    except Exception as exc:
+        print(f"ERROR: cannot parse private key: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(private_key, EllipticCurvePrivateKey):
+        print(
+            f"ERROR: expected ECDSA private key, got {type(private_key).__name__}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not isinstance(private_key.public_key().curve, SECP256R1):
+        print("ERROR: counter private key is not on curve P-256 (secp256r1)", file=sys.stderr)
+        sys.exit(1)
+
+    # The message being signed: SHA-256 of the UTF-8 bundle string.
+    # This double-hash envelope matches verifier._check_hash_bundle_attestation():
+    #   pub_key.verify(sig_bytes, bundle_digest, ECDSA(CryptoSHA256()))
+    # where bundle_digest = sha256(bundle_str.encode("utf-8")).digest()
+    bundle_digest = hashlib.sha256(bundle_str.encode("utf-8")).digest()
+
+    try:
+        sig_bytes = private_key.sign(bundle_digest, ECDSA(CryptoSHA256()))
+    except Exception as exc:
+        print(f"ERROR: signing failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Self-verify before emitting — never output an unverified signature.
+    try:
+        public_key = private_key.public_key()
+        public_key.verify(sig_bytes, bundle_digest, ECDSA(CryptoSHA256()))
+    except InvalidSignature:
+        print("ERROR: self-verification of produced signature FAILED — aborting", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: self-verification raised unexpected error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    return base64.b64encode(sig_bytes).decode("ascii")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Sign the canonical hash-bundle with the counter private key. "
+            "Outputs a standard-base64 ECDSA P-256 signature."
+        )
+    )
+    parser.add_argument(
+        "--key",
+        required=True,
+        metavar="PRIVATE_KEY_PEM",
+        help="Path to yashigani_counter_private.pem (never baked into an image).",
+    )
+    parser.add_argument(
+        "--bundle-str",
+        required=True,
+        metavar="STRING_OR_DASH",
+        help=(
+            "Canonical hash-bundle string (sorted KEY=hex\\n... pairs, no trailing newline). "
+            "Pass '-' to read from stdin."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.bundle_str == "-":
+        bundle_str = sys.stdin.read()
+    else:
+        bundle_str = args.bundle_str
+
+    # Strip only a trailing newline that a shell heredoc / echo would add.
+    bundle_str = bundle_str.rstrip("\n")
+
+    if not bundle_str:
+        print("ERROR: empty bundle string", file=sys.stderr)
+        sys.exit(1)
+
+    sig = sign_bundle(args.key, bundle_str)
+    print(sig)
+
+
+if __name__ == "__main__":
+    main()

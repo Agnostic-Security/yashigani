@@ -248,12 +248,21 @@ def _check_hash_bundle_attestation() -> None:
         )
         return
 
-    # Build canonical bundle string (sorted by key name)
+    # Build canonical bundle string (sorted by key name, 5 module hashes only).
+    # DESIGN-NOTE (Su 2026-06-15): INTEGRITY_HASH is intentionally excluded from
+    # the signed bundle.  Including it creates an unresolvable circularity in the
+    # injection pipeline: INTEGRITY_HASH covers the final _integrity.py (including
+    # HASH_BUNDLE_SIG), but HASH_BUNDLE_SIG must be signed before INTEGRITY_HASH
+    # is finalized.  INTEGRITY_HASH already receives independent protection via the
+    # enforcer cross-check (_check_enforcer_integrity → cross-checks _integrity.py
+    # hash via INTEGRITY_HASH), which catches any attacker who patches _integrity.py
+    # to substitute their own bundle sig.  The 5-module bundle covers all module
+    # files that gate the licence; _integrity.py tamper evidence comes from the
+    # enforcer cross-check path.  Security goal is identical to Nico's §2.4 design.
     bundle_str = "\n".join([
         f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
         f"ENFORCER_HASH={_integrity.ENFORCER_HASH}",
         f"IDENTITY_REGISTRY_HASH={_integrity.IDENTITY_REGISTRY_HASH}",
-        f"INTEGRITY_HASH={_integrity.INTEGRITY_HASH}",
         f"LOADER_HASH={_integrity.LOADER_HASH}",
         f"VERIFIER_HASH={_integrity.VERIFIER_HASH}",
     ])
@@ -372,11 +381,11 @@ def _check_kdf_token() -> None:
         return
 
     try:
+        # 5-module bundle (INTEGRITY_HASH excluded — see DESIGN-NOTE in _check_hash_bundle_attestation)
         bundle_str = "\n".join([
             f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
             f"ENFORCER_HASH={_integrity.ENFORCER_HASH}",
             f"IDENTITY_REGISTRY_HASH={_integrity.IDENTITY_REGISTRY_HASH}",
-            f"INTEGRITY_HASH={_integrity.INTEGRITY_HASH}",
             f"LOADER_HASH={_integrity.LOADER_HASH}",
             f"VERIFIER_HASH={_integrity.VERIFIER_HASH}",
         ])

@@ -8199,6 +8199,64 @@ compose_up() {
     return 0
   fi
 
+  # ---------------------------------------------------------------------------
+  # S11 — pre-flight: refuse to start a prod image with un-injected constants.
+  #
+  # Greps for _PLACEHOLDER_INTEGRITY sentinel inside the installed _integrity.py
+  # in the backoffice image.  An image built without running inject_hashes.sh
+  # will still contain placeholder strings and must not start in production.
+  #
+  # Technique: `docker run --rm --entrypoint python3 <image> -c "..."` so we
+  # inspect the installed package without starting the full service.
+  # Image name is read from COMPOSE_CMD + compose file — same image compose would pull.
+  # Skipped in DRY_RUN (already returned above) and when YASHIGANI_ENV=dev.
+  # ---------------------------------------------------------------------------
+  if [[ "${YASHIGANI_ENV:-}" != "dev" ]]; then
+    log_info "Pre-flight: verifying backoffice image has no placeholder integrity constants..."
+    local _backoffice_image=""
+    _backoffice_image="$(
+      "${COMPOSE_CMD[@]}" "${compose_files[@]}" \
+        config --format json 2>/dev/null \
+        | python3 -c "
+import sys, json
+cfg = json.load(sys.stdin)
+svc = cfg.get('services', {}).get('backoffice', {})
+print(svc.get('image', ''))
+" 2>/dev/null || echo ""
+    )"
+    if [[ -n "${_backoffice_image}" ]]; then
+      local _placeholder_check_out=""
+      _placeholder_check_out="$(
+        "${COMPOSE_CMD[0]}" run --rm --entrypoint python3 "${_backoffice_image}" \
+          -c "
+import sys
+try:
+    from yashigani.licensing import _integrity
+    if _integrity.is_any_hash_placeholder() or _integrity.is_bundle_sig_placeholder() or _integrity.is_kdf_token_placeholder():
+        print('PLACEHOLDER_FOUND')
+        sys.exit(1)
+    print('OK')
+except Exception as e:
+    print(f'ERROR:{e}')
+    sys.exit(2)
+" 2>&1 || true
+      )"
+      if echo "${_placeholder_check_out}" | grep -q 'PLACEHOLDER_FOUND'; then
+        log_error "FATAL: backoffice image ${_backoffice_image} still contains _PLACEHOLDER_INTEGRITY constants."
+        log_error "       The build pipeline did not run scripts/inject_hashes.sh before building the wheel."
+        log_error "       Re-build the image with: docker build --secret id=counter_private_key,src=<key> ..."
+        log_error "       Refusing to start a prod image with un-injected hash constants (S11 / §4.2)."
+        return 1
+      elif echo "${_placeholder_check_out}" | grep -q 'ERROR:'; then
+        log_warn "Pre-flight: could not inspect _integrity.py in image (${_placeholder_check_out}) — proceeding (image may be freshly pulled)"
+      else
+        log_info "Pre-flight: backoffice image integrity constants OK (no placeholders)"
+      fi
+    else
+      log_warn "Pre-flight: could not determine backoffice image name from compose config — skipping placeholder check"
+    fi
+  fi
+
   # Clean up any stale containers/networks from failed previous runs.
   # NEVER use -v (--volumes) — that destroys user data (Postgres, Redis, audit logs).
   log_info "Stopping any existing containers (preserving data volumes)..."
