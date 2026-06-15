@@ -122,46 +122,300 @@ def _check_self_integrity() -> None:
             _integrity.VERIFIER_HASH,
             digest,
         )
-        _emit_integrity_audit_alert(digest)
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="self_hash",
+            expected_hash=_integrity.VERIFIER_HASH,
+            actual_hash=digest,
+        )
 
 
-def _emit_integrity_audit_alert(actual_hash: str) -> None:
+def _emit_licence_integrity_violation_event(
+    module: str,
+    check_type: str,
+    expected_hash: str,
+    actual_hash: str,
+    classification: str = "unknown",
+) -> None:
     """
-    Write a P1 audit event if an AuditLogWriter is available in the process.
+    Write a typed LicenceIntegrityViolationEvent if an AuditLogWriter is available.
 
     Wrapped in a broad except so that a missing / uninitialised audit subsystem
-    never blocks the integrity check result.
+    never blocks the integrity check result.  The CRITICAL log is the primary alert;
+    audit is defence-in-depth.
     """
     try:
-        from yashigani.audit.schema import AuditEvent
-
-        # Access the audit writer from backoffice state if available.
-        # At module load time, backoffice may not be initialised yet —
-        # the CRITICAL log is the primary alert, audit is defence-in-depth.
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
         try:
             from yashigani.backoffice.state import backoffice_state
-            writer = backoffice_state.audit_writer
+            writer = getattr(backoffice_state, "audit_writer", None)
         except Exception:
             writer = None
 
         if writer is None:
             return
 
-        event = AuditEvent(
-            event_type="LICENSE_INTEGRITY_VIOLATION",
-            account_tier="system",
-            masking_applied=False,
+        event = LicenceIntegrityViolationEvent(
+            module=module,
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
         )
-        writer.write(
-            event,
-            component=f"licensing.integrity expected={_integrity.VERIFIER_HASH[:16]} actual={actual_hash[:16]}",
-        )
+        event._internal_classification = classification
+        writer.write(event)
     except Exception:
         pass  # audit subsystem unavailable — integrity violation already logged via CRITICAL
 
 
+# ---------------------------------------------------------------------------
+# T6: KDF-derived integrity token
+# ---------------------------------------------------------------------------
+
+def _derive_integrity_token(hash_bundle_str: str, licence_id: str, seat_policy: str) -> bytes:
+    """
+    Derive a 32-byte integrity token using HKDF-SHA-256.
+
+    IKM  = SHA-256(hash_bundle_str.encode("utf-8"))
+    salt = SHA-256(licence_id.encode("utf-8") + seat_policy.encode("utf-8"))
+    info = b"yashigani-integrity-v1"
+    L    = 32
+
+    DG-01: inputs are ONLY (hash_bundle_str, licence_id, seat_policy) — no CA fingerprint.
+    DG-03: Community seat_policy is "20,5,2".
+    """
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.hashes import SHA256 as CryptoSHA256
+    from cryptography.hazmat.backends import default_backend
+
+    ikm = hashlib.sha256(hash_bundle_str.encode("utf-8")).digest()
+    salt = hashlib.sha256(
+        licence_id.encode("utf-8") + seat_policy.encode("utf-8")
+    ).digest()
+    hkdf = HKDF(
+        algorithm=CryptoSHA256(),
+        length=32,
+        salt=salt,
+        info=b"yashigani-integrity-v1",
+        backend=default_backend(),
+    )
+    return hkdf.derive(ikm)
+
+
+def _check_hash_bundle_attestation() -> None:
+    """
+    T6: Verify HASH_BUNDLE_SIG is a valid ECDSA P-256 signature over the canonical
+    hash-bundle string.  Sets _integrity_violated on failure.
+
+    Placeholder behaviour:
+      - If is_any_hash_placeholder() → skip (dev) / fail-closed (prod).
+      - If is_bundle_sig_placeholder() → skip (dev) / fail-closed (prod).
+    """
+    global _integrity_violated
+
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if _integrity.is_any_hash_placeholder():
+        if is_dev:
+            return  # dev: skip
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: one or more file hashes are still placeholders "
+            "in a non-dev environment — hash bundle attestation cannot proceed; "
+            "forcing COMMUNITY tier (T6)"
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="bundle_sig",
+            expected_hash="<real_hash>",
+            actual_hash="<placeholder>",
+        )
+        return
+
+    if _integrity.is_bundle_sig_placeholder():
+        if is_dev:
+            return  # dev: skip
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: HASH_BUNDLE_SIG is still a placeholder "
+            "in a non-dev environment — build pipeline did not embed bundle signature; "
+            "forcing COMMUNITY tier (T6)"
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="bundle_sig",
+            expected_hash="<sig>",
+            actual_hash="<placeholder>",
+        )
+        return
+
+    # Build canonical bundle string (sorted by key name)
+    bundle_str = "\n".join([
+        f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
+        f"ENFORCER_HASH={_integrity.ENFORCER_HASH}",
+        f"IDENTITY_REGISTRY_HASH={_integrity.IDENTITY_REGISTRY_HASH}",
+        f"INTEGRITY_HASH={_integrity.INTEGRITY_HASH}",
+        f"LOADER_HASH={_integrity.LOADER_HASH}",
+        f"VERIFIER_HASH={_integrity.VERIFIER_HASH}",
+    ])
+
+    try:
+        import base64 as _b64
+        sig_bytes = _b64.b64decode(_integrity.HASH_BUNDLE_SIG + "==")
+    except Exception:
+        try:
+            sig_bytes = bytes.fromhex(_integrity.HASH_BUNDLE_SIG)
+        except Exception:
+            _integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: HASH_BUNDLE_SIG is not valid base64 or hex — "
+                "forcing COMMUNITY tier (T6)"
+            )
+            _emit_licence_integrity_violation_event(
+                module="verifier",
+                check_type="bundle_sig",
+                expected_hash="<valid_sig>",
+                actual_hash="<unparseable>",
+            )
+            return
+
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey
+        from cryptography.hazmat.primitives.hashes import SHA256 as CryptoSHA256
+        from cryptography.exceptions import InvalidSignature
+
+        if _integrity.is_counter_key_placeholder():
+            if is_dev:
+                return
+            _integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: cannot verify bundle signature — "
+                "COUNTER_PUBLIC_KEY_PEM is placeholder in non-dev environment (T6)"
+            )
+            _emit_licence_integrity_violation_event(
+                module="verifier",
+                check_type="bundle_sig",
+                expected_hash="<key>",
+                actual_hash="<placeholder>",
+            )
+            return
+
+        pub_key = load_pem_public_key(_integrity.COUNTER_PUBLIC_KEY_PEM.encode("utf-8"))
+        if not isinstance(pub_key, EllipticCurvePublicKey):
+            raise ValueError(f"Not an EC key: {type(pub_key).__name__}")
+
+        bundle_digest = hashlib.sha256(bundle_str.encode("utf-8")).digest()
+        pub_key.verify(sig_bytes, bundle_digest, ECDSA(CryptoSHA256()))
+        # Signature valid — no action
+
+    except InvalidSignature:
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: hash bundle signature verification failed — "
+            "binary may have been tampered with; forcing COMMUNITY tier (T6). "
+            "License integrity check failed — system restrained to Community limits. "
+            "Contact support@agnosticsec.com or re-activate."
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="bundle_sig",
+            expected_hash=_integrity.HASH_BUNDLE_SIG[:16],
+            actual_hash="<invalid>",
+        )
+    except Exception as exc:
+        logger.warning("License integrity: bundle attestation check failed unexpectedly: %s", exc)
+        if not is_dev:
+            _integrity_violated = True
+
+
+def _check_kdf_token() -> None:
+    """
+    T7: Verify EXPECTED_TOKEN_HMAC matches SHA-256(token || b"yashigani-kdf-gate-v1")
+    where token = _derive_integrity_token(bundle_str, "", "20,5,2").
+
+    Placeholder behaviour: skip (dev) / fail-closed (prod).
+    """
+    global _integrity_violated
+
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if _integrity.is_kdf_token_placeholder():
+        if is_dev:
+            return
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: EXPECTED_TOKEN_HMAC is still a placeholder "
+            "in a non-dev environment; forcing COMMUNITY tier (T7)"
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="kdf_token",
+            expected_hash="<hmac>",
+            actual_hash="<placeholder>",
+        )
+        return
+
+    if _integrity.is_any_hash_placeholder():
+        if is_dev:
+            return
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: KDF token check skipped — hash placeholders "
+            "in non-dev; forcing COMMUNITY tier (T7)"
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="kdf_token",
+            expected_hash="<token>",
+            actual_hash="<placeholder>",
+        )
+        return
+
+    try:
+        bundle_str = "\n".join([
+            f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
+            f"ENFORCER_HASH={_integrity.ENFORCER_HASH}",
+            f"IDENTITY_REGISTRY_HASH={_integrity.IDENTITY_REGISTRY_HASH}",
+            f"INTEGRITY_HASH={_integrity.INTEGRITY_HASH}",
+            f"LOADER_HASH={_integrity.LOADER_HASH}",
+            f"VERIFIER_HASH={_integrity.VERIFIER_HASH}",
+        ])
+        # DG-01 + DG-03: Community KDF uses licence_id="" and seat_policy="20,5,2"
+        token = _derive_integrity_token(bundle_str, "", "20,5,2")
+        actual_hmac = hashlib.sha256(token + b"yashigani-kdf-gate-v1").hexdigest()
+
+        expected = _integrity.EXPECTED_TOKEN_HMAC.strip()
+        if actual_hmac != expected:
+            _integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: KDF token mismatch — "
+                "expected=%s actual=%s; forcing COMMUNITY tier (T7). "
+                "License integrity check failed — system restrained to Community limits. "
+                "Contact support@agnosticsec.com or re-activate.",
+                expected[:16],
+                actual_hmac[:16],
+            )
+            _emit_licence_integrity_violation_event(
+                module="verifier",
+                check_type="kdf_token",
+                expected_hash=expected[:16],
+                actual_hash=actual_hmac[:16],
+            )
+    except Exception as exc:
+        logger.warning("License integrity: KDF token check failed unexpectedly: %s", exc)
+        if not is_dev:
+            _integrity_violated = True
+
+
+def get_integrity_status() -> bool:
+    """Return True if the integrity has been violated in this process."""
+    return _integrity_violated
+
+
 # Run at module load.
 _check_self_integrity()
+_check_hash_bundle_attestation()
+_check_kdf_token()
 
 
 # ---------------------------------------------------------------------------
