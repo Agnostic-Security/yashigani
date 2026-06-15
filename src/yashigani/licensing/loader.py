@@ -11,6 +11,7 @@ Last updated: 2026-05-05T00:00:00+01:00
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -19,6 +20,85 @@ from yashigani.licensing.model import COMMUNITY_LICENSE, LicenseState
 from yashigani.licensing.verifier import verify_license
 
 logger = logging.getLogger(__name__)
+
+# Module-level integrity state (T2)
+_loader_integrity_violated = False
+
+
+def _emit_licence_integrity_violation_event(
+    module: str,
+    check_type: str,
+    expected_hash: str,
+    actual_hash: str,
+    classification: str = "unknown",
+) -> None:
+    """Emit a typed LicenceIntegrityViolationEvent (defence-in-depth)."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            from yashigani.backoffice.state import backoffice_state
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        event = LicenceIntegrityViolationEvent(
+            module=module,
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        )
+        event._internal_classification = classification
+        writer.write(event)
+    except Exception:
+        pass
+
+
+def _check_loader_integrity() -> None:
+    """
+    T2: Self-check loader.py SHA-256 against _integrity.LOADER_HASH.
+    Sets _loader_integrity_violated = True on mismatch.
+    Called at module load (DG-04).
+    """
+    global _loader_integrity_violated
+    from yashigani.licensing import _integrity
+
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if _integrity.is_loader_hash_placeholder():
+        if not is_dev:
+            _loader_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: LOADER_HASH is still a placeholder "
+                "in a non-dev environment; forcing COMMUNITY tier (T2)"
+            )
+        return
+
+    try:
+        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception as exc:
+        logger.warning("License integrity: could not read loader.py for hash check: %s", exc)
+        return
+
+    if digest != _integrity.LOADER_HASH:
+        _loader_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: loader.py has been tampered with "
+            "(expected=%s, actual=%s); forcing COMMUNITY tier (T2)",
+            _integrity.LOADER_HASH[:16],
+            digest[:16],
+        )
+        _emit_licence_integrity_violation_event(
+            module="loader",
+            check_type="self_hash",
+            expected_hash=_integrity.LOADER_HASH,
+            actual_hash=digest,
+        )
+
+
+def get_loader_integrity_status() -> bool:
+    """Return True if the loader integrity has been violated."""
+    return _loader_integrity_violated
 
 
 def _normalise_domain(d: str) -> str:
@@ -136,3 +216,7 @@ def load_license() -> LicenseState:
 
     # No license file found anywhere — silently use community
     return COMMUNITY_LICENSE
+
+
+# Run integrity check at module load (T2 / DG-04)
+_check_loader_integrity()
