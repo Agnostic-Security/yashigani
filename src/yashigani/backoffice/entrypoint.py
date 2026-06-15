@@ -564,6 +564,17 @@ def _bootstrap():
     from yashigani.licensing import load_license, set_license
     license_state = load_license()
     set_license(license_state)
+    import os as _os_lic
+    if _os_lic.environ.get("YASHIGANI_ENV") == "dev":
+        from yashigani.licensing.enforcer import get_license as _get_lic
+        from yashigani.licensing.model import LicenseTier as _LicTier, COMMUNITY_LICENSE as _COMM_LIC
+        _lic = _get_lic()
+        if _lic.tier != _LicTier.COMMUNITY:
+            logger.critical(
+                "YASHIGANI_ENV=dev set with a non-Community licence — "
+                "forcing COMMUNITY (LAURA-P7-FIX)"
+            )
+            set_license(_COMM_LIC)
     logger.info(
         "License: tier=%s agents=%s/%s expires=%s",
         license_state.tier.value,
