@@ -191,15 +191,30 @@ def get_license() -> LicenseState:
         from yashigani.agents.registry import get_agents_registry_integrity_status as _a_status
         if _a_status():
             return COMMUNITY_LICENSE
-    except Exception:
-        pass
+    except Exception as _exc_agents:
+        # IMPL-03: import failure of an integrity module is treated as a
+        # violation — an attacker who can cause the import to fail while
+        # having patched agents/registry.py would otherwise bypass this check.
+        # Log critical and fail to Community rather than silently pass.
+        logger.critical(
+            "License gate: failed to import agents.registry integrity check — "
+            "treating as integrity violation and restraining to Community (IMPL-03): %s",
+            _exc_agents,
+        )
+        return COMMUNITY_LICENSE
 
     try:
         from yashigani.identity.registry import get_identity_registry_integrity_status as _id_status
         if _id_status():
             return COMMUNITY_LICENSE
-    except Exception:
-        pass
+    except Exception as _exc_identity:
+        # IMPL-03: same treatment as agents.registry — import failure → Community.
+        logger.critical(
+            "License gate: failed to import identity.registry integrity check — "
+            "treating as integrity violation and restraining to Community (IMPL-03): %s",
+            _exc_identity,
+        )
+        return COMMUNITY_LICENSE
 
     return _license
 

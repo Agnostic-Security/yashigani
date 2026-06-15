@@ -371,5 +371,145 @@ class TestLicenceStateSetEventStructure(unittest.TestCase):
         self.assertEqual(d["caller_module"], "loader")
 
 
+# ---------------------------------------------------------------------------
+# Test 13: agents/registry integrity flag → COMMUNITY_LICENSE (T3)
+# ---------------------------------------------------------------------------
+
+class TestAgentsRegistryIntegrityViolation(unittest.TestCase):
+    def test_restrain_to_community_on_agents_registry_integrity_violation(self):
+        """T3/T5: agents/registry._agents_registry_integrity_violated=True → COMMUNITY_LICENSE."""
+        import yashigani.licensing.enforcer as enforcer
+        import yashigani.agents.registry as agents_registry
+        from yashigani.licensing.model import LicenseTier, LicenseState
+        from datetime import datetime, timezone
+
+        non_community = LicenseState(
+            tier=LicenseTier.STARTER,
+            org_domain="test.com",
+            max_agents=10,
+            max_end_users=100,
+            max_admin_seats=5,
+            max_orgs=1,
+            features=frozenset(),
+            issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            expires_at=None,
+            license_id="test-t3",
+            valid=True,
+            error=None,
+        )
+        original_license = enforcer._license
+        original_violated = agents_registry._agents_registry_integrity_violated
+        try:
+            enforcer._license = non_community
+            agents_registry._agents_registry_integrity_violated = True
+            result = enforcer.get_license()
+            self.assertEqual(result.tier, LicenseTier.COMMUNITY)
+        finally:
+            enforcer._license = original_license
+            agents_registry._agents_registry_integrity_violated = original_violated
+
+    def test_agents_registry_hash_mismatch_sets_flag(self):
+        """T3: _check_agents_registry_integrity() with wrong hash sets violated flag."""
+        import yashigani.agents.registry as agents_registry
+        import yashigani.licensing._integrity as _integrity
+
+        original_violated = agents_registry._agents_registry_integrity_violated
+        orig_hash = _integrity.AGENTS_REGISTRY_HASH
+        try:
+            agents_registry._agents_registry_integrity_violated = False
+            # Set a non-placeholder hash that won't match the file digest
+            _integrity.AGENTS_REGISTRY_HASH = "a" * 64
+            with patch.dict("os.environ", {"YASHIGANI_ENV": "production"}):
+                agents_registry._check_agents_registry_integrity()
+            self.assertTrue(agents_registry._agents_registry_integrity_violated)
+        finally:
+            agents_registry._agents_registry_integrity_violated = original_violated
+            _integrity.AGENTS_REGISTRY_HASH = orig_hash
+
+
+# ---------------------------------------------------------------------------
+# Test 14: identity/registry integrity flag → COMMUNITY_LICENSE (T4)
+# ---------------------------------------------------------------------------
+
+class TestIdentityRegistryIntegrityViolation(unittest.TestCase):
+    def test_restrain_to_community_on_identity_registry_integrity_violation(self):
+        """T4/T5: identity/registry._identity_registry_integrity_violated=True → COMMUNITY_LICENSE."""
+        import yashigani.licensing.enforcer as enforcer
+        import yashigani.identity.registry as identity_registry
+        from yashigani.licensing.model import LicenseTier, LicenseState
+        from datetime import datetime, timezone
+
+        non_community = LicenseState(
+            tier=LicenseTier.STARTER,
+            org_domain="test.com",
+            max_agents=10,
+            max_end_users=100,
+            max_admin_seats=5,
+            max_orgs=1,
+            features=frozenset(),
+            issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            expires_at=None,
+            license_id="test-t4",
+            valid=True,
+            error=None,
+        )
+        original_license = enforcer._license
+        original_violated = identity_registry._identity_registry_integrity_violated
+        try:
+            enforcer._license = non_community
+            identity_registry._identity_registry_integrity_violated = True
+            result = enforcer.get_license()
+            self.assertEqual(result.tier, LicenseTier.COMMUNITY)
+        finally:
+            enforcer._license = original_license
+            identity_registry._identity_registry_integrity_violated = original_violated
+
+    def test_identity_registry_hash_mismatch_sets_flag(self):
+        """T4: _check_identity_registry_integrity() with wrong hash sets violated flag."""
+        import yashigani.identity.registry as identity_registry
+        import yashigani.licensing._integrity as _integrity
+
+        original_violated = identity_registry._identity_registry_integrity_violated
+        orig_hash = _integrity.IDENTITY_REGISTRY_HASH
+        try:
+            identity_registry._identity_registry_integrity_violated = False
+            # Set a non-placeholder hash that won't match the file digest
+            _integrity.IDENTITY_REGISTRY_HASH = "b" * 64
+            with patch.dict("os.environ", {"YASHIGANI_ENV": "production"}):
+                identity_registry._check_identity_registry_integrity()
+            self.assertTrue(identity_registry._identity_registry_integrity_violated)
+        finally:
+            identity_registry._identity_registry_integrity_violated = original_violated
+            _integrity.IDENTITY_REGISTRY_HASH = orig_hash
+
+
+# ---------------------------------------------------------------------------
+# Test 15: IMPL-01 — no runtime YASHIGANI_ENV=dev bypass in _verify_counter_signature
+# ---------------------------------------------------------------------------
+
+class TestNoDevBypassInCounterSigVerification(unittest.TestCase):
+    def test_counter_sig_placeholder_with_dev_env_returns_false(self):
+        """IMPL-01: YASHIGANI_ENV=dev must NOT make _verify_counter_signature return True on placeholder key."""
+        import yashigani.licensing.verifier as verifier
+        import yashigani.licensing._integrity as _integrity
+
+        orig_key = _integrity.COUNTER_PUBLIC_KEY_PEM
+        try:
+            # Ensure placeholder key
+            _integrity.COUNTER_PUBLIC_KEY_PEM = (
+                "PLACEHOLDER_YASHIGANI_INTEGRITY_COUNTER_KEY"
+            )
+            with patch.dict("os.environ", {"YASHIGANI_ENV": "dev"}):
+                result = verifier._verify_counter_signature(
+                    payload_bytes=b"test-payload",
+                    primary_public_key_pem=verifier._PUBLIC_KEY_PEM,
+                    counter_sig_bytes=b"\x00" * 64,
+                )
+            # Must NOT return True — IMPL-01 closed the dev-bypass
+            self.assertFalse(result)
+        finally:
+            _integrity.COUNTER_PUBLIC_KEY_PEM = orig_key
+
+
 if __name__ == "__main__":
     unittest.main()
