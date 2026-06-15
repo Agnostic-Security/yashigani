@@ -90,6 +90,20 @@ IDENTITY_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_IDENTITY_REGISTRY_HASH"
 # ---------------------------------------------------------------------------
 COUNTER_PUBLIC_KEY_PEM: str = _PLACEHOLDER_INTEGRITY + "_COUNTER_KEY"
 
+# ---------------------------------------------------------------------------
+# HASH_BUNDLE_SIG
+# Replace with the ECDSA P-256 signature over SHA-256 of the canonical hash-bundle string.
+# Produced by: python scripts/sign_bundle.py --key keys/yashigani_counter_private.pem
+# ---------------------------------------------------------------------------
+HASH_BUNDLE_SIG: str = _PLACEHOLDER_INTEGRITY + "_HASH_BUNDLE_SIG"
+
+# ---------------------------------------------------------------------------
+# EXPECTED_TOKEN_HMAC
+# Replace with: SHA-256(derive_integrity_token(bundle_str, "", "20,5,2") || b"yashigani-kdf-gate-v1")
+# Produced by: python scripts/compute_kdf_token.py
+# ---------------------------------------------------------------------------
+EXPECTED_TOKEN_HMAC: str = _PLACEHOLDER_INTEGRITY + "_EXPECTED_TOKEN_HMAC"
+
 
 def is_verifier_hash_placeholder() -> bool:
     """Return True when VERIFIER_HASH has not been set at build time."""
@@ -115,3 +129,33 @@ def is_any_hash_placeholder() -> bool:
         or _PLACEHOLDER_INTEGRITY in AGENTS_REGISTRY_HASH
         or _PLACEHOLDER_INTEGRITY in IDENTITY_REGISTRY_HASH
     )
+
+
+def is_bundle_sig_placeholder() -> bool:
+    """Return True when HASH_BUNDLE_SIG has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in HASH_BUNDLE_SIG
+
+
+def is_kdf_token_placeholder() -> bool:
+    """Return True when EXPECTED_TOKEN_HMAC has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in EXPECTED_TOKEN_HMAC
+
+
+def is_enforcer_hash_placeholder() -> bool:
+    """Return True when ENFORCER_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in ENFORCER_HASH
+
+
+def is_loader_hash_placeholder() -> bool:
+    """Return True when LOADER_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in LOADER_HASH
+
+
+def is_agents_registry_hash_placeholder() -> bool:
+    """Return True when AGENTS_REGISTRY_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in AGENTS_REGISTRY_HASH
+
+
+def is_identity_registry_hash_placeholder() -> bool:
+    """Return True when IDENTITY_REGISTRY_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in IDENTITY_REGISTRY_HASH
