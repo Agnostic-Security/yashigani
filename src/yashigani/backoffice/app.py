@@ -646,6 +646,18 @@ async def lifespan(app: FastAPI):
                 max_instances=1,
             )
 
+        # Auth user count Redis sync (licence-hardening T13) — every 60s
+        try:
+            from yashigani.licensing.enforcer import _sync_auth_user_count
+            scheduler.add_job(
+                _sync_auth_user_count,
+                trigger="interval",
+                seconds=60,
+                id="licence_auth_user_count_sync",
+                replace_existing=True,
+            )
+        except ImportError:
+            pass
         scheduler.start()
         # Fire all immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
