@@ -158,10 +158,11 @@ def check_gateway_access(
         from yashigani.licensing.enforcer import get_license
         lic = get_license()
     except Exception as exc:
-        # If the licensing module is unavailable, fail-open (don't block legitimate
-        # traffic due to import errors).  Log a warning; this is defence-in-depth.
-        logger.warning("grace_period.check_gateway_access: could not read licence: %s", exc)
-        return
+        logger.critical(
+            "grace_period.check_gateway_access: licence read failed — "
+            "blocking request fail-safe (LAURA-P6-FIX): %s", exc
+        )
+        raise GatewayBlockedError()
 
     if now is None:
         now = datetime.now(timezone.utc)
