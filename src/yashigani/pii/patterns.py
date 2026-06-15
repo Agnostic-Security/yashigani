@@ -106,8 +106,15 @@ PASSPORT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b[A-Z]\d{8}\b"),
     # UK: 2 letters + 7 digits
     re.compile(r"\b[A-Z]{2}\d{7}\b"),
-    # EU (DE, FR, NL, etc.): 1–2 letters + 6–9 alphanumeric, wide form
-    re.compile(r"\b[A-Z]{1,2}[0-9A-Z]{6,9}\b"),
+    # EU (DE, FR, NL, etc.): 1–2 letters + 6–9 alphanumeric, wide form.
+    # PII-PASSPORT-FP-001: the original `[A-Z]{1,2}[0-9A-Z]{6,9}` matched every
+    # uppercase English word of 7–11 chars (CUSTOMER, CLINICAL, PARTICIPANT, etc.).
+    # Document-enforcement records these as PII "originals"; the residual check then
+    # fails CLOSED on every document that contains uppercase words.
+    # Fix: require at least one digit anywhere in the token via a lookahead
+    # `(?=[A-Z0-9]*[0-9])`. Real passport numbers always contain digits;
+    # all-alpha words (plain English) do not.
+    re.compile(r"\b(?=[A-Z0-9]*[0-9])[A-Z]{1,2}[0-9A-Z]{6,9}\b"),
     # Canadian: 2 letters + 6 digits
     re.compile(r"\b[A-Z]{2}\d{6}\b"),
 ]
