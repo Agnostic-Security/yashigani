@@ -343,6 +343,12 @@ OPTIONS
                                             ./scripts/prepare-airgap-bundle.sh --profile core
   --bundle         PATH                   Path to the .tar.zst bundle produced by
                                           prepare-airgap-bundle.sh. Required with --air-gap.
+  --gpu-index      N                      On multi-GPU hosts: index (0-based) of the NVIDIA
+                                          GPU to use for Ollama inference. Without this flag
+                                          the installer auto-selects the card with the most
+                                          VRAM and prompts interactively when multiple cards
+                                          are present. Equivalent to setting YSG_GPU_INDEX.
+                                          Example: --gpu-index 1 (selects the second card).
   --non-interactive                       Skip all interactive prompts
   --runtime <docker|podman|k8s>          Lock the container runtime (admin-must-choose
                                           rule per feedback_runtime_choice.md;
@@ -609,6 +615,16 @@ parse_args() {
       --dry-run)         DRY_RUN=true;           shift ;;
       --agent-bundles)
         AGENT_BUNDLES="${2:?'--agent-bundles requires a value, e.g. langflow,letta'}"
+        shift 2
+        ;;
+      --gpu-index)
+        _raw_gpu_index="${2:?'--gpu-index requires a non-negative integer'}"
+        if ! [[ "$_raw_gpu_index" =~ ^[0-9]+$ ]]; then
+          log_error "--gpu-index must be a non-negative integer (0-based GPU index), got: ${_raw_gpu_index}"
+          exit 1
+        fi
+        YSG_GPU_INDEX="$_raw_gpu_index"
+        export YSG_GPU_INDEX
         shift 2
         ;;
       --pki-action)
@@ -1674,6 +1690,12 @@ print_platform_summary() {
   # or pre-existing env var).
   prompt_runtime_choice
 
+  # --- Multi-GPU selection (NVIDIA only; no-op for single-GPU / non-NVIDIA) ---
+  # Picks the largest-VRAM card as default, shows an interactive choice when
+  # more than one card is present, honours --gpu-index / YSG_GPU_INDEX.
+  # Updates YSG_GPU_NAME / YSG_GPU_VRAM_MB / YSG_GPU_CDI before the summary.
+  _select_nvidia_gpu
+
   printf "\n"
   printf "  %-22s %s\n" "OS:"           "${YSG_OS:-unknown} (${YSG_DISTRO:-unknown})"
   printf "  %-22s %s\n" "Architecture:" "${YSG_ARCH:-unknown}"
@@ -1685,9 +1707,12 @@ print_platform_summary() {
     printf "  %-22s %s\n" "Namespace:"  "$NAMESPACE"
   fi
   if [[ "${YSG_GPU_TYPE:-none}" != "none" ]]; then
-    printf "  %-22s %s\n" "GPU:"        "${YSG_GPU_NAME:-detected}"
+    local _gpu_label="${YSG_GPU_NAME:-detected}"
+    [[ -n "${YSG_GPU_INDEX:-}" ]] && _gpu_label="[${YSG_GPU_INDEX}] ${_gpu_label}"
+    printf "  %-22s %s\n" "GPU:"        "$_gpu_label"
     printf "  %-22s %s\n" "GPU memory:" "$(_format_gpu_vram)"
     printf "  %-22s %s\n" "GPU compute:" "${YSG_GPU_COMPUTE:-unknown}"
+    [[ -n "${YSG_GPU_CDI:-}" ]] && printf "  %-22s %s\n" "GPU device (CDI):" "${YSG_GPU_CDI}"
   else
     printf "  %-22s %s\n" "GPU:"        "none detected"
   fi
@@ -1715,7 +1740,7 @@ print_platform_summary() {
   printf "  Optional services (deploy-time choice):\n"
   printf "    [%s] %-12s %s\n" "$_ow" "Open WebUI"  "browser chat UI for end users"
   printf "    [%s] %-12s %s\n" "$_wz" "Wazuh SIEM"  "security monitoring — SIEM (manager+indexer+dashboard)"
-  printf "    [%s] %-12s %s\n" "$_ca" "Internal CA" "Smallstep CA for service-to-service mTLS"
+  printf "    [%s] %-12s %s\n" "$_ca" "BYO CA"      "Bring-your-own intermediate CA (default: built-in mesh CA)"
   printf "    [%s] %-12s %s\n" "$_lf" "Langflow"    "visual multi-agent workflow builder"
   printf "    [%s] %-12s %s\n" "$_le" "Letta"       "stateful agent with persistent memory"
   printf "    [%s] %-12s %s\n" "$_oc" "OpenClaw"    "connected agent (web search + messaging)"
@@ -1750,6 +1775,133 @@ _print_model_recommendations() {
     printf "    - qwen2.5:3b (inspection only), CPU inference for others\n"
   fi
   printf "\n"
+}
+
+# =============================================================================
+# Multi-GPU selection — pick largest VRAM as default; let operator choose
+# =============================================================================
+# Called from print_platform_summary after platform-detect sets YSG_GPU_TYPE.
+# Only runs when nvidia-smi reports >= 2 GPUs.
+# Sets YSG_GPU_INDEX (0-based), YSG_GPU_NAME, YSG_GPU_VRAM_MB, and YSG_GPU_CDI
+# so downstream compose overlays wire the right card into ollama.
+_select_nvidia_gpu() {
+  # Require nvidia-smi and at least two GPUs; single-GPU or non-NVIDIA: no-op.
+  if [[ "${YSG_GPU_TYPE:-none}" != "nvidia" ]]; then return 0; fi
+  if ! command -v nvidia-smi >/dev/null 2>&1; then return 0; fi
+
+  # Enumerate: "index,name,vram_mb" per line (noheader, nounits → bare integers for VRAM)
+  local smi_out
+  smi_out="$(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits 2>/dev/null)" || return 0
+
+  local gpu_count
+  gpu_count="$(echo "$smi_out" | grep -c .)" || gpu_count=0
+  if [[ "$gpu_count" -lt 2 ]]; then
+    # Single GPU — set CDI to pin it explicitly (index 0) rather than "all"
+    local _idx _name _vram
+    IFS=',' read -r _idx _name _vram <<< "$(echo "$smi_out" | head -1)"
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    YSG_GPU_INDEX="${YSG_GPU_INDEX:-${_idx}}"
+    YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
+    export YSG_GPU_INDEX YSG_GPU_CDI
+    return 0
+  fi
+
+  # Multiple GPUs present — find the one with the most VRAM as the default.
+  local best_idx=0 best_name="" best_vram=0
+  while IFS=',' read -r _idx _name _vram; do
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    if [[ "${_vram:-0}" -gt "$best_vram" ]]; then
+      best_idx="$_idx"; best_name="$_name"; best_vram="${_vram:-0}"
+    fi
+  done <<< "$smi_out"
+
+  # If --gpu-index was passed (YSG_GPU_INDEX already set), validate it.
+  if [[ -n "${YSG_GPU_INDEX:-}" ]]; then
+    local _chosen_name _chosen_vram _found=false
+    while IFS=',' read -r _idx _name _vram; do
+      _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+      if [[ "$_idx" == "$YSG_GPU_INDEX" ]]; then
+        _chosen_name="$_name"; _chosen_vram="${_vram:-0}"; _found=true
+      fi
+    done <<< "$smi_out"
+    if [[ "$_found" != "true" ]]; then
+      log_error "--gpu-index ${YSG_GPU_INDEX} is out of range (detected ${gpu_count} GPUs, indices 0-$((gpu_count-1)))"
+      exit 1
+    fi
+    YSG_GPU_NAME="$_chosen_name"
+    YSG_GPU_VRAM_MB="$_chosen_vram"
+    YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
+    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI
+    log_info "GPU pinned via --gpu-index: [${YSG_GPU_INDEX}] ${YSG_GPU_NAME} ($(_format_gpu_vram))"
+    return 0
+  fi
+
+  # Interactive: show detected GPUs and let the operator choose.
+  printf "\n"
+  printf "  ${C_BOLD}Multiple NVIDIA GPUs detected — select the one for Ollama inference:${C_RESET}\n"
+  printf "\n"
+  while IFS=',' read -r _idx _name _vram; do
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    local _vram_display
+    if [[ "${_vram:-0}" -ge 1024 ]]; then
+      _vram_display="$(awk "BEGIN { printf \"%.1f GB\", ${_vram}/1024 }")"
+    else
+      _vram_display="${_vram} MB"
+    fi
+    local _default_tag=""
+    [[ "$_idx" == "$best_idx" ]] && _default_tag=" ${C_GREEN}← most VRAM (default)${C_RESET}"
+    printf "    %s) %-36s %s%b\n" "$_idx" "$_name" "$_vram_display" "$_default_tag"
+  done <<< "$smi_out"
+  printf "\n"
+
+  local chosen_idx
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # Non-interactive without --gpu-index: auto-select largest VRAM, no prompt.
+    chosen_idx="$best_idx"
+    log_info "Non-interactive: auto-selected GPU ${chosen_idx} (${best_name}, $(_format_gpu_vram_mb "$best_vram")) — largest VRAM"
+  else
+    printf "  Choice [%s]: " "$best_idx"
+    read -r chosen_idx </dev/tty 2>/dev/null || chosen_idx=""
+    chosen_idx="${chosen_idx:-$best_idx}"
+    chosen_idx="${chosen_idx// /}"
+    # Validate
+    local _valid=false
+    while IFS=',' read -r _idx _ _; do
+      _idx="${_idx// /}"
+      [[ "$_idx" == "$chosen_idx" ]] && _valid=true
+    done <<< "$smi_out"
+    if [[ "$_valid" != "true" ]]; then
+      log_warn "Invalid choice '${chosen_idx}' — defaulting to GPU ${best_idx} (largest VRAM)"
+      chosen_idx="$best_idx"
+    fi
+  fi
+
+  # Apply the chosen GPU
+  local _chosen_name="" _chosen_vram=0
+  while IFS=',' read -r _idx _name _vram; do
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    if [[ "$_idx" == "$chosen_idx" ]]; then
+      _chosen_name="$_name"; _chosen_vram="${_vram:-0}"
+    fi
+  done <<< "$smi_out"
+
+  YSG_GPU_INDEX="$chosen_idx"
+  YSG_GPU_NAME="$_chosen_name"
+  YSG_GPU_VRAM_MB="$_chosen_vram"
+  YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
+  export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI
+  log_success "GPU selected: [${YSG_GPU_INDEX}] ${YSG_GPU_NAME} ($(_format_gpu_vram))"
+  printf "\n"
+}
+
+# Helper: format an arbitrary VRAM-MB value (not the global YSG_GPU_VRAM_MB)
+_format_gpu_vram_mb() {
+  local vram_mb="${1:-0}"
+  if [ "$vram_mb" -ge 1024 ]; then
+    printf "%.1f GB" "$(awk "BEGIN { printf \"%.1f\", ${vram_mb}/1024 }")"
+  else
+    printf "%d MB" "$vram_mb"
+  fi
 }
 
 # =============================================================================
@@ -4644,6 +4796,7 @@ select_agent_bundles() {
   printf "\n"
   printf "${C_YELLOW}╔═══════════════════════════════════════════════════════════╗${C_RESET}\n"
   printf "${C_YELLOW}║  THIRD-PARTY AGENT BUNDLES — COURTESY INTEGRATIONS        ║${C_RESET}\n"
+  printf "${C_YELLOW}║  Integrations: OpenWebUI, Wazuh, Langflow, Letta, OpenClaw║${C_RESET}\n"
   printf "${C_YELLOW}╠═══════════════════════════════════════════════════════════╣${C_RESET}\n"
   printf "${C_YELLOW}║  The following agents are provided AS IS by               ║${C_RESET}\n"
   printf "${C_YELLOW}║  Agnostic Security as a convenience.                      ║${C_RESET}\n"
