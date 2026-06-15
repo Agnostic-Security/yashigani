@@ -669,18 +669,17 @@ def _verify_counter_signature(
     counter-signing key.
     """
     if _integrity.is_counter_key_placeholder():
-        # #103 (LICENSE-2024-001 / CVSS 9.1) — placeholder skip is only
-        # permitted in dev/CI builds (YASHIGANI_ENV=dev).  In any other
-        # environment a placeholder counter key means the build pipeline
-        # failed to embed the real key; fail-closed so that unsigned prod
-        # images cannot pass v4 counter-signature verification.
-        if os.environ.get("YASHIGANI_ENV") == "dev":
-            return True  # dev mode: skip counter-sig check
-        # Non-dev: log critical and fall through to key-load failure path.
+        # #103 (LICENSE-2024-001 / CVSS 9.1) — placeholder skip is NOT
+        # permitted here regardless of YASHIGANI_ENV.  The dev/placeholder
+        # case is already handled by _check_hash_bundle_attestation() which
+        # skips bundle-sig verification in dev and fails closed in prod.
+        # _verify_counter_signature() must NEVER have its own env-based skip:
+        # a runtime YASHIGANI_ENV=dev override (docker run -e / Helm) must
+        # not bypass counter-sig crypto in a prod image (IMPL-01).
         logger.critical(
             "License verifier: COUNTER_PUBLIC_KEY_PEM is still a placeholder "
-            "in a non-dev environment — build pipeline did not embed counter key; "
-            "failing counter-signature (LICENSE-2024-001)"
+            "— build pipeline did not embed counter key; "
+            "failing counter-signature (LICENSE-2024-001 / IMPL-01)"
         )
         # Fall through — attempt to parse placeholder string as PEM,
         # which will raise an exception and trigger the return-False path.
