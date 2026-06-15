@@ -2147,13 +2147,17 @@ services:
         export PGSSLROOTCERT=/run/secrets/ca_root.crt
         export PGSSLCERT=/run/secrets/backoffice_client.crt
         export PGSSLKEY=/run/secrets/backoffice_client.key
-        # Step 1: create the letta database (idempotent — WHERE NOT EXISTS guard).
-        # Uses the same \gexec trick as init-agent-dbs.sh; -c instead of heredoc
-        # avoids leading-whitespace issues in YAML block scalars.
-        psql -v ON_ERROR_STOP=1 \
-             --host=postgres --port=5432 \
-             --username=yashigani_admin --dbname=postgres \
-             -c "SELECT 'CREATE DATABASE letta OWNER yashigani_app' WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_database WHERE datname = 'letta')\gexec"
+        # Step 1: create the letta database if it does not already exist.
+        # \gexec is a psql metacommand that executes the result of the preceding
+        # SELECT as SQL. It requires input on stdin (not -c). The WHERE NOT EXISTS
+        # guard makes this idempotent: if letta already exists the SELECT returns
+        # 0 rows and \gexec executes nothing. Two echo calls produce:
+        #   line 1: the SELECT that returns the CREATE DATABASE DDL string
+        #   line 2: \gexec — psql metacommand that runs that string
+        { echo "SELECT 'CREATE DATABASE letta OWNER yashigani_app' WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_database WHERE datname = 'letta')"; echo '\gexec'; } \
+          | psql -v ON_ERROR_STOP=1 \
+                 --host=postgres --port=5432 \
+                 --username=yashigani_admin --dbname=postgres
         # Step 2: enable pgvector extension in the letta database (IF NOT EXISTS guard).
         psql -v ON_ERROR_STOP=1 \
              --host=postgres --port=5432 \
