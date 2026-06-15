@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import datetime
 import enum
+import hashlib
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from yashigani.identity.api_key import (
@@ -36,6 +39,81 @@ from yashigani.identity.api_key import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Module-level integrity state (T4)
+_identity_registry_integrity_violated = False
+
+
+def _emit_identity_registry_integrity_violation_event(
+    check_type: str,
+    expected_hash: str,
+    actual_hash: str,
+) -> None:
+    """Emit a typed LicenceIntegrityViolationEvent (defence-in-depth)."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            from yashigani.backoffice.state import backoffice_state
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        event = LicenceIntegrityViolationEvent(
+            module="identity.registry",
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        )
+        writer.write(event)
+    except Exception:
+        pass
+
+
+def _check_identity_registry_integrity() -> None:
+    """
+    T4: Self-check identity/registry.py SHA-256 against _integrity.IDENTITY_REGISTRY_HASH.
+    Sets _identity_registry_integrity_violated = True on mismatch.
+    Called from IdentityRegistry.__init__ (DG-04).
+    """
+    global _identity_registry_integrity_violated
+    from yashigani.licensing import _integrity
+
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if _integrity.is_identity_registry_hash_placeholder():
+        if not is_dev:
+            _identity_registry_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: IDENTITY_REGISTRY_HASH is still a placeholder "
+                "in a non-dev environment; forcing COMMUNITY tier (T4)"
+            )
+        return
+
+    try:
+        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception as exc:
+        logger.warning("License integrity: could not read identity/registry.py for hash check: %s", exc)
+        return
+
+    if digest != _integrity.IDENTITY_REGISTRY_HASH:
+        _identity_registry_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: identity/registry.py has been tampered with "
+            "(expected=%s, actual=%s); forcing COMMUNITY tier (T4)",
+            _integrity.IDENTITY_REGISTRY_HASH[:16],
+            digest[:16],
+        )
+        _emit_identity_registry_integrity_violation_event(
+            check_type="self_hash",
+            expected_hash=_integrity.IDENTITY_REGISTRY_HASH,
+            actual_hash=digest,
+        )
+
+
+def get_identity_registry_integrity_status() -> bool:
+    """Return True if the identity/registry integrity has been violated."""
+    return _identity_registry_integrity_violated
 
 
 class IdentityKind(str, enum.Enum):
@@ -149,6 +227,46 @@ end
 return 1
 """
 
+    # T14: atomic admin-select Lua script — suspends all HUMAN identities not in keep_ids,
+    # reactivates all in keep_ids. Rejects if len(keep_ids) > max_end_users.
+    # KEYS[1] = identity:index:kind:human
+    # KEYS[2] = identity:index:active
+    # ARGV[1] = max_end_users (int, -1 = unlimited)
+    # ARGV[2] = len(keep_ids)
+    # ARGV[3..N] = keep_ids to reactivate/keep active
+    _ADMIN_SELECT_LUA = """
+local max_limit = tonumber(ARGV[1])
+local keep_count = tonumber(ARGV[2])
+if max_limit ~= -1 and keep_count > max_limit then
+    return redis.error_reply("LIMIT_EXCEEDED:" .. keep_count .. ":" .. max_limit)
+end
+local keep_set = {}
+for i = 3, #ARGV do
+    keep_set[ARGV[i]] = true
+end
+local all_human_ids = redis.call("SMEMBERS", KEYS[1])
+local suspended_count = 0
+local reactivated_count = 0
+for _, identity_id in ipairs(all_human_ids) do
+    local reg_key = "identity:reg:" .. identity_id
+    local current_status = redis.call("HGET", reg_key, "status")
+    if keep_set[identity_id] then
+        if current_status ~= "active" then
+            redis.call("HSET", reg_key, "status", "active")
+            redis.call("SADD", KEYS[2], identity_id)
+            reactivated_count = reactivated_count + 1
+        end
+    else
+        if current_status == "active" then
+            redis.call("HSET", reg_key, "status", "suspended")
+            redis.call("SREM", KEYS[2], identity_id)
+            suspended_count = suspended_count + 1
+        end
+    end
+end
+return {suspended_count, reactivated_count}
+"""
+
     def __init__(self, redis_client, durable_store=None) -> None:
         self._r = redis_client
         # Optional IdentityDurableStore (B1 follow-on). When wired, register /
@@ -160,6 +278,8 @@ return 1
             "IdentityRegistry initialised: %d identity(ies) (durable_store=%s)",
             count, "wired" if durable_store else "off",
         )
+        # T4: integrity self-check (DG-04 — called in consuming class, not _integrity.py)
+        _check_identity_registry_integrity()
 
     # ── Registration ─────────────────────────────────────────────────────
 
@@ -720,3 +840,88 @@ return 1
             "api_key_expires_at": _s("api_key_expires_at"),
             "api_key_rotated_at": _s("api_key_rotated_at"),
         }
+
+    # ── T14: Admin-select suspend / reactivate ────────────────────────────
+
+    def admin_select_active(self, keep_ids: list[str]) -> dict:
+        """
+        T14: Atomically suspend all HUMAN identities not in keep_ids, and
+        reactivate all in keep_ids.  Rejects if len(keep_ids) > max_end_users.
+
+        Returns {"suspended": N, "reactivated": M}.
+        Raises LicenseLimitExceeded if keep_ids exceeds the licence limit.
+        """
+        from yashigani.licensing.enforcer import get_license, LicenseLimitExceeded
+        lic = get_license()
+        max_end_users = lic.max_end_users  # -1 = unlimited
+
+        keys = [
+            "identity:index:kind:human",
+            "identity:index:active",
+        ]
+        argv = [str(max_end_users), str(len(keep_ids))] + list(keep_ids)
+
+        try:
+            result = self._r.eval(self._ADMIN_SELECT_LUA, len(keys), *keys, *argv)
+        except Exception as exc:
+            err_str = str(exc)
+            if "LIMIT_EXCEEDED" in err_str:
+                parts = err_str.split(":")
+                current = int(parts[1]) if len(parts) > 1 else len(keep_ids)
+                raise LicenseLimitExceeded(
+                    limit_name="max_end_users",
+                    current=current,
+                    max_val=max_end_users,
+                ) from exc
+            raise
+
+        if isinstance(result, (list, tuple)) and len(result) == 2:
+            return {"suspended": int(result[0]), "reactivated": int(result[1])}
+        return {"suspended": 0, "reactivated": 0}
+
+    def auto_suspend_excess(self, max_keep: int) -> dict:
+        """
+        T14: Auto-suspend: get active HUMAN set, sort by created_at desc,
+        keep the first max_keep, suspend the rest.
+
+        Returns {"suspended": N, "reactivated": M}.
+
+        TODO (app.py wiring): schedule a 60s eventual-consistency check
+        after auto_suspend completes using the job id returned here.
+        Caller receives the check_job_id for APScheduler registration.
+        """
+        # Get all active HUMAN identity IDs
+        try:
+            members_raw = self._r.smembers("identity:index:kind:human") or set()
+        except Exception:
+            return {"suspended": 0, "reactivated": 0}
+
+        identities = []
+        for mid in members_raw:
+            mid_str = mid.decode("utf-8") if isinstance(mid, bytes) else mid
+            try:
+                created_raw = self._r.hget(f"identity:reg:{mid_str}", "created_at")
+                created_at = (
+                    created_raw.decode("utf-8") if isinstance(created_raw, bytes)
+                    else (created_raw or "")
+                )
+            except Exception:
+                created_at = ""
+            # Check if active
+            try:
+                status_raw = self._r.hget(f"identity:reg:{mid_str}", "status")
+                status = (
+                    status_raw.decode("utf-8") if isinstance(status_raw, bytes)
+                    else (status_raw or "")
+                )
+            except Exception:
+                status = ""
+            if status == "active":
+                identities.append((created_at, mid_str))
+
+        # Sort by created_at desc (most recent first)
+        identities.sort(key=lambda x: x[0], reverse=True)
+        keep_ids = [mid for _, mid in identities[:max_keep]]
+
+        # TODO (app.py wiring): wire a 60s eventual-consistency check job here
+        return self.admin_select_active(keep_ids)
