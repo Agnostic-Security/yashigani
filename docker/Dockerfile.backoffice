@@ -40,6 +40,12 @@ RUN apt-get update \
         libxmlsec1-openssl \
         postgresql-client-17 \
         age=1.2.1-1+b5 \
+        # docker-cli: the CLI binary only (no daemon). Used by the extractor
+        # sandbox CliContainerBackend to spawn per-job containers via the
+        # docker-socket-proxy (TCP-filtered API, internal network only).
+        # The binary talks to DOCKER_HOST=tcp://socket-proxy:2375 — never the
+        # raw host socket. The raw /var/run/docker.sock is NOT mounted here.
+        docker-cli \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

@@ -546,11 +546,18 @@ class CliContainerBackend:
                 argv, input=stdin, capture_output=True, timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
-            # Wall-clock breach: reap the lingering container by name, fail-closed.
+            # Wall-clock breach: stop the container (POST /containers/{id}/stop —
+            # allowed by the socket-proxy ALLOW_STOP=1 rule) then let --rm
+            # auto-remove it. We CANNOT call `docker rm -f` here because that is
+            # an HTTP DELETE method, which the socket-proxy denies (defence-in-depth).
+            # docker stop sends SIGTERM then SIGKILL after --time=5s, causing the
+            # container to exit cleanly and be auto-removed by the --rm flag.
             killed = True
             try:
-                subprocess.run([self._cli, "rm", "-f", name],
-                               capture_output=True, timeout=15)
+                subprocess.run(
+                    [self._cli, "stop", "--time=5", name],
+                    capture_output=True, timeout=20,
+                )
             except Exception:
                 pass
             stdout = exc.stdout or b""
