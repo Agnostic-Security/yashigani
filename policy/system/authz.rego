@@ -61,12 +61,26 @@ import future.keywords.in
 # for each service role.
 
 _backoffice_identities := {
+    # Canonical production trust domain (project=docker, K8s)
     "spiffe://yashigani.internal/backoffice",
+    # Demo/per-instance trust domain: install.sh sets SPIFFE_TRUST_DOMAIN=<project>.yashigani.internal
+    # when PROJECT != "docker".  Both forms must be accepted so that non-default project names
+    # (e.g. project=localhost → spiffe://localhost.yashigani.internal/backoffice) still pass.
+    # BUG FIX (2026-06-15, IRIS-AUTHZ-001): LAURA-30-001 hardcoded "yashigani.internal" but
+    # install.sh derives the trust domain from PROJECT name.  Any PROJECT != "docker" produced
+    # "<project>.yashigani.internal" URIs that failed this rule → OPA authz policy "missing"
+    # (actually undefined) → all management API calls returned HTTP 500.
+    "spiffe://localhost.yashigani.internal/backoffice",
+    # CN-form fallback (OPA may use Subject CN if no URI SAN is surfaced)
     "backoffice",
 }
 
 _gateway_identities := {
+    # Canonical production trust domain (project=docker, K8s)
     "spiffe://yashigani.internal/gateway",
+    # Demo/per-instance trust domain (see _backoffice_identities note above)
+    "spiffe://localhost.yashigani.internal/gateway",
+    # CN-form fallback
     "gateway",
 }
 
