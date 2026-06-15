@@ -8226,6 +8226,10 @@ print(svc.get('image', ''))
     )"
     if [[ -n "${_backoffice_image}" ]]; then
       local _placeholder_check_out=""
+      local _placeholder_check_rc=0
+      # IMPL-02: capture exit code explicitly — do NOT use || true which
+      # silently passes when the docker command itself fails to launch,
+      # producing an empty output that falls through to the "OK" branch.
       _placeholder_check_out="$(
         "${COMPOSE_CMD[0]}" run --rm --entrypoint python3 "${_backoffice_image}" \
           -c "
@@ -8239,8 +8243,8 @@ try:
 except Exception as e:
     print(f'ERROR:{e}')
     sys.exit(2)
-" 2>&1 || true
-      )"
+" 2>&1
+      )" || _placeholder_check_rc=$?
       if echo "${_placeholder_check_out}" | grep -q 'PLACEHOLDER_FOUND'; then
         log_error "FATAL: backoffice image ${_backoffice_image} still contains _PLACEHOLDER_INTEGRITY constants."
         log_error "       The build pipeline did not run scripts/inject_hashes.sh before building the wheel."
@@ -8249,6 +8253,15 @@ except Exception as e:
         return 1
       elif echo "${_placeholder_check_out}" | grep -q 'ERROR:'; then
         log_warn "Pre-flight: could not inspect _integrity.py in image (${_placeholder_check_out}) — proceeding (image may be freshly pulled)"
+      elif [[ -z "${_placeholder_check_out}" ]] || ! echo "${_placeholder_check_out}" | grep -q 'OK'; then
+        # docker run itself failed (daemon unreachable, image missing, etc.) —
+        # output is empty or doesn't contain the expected OK sentinel.
+        # This is NOT a clean pass; abort in non-dev (IMPL-02 fail-closed).
+        log_error "FATAL: Pre-flight placeholder check did not produce expected output"
+        log_error "       (rc=${_placeholder_check_rc}, output='${_placeholder_check_out}')"
+        log_error "       Cannot confirm backoffice image integrity constants are injected."
+        log_error "       If the image is not yet pulled, pull it first: ${COMPOSE_CMD[0]} pull backoffice"
+        return 1
       else
         log_info "Pre-flight: backoffice image integrity constants OK (no placeholders)"
       fi
