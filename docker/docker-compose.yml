@@ -1,5 +1,6 @@
 ---
 # Yashigani v2.24.1 — Docker Compose stack
+# Last updated: 2026-06-15T00:00:00+01:00 (fix(postgres,letta): LETTA-002 — agent-db-init one-shot job ensures letta DB + pgvector exist on EVERY up, not just first initdb)
 # Last updated: 2026-06-13T00:00:00+01:00 (fix(redis): B1 — enable AOF+volatile-lru on main redis; identities/agents/allocations survive --upgrade container recreate)
 # Last updated: 2026-05-24T12:00:00+01:00 (security(secrets): PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets mount removed; closes NICO-V241-001 + YSG-RISK-060)
 # Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
@@ -2044,6 +2045,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      agent-db-init:
+        # Block until agent-db-init has confirmed the letta DB and pgvector
+        # extension exist. letta-pgbouncer's auth_query (ysg_pgbouncer_get_auth)
+        # targets auth_dbname=yashigani — but pool connections are to dbname=letta.
+        # Starting before the DB exists would cause pool-connect failures on first
+        # letta psycopg connection. service_completed_successfully is the compose
+        # primitive for one-shot init jobs.
+        condition: service_completed_successfully
     # YSG-RISK-008 (v2.23.4): read_only skipped on compose path for pgbouncer.
     # v2.24.0: edoburu does NOT generate /etc/pgbouncer/userlist.txt under
     # scram-sha-256 + auth_query mode. /var/run/pgbouncer still needs to be
@@ -2064,6 +2073,110 @@ services:
     # openclaw (they are on their own isolated bridges, not data).
     networks:
       - letta_isolated
+      - data
+    profiles:
+      - letta
+
+  # agent-db-init — idempotent one-shot job: ensure letta DB + pgvector exist.
+  #
+  # PROBLEM CODIFIED (fix/medlow-findings):
+  #   init-agent-dbs.sh is mounted into postgres docker-entrypoint-initdb.d/ and
+  #   only runs on the FIRST-EVER Postgres initialisation (empty PGDATA). On any
+  #   subsequent `docker compose up` over an existing postgres volume the initdb.d
+  #   scripts are SKIPPED — so the `letta` database and `vector` extension are
+  #   never created, causing letta to crash with "database 'letta' does not exist"
+  #   (PG error 3D000). A prior production recovery required a hand-created `psql`
+  #   session — a codify-violation that this service permanently eliminates.
+  #
+  # SOLUTION:
+  #   This service runs EVERY TIME `docker compose up` starts the letta profile.
+  #   It connects to postgres as yashigani_admin using the project's internal mTLS
+  #   posture (sslmode=verify-ca, backoffice_client.crt/key, ca_root.crt trust
+  #   anchor) — identical to the admin DSN used by backoffice and gateway.
+  #   The SQL is idempotent: WHERE NOT EXISTS + CREATE EXTENSION IF NOT EXISTS.
+  #   Exit 0 on success (DB + extension already exist is also success); letta and
+  #   letta-pgbouncer only start after this job reports service_completed_successfully.
+  #
+  # CERT CHOICE (ENUMERATE-BEFORE-EDIT):
+  #   backoffice_client.crt/key — already issued by install.sh PKI bootstrap to
+  #   backoffice (UID 1001 readable: pki_ownership.sh "backoffice:1001:0600"). The
+  #   same cert is used in the admin DSN (YASHIGANI_DB_DSN_ADMIN_DIRECT) for
+  #   backoffice→postgres DDL. No new cert or identity required. ./secrets
+  #   bind-mount is the standard pattern for all core services on the `data` network.
+  #
+  # RESTART: on-failure — retries on transient postgres-not-yet-ready; exits 0 and
+  #   stays "exited (0)" (compose: service_completed_successfully) once done.
+  # NOTE: `restart: on-failure` on a completed (exit 0) service means compose will
+  #   NOT restart it (only restarts on non-zero exit). This is correct behaviour:
+  #   once the DB and extension exist the job is permanently done.
+  #
+  # DOES NOT REPLACE init-agent-dbs.sh:
+  #   The initdb.d script is retained — it handles the genuinely-fresh path where
+  #   postgres superuser ident is in trust mode (local socket) before pg_hba is
+  #   applied. This job handles every subsequent `up` over an existing volume.
+  #
+  # PODMAN PARITY:
+  #   Uses the same pgvector/pgvector image already pulled for the postgres service.
+  #   No new image pull. user: "1001:1001" matches gateway/backoffice UID so
+  #   backoffice_client.crt/key (1001:1001 0600) and postgres_password (1001:999
+  #   0640) are readable as file owner. ca_root.crt is world-readable (0644).
+  agent-db-init:
+    dns_search: ["."]
+    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    # UID 1001:1001 — same UID as gateway/backoffice Python apps.
+    # backoffice_client.crt/key are chowned to 1001:1001 0600 by install.sh
+    # (pki_ownership.sh: "backoffice:1001:0600"). postgres_password is 1001:999 0640
+    # so UID 1001 reads it as file owner. ca_root.crt is 0644 (world-readable).
+    # All three files the job needs are readable at this UID without DAC_OVERRIDE.
+    user: "1001:1001"
+    restart: on-failure
+    mem_limit: 64m
+    cpus: 0.1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "[agent-db-init] Ensuring letta database and pgvector extension exist"
+        # Internal mTLS posture — identical to backoffice YASHIGANI_DB_DSN_ADMIN_DIRECT.
+        # sslmode=verify-ca: postgres server cert is verified against ca_root.crt.
+        # backoffice_client.crt/key: client cert presented to postgres (clientcert=verify-ca).
+        # PGPASSWORD read from /run/secrets/postgres_password (install.sh-generated).
+        export PGPASSWORD
+        PGPASSWORD=$(cat /run/secrets/postgres_password)
+        export PGSSLMODE=verify-ca
+        export PGSSLROOTCERT=/run/secrets/ca_root.crt
+        export PGSSLCERT=/run/secrets/backoffice_client.crt
+        export PGSSLKEY=/run/secrets/backoffice_client.key
+        # Step 1: create the letta database (idempotent — WHERE NOT EXISTS guard).
+        # Uses the same \gexec trick as init-agent-dbs.sh; -c instead of heredoc
+        # avoids leading-whitespace issues in YAML block scalars.
+        psql -v ON_ERROR_STOP=1 \
+             --host=postgres --port=5432 \
+             --username=yashigani_admin --dbname=postgres \
+             -c "SELECT 'CREATE DATABASE letta OWNER yashigani_app' WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_database WHERE datname = 'letta')\gexec"
+        # Step 2: enable pgvector extension in the letta database (IF NOT EXISTS guard).
+        psql -v ON_ERROR_STOP=1 \
+             --host=postgres --port=5432 \
+             --username=yashigani_admin --dbname=letta \
+             -c "CREATE EXTENSION IF NOT EXISTS vector;"
+        echo "[agent-db-init] Done — letta database and pgvector extension ready"
+    volumes:
+      # Internal mTLS material (same bind-mount as all core `data`-network services).
+      # Provides: ca_root.crt, backoffice_client.crt, backoffice_client.key,
+      #           postgres_password (PGPASSWORD).
+      # No write access required — the job only reads secrets and runs psql.
+      - ./secrets:/run/secrets:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # EX-231-10: agent-db-init only needs to reach postgres (data network).
+    networks:
       - data
     profiles:
       - letta
@@ -2159,6 +2272,11 @@ services:
         condition: service_healthy
       letta-pgbouncer:
         condition: service_healthy
+      agent-db-init:
+        # letta runs alembic upgrade head on startup (startup.sh). If the letta
+        # database does not exist yet, alembic fails and letta crashes (3D000).
+        # Wait for agent-db-init to confirm the DB + pgvector extension exist.
+        condition: service_completed_successfully
     read_only: true
     tmpfs:
       # /tmp: Python runtime temp files.
