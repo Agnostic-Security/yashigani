@@ -14121,10 +14121,30 @@ main() {
       local _oc_env_file="${WORK_DIR}/docker/.env"
 
       # Safety: remove a stale directory left by Docker's dir-autocreate (broken prior run).
+      # The directory may be root-owned (Docker creates it as root), so plain rm -rf may fail.
+      # Fall back to an ephemeral alpine container that can remove it (same pattern as
+      # _chown_agent_volumes and the PKI issuer container).
       if [[ -d "$_oc_runtime" ]] && [[ ! -L "$_oc_runtime" ]]; then
         log_warn "Removing stale openclaw.runtime.json DIRECTORY (left by Docker dir-autocreate on prior broken install)"
-        rm -rf "$_oc_runtime" \
-          || { log_error "Cannot remove stale openclaw.runtime.json directory — please run: rm -rf ${_oc_runtime}"; exit 1; }
+        if ! rm -rf "$_oc_runtime" 2>/dev/null; then
+          log_info "Plain rm failed (likely root-owned) — using alpine container to remove stale directory"
+          local _oc_alpine="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+          local _oc_openclaw_dir
+          _oc_openclaw_dir="$(dirname "$_oc_runtime")"
+          local _oc_dir_basename
+          _oc_dir_basename="$(basename "$_oc_runtime")"
+          ${YSG_RUNTIME:-docker} run --rm \
+            -v "${_oc_openclaw_dir}:/mnt/openclaw" \
+            "$_oc_alpine" \
+            rm -rf "/mnt/openclaw/${_oc_dir_basename}" \
+            2>/dev/null \
+            || { log_error "Cannot remove stale openclaw.runtime.json directory via container — please run: sudo rm -rf ${_oc_runtime}"; exit 1; }
+        fi
+        if [[ -e "$_oc_runtime" ]]; then
+          log_error "Stale openclaw.runtime.json directory still exists after removal attempt — please run: sudo rm -rf ${_oc_runtime}"
+          exit 1
+        fi
+        log_info "Stale openclaw.runtime.json directory removed"
       fi
 
       if [[ ! -f "$_oc_template" ]]; then
