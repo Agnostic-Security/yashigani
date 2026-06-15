@@ -48,11 +48,16 @@ ARG COUNTER_PUB_KEY_PATH_ARG=keys/yashigani_counter_public.pem
 COPY ${COUNTER_PUB_KEY_PATH_ARG} keys/yashigani_counter_public.pem
 
 RUN --mount=type=secret,id=counter_private_key \
+    --mount=type=secret,id=counter_key_passphrase \
     test -f /run/secrets/counter_private_key || \
         { echo "ERROR: BuildKit secret 'counter_private_key' not mounted — cannot inject hashes; aborting build" >&2; exit 1; } && \
+    test -f /run/secrets/counter_key_passphrase || \
+        { echo "ERROR: BuildKit secret 'counter_key_passphrase' not mounted — cannot decrypt counter key (MC-01); aborting build" >&2; exit 1; } && \
     chmod 0400 /run/secrets/counter_private_key && \
+    chmod 0400 /run/secrets/counter_key_passphrase && \
     COUNTER_KEY_PATH=/run/secrets/counter_private_key \
     COUNTER_PUB_KEY_PATH=/build/keys/yashigani_counter_public.pem \
+    COUNTER_KEY_PASSPHRASE="$(cat /run/secrets/counter_key_passphrase)" \
     SRC_ROOT=/build/src \
     SCRIPT_DIR=/build/scripts \
     INTEGRITY_PY=/build/src/yashigani/licensing/_integrity.py \

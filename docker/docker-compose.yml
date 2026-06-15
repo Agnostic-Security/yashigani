@@ -711,6 +711,14 @@ services:
         YASHIGANI_BUILD_TARGET: ${YASHIGANI_BUILD_TARGET:-prod}
       secrets:
         - counter_private_key
+        # MC-01 (2026-06-15): counter private key is now AES-256 encrypted at rest.
+        # The passphrase must be supplied as a separate BuildKit secret so that
+        # sign_bundle.py (via inject_hashes.sh) can decrypt the key.
+        # Set COUNTER_KEY_PASSPHRASE_SRC to the path of a 0400 file containing
+        # the passphrase before building:
+        #   COUNTER_KEY_PASSPHRASE_SRC=/path/to/passphrase.txt \
+        #     docker compose build backoffice
+        - counter_key_passphrase
     restart: unless-stopped
     mem_limit: ${YASHIGANI_BACKOFFICE_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_BACKOFFICE_CPU_LIMIT:-1.0}
@@ -3284,6 +3292,13 @@ secrets:
   # Default path (dev keypair only; prod key must be substituted):
   counter_private_key:
     file: ${COUNTER_PRIVATE_KEY_SRC:-./keys/dev-test-2026-06-15/yashigani_counter_private.pem}
+  # MC-01 (2026-06-15): passphrase for the AES-256 encrypted counter private key.
+  # File must be chmod 0400. Contents: the raw passphrase (trailing newline stripped
+  # by the Dockerfile RUN step before it is passed to COUNTER_KEY_PASSPHRASE).
+  # On CI/CD: supply as a masked secret → write to a temp 0400 file → set
+  # COUNTER_KEY_PASSPHRASE_SRC to that path.
+  counter_key_passphrase:
+    file: ${COUNTER_KEY_PASSPHRASE_SRC:-./keys/dev-test-2026-06-15/yashigani_counter_passphrase.txt}
 
   # langflow + letta entrypoint shim: cat /run/secrets/yashigani_internal_bearer
   yashigani_internal_bearer:
