@@ -32,8 +32,14 @@ import future.keywords.if
 
 _backoffice_spiffe := "spiffe://yashigani.internal/backoffice"
 _backoffice_cn     := "backoffice"
+# OPA 1.x TLS auth: RFC 2253 Subject DN (verified live on OPA 1.16.1, 2026-06-15).
+# OPA with --authentication=tls sets input.identity to the client cert Subject DN
+# in RFC 2253 format, NOT the URI SAN. The install.sh-generated certs have
+# Subject: O=Agnostic Security, CN=<service> → RFC 2253: "CN=<service>,O=Agnostic Security".
+_backoffice_dn     := "CN=backoffice,O=Agnostic Security"
 _gateway_spiffe    := "spiffe://yashigani.internal/gateway"
 _gateway_cn        := "gateway"
+_gateway_dn        := "CN=gateway,O=Agnostic Security"
 _agent_id          := "spiffe://yashigani.internal/langflow"
 _mcp_id            := "spiffe://yashigani.internal/openclaw"
 _rogue_id          := "spiffe://evil.example.com/attacker"
@@ -223,5 +229,45 @@ test_rogue_identity_denied if {
         "identity": _rogue_id,
         "method": "PUT",
         "path": ["v1", "policies", "evil"],
+    }
+}
+
+# ── 21–24. RFC 2253 DN form (OPA 1.x TLS auth, IRIS-AUTHZ-001) ──────────────
+# OPA 1.16.1 sets input.identity to the Subject DN in RFC 2253 format,
+# NOT the URI SAN. These tests verify the DN-form identities are authorised.
+
+# 21. backoffice RFC 2253 DN: PUT /v1/policies/* → ALLOW
+test_backoffice_dn_put_policy_allowed if {
+    data.system.authz.allow with input as {
+        "identity": _backoffice_dn,
+        "method": "PUT",
+        "path": ["v1", "policies", "clients", "my_policy"],
+    }
+}
+
+# 22. backoffice RFC 2253 DN: GET /v1/policies → ALLOW
+test_backoffice_dn_get_policies_allowed if {
+    data.system.authz.allow with input as {
+        "identity": _backoffice_dn,
+        "method": "GET",
+        "path": ["v1", "policies"],
+    }
+}
+
+# 23. gateway RFC 2253 DN: POST /v1/data/yashigani → ALLOW
+test_gateway_dn_post_eval_allowed if {
+    data.system.authz.allow with input as {
+        "identity": _gateway_dn,
+        "method": "POST",
+        "path": ["v1", "data", "yashigani", "allow"],
+    }
+}
+
+# 24. gateway RFC 2253 DN: PUT /v1/data → DENY (gateway eval-only)
+test_gateway_dn_put_data_denied if {
+    not data.system.authz.allow with input as {
+        "identity": _gateway_dn,
+        "method": "PUT",
+        "path": ["v1", "data", "yashigani"],
     }
 }

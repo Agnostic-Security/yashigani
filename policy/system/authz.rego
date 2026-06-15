@@ -49,38 +49,57 @@ package system.authz
 import future.keywords.if
 import future.keywords.in
 
+# ── Default deny ──────────────────────────────────────────────────────────────
+# IRIS-AUTHZ-001 / 2026-06-15: OPA 1.x management-API authz evaluator treats
+# an UNDEFINED allow result identically to "policy missing or undefined" → 500.
+# Adding `default allow := false` ensures allow is always DEFINED (true or false)
+# so the evaluator can distinguish "policy loaded, caller denied" (401/403) from
+# "policy not loaded" (500).  Without this line, every management call returned
+# 500 even though system.authz.rego was correctly loaded from the /policies dir.
+default allow := false
+
 # ── Identity constants ────────────────────────────────────────────────────────
-# OPA --authentication=tls surfaces the client cert identity as input.identity.
-# The exact string depends on how the cert was issued:
-#   - If the cert carries a URI SAN (SPIFFE URI), OPA ≥1.0 sets input.identity
-#     to that URI SAN string.
-#   - Older builds may use Subject CN. Both are leaf-cert-anchored and CA-verified.
-# We match on both the SPIFFE URI and the CN form (Subject=backoffice / gateway)
-# to be robust across OPA versions and cert issuance variants in the mesh.
-# The sets below represent every string form that may appear as input.identity
-# for each service role.
+# OPA --authentication=tls with OPA 1.x sets input.identity to the client cert's
+# SUBJECT DISTINGUISHED NAME in RFC 2253 format:
+#   "CN=<common-name>,O=<org>"
+# NOT the URI SAN (SPIFFE URI). The URI SAN is present in the cert but OPA does
+# not surface it as input.identity for TLS-based authentication in OPA 1.x.
+#
+# IRIS-AUTHZ-001 live verification (2026-06-15): tested OPA 1.16.1 with actual
+# install.sh-generated certs. The backoffice cert has:
+#   Subject: O=Agnostic Security, CN=backoffice
+#   URI SAN: spiffe://localhost.yashigani.internal/backoffice
+# OPA sets input.identity = "CN=backoffice,O=Agnostic Security" (RFC 2253 DN).
+# Testing showed: "backoffice" (bare CN) → 401, SPIFFE URI → 401, RFC 2253 DN → 200.
+#
+# We include both the RFC 2253 DN form AND the SPIFFE URI form to be robust across
+# OPA versions (OPA 0.x may surface the URI SAN; OPA 1.x uses the Subject DN).
+#
+# The certs are issued by install.sh which sets:
+#   O=Agnostic Security, CN=<service-name>
+# in all leaf certs. The RFC 2253 format reverses the OpenSSL display order.
 
 _backoffice_identities := {
+    # OPA 1.x TLS auth: RFC 2253 Subject DN (verified live on OPA 1.16.1)
+    "CN=backoffice,O=Agnostic Security",
+    # SPIFFE URI form (OPA 0.x / future OPA versions that surface URI SANs)
     # Canonical production trust domain (project=docker, K8s)
     "spiffe://yashigani.internal/backoffice",
     # Demo/per-instance trust domain: install.sh sets SPIFFE_TRUST_DOMAIN=<project>.yashigani.internal
-    # when PROJECT != "docker".  Both forms must be accepted so that non-default project names
+    # when PROJECT != "docker". Both forms must be accepted so that non-default project names
     # (e.g. project=localhost → spiffe://localhost.yashigani.internal/backoffice) still pass.
-    # BUG FIX (2026-06-15, IRIS-AUTHZ-001): LAURA-30-001 hardcoded "yashigani.internal" but
-    # install.sh derives the trust domain from PROJECT name.  Any PROJECT != "docker" produced
-    # "<project>.yashigani.internal" URIs that failed this rule → OPA authz policy "missing"
-    # (actually undefined) → all management API calls returned HTTP 500.
     "spiffe://localhost.yashigani.internal/backoffice",
-    # CN-form fallback (OPA may use Subject CN if no URI SAN is surfaced)
+    # Bare CN fallback (OPA < 0.50 may use Subject CN only)
     "backoffice",
 }
 
 _gateway_identities := {
-    # Canonical production trust domain (project=docker, K8s)
+    # OPA 1.x TLS auth: RFC 2253 Subject DN (see _backoffice_identities note above)
+    "CN=gateway,O=Agnostic Security",
+    # SPIFFE URI forms
     "spiffe://yashigani.internal/gateway",
-    # Demo/per-instance trust domain (see _backoffice_identities note above)
     "spiffe://localhost.yashigani.internal/gateway",
-    # CN-form fallback
+    # Bare CN fallback
     "gateway",
 }
 

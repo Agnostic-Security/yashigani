@@ -381,6 +381,19 @@ services:
       # Without OPA, inspection produces a classification with nothing to consume it.
       # See docs/operator-guide.md §2 for the opt-in recipe and YSG-RISK-057 for rationale.
       YASHIGANI_INSPECT_RESPONSES: ${YASHIGANI_INSPECT_RESPONSES:-false}
+      # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
+      # Opt-in flag; production deployments default false.  Set true in .env for demo.
+      YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # Extractor sandbox knobs (used when YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true).
+      # IRIS-DOC-001 (2026-06-15): extracted from docker-compose.extractor.yml overlay
+      # so the feature works without needing a separate -f flag on compose up.
+      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
+      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
+      YASHIGANI_EXTRACTOR_MEM_LIMIT: "512m"
+      YASHIGANI_EXTRACTOR_CPUS: "1.0"
+      YASHIGANI_EXTRACTOR_PIDS_LIMIT: "64"
+      YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
+      YASHIGANI_EXTRACTOR_SECCOMP_PATH: "/app/docker/seccomp/yashigani-extractor.json"
       # P3 MCP broker — JSON array of registered MCP server descriptors.
       # Written by install.sh --onboard (Shape C) and cleared by install.sh --offboard.
       # Default [] = no MCP servers (broker disabled at startup).
@@ -430,12 +443,15 @@ services:
       # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
       # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
-      # Container socket for Pool Manager (per-identity isolation)
+      # Container socket for Pool Manager (per-identity isolation) and extractor sandbox.
       # SECURITY: read-only mount, gateway runs as non-root (UID 1001).
       # Pool Manager uses only: containers.run(), .get(), .kill(), .remove().
       # No host filesystem access. Podman rootless provides additional isolation.
       # To disable: set CONTAINER_SOCKET_ENABLED=false — Pool Manager falls back to stub mode.
       # macOS Podman: socket can't be mounted from host — Pool Manager uses stub mode.
+      # IRIS-DOC-001 (2026-06-15): missing socket mount was causing extractor sandbox
+      # "no container backend available" → fail-closed BLOCK on document enforcement.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     read_only: true
     tmpfs:
       - /tmp:size=100M
@@ -637,6 +653,16 @@ services:
       # Operators extending with custom agents: append comma-separated names to this value.
       # Example: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,letta,openclaw,custom-agent
       YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
+      # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
+      YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # Extractor sandbox knobs (backoffice runs /admin/documents/inspect which spawns sandbox).
+      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
+      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
+      YASHIGANI_EXTRACTOR_MEM_LIMIT: "512m"
+      YASHIGANI_EXTRACTOR_CPUS: "1.0"
+      YASHIGANI_EXTRACTOR_PIDS_LIMIT: "64"
+      YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
+      YASHIGANI_EXTRACTOR_SECCOMP_PATH: "/app/docker/seccomp/yashigani-extractor.json"
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -663,6 +689,21 @@ services:
       # Source: docker/secrets/audit-signing/ (gitignored, populated by
       # install.sh _provision_audit_signing_key).
       - ./secrets/audit-signing:/run/audit-signing:ro
+      # IRIS-DOC-001 (2026-06-15): Docker socket — document-enforcement extractor sandbox.
+      # The backoffice /admin/documents/inspect endpoint uses ContainerBackend (sandbox.py)
+      # to spawn per-job yashigani/extractor containers. Without this mount the backend
+      # has no container runtime → fail-closed BLOCK on every inspect call.
+      # Mounted :ro because the SDK only needs to read the socket (send API calls);
+      # read_only:true on the rootfs is not affected by a :ro socket bind-mount.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # IRIS-DOC-001b (2026-06-15): Docker CLI binary bind-mount.
+      # The backoffice image does NOT bundle the docker CLI (it's a Python FastAPI image).
+      # create_extractor_backend() probes shutil.which("docker") → finds nothing → falls
+      # through to SDK (also absent) → SandboxUnavailableError → fail-closed BLOCK.
+      # Fix: bind-mount the host docker binary RO so the CLI backend path succeeds.
+      # This is demo-stack-specific; production: the extractor Job runs from a DinD image
+      # or the K8s backend path (no host binary needed in K8s).
+      - /usr/bin/docker:/usr/local/bin/docker:ro
     read_only: true
     tmpfs:
       - /tmp:size=100M
@@ -678,6 +719,15 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (backoffice.yaml:104-105).
     # No cap_add: backoffice binds port 8443 (non-privileged).
     cap_drop: [ALL]
+    # IRIS-DOC-001c (2026-06-15): Docker socket group membership.
+    # The host docker.sock is rw-rw---- root:docker (gid 138). The backoffice
+    # process runs as uid 1001 (yashigani). Without group_add the CLI backend
+    # probe gets "permission denied" → sandbox unavailable → fail-closed BLOCK.
+    # group_add=["138"] grants gid 138 (docker) membership to uid 1001 inside the
+    # container — least-privilege (no cap_add, no privileged flag, just socket access).
+    # Demo-stack only. Production K8s: extractor runs as a hardened Job Pod, no host socket.
+    group_add:
+      - "138"
     healthcheck:
       # mTLS — Pattern A for Python ssl: trust anchor is the public ca_root.crt
       # (Py 3.12/OpenSSL 3.0 strict-chain rejects intermediate-only — gate #58a).
@@ -952,6 +1002,12 @@ services:
       - "--tls-private-key-file=/run/secrets/policy_client.key"
       - "--tls-ca-cert-file=/run/secrets/ca_root.crt"
       - "--authentication=tls"
+      # LAURA-30-001 / IRIS-AUTHZ-001: --authorization=basic (proper fix).
+      # Root cause: policy/system/authz.rego lacked `default allow := false`.
+      # OPA 1.x management-API authz treats UNDEFINED allow as "policy missing or
+      # undefined" → 500 on every management call. With the default, allow is always
+      # DEFINED so the evaluator correctly returns 401/403 (deny) vs 200 (allow).
+      # policy/system/authz.rego enforces: backoffice=WRITE, gateway=EVAL, others=DENY.
       - "--authorization=basic"
       - "/policies"
     volumes:
