@@ -30,6 +30,9 @@ export PATH
 # without this definition, set -euo pipefail aborts before any cleanup runs.
 # (UNINSTALL-LOG_INFO-BUG — Ava phase2-verdict.md:69, v2.23.4)
 log_info() { printf "    --> %s\n" "$1"; }
+log_warn() { printf "    !!  %s\n" "$1" >&2; }
+log_error() { printf "    XX  %s\n" "$1" >&2; }
+log_success() { printf "    ok  %s\n" "$1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
