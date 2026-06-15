@@ -1777,6 +1777,23 @@ _print_model_recommendations() {
   printf "\n"
 }
 
+# _pick_ollama_model_for_vram — return the best default OLLAMA_MODEL for the
+# installed GPU's VRAM. Mirrors the tier thresholds in _print_model_recommendations
+# so the pulled model matches the displayed recommendation (BUG-GPU-VRAM-001).
+# Printed to stdout; caller assigns with $().
+_pick_ollama_model_for_vram() {
+  local vram="${YSG_GPU_VRAM_MB:-0}"
+  if [ "$vram" -ge 32768 ]; then
+    printf "qwen3:30b-a3b"
+  elif [ "$vram" -ge 16384 ]; then
+    printf "llama3.1:8b"
+  elif [ "$vram" -ge 8192 ]; then
+    printf "llama3.1:8b"
+  else
+    printf "qwen2.5:3b"
+  fi
+}
+
 # =============================================================================
 # Multi-GPU selection — pick largest VRAM as default; let operator choose
 # =============================================================================
@@ -1796,13 +1813,17 @@ _select_nvidia_gpu() {
   local gpu_count
   gpu_count="$(echo "$smi_out" | grep -c .)" || gpu_count=0
   if [[ "$gpu_count" -lt 2 ]]; then
-    # Single GPU — set CDI to pin it explicitly (index 0) rather than "all"
+    # Single GPU — set CDI to pin it explicitly (index 0) rather than "all".
+    # Also update YSG_GPU_NAME / YSG_GPU_VRAM_MB so the preflight VRAM check
+    # and model-recommendation logic use the real card's values (BUG-GPU-VRAM-001).
     local _idx _name _vram
     IFS=',' read -r _idx _name _vram <<< "$(echo "$smi_out" | head -1)"
     _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
     YSG_GPU_INDEX="${YSG_GPU_INDEX:-${_idx}}"
+    YSG_GPU_NAME="$_name"
+    YSG_GPU_VRAM_MB="${_vram:-0}"
     YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
-    export YSG_GPU_INDEX YSG_GPU_CDI
+    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI
     return 0
   fi
 
@@ -6101,7 +6122,7 @@ compose_up() {
   local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
   if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
     compose_files+=("-f" "$_gpu_overlay")
-    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_UUID:-all}"
+    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
   fi
   # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
   local _gpu_overlay_podman="${WORK_DIR}/docker/docker-compose.gpu-podman.yml"
@@ -13966,11 +13987,15 @@ main() {
     # so the var is irrelevant there.
     if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
       local _env_file="${WORK_DIR}/docker/.env"
-      local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-qwen2.5:3b}"
+      # BUG-GPU-VRAM-001: pick a model appropriate for the SELECTED GPU's VRAM
+      # (set by _select_nvidia_gpu earlier in this step). Previously this always
+      # defaulted to qwen2.5:3b regardless of available VRAM. OLLAMA_MODEL_OVERRIDE
+      # still wins, preserving explicit operator choice.
+      local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-$(_pick_ollama_model_for_vram)}"
       # Preserve any operator-supplied OLLAMA_MODEL — only write if absent.
       if ! grep -q "^OLLAMA_MODEL=" "$_env_file" 2>/dev/null; then
         echo "OLLAMA_MODEL=${_ollama_model}" >> "$_env_file"
-        log_info "Ollama default model set: ${_ollama_model} (1.9 GB — will pull on first start)"
+        log_info "Ollama default model set: ${_ollama_model} (VRAM-tier choice for $(_format_gpu_vram) — will pull on first start)"
       else
         log_info "Ollama model already set in .env — preserving operator value"
       fi
@@ -14074,6 +14099,64 @@ main() {
       chmod 0666 "$_letta_openapi" \
         || log_warn "Could not chmod 0666 letta-runtime/openapi_letta.json — letta openapi bind-mount may fail"
       log_info "letta-runtime/openapi_letta.json placeholder: mode 0666 (DAC_OVERRIDE-free write)"
+    fi
+
+    # Step 8f: Substitute __YASHIGANI_INTERNAL_BEARER__ into openclaw.runtime.json.
+    # docker/docker-compose.yml (openclaw service) bind-mounts
+    #   ./openclaw/openclaw.runtime.json:/etc/openclaw/openclaw.json:ro
+    # Docker auto-creates the missing bind-source as a DIRECTORY when the file does
+    # not yet exist on the host, causing openclaw to read a directory and crash with
+    # EISDIR. This step reads docker/openclaw/openclaw.json (git-tracked template),
+    # substitutes __YASHIGANI_INTERNAL_BEARER__ with the real token from
+    # docker/secrets/yashigani_internal_bearer, and writes the result as a file
+    # at docker/openclaw/openclaw.runtime.json (mode 0640, git-ignored).
+    # Runs only when the openclaw profile is active.
+    # Idempotent: re-runs overwrite the file with fresh token value; a stale
+    # directory from a prior broken run is removed first.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^openclaw$"; then
+      local _oc_template="${WORK_DIR}/docker/openclaw/openclaw.json"
+      local _oc_runtime="${WORK_DIR}/docker/openclaw/openclaw.runtime.json"
+      local _oc_secrets_dir="${WORK_DIR}/docker/secrets"
+      local _oc_bearer_file="${_oc_secrets_dir}/yashigani_internal_bearer"
+      local _oc_env_file="${WORK_DIR}/docker/.env"
+
+      # Safety: remove a stale directory left by Docker's dir-autocreate (broken prior run).
+      if [[ -d "$_oc_runtime" ]] && [[ ! -L "$_oc_runtime" ]]; then
+        log_warn "Removing stale openclaw.runtime.json DIRECTORY (left by Docker dir-autocreate on prior broken install)"
+        rm -rf "$_oc_runtime" \
+          || { log_error "Cannot remove stale openclaw.runtime.json directory — please run: rm -rf ${_oc_runtime}"; exit 1; }
+      fi
+
+      if [[ ! -f "$_oc_template" ]]; then
+        log_error "openclaw: template ${_oc_template} not found — cannot generate openclaw.runtime.json"
+        exit 1
+      fi
+
+      # Read bearer token (Podman-rootless-aware; falls back to .env).
+      local _oc_bearer
+      _oc_bearer="$(_safe_read_secret "$_oc_bearer_file" "YASHIGANI_INTERNAL_BEARER" "$_oc_env_file" || true)"
+      if [[ -z "$_oc_bearer" ]] || [[ "$_oc_bearer" == \#* ]]; then
+        log_error "openclaw: yashigani_internal_bearer could not be read from ${_oc_bearer_file} — cannot generate openclaw.runtime.json"
+        exit 1
+      fi
+
+      # Substitute placeholder and write runtime file (mode 0640 — readable by group GID 2002).
+      # Use a temp file + atomic rename to avoid a partial write being bind-mounted.
+      local _oc_tmpfile
+      _oc_tmpfile="$(mktemp "${WORK_DIR}/docker/openclaw/.openclaw_runtime_XXXXXX")"
+      sed "s|__YASHIGANI_INTERNAL_BEARER__|${_oc_bearer}|g" "$_oc_template" > "$_oc_tmpfile" \
+        || { rm -f "$_oc_tmpfile"; log_error "openclaw: sed substitution into openclaw.runtime.json failed"; exit 1; }
+      chmod 0640 "$_oc_tmpfile" \
+        || log_warn "openclaw: could not chmod 0640 openclaw.runtime.json temp file"
+      mv -f "$_oc_tmpfile" "$_oc_runtime" \
+        || { rm -f "$_oc_tmpfile"; log_error "openclaw: atomic rename of openclaw.runtime.json failed"; exit 1; }
+
+      # Fail-closed: assert the result is a regular file, not a directory.
+      if [[ ! -f "$_oc_runtime" ]] || [[ -d "$_oc_runtime" ]]; then
+        log_error "openclaw: openclaw.runtime.json is not a regular file after write — aborting to prevent EISDIR crash"
+        exit 1
+      fi
+      log_info "openclaw.runtime.json written (bearer substituted, mode 0640)"
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load
