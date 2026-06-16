@@ -5808,11 +5808,15 @@ _provision_wazuh_mtls() {
     "$rt" rm "$cid" >/dev/null 2>&1; log_error "could not extract base indexer config from image"; return 1
   fi
   "$rt" rm "$cid" >/dev/null 2>&1
-  sed -i \
+  # MACOS-SED-001: BSD sed requires an explicit backup extension with -i (e.g. -i '')
+  # while GNU sed accepts bare -i. Use -i.bak + rm to be portable across both.
+  # Wazuh is Linux-only in practice but the installer runs on macOS for Colima/Docker.
+  sed -i.bak \
     -e 's#ssl.http.pemcert_filepath: .*#ssl.http.pemcert_filepath: /usr/share/wazuh-indexer/config/certs/http-indexer.pem#' \
     -e 's#ssl.http.pemkey_filepath: .*#ssl.http.pemkey_filepath: /usr/share/wazuh-indexer/config/certs/http-indexer-key.pem#' \
     -e 's#ssl.http.pemtrustedcas_filepath: .*#ssl.http.pemtrustedcas_filepath: /usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem#' \
-    "${wp}/opensearch.yml"
+    "${wp}/opensearch.yml" \
+    && rm -f "${wp}/opensearch.yml.bak"
   if ! python3 - "${wp}/opensearch.yml" <<'PYEOF'
 import sys,re,yaml
 p=sys.argv[1]; t=open(p).read()
@@ -12068,7 +12072,16 @@ _activate_byo_ca_rerun() {
   local _compose_file="${WORK_DIR}/docker/docker-compose.yml"
   local _stack_running=false
   if [[ -f "$_compose_file" && ${#COMPOSE_CMD[@]} -gt 0 ]]; then
-    if timeout 10 "${COMPOSE_CMD[@]}" -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
+    # MACOS-TIMEOUT-001: `timeout` (GNU coreutils) is absent on macOS; use
+    # gtimeout (via Homebrew coreutils) when available, otherwise omit the
+    # guard. The compose ps call is local-socket so hangs are unlikely.
+    local _timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+      _timeout_cmd="timeout 10"
+    elif command -v gtimeout >/dev/null 2>&1; then
+      _timeout_cmd="gtimeout 10"
+    fi
+    if ${_timeout_cmd} "${COMPOSE_CMD[@]}" -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
       _stack_running=true
       log_info "  Stack is running — will restart services after BYO CA activation"
     fi
