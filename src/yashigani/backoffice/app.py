@@ -699,7 +699,7 @@ async def lifespan(app: FastAPI):
         if _doc_store is not None:
             from yashigani.documents.opa_push import push_document_data
             _pol_n = len(_doc_store.list_policies())
-            for _attempt in range(1, 4):
+            for _attempt in range(1, 6):
                 try:
                     push_document_data(_doc_store, backoffice_state.opa_url)
                     _osync_log.info(
@@ -708,11 +708,11 @@ async def lifespan(app: FastAPI):
                     )
                     break
                 except Exception as _push_exc:
-                    if _attempt < 3:
-                        await asyncio.sleep(2)
+                    if _attempt < 5:
+                        await asyncio.sleep(3)
                     else:
                         _osync_log.warning(
-                            "OPA-PERSIST: document startup re-sync failed after 3 attempts (%s) — "
+                            "OPA-PERSIST: document startup re-sync failed after 5 attempts (%s) — "
                             "policies remain in Redis; OPA will sync on next mutation", _push_exc
                         )
     except Exception as _outer_exc:
