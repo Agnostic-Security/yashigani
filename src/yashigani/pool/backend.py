@@ -23,8 +23,16 @@ K8s backend notes (YSG-RISK-070):
   - RBAC: gateway ServiceAccount needs pods CRUD in its namespace (see
     helm/yashigani/templates/rbac-pool-manager.yaml). Least privilege — no
     cluster-wide permissions, no other resource types.
+
+Extractor backend (LAURA-30-001 / YSG-RISK-080 fix):
+  HttpExtractorBackend calls the pre-spawned extractor service over plain HTTP.
+  This completely eliminates the docker socket from backoffice — a compromised
+  backoffice has only one capability: POST document bytes to the extractor service.
+  The extractor service is itself hardened (egress=none, ro-rootfs, caps-drop-ALL,
+  non-root, seccomp) and runs on an internal-only bridge unreachable from the internet.
+  No dynamic container creation, no host bind-mount primitive.
 """
-# Last updated: 2026-05-25T00:00:00+00:00 (feat(pool): K8s API backend — YSG-RISK-070)
+# Last updated: 2026-06-16T00:00:00+00:00 (fix: LAURA-30-001 — HttpExtractorBackend, design A)
 from __future__ import annotations
 
 import logging
@@ -915,6 +923,162 @@ class KubernetesPodHandle:
         return self._pod_ip
 
 
+class HttpExtractorBackend:
+    """Pre-spawned extractor service backend (Design A, LAURA-30-001 / YSG-RISK-080).
+
+    Instead of creating ephemeral containers per job (which required docker socket
+    access and the body-blind tecnativa socket-proxy), backoffice calls the
+    pre-spawned extractor-svc container over plain HTTP.
+
+    SECURITY MODEL:
+      - Backoffice has NO docker socket, NO container API access whatsoever.
+      - A compromised backoffice can only POST document bytes to this HTTP endpoint.
+      - The extractor service is hardened: egress=none (internal bridge), read-only
+        rootfs, cap_drop ALL, non-root, seccomp, AppArmor, mem/pids limits.
+      - The internal bridge (extractor_svc) is isolated — no external reachability.
+      - This eliminates the host-escape primitive entirely (LAURA-30-001).
+
+    Configured via YASHIGANI_EXTRACTOR_WORKER_URL env (set by install.sh / compose
+    to http://extractor-svc:8090 on the extractor_svc internal bridge).
+    """
+
+    name = "http_extractor"
+
+    def __init__(self, base_url: str) -> None:
+        # base_url: e.g. "http://extractor-svc:8090"
+        self._base_url = base_url.rstrip("/")
+
+    def ping(self) -> bool:
+        """Check if the extractor service is reachable."""
+        try:
+            import urllib.request
+            req = urllib.request.urlopen(
+                f"{self._base_url}/_ping", timeout=5
+            )
+            return req.status == 200
+        except Exception:
+            return False
+
+    def run_extractor_job(
+        self,
+        *,
+        stdin: bytes,
+        timeout_s: int,
+        image: str,
+        name: str,
+        command: list,
+        network_disabled: bool,
+        read_only: bool,
+        cap_drop: list,
+        cap_add: list,
+        user: str,
+        security_opt: list,
+        seccomp_path: str,
+        apparmor_profile: str,
+        tmpfs: dict,
+        mem_limit: str,
+        memswap_limit: str,
+        nano_cpus: int,
+        pids_limit: int,
+        labels: dict,
+        auto_remove: bool,
+    ) -> tuple:
+        """Run one extractor job via the pre-spawned extractor HTTP service.
+
+        The hardening parameters (network_disabled, cap_drop, read_only, etc.)
+        are enforced at the SERVICE level by compose/Dockerfile — not per-call.
+        This method ignores them (they are already applied permanently to the
+        extractor container at deploy time).
+
+        Returns (stdout_bytes, exit_code, killed). Fail-closed: any HTTP error,
+        timeout, or non-200 response raises SandboxUnavailableError.
+        """
+        import base64
+        import json
+        import urllib.error
+        import urllib.request
+
+        # Parse the command argv to extract --job, --format, --declared-mime, --plan.
+        # Command is in the form: ["--job", "extract", "--format", "docx", ...]
+        job = "extract"
+        fmt = ""
+        declared_mime = ""
+        plan_b64 = ""
+        i = 0
+        while i < len(command):
+            arg = command[i]
+            if arg == "--job" and i + 1 < len(command):
+                job = command[i + 1]
+                i += 2
+            elif arg == "--format" and i + 1 < len(command):
+                fmt = command[i + 1]
+                i += 2
+            elif arg == "--declared-mime" and i + 1 < len(command):
+                declared_mime = command[i + 1]
+                i += 2
+            elif arg == "--plan" and i + 1 < len(command):
+                plan_b64 = command[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        payload = json.dumps({
+            "data_b64": base64.b64encode(stdin).decode("ascii"),
+            "job": job,
+            "fmt": fmt,
+            "declared_mime": declared_mime,
+            "plan_b64": plan_b64,
+        }, separators=(",", ":")).encode("utf-8")
+
+        url = f"{self._base_url}/run"
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+            method="POST",
+        )
+
+        killed = False
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s + 5) as resp:
+                body = resp.read()
+        except urllib.error.URLError as exc:
+            from yashigani.documents.sandbox import SandboxUnavailableError
+            raise SandboxUnavailableError(
+                f"extractor service unreachable ({self._base_url}): {exc} — fail-closed BLOCK"
+            ) from exc
+        except TimeoutError as exc:
+            killed = True
+            return (b"", 137, killed)
+        except Exception as exc:
+            from yashigani.documents.sandbox import SandboxUnavailableError
+            raise SandboxUnavailableError(
+                f"extractor service HTTP error: {exc!r} — fail-closed BLOCK"
+            ) from exc
+
+        # The service always returns 200 with a JSON body (ok true/false).
+        # A non-200 is an unexpected server error — treat as unavailable.
+        try:
+            result = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            from yashigani.documents.sandbox import SandboxUnavailableError
+            raise SandboxUnavailableError(
+                f"extractor service returned non-JSON: {exc} — fail-closed BLOCK"
+            ) from exc
+
+        if not isinstance(result, dict):
+            from yashigani.documents.sandbox import SandboxUnavailableError
+            raise SandboxUnavailableError(
+                "extractor service returned non-object JSON — fail-closed BLOCK"
+            )
+
+        # Re-serialise the result for the caller (SandboxJobResult.from_stdout expects
+        # raw JSON bytes — the same contract as the CLI/SDK runners).
+        stdout = json.dumps(result, separators=(",", ":")).encode("utf-8")
+        exit_code = 0
+        return (stdout, exit_code, killed)
+
+
 def create_backend() -> Optional["ContainerBackend | KubernetesBackend"]:
     """
     Auto-detect and create the best available container backend.
@@ -1003,45 +1167,71 @@ def create_backend() -> Optional["ContainerBackend | KubernetesBackend"]:
     return None
 
 
-#: Operator override: force the extractor-sandbox runtime ("docker"|"podman"|
-#: "sdk"|"auto"). On the demo host the runtime is Docker; "auto" prefers the CLI
-#: backend (matches the proven containment harness + sidesteps the Podman-3.4.4
-#: SDK kwarg gap and the missing docker-py). Set to "sdk" to force the legacy SDK
-#: path (only where the SDK accepts our jail kwargs, e.g. Podman >= 4 / docker-py
-#: installed).
+#: Operator override: force the extractor backend type.
+#:   "http"   — HttpExtractorBackend (Design A, LAURA-30-001 fix — PREFERRED)
+#:   "docker" / "podman" — CliContainerBackend (per-job ephemeral container)
+#:   "sdk"    — legacy SDK selector
+#:   "auto"   — http if YASHIGANI_EXTRACTOR_WORKER_URL is set, else CLI, else K8s
 ENV_EXTRACTOR_RUNTIME = "YASHIGANI_EXTRACTOR_RUNTIME"
+
+#: URL of the pre-spawned extractor service (Design A).
+#: Set to "http://extractor-svc:8090" by install.sh / compose.
+#: When set, HttpExtractorBackend is used and NO docker socket is needed in backoffice.
+ENV_EXTRACTOR_WORKER_URL = "YASHIGANI_EXTRACTOR_WORKER_URL"
 
 
 def create_extractor_backend() -> Optional[
-    "ContainerBackend | KubernetesBackend | CliContainerBackend"
+    "ContainerBackend | KubernetesBackend | CliContainerBackend | HttpExtractorBackend"
 ]:
-    """Pick the backend that runs the per-job EXTRACTOR sandbox.
+    """Pick the backend that runs the EXTRACTOR sandbox.
 
-    This is deliberately SEPARATE from ``create_backend()`` (the per-identity Pool
-    Manager selector). The extractor sandbox only ever calls ``run_extractor_job``,
-    and on this host the SDK path is unusable for it (docker-py absent; Podman
-    3.4.4 SDK rejects ``network_disabled``/``tmpfs``). So we resolve a backend that
-    can actually spawn the hardened jail:
+    LAURA-30-001 / YSG-RISK-080 — Design A (preferred):
+      When YASHIGANI_EXTRACTOR_WORKER_URL is set (install.sh / compose sets this to
+      http://extractor-svc:8090), use HttpExtractorBackend. This is the complete fix:
+      backoffice has NO docker socket, NO container API access — it can only POST
+      document bytes to the pre-spawned extractor service. The socket-proxy and the
+      entire host-escape primitive are eliminated.
 
-      1. K8s in-cluster → KubernetesBackend (declarative hardened Pod + deny-all
-         egress NetworkPolicy; unchanged).
-      2. Otherwise a CLI backend over the runtime binary that is present and
-         reachable — Docker first (the demo runtime here), then Podman. The CLI
-         path is exactly what the containment harness proved 5/5, with the full
-         hardened flag set, on BOTH Docker 29.1.3 and Podman 3.4.4.
-      3. ``YASHIGANI_EXTRACTOR_RUNTIME=docker|podman`` forces a specific CLI.
-      4. ``YASHIGANI_EXTRACTOR_RUNTIME=sdk`` forces the legacy SDK selector
-         (create_backend) — only useful where the SDK accepts our jail kwargs.
+    Fallback order (for environments without the extractor service):
+      1. YASHIGANI_EXTRACTOR_WORKER_URL set → HttpExtractorBackend (Design A, preferred)
+      2. K8s in-cluster → KubernetesBackend (hardened Pod per job)
+      3. Docker CLI → CliContainerBackend (per-job ephemeral container)
+      4. Podman CLI → CliContainerBackend
+      5. SDK selector → ContainerBackend (legacy)
 
-    Returns None (→ SandboxUnavailableError → fail-closed BLOCK) when nothing can
-    run the jail. We NEVER fall back to in-process parsing.
+    Returns None (→ SandboxUnavailableError → fail-closed BLOCK) when nothing is
+    available. We NEVER fall back to in-process parsing.
     """
     forced = (os.environ.get(ENV_EXTRACTOR_RUNTIME) or "auto").strip().lower()
+
+    # --- Design A: HttpExtractorBackend (LAURA-30-001 fix) ---
+    # Check the worker URL regardless of forced mode unless explicitly overridden.
+    worker_url = os.environ.get(ENV_EXTRACTOR_WORKER_URL, "").strip()
+    if worker_url and forced in ("auto", "http"):
+        be = HttpExtractorBackend(worker_url)
+        if be.ping():
+            logger.info(
+                "Extractor sandbox: HttpExtractorBackend selected — url=%s "
+                "(Design A: no docker socket, no host-escape primitive — LAURA-30-001 fix)",
+                worker_url,
+            )
+            return be
+        logger.warning(
+            "Extractor sandbox: HttpExtractorBackend at %s is unreachable "
+            "— falling through to CLI/K8s backends", worker_url,
+        )
+    elif forced == "http":
+        # Explicit http mode but no URL configured.
+        logger.error(
+            "Extractor sandbox: YASHIGANI_EXTRACTOR_RUNTIME=http but "
+            "YASHIGANI_EXTRACTOR_WORKER_URL is not set — sandbox UNAVAILABLE"
+        )
+        return None
 
     if forced == "sdk":
         return create_backend()
 
-    # K8s in-cluster takes precedence (its run_extractor_job is the hardened Pod).
+    # K8s in-cluster takes precedence over CLI (its run_extractor_job is the hardened Pod).
     _SA_TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     if forced in ("auto",) and os.path.exists(_SA_TOKEN) and os.environ.get(
         "KUBERNETES_SERVICE_HOST"
@@ -1075,14 +1265,15 @@ def create_extractor_backend() -> Optional[
         be = create_backend()
         if be is not None:
             logger.info(
-                "Extractor sandbox: no usable CLI runtime — falling back to SDK "
+                "Extractor sandbox: no usable CLI/HTTP runtime — falling back to SDK "
                 "backend %s", getattr(be, "name", "?"),
             )
             return be
 
     logger.warning(
-        "Extractor sandbox: no Docker/Podman CLI, K8s, or SDK backend available "
-        "— sandbox UNAVAILABLE (fail-closed BLOCK on every doc job).",
+        "Extractor sandbox: no HTTP extractor service, Docker/Podman CLI, K8s, or "
+        "SDK backend available — sandbox UNAVAILABLE (fail-closed BLOCK on every doc job). "
+        "Set YASHIGANI_EXTRACTOR_WORKER_URL=http://extractor-svc:8090 (Design A, preferred).",
     )
     return None
 

@@ -89,16 +89,32 @@ COPY src/yashigani/__init__.py            /app/yashigani/__init__.py
 COPY src/yashigani/documents/__init__marker /app/yashigani/documents/__init__.py
 COPY src/yashigani/documents/bomb_guard.py /app/yashigani/documents/bomb_guard.py
 COPY docker/extractor/worker.py            /app/worker.py
+# LAURA-30-001 / YSG-RISK-080 (Design A): long-running HTTP server mode.
+# The server wraps worker.py: each POST /run forks a worker subprocess and returns
+# the result as JSON. Backoffice calls this service instead of the docker socket.
+COPY docker/extractor/server.py            /app/server.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONNOUSERSITE=1 \
     PYTHONPATH=/app \
-    YASHIGANI_EXTRACTOR_IN_SANDBOX=1
+    YASHIGANI_EXTRACTOR_IN_SANDBOX=1 \
+    YASHIGANI_WORKER_PATH=/app/worker.py \
+    YASHIGANI_EXTRACTOR_HOST=0.0.0.0 \
+    YASHIGANI_EXTRACTOR_PORT=8090
 
 USER 65532:65532
 
-# No EXPOSE, no HEALTHCHECK: this is a one-shot batch worker, not a service. It
-# reads stdin, writes one JSON object to stdout, and exits. It has no network
-# (egress=none) and nothing to health-probe.
-ENTRYPOINT ["python", "/app/worker.py"]
+# EXPOSE 8090: the extractor service listens on this port (internal bridge only).
+# Compose maps extractor_svc network (backoffice ↔ extractor-svc). No external
+# port binding — the network bridge is internal: true (no internet reachability).
+EXPOSE 8090
+
+# HEALTHCHECK: GET /healthz confirms the server is up and worker.py is importable.
+# Used by compose to gate backoffice startup on the extractor service being ready.
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 --start-period=30s \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8090/healthz', timeout=4)" || exit 1
+
+# Default: long-running server mode (Design A).
+# Override with CMD ["python", "/app/worker.py"] for per-job invocation (legacy/test).
+ENTRYPOINT ["python", "/app/server.py"]

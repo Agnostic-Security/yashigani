@@ -1766,3 +1766,43 @@ risks:
       /login 200 OK. No FATAL errors. Evidence: testing_runs/captain_bug_c7_001_scram_fix_20260525/.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
+- id: YSG-RISK-080
+  description: >-
+    LAURA-30-001 (2026-06-16): Critical host-escape via docker socket proxy (commit 6fc10fc).
+    The tecnativa/docker-socket-proxy replacement for the raw docker.sock mount allowed
+    POST /containers/create + POST /containers/{id}/start via CONTAINERS=1 + POST=1 ACL.
+    The proxy enforces path/method only — it CANNOT inspect the request body. A compromised
+    backoffice could POST /containers/create with HostConfig.Binds=["/:/hostroot:ro"] (passes
+    the ACL), start the container, and read /etc/passwd or every mTLS private key under
+    /run/secrets from the bind-mounted host root. This gives full host takeover from a single
+    compromised network-facing admin container. Original severity mis-registered as LOW (accepted)
+    in commit 6fc10fc — Laura proved CRITICAL exploitability live on 2026-06-16.
+    Fix (Design A, 2026-06-16): replaced socket-proxy with a pre-spawned hardened extractor
+    service (extractor-svc). Backoffice calls it via plain HTTP (extractor_svc internal bridge).
+    Backoffice has NO docker socket, NO container API access. A compromised backoffice can only
+    POST document bytes to http://extractor-svc:8090/run. The extractor-svc is itself hardened:
+    egress=none (internal bridge), read-only rootfs, cap_drop ALL, non-root (UID 65532),
+    no-new-privileges, seccomp, AppArmor, mem/pids limits, no host volume mounts, no secrets.
+    The host-escape primitive is completely eliminated.
+  severity: critical
+  controls_impacted:
+  - Host isolation — arbitrary host bind-mount from compromised backoffice via socket-proxy body-blind ACL
+  - Secret confidentiality — /run/secrets readable by any extractor container the attacker created
+  - Container isolation — attacker could spawn privileged containers on the host
+  compensating_controls:
+  - Prior to fix: backoffice was the only service on extractor_proxy bridge (limiting pivot scope)
+  - Prior to fix: Caddy + OPA gated all inbound requests to backoffice (reducing compromise probability)
+  - After fix (Design A): NO docker socket in backoffice; HttpExtractorBackend calls extractor-svc over HTTP
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      Design A implemented: socket-proxy service removed; extractor-svc service added (yashigani/extractor
+      image running server.py as long-running HTTP server). backoffice env updated:
+      YASHIGANI_EXTRACTOR_WORKER_URL=http://extractor-svc:8090, YASHIGANI_EXTRACTOR_RUNTIME=http,
+      DOCKER_HOST removed. HttpExtractorBackend added to pool/backend.py. extractor_proxy network
+      replaced with extractor_svc (internal=true). Laura exploit re-attempted after fix: backoffice
+      has no docker socket and no DOCKER_HOST — POST /containers/create is impossible (no path to
+      Docker API from within the backoffice container). Doc round-trip verified: REDACT and
+      PSEUDONYMIZE both succeeded via the new HTTP extractor backend. All containers healthy.
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-16'

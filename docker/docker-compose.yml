@@ -384,16 +384,10 @@ services:
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       # Opt-in flag; production deployments default false.  Set true in .env for demo.
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
-      # Extractor sandbox knobs (used when YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true).
-      # IRIS-DOC-001 (2026-06-15): extracted from docker-compose.extractor.yml overlay
-      # so the feature works without needing a separate -f flag on compose up.
-      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
-      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
-      YASHIGANI_EXTRACTOR_MEM_LIMIT: "512m"
-      YASHIGANI_EXTRACTOR_CPUS: "1.0"
-      YASHIGANI_EXTRACTOR_PIDS_LIMIT: "64"
+      # Extractor sandbox: gateway does NOT spawn containers — only backoffice does.
+      # These knobs are kept here only for completeness (MAX_OUTPUT_BYTES is read by
+      # the proxy_modeb pipeline in the gateway). The sandbox runtime vars live in backoffice.
       YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
-      YASHIGANI_EXTRACTOR_SECCOMP_PATH: "/app/docker/seccomp/yashigani-extractor.json"
       # P3 MCP broker — JSON array of registered MCP server descriptors.
       # Written by install.sh --onboard (Shape C) and cleared by install.sh --offboard.
       # Default [] = no MCP servers (broker disabled at startup).
@@ -655,24 +649,16 @@ services:
       YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
-      # Extractor sandbox knobs (backoffice runs /admin/documents/inspect which spawns sandbox).
-      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
+      # Extractor sandbox — Design A (LAURA-30-001 / YSG-RISK-080 fix, 2026-06-16).
+      # Backoffice calls the pre-spawned extractor-svc container over plain HTTP.
+      # NO docker socket, NO socket-proxy, NO container API access in backoffice.
+      # A compromised backoffice can only POST document bytes to extractor-svc:8090.
+      # The extractor-svc is itself hardened (egress=none, ro-rootfs, cap_drop ALL,
+      # non-root, seccomp, AppArmor) on an internal-only bridge (extractor_svc).
+      YASHIGANI_EXTRACTOR_WORKER_URL: "http://extractor-svc:8090"
+      YASHIGANI_EXTRACTOR_RUNTIME: "http"
       YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
-      YASHIGANI_EXTRACTOR_MEM_LIMIT: "512m"
-      YASHIGANI_EXTRACTOR_CPUS: "1.0"
-      YASHIGANI_EXTRACTOR_PIDS_LIMIT: "64"
       YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
-      YASHIGANI_EXTRACTOR_SECCOMP_PATH: "/app/docker/seccomp/yashigani-extractor.json"
-      # Extractor sandbox: route docker CLI to the socket-proxy (filtered TCP API).
-      # The raw host socket is NOT mounted in this container. The socket-proxy
-      # (service: socket-proxy, network: extractor_proxy) allows ONLY container
-      # lifecycle calls (create/start/stop/wait/logs) and denies exec, images/build,
-      # swarm, volumes, secrets, privileged variants. This replaces the prior
-      # /var/run/docker.sock direct mount (IRIS-DOC-001 hack — host-takeover surface).
-      # YASHIGANI_EXTRACTOR_RUNTIME=docker forces the CLI backend (not SDK); the
-      # docker CLI binary is baked into the backoffice image (docker-cli package).
-      DOCKER_HOST: tcp://socket-proxy:2375
-      YASHIGANI_EXTRACTOR_RUNTIME: "docker"
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -699,9 +685,9 @@ services:
       # Source: docker/secrets/audit-signing/ (gitignored, populated by
       # install.sh _provision_audit_signing_key).
       - ./secrets/audit-signing:/run/audit-signing:ro
-      # NOTE: NO raw docker.sock mount here. The extractor sandbox reaches
-      # Docker via the socket-proxy service (extractor_proxy network, TCP 2375,
-      # filtered to container-lifecycle calls only). See socket-proxy service.
+      # LAURA-30-001 / YSG-RISK-080 fix (Design A): NO docker socket mounted here.
+      # Backoffice reaches the extractor via HTTP (extractor-svc:8090 on extractor_svc
+      # internal bridge). The host-escape primitive is fully eliminated.
     read_only: true
     tmpfs:
       - /tmp:size=100M
@@ -717,7 +703,9 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (backoffice.yaml:104-105).
     # No cap_add: backoffice binds port 8443 (non-privileged).
     cap_drop: [ALL]
-    # NO group_add: the raw docker socket is not mounted; group membership not needed.
+    # NO group_add: no docker socket mounted; no group membership needed.
+    # NO docker CLI binary in the backoffice image (removed in Design A rebuild —
+    # the docker-cli package is no longer needed since backoffice uses HTTP not CLI).
     healthcheck:
       # mTLS — Pattern A for Python ssl: trust anchor is the public ca_root.crt
       # (Py 3.12/OpenSSL 3.0 strict-chain rejects intermediate-only — gate #58a).
@@ -731,112 +719,88 @@ services:
         condition: service_healthy
       pgbouncer:
         condition: service_healthy
-      socket-proxy:
+      extractor-svc:
         condition: service_healthy
     # EX-231-10: backoffice joins caddy_internal (Caddy→backoffice:8443) AND
     # data (backoffice→redis, policy, ollama, pgbouncer outbound).
     # obs (#21): also joins obs to forward audit events to wazuh-indexer:9200
     # (obs-plane only). Outbound mesh-mTLS only; no inbound exposure. Does NOT join edge.
-    # extractor_proxy: backoffice → socket-proxy:2375 for extractor sandbox only.
+    # extractor_svc: backoffice → extractor-svc:8090 for doc enforcement (Design A).
     networks:
       - caddy_internal
       - data
       - obs
-      - extractor_proxy
+      - extractor_svc
 
   # ---------------------------------------------------------------------------
-  # Docker Socket Proxy — least-privilege container lifecycle gateway
+  # Extractor Service — pre-spawned hardened document extraction worker
   #
-  # Replaces the raw /var/run/docker.sock bind-mount that Iris added to
-  # backoffice (IRIS-DOC-001, 2026-06-15) for the extractor sandbox.
-  # A raw socket in a network-facing admin container is a host-takeover surface:
-  # even :ro allows creating privileged containers, bind-mounting /, and running
-  # arbitrary code as root on the host. This proxy eliminates that surface.
+  # LAURA-30-001 / YSG-RISK-080 fix (Design A, 2026-06-16):
+  #   The previous design (commit 6fc10fc) used a tecnativa socket-proxy to filter
+  #   docker socket calls. Laura proved that CONTAINERS=1 + POST=1 allows
+  #   POST /containers/create with arbitrary HostConfig.Binds — the proxy is
+  #   path/method-only and CANNOT inspect the request body. This gave backoffice
+  #   full host bind-mount capability = host takeover from a compromised backoffice.
   #
-  # Design (fix/medlow-findings):
-  #   - tecnativa/docker-socket-proxy@sha256:<amd64-digest> holds the raw socket.
-  #   - It exposes TCP 2375 on the extractor_proxy internal network ONLY.
-  #   - HAProxy ACL allows: CONTAINERS, POST (create/start/wait/logs), ALLOW_STOP.
-  #   - HAProxy ACL denies: EXEC, IMAGES, BUILD, SWARM, VOLUMES, SECRETS,
-  #     NETWORKS, SYSTEM, INFO, PLUGINS, SERVICES, CONFIGS, NODES, TASKS,
-  #     SESSION, GRPC, DISTRIBUTION, AUTH, COMMIT, ALLOW_RESTARTS.
-  #   - No ports published — TCP 2375 is internal-only (extractor_proxy bridge).
-  #   - Hardened: read_only, cap_drop ALL, no-new-privileges, non-root (nobody).
-  #   - Podman path: set YASHIGANI_DOCKER_SOCKET to the Podman rootless socket
-  #     (/run/user/$UID/podman/podman.sock). install.sh sets this when
-  #     --runtime podman is selected. The CLI backend is runtime-agnostic.
+  #   Design A (this service) eliminates the host-escape primitive entirely:
+  #   - Backoffice has NO docker socket, NO container API access.
+  #   - Backoffice calls this pre-spawned service via HTTP (extractor_svc bridge).
+  #   - This service runs the worker.py logic in a subprocess per request.
+  #   - A compromised backoffice can only POST document bytes to port 8090.
+  #   - This service cannot reach the internet or any other service (internal bridge).
+  #
+  # Security posture:
+  #   - read_only: true — no filesystem writes
+  #   - cap_drop: [ALL] — no Linux capabilities
+  #   - no-new-privileges — cannot escalate
+  #   - non-root (UID/GID 65532 — nonroot, per Dockerfile.extractor)
+  #   - seccomp confined (yashigani-extractor.json)
+  #   - AppArmor where loaded (yashigani-extractor)
+  #   - mem_limit 512m + pids_limit 64
+  #   - extractor_svc bridge: internal=true (no internet egress)
+  #   - NO volume mounts beyond a small tmpfs for parser scratch
+  #   - NO docker socket, NO secrets, NO host paths
   # ---------------------------------------------------------------------------
-  socket-proxy:
+  extractor-svc:
     dns_search: ["."]
-    # tecnativa/docker-socket-proxy:latest — amd64 digest (2026-06-16).
-    # Re-pin: docker manifest inspect tecnativa/docker-socket-proxy:latest
-    image: tecnativa/docker-socket-proxy@sha256:bd2241b3bec83abcff25927a0a7ae518e0c5bef624b3cc247dcb31e68b53f417
+    image: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.extractor
     restart: unless-stopped
-    mem_limit: 64m
-    cpus: 0.1
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 64
     environment:
-      # Deny everything by default; allow ONLY container lifecycle for extractor.
-      CONTAINERS: 1     # /containers/* — create, start, wait, logs, stop
-      POST: 1           # allow POST methods (create / start / wait / stop)
-      ALLOW_STOP: 1     # POST /containers/{id}/stop (timeout cleanup path)
-      # Explicit deny for every other resource class (defence-in-depth).
-      EXEC: 0
-      IMAGES: 0
-      BUILD: 0
-      SWARM: 0
-      VOLUMES: 0
-      SECRETS: 0
-      NETWORKS: 0
-      SYSTEM: 0
-      INFO: 0
-      PLUGINS: 0
-      SERVICES: 0
-      CONFIGS: 0
-      NODES: 0
-      TASKS: 0
-      SESSION: 0
-      GRPC: 0
-      DISTRIBUTION: 0
-      AUTH: 0
-      COMMIT: 0
-      ALLOW_RESTARTS: 0
-      ALLOW_START: 0    # start is via POST /containers/{id}/start (covered by CONTAINERS+POST)
-      # VERSION + PING: required for CliContainerBackend.ping() (docker version probe).
-      VERSION: 1
-      PING: 1
-      LOG_LEVEL: info
-    volumes:
-      # The proxy holds the raw socket — isolated here; not mounted in backoffice.
-      # YASHIGANI_DOCKER_SOCKET defaults to the Docker Engine socket; override to
-      # /run/user/$UID/podman/podman.sock on Podman rootless deployments.
-      - ${YASHIGANI_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
-    # No ports: TCP 2375 is extractor_proxy-internal only (not published to host).
-    read_only: true
+      YASHIGANI_EXTRACTOR_HOST: "0.0.0.0"
+      YASHIGANI_EXTRACTOR_PORT: "8090"
+      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
+      YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
+      YASHIGANI_EXTRACTOR_MAX_REQUEST_BYTES: "134217728"
+      YASHIGANI_WORKER_PATH: "/app/worker.py"
+      YASHIGANI_EXTRACTOR_IN_SANDBOX: "1"
+      PYTHONUNBUFFERED: "1"
+    # tmpfs for parser scratch (openpyxl, pypdf temp files). NO host mounts.
     tmpfs:
-      # HAProxy entrypoint writes /tmp/haproxy.cfg (generated from template).
-      # HAProxy daemon writes pid + stats files to /run.
-      - /tmp:size=4m,mode=1777
-      - /run:size=4m,mode=1777
+      - /tmp:size=64m,noexec,nosuid,nodev,mode=1777
+    read_only: true
     security_opt:
       - no-new-privileges:true
+      - seccomp=${YASHIGANI_EXTRACTOR_SECCOMP_PROFILE:-./seccomp/yashigani-extractor.json}
+      - apparmor=${YASHIGANI_EXTRACTOR_APPARMOR_PROFILE:-yashigani-extractor}
     cap_drop: [ALL]
-    # NOTE: socket-proxy runs as root (uid 0) inside the container. This is
-    # intentional and unavoidable: the image's HAProxy process needs to read
-    # /var/run/docker.sock (root:docker 660 on the host). The compensating
-    # controls are: ONLY this service holds the raw socket; cap_drop ALL removes
-    # all Linux capabilities post-launch; read_only rootfs prevents persistence;
-    # extractor_proxy is internal-only — no direct host or internet exposure;
-    # HAProxy ACLs are the containment gate, not OS user isolation.
+    # No cap_add, no volumes, no docker socket — this is the hardened extraction jail.
     healthcheck:
-      # HAProxy proxies /_ping to the Docker daemon — confirms the proxy is
-      # reachable AND the Docker socket is live before backoffice depends on it.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:2375/_ping || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/healthz', timeout=4)\" || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
+    # extractor_svc: internal-only bridge (no internet reachability).
+    # Only backoffice joins this bridge — the extractor service is invisible to
+    # all other services (gateway, redis, OPA, caddy, etc.).
     networks:
-      - extractor_proxy
+      - extractor_svc
 
   # ---------------------------------------------------------------------------
   # Open WebUI — User-facing chat interface (v1.0)
@@ -3005,11 +2969,12 @@ networks:
     driver: bridge
     enable_ipv6: false
     internal: true
-  # Extractor proxy network (fix/medlow-findings): socket-proxy ↔ backoffice only.
-  # Members: socket-proxy (raw socket holder) + backoffice (extractor sandbox client).
-  # No other service joins this bridge. internal:true — no host-external egress.
+  # Extractor service network (LAURA-30-001 / YSG-RISK-080 fix, Design A):
+  # extractor-svc ↔ backoffice only. No other service joins this bridge.
+  # internal:true — no internet reachability for extractor-svc (belt-and-suspenders
+  # on top of the extractor service's own egress=none design: no outbound at all).
   # IPv6 disabled consistent with all other internal bridges (Tiago 2026-05-26).
-  extractor_proxy:
+  extractor_svc:
     driver: bridge
     enable_ipv6: false
     internal: true
