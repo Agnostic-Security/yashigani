@@ -14161,7 +14161,7 @@ main() {
         exit 1
       fi
 
-      # Substitute placeholder and write runtime file (mode 0640 — readable by group GID 2002).
+      # Substitute placeholder and write runtime file.
       # Use a temp file + atomic rename to avoid a partial write being bind-mounted.
       local _oc_tmpfile
       _oc_tmpfile="$(mktemp "${WORK_DIR}/docker/openclaw/.openclaw_runtime_XXXXXX")"
@@ -14177,7 +14177,30 @@ main() {
         log_error "openclaw: openclaw.runtime.json is not a regular file after write — aborting to prevent EISDIR crash"
         exit 1
       fi
-      log_info "openclaw.runtime.json written (bearer substituted, mode 0640)"
+
+      # Fix EACCES: chown openclaw.runtime.json to the openclaw container's runtime
+      # UID/GID (node uid=1000, gid=1000 — confirmed from image USER directive).
+      # Mode 0640: owner rw, group r, no world-read — preserves CWE-732 intent (the
+      # file holds yashigani_internal_bearer; world-read was already excluded by the
+      # o+rX exclusion in commit 1f25bec). The install user (e.g. uid 1001) writes the
+      # file, but the openclaw process runs as uid 1000 and is not the owner — so it
+      # cannot read at 0640 unless it IS the owner. We chown 1000:1000 so the openclaw
+      # process is the file owner and mode 0640 grants it read.
+      #
+      # Docker: _do_chown uses an ephemeral alpine container (docker_run mode) with the
+      # openclaw directory mounted at /s — daemon-provided root can chown any UID.
+      # Podman rootless: _do_chown uses podman unshare (local) or podman run (remote)
+      # to remap container UID 1000 into the host subuid namespace; virtiofs/fuse-
+      # overlayfs ensures the remapped ownership is seen correctly by the container.
+      # K8s: _do_chown is a no-op (k8s path) — Helm uses podSecurityContext.fsGroup.
+      #
+      # _mount_base arg (arg 5): the parent directory of _oc_runtime so the /s mount
+      # and the relative path strip work correctly (S5 convention from _do_chown).
+      local _oc_dir
+      _oc_dir="$(dirname "$_oc_runtime")"
+      _do_chown "1000" "$_oc_runtime" "openclaw.runtime.json" "0640" "$_oc_dir" \
+        || { log_error "openclaw: chown 1000:1000 on openclaw.runtime.json failed — openclaw will EACCES on startup"; exit 1; }
+      log_info "openclaw.runtime.json written (bearer substituted, mode 0640, owner 1000:1000 — container-readable, not world-readable)"
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load
