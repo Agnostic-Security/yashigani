@@ -1287,6 +1287,18 @@ services:
           fi
         fi
         echo "Model pull complete: ${OLLAMA_MODEL:-qwen2.5:3b}"
+        # SF-QWEN-001: always also pull qwen2.5:3b regardless of the VRAM-tier model.
+        # The gateway (DEFAULT_MODELS), langflow (LANGFLOW_DEFAULT_MODEL), letta
+        # (LETTA_LLM_MODEL/LETTA_EMBEDDING_MODEL), and openclaw all hardcode
+        # qwen2.5:3b as their inference target. If OLLAMA_MODEL was set to a
+        # higher-VRAM-tier model (e.g. llama3.1:8b on 12 GB VRAM) this secondary
+        # pull was skipped, leaving agents with HTTP 404 "model not found" on
+        # every chat/completion request. Pull is idempotent when already present.
+        if [ "${OLLAMA_MODEL:-qwen2.5:3b}" != "qwen2.5:3b" ]; then
+          echo "Pulling required base model: qwen2.5:3b (agent/gateway dependency — SF-QWEN-001)"
+          OLLAMA_HOST=http://ollama:11434 ollama pull qwen2.5:3b
+          echo "Base model pull complete: qwen2.5:3b"
+        fi
     depends_on:
       ollama:
         condition: service_healthy
