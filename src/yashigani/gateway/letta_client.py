@@ -6,10 +6,16 @@ on port 8283 but is NOT a drop-in OpenAI replacement. This adapter:
 1. Creates a default Letta agent on first request (if none exists)
 2. Routes messages via POST /v1/agents/{agent_id}/messages (native API)
 3. Converts Letta's response format to OpenAI ChatCompletionResponse
+
+fix/medlow-findings P1.5: the brain model used when creating the default agent is
+now configurable via YASHIGANI_LETTA_BRAIN_MODEL (falls back to
+"openai-proxy/qwen2.5:3b"). This is the model Letta uses for its OWN reasoning —
+it must be reachable via Letta's OPENAI_API_BASE (which points to the gateway).
 """
 
 import json
 import logging
+import os
 import uuid
 
 import httpx
@@ -20,13 +26,23 @@ logger = logging.getLogger(__name__)
 _default_agent_id: str | None = None
 
 
+def _letta_brain_model() -> str:
+    """Return the model Letta uses for its own reasoning (configurable at deploy time).
+
+    Letta resolves this through its ``openai-proxy/`` provider prefix, which maps to
+    the gateway's /v1 endpoint.  The concrete model name after the slash must exist in
+    Ollama (pulled by the installer).  Installer default: qwen2.5:3b.
+    """
+    return os.getenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+
+
 async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
     """Get or create the default Letta agent. Returns agent_id."""
     global _default_agent_id
     if _default_agent_id:
         return _default_agent_id
 
-    # Check if any agents exist
+    # Check if any agents exist — P1.5: handle non-200 list response gracefully.
     resp = await client.get(f"{base_url}/v1/agents/")
     if resp.status_code == 200:
         agents = resp.json()
@@ -35,7 +51,15 @@ async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
                 _default_agent_id = agent["id"]
                 logger.info("Letta: found existing agent %s", _default_agent_id)
                 return _default_agent_id
+    elif resp.status_code != 404:
+        # Non-404 error on list call: log and continue to create attempt;
+        # surface a clear error if create also fails rather than swallowing.
+        logger.warning(
+            "Letta: agent list returned HTTP %s — proceeding to create: %s",
+            resp.status_code, resp.text[:200],
+        )
 
+    brain_model = _letta_brain_model()
     # Create a new agent
     resp = await client.post(f"{base_url}/v1/agents/", json={
         "name": "yashigani-default",
@@ -43,12 +67,18 @@ async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
             {"label": "human", "value": "The user is interacting via the Yashigani AI security gateway."},
             {"label": "persona", "value": "I am a helpful AI assistant with persistent memory. I remember our conversations."},
         ],
-        "model": "openai-proxy/qwen2.5:3b",
+        "model": brain_model,
         "embedding": "letta/letta-free",
     })
 
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Letta agent creation failed: {resp.status_code} {resp.text[:200]}")
+        # P1.5: include the model name in the error so admins can distinguish
+        # "model not found on Letta" (404 on model) vs "Letta unreachable" vs
+        # other configuration issues.
+        raise RuntimeError(
+            f"Letta agent creation failed (model={brain_model!r}): "
+            f"HTTP {resp.status_code} {resp.text[:300]}"
+        )
 
     agent_data = resp.json()
     _default_agent_id = agent_data["id"]

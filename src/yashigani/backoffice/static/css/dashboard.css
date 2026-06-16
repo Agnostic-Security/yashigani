@@ -146,6 +146,9 @@ tr:hover { background: #f8fafc; }
 .card-clickable { cursor: pointer; }
 .card-value-lg { font-size: 1.2rem; font-weight: 700; color: #1e293b; }
 .card-desc { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+/* tile-disabled: optional-service card whose profile is not deployed.
+   Renders greyed-out and non-interactive. JS (loadMonitoring) toggles this. */
+.tile-disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.4); pointer-events: none; }
 
 /* ── Text helpers ───────────────────────────────────────────── */
 .txt-sm { font-size: 0.85rem; }

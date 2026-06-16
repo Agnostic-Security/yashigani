@@ -56,6 +56,16 @@ import os
 import re
 import uuid
 
+
+def _letta_brain_model() -> str:
+    """Return the brain model for letta orchestration agents (configurable).
+
+    P1.5 (fix/medlow-findings): consolidate model resolution here and in
+    letta_client.py so both use YASHIGANI_LETTA_BRAIN_MODEL; this lets the
+    installer set a single env var to swap the brain model for all letta paths.
+    """
+    return os.environ.get("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+
 logger = logging.getLogger(__name__)
 
 
@@ -319,6 +329,7 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
         "gateway executes on my behalf.\n\n"
         + _BRAIN_PROTOCOL.format(tools=_tool_lines(catalog))
     )
+    brain_model = _letta_brain_model()
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{base_url}/v1/agents/", json={
             "name": f"yashigani-orch-{uuid.uuid4().hex[:8]}",
@@ -327,12 +338,16 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
                                             "orchestration request."},
                 {"label": "persona", "value": persona},
             ],
-            "model": "openai-proxy/qwen2.5:3b",
+            "model": brain_model,
             "embedding": "letta/letta-free",
         })
         if resp.status_code not in (200, 201):
-            raise RuntimeError(f"letta brain-agent creation failed: "
-                               f"{resp.status_code} {resp.text[:200]}")
+            # P1.5: include the model name for fast diagnostics (404 on model
+            # means the model name is wrong or not configured in Letta's proxy).
+            raise RuntimeError(
+                f"letta brain-agent creation failed (model={brain_model!r}): "
+                f"HTTP {resp.status_code} {resp.text[:300]}"
+            )
         return resp.json()["id"]
 
 

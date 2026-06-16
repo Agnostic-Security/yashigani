@@ -441,6 +441,35 @@
                     <tbody id="allocs-tbody"><tr><td colspan="4" class="empty">No allocations configured</td></tr></tbody>
                 </table>
             </div>
+            <!-- Cloud-provider API keys (OpenAI / Anthropic) — stored via KMS -->
+            <div class="panel">
+                <div class="panel-header">Cloud Provider API Keys</div>
+                <div class="panel-body">
+                    <p class="txt-note">Store an OpenAI or Anthropic API key so the gateway can route to cloud models.
+                        Keys are stored via the KMS backend (never plaintext DB). Step-up required to save.
+                        The gateway reads keys from KMS at routing time using the key name convention
+                        <code>openai_api_key</code> / <code>anthropic_api_key</code>.</p>
+                    <table>
+                        <thead><tr><th>Provider</th><th>Status</th></tr></thead>
+                        <tbody id="cloud-key-status"><tr><td colspan="2" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                    <div class="form-row form-row--mt">
+                        <div><label class="lbl">Provider</label><br>
+                            <select id="cloud-key-provider" class="fi w-140">
+                                <option value="openai">OpenAI</option>
+                                <option value="anthropic">Anthropic</option>
+                            </select>
+                        </div>
+                        <div class="flex-1"><label class="lbl">API Key (stored encrypted via KMS)</label><br>
+                            <input id="cloud-key-value" type="password" placeholder="sk-…" class="fi w-full" autocomplete="new-password"></div>
+                    </div>
+                    <div class="form-row--gap12 form-row--mt">
+                        <button data-action="cloudKeySet" class="btn-sm-save">Save key (step-up)</button>
+                    </div>
+                    <div id="cloud-key-result" class="form-result"></div>
+                </div>
+            </div>
+
             <!-- #25: dual-admin cloud-LLM risk-accepted override (break-glass) -->
             <div class="panel">
                 <div class="panel-header">Cloud-LLM Override (dual-admin, risk-accepted)</div>
@@ -1034,10 +1063,11 @@
                     <div class="card-value card-value-lg">Query Engine</div>
                     <p class="card-desc">Direct access to Prometheus PromQL queries, alert rules, and target status. Click to open.</p>
                 </div>
-                <div class="card card-clickable" data-action="openExternal" data-url="/admin/wazuh/">
+                <!-- Wazuh tile — optional service; loadMonitoring() hides/greys when not deployed -->
+                <div id="monitoring-tile-wazuh" class="card card-clickable tile-disabled" data-url="/admin/wazuh/" aria-disabled="true">
                     <div class="card-label">Wazuh SIEM</div>
                     <div class="card-value card-value-lg">Security Monitoring</div>
-                    <p class="card-desc">Open-source SIEM: threat detection, compliance, vulnerability assessment. Available when installed with --wazuh flag.</p>
+                    <p id="monitoring-tile-wazuh-note" class="card-desc">Not deployed — re-run installer with --wazuh to enable.</p>
                 </div>
             </div>
             <h2>Quick Links</h2>
@@ -1060,6 +1090,37 @@
                             <tr><td>CI/CD</td><td>Pipeline metrics and deployment tracking</td><td><a href="/admin/grafana/d/yashigani-cicd" target="_blank">Open</a></td></tr>
                         </tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- External SIEM connect form — wired to /admin/audit/siem/config (PUT) + test (POST) -->
+            <div class="panel">
+                <div class="panel-header">External SIEM / Audit Sink</div>
+                <div class="panel-body">
+                    <p class="txt-note">Forward audit events to an external SIEM (Splunk, Elasticsearch, or an existing Wazuh).
+                        Step-up required to save. A test event is sent to verify connectivity before the change is persisted.</p>
+                    <div id="siem-config-status" class="form-result">Loading…</div>
+                    <div class="form-row form-row--mt">
+                        <div><label class="lbl">Backend</label><br>
+                            <select id="siem-backend" class="fi w-160">
+                                <option value="none">None (disabled)</option>
+                                <option value="splunk">Splunk HEC</option>
+                                <option value="elasticsearch">Elasticsearch</option>
+                                <option value="wazuh">Wazuh (existing)</option>
+                            </select>
+                        </div>
+                        <div><label class="lbl">Endpoint URL</label><br>
+                            <input id="siem-endpoint" type="url" placeholder="https://siem.corp.example:9200" class="fi w-320"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="flex-1"><label class="lbl">API Key / Token (stored via KMS — never plaintext DB)</label><br>
+                            <input id="siem-token" type="password" placeholder="Leave blank to keep existing" class="fi w-full" autocomplete="new-password"></div>
+                    </div>
+                    <div class="form-row--gap12 form-row--mt">
+                        <button data-action="siemTest" class="btn-sm">Test connection</button>
+                        <button data-action="siemSave" class="btn-sm-save">Save (step-up)</button>
+                    </div>
+                    <div id="siem-config-result" class="form-result"></div>
                 </div>
             </div>
         </div>

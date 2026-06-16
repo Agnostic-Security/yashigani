@@ -508,15 +508,39 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
         or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
     ).rstrip("/")
 
-    # Resolve install-default model
+    # P1.4 (fix/medlow-findings): resolve model robustly — surface a SPECIFIC error
+    # if no model is available rather than falling back to a hardcoded default that
+    # might also be absent. Mirrors the improved _resolve_default_model in policies.py.
     pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL")
+    ollama_reachable = False
     try:
         async with _httpx.AsyncClient(timeout=10.0) as c:
             tags_resp = await c.get(ollama_url + "/api/tags")
+            tags_resp.raise_for_status()
             avail = [m.get("name") for m in tags_resp.json().get("models", []) if m.get("name")]
-    except Exception:
+            ollama_reachable = True
+    except Exception as _exc:
+        logger.warning("generate_pattern: Ollama unreachable at %s: %s", ollama_url, _exc)
         avail = []
-    model = pref if (pref and pref in avail) else (avail[0] if avail else (pref or "qwen2.5:3b"))
+    if not avail and not pref:
+        raise _HTTPException(
+            status_code=503,
+            detail={
+                "error": "no_model_available",
+                "message": (
+                    f"No LLM models available. Ollama at {ollama_url} "
+                    + ("returned 0 models — pull one first (e.g. `ollama pull qwen2.5:3b`)"
+                       if ollama_reachable else "is unreachable — ensure the Ollama service is running")
+                    + ". Set YASHIGANI_OPA_ASSISTANT_MODEL to override the model choice."
+                ),
+            },
+        )
+    model = pref if pref else (avail[0] if avail else "qwen2.5:3b")
+    if pref and avail and pref not in avail:
+        logger.warning(
+            "generate_pattern: preferred model %r not in pulled models %s — will attempt anyway",
+            pref, avail,
+        )
 
     # LAURA-2255-003: chat API with separate system + user roles.
     # description is the user message — not concatenated into the system prompt.
@@ -538,11 +562,12 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
             raw = (resp.json().get("message", {}).get("content") or "").strip()
     except _httpx.HTTPError as exc:
         logger.warning("generate_pattern: LLM error: %s", exc)
+        # P1.4: include the model name in the error so admins can diagnose
+        # "model not found" (404) vs "Ollama down" (connection error) vs other issues.
         raise _HTTPException(
             status_code=503,
             detail={"error": "llm_unavailable",
-                    "message": "Could not reach the pattern-generation LLM. "
-                               "Ensure the Ollama service is running."},
+                    "message": f"LLM request failed (model={model!r}, ollama={ollama_url}): {exc}"},
         )
 
     # Parse JSON — best-effort; log failures server-side only (never expose raw to client)

@@ -49,12 +49,13 @@ function showPage(name, triggerEl) {
     if (name === 'agents') loadAgents();
     if (name === 'accounts') { loadAccounts(); loadEnforcementBanner(); }
     if (name === 'budgets') loadBudgets();
-    if (name === 'models') { loadModels(); loadCloudOverride(); }
+    if (name === 'models') { loadModels(); loadCloudOverride(); loadCloudKeys(); }
     if (name === 'sensitivity') loadSensitivity();
     if (name === 'policies') { loadPolicies(); loadLifecycle(); }
     if (name === 'audit') loadAuditFacets();  // R19/R20 — populate verdict + source-type filters
     if (name === 'settings') { loadSettings(); loadEntitlements(); }
     if (name === 'backup') loadBackup();
+    if (name === 'monitoring') { loadMonitoring(); loadSiemConfig(); }
     // PKI / Crypto page — R24: also load crypto inventory when PKI tab is activated.
     // loadPkiStatus is defined in pki.js (loaded defer).
     if (name === 'pki') {
@@ -1348,18 +1349,22 @@ async function createAdmin() {
 
 async function createUser() {
     var username = document.getElementById('new-user-name').value.trim();
+    var email = document.getElementById('new-user-email').value.trim();
     var result = document.getElementById('create-user-result');
-    if (!username) { result.textContent = 'Username is required.'; return; }
+    if (!email) { result.textContent = 'Email is required (it is the user’s canonical identity).'; return; }
     result.innerHTML = '<span class="loading">Creating...</span>';
+    var payload = { email: email };
+    if (username) { payload.username = username; }
     var resp = await fetch('/admin/users', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username })
+        body: JSON.stringify(payload)
     });
     if (resp.ok) {
         var data = await resp.json();
         result.innerHTML = '<span class="badge badge-green">Created</span>';
         document.getElementById('new-user-name').value = '';
+        document.getElementById('new-user-email').value = '';
         showCredentials(username, data.temporary_password, data.totp_secret, data.totp_uri);
         loadAccounts();
     } else {
@@ -2966,6 +2971,17 @@ document.addEventListener('click', function(e) {
         case 'disableService':
             toggleService(e.target.dataset.service, 'disable');
             break;
+        // SIEM / audit sink
+        case 'siemSave':
+            siemSave();
+            break;
+        case 'siemTest':
+            siemTest();
+            break;
+        // Cloud-provider API key
+        case 'cloudKeySet':
+            cloudKeySet();
+            break;
         // Backup
         case 'createBackup':
             createBackup();
@@ -3163,6 +3179,127 @@ async function toggleService(serviceId, action) {
 }
 
 loadServices();
+
+// ── Monitoring page — hide/grey optional service tiles when not deployed ────
+// Fetches /admin/services and adds .tile-disabled to each optional-service
+// card whose profile is not in the deployed set. Grafana and Prometheus are
+// always present (bundled); only Wazuh is optional. If the services API is
+// unavailable, tiles remain as-is (no silent removal).
+async function loadMonitoring() {
+    var data = await api('/admin/services');
+    if (!data || !data.services) return;
+    var deployed = {};
+    data.services.forEach(function(s) { deployed[s.id] = (s.status === 'running'); });
+
+    // Gate: Wazuh monitoring tile
+    var wazuhTile = document.getElementById('monitoring-tile-wazuh');
+    if (wazuhTile) {
+        if (deployed['wazuh']) {
+            wazuhTile.classList.remove('tile-disabled');
+            wazuhTile.removeAttribute('aria-disabled');
+            wazuhTile.setAttribute('data-action', 'openExternal');
+        } else {
+            wazuhTile.classList.add('tile-disabled');
+            wazuhTile.setAttribute('aria-disabled', 'true');
+            wazuhTile.removeAttribute('data-action');  // prevent click-through
+            var wazuhNote = document.getElementById('monitoring-tile-wazuh-note');
+            if (wazuhNote) wazuhNote.textContent = 'Not deployed — re-run installer with --wazuh to enable.';
+        }
+    }
+}
+
+// ── SIEM config (Monitoring page) ───────────────────────────────────────────
+async function loadSiemConfig() {
+    var status = document.getElementById('siem-config-status');
+    if (!status) return;
+    var data = await api('/admin/audit/siem/config');
+    if (!data) { status.textContent = 'Could not load SIEM config.'; return; }
+    var be = data.backend || 'none';
+    var ep = data.endpoint || '';
+    status.innerHTML = 'Current backend: <strong>' + escapeHtml(be) + '</strong>'
+        + (ep ? ' — <span class="txt-muted">' + escapeHtml(ep) + '</span>' : '');
+    var sel = document.getElementById('siem-backend');
+    if (sel) sel.value = be;
+    var epEl = document.getElementById('siem-endpoint');
+    if (epEl) epEl.value = ep;
+}
+
+async function siemTest() {
+    var result = document.getElementById('siem-config-result');
+    if (result) result.innerHTML = '<span class="loading">Sending test event…</span>';
+    var r = await apiMutate('/admin/audit/siem/config/test', { method: 'POST' });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Failed</span>'; return; }
+    var data = await r.json().catch(function() { return {}; });
+    if (r.ok) {
+        if (result) result.innerHTML = '<span class="badge badge-green">Test event sent</span>';
+    } else {
+        if (result) result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(data.detail || r.status);
+    }
+}
+
+async function siemSave() {
+    var result = document.getElementById('siem-config-result');
+    var backend = (document.getElementById('siem-backend') || {}).value || 'none';
+    var endpoint = (document.getElementById('siem-endpoint') || {}).value || '';
+    var token = (document.getElementById('siem-token') || {}).value || '';
+    if (result) result.innerHTML = '<span class="loading">Saving…</span>';
+    // Step-up: apiMutate triggers TOTP challenge automatically.
+    var body = { backend: backend, endpoint: endpoint || null };
+    if (token) body.token_secret_key = token;
+    var r = await apiMutate('/admin/audit/siem/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Cancelled</span>'; return; }
+    var data = await r.json().catch(function() { return {}; });
+    if (r.ok) {
+        if (result) result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('siem-token').value = '';
+        loadSiemConfig();
+    } else {
+        if (result) result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(data.detail || r.status);
+    }
+}
+
+// ── Cloud provider API key (Models page) ────────────────────────────────────
+async function loadCloudKeys() {
+    var status = document.getElementById('cloud-key-status');
+    if (!status) return;
+    var data = await api('/admin/cloud-keys');
+    if (!data) { status.textContent = 'Could not load cloud key status.'; return; }
+    var html = '';
+    (data.providers || []).forEach(function(p) {
+        var badge = p.configured
+            ? '<span class="badge badge-green">Configured</span>'
+            : '<span class="badge badge-slate">Not set</span>';
+        html += '<tr><td>' + escapeHtml(p.provider) + '</td><td>' + badge + '</td></tr>';
+    });
+    status.innerHTML = html || '<span class="txt-muted">No keys configured.</span>';
+}
+
+async function cloudKeySet() {
+    var result = document.getElementById('cloud-key-result');
+    var provider = (document.getElementById('cloud-key-provider') || {}).value || '';
+    var key = (document.getElementById('cloud-key-value') || {}).value || '';
+    if (!provider) { if (result) result.innerHTML = '<span class="badge badge-red">Select a provider</span>'; return; }
+    if (!key) { if (result) result.innerHTML = '<span class="badge badge-red">API key is required</span>'; return; }
+    if (result) result.innerHTML = '<span class="loading">Saving (step-up required)…</span>';
+    var r = await apiMutate('/admin/cloud-keys', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: provider, api_key: key })
+    });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Cancelled</span>'; return; }
+    var data = await r.json().catch(function() { return {}; });
+    if (r.ok) {
+        if (result) result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('cloud-key-value').value = '';
+        loadCloudKeys();
+    } else {
+        if (result) result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(data.detail || r.status);
+    }
+}
 
 // Backup status + verify
 async function loadBackup() {
