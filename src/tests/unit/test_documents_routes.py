@@ -55,6 +55,27 @@ class _FakeRBACStore:
         return self._membership.get(email, [])
 
 
+class _FakeAccountRecord:
+    """Minimal account record returned by the fake auth service."""
+
+    def __init__(self, email: str):
+        self.email = email
+        self.username = email
+
+
+class _FakeAuthService:
+    """Minimal async auth_service for the detokenize gate (LAURA-30-003).
+
+    The gate calls ``await auth_service.get_account_by_id(account_id)`` to
+    resolve UUID → email.  In these unit tests ``account_id`` IS already an
+    email address (tests pre-date the UUID→email fix), so the fake returns an
+    AccountRecord whose email equals the supplied account_id.
+    """
+
+    async def get_account_by_id(self, account_id: str):  # noqa: D401
+        return _FakeAccountRecord(email=account_id)
+
+
 def _session(account_id: str) -> Session:
     return Session(
         token="t",
@@ -95,6 +116,10 @@ def client(monkeypatch):
     })
     backoffice_state.rbac_store = store
     backoffice_state.audit_writer = None
+    # LAURA-30-003: wire a fake auth_service so the detokenize gate can resolve
+    # account_id → email.  In these tests account_id IS the email, so the fake
+    # returns an AccountRecord with email == account_id.
+    backoffice_state.auth_service = _FakeAuthService()
 
     # Default to the authorised admin; tests override per-call where needed.
     app.dependency_overrides[require_admin_session] = lambda: _session(AUTHORISED_ADMIN)
@@ -106,6 +131,7 @@ def client(monkeypatch):
     yield TestClient(app), app
 
     backoffice_state.rbac_store = None
+    backoffice_state.auth_service = None
     docroutes._results.clear()
 
 

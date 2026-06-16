@@ -293,20 +293,38 @@ def _install_tenant() -> str:
     return os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
 
 
-def _admin_in_detokenize_role(account_id: str, role: str) -> bool:
+async def _admin_in_detokenize_role(account_id: str, role: str) -> bool:
     """RBAC gate: True iff ``account_id`` is a member of the group identified by
     ``role`` (the document's ``detokenize_rbac_role``).
 
     Matches on group ``id`` OR ``display_name`` so an operator can name the
-    detokenize role either way.  Fail-closed: any store error / missing store →
-    False (deny).  This is the proof-bearing gate the brief mandates: an
-    unauthorised user must NOT receive the table.
+    detokenize role either way.  Fail-closed: any store error / missing store /
+    unknown account → False (deny).  This is the proof-bearing gate the brief
+    mandates: an unauthorised user must NOT receive the table.
+
+    LAURA-30-003: ``account_id`` is a UUID; ``RBACStore.get_user_groups`` keys on
+    email.  Resolve the email via ``auth_service.get_account_by_id`` before the
+    RBAC lookup so the gate actually fires instead of always-denying.
     """
     store = backoffice_state.rbac_store
     if store is None:
         return False
+    # Resolve UUID → email via auth service (fail-closed on None auth_service).
+    auth_service = backoffice_state.auth_service
+    if auth_service is None:
+        return False
     try:
-        groups = store.get_user_groups(account_id)
+        record = await auth_service.get_account_by_id(account_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("RBAC detokenize gate: account lookup failed for %s: %s", account_id, exc)
+        return False
+    if record is None:
+        return False
+    email = getattr(record, "email", None) or getattr(record, "username", None)
+    if not email:
+        return False
+    try:
+        groups = store.get_user_groups(email)
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("RBAC lookup failed for detokenize gate: %s", exc)
         return False
@@ -548,13 +566,16 @@ async def get_result(request_id: str, session: AdminSession):
 #      cannot re-retrieve it.
 
 
-def _detokenize_gate(result, request_id: str, session, *, surface: str):
+async def _detokenize_gate(result, request_id: str, session, *, surface: str):
     """Shared fail-closed gate for the mode-A table surfaces (G-NEW-2 / R5).
 
     Returns the (table, role) on success.  Raises the appropriate HTTPException
     (404 / 403) on any failure, NEVER leaking the table contents.  Enforces:
     role membership AND identity+tenant binding (BOLA close).  Step-up is
     enforced by the ``StepUpAdminSession`` dependency on the calling route.
+
+    LAURA-30-003: now async so ``_admin_in_detokenize_role`` can await the
+    ``auth_service.get_account_by_id`` call needed to resolve UUID → email.
     """
     table = getattr(result, "correspondence_table", None)
     if table is None:
@@ -566,7 +587,7 @@ def _detokenize_gate(result, request_id: str, session, *, surface: str):
 
     role = table.detokenize_rbac_role
     # Coarse role gate (Laura) — still required.
-    if not _admin_in_detokenize_role(session.account_id, role):
+    if not await _admin_in_detokenize_role(session.account_id, role):
         logger.warning(
             "detokenize RBAC DENIED (%s): account=%s document=%s role=%s",
             surface, session.account_id, request_id, role,
@@ -643,7 +664,7 @@ async def get_correspondence_table(request_id: str, session: StepUpAdminSession)
     if result is None:
         raise HTTPException(status_code=404, detail={"error": "result_not_found"})
 
-    table, role = _detokenize_gate(result, request_id, session, surface="json")
+    table, role = await _detokenize_gate(result, request_id, session, surface="json")
     rows = [{"token": t, "original": v} for t, v in table.rows.items()]
     row_count = len(table.rows)
 
@@ -673,7 +694,7 @@ async def download_correspondence_table(request_id: str, session: StepUpAdminSes
     if result is None:
         raise HTTPException(status_code=404, detail={"error": "result_not_found"})
 
-    table, role = _detokenize_gate(result, request_id, session, surface="csv")
+    table, role = await _detokenize_gate(result, request_id, session, surface="csv")
     csv_text = table.to_csv()
     row_count = len(table.rows)
 
