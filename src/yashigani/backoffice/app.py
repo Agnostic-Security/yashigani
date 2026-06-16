@@ -104,6 +104,7 @@ from yashigani.backoffice.routes import (
     # v2.25.5 — R13: RBAC sources / R26: version check
     rbac_sources_router,
     version_check_router,
+    cloud_keys_router,
 )
 
 
@@ -1215,6 +1216,8 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(rbac_sources_router, prefix="/admin/rbac", tags=["rbac"])
     # v2.25.5 — R26: version check (opt-in egress)
     app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
+    # fix/medlow-findings — cloud provider API key management (KMS-backed)
+    app.include_router(cloud_keys_router, tags=["cloud-keys"])
 
     # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
     # OpenAPI schema and annotate all /scim/v2/* paths with the scheme reference.

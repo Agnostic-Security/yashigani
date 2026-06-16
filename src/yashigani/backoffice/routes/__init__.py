@@ -60,6 +60,8 @@ from yashigani.backoffice.routes.runtime_settings import router as runtime_setti
 from yashigani.backoffice.routes.rbac_sources import router as rbac_sources_router
 # v2.25.5 — R26: version check endpoint
 from yashigani.backoffice.routes.version_check import router as version_check_router
+# fix/medlow-findings — cloud provider API key management
+from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -108,4 +110,6 @@ __all__ = [
     "rbac_sources_router",
     # v2.25.5 — R26: version check
     "version_check_router",
+    # fix/medlow-findings — cloud provider API key management
+    "cloud_keys_router",
 ]

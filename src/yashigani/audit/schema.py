@@ -329,6 +329,7 @@ class EventType(str, Enum):
     SENSITIVITY_PATTERN_DELETED = "SENSITIVITY_PATTERN_DELETED"
     SENSITIVITY_PATTERN_AI_GENERATED = "SENSITIVITY_PATTERN_AI_GENERATED"
     TAXONOMY_LEVEL_CHANGED = "TAXONOMY_LEVEL_CHANGED"
+    ADMIN_CLOUD_KEY_SET = "ADMIN_CLOUD_KEY_SET"
 
 
 # ---------------------------------------------------------------------------
@@ -2955,3 +2956,19 @@ class TaxonomyLevelChangedEvent(AuditEvent):
     label: str = ""                # new label (empty on delete)
     colour_class: str = ""         # new colour_class (empty on delete)
     step_up_verified: bool = True  # always True — write ops require step-up
+
+
+@dataclass
+class AdminCloudKeySetEvent(AuditEvent):
+    """Emitted when an admin stores or updates a cloud provider API key via KMS.
+
+    Key VALUE is never logged. Only the provider name and KMS key name are
+    recorded. Step-up TOTP is required to reach the endpoint (ASVS V6.8.4).
+    """
+
+    event_type: str = EventType.ADMIN_CLOUD_KEY_SET
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    provider: str = ""     # e.g. "openai" | "anthropic"
+    kms_key: str = ""      # KMS key name (e.g. "openai_api_key") — never the value
