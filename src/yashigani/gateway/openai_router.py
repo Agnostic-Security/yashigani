@@ -2159,6 +2159,63 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         except Exception as exc:
             logger.warning("Response inspection raised unexpectedly: %s", exc)
 
+    # ── 7b-ii. Always-on MCP/agent result injection pattern scan (I5 invariant) ──
+    # INDEPENDENT of YASHIGANI_INSPECT_RESPONSES — MCP/agent results are UNTRUSTED.
+    # The full ResponseInspectionPipeline is optional (performance toggle, YSG-RISK-057),
+    # but injection pattern detection on untrusted agent results is MANDATORY.
+    # Closes LAURA-30-002 / I5 invariant violation.
+    if response_verdict == "clean" and assistant_content:
+        try:
+            from yashigani.mcp._content_filter import _COMPILED_PATTERN as _inj_pattern
+            import unicodedata as _unicodedata
+            _scan_text = _unicodedata.normalize("NFKC", assistant_content)
+            if _inj_pattern.search(_scan_text):
+                _inj_layman_msg = (
+                    "Your request was blocked because the agent's response contained "
+                    "content that attempted to override your AI assistant's instructions. "
+                    "This is a security protection. Please contact your administrator if you "
+                    "believe this is an error."
+                )
+                logger.warning(
+                    "LAURA-30-002: agent result injection pattern detected request_id=%s "
+                    "— BLOCKING delivery (always-on I5 gate)",
+                    request_id,
+                )
+                if _state.audit_writer:
+                    try:
+                        _inj_hash = hashlib.sha256(
+                            assistant_content.encode("utf-8", errors="replace")
+                        ).hexdigest()
+                        _state.audit_writer.write(
+                            ResponseInjectionDetectedEvent(
+                                verdict="BLOCKED",
+                                request_id=request_id,
+                                session_id=identity.get("identity_id", request_id) if identity else request_id,
+                                agent_id=identity.get("slug", "agent-result") if identity else "agent-result",
+                                confidence_score=0.95,
+                                action_taken="blocked_injection_pattern",
+                                content_type="text/plain",
+                                response_content_hash=_inj_hash,
+                                classifier_only_mode=True,
+                            )
+                        )
+                    except Exception as _audit_exc:
+                        logger.warning("Audit write failed for injection block: %s", _audit_exc)
+                response_verdict = "blocked"
+                response_inspection_confidence = 0.95
+                assistant_content = _inj_layman_msg
+        except Exception as _inj_exc:
+            # Fail-closed: if the scan itself errors, block to avoid delivering
+            # potentially unsafe content.
+            logger.error(
+                "LAURA-30-002: injection scan raised %s — fail-closed block", _inj_exc
+            )
+            response_verdict = "blocked"
+            assistant_content = (
+                "Your request was blocked due to a safety check error. "
+                "Please contact your administrator."
+            )
+
     # ── 7c. PII detection on response (buffered path only) ────────────
     #
     # Runs AFTER response inspection so any injection-flagged content is
