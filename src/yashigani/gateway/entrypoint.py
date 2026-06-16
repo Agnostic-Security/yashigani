@@ -793,6 +793,7 @@ def _build_app(mesh_mode: bool = False):
         ddos_protector=ddos_protector,
         model_allocation_store=model_allocation_store,
         model_alias_store=model_alias_store,
+        kms_provider=kms_provider,
     )
 
     # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────

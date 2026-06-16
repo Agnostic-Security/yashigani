@@ -731,6 +731,13 @@ class OpenAIRouterState:
         self.content_relay_detector = None
         # v2.4.1 — PoolManager for container-per-identity dispatch
         self.pool_manager = None          # PoolManager | None
+        # Cloud key resolution: KMS provider + per-provider short-TTL cache.
+        # Cache entry: {"value": str | None, "ts": float}; TTL = 60 s so a
+        # newly-set key takes effect within one minute without a restart.
+        # The env-var fallback (OPENAI_API_KEY / ANTHROPIC_API_KEY) keeps
+        # existing Helm/env-only deployments working unchanged.
+        self.kms_provider = None   # KSMProvider | None
+        self._cloud_key_cache: dict[str, dict] = {}  # provider -> {value, ts}
         # F-T10-001: low-confidence step-up threshold.  When response-inspection
         # confidence falls below this value AND sensitivity >= CONFIDENTIAL,
         # X-Yashigani-Low-Confidence-Stepup: required is added to the response.
@@ -748,6 +755,80 @@ class OpenAIRouterState:
 
 
 _state = OpenAIRouterState()
+
+# ---------------------------------------------------------------------------
+# Cloud provider configuration: API endpoint URL, key env-var fallback,
+# request body/response body adapters.
+#
+# OpenAI uses the OpenAI-compatible /v1/chat/completions API (JSON same shape
+# as our request body).  Anthropic uses a different messages API — we translate
+# to their format here and normalise the response back to the OpenAI shape so
+# downstream code is unaffected.
+#
+# Key resolution order (per request / per provider, with 60 s TTL):
+#   1. kms_provider.get_secret("{provider}_api_key")  — UI-set key (KMS)
+#   2. os.environ.get("{PROVIDER}_API_KEY")           — env-var / Helm fallback
+#   3. None → HTTPException(503)
+#
+# A restart is NOT required when a key is changed via the admin UI.  The
+# 60-second TTL cache (per provider) bounds the propagation delay.
+# ---------------------------------------------------------------------------
+_CLOUD_PROVIDER_CONFIG: dict[str, dict] = {
+    "openai": {
+        "kms_key": "openai_api_key",
+        "env_var": "OPENAI_API_KEY",
+        "base_url": os.getenv("YASHIGANI_OPENAI_BASE_URL", "https://api.openai.com"),
+    },
+    "anthropic": {
+        "kms_key": "anthropic_api_key",
+        "env_var": "ANTHROPIC_API_KEY",
+        "base_url": os.getenv("YASHIGANI_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+    },
+}
+
+_CLOUD_KEY_TTL: float = 60.0  # seconds
+
+
+def _get_cloud_api_key(provider: str) -> Optional[str]:
+    """Resolve the API key for a cloud provider.
+
+    Reads from KMS with a 60 s per-provider TTL cache, then falls back to the
+    environment variable.  Never logs the key value.
+
+    Returns None if no key is available (KMS miss + env var absent).
+    """
+    cfg = _CLOUD_PROVIDER_CONFIG.get(provider)
+    if cfg is None:
+        return None
+
+    now = time.monotonic()
+    cache_entry = _state._cloud_key_cache.get(provider, {})
+    if now - cache_entry.get("ts", 0.0) < _CLOUD_KEY_TTL:
+        return cache_entry.get("value")
+
+    key: Optional[str] = None
+
+    # 1. KMS — preferred when the admin has set the key via the UI.
+    if _state.kms_provider is not None:
+        try:
+            val = _state.kms_provider.get_secret(cfg["kms_key"])
+            if val:
+                key = val
+        except Exception as exc:
+            # KeyNotFoundError = key not set in KMS yet — not an error.
+            logger.debug(
+                "_get_cloud_api_key: KMS miss for provider=%s kms_key=%s (%s)",
+                provider, cfg["kms_key"], type(exc).__name__,
+            )
+
+    # 2. Env-var fallback — for Helm / docker-compose env-based deployments.
+    if not key:
+        key = os.environ.get(cfg["env_var"]) or None
+
+    # Cache the resolved value (including None — so a missing key does not
+    # hammer KMS on every request while the TTL runs).
+    _state._cloud_key_cache[provider] = {"value": key, "ts": now}
+    return key
 
 
 def configure(
@@ -771,6 +852,7 @@ def configure(
     pool_manager=None,    # v2.4.1 — PoolManager | None
     model_allocation_store=None,  # Track B1 — ModelAllocationStore | None
     model_alias_store=None,       # Track B1 — ModelAliasStore | None
+    kms_provider=None,            # KSMProvider | None — for cloud API key resolution
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -804,6 +886,8 @@ def configure(
     _state.pool_manager = pool_manager  # v2.4.1
     _state.model_allocation_store = model_allocation_store  # Track B1
     _state.model_alias_store = model_alias_store            # Track B1
+    _state.kms_provider = kms_provider                      # cloud API key resolution
+    _state._cloud_key_cache = {}                            # reset cache on reconfigure
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -2047,29 +2131,174 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     route_reason = f"agent:{selected_model[1:]}"
 
         if not is_agent_call:
-            # Standard Ollama routing (buffered)
-            ollama_body = {
-                "model": selected_model if not is_agent_call else _state.default_model,
-                "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
-                "stream": False,
-            }
-            if body.temperature is not None:
-                ollama_body["temperature"] = body.temperature
+            if selected_provider in _CLOUD_PROVIDER_CONFIG:
+                # ── 7b-cloud. Cloud provider call (OpenAI / Anthropic) ────────
+                # Resolve API key from KMS (TTL-cached, per-request) then env-var.
+                # Never log the key value.
+                cloud_api_key = _get_cloud_api_key(selected_provider)
+                if not cloud_api_key:
+                    logger.error(
+                        "Cloud provider %r selected but no API key available "
+                        "(KMS miss and env-var absent) request_id=%s",
+                        selected_provider, request_id,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            f"Cloud provider '{selected_provider}' is not configured. "
+                            "Set the API key via the admin UI (Cloud Provider API Keys) "
+                            f"or the {_CLOUD_PROVIDER_CONFIG[selected_provider]['env_var']} "
+                            "environment variable."
+                        ),
+                    )
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{_state.ollama_url}/api/chat",
-                    json=ollama_body,
-                )
+                cloud_cfg = _CLOUD_PROVIDER_CONFIG[selected_provider]
+                messages_payload = [
+                    {"role": m.role, "content": m.content or ""}
+                    for m in body.messages
+                ]
 
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Backend error: {resp.text[:200]}",
-                )
+                if selected_provider == "openai":
+                    # OpenAI-compatible /v1/chat/completions
+                    cloud_body: dict = {
+                        "model": selected_model,
+                        "messages": messages_payload,
+                        "stream": False,
+                    }
+                    if body.temperature is not None:
+                        cloud_body["temperature"] = body.temperature
+                    if body.max_tokens is not None:
+                        cloud_body["max_tokens"] = body.max_tokens
 
-            backend_body = resp.json()
-            assistant_content = backend_body.get("message", {}).get("content", "")
+                    cloud_headers = {
+                        "Authorization": f"Bearer {cloud_api_key}",
+                        "Content-Type": "application/json",
+                    }
+
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        resp = await client.post(
+                            f"{cloud_cfg['base_url']}/v1/chat/completions",
+                            json=cloud_body,
+                            headers=cloud_headers,
+                        )
+
+                    if resp.status_code != 200:
+                        logger.error(
+                            "OpenAI upstream error %d request_id=%s",
+                            resp.status_code, request_id,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Cloud provider error. Try again or contact your administrator.",
+                        )
+
+                    resp_json = resp.json()
+                    choices = resp_json.get("choices", [])
+                    assistant_content = (
+                        choices[0].get("message", {}).get("content", "") if choices else ""
+                    )
+                    # Normalise to Ollama-compatible shape for downstream code.
+                    backend_body = {
+                        "model": selected_model,
+                        "message": {"role": "assistant", "content": assistant_content},
+                        "done": True,
+                        "prompt_eval_count": resp_json.get("usage", {}).get("prompt_tokens", 0),
+                        "eval_count": resp_json.get("usage", {}).get("completion_tokens", 0),
+                    }
+
+                elif selected_provider == "anthropic":
+                    # Anthropic Messages API — different wire format.
+                    # Extract system message (if any) and user/assistant turns.
+                    system_text = ""
+                    anthropic_messages = []
+                    for m in body.messages:
+                        if m.role == "system":
+                            system_text = m.content or ""
+                        else:
+                            anthropic_messages.append(
+                                {"role": m.role, "content": m.content or ""}
+                            )
+
+                    anthropic_body: dict = {
+                        "model": selected_model,
+                        "messages": anthropic_messages,
+                        "max_tokens": body.max_tokens or 1024,
+                    }
+                    if system_text:
+                        anthropic_body["system"] = system_text
+                    if body.temperature is not None:
+                        anthropic_body["temperature"] = body.temperature
+
+                    cloud_headers = {
+                        "x-api-key": cloud_api_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    }
+
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        resp = await client.post(
+                            f"{cloud_cfg['base_url']}/v1/messages",
+                            json=anthropic_body,
+                            headers=cloud_headers,
+                        )
+
+                    if resp.status_code != 200:
+                        logger.error(
+                            "Anthropic upstream error %d request_id=%s",
+                            resp.status_code, request_id,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Cloud provider error. Try again or contact your administrator.",
+                        )
+
+                    resp_json = resp.json()
+                    # Anthropic response: {"content": [{"type":"text","text":"..."}], ...}
+                    content_blocks = resp_json.get("content", [])
+                    assistant_content = " ".join(
+                        b.get("text", "") for b in content_blocks if b.get("type") == "text"
+                    )
+                    usage = resp_json.get("usage", {})
+                    # Normalise to Ollama-compatible shape for downstream code.
+                    backend_body = {
+                        "model": selected_model,
+                        "message": {"role": "assistant", "content": assistant_content},
+                        "done": True,
+                        "prompt_eval_count": usage.get("input_tokens", 0),
+                        "eval_count": usage.get("output_tokens", 0),
+                    }
+
+                else:
+                    # Unreachable: _CLOUD_PROVIDER_CONFIG only contains "openai"/"anthropic".
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Unknown cloud provider: {selected_provider!r}",
+                    )
+
+            else:
+                # ── 7b-local. Standard Ollama routing (buffered) ──────────────
+                ollama_body = {
+                    "model": selected_model,
+                    "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
+                    "stream": False,
+                }
+                if body.temperature is not None:
+                    ollama_body["temperature"] = body.temperature
+
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        f"{_state.ollama_url}/api/chat",
+                        json=ollama_body,
+                    )
+
+                if resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail=f"Backend error: {resp.text[:200]}",
+                    )
+
+                backend_body = resp.json()
+                assistant_content = backend_body.get("message", {}).get("content", "")
 
     except httpx.ConnectError:
         raise HTTPException(
