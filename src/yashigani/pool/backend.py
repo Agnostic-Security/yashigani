@@ -1216,6 +1216,17 @@ def create_extractor_backend() -> Optional[
                 worker_url,
             )
             return be
+        # Ping failed. If forced=http, bail immediately (no CLI fallback for explicit
+        # http mode — a mis-configured URL should not silently fall to a CLI that may
+        # not exist or may use a dangling socket).
+        if forced == "http":
+            logger.error(
+                "Extractor sandbox: YASHIGANI_EXTRACTOR_RUNTIME=http but "
+                "extractor-svc at %s is unreachable — sandbox UNAVAILABLE "
+                "(will retry on next job — check extractor-svc healthcheck)",
+                worker_url,
+            )
+            return None
         logger.warning(
             "Extractor sandbox: HttpExtractorBackend at %s is unreachable "
             "— falling through to CLI/K8s backends", worker_url,

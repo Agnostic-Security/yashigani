@@ -284,17 +284,20 @@ class SandboxedExtractorRunner:
     def _resolve_backend(self):
         if not self._backend_resolved:
             # Use the EXTRACTOR-specific backend selector — NOT the per-identity
-            # Pool Manager create_backend(). On this host the SDK path cannot
-            # spawn the jail (docker-py absent; Podman 3.4.4 SDK rejects
-            # network_disabled/tmpfs), so the selector resolves a CLI backend
-            # (the path the containment harness proved 5/5) for Docker/Podman, or
-            # the K8s hardened-Pod backend in-cluster. Fail-closed if none.
+            # Pool Manager create_backend(). Prefers HttpExtractorBackend (Design A,
+            # LAURA-30-001 fix) when YASHIGANI_EXTRACTOR_WORKER_URL is set, then CLI
+            # (Docker/Podman), then K8s. Fail-closed if none.
             from yashigani.pool.backend import create_extractor_backend
             self._backend = create_extractor_backend()
-            self._backend_resolved = True
+            # Only cache a positive result — if backend is None (unavailable right
+            # now), stay unresolved so the next call retries. This allows the
+            # pre-spawned extractor-svc (Design A) to become available after
+            # backoffice startup without requiring a container restart.
+            if self._backend is not None:
+                self._backend_resolved = True
         if self._backend is None:
             raise SandboxUnavailableError(
-                "no container backend (Docker/Podman/K8s) available — refusing "
+                "no container backend (Docker/Podman/K8s/HTTP) available — refusing "
                 "to run an untrusted parser in-process (fail-closed BLOCK)"
             )
         return self._backend

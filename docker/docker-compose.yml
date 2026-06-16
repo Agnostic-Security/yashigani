@@ -786,8 +786,15 @@ services:
     read_only: true
     security_opt:
       - no-new-privileges:true
-      - seccomp=${YASHIGANI_EXTRACTOR_SECCOMP_PROFILE:-./seccomp/yashigani-extractor.json}
-      - apparmor=${YASHIGANI_EXTRACTOR_APPARMOR_PROFILE:-yashigani-extractor}
+      # seccomp: the extractor-svc is a long-running HTTP server (needs socket/bind/listen).
+      # The per-job yashigani-extractor.json profile blocks all networking — correct for
+      # the ephemeral per-job worker but not for the server. Use the gateway profile here
+      # (same Python HTTP server surface). The isolation is network-level (extractor_svc
+      # internal bridge, internal:true) + cap_drop ALL + no-new-privileges + non-root.
+      - seccomp=${YASHIGANI_SECCOMP_PROFILE:-./seccomp/yashigani.json}
+      # AppArmor: use the same override env as the gateway/backoffice so a single
+      # YASHIGANI_APPARMOR_PROFILE=unconfined in .env disables it across all services.
+      - apparmor=${YASHIGANI_APPARMOR_PROFILE:-yashigani-gateway}
     cap_drop: [ALL]
     # No cap_add, no volumes, no docker socket — this is the hardened extraction jail.
     healthcheck:
