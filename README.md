@@ -5,7 +5,7 @@
 <html>
 <body>
 <div>
-  <img src="https://github.com/agnosticsec-com/yashigani_img/blob/main/Yashiganymaster.png" alt="Yashigani" style="width:100%">
+  <img src="https://github.com/agnosticsec-com/yashigani_img/blob/main/Yashigani%20dataflowsecurity.png" alt="Yashigani" style="width:100%">
 </div>
 </body>
 </html>
