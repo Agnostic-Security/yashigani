@@ -47,7 +47,7 @@ _pattern_counter = 5
 
 class PatternRequest(BaseModel):
     classification: str = Field(pattern=r"^(RESTRICTED|CONFIDENTIAL|INTERNAL|PUBLIC)$")
-    type: str = Field(default="regex", pattern=r"^(regex|keyword|classifier|fasttext|ollama)$")
+    type: str = Field(default="regex", pattern=r"^(regex|keyword|classifier|ollama)$")
     pattern: str = Field(min_length=1, max_length=512)
     description: str = Field(min_length=1, max_length=256)
 
@@ -114,8 +114,6 @@ async def pipeline_status(session: AdminSession):
         "regex": True,  # always active
         "sklearn_available": sklearn_available,
         "classifier_available": sklearn_available,
-        # Legacy key — DEPRECATED in v2.25.3, removed in v2.26.0.
-        "fasttext_available": sklearn_available,
         "ollama_available": ollama_available,
         "pattern_count": len(_patterns),
     }

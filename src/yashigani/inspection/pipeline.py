@@ -447,7 +447,7 @@ class ResponseInspectionPipeline:
     Threat model:
         A malicious document (or tool response) may embed natural-language
         instructions designed to redirect agent behaviour — indirect prompt
-        injection. This pipeline applies the same FastText + LLM fallback
+        injection. This pipeline applies the same classifier + LLM fallback
         chain used for request inspection, but operates on the *response body*
         rather than the agent query.
 

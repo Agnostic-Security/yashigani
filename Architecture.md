@@ -935,9 +935,9 @@ v2.0 is Yashigani's first production-grade release. It adds five major subsystem
 - IdP limits tier-gated
 
 **Sensitivity Classification Pipeline**
-- Three layers, all ON by default: regex + FastText + Ollama
+- Three layers, all ON by default: regex + scikit-learn classifier + Ollama
 - Regex: PII, PCI, intellectual property, PHI patterns
-- FastText: sub-5ms offline ML classification
+- sklearn classifier: sub-5ms offline ML classification (TF-IDF + LogisticRegression, since v2.23.3)
 - Ollama: deep semantic analysis (qwen2.5)
 - Admin can opt out of Ollama layer but cannot disable regex
 - Results feed directly into OE routing

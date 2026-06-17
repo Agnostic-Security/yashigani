@@ -6,8 +6,7 @@ Covers:
   - SklearnBackend.classify() returns UNCERTAIN when model not available
   - Pipeline trains from corpus, F1 >= 0.90 on 80/20 split (regression gate)
   - SensitivityClassifier._scan_sklearn() calls backend.classify() correctly
-  - SensitivityClassifier legacy fasttext_backend alias logs deprecation warning
-  - Metric aliases: sensitivity_classifier_* is the same object as fasttext_*
+  - Metric aliases: sensitivity_classifier_* is the same object as classifier_*
   - _label_to_level maps UNSAFE → RESTRICTED, CLEAN → PUBLIC, UNCERTAIN → PUBLIC
 
 Per feedback_no_fabricated_directives.md — F1 >= 0.90 must be measured, not asserted.
@@ -16,7 +15,6 @@ Per feedback_test_real_scans_not_just_unit_tests.md — train from real corpus.
 from __future__ import annotations
 
 import io
-import logging
 import math
 import os
 import random
@@ -215,39 +213,44 @@ class TestSensitivityClassifierSklearnLayer:
         result = clf.classify("hello")
         assert "sklearn" not in result.layer_results
 
-    def test_scan_fasttext_alias_delegates_to_scan_sklearn(self):
-        """_scan_fasttext must be a backward-compat alias — same result as _scan_sklearn."""
+    def test_scan_classifier_delegates_to_scan_sklearn(self):
+        """_scan_classifier and _scan_sklearn must return the same result."""
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier, SensitivityLevel
         backend = self._make_mock_backend(label="CLEAN", confidence=0.9)
         clf = SensitivityClassifier(enable_sklearn=True, sklearn_backend=backend, enable_ollama=False)
 
-        triggers_ft: list[str] = []
+        triggers_c: list[str] = []
         triggers_sk: list[str] = []
-        level_ft = clf._scan_fasttext("test", triggers_ft)
+        level_c = clf._scan_classifier("test", triggers_c)
         backend.classify.reset_mock()
         level_sk = clf._scan_sklearn("test", triggers_sk)
-        assert level_ft == level_sk
+        assert level_c == level_sk
 
-    def test_legacy_fasttext_backend_kwarg_emits_deprecation_warning(self, caplog):
-        """fasttext_backend= kwarg must log a deprecation warning."""
+    def test_scan_fasttext_alias_removed(self):
+        """_scan_fasttext must not exist — removed in v3.0."""
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
-        from yashigani.inspection.backends.sklearn_backend import SklearnResult
-        backend = MagicMock()
-        backend.classify.return_value = SklearnResult(
-            label="CLEAN", confidence=0.9, latency_ms=0.0, needs_llm_pass=False
+        clf = SensitivityClassifier(enable_sklearn=False, enable_ollama=False)
+        assert not hasattr(clf, "_scan_fasttext"), (
+            "_scan_fasttext alias should have been removed; use _scan_classifier"
         )
-        with caplog.at_level(logging.WARNING, logger="yashigani.optimization.sensitivity_classifier"):
-            clf = SensitivityClassifier(fasttext_backend=backend, enable_ollama=False)
-        assert any("fasttext_backend is deprecated" in r.message for r in caplog.records)
-        assert clf._sklearn is backend
 
-    def test_legacy_enable_fasttext_kwarg_emits_deprecation_warning(self, caplog):
-        """enable_fasttext= kwarg must log a deprecation warning."""
+    def test_enable_fasttext_kwarg_removed(self):
+        """enable_fasttext kwarg must not be accepted — removed in v3.0."""
+        import inspect
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
-        with caplog.at_level(logging.WARNING, logger="yashigani.optimization.sensitivity_classifier"):
-            clf = SensitivityClassifier(enable_fasttext=False, enable_ollama=False)
-        assert any("enable_fasttext is deprecated" in r.message for r in caplog.records)
-        assert not clf._enable_sklearn
+        sig = inspect.signature(SensitivityClassifier.__init__)
+        assert "enable_fasttext" not in sig.parameters, (
+            "enable_fasttext parameter should have been removed; use enable_sklearn"
+        )
+
+    def test_fasttext_backend_kwarg_removed(self):
+        """fasttext_backend kwarg must not be accepted — removed in v3.0."""
+        import inspect
+        from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
+        sig = inspect.signature(SensitivityClassifier.__init__)
+        assert "fasttext_backend" not in sig.parameters, (
+            "fasttext_backend parameter should have been removed; use sklearn_backend"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -255,26 +258,29 @@ class TestSensitivityClassifierSklearnLayer:
 # ---------------------------------------------------------------------------
 
 class TestMetricAliases:
-    def test_sensitivity_classifier_is_fasttext_alias(self):
-        """All metric aliases point to the same Prometheus counter object.
+    def test_sensitivity_classifier_aliases_point_to_canonical(self):
+        """sensitivity_classifier_* convenience aliases point to the same object as classifier_*.
 
-        v2.25.3: classifier_* is the canonical name. fasttext_* and
-        sensitivity_classifier_* are deprecated aliases that must remain
-        pointing at the same object for one release cycle (v2.26.0 removal).
+        fasttext_* aliases were removed in v3.0.
         """
         from yashigani.metrics.registry import (
             classifier_classifications_total,
             classifier_latency_ms,
-            fasttext_classifications_total,
             sensitivity_classifier_classifications_total,
-            fasttext_latency_ms,
             sensitivity_classifier_latency_ms,
         )
-        # Canonical: classifier_* is the primary object.
-        assert fasttext_classifications_total is classifier_classifications_total
         assert sensitivity_classifier_classifications_total is classifier_classifications_total
-        assert fasttext_latency_ms is classifier_latency_ms
         assert sensitivity_classifier_latency_ms is classifier_latency_ms
+
+    def test_fasttext_metric_aliases_removed(self):
+        """fasttext_* Python names must not exist in registry — removed in v3.0."""
+        import yashigani.metrics.registry as reg
+        assert not hasattr(reg, "fasttext_classifications_total"), (
+            "fasttext_classifications_total should have been removed from registry"
+        )
+        assert not hasattr(reg, "fasttext_latency_ms"), (
+            "fasttext_latency_ms should have been removed from registry"
+        )
 
 
 # ---------------------------------------------------------------------------

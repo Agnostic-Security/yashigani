@@ -8,8 +8,8 @@ Design decisions
 ----------------
 Layer constraints during streaming:
   - Regex (Layer 1): runs on every chunk — sub-millisecond, safe to call inline.
-  - FastText (Layer 2): runs on the accumulated buffer at every inspect interval
-    (default 200 chars). Still fast (<1 ms), acceptable for streaming.
+  - sklearn classifier (Layer 2): runs on the accumulated buffer at every inspect
+    interval (default 200 chars). Still fast (<1 ms), acceptable for streaming.
   - Ollama LLM (Layer 3): NOT called during streaming — latency (200-500 ms)
     would cause visible pauses between chunks. Runs once on the complete
     accumulated text after the stream ends.
@@ -101,7 +101,7 @@ class StreamingInspector:
         Feed a text chunk into the inspector.
 
         Runs regex on the chunk immediately. If the accumulated buffer has
-        grown past ``inspect_interval``, also runs FastText.
+        grown past ``inspect_interval``, also runs the sklearn classifier.
 
         Returns:
             True  — chunk is clean; caller may forward it to the client.
@@ -201,11 +201,6 @@ class StreamingInspector:
         except Exception as exc:
             logger.debug("StreamingInspector classifier scan error: %s", exc)
             return "PUBLIC"
-
-    # Deprecated alias — kept for one release cycle (v2.26.0 removal).
-    def _run_fasttext(self, text: str) -> str:
-        """Deprecated alias for _run_classifier. Removed in v2.26.0."""
-        return self._run_classifier(text)
 
     def _trigger_termination(self, trigger: str, snippet: str) -> None:
         self.terminated = True

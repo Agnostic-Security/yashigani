@@ -5,11 +5,11 @@ Covers:
   - Clean stream passes through all chunks
   - Stream with PII mid-way triggers termination
   - Stream end (final_inspect) triggers termination when LLM layer detects
-  - Buffer accumulation and interval-based FastText check
+  - Buffer accumulation and interval-based sklearn classifier check
   - Streaming disabled falls back to buffered path (router-level test)
 
-All tests use a mock SensitivityClassifier so no Ollama or FastText binary
-is required.
+All tests use a mock SensitivityClassifier so no Ollama or sklearn model
+artifact is required.
 """
 from __future__ import annotations
 
@@ -64,18 +64,15 @@ class _MockSensitivityResult:
 
 def _make_classifier(
     regex_level: str = "PUBLIC",
-    fasttext_level: str = "PUBLIC",
+    classifier_level: str = "PUBLIC",
     full_classify_level: str = "PUBLIC",
 ):
     """
     Build a mock SensitivityClassifier.
 
     - ``_scan_regex``       returns ``_MockSensitivityLevel(regex_level)``
-    - ``_scan_classifier``  returns ``_MockSensitivityLevel(fasttext_level)``
+    - ``_scan_classifier``  returns ``_MockSensitivityLevel(classifier_level)``
     - ``classify``          returns ``_MockSensitivityResult(full_classify_level)``
-
-    ``_scan_fasttext`` is kept as a deprecated alias so tests that call it
-    directly still work (back-compat alias coverage).
     """
     clf = MagicMock()
 
@@ -83,16 +80,13 @@ def _make_classifier(
         return _MockSensitivityLevel(regex_level)
 
     def _scan_classifier(text, triggers):
-        return _MockSensitivityLevel(fasttext_level)
+        return _MockSensitivityLevel(classifier_level)
 
     def _classify(text):
         return _MockSensitivityResult(full_classify_level)
 
     clf._scan_regex = _scan_regex
     clf._scan_classifier = _scan_classifier
-    # Deprecated alias — streaming.py no longer calls this directly, but kept
-    # for any test that still exercises the old name.
-    clf._scan_fasttext = _scan_classifier
     clf.classify = _classify
     # F-RT1: final_inspect now prefers classify_decoded (decode-before-classify).
     # The mock returns the same level either way (decode is a superset of classify).
@@ -102,12 +96,12 @@ def _make_classifier(
 
 def _make_inspector(
     regex_level: str = "PUBLIC",
-    fasttext_level: str = "PUBLIC",
+    classifier_level: str = "PUBLIC",
     full_classify_level: str = "PUBLIC",
     inspect_interval: int = 200,
     on_audit=None,
 ) -> StreamingInspector:
-    clf = _make_classifier(regex_level, fasttext_level, full_classify_level)
+    clf = _make_classifier(regex_level, classifier_level, full_classify_level)
     return StreamingInspector(
         sensitivity_classifier=clf,
         inspect_interval=inspect_interval,
@@ -168,10 +162,10 @@ class TestStreamingInspectorTermination:
         assert result is False
         assert inspector.terminated is True
 
-    def test_fasttext_hit_at_interval_terminates(self):
+    def test_classifier_hit_at_interval_terminates(self):
         """Classifier RESTRICTED hit at interval boundary terminates stream."""
         # interval=10 so we trip it after 10+ chars
-        inspector = _make_inspector(fasttext_level="RESTRICTED", inspect_interval=10)
+        inspector = _make_inspector(classifier_level="RESTRICTED", inspect_interval=10)
         result = inspector.feed("A" * 15)  # > interval=10
         assert result is False
         assert inspector.terminated is True
@@ -335,7 +329,7 @@ async def test_stream_response_final_inspect_termination():
     # All chunks clean at regex/classifier level but full classify is CONFIDENTIAL
     inspector = _make_inspector(
         regex_level="PUBLIC",
-        fasttext_level="PUBLIC",
+        classifier_level="PUBLIC",
         full_classify_level="CONFIDENTIAL",
     )
 

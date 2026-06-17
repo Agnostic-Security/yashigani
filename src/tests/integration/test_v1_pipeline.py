@@ -39,7 +39,7 @@ def enforcer(budget_redis):
 
 @pytest.fixture
 def classifier():
-    return SensitivityClassifier(enable_fasttext=False, enable_ollama=False)
+    return SensitivityClassifier(enable_sklearn=False, enable_ollama=False)
 
 
 @pytest.fixture

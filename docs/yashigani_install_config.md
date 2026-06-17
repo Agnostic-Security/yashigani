@@ -297,7 +297,7 @@ corrective message, rather than executing eight steps and then failing at
 
 ### 3.2 Full Wizard (Production / Enterprise)
 
-**Step 1 — Preflight checks.** Verifies container runtime (Docker Engine, Docker Desktop, or Podman), available disk space, and available RAM. GPU hardware is detected via `platform-detect.sh` — Apple Silicon M-series, NVIDIA (nvidia-smi), AMD (rocm-smi), and lspci fallback. Model recommendations are printed based on detected VRAM (since v0.8.4). The health check script auto-detects the compose command for Docker or Podman environments. The preflight now also verifies that the sensitivity pipeline prerequisites (regex, FastText, Ollama) are available (since v2.0).
+**Step 1 — Preflight checks.** Verifies container runtime (Docker Engine, Docker Desktop, or Podman), available disk space, and available RAM. GPU hardware is detected via `platform-detect.sh` — Apple Silicon M-series, NVIDIA (nvidia-smi), AMD (rocm-smi), and lspci fallback. Model recommendations are printed based on detected VRAM (since v0.8.4). The health check script auto-detects the compose command for Docker or Podman environments. The preflight now also verifies that the sensitivity pipeline prerequisites (regex, sklearn classifier, Ollama) are available (since v2.0).
 
 **Step 2 — Container platform.** Asks whether you are deploying to Docker Compose or Kubernetes (Helm). Choose **Docker Compose** for standalone hosts; choose **Kubernetes** if you have an existing cluster and `kubectl` configured.
 
@@ -490,7 +490,7 @@ The following tables document every significant variable, grouped by category.
 | `YASHIGANI_INSPECTION_FALLBACK_CHAIN` | No | comma-separated backends | e.g., `ollama,gemini,fail_closed` |
 | `OLLAMA_MODEL` | No | any Ollama model tag | Default: `qwen2.5:3b` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC URL | Default: `http://otel-collector:4317` |
-| `FASTTEXT_MODEL_PATH` | No | file path | Default: `/app/models/fasttext_classifier.bin` |
+| `YASHIGANI_CLASSIFIER_MODEL_PATH` | No | file path | Default: `/app/models/sensitivity_classifier.joblib` (baked into image) |
 
 ---
 
@@ -1013,8 +1013,8 @@ docker compose --profile vault up -d
 
 Yashigani uses a two-stage pipeline to detect prompt injection attacks:
 
-- **Stage 1 — FastText first-pass:** A lightweight FastText binary classifier (`fasttext_classifier.bin`) performs a high-speed first-pass scan. This runs on every request with sub-millisecond latency and eliminates clear benign requests from further analysis.
-- **Stage 2 — LLM second-pass:** Requests that exceed the FastText suspicion threshold are forwarded to a full LLM for semantic analysis. The LLM is configured via `YASHIGANI_INSPECTION_DEFAULT_BACKEND`.
+- **Stage 1 — scikit-learn first-pass:** A lightweight TF-IDF + LogisticRegression classifier (`sensitivity_classifier.joblib`, ~28 KB, baked into the image) performs a high-speed first-pass scan. This runs on every request with sub-millisecond latency and eliminates clear benign requests from further analysis.
+- **Stage 2 — LLM second-pass:** Requests that exceed the classifier suspicion threshold are forwarded to a full LLM for semantic analysis. The LLM is configured via `YASHIGANI_INSPECTION_DEFAULT_BACKEND`.
 
 ### 7.1 Ollama (Default — Fully Local)
 
@@ -2177,11 +2177,11 @@ Agent registration remains **admin-gated** (TOTP step-up required, full audit lo
 
 ## 18. Response Path Inspection (since v0.9.0)
 
-v0.9.0 adds `ResponseInspectionPipeline` — a bidirectional inspection layer that applies the same FastText + LLM fallback pipeline to upstream responses before they are returned to the client. This closes the indirect prompt injection vector where a malicious upstream response could hijack an agent's next action.
+v0.9.0 adds `ResponseInspectionPipeline` — a bidirectional inspection layer that applies the same classifier + LLM fallback pipeline to upstream responses before they are returned to the client. This closes the indirect prompt injection vector where a malicious upstream response could hijack an agent's next action.
 
 ### 18.1 How It Works
 
-- Upstream responses pass through FastText first-pass (sub-5ms, offline).
+- Upstream responses pass through the sklearn first-pass classifier (sub-5ms, offline; TF-IDF + LogisticRegression since v2.23.3).
 - Responses that exceed the suspicion threshold are forwarded to the configured LLM backend for semantic analysis.
 - **BLOCKED** verdict: the gateway returns `502 Bad Gateway` to the client. The upstream response is not forwarded. The audit event records `response_inspection_verdict: BLOCKED` and emits a `RESPONSE_INJECTION_DETECTED` event.
 - **FLAGGED** verdict: the response is forwarded to the client with the header `X-Yashigani-Response-Verdict: FLAGGED`. The audit event records the verdict.
@@ -2195,7 +2195,7 @@ Response inspection is configurable per agent via the admin panel (Admin → Age
 {
   "response_inspection": {
     "enabled": true,
-    "fasttext_only": false,
+    "classifier_only": false,
     "exempt_content_types": ["application/json"]
   }
 }
@@ -2204,7 +2204,7 @@ Response inspection is configurable per agent via the admin panel (Admin → Age
 | Field | Default | Notes |
 |-------|---------|-------|
 | `enabled` | `true` | Set `false` to disable response inspection for this agent (not recommended) |
-| `fasttext_only` | `false` | Skip the LLM second-pass; use only the FastText classifier. Reduces latency at the cost of accuracy. |
+| `classifier_only` | `false` | Skip the LLM second-pass; use only the sklearn classifier. Reduces latency at the cost of accuracy. |
 | `exempt_content_types` | `["application/json"]` | Content types that bypass inspection entirely (e.g., binary blobs, media files) |
 
 ### 18.3 `.env` Settings

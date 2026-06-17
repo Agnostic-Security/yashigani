@@ -75,20 +75,13 @@ class SensitivityClassifier:
     Layers 2 and 3 are opt-out via constructor flags.
 
     v2.23.3: Layer 2 backend changed from fasttext-wheel to scikit-learn.
-    The constructor accepts both `enable_sklearn`/`sklearn_backend` (preferred)
-    and legacy `enable_fasttext`/`fasttext_backend` keyword aliases for callers
-    that haven't been updated yet (deprecated, removed in v2.24.0).
     """
 
     def __init__(
         self,
         patterns: list[tuple[str, SensitivityLevel, str]] | None = None,
-        # Preferred names (v2.23.3+)
         enable_sklearn: bool = True,
         sklearn_backend=None,
-        # Legacy aliases — deprecated, will be removed in v2.24.0
-        enable_fasttext: bool | None = None,
-        fasttext_backend=None,
         # Ollama layer
         enable_ollama: bool = True,
         ollama_url: str = "http://ollama:11434",
@@ -98,20 +91,6 @@ class SensitivityClassifier:
             (re.compile(p, re.IGNORECASE), level, desc)
             for p, level, desc in (patterns or _DEFAULT_PATTERNS)
         ]
-        # Handle legacy keyword aliases with deprecation warnings
-        if enable_fasttext is not None:
-            logger.warning(
-                "SensitivityClassifier: enable_fasttext is deprecated, use enable_sklearn. "
-                "Will be removed in v2.24.0."
-            )
-            enable_sklearn = enable_fasttext
-        if fasttext_backend is not None:
-            logger.warning(
-                "SensitivityClassifier: fasttext_backend is deprecated, use sklearn_backend. "
-                "Will be removed in v2.24.0."
-            )
-            sklearn_backend = fasttext_backend
-
         self._enable_sklearn = enable_sklearn
         self._enable_ollama = enable_ollama
         self._sklearn = sklearn_backend
@@ -294,13 +273,6 @@ class SensitivityClassifier:
     def _scan_classifier(self, text: str, triggers: list[str]) -> SensitivityLevel:
         """Engine-agnostic alias for _scan_sklearn (v2.25.3+). Preferred name."""
         return self._scan_sklearn(text, triggers)
-
-    # ---------------------------------------------------------------------------
-    # Legacy aliases — kept for back-compat; removed in v2.26.0.
-    # ---------------------------------------------------------------------------
-    def _scan_fasttext(self, text: str, triggers: list[str]) -> SensitivityLevel:
-        """Deprecated alias for _scan_classifier. Removed in v2.26.0."""
-        return self._scan_classifier(text, triggers)
 
     def _scan_ollama(self, text: str, triggers: list[str]) -> SensitivityLevel:
         """Layer 3: Ollama deep contextual scan.

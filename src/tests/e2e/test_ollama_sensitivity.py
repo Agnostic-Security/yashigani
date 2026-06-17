@@ -38,7 +38,7 @@ def _classify_via_gateway(text: str) -> dict:
     """Classify text using the sensitivity classifier inside the gateway."""
     output = runtime_run("docker-gateway-1", f"""
 from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
-c = SensitivityClassifier(enable_fasttext=False, enable_ollama=False)
+c = SensitivityClassifier(enable_sklearn=False, enable_ollama=False)
 r = c.classify({repr(text)})
 import json
 print(json.dumps({{"level": r.level.value, "triggers": r.triggers}}))

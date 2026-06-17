@@ -25,14 +25,11 @@ docker/.yashigani-install-state
 # This file must never be committed — it contains per-install token hashes.
 docker/var/
 data/*
-!data/fasttext
 docker/data/
 *.log
 
-# FastText model binaries — train locally, never commit
-models/*.bin
-models/*.vec
-models/*.ftz
+# Model binaries — train locally, never commit
+models/*.joblib
 
 # License signing keys — NEVER commit private key
 keys/
