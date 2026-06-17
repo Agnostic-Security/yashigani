@@ -7956,6 +7956,77 @@ run_health_check() {
 
   bash "$health_script"
   log_success "Health checks passed"
+
+  # OLLAMA-INIT-EXIT-001: check ollama-init exit status and warn loudly if it
+  # failed. ollama-init is a one-shot container (no restart-unless-stopped) so
+  # a failed pull is silent once compose_up returns — the step-12 health check
+  # only verifies the ollama service port, not that models were actually pulled.
+  # This check surfaces init failures so the operator is not left wondering why
+  # agents return 404 "model not found". Non-fatal: the core stack is healthy;
+  # the operator can re-run 'docker compose --profile <profile> run ollama-init'.
+  _check_ollama_init_exit "${WORK_DIR}/docker"
+}
+
+# _check_ollama_init_exit — inspect the stopped ollama-init container exit code.
+# Called at the end of run_health_check() after the main health script passes.
+# Non-fatal: emits a clear WARNING and remediation hint; does NOT exit 1 because
+# compose warn-and-continue logic (digest=skip) means exit 0 is now the normal
+# path; a lingering exit-1 container means something else (network, disk) failed.
+_check_ollama_init_exit() {
+  local _compose_dir="${1:-${WORK_DIR}/docker}"
+  local _compose_file="${_compose_dir}/docker-compose.yml"
+
+  # Only applies to compose deployments; helm has its own Job status.
+  if [[ "${DEPLOY_MODE:-compose}" != "compose" && "${DEPLOY_MODE:-compose}" != "vm" ]]; then
+    return 0
+  fi
+
+  # ollama-init only runs when at least one AI profile is active.
+  local _has_ai_profile=false
+  for _p in "${COMPOSE_PROFILES[@]:-}"; do
+    case "$_p" in
+      openwebui|langflow|letta|openclaw) _has_ai_profile=true; break ;;
+    esac
+  done
+  if [[ "$_has_ai_profile" != "true" ]]; then
+    return 0
+  fi
+
+  # Look for an exited ollama-init container. Container name format varies by
+  # runtime: docker = <project>-ollama-init-1, podman = <project>_ollama-init_1
+  local _exit_code=""
+  local _ctr_name=""
+  while IFS= read -r _line; do
+    if [[ "$_line" == *"ollama-init"* ]]; then
+      _ctr_name="$_line"
+      break
+    fi
+  done < <("${COMPOSE_CMD[@]:-docker compose}" -f "$_compose_file" ps -a --format '{{.Name}}' 2>/dev/null || true)
+
+  if [[ -z "$_ctr_name" ]]; then
+    log_warn "ollama-init container not found — model pull status unknown (check: docker compose ps -a)"
+    return 0
+  fi
+
+  _exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$_ctr_name" 2>/dev/null || \
+                podman inspect --format '{{.State.ExitCode}}' "$_ctr_name" 2>/dev/null || true)"
+
+  if [[ -z "$_exit_code" ]]; then
+    log_warn "ollama-init: could not read exit code from container '$_ctr_name'"
+    return 0
+  fi
+
+  if [[ "$_exit_code" != "0" ]]; then
+    log_warn "################################################################"
+    log_warn "INSTALL WARNING: ollama-init exited with code ${_exit_code}"
+    log_warn "  The model pull container failed — agents (@letta/@langflow/@openclaw)"
+    log_warn "  may return 404 'model not found' until models are available in Ollama."
+    log_warn "  Check logs:  docker compose -f ${_compose_file} logs ollama-init"
+    log_warn "  Re-run pull: docker compose -f ${_compose_file} --profile <profile> run --rm ollama-init"
+    log_warn "################################################################"
+  else
+    log_success "ollama-init exited cleanly (models pulled successfully)"
+  fi
 }
 
 # =============================================================================

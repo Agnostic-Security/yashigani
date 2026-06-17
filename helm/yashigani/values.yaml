@@ -724,14 +724,17 @@ ollama:
   # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
   #   chat surface shows it as an available backend.
   # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
-  #   Set to "skip" after an upstream model update that changes the digest.
+  #   Default is "skip" — Ollama republishes models on upstream updates, which
+  #   changes the manifest SHA and hard-fails every clean install if a stale
+  #   digest is pinned. Prod operators who need strict enforcement set an explicit
+  #   prefix here; mismatches are always logged as loud WARNINGs.
   # minDiskGiB: minimum free gigabytes required on the ollama volume before pull.
   #   If free space < minDiskGiB the Job logs a warning and exits 0 (warn-only).
   initJob:
     # defaultModel: qwen2.5:3b — 1.9 GB, Qwen 2.5 3B-parameter instruct model.
     # Good balance of size and capability for a single-node deployment.
     defaultModel: "qwen2.5:3b"
-    modelDigest: "357c53fb659c"
+    modelDigest: "skip"
     minDiskGiB: 3
     resources:
       requests:

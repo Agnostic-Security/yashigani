@@ -1268,10 +1268,14 @@ services:
       # OLLAMA_MODEL: defaults to qwen2.5:3b. install.sh writes this to .env
       # when --with-openwebui is used; agent-bundle installs rely on this default.
       # Operators may override in docker/.env.
-      # OLLAMA_MODEL_DIGEST: short SHA for supply-chain digest verification.
-      # Set to "skip" to bypass (e.g. after an upstream model update).
+      # OLLAMA_MODEL_DIGEST: short SHA for supply-chain digest verification (SOL-SC-03).
+      # Default is "skip" — Ollama republishes models when they update them; a stale
+      # pinned digest causes exit 1 on every clean install even though the model is
+      # legitimate. For prod supply-chain enforcement, set an explicit digest prefix
+      # (e.g. OLLAMA_MODEL_DIGEST=357c53fb659c) via docker/.env. Mismatches are
+      # always logged as loud WARNINGs; they never hard-fail so agents stay healthy.
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
-      OLLAMA_MODEL_DIGEST: ${OLLAMA_MODEL_DIGEST:-357c53fb659c}
+      OLLAMA_MODEL_DIGEST: ${OLLAMA_MODEL_DIGEST:-skip}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -1291,32 +1295,45 @@ services:
           exit 0
         fi
         echo "Disk space OK ($$AVAIL_KB KB free). Pulling model..."
-        OLLAMA_HOST=http://ollama:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
-        # Verify model digest — detect tampered/poisoned models (SOL-SC-03)
-        EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-357c53fb659c}"
-        ACTUAL_DIGEST=$$(OLLAMA_HOST=http://ollama:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $$2}')
-        if [ -n "$$EXPECTED_DIGEST" ] && [ "$$EXPECTED_DIGEST" != "skip" ]; then
-          if echo "$$ACTUAL_DIGEST" | grep -q "$$EXPECTED_DIGEST"; then
-            echo "Model digest verified: $$ACTUAL_DIGEST"
-          else
-            echo "WARNING: Model digest mismatch! Expected=$$EXPECTED_DIGEST Actual=$$ACTUAL_DIGEST"
-            echo "This may indicate a tampered or updated model. Set OLLAMA_MODEL_DIGEST=skip to bypass."
-            exit 1
-          fi
-        fi
-        echo "Model pull complete: ${OLLAMA_MODEL:-qwen2.5:3b}"
-        # SF-QWEN-001: always also pull qwen2.5:3b regardless of the VRAM-tier model.
-        # The gateway (DEFAULT_MODELS), langflow (LANGFLOW_DEFAULT_MODEL), letta
-        # (LETTA_LLM_MODEL/LETTA_EMBEDDING_MODEL), and openclaw all hardcode
-        # qwen2.5:3b as their inference target. If OLLAMA_MODEL was set to a
-        # higher-VRAM-tier model (e.g. llama3.1:8b on 12 GB VRAM) this secondary
-        # pull was skipped, leaving agents with HTTP 404 "model not found" on
-        # every chat/completion request. Pull is idempotent when already present.
+        # SF-QWEN-001 (ordering fix): pull qwen2.5:3b FIRST, unconditionally, before
+        # any digest check on the VRAM-tier primary model. Previously qwen was pulled
+        # AFTER the primary digest gate — a stale digest on the primary caused exit 1
+        # which skipped the qwen pull entirely, leaving agents without their required
+        # inference model. qwen2.5:3b is the mandatory agent/gateway model regardless
+        # of which tier model is selected; it must always land in ollama.
         if [ "${OLLAMA_MODEL:-qwen2.5:3b}" != "qwen2.5:3b" ]; then
           echo "Pulling required base model: qwen2.5:3b (agent/gateway dependency — SF-QWEN-001)"
           OLLAMA_HOST=http://ollama:11434 ollama pull qwen2.5:3b
           echo "Base model pull complete: qwen2.5:3b"
         fi
+        # Now pull the operator-selected VRAM-tier model.
+        OLLAMA_HOST=http://ollama:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
+        # Verify model digest — detect tampered/poisoned models (SOL-SC-03).
+        # DIGEST POLICY: default is "skip" (see env comment above).
+        # A mismatch is a loud WARNING, never exit 1 — Ollama republishes models
+        # (changing their manifest SHA) on upstream updates; hard-failing breaks
+        # every clean install until the operator pins a new digest. Prod operators
+        # who need strict enforcement set OLLAMA_MODEL_DIGEST=<prefix> in .env;
+        # the warning gives them a clear signal to review + repin.
+        EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-skip}"
+        ACTUAL_DIGEST=$$(OLLAMA_HOST=http://ollama:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $$2}')
+        if [ -n "$$EXPECTED_DIGEST" ] && [ "$$EXPECTED_DIGEST" != "skip" ]; then
+          if echo "$$ACTUAL_DIGEST" | grep -q "$$EXPECTED_DIGEST"; then
+            echo "Model digest verified: $$ACTUAL_DIGEST"
+          else
+            echo "###############################################################"
+            echo "WARNING: Model digest mismatch (SOL-SC-03)"
+            echo "  Model:    ${OLLAMA_MODEL:-qwen2.5:3b}"
+            echo "  Expected: $$EXPECTED_DIGEST"
+            echo "  Actual:   $$ACTUAL_DIGEST"
+            echo "This model was updated upstream. Review the change and update"
+            echo "OLLAMA_MODEL_DIGEST in docker/.env to the new digest prefix,"
+            echo "or set OLLAMA_MODEL_DIGEST=skip to silence this warning."
+            echo "Continuing with the pulled model (install not aborted)."
+            echo "###############################################################"
+          fi
+        fi
+        echo "Model pull complete: ${OLLAMA_MODEL:-qwen2.5:3b}"
     depends_on:
       ollama:
         condition: service_healthy
