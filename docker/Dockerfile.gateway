@@ -150,4 +150,14 @@ COPY --chown=root:root docker/gateway-start.sh /usr/local/bin/gateway-start.sh
 USER root
 RUN chmod 0755 /usr/local/bin/gateway-start.sh
 USER yashigani
+
+# Cache-busting build arg consumed AFTER all COPY/pip steps so only the
+# final image layer re-executes when the source SHA changes; base + dep
+# layers remain cached.  The arg is stamped as a standard OCI label so
+# the installer can verify the built image matches the current source.
+# install.sh passes --build-arg GIT_SHA=$(git rev-parse --short HEAD).
+# Default "dev" is used in local docker build invocations without the arg.
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+
 CMD ["/bin/sh", "/usr/local/bin/gateway-start.sh"]

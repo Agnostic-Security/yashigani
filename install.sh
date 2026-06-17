@@ -93,6 +93,26 @@ fi
 # =============================================================================
 
 YASHIGANI_VERSION="3.0.0"
+# GIT_SHA: git short-hash of the current source tree used as a cache-busting
+# build arg (--build-arg GIT_SHA=...) for first-party images (gateway,
+# backoffice, extractor). Consumed as ARG GIT_SHA / LABEL revision in each
+# Dockerfile AFTER all dep-install COPY layers so base/dep layers stay cached
+# while any source commit forces the app-code layer to rebuild.
+# This closes the version-drift stale-image bug class (cf. 0d9aed1): when
+# YASHIGANI_VERSION is unchanged but source commits have landed, a cached image
+# tagged :3.0.0 from an earlier build would be reused silently. With GIT_SHA
+# baked into the image label, _local_images_cached() detects the mismatch and
+# forces a rebuild even when the version tag already exists in the local store.
+# Falls back to "dev" (non-git checkout / airgap / tarball installs); in those
+# cases the caller must ensure the image store is clean or set YASHIGANI_FORCE_REBUILD=1.
+YASHIGANI_GIT_SHA="${YASHIGANI_GIT_SHA:-}"
+if [[ -z "$YASHIGANI_GIT_SHA" ]]; then
+  if command -v git >/dev/null 2>&1 && git -C "${_YSG_SCRIPT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    YASHIGANI_GIT_SHA="$(git -C "${_YSG_SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  YASHIGANI_GIT_SHA="${YASHIGANI_GIT_SHA:-dev}"
+fi
+export YASHIGANI_GIT_SHA
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 # MI-1: record whether the operator pinned YSG_INSTALL_DIR explicitly in the
@@ -3319,6 +3339,14 @@ SSO_EOF
     dry_print "Generate SAML SP RSA-4096 key + certificate (YSG-RISK-044)"
   fi
 
+  # --- Source SHA for first-party image cache-busting ---
+  # Written here so `compose build` (Docker path) picks it up via .env
+  # interpolation: the compose YAML passes it as build arg GIT_SHA to each
+  # first-party Dockerfile. _local_images_cached() reads it back from the
+  # running image label to detect stale-tag hits when YASHIGANI_VERSION
+  # is unchanged but source commits have landed (version-drift stale-image bug).
+  _env_set "YASHIGANI_GIT_SHA" "${YASHIGANI_GIT_SHA}"
+
   log_info "Environment written to ${env_file}"
 }
 
@@ -4952,9 +4980,18 @@ _build_extractor_image() {
   fi
 
   # Skip if already built (versioned tag), to support airgap / re-runs.
-  if docker image inspect "$_tag" >/dev/null 2>&1; then
-    log_info "Extractor image already present ($_tag) — skipping build"
-    return 0
+  # Also verify the revision label matches the current source SHA so a stale
+  # cached extractor image does not shadow the current source (same fix class
+  # as _local_images_cached — version-drift stale-image bug).
+  if docker image inspect "$_tag" >/dev/null 2>&1 && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+    local _cached_sha
+    _cached_sha="$(docker image inspect "$_tag" \
+      --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
+    if [[ "$YASHIGANI_GIT_SHA" == "dev" || "$_cached_sha" == "$YASHIGANI_GIT_SHA" ]]; then
+      log_info "Extractor image already present ($_tag, SHA ${_cached_sha:-dev}) — skipping build"
+      return 0
+    fi
+    log_info "Extractor image SHA (${_cached_sha:-none}) != source SHA ${YASHIGANI_GIT_SHA} — rebuilding"
   fi
 
   log_info "Building per-job extractor image ($_tag) as a release artifact..."
@@ -5109,22 +5146,56 @@ except Exception:
   # store. This supports airgap installs and CI harnesses where images are
   # pre-seeded, and avoids unnecessary registry round-trips for the base image.
   # Check by versioned tag (not :latest) to avoid using stale images.
+  # _local_images_cached returns 0 (true) only when BOTH version-tagged images
+  # exist in the local store AND their org.opencontainers.image.revision label
+  # matches the current YASHIGANI_GIT_SHA.  A tag-only match is not sufficient:
+  # a cached yashigani/backoffice:3.0.0 built from an earlier commit satisfies
+  # the tag check while shipping stale code.  The revision label is stamped by
+  # --build-arg GIT_SHA=<sha> consumed late in each Dockerfile so the app-code
+  # layer re-executes on every source commit while base/dep layers remain cached.
+  # Skips the label check and always rebuilds when YASHIGANI_FORCE_REBUILD=1
+  # (operator escape hatch for airgap / pre-seeded stores that use GIT_SHA=dev).
   _local_images_cached() {
-    local _gw _bo
+    local _gw _bo _sha_label_gw _sha_label_bo
+    if [[ "${YASHIGANI_FORCE_REBUILD:-0}" == "1" ]]; then
+      return 1  # force rebuild requested
+    fi
     if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
       _gw="localhost/yashigani/gateway:${YASHIGANI_VERSION}"
       _bo="localhost/yashigani/backoffice:${YASHIGANI_VERSION}"
-      podman image inspect "$_gw" >/dev/null 2>&1 && \
-        podman image inspect "$_bo" >/dev/null 2>&1
+      # Existence check first (fast path — avoids inspect parse on miss)
+      podman image inspect "$_gw" >/dev/null 2>&1 || \
+        podman image inspect "yashigani/gateway:${YASHIGANI_VERSION}" >/dev/null 2>&1 || return 1
+      podman image inspect "$_bo" >/dev/null 2>&1 || \
+        podman image inspect "yashigani/backoffice:${YASHIGANI_VERSION}" >/dev/null 2>&1 || return 1
+      # Revision label check — detect stale-tag cache hits
+      _sha_label_gw="$(podman image inspect "$_gw" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+      _sha_label_bo="$(podman image inspect "$_bo" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
     else
       _gw="yashigani/gateway:${YASHIGANI_VERSION}"
       _bo="yashigani/backoffice:${YASHIGANI_VERSION}"
-      docker image inspect "$_gw" >/dev/null 2>&1 && \
-        docker image inspect "$_bo" >/dev/null 2>&1
+      docker image inspect "$_gw" >/dev/null 2>&1 || return 1
+      docker image inspect "$_bo" >/dev/null 2>&1 || return 1
+      _sha_label_gw="$(docker image inspect "$_gw" \
+        --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
+      _sha_label_bo="$(docker image inspect "$_bo" \
+        --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
     fi
+    # If GIT_SHA is "dev" (non-git install), trust the tag and skip label check.
+    if [[ "$YASHIGANI_GIT_SHA" == "dev" ]]; then
+      return 0
+    fi
+    # Labels must match; mismatch means the cached image is from an older commit.
+    if [[ "$_sha_label_gw" != "$YASHIGANI_GIT_SHA" || "$_sha_label_bo" != "$YASHIGANI_GIT_SHA" ]]; then
+      log_info "Cached image SHA (gw=${_sha_label_gw:-none} bo=${_sha_label_bo:-none}) != source SHA ${YASHIGANI_GIT_SHA} — will rebuild"
+      return 1
+    fi
+    return 0
   }
   if _local_images_cached; then
-    log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}) — skipping build"
+    log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}, SHA ${YASHIGANI_GIT_SHA}) — skipping build"
     log_success "Local images ready (cached)"
     # Signal compose_up() to use --pull never so digest-pinned compose image refs
     # don't trigger registry round-trips for pre-seeded images. Only safe when
@@ -5132,7 +5203,7 @@ except Exception:
     # bundle); fresh installs build+pull with digest verification as usual.
     YASHIGANI_COMPOSE_PULL_POLICY="never"
   else
-    log_info "Building gateway and backoffice images from source..."
+    log_info "Building gateway and backoffice images from source (SHA ${YASHIGANI_GIT_SHA})..."
     "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
       log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
       exit 1
@@ -6347,15 +6418,43 @@ compose_up() {
     fi
 
     # 5. Build images with podman build (compose build uses Docker buildx)
-    #    Skip rebuild on upgrade if images already exist
+    #    Skip rebuild only when both version-tagged images exist AND their
+    #    revision label matches the current source SHA. A stale :latest or a
+    #    version-tagged image from an older commit must be rebuilt (version-drift
+    #    stale-image bug — cf. 0d9aed1 + YASHIGANI_GIT_SHA cache-busting fix).
     local _gw_exists=false _bo_exists=false
-    podman image exists yashigani/gateway:latest 2>/dev/null && _gw_exists=true
-    podman image exists yashigani/backoffice:latest 2>/dev/null && _bo_exists=true
+    local _gw_sha_ok=false _bo_sha_ok=false
+    if podman image exists "yashigani/gateway:${YASHIGANI_VERSION}" 2>/dev/null || \
+       podman image exists "localhost/yashigani/gateway:${YASHIGANI_VERSION}" 2>/dev/null; then
+      _gw_exists=true
+      if [[ "$YASHIGANI_GIT_SHA" == "dev" ]]; then
+        _gw_sha_ok=true
+      else
+        local _gw_lbl
+        _gw_lbl="$(podman image inspect "yashigani/gateway:${YASHIGANI_VERSION}" 2>/dev/null \
+          | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+        [[ "$_gw_lbl" == "$YASHIGANI_GIT_SHA" ]] && _gw_sha_ok=true
+      fi
+    fi
+    if podman image exists "yashigani/backoffice:${YASHIGANI_VERSION}" 2>/dev/null || \
+       podman image exists "localhost/yashigani/backoffice:${YASHIGANI_VERSION}" 2>/dev/null; then
+      _bo_exists=true
+      if [[ "$YASHIGANI_GIT_SHA" == "dev" ]]; then
+        _bo_sha_ok=true
+      else
+        local _bo_lbl
+        _bo_lbl="$(podman image inspect "yashigani/backoffice:${YASHIGANI_VERSION}" 2>/dev/null \
+          | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+        [[ "$_bo_lbl" == "$YASHIGANI_GIT_SHA" ]] && _bo_sha_ok=true
+      fi
+    fi
 
-    if [[ "$UPGRADE" == "true" && "$_gw_exists" == "true" && "$_bo_exists" == "true" ]]; then
-      log_info "Images already built — skipping rebuild (upgrade path)"
+    if [[ "$_gw_exists" == "true" && "$_bo_exists" == "true" && \
+          "$_gw_sha_ok" == "true" && "$_bo_sha_ok" == "true" && \
+          "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+      log_info "Images already current (v${YASHIGANI_VERSION}, SHA ${YASHIGANI_GIT_SHA}) — skipping rebuild (Podman)"
     else
-      log_info "Building images with Podman..."
+      log_info "Building images with Podman (SHA ${YASHIGANI_GIT_SHA})..."
       # retro #32: do NOT pipe through `tail -1`. The script's outer exec
       # redirect at the top of main() already tees stdout+stderr to
       # install.log. Piping through `tail -1` here truncates build output
@@ -6363,8 +6462,14 @@ compose_up() {
       # errors ("no space left on device"), Dockerfile syntax errors, and
       # cache-eviction warnings are silently dropped from the log.
       # Verbose terminal output is the explicit tradeoff for visibility.
-      podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" -t yashigani/gateway:latest "${WORK_DIR}"
-      podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" -t yashigani/backoffice:latest "${WORK_DIR}"
+      podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
+        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+        -t "yashigani/gateway:${YASHIGANI_VERSION}" \
+        -t yashigani/gateway:latest "${WORK_DIR}"
+      podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
+        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+        -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
+        -t yashigani/backoffice:latest "${WORK_DIR}"
       log_success "Images built with Podman"
     fi
 
@@ -6372,11 +6477,20 @@ compose_up() {
     # Podman too. Build-only (never `up`), so it must be built + tagged
     # explicitly with the VERSIONED tag the runner names
     # (yashigani/extractor:${YASHIGANI_VERSION}). Idempotent on re-run.
-    if podman image exists "yashigani/extractor:${YASHIGANI_VERSION}" 2>/dev/null; then
-      log_info "Extractor image already present (yashigani/extractor:${YASHIGANI_VERSION}) — skipping"
+    local _podman_ext_tag="yashigani/extractor:${YASHIGANI_VERSION}"
+    local _podman_ext_cached_sha=""
+    if podman image exists "$_podman_ext_tag" 2>/dev/null && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+      _podman_ext_cached_sha="$(podman image inspect "$_podman_ext_tag" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+    fi
+    if podman image exists "$_podman_ext_tag" 2>/dev/null \
+        && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]] \
+        && { [[ "$YASHIGANI_GIT_SHA" == "dev" ]] || [[ "$_podman_ext_cached_sha" == "$YASHIGANI_GIT_SHA" ]]; }; then
+      log_info "Extractor image already present ($_podman_ext_tag, SHA ${_podman_ext_cached_sha:-dev}) — skipping"
     elif [[ -f "${WORK_DIR}/docker/Dockerfile.extractor" ]]; then
       log_info "Building per-job extractor image with Podman (release artifact)..."
       if podman build -f "${WORK_DIR}/docker/Dockerfile.extractor" \
+           --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
            -t "yashigani/extractor:${YASHIGANI_VERSION}" \
            -t "yashigani/extractor:latest" "${WORK_DIR}"; then
         log_success "Extractor image built with Podman (yashigani/extractor:${YASHIGANI_VERSION})"
@@ -9354,11 +9468,23 @@ generate_secrets() {
   # consistently with the installer version (`:${YASHIGANI_VERSION}`) and the
   # version is visible to Compose for any `${YASHIGANI_VERSION}` interpolation.
   if grep -q "^YASHIGANI_VERSION=" "$env_file" 2>/dev/null; then
-    local tmp_env; tmp_env="$(mktemp)"
+    local tmp_env; tmp_env="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
     sed "s|^YASHIGANI_VERSION=.*|YASHIGANI_VERSION=${YASHIGANI_VERSION}|" "$env_file" > "$tmp_env"
     mv "$tmp_env" "$env_file"
   else
     echo "YASHIGANI_VERSION=${YASHIGANI_VERSION}" >> "$env_file"
+  fi
+
+  # Cache-busting SHA — keep in sync with the value written by _write_aes_key_to_env.
+  # This block runs on the upgrade path (step 7 re-runs secrets generation but skips
+  # _write_aes_key_to_env on non-fresh installs), so we always refresh the SHA here
+  # to reflect the current source commit.
+  if grep -q "^YASHIGANI_GIT_SHA=" "$env_file" 2>/dev/null; then
+    local tmp_sha; tmp_sha="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+    sed "s|^YASHIGANI_GIT_SHA=.*|YASHIGANI_GIT_SHA=${YASHIGANI_GIT_SHA}|" "$env_file" > "$tmp_sha"
+    mv "$tmp_sha" "$env_file"
+  else
+    echo "YASHIGANI_GIT_SHA=${YASHIGANI_GIT_SHA}" >> "$env_file"
   fi
 
   # BEGIN YSG-P3-MCP-SIGKEY

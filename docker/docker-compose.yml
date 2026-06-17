@@ -303,6 +303,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
+      args:
+        GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_GATEWAY_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_GATEWAY_CPU_LIMIT:-1.0}
@@ -535,6 +537,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.backoffice
+      args:
+        GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_BACKOFFICE_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_BACKOFFICE_CPU_LIMIT:-1.0}
@@ -785,6 +789,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.extractor
+      args:
+        GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
     restart: unless-stopped
     mem_limit: 512m
     cpus: 1.0

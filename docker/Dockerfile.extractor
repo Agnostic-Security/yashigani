@@ -103,6 +103,15 @@ ENV PYTHONUNBUFFERED=1 \
     YASHIGANI_EXTRACTOR_HOST=0.0.0.0 \
     YASHIGANI_EXTRACTOR_PORT=8090
 
+# Cache-busting build arg consumed AFTER all COPY/pip steps so only the
+# final image layer re-executes when the source SHA changes; base + dep
+# layers remain cached.  The arg is stamped as a standard OCI label so
+# the installer can verify the built image matches the current source.
+# install.sh passes --build-arg GIT_SHA=$(git rev-parse --short HEAD).
+# Default "dev" is used in local docker build invocations without the arg.
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+
 USER 65532:65532
 
 # EXPOSE 8090: the extractor service listens on this port (internal bridge only).
