@@ -2,17 +2,17 @@
 
 ## Supported Versions
 
-A single release line is actively maintained on the `main` branch. Open WebUI is an optional flag (`--with-openwebui`), not a separate branch.
+A single release line is actively maintained on the `main` branch; security fixes land on the latest minor and ship as patch releases. Open WebUI is an optional flag (`--with-openwebui`), not a separate branch.
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
-| 2.23.1  | ✅ Current | Core-plane mTLS default-on, two-tier PKI (step-ca), seccomp + AppArmor default-on, full pre-release security and QA hardening |
-| 2.23.0  | ✅ Patch window | Single branch, API-first admin, strict CSP, compose profiles, opt-in internal CA |
-| 2.22.x  | ✅ Patch window | OPA on /v1, Wazuh SIEM, Grafana/Prometheus admin access, agent personas |
-| 2.20.x  | ❌ | Superseded by 2.22.x |
-| 2.1.x   | ❌ | Superseded by 2.20.x |
-| 2.0.x   | ❌ | Superseded by 2.1.x |
-| < 2.0   | ❌ | End of life |
+| 2.25.x  | ✅ Current | Latest public release line (2.25.4): MCP broker + signed integrity bundles, audit-chain hardening, OPA fail-close correctness, RBAC / Access model, durable agent registry, GPU/CDI, Caddy TLS edge |
+| 2.24.x  | ❌ | Superseded by 2.25.x |
+| 2.23.x  | ❌ | Superseded by 2.25.x |
+| 2.22.x  | ❌ | End of life |
+| < 2.22  | ❌ | End of life |
+
+> Yashigani **3.0** is in early-access beta and is **not yet covered** by this support policy.
 
 ## Reporting a Vulnerability
 
