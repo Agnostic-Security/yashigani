@@ -77,6 +77,12 @@ x-common-env: &common-env
   YASHIGANI_ENV: ${YASHIGANI_ENV:-production}
   YASHIGANI_ENVIRONMENT_LABEL: ${YASHIGANI_ENVIRONMENT_LABEL:-production}
   YASHIGANI_KMS_PROVIDER: ${YASHIGANI_KMS_PROVIDER:-docker}
+  # Demo/free: writable path for runtime-set cloud LLM API keys (Tiago directive).
+  # DockerSecretsProvider.set_secret writes atomically (0600) here when the admin
+  # stores a key via the UI.  get_secret checks this dir first, then /run/secrets.
+  # Scoped to cloud keys only (openai_api_key, anthropic_api_key) — install-managed
+  # secrets remain read-only.  Production KMS (keeper/aws/vault) ignores this var.
+  YASHIGANI_CLOUD_KEYS_DIR: /run/cloud-keys
   YASHIGANI_AUDIT_LOG_PATH: /data/audit/audit.log
   YASHIGANI_AUDIT_MAX_FILE_SIZE_MB: ${YASHIGANI_AUDIT_MAX_FILE_SIZE_MB:-100}
   YASHIGANI_AUDIT_RETENTION_DAYS: ${YASHIGANI_AUDIT_RETENTION_DAYS:-90}
@@ -434,6 +440,13 @@ services:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
       - ./secrets:/run/secrets:ro
+      # Demo/free: writable cloud-keys volume for runtime-set cloud LLM API keys.
+      # DockerSecretsProvider reads this dir first (before /run/secrets) when
+      # resolving cloud keys set via the admin UI.  Mode 0600 per-file (set by
+      # set_secret atomic write); dir itself must be writable by UID 1001.
+      # Never place install-managed secrets here — the provider enforces the
+      # cloud-key namespace at write time.
+      - ./cloud-keys:/run/cloud-keys:rw
       # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
       # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
@@ -674,6 +687,11 @@ services:
       # for v2.24.0. K8s is already protected: backoffice.yaml initContainer runs
       # chmod 0400 on all /secrets-rw/* files including license_key.
       - ./secrets:/run/secrets
+      # Demo/free: writable cloud-keys volume for runtime-set cloud LLM API keys.
+      # Backoffice calls DockerSecretsProvider.set_secret (atomic write, 0600)
+      # here when an admin stores a key via the UI.  Gateway reads back from this
+      # same host path via its own cloud-keys mount.  Scoped to cloud keys only.
+      - ./cloud-keys:/run/cloud-keys:rw
       # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
       # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
