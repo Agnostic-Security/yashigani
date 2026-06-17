@@ -34,7 +34,17 @@ _AGENTS_PATH = Path(__file__).parents[2] / "yashigani" / "backoffice" / "routes"
 
 def _load_agents_module():
     """Load agents.py without triggering the full backoffice import chain."""
+    # FIND-3.0-001: agents.py now imports from yashigani.backoffice._ssrf.
+    # Pre-load _ssrf directly (it has no backoffice deps) so that the package
+    # __init__ is not triggered when agents.py does the import.
+    import importlib as _il
+    _ssrf_path = Path(__file__).parents[2] / "yashigani" / "backoffice" / "_ssrf.py"
+    _ssrf_spec = _il.util.spec_from_file_location("yashigani.backoffice._ssrf", _ssrf_path)
+    _ssrf_mod = _il.util.module_from_spec(_ssrf_spec)
+    _ssrf_spec.loader.exec_module(_ssrf_mod)
+
     _stubs = {
+        "yashigani.backoffice._ssrf": _ssrf_mod,
         "yashigani.backoffice.middleware": type(sys)("stub"),
         "yashigani.backoffice.state": type(sys)("stub"),
         "yashigani.licensing.enforcer": type(sys)("stub"),

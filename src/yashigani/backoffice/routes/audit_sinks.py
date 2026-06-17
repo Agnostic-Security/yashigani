@@ -31,6 +31,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, HttpUrl
 
+from yashigani.backoffice._ssrf import assert_safe_outbound_url
 from yashigani.backoffice.middleware import require_admin_session, require_stepup_admin_session
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,24 @@ async def update_siem_config(
 
     if body.backend != "none" and not body.endpoint:
         raise HTTPException(status_code=422, detail="endpoint required for non-none backend")
+
+    # FIND-3.0-001: validate endpoint URL against SSRF targets before storing.
+    # Rejects loopback, link-local (incl. cloud IMDS 169.254.169.254), RFC-1918,
+    # multicast, and non-http(s) schemes (file://, gopher://, …).
+    # Operator-allowlisted internal SIEM hosts (YASHIGANI_SIEM_HOSTNAMES) bypass
+    # the IP-category check — same pattern as agent upstream_url.
+    if body.endpoint:
+        try:
+            assert_safe_outbound_url(
+                body.endpoint,
+                allowlist_env="YASHIGANI_SIEM_HOSTNAMES",
+                label="siem_endpoint",
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "ssrf_rejected", "message": str(exc)},
+            ) from exc
 
     backoffice_state.siem_backend = body.backend
     backoffice_state.siem_endpoint = body.endpoint
