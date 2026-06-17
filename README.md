@@ -24,6 +24,11 @@
 The next major release is now in **early-access beta**. What's coming:
 
 - **File redaction & pseudonymisation, in-flight** — proportionate enforcement beyond log/block: sensitive data in prompts, responses and documents is **redacted or pseudonymised** as it crosses the gateway (`Log · Redact · Pseudonymise · Block`).
+
+<div>
+  <img src="https://github.com/agnosticsec-com/yashigani_img/blob/main/Yashigani%20Pseudonomization.png" alt="Yashigani" style="width:100%">
+</div>
+  
 - **Security-mediated agent orchestration** — agents can fan out to other agents, LLMs and MCP tools, and **every hop is OPA-adjudicated at ingress *and* egress, up to 9 nested levels**; no agent ever holds direct network reach to an upstream.
 - **Tool-result inspection** — a poisoned MCP tool result or a compromised API response is inspected and **blocked before it re-enters an agent's context**.
 - **Multi-instance / HA** and **MCP capability-envelope pinning**.
