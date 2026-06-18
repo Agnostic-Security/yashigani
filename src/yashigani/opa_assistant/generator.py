@@ -12,6 +12,10 @@ LAURA-2255-004 / 30-007 hardening (2026-06-14):
   (opa_assistant.py) drops it before sending to the client.
 - Current RBAC document is passed as a separate system message (data context),
   not concatenated into the instruction.
+
+FIND-003 hardening (fix/medlow-findings):
+- Empty/non-JSON response triggers one retry with a stricter prompt suffix.
+- Empty response after retry returns a clear error, not a silent empty suggestion.
 """
 from __future__ import annotations
 
@@ -35,6 +39,14 @@ _SYSTEM_PROMPT = (
     "- method: HTTP verb or '*' for any\n"
     "- path_glob: exact path, /prefix/**, or /prefix/*/suffix\n"
     "- Output ONLY the JSON object."
+)
+
+# FIND-003: stricter retry suffix appended when first response is empty/non-JSON.
+_STRICT_SUFFIX = (
+    "\n\nIMPORTANT: You MUST respond with ONLY a JSON object and nothing else. "
+    'Example: {"groups": {"eng": {"id": "eng", "display_name": "Engineering", '
+    '"allowed_resources": [{"method": "*", "path_glob": "/tools/**"}]}}, '
+    '"user_groups": {"alice@example.com": ["eng"]}}'
 )
 
 
@@ -84,19 +96,23 @@ class OPAAssistantGenerator:
         # Description is the user message — isolated from the system prompt
         messages.append({"role": "user", "content": description})
 
-        try:
+        async def _post_messages(msgs: list[dict]) -> str:
+            """Post a chat request and return raw content string."""
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(
                     f"{self._url}/api/chat",
                     json={
                         "model": self._model,
-                        "messages": messages,
+                        "messages": msgs,
                         "format": "json",
                         "stream": False,
                     },
                 )
                 resp.raise_for_status()
-                raw = resp.json().get("message", {}).get("content", "").strip()
+                return resp.json().get("message", {}).get("content", "").strip()
+
+        try:
+            raw = await _post_messages(messages)
         except httpx.TimeoutException:
             logger.error("OPA assistant: Ollama timeout after %.1fs", self._timeout)
             return {"suggestion": None, "valid": False, "error": "ollama_timeout"}
@@ -107,6 +123,49 @@ class OPAAssistantGenerator:
         except Exception as exc:
             logger.error("OPA assistant: Ollama error: %s", exc)
             return {"suggestion": None, "valid": False, "error": f"ollama_error:{exc}"}
+
+        # FIND-003: retry once with a stricter prompt if the response is empty or
+        # contains no JSON object at all. qwen2.5:3b reliably handles format:json;
+        # this guard is defensive against model swap or transient blank responses.
+        if not raw or "{" not in raw:
+            logger.warning(
+                "OPA assistant: empty/non-JSON response from model=%r (len=%d) — "
+                "retrying with stricter prompt",
+                self._model, len(raw),
+            )
+            # Append the strict suffix to the LAST system message (the instruction).
+            retry_messages = list(messages)
+            # Find the first system message and augment it
+            for i, msg in enumerate(retry_messages):
+                if msg.get("role") == "system" and msg.get("content") == _SYSTEM_PROMPT:
+                    retry_messages[i] = {"role": "system", "content": _SYSTEM_PROMPT + _STRICT_SUFFIX}
+                    break
+            try:
+                raw = await _post_messages(retry_messages)
+            except httpx.TimeoutException:
+                logger.error("OPA assistant: retry Ollama timeout after %.1fs", self._timeout)
+                return {"suggestion": None, "valid": False, "error": "ollama_timeout_retry"}
+            except httpx.HTTPStatusError as exc:
+                logger.error("OPA assistant: retry Ollama HTTP error: %s", exc)
+                return {"suggestion": None, "valid": False,
+                        "error": f"ollama_http_error_retry:{exc.response.status_code}"}
+            except Exception as exc:
+                logger.error("OPA assistant: retry Ollama error: %s", exc)
+                return {"suggestion": None, "valid": False, "error": f"ollama_error_retry:{exc}"}
+
+        # FIND-003: if still empty after retry, return a clear actionable error.
+        if not raw or "{" not in raw:
+            logger.error(
+                "OPA assistant: empty response after retry (model=%r) — "
+                "raw logged server-side only: %r",
+                self._model, raw[:200],
+            )
+            return {
+                "suggestion": None,
+                "valid": False,
+                "error": "empty_llm_response: model returned no JSON after retry. "
+                         "Ensure YASHIGANI_OPA_ASSISTANT_MODEL=qwen2.5:3b or try a more specific description.",
+            }
 
         # Strip markdown code fences (defensive — format:json should prevent them)
         clean = raw

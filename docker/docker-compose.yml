@@ -137,6 +137,13 @@ x-common-env: &common-env
   # via YSG_CMVP_CERT env (e.g. "#4985" for the CMVP-validated OpenSSL FIPS Provider).
   # Empty default = attestation field reports null.
   YASHIGANI_CMVP_CERT: ${YSG_CMVP_CERT:-}
+  # FIND-003 (fix/medlow-findings): structured-output assistant flows (generate-pattern,
+  # OPA policy-draft) default to qwen2.5:3b — the small instruct model always pulled by
+  # the installer. Without this, the resolution falls through to OLLAMA_MODEL which may
+  # be a VRAM-tier model (llama3.1:8b etc.) that returns empty JSON for these tasks.
+  # Operator override: set YASHIGANI_OPA_ASSISTANT_MODEL in docker/.env to a different
+  # model; the env var takes priority over this default.
+  YASHIGANI_OPA_ASSISTANT_MODEL: ${YASHIGANI_OPA_ASSISTANT_MODEL:-qwen2.5:3b}
 
 # Reminder for readers: the runtime manifest (with per-install bootstrap_token_sha256
 # values populated) is mounted into each Python service as:

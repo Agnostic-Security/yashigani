@@ -489,8 +489,10 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
 
     POST a description of a sensitive data type → returns a generated regex,
     suggested sensitivity level (1–5), and short description. Uses the
-    install-default model (resolved via YASHIGANI_OPA_ASSISTANT_MODEL /
-    OLLAMA_MODEL / first available Ollama model).
+    install-default model (resolved via YASHIGANI_OPA_ASSISTANT_MODEL env var;
+    defaults to qwen2.5:3b — the structured-output capable model always pulled
+    by the installer). FIND-003: never uses OLLAMA_MODEL (may be a VRAM-tier
+    model that returns empty JSON for structured-output tasks).
 
     The returned pattern is a DRAFT — the admin reviews and creates it via
     POST /admin/sensitivity/patterns. Nothing is auto-applied.
@@ -500,6 +502,8 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
 
     LAURA-2255-003 hardening: uses chat API (system+user roles), format:json,
     and does NOT return the raw LLM response to the client.
+    FIND-003 hardening: retries once with stricter prompt on empty response;
+    returns actionable error instead of silent empty pattern.
     """
     from yashigani.backoffice.state import backoffice_state as _state
 
@@ -508,10 +512,14 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
         or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
     ).rstrip("/")
 
-    # P1.4 (fix/medlow-findings): resolve model robustly — surface a SPECIFIC error
-    # if no model is available rather than falling back to a hardcoded default that
-    # might also be absent. Mirrors the improved _resolve_default_model in policies.py.
-    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL")
+    # FIND-003 (fix/medlow-findings): resolve model for structured-output tasks.
+    # YASHIGANI_OPA_ASSISTANT_MODEL is the operator override (highest priority).
+    # Default: qwen2.5:3b — the small instruct model always pulled by the installer
+    # and capable of format:json structured output.
+    # We do NOT fall through to OLLAMA_MODEL: it may be a VRAM-tier model
+    # (llama3.1:8b etc.) that returns empty JSON for generate-pattern tasks.
+    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL")
+    _STRUCTURED_OUTPUT_DEFAULT = "qwen2.5:3b"
     ollama_reachable = False
     try:
         async with _httpx.AsyncClient(timeout=10.0) as c:
@@ -535,7 +543,7 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
                 ),
             },
         )
-    model = pref if pref else (avail[0] if avail else "qwen2.5:3b")
+    model = pref if pref else _STRUCTURED_OUTPUT_DEFAULT
     if pref and avail and pref not in avail:
         logger.warning(
             "generate_pattern: preferred model %r not in pulled models %s — will attempt anyway",
@@ -544,31 +552,58 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
 
     # LAURA-2255-003: chat API with separate system + user roles.
     # description is the user message — not concatenated into the system prompt.
-    try:
+    # FIND-003: helper to call the chat API once; used for initial attempt + retry.
+    async def _call_llm(system_msg: str) -> str:
         async with _httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
+            r = await client.post(
                 ollama_url + "/api/chat",
                 json={
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": _PATTERN_GEN_SYSTEM_MSG},
+                        {"role": "system", "content": system_msg},
                         {"role": "user", "content": body.description},
                     ],
                     "format": "json",
                     "stream": False,
                 },
             )
-            resp.raise_for_status()
-            raw = (resp.json().get("message", {}).get("content") or "").strip()
+            r.raise_for_status()
+            return (r.json().get("message", {}).get("content") or "").strip()
+
+    try:
+        raw = await _call_llm(_PATTERN_GEN_SYSTEM_MSG)
     except _httpx.HTTPError as exc:
         logger.warning("generate_pattern: LLM error: %s", exc)
-        # P1.4: include the model name in the error so admins can diagnose
-        # "model not found" (404) vs "Ollama down" (connection error) vs other issues.
+        # P1.4: include the model name so admins can diagnose
+        # "model not found" (404) vs "Ollama down" vs other issues.
         raise _HTTPException(
             status_code=503,
             detail={"error": "llm_unavailable",
                     "message": f"LLM request failed (model={model!r}, ollama={ollama_url}): {exc}"},
         )
+
+    # FIND-003: retry once with a stricter prompt if the response is empty or
+    # clearly not a JSON object. Some VRAM-tier models ignore format:json on the
+    # first attempt. qwen2.5:3b reliably handles this on retry.
+    _STRICT_SUFFIX = (
+        "\n\nIMPORTANT: You MUST respond with ONLY a JSON object, no other text. "
+        'Example: {"regex": "\\\\bpattern\\\\b", "level": 3, "description": "short desc"}'
+    )
+    _needs_retry = not raw or not _re.search(r"\{", raw)
+    if _needs_retry:
+        logger.warning(
+            "generate_pattern: empty/non-JSON response from model=%r (len=%d) — retrying with stricter prompt",
+            model, len(raw),
+        )
+        try:
+            raw = await _call_llm(_PATTERN_GEN_SYSTEM_MSG + _STRICT_SUFFIX)
+        except _httpx.HTTPError as exc:
+            logger.warning("generate_pattern: retry LLM error: %s", exc)
+            raise _HTTPException(
+                status_code=503,
+                detail={"error": "llm_unavailable",
+                        "message": f"LLM retry failed (model={model!r}, ollama={ollama_url}): {exc}"},
+            )
 
     # Parse JSON — best-effort; log failures server-side only (never expose raw to client)
     generated_regex: str = ""
@@ -590,6 +625,16 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
     except Exception as exc:
         # Log server-side only — never expose raw LLM output to client
         logger.warning("generate_pattern: parse error (logged server-side only): %s | raw=%r", exc, raw[:300])
+
+    # FIND-003: empty regex after a successful parse is still a failure.
+    # Surface a clear error rather than silently returning an empty pattern.
+    if parse_ok and not generated_regex:
+        logger.warning(
+            "generate_pattern: model=%r returned parseable JSON but empty regex field — "
+            "returning empty_regex error (raw logged server-side only)",
+            model,
+        )
+        parse_ok = False
 
     # Validate the AI-generated regex for safety before returning it
     if generated_regex:
@@ -622,17 +667,34 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
 
     # LAURA-2255-003: raw_llm_response is NEVER returned to the client.
     # Log it server-side above; the client gets only the structured fields.
+    # FIND-003: "ok" requires a non-empty regex. "parse_error" = unparseable JSON.
+    # "empty_regex" = parseable JSON but the regex field was empty (actionable signal
+    # to the admin: try a more specific description or set YASHIGANI_OPA_ASSISTANT_MODEL).
+    if parse_ok:
+        status_str = "ok"
+    elif not raw or not _re.search(r"\{", raw):
+        status_str = "empty_response"
+    else:
+        status_str = "parse_error"
+
+    note_ok = (
+        "AI-generated draft — review the regex before applying. "
+        "To create the pattern: POST /admin/sensitivity/patterns with "
+        "{'classification': '<level>', 'type': 'regex', "
+        "'pattern': '<regex>', 'description': '<desc>'}."
+    )
+    note_fail = (
+        "The model returned an empty or unparseable response. "
+        "Try a more specific description (e.g. 'UK National Insurance numbers in the format AB123456C'). "
+        "You can also set YASHIGANI_OPA_ASSISTANT_MODEL=qwen2.5:3b in docker/.env to force the "
+        "structured-output model."
+    )
     return {
-        "status": "ok" if parse_ok else "parse_error",
+        "status": status_str,
         "description": body.description,
         "model": model,
         "generated_regex": generated_regex,
         "suggested_level": suggested_level,
         "generated_description": generated_description,
-        "note": (
-            "AI-generated draft — review the regex before applying. "
-            "To create the pattern: POST /admin/sensitivity/patterns with "
-            "{'classification': '<level>', 'type': 'regex', "
-            "'pattern': '<regex>', 'description': '<desc>'}."
-        ),
+        "note": note_ok if parse_ok else note_fail,
     }

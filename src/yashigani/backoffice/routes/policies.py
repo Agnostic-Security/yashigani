@@ -119,15 +119,25 @@ _lifecycle_store = _PolicyLifecycle()
 # ---------------------------------------------------------------------------
 
 async def _resolve_default_model(ollama_url: str) -> tuple[str, list[str]]:
-    """Resolve the install-default model: prefer YASHIGANI_OPA_ASSISTANT_MODEL /
-    OLLAMA_MODEL env vars; fall back to first available model from /api/tags.
+    """Resolve the install-default model for structured-output assistant flows.
+
+    Resolution order (FIND-003 fix/medlow-findings):
+      1. YASHIGANI_OPA_ASSISTANT_MODEL — explicit operator override (highest priority).
+      2. qwen2.5:3b — always-present installer-pulled model; suitable for structured JSON.
+         We do NOT fall through to OLLAMA_MODEL because it may be a VRAM-tier model
+         (llama3.1:8b etc.) that returns empty JSON for generate-pattern / policy-draft.
+
+    Still fetches /api/tags for availability checking and warning on missing pref model.
     Returns (model_name, available_names).
 
     fix/medlow-findings P1.4: raises HTTPException 503 with a SPECIFIC error message
-    (naming the Ollama URL and the preferred model) when no model can be found rather
-    than silently falling through to a hardcoded default that might also be absent.
+    when Ollama is unreachable AND no YASHIGANI_OPA_ASSISTANT_MODEL override is set.
     """
-    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL")
+    # FIND-003: YASHIGANI_OPA_ASSISTANT_MODEL only — never fall through to OLLAMA_MODEL.
+    # qwen2.5:3b is the always-present structured-output model; OLLAMA_MODEL is the
+    # VRAM-tier inference model which may not handle format:json tasks correctly.
+    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL")
+    _STRUCTURED_OUTPUT_DEFAULT = "qwen2.5:3b"
     ollama_reachable = False
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
@@ -150,10 +160,9 @@ async def _resolve_default_model(ollama_url: str) -> tuple[str, list[str]]:
             status_code=503,
             detail={"error": "no_model_available", "message": detail_msg},
         )
-    # If pref is set but not in avail (e.g. model not yet pulled), use it anyway
-    # and let Ollama return a 404 — that gives the admin a specific error about the
-    # missing model rather than silently falling back to a random one.
-    model = pref if pref else (avail[0] if avail else "qwen2.5:3b")
+    # Default: qwen2.5:3b (structured-output capable, always pulled by installer).
+    # Operator override via YASHIGANI_OPA_ASSISTANT_MODEL takes priority.
+    model = pref if pref else _STRUCTURED_OUTPUT_DEFAULT
     if pref and avail and pref not in avail:
         _log.warning(
             "_resolve_default_model: preferred model %r not in pulled models %s — "

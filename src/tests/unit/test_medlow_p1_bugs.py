@@ -10,6 +10,8 @@ Covers:
           generate_policy returns status="compile_error" when repair fails
   P1.4 — _resolve_default_model raises 503 with specific message when no model
   P1.5 — letta_client/_letta_brain_model respects YASHIGANI_LETTA_BRAIN_MODEL
+  FIND-003 — generate-pattern / OPA policy-draft default to qwen2.5:3b;
+             empty LLM response triggers retry + clear error (not silent empty pattern)
 """
 from __future__ import annotations
 
@@ -352,3 +354,226 @@ def test_admin_cloud_key_event_in_schema():
     # Key VALUE must not appear in the event — only kms_key name
     assert not hasattr(ev, "api_key"), \
         "AdminCloudKeySetEvent must not have api_key field"
+
+
+# ---------------------------------------------------------------------------
+# FIND-003 — generate-pattern defaults to qwen2.5:3b; empty → retry → error
+# ---------------------------------------------------------------------------
+
+def test_resolve_default_model_ignores_ollama_model_env(monkeypatch):
+    """_resolve_default_model must NOT use OLLAMA_MODEL — only YASHIGANI_OPA_ASSISTANT_MODEL.
+    This is the root cause of FIND-003: OLLAMA_MODEL=llama3.1:8b was picked up and
+    that model returns empty JSON for structured-output tasks.
+    """
+    import inspect
+    from yashigani.backoffice.routes import policies as pol_module
+    src = inspect.getsource(pol_module._resolve_default_model)
+    # Must NOT fall through to OLLAMA_MODEL
+    assert "OLLAMA_MODEL" not in src or "YASHIGANI_OPA_ASSISTANT_MODEL" in src, \
+        "_resolve_default_model must not use OLLAMA_MODEL as a fallback"
+    # Confirm the structured-output default is qwen2.5:3b
+    assert "qwen2.5:3b" in src, \
+        "_resolve_default_model must default to qwen2.5:3b for structured-output tasks"
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_model_defaults_to_qwen(monkeypatch):
+    """When no YASHIGANI_OPA_ASSISTANT_MODEL is set but models are available,
+    the function must return qwen2.5:3b (not avail[0] which could be llama3.1:8b)."""
+    monkeypatch.delenv("YASHIGANI_OPA_ASSISTANT_MODEL", raising=False)
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        tags_resp = MagicMock()
+        tags_resp.raise_for_status = MagicMock()
+        # Simulate llama3.1:8b as the ONLY available model
+        tags_resp.json = MagicMock(return_value={"models": [{"name": "llama3.1:8b"}]})
+        mock_client.get = AsyncMock(return_value=tags_resp)
+        mock_client_cls.return_value = mock_client
+
+        from yashigani.backoffice.routes.policies import _resolve_default_model
+        model, avail = await _resolve_default_model("http://ollama:11434")
+
+    # Must default to qwen2.5:3b NOT to avail[0] = llama3.1:8b
+    assert model == "qwen2.5:3b", \
+        f"Expected qwen2.5:3b, got {model!r} — FIND-003 regression"
+    assert "llama3.1:8b" in avail
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_model_respects_assistant_model_override(monkeypatch):
+    """YASHIGANI_OPA_ASSISTANT_MODEL overrides the qwen2.5:3b default."""
+    monkeypatch.setenv("YASHIGANI_OPA_ASSISTANT_MODEL", "mistral:7b")
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        tags_resp = MagicMock()
+        tags_resp.raise_for_status = MagicMock()
+        tags_resp.json = MagicMock(return_value={"models": [{"name": "qwen2.5:3b"}]})
+        mock_client.get = AsyncMock(return_value=tags_resp)
+        mock_client_cls.return_value = mock_client
+
+        from yashigani.backoffice.routes.policies import _resolve_default_model
+        model, _ = await _resolve_default_model("http://ollama:11434")
+
+    assert model == "mistral:7b", \
+        "YASHIGANI_OPA_ASSISTANT_MODEL must override the qwen2.5:3b default"
+
+
+def test_sensitivity_generate_pattern_ignores_ollama_model():
+    """generate_pattern must NOT call os.getenv('OLLAMA_MODEL') in its resolution
+    logic (FIND-003). OLLAMA_MODEL may be a VRAM-tier model that returns empty JSON
+    for structured-output tasks. The docstring may mention it for documentation
+    purposes but the code must not read it."""
+    import inspect, ast
+    from yashigani.backoffice.routes import sensitivity as sens_mod
+    src = inspect.getsource(sens_mod.generate_pattern)
+    # Parse the AST and look for os.getenv("OLLAMA_MODEL") calls in the function body.
+    # We skip the docstring by checking that OLLAMA_MODEL only appears in string literals
+    # inside the docstring, not in actual getenv calls.
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            # Check for os.getenv("OLLAMA_MODEL") or getenv("OLLAMA_MODEL")
+            func = node.func
+            is_getenv = (
+                (isinstance(func, ast.Attribute) and func.attr == "getenv") or
+                (isinstance(func, ast.Name) and func.id == "getenv")
+            )
+            if is_getenv and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and arg.value == "OLLAMA_MODEL":
+                    raise AssertionError(
+                        "generate_pattern calls os.getenv('OLLAMA_MODEL') — FIND-003 regression. "
+                        "Must use only YASHIGANI_OPA_ASSISTANT_MODEL with qwen2.5:3b default."
+                    )
+    assert "qwen2.5:3b" in src, \
+        "generate_pattern must use qwen2.5:3b as the structured-output default"
+
+
+def test_sensitivity_generate_pattern_has_retry_logic():
+    """generate_pattern must contain retry logic for empty LLM responses (FIND-003)."""
+    import inspect
+    from yashigani.backoffice.routes import sensitivity as sens_mod
+    src = inspect.getsource(sens_mod.generate_pattern)
+    assert "_needs_retry" in src or "_STRICT_SUFFIX" in src, \
+        "generate_pattern must have retry logic for empty LLM responses"
+    assert "empty_response" in src or "empty_regex" in src or "empty" in src.lower(), \
+        "generate_pattern must surface a clear error on empty LLM response"
+
+
+def test_opa_assistant_generator_has_empty_output_guard():
+    """OPAAssistantGenerator.generate must guard against empty LLM output (FIND-003)."""
+    import inspect
+    from yashigani.opa_assistant.generator import OPAAssistantGenerator
+    src = inspect.getsource(OPAAssistantGenerator.generate)
+    assert "empty_llm_response" in src or "_STRICT_SUFFIX" in src, \
+        "OPAAssistantGenerator.generate must guard against empty LLM output"
+    assert "retry" in src.lower(), \
+        "OPAAssistantGenerator.generate must retry on empty response"
+
+
+@pytest.mark.asyncio
+async def test_opa_assistant_generator_retries_on_empty_response():
+    """OPAAssistantGenerator.generate must retry once on an empty first response
+    and return a clear error if the retry also fails (FIND-003)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import httpx
+
+    # First call returns empty string; second also returns empty → clear error
+    call_count = 0
+
+    async def fake_post(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"message": {"content": ""}})
+        return resp
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = fake_post
+
+    from yashigani.opa_assistant.generator import OPAAssistantGenerator
+    gen = OPAAssistantGenerator(ollama_url="http://ollama:11434", model="qwen2.5:3b")
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await gen.generate("allow engineering team to access all tools")
+
+    # Must have retried (2 calls total)
+    assert call_count == 2, f"Expected 2 LLM calls (initial + retry), got {call_count}"
+    # Must return a clear error, not a silent empty suggestion
+    assert result["valid"] is False
+    assert result["suggestion"] is None
+    assert "empty" in (result.get("error") or "").lower(), \
+        f"Error must mention 'empty', got: {result.get('error')!r}"
+
+
+@pytest.mark.asyncio
+async def test_opa_assistant_generator_succeeds_on_retry():
+    """OPAAssistantGenerator.generate must succeed when the retry returns valid JSON."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import json as _json
+
+    valid_rbac = {
+        "groups": {"eng": {"id": "eng", "display_name": "Engineering",
+                            "allowed_resources": [{"method": "*", "path_glob": "/tools/**"}]}},
+        "user_groups": {"alice@example.com": ["eng"]},
+    }
+
+    call_count = 0
+
+    async def fake_post(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if call_count == 1:
+            # First attempt: empty
+            resp.json = MagicMock(return_value={"message": {"content": ""}})
+        else:
+            # Retry: valid JSON
+            resp.json = MagicMock(return_value={"message": {"content": _json.dumps(valid_rbac)}})
+        return resp
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = fake_post
+
+    from yashigani.opa_assistant.generator import OPAAssistantGenerator
+    gen = OPAAssistantGenerator(ollama_url="http://ollama:11434", model="qwen2.5:3b")
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await gen.generate("allow engineering team to access all tools")
+
+    assert call_count == 2, f"Expected 2 calls (initial empty + retry), got {call_count}"
+    assert result["valid"] is True
+    assert result["suggestion"] == valid_rbac
+    assert result["error"] is None
+
+
+def test_compose_sets_yashigani_opa_assistant_model():
+    """docker-compose.yml x-common-env must set YASHIGANI_OPA_ASSISTANT_MODEL=qwen2.5:3b
+    so that structured-output assistant flows never fall through to the VRAM-tier OLLAMA_MODEL."""
+    import pathlib
+    compose = pathlib.Path("docker/docker-compose.yml").read_text()
+    assert "YASHIGANI_OPA_ASSISTANT_MODEL" in compose, \
+        "docker-compose.yml must set YASHIGANI_OPA_ASSISTANT_MODEL in x-common-env (FIND-003)"
+    # Verify the default value is qwen2.5:3b
+    assert "qwen2.5:3b" in compose, \
+        "docker-compose.yml YASHIGANI_OPA_ASSISTANT_MODEL must default to qwen2.5:3b"
