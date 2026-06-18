@@ -696,6 +696,36 @@ class ModelListResponse(BaseModel):
     data: list[ModelInfo]
 
 
+# ── Embeddings models ─────────────────────────────────────────────────────
+
+class EmbeddingRequest(BaseModel):
+    """OpenAI-compatible embeddings request body."""
+    model: str = Field(description="Model name or alias to use for embeddings")
+    input: str | list[str] = Field(description="Text(s) to embed")
+    encoding_format: Optional[str] = None  # "float" (default) or "base64"
+    dimensions: Optional[int] = None       # returned vector size (provider-dependent)
+    user: Optional[str] = None             # end-user identifier (OpenAI passthrough)
+
+
+class EmbeddingObject(BaseModel):
+    """Single embedding result (OpenAI shape)."""
+    object: str = "embedding"
+    embedding: list[float]
+    index: int = 0
+
+
+class EmbeddingUsage(BaseModel):
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+class EmbeddingResponse(BaseModel):
+    object: str = "list"
+    data: list[EmbeddingObject]
+    model: str
+    usage: EmbeddingUsage
+
+
 # ── State (injected at startup) ─────────────────────────────────────────
 
 class OpenAIRouterState:
@@ -787,6 +817,42 @@ _CLOUD_PROVIDER_CONFIG: dict[str, dict] = {
 }
 
 _CLOUD_KEY_TTL: float = 60.0  # seconds
+
+# ---------------------------------------------------------------------------
+# Cloud embedding model configuration (per-provider).
+#
+# Most cloud LLM providers have a SEPARATE dedicated embedding model (e.g.
+# OpenAI text-embedding-3-small) that is NOT a chat model. We therefore cannot
+# simply forward the caller's model name when routing to cloud.
+#
+# Resolution order per provider:
+#   1. YASHIGANI_<PROVIDER>_EMBEDDING_MODEL env var (operator override)
+#   2. _CLOUD_EMBEDDING_DEFAULTS[provider] built-in default
+#   3. None → provider has no embedding API → fall back to local Ollama
+#
+# Anthropic has no public embeddings API as of the knowledge cutoff; its entry
+# is None → any cloud-routed embeddings request for an Anthropic-hosted model
+# falls back to the local Ollama embedder automatically.
+# ---------------------------------------------------------------------------
+_CLOUD_EMBEDDING_DEFAULTS: dict[str, Optional[str]] = {
+    "openai": "text-embedding-3-small",
+    "anthropic": None,  # Anthropic has no embeddings API → Ollama fallback
+}
+
+
+def _get_cloud_embedding_model(provider: str) -> Optional[str]:
+    """Return the embedding model to use for a cloud provider.
+
+    Reads YASHIGANI_<PROVIDER>_EMBEDDING_MODEL from env (operator override),
+    then falls back to the built-in default. Returns None when the provider
+    has no embeddings API (e.g. Anthropic) — callers must then fall back to
+    the local Ollama embedder.
+    """
+    env_var = f"YASHIGANI_{provider.upper()}_EMBEDDING_MODEL"
+    env_val = os.getenv(env_var, "").strip()
+    if env_val:
+        return env_val
+    return _CLOUD_EMBEDDING_DEFAULTS.get(provider)  # may be None
 
 
 def _get_cloud_api_key(provider: str) -> Optional[str]:
@@ -2709,6 +2775,419 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     return JSONResponse(
         content=_completion,
         headers=headers,
+    )
+
+
+@router.post("/embeddings", response_model=EmbeddingResponse)
+async def create_embeddings(body: EmbeddingRequest, request: Request):
+    """
+    OpenAI-compatible embeddings endpoint.
+
+    Pipeline (mirrors /v1/chat/completions):
+    1. Identity resolution + anonymous-caller reject (401)
+    2. Sensitivity classification of input text(s) — SAME classifier as chat
+    3. OPA ingress policy check (fail-closed)
+    4. Sensitivity × routing gate: sensitive input + cloud provider → refuse
+       (routing_unsafe_sensitive_to_cloud, same code as chat path via OPA)
+    5. Provider routing:
+       a. Ollama local  → POST <ollama_url>/api/embed (native multi-input API)
+          or /v1/embeddings (OpenAI-compat — TO BE CONFIRMED on live stack)
+       b. Cloud (OpenAI) → POST <base_url>/v1/embeddings with embedding model
+       c. Cloud (Anthropic) → no embeddings API; fall back to Ollama + log
+    6. Normalise response to OpenAI embeddings shape
+    7. Audit via GatewayRequestEvent
+
+    Security invariants:
+    - Sensitive text (CONFIDENTIAL/RESTRICTED) MUST NOT egress to cloud for
+      embedding — archival memory stored via cloud embedder would leak to the
+      provider. This is the key gate for Letta archival memory.
+    - OPA denial from routing_unsafe_sensitive_to_cloud is the same code path
+      as chat; the OPA v1_routing.rego `routing_safe` rule covers both.
+
+    Uncertainty (flag for live stack verification):
+    - Ollama < 0.5.0 may not expose /v1/embeddings (OpenAI-compat path).
+      We use /api/embed (native, available from Ollama 0.1.x); if that also
+      errors the caller gets 503.  Confirm the installed Ollama version exposes
+      /api/embed on the live 3.1 stack.
+    - Letta archival-memory embedding model: Letta may send any model name;
+      this handler resolves the provider from the model name just like chat,
+      so the model name Letta is configured to use must exist in Ollama or
+      match a cloud-routing alias.
+    """
+    from yashigani.audit.schema import GatewayRequestEvent
+
+    request_id = f"embed-{uuid.uuid4().hex[:12]}"
+    start_time = time.time()
+
+    # ── 1. Identity resolution ────────────────────────────────────────
+    identity = _resolve_identity(request)
+    identity_id = identity.get("identity_id", "anonymous") if identity else "anonymous"
+
+    if identity is None:
+        logger.warning(
+            "Anonymous /v1/embeddings caller rejected (request_id=%s) — "
+            "zero-trust fail-closed",
+            request_id,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "AUTHENTICATION_REQUIRED",
+                "detail": (
+                    "POST /v1/embeddings requires an authenticated identity. "
+                    "Provide Authorization: Bearer <api_key> or authenticate via "
+                    "the SSO flow (X-Forwarded-User header from Caddy)."
+                ),
+                "request_id": request_id,
+            },
+        )
+
+    # ── 2. Normalise input to a single classification string ──────────
+    # Classify the concatenation of all inputs so a multi-input request is
+    # gated on its strictest member. We do NOT forward the raw inputs to
+    # the classifier one-by-one (that would miss cross-input context and
+    # be slower). The routing gate below uses this single level.
+    raw_input = body.input
+    if isinstance(raw_input, list):
+        input_texts: list[str] = [t for t in raw_input if t]
+        classification_text = " ".join(input_texts)
+    else:
+        input_texts = [raw_input] if raw_input else []
+        classification_text = raw_input or ""
+
+    # ── 3. Sensitivity classification ─────────────────────────────────
+    sensitivity_level = "PUBLIC"
+    s_result = None
+    if _state.sensitivity_classifier and classification_text:
+        s_result = _state.sensitivity_classifier.classify_decoded(classification_text)
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
+    if s_result is None:
+        from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
+        s_result = SensitivityResult(level=SensitivityLevel.PUBLIC)
+
+    # ── 4. Route decision ─────────────────────────────────────────────
+    selected_model = body.model or _state.default_model
+    selected_provider = "ollama"  # safe default
+    route_reason = "embedding_local"
+
+    if _state.optimization_engine and _state.sensitivity_classifier and _state.complexity_scorer:
+        # Reuse the optimisation engine — embeddings use a minimal complexity
+        # stub (no token count / heuristic) so the engine sees a MEDIUM budget.
+        from yashigani.optimization.complexity_scorer import ComplexityLevel, ComplexityResult
+        stub_complexity = ComplexityResult(
+            level=ComplexityLevel.MEDIUM,
+            token_count=len(classification_text) // 4,
+            heuristic_score=0.0,
+            reasons=[],
+        )
+        from yashigani.billing.budget_enforcer import BudgetSignal, BudgetState
+        stub_budget = BudgetState(
+            identity_id=identity_id, provider="cloud",
+            used=0, total=0, signal=BudgetSignal.NORMAL, pct=0,
+        )
+        try:
+            decision = _state.optimization_engine.route(
+                requested_model=selected_model,
+                sensitivity=s_result,
+                complexity=stub_complexity,
+                budget=stub_budget,
+                force_local=False,
+                force_cloud=False,
+            )
+            selected_provider = decision.provider
+            selected_model = decision.model
+            route_reason = f"embedding:{decision.rule}:{decision.reason}"
+        except Exception as _route_exc:
+            logger.warning(
+                "Embeddings route decision failed (%s) — falling back to ollama",
+                _route_exc,
+            )
+            selected_provider = "ollama"
+            route_reason = "embedding_local_fallback"
+    else:
+        selected_provider = "ollama"
+        route_reason = "embedding_local"
+        if sensitivity_level in ("CONFIDENTIAL", "RESTRICTED"):
+            route_reason = "embedding_sensitivity_local"
+
+    # ── 5. OPA ingress check ──────────────────────────────────────────
+    opa_decision = await _opa_v1_check(
+        identity=identity,
+        selected_model=selected_model,
+        selected_provider=selected_provider,
+        sensitivity_level=sensitivity_level,
+        route_reason=route_reason,
+        request_path="/v1/embeddings",
+    )
+    if not opa_decision.get("allow", False):
+        opa_reason = opa_decision.get("reason", "policy_denied")
+        logger.warning(
+            "OPA DENIED /v1/embeddings: identity=%s model=%s reason=%s",
+            identity_id, selected_model, opa_reason,
+        )
+        # Audit the deny
+        if _state.audit_writer is not None:
+            try:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                _state.audit_writer.write(
+                    GatewayRequestEvent(
+                        request_id=request_id,
+                        method="POST",
+                        path="/v1/embeddings",
+                        action="DENIED",
+                        reason=opa_reason,
+                        elapsed_ms=elapsed_ms,
+                    )
+                )
+            except Exception as _ae:
+                logger.warning("Embeddings OPA-deny audit write failed: %s", _ae)
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": _owui_deny_message(opa_reason),
+                    "type": "policy_denied",
+                    "code": opa_reason,
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": opa_reason},
+        )
+
+    # ── 6. Sensitive-to-cloud gate (belt-and-braces, independent of OPA) ─
+    # OPA's routing_safe rule already covers this via v1_routing.rego, but we
+    # apply it explicitly here too so a misconfigured OPA bundle (which might
+    # return allow=True with routing_safe=False) cannot silently egress sensitive
+    # archival-memory embeddings to cloud. The check is: if the resolved
+    # provider is a cloud provider AND sensitivity >= CONFIDENTIAL, refuse.
+    # This mirrors the OPA reason code so the client error is identical.
+    _SENSITIVE_LEVELS = {"CONFIDENTIAL", "RESTRICTED"}
+    if selected_provider in _CLOUD_PROVIDER_CONFIG and sensitivity_level in _SENSITIVE_LEVELS:
+        logger.warning(
+            "EMBEDDINGS routing_unsafe_sensitive_to_cloud: identity=%s "
+            "sensitivity=%s provider=%s — refusing (fail-closed)",
+            identity_id, sensitivity_level, selected_provider,
+        )
+        if _state.audit_writer is not None:
+            try:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                _state.audit_writer.write(
+                    GatewayRequestEvent(
+                        request_id=request_id,
+                        method="POST",
+                        path="/v1/embeddings",
+                        action="DENIED",
+                        reason="routing_unsafe_sensitive_to_cloud",
+                        elapsed_ms=elapsed_ms,
+                    )
+                )
+            except Exception as _ae:
+                logger.warning("Embeddings routing-unsafe audit write failed: %s", _ae)
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": _owui_deny_message("routing_unsafe_sensitive_to_cloud"),
+                    "type": "policy_denied",
+                    "code": "routing_unsafe_sensitive_to_cloud",
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": "routing_unsafe_sensitive_to_cloud"},
+        )
+
+    # ── 7. Forward to backend ─────────────────────────────────────────
+    try:
+        import httpx as _httpx
+
+        embedding_data: list[dict] = []
+        prompt_tokens = 0
+        actual_model = selected_model
+
+        if selected_provider in _CLOUD_PROVIDER_CONFIG:
+            # ── 7a. Cloud provider ────────────────────────────────────
+            cloud_embedding_model = _get_cloud_embedding_model(selected_provider)
+
+            if cloud_embedding_model is None:
+                # Provider has no embeddings API (e.g. Anthropic) → fall back to Ollama.
+                logger.info(
+                    "Cloud provider %r has no embeddings API — falling back to "
+                    "local Ollama embedder (request_id=%s)",
+                    selected_provider, request_id,
+                )
+                selected_provider = "ollama"
+                route_reason += ":no_cloud_embeddings_fallback_local"
+                # Fall through to the Ollama branch below (no early return).
+            else:
+                cloud_api_key = _get_cloud_api_key(selected_provider)
+                if not cloud_api_key:
+                    logger.error(
+                        "Cloud provider %r selected for embeddings but no API key "
+                        "(KMS miss and env-var absent) request_id=%s",
+                        selected_provider, request_id,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            f"Cloud provider '{selected_provider}' is not configured. "
+                            "Set the API key via the admin UI or the "
+                            f"{_CLOUD_PROVIDER_CONFIG[selected_provider]['env_var']} "
+                            "environment variable."
+                        ),
+                    )
+
+                cloud_cfg = _CLOUD_PROVIDER_CONFIG[selected_provider]
+                actual_model = cloud_embedding_model
+
+                if selected_provider == "openai":
+                    cloud_body: dict = {"model": actual_model, "input": raw_input}
+                    if body.encoding_format:
+                        cloud_body["encoding_format"] = body.encoding_format
+                    if body.dimensions:
+                        cloud_body["dimensions"] = body.dimensions
+                    if body.user:
+                        cloud_body["user"] = body.user
+
+                    cloud_headers = {
+                        "Authorization": f"Bearer {cloud_api_key}",
+                        "Content-Type": "application/json",
+                    }
+
+                    async with _httpx.AsyncClient(timeout=60.0) as _client:
+                        resp = await _client.post(
+                            f"{cloud_cfg['base_url']}/v1/embeddings",
+                            json=cloud_body,
+                            headers=cloud_headers,
+                        )
+
+                    if resp.status_code != 200:
+                        logger.error(
+                            "OpenAI embeddings upstream error %d request_id=%s: %s",
+                            resp.status_code, request_id, resp.text[:200],
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Cloud provider error. Try again or contact your administrator.",
+                        )
+
+                    resp_json = resp.json()
+                    embedding_data = resp_json.get("data", [])
+                    usage = resp_json.get("usage", {})
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    actual_model = resp_json.get("model", actual_model)
+
+                else:
+                    # Unreachable: only openai has a non-None cloud_embedding_model
+                    # in _CLOUD_EMBEDDING_DEFAULTS; but guard for future additions.
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Unknown cloud provider for embeddings: {selected_provider!r}",
+                    )
+
+        if selected_provider == "ollama":
+            # ── 7b. Ollama local embeddings ───────────────────────────
+            # Ollama exposes two endpoints:
+            #   /api/embeddings  — legacy single-input (model + prompt)
+            #   /api/embed       — v0.5.x multi-input (model + input: str|list)
+            # We prefer /api/embed (accepts both str and list natively).
+            # If the installed Ollama does not expose /api/embed (< 0.5.x),
+            # callers will receive 404 from Ollama which surfaces as 502 here.
+            # VERIFY on live 3.1 stack: `curl http://ollama:11434/api/embed`
+            # returns 405 (Method Not Allowed, not 404) on 0.5.x when GET is used.
+            # Use POST with model+input.
+            ollama_body: dict = {
+                "model": selected_model,
+                "input": raw_input,  # Ollama /api/embed accepts str or list[str]
+            }
+            async with _httpx.AsyncClient(timeout=60.0) as _client:
+                resp = await _client.post(
+                    f"{_state.ollama_url}/api/embed",
+                    json=ollama_body,
+                )
+
+            if resp.status_code != 200:
+                logger.error(
+                    "Ollama embeddings error %d request_id=%s: %s",
+                    resp.status_code, request_id, resp.text[:200],
+                )
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Embedding backend error: {resp.text[:200]}",
+                )
+
+            resp_json = resp.json()
+            # Ollama /api/embed returns {"model": ..., "embeddings": [[...], ...]}
+            # (list of float-lists, one per input item).
+            # Ollama /api/embeddings (legacy single) returns {"embedding": [...]}
+            raw_embeddings = resp_json.get("embeddings") or []
+            if not raw_embeddings and "embedding" in resp_json:
+                # Legacy single-input shape fallback
+                raw_embeddings = [resp_json["embedding"]]
+            embedding_data = [
+                {"object": "embedding", "embedding": vec, "index": i}
+                for i, vec in enumerate(raw_embeddings)
+            ]
+            actual_model = resp_json.get("model", selected_model)
+            # Ollama does not report token counts for embeddings; estimate
+            prompt_tokens = len(classification_text) // 4
+
+    except _httpx.ConnectError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding backend unavailable. Ollama may be starting up.",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Embeddings backend call failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Embedding backend communication error",
+        )
+
+    # ── 8. Build OpenAI-compatible response ───────────────────────────
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    embedding_objects = [
+        EmbeddingObject(
+            embedding=item.get("embedding", []) if isinstance(item, dict) else item,
+            index=item.get("index", i) if isinstance(item, dict) else i,
+        )
+        for i, item in enumerate(embedding_data)
+    ]
+    response = EmbeddingResponse(
+        data=embedding_objects,
+        model=actual_model,
+        usage=EmbeddingUsage(
+            prompt_tokens=prompt_tokens,
+            total_tokens=prompt_tokens,
+        ),
+    )
+
+    # ── 9. Audit ──────────────────────────────────────────────────────
+    if _state.audit_writer is not None:
+        try:
+            _state.audit_writer.write(
+                GatewayRequestEvent(
+                    request_id=request_id,
+                    method="POST",
+                    path="/v1/embeddings",
+                    action="FORWARDED",
+                    reason=route_reason,
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+        except Exception as _ae:
+            logger.warning("Embeddings audit write failed: %s", _ae)
+
+    return JSONResponse(
+        content=response.model_dump(),
+        headers={
+            "X-Yashigani-Request-Id": request_id,
+            "X-Yashigani-Routed-Via": selected_provider,
+            "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
+            "X-Yashigani-Model": actual_model,
+            "X-Yashigani-Sensitivity": sensitivity_level,
+            "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
+        },
     )
 
 

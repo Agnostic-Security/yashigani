@@ -320,8 +320,14 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
     `persona` memory block so they persist across turns WITHOUT re-sending them
     each turn (keeps the per-turn payload small).  The agent is deleted on
     teardown (close_letta_brain).
+
+    SC-AGENT-003: uses _letta_embedding_config() (imported from letta_client) to
+    build an explicit embedding_config pointing at the gateway's /v1/embeddings
+    instead of the cloud handle "letta/letta-free" (which resolves to
+    embeddings.letta.com — unreachable from the network-isolated Letta container).
     """
     import httpx
+    from yashigani.gateway.letta_client import _letta_embedding_config
 
     persona = (
         "I am a Yashigani orchestration BRAIN. I have NO network access; the only "
@@ -331,6 +337,8 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
     )
     brain_model = _letta_brain_model()
     async with httpx.AsyncClient(timeout=timeout) as client:
+        # SC-AGENT-003: explicit embedding_config replaces cloud handle.
+        embedding_cfg = await _letta_embedding_config(client)
         resp = await client.post(f"{base_url}/v1/agents/", json={
             "name": f"yashigani-orch-{uuid.uuid4().hex[:8]}",
             "memory_blocks": [
@@ -339,7 +347,7 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
                 {"label": "persona", "value": persona},
             ],
             "model": brain_model,
-            "embedding": "letta/letta-free",
+            "embedding_config": embedding_cfg,
         })
         if resp.status_code not in (200, 201):
             # P1.5: include the model name for fast diagnostics (404 on model

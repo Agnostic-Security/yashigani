@@ -445,6 +445,16 @@ services:
       #     demo upstream); _resolve_mcp_servers() treats unset/empty as fallback.
       YASHIGANI_ORCH_SELFCALL_BASE: ${YASHIGANI_ORCH_SELFCALL_BASE:-http://127.0.0.1:8081}
       YASHIGANI_ORCH_MCP_SERVERS: ${YASHIGANI_ORCH_MCP_SERVERS:-}
+      # SC-AGENT-003 (3.1): letta embedding routing through the gateway.
+      #   YASHIGANI_LETTA_BRAIN_MODEL — model Letta uses for its own reasoning; must
+      #     be reachable via Letta's OPENAI_API_BASE (= http://gateway:8081/v1).
+      #     Format: "openai-proxy/<ollama-model-name>".
+      #   YASHIGANI_LETTA_EMBEDDING_MODEL — bare Ollama model name the GATEWAY uses
+      #     when Letta calls POST /v1/embeddings.  Read by letta_client._letta_embedding_model()
+      #     on the gateway side.  Defaults to the brain model's bare name.  Must be
+      #     a model pulled by the installer (currently qwen2.5:3b).
+      YASHIGANI_LETTA_BRAIN_MODEL: ${YASHIGANI_LETTA_BRAIN_MODEL:-openai-proxy/qwen2.5:3b}
+      YASHIGANI_LETTA_EMBEDDING_MODEL: ${YASHIGANI_LETTA_EMBEDDING_MODEL:-qwen2.5:3b}
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -2409,8 +2419,26 @@ services:
       OPENAI_API_BASE: http://gateway:8081/v1
       # OPENAI_API_KEY is injected by the entrypoint shim from
       # /run/secrets/yashigani_internal_bearer — do NOT set it here.
-      LETTA_LLM_MODEL: "qwen2.5:3b"
-      LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
+      # SC-AGENT-003 (3.1): LETTA_LLM_MODEL and LETTA_EMBEDDING_MODEL are NOT real
+      # Letta env vars — Letta 0.16.7's Settings class uses env_prefix="letta_" with
+      # field names default_llm_handle and default_embedding_handle, giving the real
+      # env vars LETTA_DEFAULT_LLM_HANDLE and LETTA_DEFAULT_EMBEDDING_HANDLE.  The
+      # old names were silently ignored (no-op), so the letta container was always
+      # using the built-in letta/letta-free cloud handle for embeddings, which
+      # resolves to https://embeddings.letta.com/ — unreachable from the
+      # network-isolated Letta container.
+      #
+      # We do NOT set LETTA_DEFAULT_LLM_HANDLE or LETTA_DEFAULT_EMBEDDING_HANDLE
+      # here.  Both the LLM and embedding configs are now injected explicitly as
+      # full config objects (not handles) by letta_client.py + letta_brain.py in
+      # every create-agent payload.  This is intentional: the gateway, not the
+      # Letta server defaults, owns the routing decision.  If a code path omits
+      # embedding_config, Letta rejects the request with a clear error rather than
+      # silently falling back to the cloud endpoint.
+      #
+      # YASHIGANI_LETTA_EMBEDDING_MODEL and YASHIGANI_LETTA_BRAIN_MODEL are gateway
+      # env vars (read by letta_client.py on the gateway process) — they are set in
+      # the gateway service block above, NOT here.
       # Use shared Postgres for persistence (separate DB).
       # Letta connects to letta-pgbouncer:5432 as plain TCP (no sslmode —
       # letta pg8000 cannot present client certs via URI params, C1 in Iris's register).
