@@ -36,7 +36,7 @@ Security properties enforced here (the brief's QA mandate on our own build):
     (documents.js) MUST escapeHtml() them.  The route returns them as JSON
     strings (no HTML), so the escaping boundary is the browser sink.
 
-# Last updated: 2026-06-09
+# Last updated: 2026-06-19
 """
 from __future__ import annotations
 
@@ -149,6 +149,7 @@ _results: dict[str, object] = {}
 # ── Request / Response models ─────────────────────────────────────────────
 
 class PolicyRequest(BaseModel):
+    # Core matrix axes — validated against the rego's known vocabularies.
     data_class: str = Field(pattern=r"^(PII|QI|PHI|PCI|SECRET|IP_MARKING)$")
     format: str = Field(pattern=r"^(docx|xlsx|pptx|pdf|csv|txt|any)$")
     route: str = Field(pattern=r"^(ingress-upload|egress-mcp-result|json-attachment|any)$")
@@ -156,6 +157,42 @@ class PolicyRequest(BaseModel):
     pseudonymize_mode: str = Field(default="A", pattern=r"^(A|B)$")
     small_set_escalation: bool = Field(default=True)
     description: str = Field(min_length=1, max_length=256)
+    # Self-describing decision-contract fields (unified user-alert contract,
+    # matching the shape built-in policies carry: policy_id + user_message + code).
+    # Required so operator-created policies surface the same layman alert at every
+    # enforcement point as the built-in demo policies.
+    name: str = Field(
+        default="",
+        max_length=128,
+        description="Short human-readable label for this policy (shown in the admin UI list).",
+    )
+    policy_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$",
+        description=(
+            "Stable identifier for this policy, used in the decision contract and audit events. "
+            "Format: uppercase letters/digits separated by hyphens (e.g. DOC-OP-001). "
+            "Must match the pattern used by built-in policies."
+        ),
+    )
+    user_message: str = Field(
+        min_length=1,
+        max_length=512,
+        description=(
+            "Layman explanation shown to the end user when this policy triggers. "
+            "Must be human-readable and free of jargon."
+        ),
+    )
+    code: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Z][A-Z0-9_]+$",
+        description=(
+            "Machine code carried in the decision contract (e.g. DOCUMENT_BLOCKED). "
+            "Uppercase letters, digits, underscores only."
+        ),
+    )
 
 
 class InspectRequest(BaseModel):
@@ -381,6 +418,10 @@ async def create_policy(body: PolicyRequest, session: StepUpAdminSession):
             pseudonymize_mode=body.pseudonymize_mode,
             small_set_escalation=body.small_set_escalation,
             description=body.description,
+            name=body.name,
+            policy_id=body.policy_id,
+            user_message=body.user_message,
+            code=body.code,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "invalid_policy", "message": str(exc)})

@@ -342,9 +342,14 @@ class DocumentPolicyStore:
         Shape consumed by policy/document.rego:
             {
                 "policies": [ { data_class, format, route, action,
-                                pseudonymize_mode, small_set_escalation }, ... ],
+                                pseudonymize_mode, small_set_escalation,
+                                policy_id, user_message, code }, ... ],
                 "config": { detokenize_role, map_ttl_seconds, small_set_threshold }
             }
+
+        The self-describing fields (policy_id, user_message, code) are included
+        so the rego decision can surface the operator-supplied values when they are
+        present, falling back to the built-in action-derived values when empty.
         """
         return {
             "policies": [
@@ -355,6 +360,11 @@ class DocumentPolicyStore:
                     "action": p["action"],
                     "pseudonymize_mode": p.get("pseudonymize_mode", "A"),
                     "small_set_escalation": bool(p.get("small_set_escalation", True)),
+                    # Self-describing fields: operator-supplied when non-empty;
+                    # the rego falls back to built-in values when these are "".
+                    "policy_id": p.get("policy_id", ""),
+                    "user_message": p.get("user_message", ""),
+                    "code": p.get("code", ""),
                 }
                 for p in self.list_policies()
             ],

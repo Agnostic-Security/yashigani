@@ -63,7 +63,12 @@
 # === DATA (documents/policy_store.py → push_document_data) ===
 #   data.yashigani.document.policies[]    the operator's action matrix, each:
 #                                           { data_class, format, route, action,
-#                                             pseudonymize_mode, small_set_escalation }
+#                                             pseudonymize_mode, small_set_escalation,
+#                                             policy_id, user_message, code }
+#                                         The last three are the operator-supplied
+#                                         self-describing fields (may be "").  When
+#                                         non-empty they override the built-in values
+#                                         in the decision (IRIS-DOC-META).
 #   data.yashigani.document.config.detokenize_role       RBAC role for de-tokenize / table
 #   data.yashigani.document.config.map_ttl_seconds       fail-closed TTL for the replacer map
 #   data.yashigani.document.config.small_set_threshold   record_count at/under which QI gate fires
@@ -76,8 +81,60 @@ package yashigani.document
 
 import rego.v1
 
+# ---------------------------------------------------------------------------
+# Self-describing policy identity — IRIS-DOC-META operator-supplied override.
+#
+# When the winning matrix row carries a non-empty operator-supplied policy_id /
+# user_message / code (pushed via to_opa_document()), the decision surfaces
+# THOSE values so the layman alert and audit event reflect the operator's
+# intent.  When those fields are absent or empty the built-in action-derived
+# values apply (fail-safe: a malformed/missing field NEVER breaks evaluation).
+#
+# _winning_policy: the applicable policy whose action equals the FINAL action,
+# i.e. the row that *drove* the actual disposition (matrix action AND final
+# action agree — no fail-closed override redirected the outcome).
+# There may be multiple rows with the same action (e.g. two PSEUDONYMIZE rows
+# for different class scopes that both matched); any one will do because they
+# share the same action — the first one found is used.
+# Undefined when:
+#   - the final action was forced by a fail-closed override (e.g. BLOCK due to
+#     incomplete extraction — _strongest_configured was PSEUDONYMIZE but the
+#     system blocked it; in that case action != _strongest_configured)
+#   - LOG with no matches (no applicable policies)
+# In those cases _op_* are undefined and built-in values apply cleanly.
+# ---------------------------------------------------------------------------
+_winning_policy := p if {
+	some p in _applicable_policies
+	p.action == _strongest_configured
+	# The final action must equal the matrix action: if a fail-closed override
+	# changed action to BLOCK while _strongest_configured was PSEUDONYMIZE, this
+	# guard fails and _winning_policy is correctly undefined.
+	action == _strongest_configured
+}
+
+# Operator field helpers — each is defined only when the field is non-empty.
+# "Non-empty" means the string exists AND is not the empty string "".
+# Fail-safe: object.get returns "" (the default) if the key is absent.
+_op_policy_id := v if {
+	v := object.get(_winning_policy, "policy_id", "")
+	v != ""
+}
+
+_op_user_message := v if {
+	v := object.get(_winning_policy, "user_message", "")
+	v != ""
+}
+
+_op_code := v if {
+	v := object.get(_winning_policy, "code", "")
+	v != ""
+}
+
 # --- Self-describing policy identity -----------------------------------------
-policy_id := "DOC-ENFORCE-001"
+# Operator-supplied value wins when present; built-in is the fallback.
+policy_id := _op_policy_id
+
+default policy_id := "DOC-ENFORCE-001"
 
 # --- Config with fail-closed defaults (override via data bundle) --------------
 default _detok_role := "doc-pseudonymize-reverser"
@@ -427,19 +484,49 @@ obligations contains "audit_document_decision"
 
 # ---------------------------------------------------------------------------
 # Self-describing code + layman user_message (never contains cleartext).
+#
+# IRIS-DOC-META: when the winning matrix row carries a non-empty operator-
+# supplied code/user_message, that value is used.  Otherwise the built-in
+# action-derived value applies.  The guard `not _op_code` / `not _op_user_message`
+# ensures exactly one definition is true (fail-safe for rego.v1 completeness).
+# user_message NEVER contains cleartext — operator-supplied messages are static
+# strings; interpolation with detected values is not permitted.
 # ---------------------------------------------------------------------------
-code := "DOCUMENT_PII_PSEUDONYMIZED" if action == "PSEUDONYMIZE"
 
-code := "DOCUMENT_REDACTED" if action == "REDACT"
+# --- Operator-supplied override (IRIS-DOC-META) ---
+code := _op_code if _op_code
 
-code := "DOCUMENT_LOGGED" if action == "LOG"
+user_message := _op_user_message if _op_user_message
 
-code := "DOCUMENT_BLOCKED" if action == "BLOCK"
+# --- Built-in action-derived fallbacks (active when no operator override) ---
+code := "DOCUMENT_PII_PSEUDONYMIZED" if {
+	action == "PSEUDONYMIZE"
+	not _op_code
+}
 
-code := "DOCUMENT_ROUTED_LOCAL" if action == "ROUTE_LOCAL"
+code := "DOCUMENT_REDACTED" if {
+	action == "REDACT"
+	not _op_code
+}
+
+code := "DOCUMENT_LOGGED" if {
+	action == "LOG"
+	not _op_code
+}
+
+code := "DOCUMENT_BLOCKED" if {
+	action == "BLOCK"
+	not _op_code
+}
+
+code := "DOCUMENT_ROUTED_LOCAL" if {
+	action == "ROUTE_LOCAL"
+	not _op_code
+}
 
 user_message := msg if {
 	action == "PSEUDONYMIZE"
+	not _op_user_message
 	msg := sprintf(
 		"We replaced %d piece(s) of identifying information in your %s file with placeholders before it left your environment. You have a private table to turn the placeholders back into the real values yourself.",
 		[count(_pseudo_matches), _format],
@@ -449,25 +536,36 @@ user_message := msg if {
 user_message := sprintf(
 	"We permanently removed %d piece(s) of identifying information from your %s file (including any hidden parts and metadata) before it left your environment.",
 	[count(_matches), _format],
-) if action == "REDACT"
+) if {
+	action == "REDACT"
+	not _op_user_message
+}
 
-user_message := "This file was allowed through; any identifying information in it has been recorded for audit." if action == "LOG"
+user_message := "This file was allowed through; any identifying information in it has been recorded for audit." if {
+	action == "LOG"
+	not _op_user_message
+}
 
 user_message := "This file still contained enough identifying detail to re-identify people even after placeholders were applied, so it was blocked from leaving your environment." if {
 	action == "BLOCK"
 	_reid_escalation
+	not _op_user_message
 }
 
 user_message := "This file could not be safely cleared for its content, so it was blocked from leaving your environment." if {
 	action == "BLOCK"
 	not _reid_escalation
+	not _op_user_message
 }
 
 # ROUTE_LOCAL: the file carries values the cloud model would compute on (amounts,
 # dates of birth, account numbers) — a placeholder there would make the cloud
 # invent a wrong value, so the whole file was handled by the on-site model
 # instead and never left your environment.
-user_message := "This file contained values that the external AI would need to calculate with (such as amounts, dates of birth or account numbers). Replacing those with placeholders would make the external AI guess wrong values, so the whole file was handled by the on-site model and never left your environment." if action == "ROUTE_LOCAL"
+user_message := "This file contained values that the external AI would need to calculate with (such as amounts, dates of birth or account numbers). Replacing those with placeholders would make the external AI guess wrong values, so the whole file was handled by the on-site model and never left your environment." if {
+	action == "ROUTE_LOCAL"
+	not _op_user_message
+}
 
 # The operate-on sensitive data classes that forced the ROUTE_LOCAL decision
 # (audit / layman-alert breadcrumb — class names only, never values; mirrors the

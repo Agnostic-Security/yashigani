@@ -120,13 +120,45 @@ def test_dps_07_to_opa_document_shape(redis_client):
     assert set(doc.keys()) == {"policies", "config"}
     assert isinstance(doc["policies"], list) and len(doc["policies"]) == 5
     row = doc["policies"][0]
+    # IRIS-DOC-META: policy_id / user_message / code are now included so the
+    # rego can surface operator-supplied self-describing fields in the decision.
     assert set(row.keys()) == {
         "data_class", "format", "route", "action",
         "pseudonymize_mode", "small_set_escalation",
+        "policy_id", "user_message", "code",
     }
     assert set(doc["config"].keys()) == {
         "detokenize_role", "map_ttl_seconds", "small_set_threshold",
     }
+
+
+def test_dps_07b_to_opa_document_self_describing_fields_seeded(redis_client):
+    """IRIS-DOC-META: seeded example rows carry non-empty operator fields in the
+    OPA document so the rego decision can surface them."""
+    store = DocumentPolicyStore(redis_client)
+    store.seed_defaults()
+    doc = store.to_opa_document()
+    # The four example policies have self-describing fields; find PII-1.
+    pii_1 = next(
+        p for p in doc["policies"] if p.get("policy_id") == "DOC-EX-PII-1"
+    )
+    assert pii_1["policy_id"] == "DOC-EX-PII-1"
+    assert pii_1["user_message"] != ""
+    assert pii_1["code"] == "DOCUMENT_PII_PSEUDONYMIZED"
+
+
+def test_dps_07c_to_opa_document_operator_row_empty_strings_when_unset(redis_client):
+    """IRIS-DOC-META: an operator-added policy that omits self-describing fields
+    gets empty-string values in the OPA document (the rego treats these as fallback
+    to built-in values)."""
+    store = DocumentPolicyStore(redis_client)
+    # add_policy with no policy_id/user_message/code arguments.
+    store.add_policy(data_class="PII", format="any", route="any", action="LOG")
+    doc = store.to_opa_document()
+    row = doc["policies"][0]
+    assert row["policy_id"] == ""
+    assert row["user_message"] == ""
+    assert row["code"] == ""
 
 
 def test_dps_08_config_write_through(redis_client):

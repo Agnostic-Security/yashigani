@@ -717,6 +717,10 @@ def test_doc_prod_02_create_persists_and_pushes(store_client):
     r = tc.post("/admin/documents/policies", json={
         "data_class": "SECRET", "format": "any", "route": "any",
         "action": "BLOCK", "description": "secrets never leave",
+        # IRIS-DOC-META: required self-describing contract fields.
+        "policy_id": "DOC-OP-SEC-TEST",
+        "user_message": "A secret was detected. The file was blocked from leaving your environment.",
+        "code": "DOCUMENT_BLOCKED",
     })
     assert r.status_code == 201, r.text
     assert len(store.list_policies()) == 6  # 5 seeded + 1 created
@@ -738,6 +742,11 @@ def test_doc_prod_04_create_503_when_store_unwired(store_client, monkeypatch):
     r = tc.post("/admin/documents/policies", json={
         "data_class": "PII", "format": "any", "route": "any",
         "action": "LOG", "description": "x",
+        # IRIS-DOC-META: required self-describing contract fields (so validation
+        # passes and the fail-closed 503 is what we're actually testing).
+        "policy_id": "DOC-OP-TEST",
+        "user_message": "This file was logged for audit.",
+        "code": "DOCUMENT_LOGGED",
     })
     assert r.status_code == 503
     assert r.json()["detail"]["error"] == "policy_store_unavailable"
@@ -901,3 +910,205 @@ def test_doc_set_05_inspect_503_when_set_id_but_store_unwired(set_client, monkey
     })
     assert r.status_code == 503
     assert r.json()["detail"]["error"] == "set_store_unavailable"
+
+
+# ===========================================================================
+# IRIS-DOC-META — operator-created policies must carry the self-describing
+# decision contract (policy_id + user_message + code).
+# ===========================================================================
+#
+# Coverage:
+#   IRIS-META-01  POST /policies with all contract fields persists + returns them
+#   IRIS-META-02  Missing required field (policy_id) → 422 validation error
+#   IRIS-META-03  Missing required field (user_message) → 422 validation error
+#   IRIS-META-04  Missing required field (code) → 422 validation error
+#   IRIS-META-05  policy_id format validated: lowercase rejected, correct pattern accepted
+#   IRIS-META-06  code format validated: spaces/lowercase rejected
+#   IRIS-META-07  Stored policy carries policy_id + user_message + code (store layer)
+#   IRIS-META-08  OPA /inspect BLOCK decision carries user_message from operator policy
+#
+# Author: Tom. IRIS-DOC-META (3.1). Last updated: 2026-06-19.
+# ===========================================================================
+
+# Minimal valid PolicyRequest payload including the new contract fields.
+_VALID_CONTRACT_BODY = {
+    "data_class": "PHI",
+    "format": "pdf",
+    "route": "egress-mcp-result",
+    "action": "BLOCK",
+    "description": "Block all PHI in PDF exports",
+    "policy_id": "DOC-OP-PHI-001",
+    "user_message": "This file was blocked because it contains health information that must not leave your environment.",
+    "code": "DOCUMENT_BLOCKED",
+}
+
+
+def test_iris_meta_01_create_persists_contract_fields(store_client):
+    """IRIS-META-01: POST /policies with policy_id + user_message + code
+    persists all three fields and returns them in the response body."""
+    tc, app, store, pushes = store_client
+    r = tc.post("/admin/documents/policies", json=_VALID_CONTRACT_BODY)
+    assert r.status_code == 201, r.text
+    policy = r.json()["policy"]
+    # All self-describing fields must be present and populated in the response.
+    assert policy["policy_id"] == "DOC-OP-PHI-001"
+    assert policy["user_message"] == _VALID_CONTRACT_BODY["user_message"]
+    assert policy["code"] == "DOCUMENT_BLOCKED"
+    # OPA re-push fired.
+    assert len(pushes) == 1
+    # Persistent: a fresh list also carries the fields.
+    r2 = tc.get("/admin/documents/policies")
+    rows = r2.json()["policies"]
+    created = next((p for p in rows if p.get("policy_id") == "DOC-OP-PHI-001"), None)
+    assert created is not None
+    assert created["user_message"] == _VALID_CONTRACT_BODY["user_message"]
+    assert created["code"] == "DOCUMENT_BLOCKED"
+
+
+def test_iris_meta_02_missing_policy_id_rejected(store_client):
+    """IRIS-META-02: Omitting policy_id returns 422 (required field)."""
+    tc, app, store, _ = store_client
+    body = {**_VALID_CONTRACT_BODY}
+    del body["policy_id"]
+    r = tc.post("/admin/documents/policies", json=body)
+    assert r.status_code == 422, r.text
+
+
+def test_iris_meta_03_missing_user_message_rejected(store_client):
+    """IRIS-META-03: Omitting user_message returns 422 (required field)."""
+    tc, app, store, _ = store_client
+    body = {**_VALID_CONTRACT_BODY}
+    del body["user_message"]
+    r = tc.post("/admin/documents/policies", json=body)
+    assert r.status_code == 422, r.text
+
+
+def test_iris_meta_04_missing_code_rejected(store_client):
+    """IRIS-META-04: Omitting code returns 422 (required field)."""
+    tc, app, store, _ = store_client
+    body = {**_VALID_CONTRACT_BODY}
+    del body["code"]
+    r = tc.post("/admin/documents/policies", json=body)
+    assert r.status_code == 422, r.text
+
+
+def test_iris_meta_05_policy_id_format_validated(store_client):
+    """IRIS-META-05: policy_id must match ^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$ —
+    lowercase, no-hyphen, or wrong-structure patterns are rejected."""
+    tc, app, store, _ = store_client
+    for bad in (
+        "doc-op-001",         # lowercase
+        "DOCOP001",           # no hyphens
+        "-DOC-001",           # leading hyphen
+        "DOC-",               # trailing hyphen (nothing after it)
+        "DOC",                # no hyphens at all
+        "",                   # empty (also min_length=1)
+    ):
+        body = {**_VALID_CONTRACT_BODY, "policy_id": bad}
+        r = tc.post("/admin/documents/policies", json=body)
+        assert r.status_code == 422, f"expected 422 for policy_id={bad!r}, got {r.status_code}"
+
+    # A valid id must be accepted.
+    body = {**_VALID_CONTRACT_BODY, "policy_id": "DOC-OP-001"}
+    r = tc.post("/admin/documents/policies", json=body)
+    assert r.status_code == 201, f"expected 201 for valid policy_id, got {r.status_code}: {r.text}"
+
+
+def test_iris_meta_06_code_format_validated(store_client):
+    """IRIS-META-06: code must match ^[A-Z][A-Z0-9_]+$ — lowercase, spaces, or
+    leading underscores are rejected."""
+    tc, app, store, _ = store_client
+    for bad in (
+        "document_blocked",   # lowercase
+        "DOCUMENT BLOCKED",   # space
+        "_DOCUMENT_BLOCKED",  # leading underscore
+        "",                   # empty (also min_length=1)
+    ):
+        body = {**_VALID_CONTRACT_BODY, "code": bad}
+        r = tc.post("/admin/documents/policies", json=body)
+        assert r.status_code == 422, f"expected 422 for code={bad!r}, got {r.status_code}"
+
+    # A valid code must be accepted.
+    body = {**_VALID_CONTRACT_BODY, "code": "DOCUMENT_PHI_BLOCKED"}
+    r = tc.post("/admin/documents/policies", json=body)
+    assert r.status_code == 201, f"expected 201 for valid code, got {r.status_code}: {r.text}"
+
+
+def test_iris_meta_07_store_layer_persists_contract_fields():
+    """IRIS-META-07: DocumentPolicyStore.add_policy() persists policy_id +
+    user_message + code and replays them on a fresh store (store-layer, no HTTP)."""
+    import fakeredis
+    from yashigani.documents.policy_store import DocumentPolicyStore
+
+    redis = fakeredis.FakeStrictRedis()
+    store = DocumentPolicyStore(redis)
+    p = store.add_policy(
+        data_class="SECRET",
+        format="any",
+        route="any",
+        action="BLOCK",
+        description="test",
+        policy_id="DOC-OP-SEC-001",
+        user_message="A secret was found. The file was blocked.",
+        code="DOCUMENT_SECRET_BLOCKED",
+        name="Block all secrets",
+    )
+    assert p["policy_id"] == "DOC-OP-SEC-001"
+    assert p["user_message"] == "A secret was found. The file was blocked."
+    assert p["code"] == "DOCUMENT_SECRET_BLOCKED"
+    assert p["name"] == "Block all secrets"
+
+    # Replay from Redis — fields survive restart.
+    fresh = DocumentPolicyStore(redis)
+    replayed = next(x for x in fresh.list_policies() if x["policy_id"] == "DOC-OP-SEC-001")
+    assert replayed["user_message"] == "A secret was found. The file was blocked."
+    assert replayed["code"] == "DOCUMENT_SECRET_BLOCKED"
+
+
+def test_iris_meta_08_inspect_block_carries_operator_user_message(store_client, monkeypatch):
+    """IRIS-META-08: when OPA decides BLOCK for an operator-authored policy, the
+    route surfaces the operator's user_message in the user_alert — not the
+    built-in fallback.  Proves the contract flows end-to-end through /inspect."""
+    tc, app, store, _ = store_client
+
+    # Plant an operator policy with a custom user_message into the store.
+    store.add_policy(
+        data_class="PHI",
+        format="any",
+        route="egress-mcp-result",
+        action="BLOCK",
+        description="block PHI",
+        policy_id="DOC-OP-PHI-002",
+        user_message="Health records were blocked. Contact compliance@example.com.",
+        code="DOCUMENT_PHI_BLOCKED",
+    )
+
+    async def _fake_block(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+        # Simulate OPA resolving to the operator-authored policy.
+        return {
+            "action": "BLOCK",
+            "policy_id": "DOC-OP-PHI-002",
+            "code": "DOCUMENT_PHI_BLOCKED",
+            "user_message": "Health records were blocked. Contact compliance@example.com.",
+            "deny": ["unpoliced_sensitive_class"],
+            "obligations": [],
+        }
+
+    monkeypatch.setattr(
+        "yashigani.documents.opa_decision.evaluate_document_decision", _fake_block
+    )
+    r = tc.post("/admin/documents/inspect", json={
+        "content": "Patient: John Smith, DOB 1990-01-01\n",
+        "filename": "referral.txt",
+        "route": "egress-mcp-result",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["opa_decision"]["action"] == "BLOCK"
+    assert body["opa_decision"]["policy_id"] == "DOC-OP-PHI-002"
+    assert body["opa_decision"]["code"] == "DOCUMENT_PHI_BLOCKED"
+    # The user_alert must carry the OPERATOR's message, not the built-in fallback.
+    assert body["user_alert"] is not None
+    assert body["user_alert"]["policy_id"] == "DOC-OP-PHI-002"
+    assert body["user_alert"]["user_message"] == "Health records were blocked. Contact compliance@example.com."
+    assert body["user_alert"]["code"] == "DOCUMENT_PHI_BLOCKED"

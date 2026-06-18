@@ -15,6 +15,10 @@
 #  11. per_match_actions populated for PSEUDONYMIZE; empty otherwise
 #  12. self-describing contract (policy_id + code + user_message) present
 #  13. namespace-prefix class match (policy "PII" matches "PII.EMAIL")
+#  17. IRIS-DOC-META — row WITH operator policy_id/user_message/code ⇒ decision surfaces them
+#  18. IRIS-DOC-META — row WITHOUT operator fields ⇒ fallback to built-in DOC-ENFORCE-001 + action message
+#  19. IRIS-DOC-META — row with EMPTY strings ⇒ same fallback (not surfaced as override)
+#  20. IRIS-DOC-META — fail-closed BLOCK (no matching row) ⇒ built-in policy_id regardless
 
 package yashigani.document_test
 
@@ -521,4 +525,174 @@ test_operate_on_classes_empty_off_route_local if {
 	d := document.decision with input as {"document": _doc([_match_email_reference], true, true)}
 		with data.yashigani.document.policies as _policies_pseudo_pii_b
 	count(d.operate_on_classes) == 0
+}
+
+# ---------------------------------------------------------------------------
+# 17. IRIS-DOC-META — operator-supplied self-describing fields surface in decision.
+#     When the winning matrix row carries non-empty policy_id / user_message / code,
+#     the decision emits THOSE values (not the generic DOC-ENFORCE-001 fallback).
+#     user_message is a static operator string — no cleartext interpolation.
+# ---------------------------------------------------------------------------
+
+# A policy row that carries all three operator-supplied self-describing fields.
+_policy_with_op_fields := [{
+	"data_class": "PII",
+	"format": "any",
+	"route": "any",
+	"action": "PSEUDONYMIZE",
+	"pseudonymize_mode": "A",
+	"small_set_escalation": false,
+	"policy_id": "DOC-EX-PII-1",
+	"user_message": "Identifying details in this file were replaced with placeholders before it left your environment.",
+	"code": "DOCUMENT_PII_PSEUDONYMIZED",
+}]
+
+# 17a — operator-supplied policy_id surfaces in the decision (not DOC-ENFORCE-001).
+test_iris_doc_meta_operator_policy_id if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.policy_id == "DOC-EX-PII-1"
+}
+
+# 17b — operator-supplied user_message surfaces in the decision.
+test_iris_doc_meta_operator_user_message if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.user_message == "Identifying details in this file were replaced with placeholders before it left your environment."
+}
+
+# 17c — operator-supplied code surfaces in the decision.
+test_iris_doc_meta_operator_code if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.code == "DOCUMENT_PII_PSEUDONYMIZED"
+}
+
+# 17d — all three operator fields together, plus action and allow are still correct.
+test_iris_doc_meta_all_operator_fields_decision_intact if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.policy_id == "DOC-EX-PII-1"
+	d.user_message == "Identifying details in this file were replaced with placeholders before it left your environment."
+	d.code == "DOCUMENT_PII_PSEUDONYMIZED"
+	d.action == "PSEUDONYMIZE"
+	d.allow == true
+}
+
+# 17e — REDACT row with operator-supplied fields: the operator message is static
+# (NOT the built-in count-interpolated template), confirming the override fired.
+test_iris_doc_meta_redact_operator_message if {
+	policies := [{
+		"data_class": "PII",
+		"format": "any",
+		"route": "any",
+		"action": "REDACT",
+		"pseudonymize_mode": "A",
+		"small_set_escalation": false,
+		"policy_id": "DOC-EX-PII-2",
+		"user_message": "Identifying details in this file were permanently removed before it left your environment.",
+		"code": "DOCUMENT_REDACTED",
+	}]
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as policies
+	d.policy_id == "DOC-EX-PII-2"
+	d.user_message == "Identifying details in this file were permanently removed before it left your environment."
+	d.code == "DOCUMENT_REDACTED"
+	d.action == "REDACT"
+}
+
+# ---------------------------------------------------------------------------
+# 18. IRIS-DOC-META — row WITHOUT operator fields falls back to built-in values.
+#     A policy row that omits policy_id / user_message / code entirely must
+#     produce the built-in DOC-ENFORCE-001 policy_id and the action-derived
+#     user_message / code.
+# ---------------------------------------------------------------------------
+
+# 18a — omitted operator fields: policy_id falls back to DOC-ENFORCE-001.
+test_iris_doc_meta_fallback_policy_id if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii
+	d.policy_id == "DOC-ENFORCE-001"
+}
+
+# 18b — omitted operator fields: built-in action-derived code still fires.
+test_iris_doc_meta_fallback_code if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii
+	d.code == "DOCUMENT_PII_PSEUDONYMIZED"
+}
+
+# 18c — omitted operator fields: built-in user_message is non-empty (the
+# count-interpolated template fires for PSEUDONYMIZE).
+test_iris_doc_meta_fallback_user_message_nonempty if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii
+	d.user_message != ""
+	# The built-in PSEUDONYMIZE message references the format — confirm it's not
+	# the operator-supplied string (the operator row has no user_message field).
+	not startswith(d.user_message, "Identifying details")
+}
+
+# ---------------------------------------------------------------------------
+# 19. IRIS-DOC-META — row with EMPTY strings falls back cleanly (not surfaced).
+#     policy_id = "" / user_message = "" / code = "" must be treated the same
+#     as absent — the built-in values apply.
+# ---------------------------------------------------------------------------
+
+_policy_with_empty_op_fields := [{
+	"data_class": "PII",
+	"format": "any",
+	"route": "any",
+	"action": "PSEUDONYMIZE",
+	"pseudonymize_mode": "A",
+	"small_set_escalation": false,
+	"policy_id": "",
+	"user_message": "",
+	"code": "",
+}]
+
+# 19a — empty policy_id string ⇒ built-in DOC-ENFORCE-001.
+test_iris_doc_meta_empty_string_policy_id_fallback if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_empty_op_fields
+	d.policy_id == "DOC-ENFORCE-001"
+}
+
+# 19b — empty code string ⇒ built-in action-derived code.
+test_iris_doc_meta_empty_string_code_fallback if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_empty_op_fields
+	d.code == "DOCUMENT_PII_PSEUDONYMIZED"
+}
+
+# 19c — empty user_message string ⇒ built-in action-derived user_message.
+test_iris_doc_meta_empty_string_user_message_fallback if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_empty_op_fields
+	d.user_message != ""
+}
+
+# ---------------------------------------------------------------------------
+# 20. IRIS-DOC-META — fail-closed BLOCK (unpoliced class / no matching row)
+#     uses built-in policy_id DOC-ENFORCE-001 regardless.
+#     There is no winning matrix row when the action is forced by a fail-closed
+#     override; _winning_policy is undefined, so built-in values apply cleanly.
+# ---------------------------------------------------------------------------
+
+# 20a — unpoliced class (PCI match, only PII policy configured) ⇒ BLOCK with
+# built-in policy_id (there is no winning row for PCI).
+test_iris_doc_meta_fail_closed_block_uses_builtin_policy_id if {
+	# PCI match but policy_with_op_fields only covers PII → unpoliced → BLOCK.
+	d := document.decision with input as {"document": _doc([_match_card], true, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.action == "BLOCK"
+	d.policy_id == "DOC-ENFORCE-001"
+}
+
+# 20b — incomplete extraction ⇒ BLOCK with built-in policy_id.
+test_iris_doc_meta_incomplete_extraction_uses_builtin_policy_id if {
+	d := document.decision with input as {"document": _doc([_match_email], false, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.action == "BLOCK"
+	d.policy_id == "DOC-ENFORCE-001"
 }
