@@ -2592,12 +2592,16 @@ async function searchAudit(cursor) {
     var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
+    var agentId = document.getElementById('audit-agent-id').value.trim();
+    var user = document.getElementById('audit-user').value.trim();
     var text = document.getElementById('audit-text').value.trim();
     if (et) params.set('event_type', et);
     if (verdict) params.set('verdict', verdict);
     if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
+    if (agentId) params.set('agent_id', agentId);
+    if (user) params.set('user', user);
     // free_text is a substring match, not a glob — treat a lone '*' as "match all".
     if (text && text !== '*') params.set('free_text', text);
     if (cursor) params.set('cursor', cursor);
@@ -2639,13 +2643,45 @@ async function exportAudit() {
     var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
+    var agentId = document.getElementById('audit-agent-id').value.trim();
+    var user = document.getElementById('audit-user').value.trim();
     if (et) params.set('event_type', et);
     if (verdict) params.set('verdict', verdict);
     if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
+    if (agentId) params.set('agent_id', agentId);
+    if (user) params.set('user', user);
     params.set('output_format', 'csv');
     window.open('/admin/audit/export?' + params.toString(), '_blank');
+}
+
+function resetAudit() {
+    // Clear all filter inputs back to their default (empty / "All") state.
+    var sel = document.getElementById('audit-event-type');
+    if (sel) sel.value = '';
+    sel = document.getElementById('audit-verdict');
+    if (sel) sel.value = '';
+    sel = document.getElementById('audit-source-type');
+    if (sel) sel.value = '';
+    var inp = document.getElementById('audit-from');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-to');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-agent-id');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-user');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-text');
+    if (inp) inp.value = '';
+    // Clear the results table and pagination.
+    var tbody = document.getElementById('audit-tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Use the search form above to query audit events.</td></tr>';
+    var pag = document.getElementById('audit-pagination');
+    if (pag) pag.innerHTML = '';
+    var hdr = document.getElementById('audit-count');
+    if (hdr) hdr.textContent = 'Events';
+    auditCursor = '';
 }
 
 // IP Access Control
@@ -2937,6 +2973,9 @@ document.addEventListener('click', function(e) {
             break;
         case 'exportAudit':
             exportAudit();
+            break;
+        case 'resetAudit':
+            resetAudit();
             break;
 
         // Monitoring — external links
