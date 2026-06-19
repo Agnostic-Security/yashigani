@@ -431,8 +431,21 @@ async def upsert_taxonomy_level(
 
 @router.delete("/taxonomy/{level}")
 async def delete_taxonomy_level(level: int, session: StepUpAdminSession):
-    """Delete a taxonomy level for the default tenant."""
+    """Delete a taxonomy level for the default tenant.
+
+    FIND-3.0-004b: check existence before delete.  The underlying SQL DELETE
+    is a no-op for a non-existent level (zero rows affected, no exception) so
+    without this guard the route would return 200 for a phantom level.
+    """
     try:
+        # Existence check — must precede business-rule guards (ValueError for
+        # level 1 / current-max) so the two failure modes are kept distinct.
+        taxonomy = await _taxonomy_store.get_taxonomy("default")
+        if level not in taxonomy:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "taxonomy_level_not_found", "level": level},
+            )
         await _taxonomy_store.delete_level(tenant_id="default", level_number=level)
         # AUDIT-GAP-001: emit to the SHA-384 hash-chain ledger.
         if backoffice_state.audit_writer is not None:
@@ -447,6 +460,8 @@ async def delete_taxonomy_level(level: int, session: StepUpAdminSession):
             except Exception as _exc:
                 logger.error("Failed to write TaxonomyLevelChangedEvent (delete): %s", _exc)
         return {"status": "ok", "level": level}
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "delete_not_allowed", "message": str(exc)}) from exc
     except Exception as exc:
