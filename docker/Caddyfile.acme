@@ -314,12 +314,33 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /mcp/* {
+        # FIND-3.1-INT-MCP-EMAIL: forward_auth validates the session cookie and
+        # injects X-Forwarded-User so the gateway MCP router can resolve user
+        # identity (mcp_router_runtime.py:270 reads x-forwarded-user).
+        # /auth/verify accepts user-tier sessions; SoD-003 rejects admin sessions
+        # (MCP is a data-plane path — same policy as /v1/* and OWUI catch-all).
+        # Strip the inbound header BEFORE forward_auth so a client cannot spoof
+        # their own X-Forwarded-User value. The validated value comes back from
+        # backoffice and is forwarded downstream via copy_headers + header_up.
+        # MCP is an API path (no browser) — 401 is returned directly, no redirect.
+        request_header -X-Forwarded-User
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify
+            copy_headers X-Forwarded-User
+            @unauthorized status 401
+            handle_response @unauthorized {
+                respond 401
+            }
+        }
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
         }
     }
 
