@@ -444,6 +444,50 @@ def _bootstrap():
             exc,
         )
 
+    # ── Budget enforcer (budget-redis, db/0) — wires /admin/budget/usage/{id} ──
+    # FIND-3.0-005 fix: /admin/budget/usage/{identity_id} returns 503 because
+    # the backoffice never connected to budget-redis or instantiated a
+    # BudgetEnforcer.  The gateway wires one at startup (gateway/entrypoint.py
+    # line ~325).  The backoffice mirrors that wiring here so usage data written
+    # by the gateway can be read back via the admin UI.
+    #
+    # budget-redis sits on the `data` bridge (compose line 1056: "budget-redis
+    # is a data-plane dep of gateway/backoffice only") — accessible from the
+    # backoffice container.  We reuse build_redis_url() with an explicit host
+    # override (BUDGET_REDIS_HOST, default "budget-redis") and the backoffice
+    # client cert (same TLS CA, accepted by budget-redis --tls-auth-clients yes).
+    try:
+        import redis as _redis_br
+        from yashigani.billing.budget_enforcer import BudgetEnforcer as _BudgetEnforcer
+        from yashigani.backoffice.routes import budget as _budget_routes_be
+        _budget_redis_host = os.getenv("BUDGET_REDIS_HOST", "budget-redis")
+        _budget_redis_port = os.getenv("BUDGET_REDIS_PORT", "6380")
+        _budget_redis_url = build_redis_url(
+            0,
+            host=_budget_redis_host,
+            port=_budget_redis_port,
+            password=_redis_password,
+            use_tls=redis_use_tls,
+            secrets_dir=_secrets_dir,
+            client_cert_name="backoffice_client",
+        )
+        _budget_redis_client = _redis_br.from_url(_budget_redis_url, decode_responses=False)
+        _budget_redis_client.ping()
+        _budget_enforcer = _BudgetEnforcer(redis_client=_budget_redis_client)
+        _budget_routes_be.configure(
+            budget_enforcer=_budget_enforcer,
+            budget_store=budget_config_store,
+        )
+        logger.info(
+            "Budget enforcer wired to /admin/budget/usage/* (budget-redis at %s:%s)",
+            _budget_redis_host, _budget_redis_port,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Budget enforcer init failed (%s) — /admin/budget/usage/* will return 503",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer
