@@ -2544,7 +2544,7 @@ async function loadAlertConfig() {
             var c = data.config || {};
             document.getElementById('alert-slack-url').value = c.slack_webhook_url || '';
             document.getElementById('alert-teams-url').value = c.teams_webhook_url || '';
-            document.getElementById('alert-pagerduty-key').value = c.pagerduty_integration_key || '';
+            document.getElementById('alert-pagerduty-key').value = c.pagerduty_routing_key || '';
             document.getElementById('alert-trigger-exfil').checked = c.alert_on_credential_exfil !== false;
             document.getElementById('alert-trigger-anomaly').checked = c.alert_on_anomaly_threshold !== false;
             document.getElementById('alert-trigger-budget').checked = c.alert_on_budget_exhaustion === true;
@@ -2563,7 +2563,7 @@ async function saveAlertConfig() {
             body: JSON.stringify({
                 slack_webhook_url: document.getElementById('alert-slack-url').value || null,
                 teams_webhook_url: document.getElementById('alert-teams-url').value || null,
-                pagerduty_integration_key: document.getElementById('alert-pagerduty-key').value || null,
+                pagerduty_routing_key: document.getElementById('alert-pagerduty-key').value || null,
                 alert_on_credential_exfil: document.getElementById('alert-trigger-exfil').checked,
                 alert_on_anomaly_threshold: document.getElementById('alert-trigger-anomaly').checked,
                 alert_on_budget_exhaustion: document.getElementById('alert-trigger-budget').checked,
