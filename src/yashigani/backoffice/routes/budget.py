@@ -2,11 +2,11 @@
 Yashigani Backoffice — Budget admin API.
 
 CRUD for the three-tier budget hierarchy:
-  POST/GET/PUT    /admin/budget/org-caps          — Organisation cloud caps
-  POST/GET/PUT    /admin/budget/groups             — Group budgets
-  POST/GET/PUT    /admin/budget/individuals        — Individual budgets
-  GET             /admin/budget/usage/{identity_id} — Usage summary
-  GET             /admin/budget/tree               — Full budget tree view
+  POST/GET/PUT/DELETE  /admin/budget/org-caps          — Organisation cloud caps
+  POST/GET/PUT/DELETE  /admin/budget/groups             — Group budgets
+  POST/GET/PUT/DELETE  /admin/budget/individuals        — Individual budgets
+  GET                  /admin/budget/usage/{identity_id} — Usage summary
+  GET                  /admin/budget/tree               — Full budget tree view
 
 Invariants enforced by this API:
   - Sum of individual budgets <= group budget
@@ -24,12 +24,12 @@ Last updated: 2026-05-02T00:00:00+01:00
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from yashigani.backoffice.middleware import require_admin_session
+from yashigani.backoffice.middleware import require_admin_session, AdminSession
+from yashigani.backoffice.state import backoffice_state
+from yashigani.audit.schema import ConfigChangedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,89 @@ async def create_individual_budget(body: IndividualBudgetRequest):
         period=body.period,
         remaining=body.token_budget,
     )
+
+
+def _emit_budget_delete_audit(admin_account: str, resource: str, target: str) -> None:
+    """Emit a CONFIG_CHANGED audit event for a budget deletion.
+
+    Fail-soft: never raises — a failed audit write must not mask a successful
+    delete so the UI refresh can proceed.
+    """
+    if backoffice_state.audit_writer is None:
+        return
+    try:
+        backoffice_state.audit_writer.write(
+            ConfigChangedEvent(
+                admin_account=admin_account,
+                setting=f"budget:{resource}",
+                previous_value=target,
+                new_value="deleted",
+            )
+        )
+    except Exception as _exc:
+        logger.error("Failed to write budget delete audit event (%s %s): %s", resource, target, _exc)
+
+
+@router.delete("/org-caps", status_code=204)
+async def delete_org_cap(
+    org_id: str,
+    provider: str,
+    session: AdminSession,
+):
+    """Delete an organisation cloud cap.  404 if the cap does not exist."""
+    if not _state.budget_store:
+        raise HTTPException(status_code=503, detail="Budget store not available")
+    deleted = await _state.budget_store.delete_org_cap(
+        "00000000-0000-0000-0000-000000000000", org_id, provider,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "org_cap_not_found", "org_id": org_id, "provider": provider},
+        )
+    _emit_budget_delete_audit(session.account_id, "org_cap", f"{org_id}:{provider}")
+
+
+@router.delete("/groups", status_code=204)
+async def delete_group_budget(
+    group_id: str,
+    provider: str,
+    session: AdminSession,
+    period: str = "monthly",
+):
+    """Delete a group budget.  404 if the budget does not exist."""
+    if not _state.budget_store:
+        raise HTTPException(status_code=503, detail="Budget store not available")
+    deleted = await _state.budget_store.delete_group_budget(
+        "00000000-0000-0000-0000-000000000000", group_id, provider, period,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "group_budget_not_found", "group_id": group_id, "provider": provider},
+        )
+    _emit_budget_delete_audit(session.account_id, "group_budget", f"{group_id}:{provider}:{period}")
+
+
+@router.delete("/individuals", status_code=204)
+async def delete_individual_budget(
+    identity_id: str,
+    provider: str,
+    session: AdminSession,
+    period: str = "monthly",
+):
+    """Delete an individual budget.  404 if the budget does not exist."""
+    if not _state.budget_store:
+        raise HTTPException(status_code=503, detail="Budget store not available")
+    deleted = await _state.budget_store.delete_individual_budget(
+        "00000000-0000-0000-0000-000000000000", identity_id, provider, period,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "individual_budget_not_found", "identity_id": identity_id, "provider": provider},
+        )
+    _emit_budget_delete_audit(session.account_id, "individual_budget", f"{identity_id}:{provider}:{period}")
 
 
 @router.get("/usage/{identity_id}")

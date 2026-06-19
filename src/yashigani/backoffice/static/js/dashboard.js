@@ -1472,12 +1472,13 @@ async function loadBudgets() {
         var html = '';
         for (var i = 0; i < caps.org_caps.length; i++) {
             var c = caps.org_caps[i];
-            html += '<tr><td>' + escapeHtml(c.provider || '*') + '</td><td>' + (c.token_cap || 0).toLocaleString() + '</td><td>' + escapeHtml(c.period || 'monthly') + '</td></tr>';
+            var delBtn = '<button class="btn btn-sm btn-sm-danger" data-action="deleteOrgCap" data-org-id="' + escapeHtml(c.org_id || 'default') + '" data-provider="' + escapeHtml(c.provider || '*') + '">Delete</button>';
+            html += '<tr><td>' + escapeHtml(c.org_id || 'default') + '</td><td>' + escapeHtml(c.provider || '*') + '</td><td>' + (c.token_cap || 0).toLocaleString() + '</td><td>' + escapeHtml(c.period || 'monthly') + '</td><td>' + delBtn + '</td></tr>';
         }
         tbody.innerHTML = html;
         document.getElementById('stat-org-caps').textContent = caps.org_caps.length;
     } else {
-        tbody.innerHTML = '<tr><td colspan="3" class="empty">No caps configured</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No caps configured</td></tr>';
         document.getElementById('stat-org-caps').textContent = '0';
     }
 
@@ -1487,12 +1488,13 @@ async function loadBudgets() {
         var html = '';
         for (var i = 0; i < groups.group_budgets.length; i++) {
             var g = groups.group_budgets[i];
-            html += '<tr><td>' + escapeHtml(g.group_id) + '</td><td>' + escapeHtml(g.provider || '*') + '</td><td>' + (g.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(g.period || 'monthly') + '</td></tr>';
+            var delBtn = '<button class="btn btn-sm btn-sm-danger" data-action="deleteGroupBudget" data-group-id="' + escapeHtml(g.group_id) + '" data-provider="' + escapeHtml(g.provider || '*') + '" data-period="' + escapeHtml(g.period || 'monthly') + '">Delete</button>';
+            html += '<tr><td>' + escapeHtml(g.group_id) + '</td><td>' + escapeHtml(g.provider || '*') + '</td><td>' + (g.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(g.period || 'monthly') + '</td><td>' + delBtn + '</td></tr>';
         }
         gtbody.innerHTML = html;
         document.getElementById('stat-group-budgets').textContent = groups.group_budgets.length;
     } else {
-        gtbody.innerHTML = '<tr><td colspan="4" class="empty">No group budgets configured</td></tr>';
+        gtbody.innerHTML = '<tr><td colspan="5" class="empty">No group budgets configured</td></tr>';
         document.getElementById('stat-group-budgets').textContent = '0';
     }
 
@@ -1502,12 +1504,13 @@ async function loadBudgets() {
         var html = '';
         for (var i = 0; i < indiv.individual_budgets.length; i++) {
             var ind = indiv.individual_budgets[i];
-            html += '<tr><td>' + escapeHtml(ind.identity_id) + '</td><td>' + escapeHtml(ind.provider || '*') + '</td><td>' + (ind.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(ind.period || 'monthly') + '</td></tr>';
+            var delBtn = '<button class="btn btn-sm btn-sm-danger" data-action="deleteIndBudget" data-identity-id="' + escapeHtml(ind.identity_id) + '" data-provider="' + escapeHtml(ind.provider || '*') + '" data-period="' + escapeHtml(ind.period || 'monthly') + '">Delete</button>';
+            html += '<tr><td>' + escapeHtml(ind.identity_id) + '</td><td>' + escapeHtml(ind.provider || '*') + '</td><td>' + (ind.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(ind.period || 'monthly') + '</td><td>' + delBtn + '</td></tr>';
         }
         itbody.innerHTML = html;
         document.getElementById('stat-individual-budgets').textContent = indiv.individual_budgets.length;
     } else {
-        itbody.innerHTML = '<tr><td colspan="4" class="empty">No individual budgets configured</td></tr>';
+        itbody.innerHTML = '<tr><td colspan="5" class="empty">No individual budgets configured</td></tr>';
         document.getElementById('stat-individual-budgets').textContent = '0';
     }
 }
@@ -1563,6 +1566,33 @@ async function addIndBudget() {
     });
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; loadBudgets(); }
     else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail || resp.status); }
+}
+
+async function deleteOrgCap(orgId, provider) {
+    var params = new URLSearchParams({ org_id: orgId, provider: provider });
+    var resp = await fetch('/admin/budget/org-caps?' + params.toString(), {
+        method: 'DELETE', credentials: 'same-origin'
+    });
+    if (resp.ok || resp.status === 204) { loadBudgets(); }
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + (err.detail || resp.status)); }
+}
+
+async function deleteGroupBudget(groupId, provider, period) {
+    var params = new URLSearchParams({ group_id: groupId, provider: provider, period: period || 'monthly' });
+    var resp = await fetch('/admin/budget/groups?' + params.toString(), {
+        method: 'DELETE', credentials: 'same-origin'
+    });
+    if (resp.ok || resp.status === 204) { loadBudgets(); }
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + (err.detail || resp.status)); }
+}
+
+async function deleteIndBudget(identityId, provider, period) {
+    var params = new URLSearchParams({ identity_id: identityId, provider: provider, period: period || 'monthly' });
+    var resp = await fetch('/admin/budget/individuals?' + params.toString(), {
+        method: 'DELETE', credentials: 'same-origin'
+    });
+    if (resp.ok || resp.status === 204) { loadBudgets(); }
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + (err.detail || resp.status)); }
 }
 
 // Models
@@ -2919,6 +2949,15 @@ document.addEventListener('click', function(e) {
             break;
         case 'addIndBudget':
             addIndBudget();
+            break;
+        case 'deleteOrgCap':
+            deleteOrgCap(actionEl.getAttribute('data-org-id'), actionEl.getAttribute('data-provider'));
+            break;
+        case 'deleteGroupBudget':
+            deleteGroupBudget(actionEl.getAttribute('data-group-id'), actionEl.getAttribute('data-provider'), actionEl.getAttribute('data-period'));
+            break;
+        case 'deleteIndBudget':
+            deleteIndBudget(actionEl.getAttribute('data-identity-id'), actionEl.getAttribute('data-provider'), actionEl.getAttribute('data-period'));
             break;
 
         // Model actions
