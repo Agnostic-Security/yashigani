@@ -857,12 +857,22 @@ async def _proxy_request_body(
     if mcp_broker_registry is not None and norm_path.startswith("/mcp/"):
         _mcp_suffix = norm_path[len("/mcp/"):]   # e.g. "filesystem-mcp"
         if _mcp_suffix and "/" not in _mcp_suffix:
-            # Valid single-segment agent_name — dispatch to the MCP handler
+            # Valid single-segment agent_name — dispatch to the MCP handler.
+            # Pass response_inspection_pipeline so the G-ORCH-OPA-1 egress gate
+            # can classify the tool result sensitivity before calling enforce_result().
+            #
+            # G-ORCH-OPA-1 / Option A: pass the identity registry so the egress
+            # gate can look up the caller's sensitivity_ceiling from the registry
+            # keyed by X-Forwarded-User.  Reuses the SAME registry the openai_router
+            # uses for all other identity resolution — no new store.
             from yashigani.gateway.mcp_router_runtime import dispatch_mcp_call
+            from yashigani.gateway import openai_router as _openai_router
             return await dispatch_mcp_call(
                 agent_name=_mcp_suffix,
                 request=request,
                 registry=mcp_broker_registry,
+                response_inspection_pipeline=state.get("response_inspection_pipeline"),
+                identity_registry=_openai_router._state.identity_registry,
             )
         # Multi-segment or empty suffix falls through to generic upstream forwarding
 

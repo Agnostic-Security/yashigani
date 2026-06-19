@@ -42,6 +42,7 @@ import httpx
 
 from yashigani.mcp._types import (
     BrokerDecision,
+    EgressDecision,
     McpCallContext,
     McpPosture,
     OpaDecision,
@@ -51,8 +52,10 @@ from yashigani.mcp._jwt import ChainDepthExceeded, McpJwtIssuer, McpJwtVerifier
 from yashigani.mcp._nonce import NonceStore, InMemoryNonceStore
 from yashigani.mcp._opa import (
     query_mcp_decision,
+    query_mcp_response_decision,
     query_filesystem_tool_allowed,
     query_git_tool_allowed,
+    OpaResponseDecisionResult,
     _normalize_tool_args,
 )
 from yashigani.mcp._content_filter import (
@@ -594,6 +597,150 @@ class McpBroker:
         # Step 5: emit audit (EVERY call — clean allowed calls leave a witness)
         await self._emit_audit(ctx, decision)
         return decision
+
+    async def enforce_result(
+        self,
+        ctx: McpCallContext,
+        result_sensitivity: str,
+        pii_detected: bool,
+    ) -> EgressDecision:
+        """
+        G-ORCH-OPA-1 — MCP egress decision for a tool result.
+
+        Called by the transport layer AFTER the upstream tool result is
+        obtained and AFTER the content-filter + inspection step has produced
+        a sensitivity label and PII flag.  Queries OPA
+        /v1/data/yashigani/mcp/mcp_response_decision to decide whether the
+        result may be returned to the calling agent.
+
+        This is an ADDITIONAL, INDEPENDENT OPA decision layer — it does not
+        replace the existing content-filter or inspection pipeline.  Both must
+        run.  The call order MUST be:
+
+          1. Get upstream result (transport layer).
+          2. Run content-filter / inspection → result_sensitivity, pii_detected.
+          3. Call enforce_result(ctx, result_sensitivity, pii_detected).
+          4. If EgressDecision.allow is False → WITHHOLD result; return error.
+             If True → return result to caller.
+
+        Fail-closed: any OPA error (timeout, unreachable, HTTP error, undefined
+        rule) results in EgressDecision.allow=False.  The result is WITHHELD
+        and the error is logged.  This implements zero-trust: OPA outage = no
+        result delivery (intentional, same posture as _opa_response_check in
+        the gateway LLM path).
+
+        Parameters
+        ----------
+        ctx :
+            The McpCallContext for the call.  ctx.caller_sensitivity_ceiling
+            MUST be populated by the transport layer from the authenticated
+            caller identity BEFORE calling enforce_result.  If it is None,
+            OPA's _result_ceiling_rank will be undefined and the decision
+            will be fail-closed deny with reason="invalid_or_missing_caller_ceiling".
+        result_sensitivity :
+            Sensitivity label produced by the inspection/classifier pipeline
+            ("PUBLIC" | "INTERNAL" | "CONFIDENTIAL" | "RESTRICTED").
+            The broker's caller is responsible for providing this — reuse the
+            ResponseInspectionResult.response_sensitivity value from the
+            inspection pipeline; do not run a second classifier.
+        pii_detected :
+            True when the inspection pipeline detected PII in the result body.
+
+        Returns EgressDecision.  Never raises.
+        """
+        t0 = time.monotonic()
+        spiffe_uri = agent_spiffe_uri(ctx.tenant_id, ctx.agent_name)
+
+        opa_result = await query_mcp_response_decision(
+            opa_url=self._opa_url,
+            caller_spiffe=spiffe_uri,
+            caller_sensitivity_ceiling=ctx.caller_sensitivity_ceiling,
+            caller_groups=[],   # populated from identity when available; empty is safe (not used for allow/deny currently)
+            result_sensitivity=result_sensitivity,
+            pii_detected=pii_detected,
+            tool_name=ctx.tool_name,
+            agent_name=ctx.agent_name,
+        )
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+
+        if not opa_result.allow:
+            logger.info(
+                "mcp-broker: [G-ORCH-OPA-1] egress DENIED call_id=%s tool=%s "
+                "reason=%s result_sensitivity=%s pii=%s elapsed_ms=%d",
+                ctx.call_id, ctx.tool_name, opa_result.deny_reason,
+                result_sensitivity, pii_detected, elapsed,
+            )
+            # Emit audit for the egress denial.
+            await self._emit_egress_audit(ctx, opa_result, result_sensitivity, pii_detected)
+        else:
+            logger.debug(
+                "mcp-broker: [G-ORCH-OPA-1] egress ALLOWED call_id=%s tool=%s elapsed_ms=%d",
+                ctx.call_id, ctx.tool_name, elapsed,
+            )
+
+        return EgressDecision(
+            allow=opa_result.allow,
+            deny_reason=opa_result.deny_reason,
+            policy_id=opa_result.policy_id,
+            code=opa_result.code,
+            user_message=opa_result.user_message,
+            elapsed_ms=elapsed,
+            error=opa_result.error,
+        )
+
+    async def _emit_egress_audit(
+        self,
+        ctx: McpCallContext,
+        opa_result: OpaResponseDecisionResult,
+        result_sensitivity: str,
+        pii_detected: bool,
+    ) -> None:
+        """
+        Emit an OPA_DECISION_ON_MCP audit event for an egress denial.
+
+        Egress allows do not emit an additional audit event beyond what
+        enforce() already emitted (the ingress allow is the witness record).
+        Egress denials require an explicit audit record so the operator can
+        see that a result was withheld after an allowed ingress call.
+        """
+        try:
+            from yashigani.audit.schema import (
+                AccountTier,
+                OpaDecisionOnMcpEvent,
+            )
+        except Exception as exc:
+            logger.error("mcp-broker: egress audit import failed: %s", exc)
+            return
+
+        event = OpaDecisionOnMcpEvent(
+            account_tier=AccountTier.SYSTEM,
+            tenant_id=ctx.tenant_id,
+            agent_name=ctx.agent_name,
+            tool_name=ctx.tool_name or ctx.prompt_name or ctx.resource_uri or "",
+            server_id=ctx.server_id,
+            request_id=ctx.request_id,
+            decision="deny",
+            deny_reason=f"egress:{opa_result.deny_reason}",
+            identity_chain=list(ctx.upstream_chain),
+            chain_depth=len(ctx.upstream_chain),
+            elapsed_ms=opa_result.elapsed_ms,
+        )
+
+        if self._audit_writer is not None:
+            try:
+                self._audit_writer.write(event)
+            except Exception as exc:
+                logger.error(
+                    "mcp-broker: egress audit write failed call_id=%s: %s",
+                    ctx.call_id, exc,
+                )
+        else:
+            logger.warning(
+                "mcp-broker: no audit_writer — egress OPA_DECISION_ON_MCP NOT written "
+                "call_id=%s reason=%s",
+                ctx.call_id, opa_result.deny_reason,
+            )
 
     def _provenance_id_for(self, server_id: str) -> Optional[str]:
         """

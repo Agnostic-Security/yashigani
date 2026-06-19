@@ -28,6 +28,8 @@ v2.25.0 / P1 W3 Phase 2b-ii + Phase-2 /
 from __future__ import annotations
 
 from yashigani.mcp._types import (
+    BrokerDecision,
+    EgressDecision,
     McpCallContext,
     McpPosture,
     McpTransportKind,
@@ -38,7 +40,12 @@ from yashigani.mcp.broker import McpBroker, McpBrokerConfig
 from yashigani.mcp._jwt import McpJwtIssuer, McpJwtVerifier
 from yashigani.mcp._nonce import NonceStore, InMemoryNonceStore
 from yashigani.mcp._posture import derive_posture_from_channel
-from yashigani.mcp._opa import query_mcp_decision, OpaDecisionResult
+from yashigani.mcp._opa import (
+    query_mcp_decision,
+    query_mcp_response_decision,
+    OpaDecisionResult,
+    OpaResponseDecisionResult,
+)
 
 # Phase-2 hardening exports
 from yashigani.mcp._content_filter import (
@@ -114,6 +121,8 @@ __all__ = [
     # Core
     "McpBroker",
     "McpBrokerConfig",
+    "BrokerDecision",
+    "EgressDecision",
     "McpCallContext",
     "McpPosture",
     "McpTransportKind",
@@ -125,7 +134,9 @@ __all__ = [
     "InMemoryNonceStore",
     "derive_posture_from_channel",
     "query_mcp_decision",
+    "query_mcp_response_decision",
     "OpaDecisionResult",
+    "OpaResponseDecisionResult",
     # Phase-2: M4 content filter
     "FilterResult",
     "ToolCatalogueStore",

@@ -607,6 +607,231 @@ async def query_filesystem_tool_allowed(
 
 
 # ---------------------------------------------------------------------------
+# G-ORCH-OPA-1 — MCP egress (result) decision
+# ---------------------------------------------------------------------------
+
+MCP_RESPONSE_OPA_PATH = "/v1/data/yashigani/mcp/mcp_response_decision"
+
+
+@dataclass
+class OpaResponseDecisionResult:
+    """
+    Result of querying data.yashigani.mcp.mcp_response_decision.
+
+    allow:           True when the tool result may be returned to the caller.
+    deny_reason:     Label for the deny case (audit + error body).
+    policy_id:       Self-describing policy identifier (I6 / unified user-alert).
+    code:            Short machine-readable code for the denial.
+    user_message:    Layman-language explanation for the calling agent.
+    elapsed_ms:      Query round-trip time.
+    error:           Set when OPA was unreachable / timed out (fail-closed).
+    """
+
+    allow: bool
+    deny_reason: str
+    policy_id: str
+    code: str
+    user_message: str
+    elapsed_ms: int
+    error: Optional[str] = None
+
+
+def _parse_mcp_response_decision(raw: dict, elapsed_ms: int) -> OpaResponseDecisionResult:
+    """Parse the raw OPA JSON response for mcp_response_decision."""
+    result = raw.get("result", {})
+    if not isinstance(result, dict):
+        # OPA returned null/undefined — fail-closed
+        return OpaResponseDecisionResult(
+            allow=False,
+            deny_reason="opa_undefined_result",
+            policy_id="mcp.response_decision",
+            code="MCP_RESPONSE_OPA_ERROR",
+            user_message=(
+                "The tool result could not be returned because the security "
+                "policy check returned an unexpected result."
+            ),
+            elapsed_ms=elapsed_ms,
+            error="OPA returned undefined result for mcp_response_decision",
+        )
+
+    return OpaResponseDecisionResult(
+        allow=bool(result.get("allow", False)),
+        deny_reason=str(result.get("deny_reason", "opa_no_reason")),
+        policy_id=str(result.get("policy_id", "mcp.response_decision")),
+        code=str(result.get("code", "MCP_RESPONSE_DENIED")),
+        user_message=str(result.get("user_message", (
+            "The tool result was blocked by the security policy."
+        ))),
+        elapsed_ms=elapsed_ms,
+    )
+
+
+async def query_mcp_response_decision(
+    opa_url: str,
+    caller_spiffe: str,
+    caller_sensitivity_ceiling: Optional[str],
+    caller_groups: Optional[list[str]],
+    result_sensitivity: str,
+    pii_detected: bool,
+    tool_name: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> OpaResponseDecisionResult:
+    """
+    G-ORCH-OPA-1 — Query OPA for an MCP tool-result egress decision.
+
+    Called AFTER the upstream tool result is obtained and AFTER/alongside
+    the content-filter + inspection step.  Determines whether the result
+    may be returned to the caller given:
+      - The caller's sensitivity ceiling (their authorisation level).
+      - The result's sensitivity (from the inspection/classifier pipeline).
+      - Whether PII was detected in the result.
+
+    Queries /v1/data/yashigani/mcp/mcp_response_decision (package yashigani.mcp).
+
+    Mirrors query_mcp_decision (same client factory, same fail-closed pattern,
+    same 500ms timeout).  Never raises — all errors produce a deny decision
+    with error field populated (fail-closed per C9 / G-ORCH-OPA-1).
+
+    Parameters
+    ----------
+    opa_url:
+        Base URL of OPA (e.g. "https://policy:8181").
+    caller_spiffe:
+        SPIFFE URI of the calling agent/entity.
+    caller_sensitivity_ceiling:
+        The caller's declared sensitivity ceiling ("PUBLIC" | "INTERNAL" |
+        "CONFIDENTIAL" | "RESTRICTED").  When None, OPA's _ceiling_rank
+        is undefined → fail-closed deny.
+    caller_groups:
+        RBAC groups the caller belongs to.  May be empty list or None.
+    result_sensitivity:
+        Sensitivity label of the tool result content, as classified by
+        the inspection/classifier pipeline.  Defaults to "PUBLIC" (most
+        permissive) when the pipeline produced no verdict.
+    pii_detected:
+        True when PII was detected in the result by the inspection pipeline.
+    tool_name:
+        Name of the tool that produced the result (for audit context in OPA).
+    agent_name:
+        Name of the agent being called (for audit context).
+    http_client:
+        Optional pre-constructed httpx.AsyncClient.  When None, a new client
+        is created using _make_opa_http_client() and closed after the call.
+
+    Returns OpaResponseDecisionResult.  Never raises.
+    """
+    t0 = time.monotonic()
+
+    input_doc = {
+        "input": {
+            "caller": {
+                "spiffe": caller_spiffe,
+                "sensitivity_ceiling": caller_sensitivity_ceiling,
+                "groups": caller_groups or [],
+            },
+            "result": {
+                "sensitivity": result_sensitivity,
+                "pii_detected": bool(pii_detected),
+            },
+        }
+    }
+    if tool_name is not None:
+        input_doc["input"]["tool"] = {"name": tool_name}
+    if agent_name is not None:
+        input_doc["input"]["agent"] = {"name": agent_name}
+
+    url = f"{opa_url.rstrip('/')}{MCP_RESPONSE_OPA_PATH}"
+    own_client = http_client is None
+
+    try:
+        if own_client:
+            http_client = _make_opa_http_client()
+
+        assert http_client is not None
+        resp = await http_client.post(url, json=input_doc)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        resp.raise_for_status()
+        raw = resp.json()
+        result = _parse_mcp_response_decision(raw, elapsed_ms)
+
+        if not result.allow:
+            logger.info(
+                "mcp-broker: [egress] OPA deny tool=%s reason=%s elapsed_ms=%d",
+                tool_name, result.deny_reason, elapsed_ms,
+            )
+        else:
+            logger.debug(
+                "mcp-broker: [egress] OPA allow tool=%s elapsed_ms=%d",
+                tool_name, elapsed_ms,
+            )
+        return result
+
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [egress] OPA timeout after %dms (limit=%dms) tool=%s — "
+            "fail-closed (G-ORCH-OPA-1 / C9)",
+            elapsed_ms, int(OPA_TIMEOUT_SECONDS * 1000), tool_name,
+        )
+        return OpaResponseDecisionResult(
+            allow=False,
+            deny_reason="opa_timeout",
+            policy_id="mcp.response_decision",
+            code="MCP_RESPONSE_OPA_TIMEOUT",
+            user_message=(
+                "The tool result could not be returned because the security "
+                "policy check timed out. Please try again."
+            ),
+            elapsed_ms=elapsed_ms,
+            error=f"OPA timeout after {elapsed_ms}ms",
+        )
+    except httpx.HTTPStatusError as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [egress] OPA HTTP error %d tool=%s — fail-closed (G-ORCH-OPA-1)",
+            exc.response.status_code, tool_name,
+        )
+        return OpaResponseDecisionResult(
+            allow=False,
+            deny_reason="opa_http_error",
+            policy_id="mcp.response_decision",
+            code="MCP_RESPONSE_OPA_ERROR",
+            user_message=(
+                "The tool result could not be returned because the security "
+                "policy check encountered an error."
+            ),
+            elapsed_ms=elapsed_ms,
+            error=f"OPA returned HTTP {exc.response.status_code}",
+        )
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.error(
+            "mcp-broker: [egress] OPA unreachable tool=%s error=%s — fail-closed (G-ORCH-OPA-1)",
+            tool_name, exc,
+        )
+        return OpaResponseDecisionResult(
+            allow=False,
+            deny_reason="opa_unreachable",
+            policy_id="mcp.response_decision",
+            code="MCP_RESPONSE_OPA_UNREACHABLE",
+            user_message=(
+                "The tool result could not be returned because the security "
+                "policy service is unreachable."
+            ),
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+        )
+    finally:
+        if own_client and http_client is not None:
+            try:
+                await http_client.aclose()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # P3-GIT / GIT-TM-001..004 — git tool-gating runtime query
 # ---------------------------------------------------------------------------
 

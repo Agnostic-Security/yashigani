@@ -120,6 +120,13 @@ class McpCallContext:
     resource_sensitivity: Optional[str] = None
     prompt_sensitivity: Optional[str] = None
 
+    # G-ORCH-OPA-1 — egress: caller's declared sensitivity ceiling.
+    # Set from the caller's identity/session before calling enforce_result().
+    # Defaults to None; OPA's mcp_response_decision fails-closed when absent
+    # (undefined _ceiling_rank → deny).  Transport layers MUST populate this
+    # from the authenticated caller identity before the egress check.
+    caller_sensitivity_ceiling: Optional[str] = None
+
 
 @dataclass
 class OpaDecision:
@@ -152,3 +159,26 @@ class BrokerDecision:
     chain_depth: int = 0
     elapsed_ms: Optional[int] = None
     error: Optional[str] = None         # internal error string (never client-visible)
+
+
+@dataclass
+class EgressDecision:
+    """
+    G-ORCH-OPA-1 — MCP egress decision after OPA mcp_response_decision check.
+
+    Returned by McpBroker.enforce_result().  When allow=False the transport
+    layer MUST NOT return the tool result to the caller — the result is
+    withheld and the deny shape (deny_reason, code, user_message) is returned
+    as the error body to the calling agent.
+
+    Fields mirror OpaResponseDecisionResult so callers need only inspect this
+    dataclass; they do not need to import from _opa directly.
+    """
+
+    allow: bool
+    deny_reason: str    # "ok" when allowed; label when denied
+    policy_id: str      # "mcp.response_decision" (stable self-describing ID)
+    code: str           # MCP_RESULT_OK | MCP_RESULT_* (machine-readable)
+    user_message: str   # layman explanation (safe to surface to calling agent)
+    elapsed_ms: int
+    error: Optional[str] = None   # internal OPA error string (never client-visible)

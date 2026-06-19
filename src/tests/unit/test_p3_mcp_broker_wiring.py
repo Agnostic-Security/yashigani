@@ -468,7 +468,7 @@ class TestFipsProviderAssertion:
 
 def _make_mock_broker(allow: bool = True, deny_reason: str = "ok", issued_jwt: str = "test-jwt"):
     """Build a mock McpBroker with a configurable enforce() response."""
-    from yashigani.mcp._types import BrokerDecision, OpaDecision
+    from yashigani.mcp._types import BrokerDecision, EgressDecision, OpaDecision
 
     broker = MagicMock()
     opa_dec = OpaDecision(
@@ -486,6 +486,16 @@ def _make_mock_broker(allow: bool = True, deny_reason: str = "ok", issued_jwt: s
         issued_jwt=issued_jwt if allow else None,
     )
     broker.enforce = AsyncMock(return_value=decision)
+    # G-ORCH-OPA-1: enforce_result must be an AsyncMock so the egress gate can
+    # await it.  Default: allow (so existing tests that only check ingress pass).
+    broker.enforce_result = AsyncMock(return_value=EgressDecision(
+        allow=True,
+        deny_reason="ok",
+        policy_id="mcp.response_decision",
+        code="MCP_RESULT_OK",
+        user_message="Tool result approved for delivery.",
+        elapsed_ms=1,
+    ))
     broker._issuer = MagicMock()
     broker._issuer.issue = MagicMock(return_value="session-jwt-value")
     return broker

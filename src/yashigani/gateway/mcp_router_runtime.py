@@ -15,6 +15,32 @@ Flow:
      JWT (gateway attaches a session-level JWT so the server trusts the gateway).
   7. Deny → 403 with deny_reason.  Unknown method → forward (pass-through).
 
+G-ORCH-OPA-1 (egress gate — v3.1):
+  For tools/call, AFTER step 5 returns an upstream result:
+    a. Run ResponseInspectionPipeline (if configured) to obtain result_sensitivity
+       and injection verdict.  The PII flag is derived from the inspection verdict.
+    b. Call broker.enforce_result(ctx, result_sensitivity, pii_detected) — an
+       additional, independent OPA decision layer on top of the content-filter.
+    c. If EgressDecision.allow is False → WITHHOLD the result; return 403 with
+       the self-describing deny contract (deny_reason, code, user_message).
+       The raw upstream result is never returned to the caller on deny.
+    d. Fail-closed: any error in the egress decision path withholds the result.
+
+  Caller sensitivity ceiling (G-ORCH-OPA-1 / Option A — v3.1):
+    ctx.caller_sensitivity_ceiling is populated from the identity registry at
+    call time (Option A: registry lookup keyed by user_id from X-Forwarded-User).
+    The identity registry is passed from the proxy (openai_router._state) so no
+    new store is introduced.
+
+    Lookup: identity_registry.get_by_slug(user_id) → identity dict →
+      identity.get("sensitivity_ceiling", "PUBLIC").  If the registry is absent
+      or the user_id is not found, ctx.caller_sensitivity_ceiling remains None
+      → OPA fails-closed (invalid_or_missing_caller_ceiling) — this is correct
+      for unauthenticated or registry-unavailable paths.
+
+    The normal gateway-mediated path (Caddy forward_auth + identity registry
+    configured) sets a real ceiling so legitimate results are allowed.
+
 Security:
   - Posture is ALWAYS derived from the channel (mcp-b for HTTP), never from headers.
   - X-Forwarded-For / X-Real-IP / X-Posture headers are stripped before any
@@ -37,6 +63,7 @@ v1 session-affinity constraint:
   affinity at the load-balancer layer first.
 
 v2.25.0 / P3 gateway integration.
+v3.1 / G-ORCH-OPA-1 egress hardening.
 """
 from __future__ import annotations
 
@@ -100,6 +127,8 @@ async def dispatch_mcp_call(
     agent_name: str,
     request: Request,
     registry: object,  # McpBrokerRegistry — typed as object to avoid circular imports
+    response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
+    identity_registry: Optional[object] = None,  # IdentityRegistry | None — for ceiling lookup
 ) -> Response:
     """
     Core MCP call handler.  Called DIRECTLY from the proxy catch-all AFTER the
@@ -122,14 +151,37 @@ async def dispatch_mcp_call(
         The inbound FastAPI Request (headers + body already read by caller).
     registry:
         McpBrokerRegistry instance.
+    response_inspection_pipeline:
+        Optional ResponseInspectionPipeline instance.  When provided, the
+        G-ORCH-OPA-1 egress gate runs the inspection pipeline over the
+        upstream result to derive result_sensitivity and pii_detected before
+        calling broker.enforce_result().  When None, result_sensitivity
+        defaults to "PUBLIC" and pii_detected to False.  Both cases still
+        invoke broker.enforce_result() — the OPA gate always runs.
+    identity_registry:
+        Optional IdentityRegistry instance.  When provided, the caller's
+        sensitivity_ceiling is looked up from the registry (keyed by the
+        X-Forwarded-User slug) and set on McpCallContext.caller_sensitivity_ceiling
+        before the G-ORCH-OPA-1 egress enforce_result() call.  When absent,
+        ctx.caller_sensitivity_ceiling remains None → OPA fails-closed.
+        Passed from the proxy (openai_router._state.identity_registry) —
+        no new store introduced (Option A / G-ORCH-OPA-1).
     """
-    return await _handle_mcp_call_inner(agent_name=agent_name, request=request, registry=registry)
+    return await _handle_mcp_call_inner(
+        agent_name=agent_name,
+        request=request,
+        registry=registry,
+        response_inspection_pipeline=response_inspection_pipeline,
+        identity_registry=identity_registry,
+    )
 
 
 async def _handle_mcp_call_inner(
     agent_name: str,
     request: Request,
     registry: object,
+    response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
+    identity_registry: Optional[object] = None,  # IdentityRegistry | None
 ) -> Response:
     """
     Core MCP call processing logic — shared by dispatch_mcp_call (catch-all path)
@@ -219,6 +271,35 @@ async def _handle_mcp_call_inner(
     call_id = str(uuid.uuid4())
     request_id = str(uuid.uuid4())
 
+    # G-ORCH-OPA-1 / Option A: look up the caller's sensitivity_ceiling from
+    # the identity registry (keyed by the X-Forwarded-User slug).  This is the
+    # SAME registry the openai_router uses for identity resolution — no new store.
+    # Result is set on McpCallContext.caller_sensitivity_ceiling before the egress
+    # enforce_result() call.
+    #
+    # Fail-closed: if the registry is absent, or user_id is "unknown", or the
+    # slug is not found, caller_sensitivity_ceiling stays None → OPA denies
+    # with invalid_or_missing_caller_ceiling.  This is intentional: an
+    # unauthenticated or registry-unavailable path must not allow result delivery.
+    caller_sensitivity_ceiling: Optional[str] = None
+    if identity_registry is not None and user_id != "unknown":
+        try:
+            identity_rec = identity_registry.get_by_slug(user_id)  # type: ignore[attr-defined]
+            if identity_rec is not None:
+                # identity_rec is either an IdentityRecord dataclass or a dict
+                # (Redis-backed registry returns a dict from get_by_slug).
+                if hasattr(identity_rec, "sensitivity_ceiling"):
+                    caller_sensitivity_ceiling = identity_rec.sensitivity_ceiling
+                elif isinstance(identity_rec, dict):
+                    caller_sensitivity_ceiling = identity_rec.get("sensitivity_ceiling")
+        except Exception as reg_exc:
+            # Registry lookup failure → leave ceiling None (fail-closed).
+            logger.warning(
+                "mcp-runtime: [G-ORCH-OPA-1] identity registry lookup failed "
+                "for user_id=%r: %s — ceiling stays None (fail-closed)",
+                user_id, reg_exc,
+            )
+
     # ── 5. Route by method ────────────────────────────────────────────────
     if method in _GATED_METHODS:
         # tools/call — full broker.enforce() pipeline
@@ -237,6 +318,9 @@ async def _handle_mcp_call_inner(
             call_id=call_id,
             request_id=request_id,
             server_id=agent_name,
+            # G-ORCH-OPA-1 / Option A: populate from identity registry lookup.
+            # None when registry absent or user not found → fail-closed at egress.
+            caller_sensitivity_ceiling=caller_sensitivity_ceiling,
         )
 
         try:
@@ -291,6 +375,122 @@ async def _handle_mcp_call_inner(
             return JSONResponse(
                 status_code=502,
                 content={"error": "UPSTREAM_ERROR"},
+            )
+
+        # ── G-ORCH-OPA-1 egress gate ──────────────────────────────────────
+        #
+        # Step 1: run the ResponseInspectionPipeline (when configured) to
+        #   derive result_sensitivity and a PII flag.  This is the SAME
+        #   inspection that runs on LLM responses (proxy.py / orchestrator.py)
+        #   applied to MCP tool results.  Do NOT run a second classifier.
+        #
+        # Step 2: call broker.enforce_result() — an independent OPA decision
+        #   layer on top of the content-filter.  Fail-closed: any exception
+        #   in either step withholds the result.
+        #
+        # ctx.caller_sensitivity_ceiling is set above from the identity registry
+        # lookup (Option A / G-ORCH-OPA-1).  When set, OPA compares the result
+        # sensitivity against the caller's ceiling and allows/denies accordingly.
+        # When None (registry absent or user not found), OPA fails-closed.
+        result_sensitivity = "PUBLIC"
+        pii_detected = False
+        inspection_blocked = False
+
+        try:
+            if response_inspection_pipeline is not None and upstream_response:
+                resp_insp = response_inspection_pipeline.inspect(  # type: ignore[union-attr]
+                    response_body=upstream_response,
+                    content_type="application/json",
+                    request_id=request_id,
+                    session_id=user_id,
+                    agent_id=agent_name,
+                )
+                # ResponseInspectionResult.response_sensitivity is the
+                # content-sensitivity label from the sensitivity_classifier.
+                result_sensitivity = getattr(resp_insp, "response_sensitivity", "PUBLIC") or "PUBLIC"
+                # Map inspection verdict to pii_detected flag for the OPA input.
+                # BLOCKED verdict = content filter withheld the result entirely;
+                # treat as pii_detected=True so OPA also denies (belt-and-suspenders).
+                verdict = getattr(resp_insp, "verdict", "CLEAN")
+                if verdict == "BLOCKED":
+                    inspection_blocked = True
+                    pii_detected = True
+                elif verdict == "FLAGGED":
+                    pii_detected = True
+        except Exception as exc:
+            # Fail-closed: inspection failure withholds the result.
+            logger.error(
+                "mcp-runtime: [G-ORCH-OPA-1] inspection error agent=%r call_id=%s: %s "
+                "— fail-closed withhold",
+                agent_name, call_id, exc,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_EGRESS_INSPECTION_ERROR",
+                    "deny_reason": "inspection_error",
+                },
+            )
+
+        if inspection_blocked:
+            # Content filter already blocked it — don't bother with OPA.
+            logger.info(
+                "mcp-runtime: [G-ORCH-OPA-1] inspection BLOCKED agent=%r call_id=%s "
+                "tool=%r — result withheld",
+                agent_name, call_id, tool_name,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_EGRESS_BLOCKED",
+                    "deny_reason": "response_inspection_blocked",
+                    "code": "MCP_RESPONSE_INSPECTION_BLOCKED",
+                    "user_message": (
+                        "The tool result was withheld because the content "
+                        "filter detected a potential injection in the response."
+                    ),
+                },
+            )
+
+        # OPA egress decision (always runs, independent of inspection).
+        try:
+            egress = await broker.enforce_result(  # type: ignore[attr-defined]
+                ctx=ctx,
+                result_sensitivity=result_sensitivity,
+                pii_detected=pii_detected,
+            )
+        except Exception as exc:
+            # Fail-closed: any error in the OPA egress path withholds result.
+            logger.error(
+                "mcp-runtime: [G-ORCH-OPA-1] enforce_result raised agent=%r call_id=%s: %s "
+                "— fail-closed withhold",
+                agent_name, call_id, exc,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_EGRESS_ERROR",
+                    "deny_reason": "egress_decision_error",
+                },
+            )
+
+        if not egress.allow:
+            logger.info(
+                "mcp-runtime: [G-ORCH-OPA-1] egress DENIED agent=%r call_id=%s "
+                "tool=%r reason=%s code=%s",
+                agent_name, call_id, tool_name, egress.deny_reason, egress.code,
+            )
+            # Return the self-describing deny contract.  The raw upstream result
+            # is NEVER included in this response — it is withheld entirely.
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_EGRESS_DENIED",
+                    "deny_reason": egress.deny_reason,
+                    "code": egress.code,
+                    "user_message": egress.user_message,
+                    "policy_id": egress.policy_id,
+                },
             )
 
         return Response(
@@ -432,7 +632,11 @@ async def _handle_mcp_call_inner(
             )
 
 
-def create_mcp_call_router(registry: object) -> APIRouter:  # McpBrokerRegistry
+def create_mcp_call_router(
+    registry: object,
+    response_inspection_pipeline: Optional[object] = None,
+    identity_registry: Optional[object] = None,
+) -> APIRouter:  # McpBrokerRegistry
     """
     Create the MCP call APIRouter.
 
@@ -449,6 +653,14 @@ def create_mcp_call_router(registry: object) -> APIRouter:  # McpBrokerRegistry
     registry:
         McpBrokerRegistry instance — maps agent_name → (broker, server_config).
         Typed as object to avoid circular imports.
+    response_inspection_pipeline:
+        Optional ResponseInspectionPipeline for the G-ORCH-OPA-1 egress gate.
+        When None, result_sensitivity defaults to "PUBLIC" and pii_detected
+        to False (but the OPA egress gate still always runs).
+    identity_registry:
+        Optional IdentityRegistry instance.  When provided, caller sensitivity
+        ceilings are looked up for the G-ORCH-OPA-1 egress gate.
+        When None, ctx.caller_sensitivity_ceiling stays None → fail-closed deny.
     """
     mcp_call_router = APIRouter()
 
@@ -460,7 +672,11 @@ def create_mcp_call_router(registry: object) -> APIRouter:  # McpBrokerRegistry
         agent_name is the path parameter — NEVER read from the request body.
         """
         return await _handle_mcp_call_inner(
-            agent_name=agent_name, request=request, registry=registry
+            agent_name=agent_name,
+            request=request,
+            registry=registry,
+            response_inspection_pipeline=response_inspection_pipeline,
+            identity_registry=identity_registry,
         )
 
     return mcp_call_router
