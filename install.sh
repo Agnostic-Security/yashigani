@@ -2255,7 +2255,7 @@ check_installer_preflight() {
   [[ -z "$_vol_root" || ! -d "$_vol_root" ]] && _vol_root="/var/lib/docker"
   [[ ! -d "$_vol_root" ]] && _vol_root="/"
   local _avail_gb
-  _avail_gb="$(df -PBG "$_vol_root" 2>/dev/null | awk 'NR==2{gsub(/[A-Za-z]/,"",$4); print $4}')"
+  _avail_gb="$(df -Pk "$_vol_root" 2>/dev/null | awk 'NR==2{print int($4/1024/1024)}')"  # MACOS-DF-001: BSD df has no -B; -Pk (1024-blocks) is BSD+GNU portable
   if [[ -n "$_avail_gb" ]] && awk "BEGIN { exit !($_avail_gb < $_min_gb) }"; then
     printf "\n"
     printf "${C_YELLOW}[WARN] Only %s GB free on %s (container-volume store).${C_RESET}\n" "$_avail_gb" "$_vol_root"
@@ -5867,7 +5867,7 @@ _provision_wazuh_mtls() {
   cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
   cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
   # fail-closed: filebeat `full` verification needs SAN=wazuh-indexer on the HTTP cert
-  if ! openssl x509 -in "${wp}/certs/http-indexer.pem" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:wazuh-indexer'; then
+  if ! openssl x509 -in "${wp}/certs/http-indexer.pem" -noout -text 2>/dev/null | grep -q 'DNS:wazuh-indexer'; then  # MACOS-WAZUHSAN-001: LibreSSL x509 has no -ext flag; the -text SAN read is portable (BSD/LibreSSL + GNU/OpenSSL)
     log_error "wazuh-indexer_client.crt lacks SAN 'wazuh-indexer' — full mTLS would fail closed; aborting"; return 1
   fi
 

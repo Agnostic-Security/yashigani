@@ -2676,7 +2676,9 @@ services:
       - filebeat_etc:/etc/filebeat
       - filebeat_var:/var/lib/filebeat
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:55000 || exit 1"]
+      # MACOS-WAZUHHC-001: test is supplied ONLY by docker-compose.wazuh.yml. Defining it in
+      # both base + override makes podman-compose 1.5.0 APPEND the two test lists → invalid
+      # CMD-SHELL (4 elems) → "CMD_SHELL takes a single string". Base keeps timings only.
       interval: 30s
       timeout: 10s
       retries: 5
@@ -2710,7 +2712,8 @@ services:
     volumes:
       - wazuh_indexer_data:/var/lib/wazuh-indexer
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf https://localhost:9200 -k || exit 1"]
+      # MACOS-WAZUHHC-001: test supplied only by docker-compose.wazuh.yml (avoids the
+      # podman-compose 1.5.0 healthcheck merge-append crash). Base keeps timings only.
       interval: 30s
       timeout: 10s
       retries: 5
@@ -2752,7 +2755,8 @@ services:
       wazuh-indexer:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5601/admin/wazuh/ || exit 1"]
+      # MACOS-WAZUHHC-001: test supplied only by docker-compose.wazuh.yml (avoids the
+      # podman-compose 1.5.0 healthcheck merge-append crash). Base keeps timings only.
       interval: 30s
       timeout: 10s
       retries: 5
