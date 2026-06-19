@@ -330,6 +330,14 @@ class EventType(str, Enum):
     SENSITIVITY_PATTERN_AI_GENERATED = "SENSITIVITY_PATTERN_AI_GENERATED"
     TAXONOMY_LEVEL_CHANGED = "TAXONOMY_LEVEL_CHANGED"
     ADMIN_CLOUD_KEY_SET = "ADMIN_CLOUD_KEY_SET"
+    # FIND-3.1-INT-AGENT-AUDIT: agent upstream unreachable (502 / connection error).
+    # Emitted when the agent router's upstream HTTP call fails with a network error
+    # or connect-level exception.  Closes the OWASP A09 logging blind-spot on the
+    # agent proxy path.  The error_type field distinguishes connect vs. timeout vs.
+    # other transport failures.  Raw exception messages are never stored — only
+    # a truncated, sanitised error_type label.
+    # OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    AGENT_UPSTREAM_UNREACHABLE = "AGENT_UPSTREAM_UNREACHABLE"
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +961,36 @@ class AgentResponseBlockedByOpaEvent(AuditEvent):
     deny_reason: str = ""                 # response_sensitivity_exceeds_caller_ceiling | pii_detected_in_response | missing_agent_identity | opa_unreachable
     request_id: str = ""
     pii_detected: bool = False
+
+
+@dataclass
+class AgentUpstreamUnreachableEvent(AuditEvent):
+    """
+    Emitted when the agent router fails to reach the upstream agent URL
+    (network error, connection refused, timeout, or similar transport failure).
+
+    FIND-3.1-INT-AGENT-AUDIT: closes the OWASP A09 logging blind-spot on the
+    agent proxy path — a 502 from an unreachable upstream was previously silent
+    in the audit chain.
+
+    Security invariants:
+    - Raw exception messages are NEVER stored — error_type is a sanitised label
+      (connect_error | timeout | unknown) derived from the exception class.
+    - target_upstream_url is NOT stored — it may contain internal network
+      addresses; only target_agent_id is recorded.
+    - masking_applied is always True.
+
+    OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    """
+
+    event_type: str = EventType.AGENT_UPSTREAM_UNREACHABLE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_agent_id: str = ""
+    target_agent_id: str = ""
+    remainder_path: str = ""
+    request_id: str = ""
+    error_type: str = ""     # connect_error | timeout | unknown
 
 
 # ---------------------------------------------------------------------------

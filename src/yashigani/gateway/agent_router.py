@@ -404,6 +404,26 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
             "route_agent_call: upstream unreachable for %s → %s%s: %s",
             caller_agent_id, target_agent_id, remainder_path, exc,
         )
+        # FIND-3.1-INT-AGENT-AUDIT: emit audit on upstream failure so OWASP A09
+        # logging is satisfied.  Best-effort — audit must never break the 502.
+        if audit_writer is not None:
+            try:
+                import httpx as _httpx
+                from yashigani.audit.schema import AgentUpstreamUnreachableEvent
+                _error_type = (
+                    "timeout" if isinstance(exc, _httpx.TimeoutException)
+                    else "connect_error" if isinstance(exc, _httpx.ConnectError)
+                    else "unknown"
+                )
+                audit_writer.write(AgentUpstreamUnreachableEvent(
+                    caller_agent_id=caller_agent_id,
+                    target_agent_id=target_agent_id,
+                    remainder_path=remainder_path,
+                    request_id=getattr(request.state, "request_id", ""),
+                    error_type=_error_type,
+                ))
+            except Exception:  # pragma: no cover — audit must never break the request
+                pass
         return JSONResponse(
             status_code=502,
             content={
