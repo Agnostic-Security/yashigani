@@ -39,8 +39,8 @@
 # InvalidBaseImagePlatform warning under emulation.
 ARG TARGETARCH=amd64
 
-FROM python:3.14.5-slim@sha256:7d8de339aa8619f9b25e7d474d687ae4f6ef9704adad90a136af0f485adeccb7 AS python-amd64
-FROM python:3.14.5-slim@sha256:4701f9885ba369bf50a80ae4b5e1f637be3aa961dbb9b676d295e98fb2c01075 AS python-arm64
+FROM python:3.14.6-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061 AS python-amd64
+FROM python:3.14.6-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061 AS python-arm64
 
 # Select the correct python stage based on TARGETARCH.
 FROM python-${TARGETARCH} AS python-base
