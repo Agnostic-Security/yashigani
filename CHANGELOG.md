@@ -8,9 +8,9 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
-## [v2.25.5] — 2026-06-13
+## [v2.25.5] — 2026-06-25
 
-Theme: **Auth/ingress rebuild + the full admin-UX refinement layer** — a single authenticated portal with role-based routing, and a top-to-bottom pass over the back-office admin experience.
+Theme: **Auth/ingress rebuild + the full admin-UX refinement layer + security hardening pass** — a single authenticated portal with role-based routing, a top-to-bottom pass over the back-office admin experience, and a security hardening batch covering SSRF, OPA path normalisation, TOTP re-provision protection, and install robustness.
 
 ### Added
 
@@ -30,6 +30,19 @@ Theme: **Auth/ingress rebuild + the full admin-UX refinement layer** — a singl
 - **fix(observability): metrics + log/metric routing** — ~40 metrics instrumented across services, with Loki and Prometheus wiring corrected.
 - **fix(sensitivity): clean-result over-block regression** — a clean result is no longer over-classified; alias resolution corrected.
 - **fix(deploy): assorted upgrade/demo fixes** — backup admin DSN, list-content schema, a durable-store array column type, and the MCP OpenTelemetry span processor.
+
+### Security
+
+- **sec(gateway): SSRF guard on JWKS URL resolution (YSG-RISK-083)** — the JWKS endpoint URL is now validated before resolution: https-only (blocks `file://` and `http://`) and the resolved IP is checked against RFC 1918/loopback/link-local/reserved ranges (blocks cloud-metadata 169.254.0.0/16 and internal networks). Primary compensating controls remain egress-default-deny firewall and mTLS mesh.
+- **sec(gateway): OPA path normalisation (YSG-RISK-081)** — the OPA policy check now receives the leading-slash-normalised path (`norm_path`) consistently with every other gate in the request handler, so OPA rego rules keyed on paths with a leading slash (e.g. `/.well-known/jwks.json`) match correctly instead of failing-closed with a spurious 403.
+- **sec(auth): step-up required to re-provision TOTP (YSG-RISK-082)** — replacing an existing TOTP authenticator (via `/auth/totp/provision/start`, `/auth/totp/provision/confirm`, or the atomic `/auth/totp/provision`) now requires a fresh step-up TOTP verification before issuing a new seed. First-time enrolment (`force_totp_provision=true` / no existing secret) is exempt — that is the bootstrap path.
+- **sec(caddy): deduplicate Content-Security-Policy header (YSG-RISK-080)** — `header_down -Content-Security-Policy` added to every `reverse_proxy https://backoffice:8443` block in all three Caddyfiles, so the backoffice-emitted CSP header is stripped before Caddy injects its own. Previously both headers reached the browser, causing the stricter of the two to silently win (or duplicate-header CSP confusion). Caddy is now the sole CSP source on all paths.
+
+### Fixed
+
+- **fix(rag): RAG embeddings — nomic-embed-text pulled on install** — `ollama-init` now pulls `nomic-embed-text` after the primary model, and `RAG_EMBEDDING_MODEL: "nomic-embed-text"` is set on the open-webui service. Fixes "No sources found" on file-upload RAG (Ollama embed endpoint returned HTTP 404 when the model was absent).
+- **fix(owui): default new-user role to `user`** — `WEBUI_DEFAULT_USER_ROLE: "user"` added to the open-webui service so user accounts created after the first are not stuck in "Account Activation Pending".
+- **fix(install): self-healing convergence gate** — if the gateway health poll times out on a clean install (caused by postgres finishing initdb after its `start_period` elapsed under heavy parallel load, aborting the app tier to "Created"), `install.sh` now re-runs `compose up -d` once (profile-aware) and re-polls before failing. postgres `start_period` raised to 300 s (was 180 s) for additional headroom.
 
 ### Known issues
 

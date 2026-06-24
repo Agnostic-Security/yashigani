@@ -6275,8 +6275,34 @@ _verify_gateway_healthz() {
     sleep "$_poll_s"
   done
 
+  # Self-heal: if the gateway never came up, the dominant cause on a clean
+  # install of the full demo stack is postgres finishing its heavy first-boot
+  # initdb AFTER its start_period elapsed under parallel load (SIEM + agents +
+  # OWUI) — compose then aborts the app tier to "Created" and they never start.
+  # postgres is healthy by now, so re-run `compose up -d` ONCE (profile-aware
+  # via YASHIGANI_ENABLED_PROFILES from .env) to start the stranded app tier,
+  # then re-poll before failing. This codifies the previously-manual converge.
   if [[ "$_gateway_ok" -eq 0 ]]; then
-    log_error "Convergence gate FAILED: gateway /healthz did not return 200 within ${_timeout_s}s"
+    log_warn "Convergence gate: gateway /healthz not 200 — re-converging stranded app tier..."
+    local _ehp; _ehp="$(grep -E '^YASHIGANI_ENABLED_PROFILES=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- | tr -d '"')"
+    COMPOSE_PROFILES="${_ehp}" "${COMPOSE_CMD[@]}" "${compose_files[@]}" up -d 2>&1 | tail -8 || true
+    local _retry_deadline=$(( $(date +%s) + _timeout_s ))
+    while [[ "$(date +%s)" -lt "$_retry_deadline" ]]; do
+      # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
+      if curl --silent $_curl_tls_opt --max-time 5 \
+           --resolve "${_domain}:${_https_port}:127.0.0.1" \
+           "https://${_domain}:${_https_port}/healthz" \
+           -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
+        _gateway_ok=1
+        log_success "Convergence gate: gateway /healthz 200 OK after self-heal re-converge"
+        break
+      fi
+      sleep "$_poll_s"
+    done
+  fi
+
+  if [[ "$_gateway_ok" -eq 0 ]]; then
+    log_error "Convergence gate FAILED: gateway /healthz did not return 200 within ${_timeout_s}s (incl. one self-heal re-converge)"
     log_error "This typically means:"
     log_error "  - Gateway container crashed (check gateway logs below)"
     log_error "  - PKI cert mismatch (contaminated postgres_data volume — re-run uninstall.sh --remove-volumes)"
