@@ -586,6 +586,39 @@ Hiring: https://agnosticsec.com/careers
     # here.  inject-caddy-verified is applied for header uniformity but OWUI
     # does not validate it.
     handle /app/webui* {
+        # OWUI is served at ROOT (see root catch-all). Back-compat redirect.
+        redir * / 302
+    }
+
+    handle /metrics-federate* {
+        basic_auth {
+            {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
+        }
+        # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
+        # inject-caddy-verified: prometheus does not validate the header but
+        # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
+        reverse_proxy https://prometheus:9090 {
+            import internal-mtls
+            import inject-caddy-verified
+        }
+    }
+
+    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
+    #
+    # Phase 2: OWUI has moved off root onto /app/webui.  Root (/) is now the
+    # portal: redirect unauthenticated visitors to /login and authenticated
+    # users to their role-appropriate surface via /login (which checks the
+    # session and issues a role-based redirect).  Using /login as the target
+    # is safe — if the user is already logged in, /login will detect the
+    # session and redirect them to /admin/ or /app/webui without re-prompting
+    # for credentials.
+    #
+    # This replaces the former OWUI catch-all (which owned root and caused
+    # the conflated-population + no-working-logout findings).  The explicit
+    # /app/webui* handle above owns all OWUI traffic; this catch-all is now
+    # purely a portal redirect guard.
+    handle {
+
         # Strip anti-spoof headers before auth subrequest.
         request_header -X-Forwarded-User
         request_header -X-Forwarded-Name
@@ -598,14 +631,14 @@ Hiring: https://agnosticsec.com/careers
 
         # ── OWUI socket.io WebSocket (Phase 2 / F-WS fix pattern) ──────────
         # Handles Connection: Upgrade + Upgrade: websocket requests under
-        # /app/webui/ws/*.  The forward_auth sub-request has the upgrade headers
+        # /ws/*.  The forward_auth sub-request has the upgrade headers
         # stripped so /auth/verify-user sees a plain GET and returns a clean
         # status.  The main reverse_proxy keeps the original upgrade headers and
         # performs the real 101 to open-webui:8080.
         @owui_ws {
             header Connection *Upgrade*
             header Upgrade websocket
-            path /app/webui/ws/*
+            path /ws/*
         }
         handle @owui_ws {
             forward_auth https://backoffice:8443 {
@@ -671,37 +704,6 @@ Hiring: https://agnosticsec.com/careers
                 header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
-    }
-
-    handle /metrics-federate* {
-        basic_auth {
-            {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
-        }
-        # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
-        # inject-caddy-verified: prometheus does not validate the header but
-        # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
-        reverse_proxy https://prometheus:9090 {
-            import internal-mtls
-            import inject-caddy-verified
-        }
-    }
-
-    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
-    #
-    # Phase 2: OWUI has moved off root onto /app/webui.  Root (/) is now the
-    # portal: redirect unauthenticated visitors to /login and authenticated
-    # users to their role-appropriate surface via /login (which checks the
-    # session and issues a role-based redirect).  Using /login as the target
-    # is safe — if the user is already logged in, /login will detect the
-    # session and redirect them to /admin/ or /app/webui without re-prompting
-    # for credentials.
-    #
-    # This replaces the former OWUI catch-all (which owned root and caused
-    # the conflated-population + no-working-logout findings).  The explicit
-    # /app/webui* handle above owns all OWUI traffic; this catch-all is now
-    # purely a portal redirect guard.
-    handle {
-        redir * /login 302
     }
 }
 

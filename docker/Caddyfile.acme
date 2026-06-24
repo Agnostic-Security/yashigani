@@ -521,6 +521,29 @@ Hiring: https://agnosticsec.com/careers
     # See Caddyfile.selfsigned for full commentary.
     # OWUI is plain HTTP on caddy_internal — no internal-mtls to open-webui:8080.
     handle /app/webui* {
+        # OWUI is served at ROOT (see root catch-all). Back-compat redirect.
+        redir * / 302
+    }
+
+    # ── Prometheus federation — admin-authenticated ─────────────────────────
+    handle /metrics-federate* {
+        basic_auth {
+            # Populated at bootstrap from generated prometheus_password secret
+            {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
+        }
+        # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
+        # inject-caddy-verified: prometheus does not validate the header but
+        # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
+        reverse_proxy https://prometheus:9090 {
+            import internal-mtls
+            import inject-caddy-verified
+        }
+    }
+
+    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
+    # OWUI has moved off root onto /app/webui.  See Caddyfile.selfsigned.
+    handle {
+
         request_header -X-Forwarded-User
         request_header -X-Forwarded-Name
         request_header -X-Forwarded-Groups
@@ -534,7 +557,7 @@ Hiring: https://agnosticsec.com/careers
         @owui_ws {
             header Connection *Upgrade*
             header Upgrade websocket
-            path /app/webui/ws/*
+            path /ws/*
         }
         handle @owui_ws {
             forward_auth https://backoffice:8443 {
@@ -592,27 +615,6 @@ Hiring: https://agnosticsec.com/careers
                 header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
-    }
-
-    # ── Prometheus federation — admin-authenticated ─────────────────────────
-    handle /metrics-federate* {
-        basic_auth {
-            # Populated at bootstrap from generated prometheus_password secret
-            {env.PROMETHEUS_BASICAUTH_USER} {env.PROMETHEUS_BASICAUTH_HASH}
-        }
-        # retro #83: Prometheus now serves HTTPS on 9090. Use internal-mtls.
-        # inject-caddy-verified: prometheus does not validate the header but
-        # we inject it uniformly across all reverse_proxy blocks. Closes LU-231-10-A.
-        reverse_proxy https://prometheus:9090 {
-            import internal-mtls
-            import inject-caddy-verified
-        }
-    }
-
-    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
-    # OWUI has moved off root onto /app/webui.  See Caddyfile.selfsigned.
-    handle {
-        redir * /login 302
     }
 }
 

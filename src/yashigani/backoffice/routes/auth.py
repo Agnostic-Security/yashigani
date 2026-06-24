@@ -477,7 +477,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     if record.account_tier == "admin":
         redirect_to = "/admin/"
     elif record.account_tier == "user":
-        redirect_to = "/app/webui"
+        redirect_to = "/"
     else:
         redirect_to = "/"
 

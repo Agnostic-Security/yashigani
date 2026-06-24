@@ -709,8 +709,6 @@ services:
       # _app/* assets, socket.io, and API calls under the subpath.
       # WEBUI_BASE_URL is the path prefix for the SvelteKit router.
       # Both must agree with the Caddy /app/webui* route.
-      WEBUI_URL: "/app/webui"
-      WEBUI_BASE_URL: "/app/webui"
       # Single-logout: when the user clicks logout in OWUI, OWUI's signout API
       # returns {"redirect_url": "/auth/logout-redirect"}.  The SvelteKit client
       # navigates there; backoffice /auth/logout-redirect invalidates the
