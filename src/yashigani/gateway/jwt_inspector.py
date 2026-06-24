@@ -169,7 +169,34 @@ class JWTInspector:
             logger.warning("jwt_config DB lookup failed: %s", exc)
         return None
 
+    @staticmethod
+    def _assert_safe_jwks_url(url: str) -> None:
+        """SSRF guard (YSG-RISK-083): https-only (blocks file:// and http://) + resolve
+        the host and reject non-public IPs (blocks cloud-metadata 169.254.0.0/16 and
+        internal RFC1918/loopback/reserved). Primary compensating controls remain the
+        egress-default-deny firewall + mTLS mesh; the gold-plated DNS-rebind-proof +
+        configurable host-allowlist is deferred to a future release."""
+        import ipaddress
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            raise ValueError(f"JWKS URL must be https, got scheme={parsed.scheme!r}")
+        if not parsed.hostname:
+            raise ValueError("JWKS URL has no host")
+        for *_unused, sockaddr in socket.getaddrinfo(
+            parsed.hostname, parsed.port or 443, proto=socket.IPPROTO_TCP
+        ):
+            ip = ipaddress.ip_address(sockaddr[0])
+            if (
+                ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast
+            ):
+                raise ValueError(f"JWKS URL resolves to non-public IP {ip}")
+
     async def _get_jwks_client(self, jwks_url: str):
+        self._assert_safe_jwks_url(jwks_url)
         url_hash = hashlib.sha256(jwks_url.encode()).hexdigest()[:16]
         now = time.monotonic()
 

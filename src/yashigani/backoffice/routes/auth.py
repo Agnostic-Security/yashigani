@@ -1042,6 +1042,16 @@ async def provision_totp_start(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
+    # YSG-RISK-082: re-provisioning an EXISTING authenticator is a credential
+    # change — require a fresh step-up (prove possession of the current TOTP
+    # before issuing a new seed). First-time enrolment (force_totp_provision /
+    # no seed) is the bootstrap path and cannot require step-up; a lost
+    # authenticator is recovered via the second admin (dual-admin recovery),
+    # not self-reprovision.
+    if record.totp_secret and not record.force_totp_provision:
+        from yashigani.auth.stepup import assert_fresh_stepup
+        assert_fresh_stepup(session)
+
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
     return {
@@ -1079,6 +1089,14 @@ async def provision_totp_confirm(
     record = await _get_record_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    # YSG-RISK-082: confirming a re-provision commits a NEW authenticator over an
+    # existing one — require fresh step-up. First-time enrolment is exempt (no
+    # TOTP yet); lost-authenticator recovery is via the second admin,
+    # not self-reprovision.
+    if record.totp_secret and not record.force_totp_provision:
+        from yashigani.auth.stepup import assert_fresh_stepup
+        assert_fresh_stepup(session)
 
     ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
     if not ok:
@@ -1121,6 +1139,14 @@ async def provision_totp(
     record = await _get_record_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    # YSG-RISK-082: atomic re-provision of an EXISTING authenticator is a
+    # credential change — require fresh step-up. First-time enrolment is exempt
+    # (no TOTP yet); lost-authenticator recovery is via the second admin,
+    # not self-reprovision.
+    if record.totp_secret and not record.force_totp_provision:
+        from yashigani.auth.stepup import assert_fresh_stepup
+        assert_fresh_stepup(session)
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 

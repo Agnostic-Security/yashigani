@@ -790,9 +790,14 @@ async def _proxy_request_body(
 
     # 4. OPA policy check
     with (_tracer.start_as_current_span("opa-check") if _tracer else _NullSpan()) as _opa_span:
-        _opa_span.set_attribute("opa.path", path)
+        _opa_span.set_attribute("opa.path", norm_path)
         _opa_span.set_attribute("yashigani.agent_id", agent_id)
-        opa_allowed = await _opa_check(cfg, request, path, session_id, agent_id, user_id)
+        # Pass norm_path (leading-slash-normalised, as every other check in this
+        # function already does) so OPA input.path matches the rego rules (which
+        # key on "/.well-known/..." etc.). Raw `path` from FastAPI /{path:path}
+        # drops the leading slash, so allowlist rules on normalised paths never
+        # matched → fail-closed 403 on those paths. (YSG-RISK-081)
+        opa_allowed = await _opa_check(cfg, request, norm_path, session_id, agent_id, user_id)
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)

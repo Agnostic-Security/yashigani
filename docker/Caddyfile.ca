@@ -335,6 +335,7 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -344,6 +345,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /auth/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -353,6 +355,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /me/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -362,6 +365,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /dashboard/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -371,6 +375,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /scim/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -393,6 +398,7 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -460,6 +466,7 @@ Hiring: https://agnosticsec.com/careers
     # ── Static assets — public, no auth required (CSS/JS for admin UI) ────
     handle /static/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -470,6 +477,7 @@ Hiring: https://agnosticsec.com/careers
     # ── User login page — /login (before catch-all) ────────────────────────
     handle /login {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -661,6 +669,7 @@ http://{$YASHIGANI_TLS_DOMAIN} {
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
 
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
             import internal-mtls
             import inject-caddy-verified
             header_up X-Forwarded-Proto https
