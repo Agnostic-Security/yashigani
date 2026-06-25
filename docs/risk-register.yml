@@ -1999,3 +1999,30 @@ risks:
       formula was proven to log in live on v3.0.0 (mia -> HTTP 200, no forced flows).
   fix_in_version: v3.0.0
   last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-091
+  description: >-
+    Dependabot HIGH GHSA-537c-gmf6-5ccf (cryptography): "Vulnerable OpenSSL
+    included in cryptography wheels" — the manylinux pip wheel statically bundles
+    an OpenSSL with known CVEs; vulnerable < 48.0.1. The release pins
+    cryptography>=42,<47 (pyproject.toml).
+  severity: high
+  controls_impacted:
+  - Transitive crypto dependency hygiene (bundled OpenSSL in the pip wheel)
+  compensating_controls:
+  - Laura v3.0.0 pentest verified the DEPLOYED image links the SYSTEM OpenSSL
+    3.5.6 (confirmed via ldd + cryptography backend.openssl_version_text()), NOT
+    the wheel's bundled OpenSSL — so the bundled-OpenSSL CVEs are not on the
+    exploitable path in the shipped containers.
+  - All internal transport is mTLS terminated by Caddy/OpenSSL (system), not the
+    cryptography wheel.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Not exploitable in the deployed image (system OpenSSL). The clean fix
+      (bump to >= 48.0.1) is BLOCKED by a real platform bug: cryptography 47.0.0
+      SIGILLs at ec.generate_private_key() on macOS Podman applehv aarch64, and
+      48.x still SIGILLs on applehv (Captain audit 2026-05-11); 46.x is the
+      verified-working pin. Accepted for v3.0.0; tracked for a bump to a
+      48.x-line that is stable on applehv (Tom P-10 cffi/hazmat investigation).
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-25'

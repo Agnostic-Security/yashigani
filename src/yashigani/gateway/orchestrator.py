@@ -906,11 +906,17 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
 def _seed_denied(request_id: str, reason: str, sensitivity_level: str):
     """Fail-closed 403 for a denied orchestration seed prompt (FIX M1)."""
     safe_reason = (reason or "policy_denied").encode("ascii", "replace").decode("ascii")
+    # Show the user a human-readable message; the raw reason code stays in the
+    # `code` field + X-Yashigani-OPA-Reason header for support/automation (decode
+    # via the reason map / decision-code-legend.yml). Deferred import avoids a
+    # module-load cycle (openai_router lazy-imports run_orchestration from here).
+    from yashigani.gateway.openai_router import _owui_deny_message
+    human_message = _owui_deny_message(safe_reason)
     return JSONResponse(
         status_code=403,
         content={
             "error": {
-                "message": f"Orchestration denied by policy: {safe_reason}",
+                "message": human_message,
                 "type": "policy_denied",
                 "code": safe_reason,
                 "request_id": request_id,
@@ -1253,7 +1259,10 @@ async def run_orchestration(*, body, identity, request, request_id: str,
                                 "You are a helpful assistant with access to tools. When the user asks "
                                 "you to use a tool, contact an agent, or tell/ask a server something, "
                                 "call the matching tool with the right arguments. If a tool result says "
-                                "it was BLOCKED, do not retry it — tell the user the step was blocked.\n\n"
+                                "it was BLOCKED, do not retry it. Tell the user plainly that the step was "
+                                "blocked by a security policy and cannot be completed. Do NOT tell the user "
+                                "to try again later — the block is a policy decision, not a transient error. "
+                                "If they need access, suggest they contact an administrator.\n\n"
                                 + _QUARANTINE_SYSTEM)})
 
     # ── FIX M1 (§0.1.1 H→A ingress): adjudicate the SEED PROMPT before the brain ──
