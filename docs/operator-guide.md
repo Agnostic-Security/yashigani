@@ -358,8 +358,6 @@ The gateway logs `"K8s backend: pod <name> phase=Pending, waiting..."` every 2 s
 2. Pod events: `kubectl describe pod <ysg-*> -n <namespace>`
 3. Increase `podReadyTimeoutSeconds` if image pull is consistently slow
 
-*Operator guide — Yashigani. Maintained by Agnostic Security.*
-
 ---
 
 ## 7. OpenWebUI (end-user chat surface)
@@ -399,3 +397,5 @@ credential-exfil payload, which the gateway's ResponseInspection + egress OPA **
 before it reaches the user. A benign tool call passes through normally. This requires
 `YASHIGANI_INSPECT_RESPONSES=true` (demo mode sets it; off by default in prod —
 YSG-RISK-057).
+
+*Operator guide — Yashigani. Maintained by Agnostic Security.*
