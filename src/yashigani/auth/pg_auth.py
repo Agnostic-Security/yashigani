@@ -75,8 +75,12 @@ def _dummy_password_hash() -> str:
     """
     global _DUMMY_PASSWORD_HASH
     if _DUMMY_PASSWORD_HASH is None:
+        # NB: must be >=36 chars and must NOT contain product/company/common
+        # terms (validate_password_context rejects e.g. "yashigani"); check_breach
+        # is disabled — this is never a real account password.
         _DUMMY_PASSWORD_HASH = hash_password(
-            "yashigani-timing-equalizer-not-a-real-account-do-not-use"
+            "constant-timing-equalizer-placeholder-row-0000",
+            check_breach=False,
         )
     return _DUMMY_PASSWORD_HASH
 
@@ -191,7 +195,12 @@ class PostgresLocalAuthService:
                 # password for a real account, otherwise the ~130ms argon2 delta
                 # leaks valid usernames (timing enumeration). Run one real argon2
                 # verify against a constant dummy hash and discard the result.
-                verify_password(password, _dummy_password_hash())
+                # Best-effort: timing-equalization must NEVER break the auth path,
+                # so any error here is swallowed and we still fail closed.
+                try:
+                    verify_password(password, _dummy_password_hash())
+                except Exception:  # noqa: BLE001 — hardening only, never fail auth
+                    pass
                 return False, None, generic_fail
 
             if _is_locked(record):
