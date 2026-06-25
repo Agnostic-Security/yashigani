@@ -13850,6 +13850,33 @@ main() {
   # ---- Step 0: Banner ----
   print_banner
 
+  # Concurrency guard (YSG retro 2026-06-25): abort if another install.sh /
+  # uninstall.sh is already running on this host. Concurrent runs collide on the
+  # shared compose project + ports 80/443 and leave the stack in a mixed state —
+  # this was the root cause of the v3.0.0 cycle's zombie-installer collision
+  # (stale hung installers from earlier sessions). Excludes this process and its
+  # full ancestor chain (the launcher) to avoid self-matches. Multi-instance
+  # hosts that genuinely run parallel installs set YASHIGANI_ALLOW_CONCURRENT_INSTALL=1.
+  if [[ "${YASHIGANI_ALLOW_CONCURRENT_INSTALL:-0}" != "1" && "$DRY_RUN" != "true" ]]; then
+    local _ancestors="$$" _p="${PPID:-}"
+    while [[ -n "$_p" && "$_p" != "0" && "$_p" != "1" ]]; do
+      _ancestors="$_ancestors $_p"
+      _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+    done
+    local _others="" _pid
+    for _pid in $(pgrep -f '[/ ](install|uninstall)\.sh' 2>/dev/null || true); do
+      case " $_ancestors " in *" $_pid "*) continue ;; esac
+      _others="$_others $_pid"
+    done
+    if [[ -n "${_others// /}" ]]; then
+      log_error "Another Yashigani installer/uninstaller is already running (PIDs:${_others} )."
+      log_error "Concurrent runs collide on the compose project + ports 80/443. Wait for it"
+      log_error "to finish (or kill the stale PID), then retry. For genuine parallel/"
+      log_error "multi-instance installs, set YASHIGANI_ALLOW_CONCURRENT_INSTALL=1."
+      exit 1
+    fi
+  fi
+
   # ---- Step 1: Working directory ----
   detect_working_directory
 
@@ -14652,7 +14679,22 @@ main() {
   # SF-012: drain the tee coprocess so the final log lines ([12/13] and [13/13])
   # are flushed to install.log before the process exits.  Wait on the specific
   # PID only — bare `wait` would deadlock (see L2782 comment on coprocess + wait).
+  #
+  # do_wait-HANG FIX (YSG retro 2026-06-25): `wait "$_tee_pid"` with stdout still
+  # open blocks FOREVER — the tee coprocess only exits when it receives EOF on the
+  # pipe, which never happens while our fd 1/2 (the pipe's write end) stay open.
+  # That left install.sh hung in do_wait after printing the completion banner,
+  # accumulating zombie installers that collided on the compose project. Fix:
+  # reassign fd 1/2 to /dev/null first (closes the pipe's write end -> tee gets
+  # EOF -> flushes -> exits), then reap with a bounded backstop so this can NEVER
+  # hang again even if tee misbehaves.
   if [[ -n "${_tee_pid:-}" ]]; then
+    exec >/dev/null 2>&1
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$_tee_pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill "$_tee_pid" 2>/dev/null || true
     wait "$_tee_pid" 2>/dev/null || true
   fi
 }
