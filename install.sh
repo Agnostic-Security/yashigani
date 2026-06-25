@@ -13850,30 +13850,27 @@ main() {
   # ---- Step 0: Banner ----
   print_banner
 
-  # Concurrency guard (YSG retro 2026-06-25): abort if another install.sh /
-  # uninstall.sh is already running on this host. Concurrent runs collide on the
-  # shared compose project + ports 80/443 and leave the stack in a mixed state —
-  # this was the root cause of the v3.0.0 cycle's zombie-installer collision
-  # (stale hung installers from earlier sessions). Excludes this process and its
-  # full ancestor chain (the launcher) to avoid self-matches. Multi-instance
-  # hosts that genuinely run parallel installs set YASHIGANI_ALLOW_CONCURRENT_INSTALL=1.
-  if [[ "${YASHIGANI_ALLOW_CONCURRENT_INSTALL:-0}" != "1" && "$DRY_RUN" != "true" ]]; then
-    local _ancestors="$$" _p="${PPID:-}"
-    while [[ -n "$_p" && "$_p" != "0" && "$_p" != "1" ]]; do
-      _ancestors="$_ancestors $_p"
-      _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
-    done
-    local _others="" _pid
-    for _pid in $(pgrep -f '[/ ](install|uninstall)\.sh' 2>/dev/null || true); do
-      case " $_ancestors " in *" $_pid "*) continue ;; esac
-      _others="$_others $_pid"
-    done
-    if [[ -n "${_others// /}" ]]; then
-      log_error "Another Yashigani installer/uninstaller is already running (PIDs:${_others} )."
-      log_error "Concurrent runs collide on the compose project + ports 80/443. Wait for it"
-      log_error "to finish (or kill the stale PID), then retry. For genuine parallel/"
-      log_error "multi-instance installs, set YASHIGANI_ALLOW_CONCURRENT_INSTALL=1."
-      exit 1
+  # Concurrency guard (YSG retro 2026-06-25): a host-wide ADVISORY LOCK prevents
+  # two installers colliding on the shared compose project + ports 80/443 (the
+  # root cause of the v3.0.0 cycle's zombie-installer collision). flock is tied to
+  # the open fd, so a crashed/killed run releases the lock automatically — no
+  # stale-lock cruft, and (unlike a pgrep heuristic) no false-positives on the
+  # launcher's own command line. FAIL-OPEN: if flock is unavailable or the lock
+  # path is unwritable we proceed (never block a legitimate install). Override
+  # with YASHIGANI_ALLOW_CONCURRENT_INSTALL=1 for genuine multi-instance hosts.
+  if [[ "${YASHIGANI_ALLOW_CONCURRENT_INSTALL:-0}" != "1" && "$DRY_RUN" != "true" ]] \
+     && command -v flock >/dev/null 2>&1; then
+    local _lockdir="/run/lock"; [[ -w "$_lockdir" ]] || _lockdir="${YSG_INSTALL_DIR:-$HOME}"
+    local _lockfile="${_lockdir}/yashigani-install.lock"
+    # fd 200 is held for the lifetime of this process; released on exit.
+    if exec 200>"$_lockfile" 2>/dev/null; then
+      if ! flock -n 200; then
+        log_error "Another Yashigani install/uninstall already holds the lock:"
+        log_error "  ${_lockfile}"
+        log_error "Wait for it to finish (or kill the stale PID), then retry. For genuine"
+        log_error "parallel/multi-instance installs set YASHIGANI_ALLOW_CONCURRENT_INSTALL=1."
+        exit 1
+      fi
     fi
   fi
 
