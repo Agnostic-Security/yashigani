@@ -398,4 +398,28 @@ before it reaches the user. A benign tool call passes through normally. This req
 `YASHIGANI_INSPECT_RESPONSES=true` (demo mode sets it; off by default in prod —
 YSG-RISK-057).
 
+---
+
+## 8. Logging, audit + SIEM storage encryption
+
+Yashigani emits operational logs (`/var/log/yashigani`, Loki), the tamper-evident
+**audit chain** (Postgres `audit_events`, SHA-384 hash-chain + daily ECDSA-signed
+Merkle checkpoints), and forwards events to your SIEM (Wazuh/Splunk/Elasticsearch).
+
+Some log/audit records intentionally retain sensitive material **in clear text**
+for forensics — e.g. the flagged high-entropy tokens that floored a request to
+RESTRICTED (YSG-RISK-092). This is required: support + the SIEM need the values
+as-is to investigate *what* was flagged.
+
+**Operator requirement — encrypt log + audit storage at rest.** Because logs can
+contain sensitive content, the deployment MUST provide encryption-at-rest for:
+
+- the Docker/host volumes backing `postgres` (audit DB), `loki`, and any
+  file-log mounts (use an encrypted filesystem / LUKS / cloud-provider volume
+  encryption);
+- the SIEM's own datastore (Wazuh indexer / Splunk / Elasticsearch).
+
+Access to these stores is already restricted to the audit/SIEM plane (mTLS,
+RBAC); encryption-at-rest closes the residual disk-theft / snapshot exposure.
+
 *Operator guide — Yashigani. Maintained by Agnostic Security.*
