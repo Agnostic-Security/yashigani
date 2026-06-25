@@ -77,6 +77,30 @@ Mustui-only build + curated public release per the repo-route policy.
 - Demo-seed reliability fixes: FIND-DEMO-CREDS (YSG-RISK-090, save rotated user pw),
   cloud-9 benign-vs-injection contrast (ana ceiling). FIND-OWUI-001 (YSG-RISK-089) open→v3.0.1.
 
+### Post-tag hardening (release-polish pass)
+- **OPA/UX message polish.** User-facing block messages humanised: "sensitivity
+  clearance" → "data classification clearance"; the seed-deny shows a human message
+  (raw code kept in `code`/header); the brain no longer says "try again later" on a
+  policy block. The per-hop orchestration transcript no longer leaks raw OPA internals
+  to end users — it emits an **opaque, stable, non-sequential coded tuple**
+  (`<tooluid>:<depth>:<status>:<leg>:<action>:<reason>`) decoded by
+  `docs/decision-code-legend.yml` / `scripts/decode-steps.py` (full reason stays in the
+  audit sink). Live-verified: cloud-9 injection → human block + coded transcript;
+  benign → passes.
+- **Installer robustness.** Fixed the `install.sh` `do_wait` hang after the completion
+  banner (tee coprocess never got EOF → zombie installers) and added a **flock**-based
+  concurrency guard (one installer per host; fail-open).
+- **GitHub security review (now a standing pre-release gate item).** Dependabot +
+  code-scanning triaged: 1 real fix path reviewed, the rest dismissed-with-comments
+  (false-positive / used-in-tests / not-exploitable) + registered. YSG-RISK-091
+  (cryptography bundled-OpenSSL) and YSG-RISK-088 (Caddy Go-stdlib CVEs) confirmed
+  **not exploitable + externally-blocked** (no patched upstream release yet) → v3.0.1.
+  YSG-RISK-092: flagged-token clear-text logging kept by design (forensics + SIEM),
+  compensating control = encrypted log/audit storage at rest (operator-guide §8).
+- **Docs/process.** SECURITY.md → v3.0.x supported versions + SSH signing; release SOP
+  gains the GitHub-security-review item + a "real-rendered-UI (no JSON/404)" anti-false-pass
+  rule; new convergence SOP (commit-by-commit, not marker-grep).
+
 ---
 
 ## [Unreleased] — v2.24.3
