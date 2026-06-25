@@ -2623,7 +2623,13 @@ services:
   # broker→upstream dispatch path. demo-mcp cannot reach any other agent.
   demo-mcp:
     dns_search: ["."]
-    image: yashigani/demo-mcp:${YASHIGANI_DEMO_MCP_VERSION:-2.25.3}
+    image: yashigani/demo-mcp:${YASHIGANI_DEMO_MCP_VERSION:-3.0.0}
+    # Reproducible from committed code (docker/demo-mcp/server.py): the "cloud-9"
+    # malicious demo upstream. `docker compose build demo-mcp` (or an `up` when the
+    # image is absent) builds it; scripts/build-demo-mcp.sh is the standalone helper.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.demo-mcp
     restart: unless-stopped
     mem_limit: ${YASHIGANI_DEMO_MCP_MEM_LIMIT:-128m}
     cpus: ${YASHIGANI_DEMO_MCP_CPU_LIMIT:-0.5}

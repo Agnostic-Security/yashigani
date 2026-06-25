@@ -3042,13 +3042,40 @@ _write_aes_key_to_env() {
   fi
 
   # --- Upstream MCP URL ---
-  # Demo mode: use a built-in echo server so compose doesn't fail on missing var
-  # Production: set from wizard or --upstream-url flag
+  # Demo mode: point the gateway at the bundled demo-mcp upstream so the headline
+  # "cloud 9" rogue-MCP leg is reproducible from committed code with zero manual
+  # steps. Two things MUST be codified together:
+  #   1. UPSTREAM_MCP_URL=http://demo-mcp:8000 — tool_catalog._resolve_mcp_servers()
+  #      only projects the demo MCP catalog when the upstream URL contains
+  #      "demo-mcp" (otherwise the orchestration MCP catalog is EMPTY and the
+  #      cloud-9 leg silently doesn't exist).
+  #   2. the `demo-mcp` compose profile — without it the service is never started
+  #      even though the gateway points at it.
+  # Both land via COMPOSE_PROFILES (drives --profile flags + YASHIGANI_ENABLED_PROFILES)
+  # and docker/.env. Production: set from wizard or --upstream-url flag.
   local upstream="${UPSTREAM_URL}"
   if [[ -z "$upstream" && "$DEPLOY_MODE" == "demo" ]]; then
-    upstream="http://localhost:8080/echo"
+    upstream="http://demo-mcp:8000"
+    # Enable the demo-mcp compose profile (idempotent — guard against a duplicate).
+    if ! printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "demo-mcp"; then
+      COMPOSE_PROFILES+=("demo-mcp")
+      log_info "Demo mode: enabling demo-mcp compose profile + pointing UPSTREAM_MCP_URL at http://demo-mcp:8000 (cloud-9 demo upstream)"
+    fi
   fi
   _env_set "UPSTREAM_MCP_URL" "${upstream}"
+
+  # --- Cloud-9 MCP-injection demo (demo mode ONLY) ---
+  # Codifies the cloud-9 wiring so `install.sh --deploy demo` + populate-demo.py
+  # reproduce it with zero manual steps: expose the cloud9-orchestrate virtual
+  # model and enable response inspection so the egress block fires and renders in
+  # OWUI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
+  # enterprise leave it OFF; demo turns it ON to showcase the injection block.
+  if [[ "$DEPLOY_MODE" == "demo" ]]; then
+    _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
+    _env_set "YASHIGANI_ORCH_BRAIN_MODEL"  "${YASHIGANI_ORCH_BRAIN_MODEL:-qwen2.5:3b}"
+    _env_set "YASHIGANI_INSPECT_RESPONSES" "${YASHIGANI_INSPECT_RESPONSES:-true}"
+    log_info "Demo mode: cloud-9 demo wired (cloud9-orchestrate model + response inspection ON)"
+  fi
 
   # --- Domain ---
   _env_set "YASHIGANI_TLS_DOMAIN" "${DOMAIN}"

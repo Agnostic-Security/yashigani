@@ -858,6 +858,42 @@ async def verify_user_session(request: Request):
     if record is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
+    # OWUI access is OPT-IN (Yashigani is API-first). A user-tier session is
+    # provisioned for the API by default (the `users` caller group); reaching
+    # OpenWebUI (served at root) additionally requires membership of the
+    # `owui-users` RBAC group. Membership lives in the RBAC store
+    # (group.members = emails), NOT identity_registry.groups (empty for RBAC
+    # members). Skip-allow when the RBAC store or owui-users group is absent
+    # (community/non-standard deploy) — never lock everyone out. (YSG 2.25.5
+    # a64331e + c751e15; see docs/operator-guide.md §5.6.)
+    _rbac = getattr(state, "rbac_store", None)
+    if _rbac is not None:
+        _email = (record.email or f"{record.username}@yashigani.local").strip().lower()
+        _owui_grp = next(
+            (grp for grp in _rbac.list_groups()
+             if str(getattr(grp, "display_name", "")).lower() == "owui-users"),
+            None,
+        )
+        if _owui_grp is not None:
+            _members = {str(m).strip().lower() for m in (_owui_grp.members or set())}
+            if _email not in _members:
+                _log.info(
+                    "verify-user: user %s not in owui-users RBAC group — denying "
+                    "OpenWebUI access (API-first; user has API access only)",
+                    record.username,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "owui_access_required",
+                        "message": (
+                            "Your account does not have OpenWebUI access. Ask an "
+                            "administrator to add you to the owui-users group."
+                        ),
+                    },
+                    headers={"X-Authz-Reason": "owui_access_required"},
+                )
+
     from starlette.responses import Response as StarletteResponse
 
     resp = StarletteResponse(status_code=200)
