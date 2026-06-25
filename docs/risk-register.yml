@@ -2026,3 +2026,27 @@ risks:
       48.x-line that is stable on applehv (Tom P-10 cffi/hazmat investigation).
   fix_in_version: v3.0.1
   last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-092
+  description: >-
+    CodeQL py/clear-text-logging-sensitive-data (#1869): the F-RT1 path logs the
+    flagged high-entropy tokens (the undecodable blobs that floored sensitivity to
+    RESTRICTED) in clear text. Decision: KEEP them clear text — the logs are the
+    operational + forensic record and are forwarded to the customer SIEM (which
+    needs the values as-is to investigate what was flagged).
+  severity: low
+  controls_impacted:
+  - Log-content confidentiality (a flagged blob may itself be sensitive)
+  compensating_controls:
+  - Log STORAGE is encrypted at rest.
+  - Logs flow only to the access-controlled, tamper-evident audit channel / the
+    operator's own SIEM — not a public surface.
+  - The blob is undecodable/unclassifiable by definition (floored to RESTRICTED);
+    the log records WHAT triggered the decision, required for forensics.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Operational necessity (security forensics + SIEM). Clear text is required by
+      design; mitigated by encrypted log storage + access-controlled SIEM delivery.
+      CodeQL #1869 dismissed as won't-fix with this rationale.
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
