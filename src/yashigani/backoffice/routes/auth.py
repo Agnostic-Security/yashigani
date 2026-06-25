@@ -198,6 +198,24 @@ def _check_ip_access(client_ip: str) -> None:
             )
 
 
+def _real_client_ip(request: Request) -> str:
+    """Real client IP for per-IP throttle + audit keys (LAURA-3X-001).
+
+    Caddy is the SOLE ingress and overwrites ``X-Real-IP`` with the actual TCP
+    peer (``{remote_host}``) on every proxied request, so it is trustworthy and
+    NOT client-spoofable.  ``X-Forwarded-For`` is deliberately NOT used here: Caddy
+    *appends* the peer to any client-supplied XFF, so ``XFF.split(',')[0]`` is
+    attacker-controlled and unsafe for a throttle key.  ``request.client.host`` is
+    the Caddy container IP behind the proxy and MUST NOT be used for per-IP
+    throttling — it collapses every client to one key, letting any single source
+    lock out all admin logins for the throttle window (LAURA-3X-001, DoS).
+    """
+    xri = request.headers.get("x-real-ip", "").strip()
+    if xri:
+        return xri.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _apply_auth_throttle(client_ip: str, response: Response) -> None:
     """
     Check per-IP and global failure counters.  If either exceeds its threshold,
@@ -335,7 +353,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     Returns 401 for any failure (no credential enumeration).
     Includes brute-force throttle per ASVS 6.3.5.
     """
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # LAURA-3X-001: real peer, not Caddy IP
 
     # Check order: allowlist → blocklist → throttle → auth
     _check_ip_access(client_ip)
@@ -698,7 +716,7 @@ async def verify_session(request: Request):
     # NIST AC-5 / OWASP ASVS V4.1.2 / ISO 27001 A.5.16 / v2.24.1 Iris #96.
     if session.account_tier == "admin":
         from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
-        _client_ip = request.client.host if request.client else "unknown"
+        _client_ip = _real_client_ip(request)  # LAURA-3X-001
         from yashigani.auth.session import _mask_ip as _verify_mask_ip
         if state.audit_writer is not None:
             state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
@@ -1790,7 +1808,7 @@ async def list_blocked_ips(request: Request, session: AdminSession):
     # Caller's own state — resolved from request headers so the admin
     # sees exactly what server-side records about their IP, even when
     # they are being throttled (non-200 paths still emit this view).
-    caller_ip = request.client.host if request.client else "unknown"
+    caller_ip = _real_client_ip(request)  # LAURA-3X-001: match the throttle key written at login
     caller_level = int(r.get(f"auth:throttle:ip:{caller_ip}") or 0)
     caller_fails = int(r.get(f"auth:fail:ip:{caller_ip}") or 0)
     caller_blocked_data = r.get(f"auth:blocked:{caller_ip}")
@@ -1977,7 +1995,7 @@ async def post_login_redirect(
 
     ASVS V5.1.5 / CWE-601 / OWASP A01:2021.
     """
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # LAURA-3X-001
     ok, result = _validate_next(next)
 
     if not ok:

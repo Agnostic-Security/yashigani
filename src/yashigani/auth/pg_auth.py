@@ -60,6 +60,26 @@ _PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
 # accepted windows.
 _TOTP_REPLAY_TTL_SECONDS = 60
 
+# LAURA-3X-002: a constant argon2 hash used to equalize authentication timing on
+# the non-existent/disabled-user path (ASVS V2.2.1). Computed lazily once so the
+# argon2 cost is not paid at import time, then reused for every dummy verify.
+_DUMMY_PASSWORD_HASH: Optional[str] = None
+
+
+def _dummy_password_hash() -> str:
+    """Return (computing once) a valid argon2 hash for timing-equalization.
+
+    Verifying a real password against this hash takes ~the same wall-clock as a
+    genuine wrong-password verify, so a non-existent username cannot be told apart
+    from a real one by response timing.
+    """
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        _DUMMY_PASSWORD_HASH = hash_password(
+            "yashigani-timing-equalizer-not-a-real-account-do-not-use"
+        )
+    return _DUMMY_PASSWORD_HASH
+
 
 class PostgresLocalAuthService:
     """
@@ -166,6 +186,12 @@ class PostgresLocalAuthService:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             record = await self._fetch_by_username(conn, username)
             if record is None or record.disabled:
+                # LAURA-3X-002 (ASVS V2.2.1): equalize timing. A non-existent or
+                # disabled username must take ~the same wall-clock as a wrong
+                # password for a real account, otherwise the ~130ms argon2 delta
+                # leaks valid usernames (timing enumeration). Run one real argon2
+                # verify against a constant dummy hash and discard the result.
+                verify_password(password, _dummy_password_hash())
                 return False, None, generic_fail
 
             if _is_locked(record):
