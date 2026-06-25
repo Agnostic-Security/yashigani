@@ -334,7 +334,13 @@ def step6_create_groups() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 USERS = [
-    {"email": "ana@agnosticsec.com", "group": "data-team", "ceiling": "CONFIDENTIAL"},
+    # ana drives the cloud-9 MCP-injection demo. Ceiling RESTRICTED so a BENIGN
+    # cloud9-orchestrate echo passes the egress ceiling (demo narrative: "safe call
+    # works"), while the INJECTION leg is still blocked by ResponseInspection
+    # (credential-exfil payload → inspection=BLOCKED), which is independent of the
+    # ceiling. With a lower ceiling both legs block on the ceiling and the
+    # benign-vs-malicious contrast is lost (Ava INFO-SCEN-A-001).
+    {"email": "ana@agnosticsec.com", "group": "data-team", "ceiling": "RESTRICTED"},
     {"email": "paul@agnosticsec.com", "group": "finance-team", "ceiling": "INTERNAL"},
     {"email": "mia@agnosticsec.com", "group": "compliance-team", "ceiling": "CONFIDENTIAL"},
     # Data-protection demo scenarios:
