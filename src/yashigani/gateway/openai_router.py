@@ -479,6 +479,32 @@ def is_orchestration_self_call(request) -> bool:
     return bool(request.headers.get("x-yashigani-orchestration-depth"))
 
 
+def is_auto_orchestrate_model(model: str) -> bool:
+    """True when the requested model is in the YASHIGANI_ORCH_AUTO_MODELS list.
+
+    YASHIGANI_ORCH_AUTO_MODELS is a comma-separated list of model ids (or
+    virtual names) for which the gateway auto-fires the qwen-brain orchestration
+    executor, even when the client does NOT set orchestrate=true.  This is the
+    OWUI-facing wiring for the cloud-9 demo: OWUI sends a plain chat request
+    with model="cloud9-orchestrate" (a virtual name in the OWUI model selector);
+    the gateway promotes it to orchestration and substitutes the real brain model
+    (YASHIGANI_ORCH_BRAIN_MODEL, default qwen2.5:3b).  The caller never sees the
+    brain model — they address the virtual name.
+
+    SECURITY NOTE: the same seed-prompt adjudication and every-hop OPA gate apply
+    identically to auto-triggered orchestration.  The auto-trigger is not an auth
+    bypass: it is a routing convenience that sets body.orchestrate=True for a
+    pre-approved set of virtual model names.  Identity, sensitivity, OPA ingress,
+    per-hop egress, and ResponseInspection all fire as normal.  The model name
+    itself is resolved to the configured brain model before any downstream hop.
+    """
+    raw = os.environ.get("YASHIGANI_ORCH_AUTO_MODELS", "").strip()
+    if not raw or not model:
+        return False
+    names = {m.strip().lower() for m in raw.split(",") if m.strip()}
+    return (model or "").strip().lower() in names
+
+
 # ---------------------------------------------------------------------------
 # G-ORCH-OPA-3 — brain-REASONING-leg marker (server-minted, UNFORGEABLE).
 #
@@ -1329,6 +1355,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if not is_orchestration_self_call(request):
         from yashigani.gateway.letta_brain import is_letta_orchestration
         letta_brain = is_letta_orchestration(body.model, body)
+        # YASHIGANI_ORCH_AUTO_MODELS: virtual model names that auto-trigger
+        # the qwen-brain orchestration executor from a plain OWUI chat request.
+        # The model field is rewritten to the brain model before the executor
+        # runs (body.model is mutated in-place so every downstream reference
+        # sees the real model; the original virtual name is logged for audit).
+        auto_orch = (not letta_brain and not body.orchestrate
+                     and is_auto_orchestrate_model(body.model))
+        if auto_orch:
+            import os as _os  # noqa: PLC0415  — local import avoids scope shadow
+            brain_model = (_os.environ.get("YASHIGANI_ORCH_BRAIN_MODEL", "")
+                           .strip()) or "qwen2.5:3b"
+            logger.info(
+                "orchestration: auto-trigger for model=%r → brain=%s (YASHIGANI_ORCH_AUTO_MODELS)",
+                body.model, brain_model,
+            )
+            body = body.model_copy(update={"model": brain_model, "orchestrate": True})
         if body.orchestrate or letta_brain:
             from yashigani.gateway.orchestrator import run_orchestration
             return await run_orchestration(
@@ -3340,6 +3382,22 @@ async def list_models(request: Request):
                 created=0,
                 owned_by=m.get("provider", "yashigani"),
             ))
+
+    # Add virtual orchestration models from YASHIGANI_ORCH_AUTO_MODELS.
+    # These are placeholder model names that auto-trigger the qwen-brain executor
+    # when selected in OWUI's model picker.  They appear in the full list only
+    # (same visibility rule as agents) so users see them but service accounts
+    # that enumerate the model list for routing decisions do not.
+    if opa_filter == "full":
+        _auto_raw = os.environ.get("YASHIGANI_ORCH_AUTO_MODELS", "").strip()
+        for _vname in (_auto_raw.split(",") if _auto_raw else []):
+            _vname = _vname.strip()
+            if _vname and not any(m.id == _vname for m in models):
+                models.append(ModelInfo(
+                    id=_vname,
+                    created=0,
+                    owned_by="yashigani-orchestration",
+                ))
 
     # Audit: MODELS_LIST_REQUESTED with count of models returned.
     # Count only — no model names stored (prevents log-based topology disclosure).

@@ -396,6 +396,14 @@ services:
       # Without OPA, inspection produces a classification with nothing to consume it.
       # See docs/operator-guide.md §2 for the opt-in recipe and YSG-RISK-057 for rationale.
       YASHIGANI_INSPECT_RESPONSES: ${YASHIGANI_INSPECT_RESPONSES:-false}
+      # YASHIGANI_ORCH_AUTO_MODELS: comma-separated virtual model name(s) that,
+      #   when selected in OWUI, auto-trigger the qwen-brain orchestration executor
+      #   (the gateway rewrites the model to YASHIGANI_ORCH_BRAIN_MODEL and runs the
+      #   ReAct loop). This is the OWUI-facing wiring for the cloud-9 demo.
+      # YASHIGANI_ORCH_BRAIN_MODEL: the real Ollama model used as the thinking brain.
+      # Set YASHIGANI_ORCH_AUTO_MODELS to enable; leave empty to disable.
+      YASHIGANI_ORCH_AUTO_MODELS: ${YASHIGANI_ORCH_AUTO_MODELS:-}
+      YASHIGANI_ORCH_BRAIN_MODEL: ${YASHIGANI_ORCH_BRAIN_MODEL:-qwen2.5:3b}
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       # Opt-in flag; production deployments default false.  Set true in .env for demo.
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
