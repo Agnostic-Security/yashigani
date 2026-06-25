@@ -1,5 +1,5 @@
 schema_version: '1.0'
-last_updated: '2026-05-24'
+last_updated: '2026-06-25'
 maintainer: lu@agnosticsec.com
 risks:
 - id: YSG-RISK-001
@@ -1806,3 +1806,196 @@ risks:
       PSEUDONYMIZE both succeeded via the new HTTP extractor backend. All containers healthy.
   fix_in_version: v3.0.1
   last_threat_model_review: '2026-06-16'
+
+- id: YSG-RISK-081
+  description: >-
+    YSG-080-2255 (converged from the 2.25.5 finalization; renumbered to avoid the
+    3.x YSG-RISK-080 docker-socket collision). Duplicate Content-Security-Policy:
+    the backoffice app emitted its own CSP and Caddy added one at the edge, so
+    responses carried two CSP headers — browsers honour the most restrictive,
+    making the policy ambiguous/hard to reason about. Fix: strip the upstream app
+    CSP at the Caddy edge (header_down -Content-Security-Policy on every backoffice
+    reverse_proxy block across all 3 Caddyfiles); single authoritative CSP at the edge.
+  severity: low
+  controls_impacted:
+  - Defence-in-depth header hygiene (CSP determinism)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      header_down -Content-Security-Policy present in all backoffice blocks of
+      Caddyfile.selfsigned/.acme/.ca (27 blocks total); caddy validate passes.
+      Live-verified on the v3.0.0 clean install (security headers present, single CSP).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-082
+  description: >-
+    YSG-081-2255 (converged). The gateway OPA authorization check was passed the
+    raw request path rather than the normalised path, so a non-canonical path
+    (e.g. missing leading slash) could reach _opa_check with an unexpected value —
+    observed making the JWKS endpoint fail-closed 403. Fix: pass norm_path (the
+    already-normalised path used everywhere else in proxy.py) to _opa_check.
+  severity: medium
+  controls_impacted:
+  - Consistent OPA path adjudication at the gateway
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      proxy.py _opa_check now receives norm_path. Live-verified: Laura DAST exercised
+      authz/OPA paths on v3.0.0 with all controls holding (no fail-closed regression).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-083
+  description: >-
+    YSG-082-2255 (converged). Re-provisioning TOTP on an ALREADY-enrolled account
+    did not require a fresh step-up, so a hijacked authenticated session could
+    silently rotate the victim's TOTP secret and lock them out. Fix: all three TOTP
+    provision endpoints (start/confirm/atomic) require assert_fresh_stepup when the
+    account already has a TOTP secret and is not in force_totp_provision state
+    (first-time enrolment remains exempt by design).
+  severity: low
+  controls_impacted:
+  - Step-up on sensitive account-security mutation (ASVS V6.8.4)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      Step-up guard present on provision_totp_start/confirm/provision. Live-verified:
+      Laura DAST confirmed step-up enforced for privileged mutations on v3.0.0.
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-084
+  description: >-
+    YSG-083-2255 (converged). SSRF surface on the JWKS fetch in jwt_inspector.
+    On the 2.25.5 line a BASIC guard shipped (https-only + reject non-public IPs)
+    with gold-plating deferred to 3.1. On the 3.x line the GOLD-PLATED guard
+    (commit 307c99d: SSRF-guarded HttpClient, allowlist/DNS-pin posture) is already
+    present and was NOT downgraded during convergence.
+  severity: low
+  controls_impacted:
+  - SSRF prevention on outbound JWKS retrieval (CWE-918)
+  compensating_controls:
+  - Internal mTLS mesh + egress default-deny (NetworkPolicy) constrain outbound reach
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      3.x jwt_inspector retains the gold-plated SSRF-guarded JWKS client (8 guard
+      references); the basic 2.25.5 guard was intentionally NOT ported (superseded).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-085
+  description: >-
+    YSG-084-2255 (converged). Install convergence race: on a heavy fresh install
+    (all agent/SIEM profiles) a slow postgres first-initdb could exceed its
+    healthcheck start_period, so compose aborted dependent app-tier containers to
+    "Created" and the gateway never started, failing the convergence gate. Fix:
+    postgres start_period 180s->300s + install.sh convergence-gate self-heal (one
+    idempotent re-converge + re-poll before failing closed).
+  severity: low
+  controls_impacted:
+  - Deterministic clean-install convergence (operability)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      start_period 300s + self-heal block present in install.sh. Live-verified:
+      v3.0.0 clean-from-scratch installs came up green unattended (multiple cycles).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-086
+  description: >-
+    LAURA-3X-001 (v3.0.0 pre-release pentest, MEDIUM). The login brute-force
+    throttle keyed on request.client.host, which behind Caddy (sole ingress) is
+    always the Caddy container IP — collapsing every client into one throttle
+    bucket. An unauthenticated source could trip the per-IP/global throttle and
+    lock out ALL admin logins for the 900s window (DoS; no alternative path for
+    admins without WebAuthn). Fix: _real_client_ip() reads X-Real-IP (Caddy
+    overwrites it with the real TCP peer {remote_host}, unspoofable; X-Forwarded-For
+    is NOT used as Caddy appends to client-supplied XFF). Applied to the login
+    throttle, the throttle-status view, and 2 audit-IP sites.
+  severity: medium
+  controls_impacted:
+  - Anti-automation / brute-force throttle correctness (ASVS V2.2.5)
+  - Admin availability (lockout DoS)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      LIVE-verified on v3.0.0: after failed logins the throttle key was
+      auth:fail:ip:172.24.0.1 (the real client peer set by Caddy via X-Real-IP),
+      NOT a Caddy container IP and NOT a client-supplied spoofed X-Real-IP (8.8.8.8
+      was overwritten by Caddy). Valid admin login confirmed working (no regression).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-087
+  description: >-
+    LAURA-3X-002 (v3.0.0 pre-release pentest, LOW). authenticate() returned
+    immediately for a non-existent/disabled username without running argon2, leaking
+    a ~130ms vs ~15ms timing delta that enables username enumeration. Fix: run one
+    real verify_password against a lazily-computed constant dummy argon2 hash on that
+    path (best-effort try/except so timing-equalization can never break auth).
+  severity: low
+  controls_impacted:
+  - Username enumeration resistance (ASVS V2.2.1)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      LIVE-verified on v3.0.0: non-existent-user and real-user-wrong-pw both return
+      401 invalid_credentials and both run argon2 (steady-state times converge),
+      closing the fast-path leak. NOTE: live-verify first caught a self-inflicted
+      regression (dummy password contained 'yashigani' -> PasswordContextError ->
+      400), which was fixed (context-valid placeholder) before closure.
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-088
+  description: >-
+    LAURA-3X-003 (v3.0.0 pre-release pentest, LOW). The pinned caddy:2.11.2-alpine
+    base image ships Go stdlib 1.26.3 with CVE-2026-27145 (x509.VerifyHostname
+    matching bypass) and CVE-2026-42504 (MIME header DoS via many invalid encoded
+    params). Upstream image CVEs; low exploitability in this deployment.
+  severity: low
+  compensating_controls:
+  - CVE-2026-27145 mitigated by internal mTLS with a pinned CA (all internal hops
+    verify against Yashigani's own CA chain, not public hostname verification).
+  - CVE-2026-42504 mitigated by Caddy request limits + all admin paths gated on
+    session auth; a basic crafted-header test showed no crash.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Accepted as low for v3.0.0 (mitigated + low exploitability); bumping the
+      sole-ingress base image at the release gate carries its own regression risk.
+      Tracked for a caddy base-image bump to Go >= 1.26.4 in v3.0.1.
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-089
+  description: >-
+    FIND-OWUI-001 (v3.0.0 QA, LOW, demo-seed reliability). Ava observed that on a
+    fresh deploy OpenWebUI users could land in the "pending" role despite
+    WEBUI_DEFAULT_USER_ROLE=user, requiring a manual SQLite role promotion before the
+    demo scenarios (noah/sara/paul) work. Product code is unaffected — this is a
+    demo-seed/OWUI-config reliability item.
+  severity: low
+  compensating_controls:
+  - WEBUI_DEFAULT_USER_ROLE=user is set + honoured (the canonical OWUI knob for
+    active-by-default users); the owui-users access gate is enforced and verified.
+  - An admin can promote any pending OWUI user (Admin Panel -> Users) — documented fallback.
+  status: open
+  closure_evidence:
+  - rationale: >-
+      Could not be definitively reproduced via curl this cycle (OWUI's trusted-header
+      user-row creation only fires through the real browser SvelteKit flow). Config
+      mitigation in place. Tracked for v3.0.1: confirm OWUI v0.9.2 trusted-header role
+      assignment on a clean browser deploy and, if needed, codify an activation step.
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-090
+  description: >-
+    FIND-DEMO-CREDS (v3.0.0 QA, LOW, demo-seed reliability). populate-demo.py saved
+    the demo-user creds file BEFORE forced-first-login rotated each user's temp
+    password, so the documented creds were stale and users could not log in with
+    them. Product code is unaffected.
+  severity: low
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      Fixed: step7b_save_user_creds now runs AFTER step7c_onboard_users and saves
+      the rotated new_pw (fallback temp_pw). Verified-by-construction: the new_pw
+      formula was proven to log in live on v3.0.0 (mia -> HTTP 200, no forced flows).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'

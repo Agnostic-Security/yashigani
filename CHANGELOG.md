@@ -34,6 +34,51 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [3.0.0] — 2026-06-25 — GA (combined 3.0 + 3.1 + 2.25.5 convergence)
+
+First public 3.x GA. Folds the 2.25.5 finalization line into the 3.x line (which
+already contained all of 3.0 and the 3.1 batch-1 work) for a single release.
+Mustui-only build + curated public release per the repo-route policy.
+
+### Headline
+- **Document-content data protection (doc-OPA):** policy-driven pass / redact (delete) /
+  pseudonymise (reversible) / block on document content, with the four self-describing
+  verdict actions; hardened HTTP extractor service (no docker socket in backoffice).
+- **Agent orchestration with every-hop OPA:** every inter-entity hop (agent↔agent/LLM/
+  human/API/MCP) adjudicated at ingress AND egress; gateway sole-mediator, no in-process
+  shortcut; SPIFFE/SVID identity projected to OPA.
+- **MCP hardening:** identity-JWT broker, import-binding, egress OPA, tool-poisoning /
+  shadowing / confused-deputy mitigations.
+- **cloud-9 MCP-injection demo:** `cloud9-orchestrate` virtual model + ResponseInspection
+  egress block — a rogue MCP's credential-exfil payload is blocked before reaching the caller.
+- **OpenWebUI served at ROOT** (OWUI v0.9.2 ignores `WEBUI_BASE_URL`; the `/app/webui`
+  subpath never rendered) behind the verify-user + owui-users access gate; default user role
+  active; RAG embeddings via `nomic-embed-text`.
+
+### Converged from the 2.25.5 finalization
+- CSP single-at-edge (YSG-RISK-081), OPA `norm_path` adjudication (YSG-RISK-082), TOTP
+  re-provision step-up (YSG-RISK-083), gold-plated JWKS SSRF guard retained (YSG-RISK-084),
+  install convergence-gate self-heal + postgres `start_period` 300s (YSG-RISK-085).
+- OWUI-at-root revert, `WEBUI_DEFAULT_USER_ROLE=user`, owui-users access gate, demo-mcp
+  built-from-source + cloud-9 wiring, 8 committed demo OPA policies + the demo seed script.
+
+### Security (pre-release gate — Laura full SAST+DAST+tooling pentest: RELEASE-CLEAR)
+- **YSG-RISK-086 (MED):** login throttle no longer collapses all clients to the Caddy IP —
+  keys on the real peer via `X-Real-IP` (unspoofable); fixes an admin-lockout DoS. Live-verified.
+- **YSG-RISK-087 (LOW):** constant-time dummy-hash on the unknown-user path closes username
+  timing enumeration. Live-verified.
+- **YSG-RISK-088 (LOW, accepted→v3.0.1):** Caddy upstream Go-stdlib CVEs — mitigated (mTLS +
+  request limits); base-image bump tracked for v3.0.1.
+- FIND-3.0-001 SIEM SSRF (previously release-blocking) confirmed fixed live.
+
+### Quality gate
+- Ava exhaustive functional QA: **83/83** assertions (admin + user UI one-by-one, API↔WebUI
+  parity, 4 demo scenarios, 11 security/adversarial). Clean-from-scratch install verified green.
+- Demo-seed reliability fixes: FIND-DEMO-CREDS (YSG-RISK-090, save rotated user pw),
+  cloud-9 benign-vs-injection contrast (ana ceiling). FIND-OWUI-001 (YSG-RISK-089) open→v3.0.1.
+
+---
+
 ## [Unreleased] — v2.24.3
 
 ### Fixed
