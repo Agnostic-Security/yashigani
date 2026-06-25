@@ -289,7 +289,7 @@ v2.0 is Yashigani's first production-grade release, adding five major subsystems
 
 **Three-Tier Budget System** -- A hierarchical budget model enforces cloud spend governance with mathematical guarantees. The org cloud cap is the hard ceiling. Group budgets are allocated beneath it. Individual budgets are allocated within groups. The sum of individual budgets never exceeds the group budget; the sum of group budgets never exceeds the org cap. Budget counters are stored in a dedicated budget-redis container configured with a noeviction policy to prevent counter loss under memory pressure. Budget state is exposed to clients via `X-Yashigani-Budget-*` response headers.
 
-**Open WebUI Integration** -- Open WebUI is integrated at `/chat/*` behind Caddy, accessible only on the internal Docker network. Open WebUI holds zero LLM credentials — all inference calls (cloud and local) route through the gateway. Caddy delegates authentication to the backoffice, which acts as the identity broker, and forwards trusted headers (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER`) to Open WebUI. Pipelines make LLM and MCP tool calls through the gateway.
+**Open WebUI Integration** -- Open WebUI is served at the root path `/` behind Caddy (since v2.25.5; earlier builds used a sub-path), accessible only on the internal Docker network. Open WebUI holds zero LLM credentials — all inference calls (cloud and local) route through the gateway. Caddy delegates authentication to the backoffice, which acts as the identity broker, and forwards trusted headers (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER`) to Open WebUI. Pipelines make LLM and MCP tool calls through the gateway.
 
 **Container Pool Manager** -- The Pool Manager provides per-identity container isolation with a universal container lifecycle: create, route, health check, replace, scale, and postmortem. The operational philosophy is self-healing: broken containers are replaced, not fixed. Before a dead container is killed, postmortem evidence (logs, inspect output, filesystem diff) is preserved for forensic analysis. Ollama scales horizontally under load. The same replace-and-scale pattern applies to all stateless core containers. License tiers gate container limits: Community (1 per service per identity, 3 total), Non-profit & Education (3/15), Starter (1/5), Professional (3/15), Professional Plus (5/50), Enterprise (unlimited).
 
@@ -913,7 +913,7 @@ v2.0 is Yashigani's first production-grade release. It adds five major subsystem
 - Admin API for budget management
 
 **Open WebUI Integration**
-- Chat interface at `/chat/*` behind Caddy
+- Chat interface at the root `/` behind Caddy
 - Internal Docker network only — no external port
 - All LLM calls (cloud and local) route through gateway
 - Open WebUI holds zero LLM credentials
