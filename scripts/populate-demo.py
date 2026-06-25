@@ -1267,13 +1267,15 @@ def step13b_cloud9_demo_wire() -> None:
     )
     if r3.status_code == 200:
         content3 = r3.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        if "BLOCKED" in content3:
-            # Check the orchestration step transcript for the block evidence
-            if "inspection=BLOCKED" in content3 or "egress_opa=deny" in content3 or "response_sensitivity" in content3:
-                print("  [PASS] cloud-9 injection BLOCKED at gateway (OPA egress + inspection)")
-                print(f"  Block evidence: {content3[:400]}")
-            else:
-                print(f"  [PASS*] cloud-9 injection BLOCKED (no step detail): {content3[:200]}")
+        import re as _re3
+        # Post message-polish (v3.0): the user sees a HUMAN block message + an opaque
+        # coded transcript (<uid>:<depth>:0:<leg>:7:<reason> — status 0=blocked,
+        # action 7=deny), NOT the old raw "BLOCKED [egress_opa=deny ... inspection=BLOCKED]".
+        # Detect either the plain-language block or the coded block line.
+        coded_block = bool(_re3.search(r"[0-9A-Fa-f]{4}:\d+:0:\d+:7:\d+", content3))
+        if "blocked" in content3.lower() or coded_block:
+            print("  [PASS] cloud-9 injection BLOCKED at gateway (human notice + coded transcript)")
+            print(f"  Evidence: {content3[:400]}")
         else:
             print(f"  [FAIL] cloud-9 injection NOT blocked: {content3[:400]}")
     else:
