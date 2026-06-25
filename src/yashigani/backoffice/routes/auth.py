@@ -472,12 +472,12 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
     # Phase 1 / 2.25.5-auth-ingress: single portal, role-based redirect.
     # admin → /admin/  (admin console)
-    # user  → /app/webui  (placeholder until Phase 2 re-paths OWUI)
+    # user  → /  (OWUI served at root; root catch-all proxies open-webui)
     # Any other tier (totp_provisioning is handled above) → / as safe fallback.
     if record.account_tier == "admin":
         redirect_to = "/admin/"
     elif record.account_tier == "user":
-        redirect_to = "/app/webui"
+        redirect_to = "/"
     else:
         redirect_to = "/"
 
@@ -1042,6 +1042,14 @@ async def provision_totp_start(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
+    if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: re-provisioning an already-enrolled authenticator
+        # requires a fresh step-up — blocks a hijacked session from silently
+        # rotating TOTP and locking out the legitimate owner.
+        from yashigani.auth.stepup import assert_fresh_stepup
+
+        assert_fresh_stepup(session)
+
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
     return {
@@ -1079,6 +1087,13 @@ async def provision_totp_confirm(
     record = await _get_record_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: confirming a re-provision against an already-enrolled
+        # authenticator requires a fresh step-up.
+        from yashigani.auth.stepup import assert_fresh_stepup
+
+        assert_fresh_stepup(session)
 
     ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
     if not ok:
@@ -1121,6 +1136,13 @@ async def provision_totp(
     record = await _get_record_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: atomic re-provision of an already-enrolled
+        # authenticator requires a fresh step-up.
+        from yashigani.auth.stepup import assert_fresh_stepup
+
+        assert_fresh_stepup(session)
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 

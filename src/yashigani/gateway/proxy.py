@@ -803,7 +803,7 @@ async def _proxy_request_body(
     with (_tracer.start_as_current_span("opa-check") if _tracer else _NullSpan()) as _opa_span:
         _opa_span.set_attribute("opa.path", path)
         _opa_span.set_attribute("yashigani.agent_id", agent_id)
-        opa_allowed = await _opa_check(cfg, request, path, session_id, agent_id, user_id)
+        opa_allowed = await _opa_check(cfg, request, norm_path, session_id, agent_id, user_id)
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)

@@ -882,13 +882,12 @@ services:
       WEBUI_AUTH: "false"
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "X-Forwarded-User"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "X-Forwarded-Name"
-      # Phase 2 / 2.25.5-auth-ingress: OWUI is now served under /app/webui.
-      # WEBUI_URL sets the canonical public URL so OWUI's SvelteKit build resolves
-      # _app/* assets, socket.io, and API calls under the subpath.
-      # WEBUI_BASE_URL is the path prefix for the SvelteKit router.
-      # Both must agree with the Caddy /app/webui* route.
-      WEBUI_URL: "/app/webui"
-      WEBUI_BASE_URL: "/app/webui"
+      WEBUI_DEFAULT_USER_ROLE: "user"
+      # OWUI is served at the site ROOT (the Caddy root catch-all reverse-proxies
+      # open-webui). OWUI v0.9.2 hardcodes the SvelteKit base="" and ignores
+      # WEBUI_BASE_URL, so it cannot serve under a /app/webui subpath without a
+      # blank page — serving at root is the supported deployment. The legacy
+      # /app/webui* route now 302-redirects to / for back-compat.
       # Single-logout: when the user clicks logout in OWUI, OWUI's signout API
       # returns {"redirect_url": "/auth/logout-redirect"}.  The SvelteKit client
       # navigates there; backoffice /auth/logout-redirect invalidates the
@@ -941,6 +940,10 @@ services:
       # network) removes the dependency entirely.
       RAG_EMBEDDING_ENGINE: "ollama"
       RAG_OLLAMA_BASE_URL: "http://ollama:11434"
+      # RAG embeddings via Ollama require a real Ollama embedding model. The OWUI
+      # default (sentence-transformers/all-MiniLM-L6-v2) is NOT an Ollama model and
+      # 404s on every retrieval call — pin nomic-embed-text (pulled by ollama-init).
+      RAG_EMBEDDING_MODEL: "nomic-embed-text"
       # HuggingFace/external model offline flags — prevent startup download
       # attempts that time out against NetworkPolicy-blocked hosts.
       HF_HUB_OFFLINE: "1"
@@ -1329,6 +1332,11 @@ services:
           OLLAMA_HOST=http://ollama:11434 ollama pull qwen2.5:3b
           echo "Base model pull complete: qwen2.5:3b"
         fi
+        # RAG embedding model for OpenWebUI document retrieval (RAG_EMBEDDING_MODEL).
+        # Required whenever OWUI is enabled — without it RAG retrieval 404s.
+        echo "Pulling RAG embedding model: nomic-embed-text"
+        OLLAMA_HOST=http://ollama:11434 ollama pull nomic-embed-text
+        echo "RAG embedding model pull complete: nomic-embed-text"
         # Now pull the operator-selected VRAM-tier model.
         OLLAMA_HOST=http://ollama:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
         # Verify model digest — detect tampered/poisoned models (SOL-SC-03).
@@ -1601,7 +1609,7 @@ services:
       # "Created" — they never start. On a loaded host that 50s window is routinely
       # exceeded. During start_period a failing probe keeps the status "starting"
       # (compose waits) and the first success marks it healthy immediately.
-      start_period: 180s
+      start_period: 300s
     # YSG-RISK-008 (v2.23.4): read_only skipped on compose path for postgres.
     # postgres needs writable /var/run/postgresql (unix-domain socket + PID lock file)
     # owned by uid 999 (postgres-in-container) with restrictive perms (e.g. 0755 or 0700).

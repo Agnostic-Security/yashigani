@@ -7159,6 +7159,34 @@ _verify_gateway_healthz() {
     sleep "$_poll_s"
   done
 
+  # YSG-RISK-084 self-heal: under a heavy fresh install (all agent/SIEM profiles),
+  # a slow postgres first-initdb can exceed its healthcheck start_period, so compose
+  # aborts dependent app-tier containers to "Created" and the gateway never starts.
+  # Postgres is healthy by now — re-converge ONCE (idempotent `up -d` with the same
+  # profiles) and re-poll before failing closed.
+  if [[ "$_gateway_ok" -eq 0 ]]; then
+    local _sh_profile_args=()
+    local _p
+    for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+      _sh_profile_args+=("--profile" "$_p")
+    done
+    log_warn "Convergence gate: gateway not healthy yet — one self-heal re-converge (YSG-RISK-084)"
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${_sh_profile_args[@]+"${_sh_profile_args[@]}"} up -d >/dev/null 2>&1 || true
+    local _deadline_sh=$(( $(date +%s) + _timeout_s ))
+    while [[ "$(date +%s)" -lt "$_deadline_sh" ]]; do
+      # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
+      if curl --silent $_curl_tls_opt --max-time 5 \
+           --resolve "${_domain}:${_https_port}:127.0.0.1" \
+           "https://${_domain}:${_https_port}/healthz" \
+           -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
+        _gateway_ok=1
+        log_success "Convergence gate: gateway healthy after self-heal re-converge"
+        break
+      fi
+      sleep "$_poll_s"
+    done
+  fi
+
   if [[ "$_gateway_ok" -eq 0 ]]; then
     log_error "Convergence gate FAILED: gateway /healthz did not return 200 within ${_timeout_s}s"
     log_error "This typically means:"
