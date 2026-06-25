@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
+<!-- last-updated: 2026-06-25T00:00:00+01:00 -->
 # Yashigani
 ---
 
@@ -16,7 +16,7 @@
 *Yashigani — Proactive compliance enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.25.5 (2026-06-13) — an auth/ingress rebuild (a single authenticated portal with role-based routing to `/admin` and `/app/webui`, end-user logout, deny-by-default preserved) and a full admin-UX refinement layer: working CRUD across the back office, a policy lifecycle (draft→staging→production) with an AI policy dry-run, plain-English detection-pattern authoring, a numeric sensitivity taxonomy with per-tenant labels, second-admin enforcement, self-hosted auth-gated OpenAPI/ReDoc docs, a Postgres-backed durable identity store, and a dashboard redesign. Built on v2.25.4 — gateway-mediated agent/tool orchestration (every inter-entity hop policy-adjudicated at ingress and egress) and model-allocation RBAC enforced on the inference path, with a visible model-pin deny, an identity-header trust gate, GPU-bound inference, and model warmup/keep-alive to remove cold-start latency. See `CHANGELOG.md` for the full release history.
+**Latest Tagged Release:** v2.25.5 (2026-06-25) — an auth/ingress rebuild (a single authenticated portal with role-based routing to `/admin` for admins and the chat surface at the root `/` for end users, end-user logout, deny-by-default preserved), a full admin-UX refinement layer, and a security hardening pass. The admin-UX layer brings working CRUD across the back office, a policy lifecycle (draft→staging→production) with an AI policy dry-run, plain-English detection-pattern authoring, a numeric sensitivity taxonomy with per-tenant labels, second-admin enforcement, self-hosted auth-gated OpenAPI/ReDoc docs, a Postgres-backed durable identity store, and a dashboard redesign. The hardening pass adds an SSRF guard on JWKS URL resolution (https-only + non-public-IP block), OPA decision-path normalisation (fixes the public MCP JWKS endpoint, previously failing closed), a fresh step-up requirement to re-provision an existing TOTP authenticator (first-time enrolment unaffected), and a single canonical Content-Security-Policy header. Open WebUI is now served at the root `/` for reliable rendering (v0.9.2), RAG file-upload embeddings are fixed (`nomic-embed-text` pulled on install), new user accounts are active by default, and a self-healing convergence gate plus a longer Postgres first-boot window let clean installs converge unattended. Built on v2.25.4 — gateway-mediated agent/tool orchestration (every inter-entity hop policy-adjudicated at ingress and egress) and model-allocation RBAC enforced on the inference path, with a visible model-pin deny, an identity-header trust gate, GPU-bound inference, and model warmup/keep-alive to remove cold-start latency. See `CHANGELOG.md` for the full release history.
 
 ---
 ### 🦀 Coming next — Yashigani 3.0 *(early-access beta)*
@@ -42,7 +42,7 @@ Early-access beta is open to design partners — get in touch or watch this repo
 ---
 **Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
-**Document Date:** 2026-06-06
+**Document Date:** 2026-06-25
 ---
 **Classification:** ***Public — Product Overview***
 ---
@@ -164,7 +164,7 @@ git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub
 git fetch --tags --force origin
 
 # Verify (any release tag from v2.23.3 onward):
-git tag -v v2.24.4
+git tag -v v2.25.5
 # Expected: 'Good "git" signature' from the Agnostic Security release signing key
 ```
 
@@ -174,7 +174,7 @@ git tag -v v2.24.4
 cosign verify \
   --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
+  ghcr.io/agnosticsec-com/yashigani-gateway:2.25.5
 ```
 
 For SBOM attestation, every release artifact carries a Sigstore-signed SBOM published as a GitHub Release asset alongside the tag.
@@ -206,7 +206,37 @@ These run alongside the supply-chain controls in §5 (SHA-pinned GitHub Actions,
 
 ## 7. Current Release Highlights
 
-The current release is **v2.25.2**. The v2.23 line established the core security foundation (mTLS, OPA, PKI, audit chain, BOPLA, air-gap); the v2.24 series hardened the K8s/Helm path, shipped FIPS 140-3 alignment, signed+encrypted backups, and addressed pgbouncer auth cycles; the v2.25 series enforces TLS 1.3 on the internal mesh, ships the Wazuh SIEM full-stack integration, and closes the audit DB and OPA hardening backlog. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+The current release is **v2.25.5**. The v2.23 line established the core security foundation (mTLS, OPA, PKI, audit chain, BOPLA, air-gap); the v2.24 series hardened the K8s/Helm path, shipped FIPS 140-3 alignment, signed+encrypted backups, and addressed pgbouncer auth cycles; the v2.25 series enforces TLS 1.3 on the internal mesh, ships the Wazuh SIEM full-stack integration, closes the audit DB and OPA hardening backlog, delivers gateway-mediated agent/tool orchestration with model-allocation RBAC, and lands the auth/ingress rebuild, the full admin-UX refinement layer, and a security hardening pass. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+
+### v2.25.5 — Auth/Ingress Rebuild, Admin-UX Refinement Layer, and Security Hardening Pass
+
+v2.25.5 rebuilds the front door, refines the entire back-office admin experience, and lands a focused security hardening batch.
+
+**Single Auth Portal + Open WebUI at Root** -- One authenticated login portal routes admins to `/admin` and end users to the chat surface served at the root `/`, with working end-user logout and deny-by-default preserved throughout. Open WebUI is now served at the root path (v0.9.2) for reliable rendering, replacing the earlier `/app/webui` subpath. All UI traffic continues to route through the gateway so OPA policy and identity-binding apply just as they do to API traffic.
+
+**Admin-UX Refinement Layer** -- A top-to-bottom pass over the back office: working CRUD everywhere (agent edit; admin/user account edit with an email column; model-alias, allocation, budget, and client-policy-binding dropdowns that persist). Policy management gains template duplicate / edit / save-as, a server-enforced danger-confirm on core-policy edits, a draft→staging→production lifecycle with promote/archive, and an **AI policy dry-run** (admin describes an intent, the system returns block/allow plus rationale). New: **generate detection patterns from plain English**; RBAC path/method dropdowns with plain-language help; budget alerts with a default-on ≥85% threshold plus full custom-alert CRUD; audit verdict / entity / source-type filters; description panels across all monitoring dashboards; license-gating of enterprise authentication (OIDC/SAML surface a "requires [tier]" notice); Cryptography consolidated under PKI; and an opt-in "new version available" check that distinguishes major from security updates.
+
+**Dashboard Redesign** -- A criticality-weighted per-service health semaphore, a five-level alert semaphore, a budget gauge (cloud/local with an 85% marker), and security + traffic widgets on a unified palette.
+
+**Numeric Sensitivity Taxonomy** -- Sensitivity levels are canonical numbers with a per-tenant label/colour mapping; the OPA shim accepts both the numeric levels and the legacy string levels, and `OFFICIAL-SENSITIVE` is built in.
+
+**Second-Admin Enforcement** -- A minimum of two admins is enforced; deleting or disabling the last remaining admin is blocked (`409`), with an enforcement-status endpoint and a back-office banner.
+
+**Self-Hosted OpenAPI / API Map** -- Auth-gated API documentation: Swagger UI at `/admin/api-docs`, ReDoc at `/admin/api-redoc`, and `/admin/openapi.json`, plus gateway `/docs` and `/redoc`. Assets are served locally and render under the strict CSP.
+
+**Durable Identity Store** -- A Postgres-backed durable mirror of the identity registry with a startup reconcile, so identities are re-hydrated if the Redis volume is lost. Install-time and on-demand backups are signed and encrypted.
+
+**Security Hardening Batch** -- SSRF guard on JWKS URL resolution (YSG-RISK-083): the JWKS endpoint URL is validated before resolution — https-only (blocks `file://` and `http://`) and the resolved IP is checked against private/loopback/link-local/reserved ranges (blocks cloud-metadata and internal networks); egress-default-deny firewall and the mTLS mesh remain the primary compensating controls. OPA path normalisation (YSG-RISK-081): the OPA policy check now receives the leading-slash-normalised path consistently with every other gate, so rego rules keyed on paths with a leading slash (e.g. the public MCP `/.well-known/jwks.json` endpoint) match correctly instead of failing closed with a spurious 403. Step-up required to re-provision TOTP (YSG-RISK-082): replacing an *existing* TOTP authenticator now requires a fresh step-up TOTP verification before a new seed is issued; first-time enrolment is exempt as the bootstrap path. CSP header deduplication (YSG-RISK-080): the edge is now the sole source of the Content-Security-Policy header, removing the duplicate-header condition that could let the stricter of two policies silently win.
+
+**Install + Open WebUI Reliability** -- RAG file-upload embeddings fixed: `nomic-embed-text` is pulled on install and set as the embedding model, resolving "No sources found" on file-upload RAG. New user accounts default to the `user` role (active), so accounts created after the first are not stuck pending activation. A self-healing convergence gate re-runs the deploy once and re-polls if the gateway health poll times out on a clean install, and the Postgres first-boot window is raised to 300 s — clean installs converge unattended under heavy parallel load. Tag SSH-signed.
+
+### v2.25.4 — Gateway-Mediated Agent/Tool Orchestration and Model-Allocation RBAC
+
+v2.25.4 routes multi-agent and tool-calling flows *through* the gateway so every inter-entity hop — agent↔agent, agent↔tool/MCP, agent↔LLM — is policy-adjudicated at ingress and egress rather than going direct. Phase 2 adds a reasoning leg (Letta) with deterministic exfiltration defence, plus Helm parity for the orchestration capabilities on Kubernetes. Model allocations granted to an identity are now enforced on the inference path, backed by a durable allocation store and pushed into OPA, with an admin **Access** panel managing per-identity allocations; an explicit model pin that is not permitted returns a visible `403` rather than silently substituting an allowed model. Requests arriving through Open WebUI carry the real end-user identity through to the gateway for per-user policy and allocation decisions, and the forwarded end-user identity header is only trusted behind the authenticated reverse-proxy boundary (closing a header-spoofing path). A content secret-detector module is added to the inspection pipeline. The bundled inference runtime is wired to the GPU via CDI (was running on CPU with idle GPUs), and model warmup + keep-alive (`OLLAMA_KEEP_ALIVE=-1`, post-deploy warmup, increased Caddy write timeout) eliminate first-request cold-load latency across compose, Helm, and the installer. Tag SSH-signed.
+
+### v2.25.3 — MCP Broker Hardening, OPA Fail-Close Correctness, Install/Upgrade Robustness
+
+v2.25.3 wires the MCP broker into the gateway runtime with OPA-gated tool access, registry, and codegen; shipped MCP server bundles are built as hardened images, every MCP hop is policy-adjudicated, and a hard chain-depth ceiling is enforced as a policy constant with parity tests across the Docker and Kubernetes OPA bundles. It corrects OPA fail-close behaviour (retires the deny-override anti-pattern that produced `eval_conflict` 500s, closes path-traversal and default-deny inversions, and makes v1 sub-decisions fail closed), runs the audit writer under a least-privilege runtime database role with `PostgresSink` on the append-only signed chain, fully codifies the Wazuh SIEM internal-CA mTLS provisioning into `install.sh` (no manual steps) with a TLS 1.3 floor on the indexer listener and internal mesh, and decodes response bodies before sensitivity classification on the inference path. A batch of clean-slate and upgrade-path install fixes lands alongside (GPU wired into Ollama via CDI on Podman, self-healing runtime-manifest bootstrap tokens, dual-wrap backup against read-only containers, rootless-Podman PKI fixes) plus a local install-path regression gate. The follow-up v2.25.3.1 hardened the agent registry for durability across restarts and added the `gateway.models.service_account_full_list` runtime setting (service-account identities receive a restricted `/v1/models` listing by default; operators opt in to the full listing for the Open WebUI model picker — this widens listing only, never call-authorisation). Tags SSH-signed.
 
 ### v2.25.2 — Wazuh Integration, Audit DB Least-Privilege, OPA Hardening, PII Decode-Before-Classify
 
