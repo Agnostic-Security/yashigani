@@ -6,13 +6,11 @@ A single release line is actively maintained on the `main` branch. Open WebUI is
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
-| 2.23.1  | ✅ Current | Core-plane mTLS default-on, two-tier PKI (step-ca), seccomp + AppArmor default-on, full pre-release security and QA hardening |
-| 2.23.0  | ✅ Patch window | Single branch, API-first admin, strict CSP, compose profiles, opt-in internal CA |
-| 2.22.x  | ✅ Patch window | OPA on /v1, Wazuh SIEM, Grafana/Prometheus admin access, agent personas |
-| 2.20.x  | ❌ | Superseded by 2.22.x |
-| 2.1.x   | ❌ | Superseded by 2.20.x |
-| 2.0.x   | ❌ | Superseded by 2.1.x |
-| < 2.0   | ❌ | End of life |
+| 3.0.x   | ✅ Current | Document-content data protection (doc-OPA: pass/redact/pseudonymize/block), every-hop OPA agent orchestration, MCP hardening, OpenWebUI at root behind the owui-users gate; full pre-release SAST + DAST + tooling security gate |
+| 2.25.x  | ✅ Patch window | Single auth portal + role routing, admin-UX layer, sensitivity taxonomy, AI pattern authoring |
+| 2.24.x  | ❌ | Superseded by 2.25.x |
+| 2.23.x  | ❌ | Superseded by 2.24.x |
+| < 2.23  | ❌ | End of life |
 
 ## Reporting a Vulnerability
 
@@ -68,38 +66,25 @@ Agnostic Security does not operate a paid bug bounty programme. Researchers who 
 
 ## Release signing
 
-Version tags and release artifacts are GPG-signed by the Agnostic Security release key.
-
-**Required repository secrets** (configure in Settings → Secrets → Actions):
-
-| Secret | Description |
-|--------|-------------|
-| `GPG_PRIVATE_KEY` | ASCII-armored RSA 4096 signing subkey, exported via `gpg --armor --export-secret-subkeys <subkey-id>!` |
-| `GPG_PASSPHRASE` | Passphrase protecting the signing subkey |
-
-**Graceful degradation:** if `GPG_PRIVATE_KEY` is not set, the release pipeline emits a `::warning::` annotation and the tag ships unsigned. No build step fails. Populate the secrets and re-run the release workflow to produce a signed tag.
+Version tags are **SSH-signed** (`git config gpg.format ssh`) with the Agnostic
+Security release key (Ed25519). Each `vX.Y.Z` tag is an annotated, signed tag;
+verification shows `Good "git" signature with ED25519 key SHA256:…`.
 
 **Verifying a signed tag:**
 
 ```sh
-gpg --import docs/release-signing-key.asc
 git fetch --tags --force origin
 git tag -v vX.Y.Z
+# Expect: Good "git" signature with ED25519 key SHA256:<release-key-fingerprint>
 ```
 
-**Public key fingerprint:** TBD — populate `docs/release-signing-key.asc` and update this file after key generation.
+The release signer's public key is published in the repository's SSH
+allowed-signers file (`.github/allowed_signers` / `docs/release-signing.md`); add
+it to your local allowed-signers to validate the signer identity.
 
-**Key generation (one-time setup):**
+**Release-signing key fingerprint:** see `docs/release-signing.md` (the active
+Ed25519 release key). Tags signed by any other key must be treated as untrusted.
 
-```sh
-# Generate a dedicated release signing subkey (RSA 4096)
-gpg --full-generate-key
-
-# Export the private signing subkey (subkey-id! notation selects subkey only)
-gpg --armor --export-secret-subkeys <subkey-id>!
-
-# Export the public key for repository consumers
-gpg --armor --export releases@agnosticsec.com > docs/release-signing-key.asc
-```
-
-**Scope note:** for FedRAMP High/strict paths, a hardware-backed key (FIPS 140-2 token) is required. This pipeline supports software keys for standard releases; hardware key integration is a separate workstream.
+**Scope note:** for FedRAMP High / strict paths, a hardware-backed key
+(FIPS 140-2 token) is required; the standard release line uses the software
+Ed25519 SSH key. Hardware-key integration is a separate workstream.
