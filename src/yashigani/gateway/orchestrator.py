@@ -1525,17 +1525,23 @@ def _finalize(body, identity, request_id, final_text, transcript, blocked_any,
     skip them — it relaxes ONLY the brain's internal cognition leg, never the
     tool-result or final-answer egress that this envelope carries.
     """
-    # Append a compact transcript so the customer "record all outputs" requirement
-    # is met inline; full per-hop evidence is in the audit sink.
-    summary_lines = []
-    for step in transcript:
-        flag = "BLOCKED" if step["status"] == "blocked" else "ok"
-        summary_lines.append(
-            f"  - {step['tool']} (depth {step['depth']}): {flag} "
-            f"[ingress_opa={step['ingress_opa']} egress_opa={step['egress_opa']} "
-            f"inspection={step['inspection']}]")
+    # Append a COMPACT, OPAQUE coded transcript so the customer "record all
+    # outputs" requirement is met inline WITHOUT leaking the security logic
+    # (tool names, policy reasons, which leg fired) to whoever can read a chat
+    # answer. Each line is the stable coded tuple
+    # <tooluid>:<depth>:<status>:<leg>:<action>:<reason> — support decodes it
+    # with docs/decision-code-legend.yml / scripts/decode-steps.py. The full
+    # human-readable per-hop reason stays in the tamper-evident audit sink.
+    from yashigani.gateway.decision_codes import encode_step
+    summary_lines = [
+        f"  {encode_step(step)}"
+        for step in transcript
+        if step.get("type") == "step"
+    ]
     if summary_lines:
-        final_text = final_text + "\n\n[Orchestration steps]\n" + "\n".join(summary_lines)
+        final_text = (final_text
+                      + "\n\n[Decision codes — decode with decision-code-legend.yml]\n"
+                      + "\n".join(summary_lines))
 
     completion = {
         "id": request_id,

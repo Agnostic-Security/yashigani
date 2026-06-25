@@ -148,16 +148,16 @@ _OWUI_DENY_MESSAGES: dict[str, str] = {
     "routing_unsafe_sensitive_to_cloud":
         "This request contains sensitive content and cannot be sent to a cloud provider. Contact an administrator to adjust your routing policy.",
     "sensitivity_ceiling_exceeded":
-        "This request exceeds your sensitivity clearance level. Contact an administrator.",
+        "This request exceeds your data classification clearance level. Contact an administrator.",
     "model_not_allocated":
         "You are not allocated this model. Ask an administrator to grant access.",
     # response-path (OPA v1_routing.rego `response_reason`)
     "denied_default_deny":
         "Your request was denied by policy. Contact an administrator for details.",
     "invalid_identity_ceiling":
-        "Your account's sensitivity clearance does not permit this response. Contact an administrator.",
+        "Your account's data classification clearance does not permit this response. Contact an administrator.",
     "response_sensitivity_exceeds_ceiling":
-        "The response contains content that exceeds your sensitivity clearance level. Contact an administrator.",
+        "The response contains content that exceeds your data classification clearance level. Contact an administrator.",
     "response_blocked_by_inspection":
         "The response was blocked by the security inspection policy. Contact an administrator.",
     # OPA infrastructure

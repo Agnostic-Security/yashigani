@@ -1,0 +1,79 @@
+# Yashigani orchestration decision-code legend
+# ---------------------------------------------------------------------------
+# The per-hop orchestration transcript shown to end users is intentionally
+# OPAQUE — a compact coded tuple, not raw OPA internals. This legend decodes it.
+#
+#   Coded line:  <tooluid>:<depth>:<status>:<leg>:<action>:<reason>
+#   Example:     64F7:1:0:8:7:14
+#                = tool 64F7, hop 1, BLOCKED (0), egress leg (8), deny (7),
+#                  response data-classification exceeded the caller's clearance (14).
+#
+# Decode quickly:  python3 scripts/decode-steps.py "64F7:1:0:8:7:14"
+#
+# The enumerations are STABLE across deployments (a fixed contract) but
+# deliberately NON-SEQUENTIAL — you cannot infer an adjacent code by guessing
+# the next number, and a value may coincide with a code in a DIFFERENT field
+# (e.g. 7 = ingress leg in field 4, but deny in field 5); the decoder reads
+# positionally. Assign new codes any unused value; never reuse or renumber an
+# existing one. The full human-readable per-hop reason is always in the
+# tamper-evident audit sink.
+#
+# Source of truth: src/yashigani/gateway/decision_codes.py (keep in sync).
+schema_version: '1.0'
+
+format: "<tooluid>:<depth>:<status>:<leg>:<action>:<reason>"
+
+fields:
+  tooluid:
+    description: >-
+      Stable 4-hex id of the tool (first 4 hex of sha256(tool_name), upper-case).
+      Hides the raw tool name. See `known_tools` to resolve; an unknown uid is
+      safe to show and resolvable by hashing a candidate tool name.
+  depth:
+    description: Orchestration hop depth (integer; 1 = first tool call).
+
+status:
+  0: blocked
+  1: ok            # delivered / allowed
+
+leg:               # which adjudication leg decided the outcome
+  6: inspection    # ResponseInspection pipeline made the call
+  7: ingress       # OPA ingress leg (before the tool ran)
+  8: egress        # OPA egress leg (on the tool/model result)
+  9: seed          # seed-prompt / pre-flight adjudication
+
+action:            # non-sequential (stable)
+  3: allow
+  7: deny
+  9: route-local   # must be served by a local model (e.g. classified marking)
+  0: redact        # content removed (doc-OPA)
+  6: pseudonymize  # content reversibly tokenised (doc-OPA)
+
+# reason / inspection code — non-sequential (stable). `note` flags when a deny on
+# a *benign* request likely means OPA is over-blocking normal usage (investigate).
+reason:
+  0:  {name: clean,                              note: "no block (action=allow)"}
+  41: {name: default_deny,                       note: "OPA fail-closed or generic policy deny. On benign usage -> OPA bundle/health issue; check OPA reachable + policy loaded."}
+  63: {name: client_policy_denied,               note: "a client OPA policy bound to the caller denied. On benign usage -> review that user's bound policies."}
+  28: {name: identity_not_active,                note: "disabled/inactive account."}
+  52: {name: model_not_allocated,                note: "caller not allocated the requested model. On benign usage -> allocate the model to the user/group."}
+  14: {name: response_sensitivity_exceeds_ceiling, note: "the RESPONSE's data-classification exceeded the caller's clearance. On benign usage -> classifier over-classified, or raise the caller's clearance."}
+  36: {name: sensitivity_ceiling_exceeded,       note: "the REQUEST's data-classification exceeded the caller's clearance."}
+  71: {name: invalid_identity_ceiling,           note: "identity clearance missing/invalid -> fix the identity record."}
+  17: {name: response_blocked_by_inspection,     note: "injection / credential-exfil detected in the tool/model result (e.g. the cloud-9 rogue MCP). A genuine security block."}
+  59: {name: pii_detected,                       note: "PII present, cannot send to this provider."}
+  84: {name: routing_unsafe_sensitive_to_cloud,  note: "sensitive content would route to a cloud model."}
+  47: {name: provenance_cap,                     note: "provenance / hop-budget cap refused the call."}
+  92: {name: unknown_tool,                       note: "tool not in the approved catalog. On benign usage -> import/approve the tool."}
+  33: {name: unsupported_tool,                   note: "tool/operation not supported."}
+  68: {name: injection_budget,                   note: "per-hop injection budget exhausted (loop/abuse guard)."}
+  25: {name: sensitivity_exceeds_egress_ceiling, note: "egress data-classification ceiling exceeded."}
+  76: {name: classified_requires_local,          note: "classified marking -> must use a local model (expected for SECRET/OFFICIAL-SENSITIVE docs)."}
+  88: {name: pci_data_present,                    note: "cardholder (PCI) data present (expected block for the no-PCI policy)."}
+  99: {name: unmapped,                            note: "reason not in this table yet -> read the full reason in the audit sink and add it here + decision_codes.py."}
+
+# Known demo/agent tool uids (resolve <tooluid>). Extend per deployment from the
+# tool catalog; unknown uids decode to "<uid XXXX>".
+# Generate with:  python3 scripts/decode-steps.py --tools mcp__demo__echo @langflow ...
+known_tools:
+  mcp__demo__echo: "64F7"
