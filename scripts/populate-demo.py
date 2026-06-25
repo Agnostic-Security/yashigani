@@ -403,7 +403,11 @@ def step7b_save_user_creds(user_creds: dict[str, dict]) -> None:
     lines = [f"# Demo user credentials — populate-2255-protocol2 run {datetime.utcnow().isoformat()}Z\n"]
     for email, creds in user_creds.items():
         username = creds.get("username", "")
-        temp_pw = creds.get("temp_pw", "(already existed)")
+        # FIND-DEMO-CREDS: step7c rotates the temp password on forced first-login,
+        # so the CURRENT password is new_pw. Prefer it; fall back to temp_pw for
+        # accounts that already existed / were not rotated. (Saving temp_pw left the
+        # documented demo creds stale + unusable after onboarding.)
+        temp_pw = creds.get("new_pw") or creds.get("temp_pw", "(already existed)")
         totp = creds.get("totp_secret", "(already existed)")
         group = creds.get("group", "")
         lines.append(f"{email}  username={username}  pw={temp_pw}  totp={totp}  group={group}\n")
@@ -1398,8 +1402,8 @@ def main() -> None:
 
     # Step 7: users + group membership
     user_creds = step7_create_users(group_ids)
-    step7b_save_user_creds(user_creds)
     api_keys = step7c_onboard_users(user_creds)
+    step7b_save_user_creds(user_creds)  # FIND-DEMO-CREDS: save AFTER onboarding so the file has the rotated new_pw
     step7d_set_sensitivity_ceilings(user_creds)
     step7e_grant_owui_access(user_creds)
     step9c_add_marking_patterns()
