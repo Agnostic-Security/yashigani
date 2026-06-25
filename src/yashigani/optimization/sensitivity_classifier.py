@@ -267,10 +267,14 @@ class SensitivityClassifier:
         if decode_result.suspicious_blob:
             all_triggers.append("decode:suspicious-blob")
             if final_level < SensitivityLevel.RESTRICTED:
+                # CodeQL py/clear-text-logging (#1869): log only the COUNT of
+                # flagged tokens — the tokens themselves are the suspicious
+                # high-entropy blobs (potentially the sensitive content), so they
+                # must never be written to logs in clear text.
                 logger.warning(
                     "F-RT1: undecodable high-entropy encoded blob present — "
-                    "flooring sensitivity at RESTRICTED/level-4 (tokens=%s)",
-                    decode_result.flagged_tokens,
+                    "flooring sensitivity at RESTRICTED/level-4 (token_count=%d)",
+                    len(decode_result.flagged_tokens),
                 )
                 final_level = SensitivityLevel.RESTRICTED
 
