@@ -1475,7 +1475,8 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     for _bm_dir in \
             "${SCRIPT_DIR}/docker/data" \
             "${SCRIPT_DIR}/docker/certs" \
-            "${SCRIPT_DIR}/docker/logs"; do
+            "${SCRIPT_DIR}/docker/logs" \
+            "${SCRIPT_DIR}/docker/wazuh-mtls"; do
         [ -d "$_bm_dir" ] || { echo "  [skip] $_bm_dir (absent)"; continue; }
         if rm -rf "$_bm_dir" 2>/dev/null; then
             echo "  [removed] $_bm_dir"

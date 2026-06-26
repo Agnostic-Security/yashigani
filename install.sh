@@ -5876,24 +5876,102 @@ _provision_wazuh_mtls() {
   fi
   mkdir -p "${wp}/certs" "${wp}/opensearch-security"
 
-  # 1. CA bundle (intermediate + root) — HTTP-layer trust anchor
-  cat "${secrets}/ca_intermediate.crt" "${secrets}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+  # -------------------------------------------------------------------------
+  # Rootless-Podman wazuh-mtls fix (gate #ROOTLESS-WAZUH-1):
+  #
+  # On rootless Podman the PKI issuer (which ran at step 9b) chowns secrets/
+  # to the subuid-mapped host UID (e.g. 165536 for container root). The host
+  # user (e.g. UID 1001) cannot open any secrets/ files → EPERM on:
+  #   - cat ca_intermediate.crt ca_root.crt  (step 1 CA bundle)
+  #   - openssl x509 -CAkey ca_intermediate.key  (step 2 admin cert signing)
+  #   - cp wazuh-indexer_client.{crt,key}  (step 3 indexer cert copy)
+  #   - password reads for steps 5, 6
+  #
+  # Fix strategy: steps 1-3 are grouped into a single `podman unshare bash -c`
+  # block that runs as namespace-root (host 165536) and can read secrets/.
+  # All output lands in ${wp}/certs/ which is host-owned, so no final chown
+  # is needed on the output files (wp/ is owned by the install user).
+  # Steps 5-6 (password reads) use _safe_read_secret, which tries direct
+  # cat first, then `podman unshare cat` on failure.
+  #
+  # Docker / rootful Podman / macOS: direct path unchanged (no unshare).
+  # Fallback: if podman unshare is unavailable (remote client), log_warn and
+  # fall through to the direct path.
+  # -------------------------------------------------------------------------
+  local _is_rootless_podman=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" || "${YSG_RUNTIME:-}" == "podman" ]] \
+      && [[ "$(id -u)" != "0" ]]; then
+    _is_rootless_podman=true
+  fi
 
-  # 2. internal-CA admin cert (EC P-256, PKCS#8 key) signed by the internal intermediate
-  openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
-  openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
-  rm -f "${wp}/certs/.admin-sec1.pem"
-  openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
-    -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
-  openssl x509 -req -in "${wp}/certs/.admin.csr" -CA "${secrets}/ca_intermediate.crt" \
-    -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "${wp}/certs/wazuh-admin.pem" \
-    -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
-  rm -f "${wp}/certs/.admin.csr" "${secrets}/ca_intermediate.srl"
+  if [[ "$_is_rootless_podman" == "true" ]]; then
+    # Rootless Podman path — steps 1-3 read from secrets/ inside podman unshare.
+    # ${wp} and ${secrets} are expanded host-side before the string reaches unshare;
+    # all writes go to ${wp}/certs/ which is host-owned so no chown of output is needed.
+    # Process substitution <(printf ...) is unreliable across bash -c heredoc delivery,
+    # so the x509 extfile is written to a temp path inside wp/certs/, then removed —
+    # keeping all scratch inside the working area (never /tmp).
+    local _wazuh_unshare_script
+    _wazuh_unshare_script="$(cat <<WAZUH_UNSHARE_EOF
+set -euo pipefail
+# Step 1: CA bundle
+cat '${secrets}/ca_intermediate.crt' '${secrets}/ca_root.crt' > '${wp}/certs/http-ca-bundle.pem'
+# Step 2: wazuh-admin leaf signed by internal intermediate
+openssl ecparam -genkey -name prime256v1 -out '${wp}/certs/.admin-sec1.pem' 2>/dev/null
+openssl pkcs8 -topk8 -nocrypt -in '${wp}/certs/.admin-sec1.pem' -out '${wp}/certs/wazuh-admin-key.pem' 2>/dev/null
+rm -f '${wp}/certs/.admin-sec1.pem'
+openssl req -new -key '${wp}/certs/wazuh-admin-key.pem' -out '${wp}/certs/.admin.csr' \
+  -subj '/O=Agnostic Security/CN=wazuh-admin' 2>/dev/null
+printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+  > '${wp}/certs/.admin-ext.cnf'
+openssl x509 -req -in '${wp}/certs/.admin.csr' -CA '${secrets}/ca_intermediate.crt' \
+  -CAkey '${secrets}/ca_intermediate.key' -CAcreateserial -days 825 \
+  -out '${wp}/certs/wazuh-admin.pem' \
+  -extfile '${wp}/certs/.admin-ext.cnf' 2>/dev/null
+rm -f '${wp}/certs/.admin.csr' '${wp}/certs/.admin-ext.cnf' '${secrets}/ca_intermediate.srl'
+# Step 3: copy indexer HTTP cert/key from secrets to wp
+cp '${secrets}/wazuh-indexer_client.crt' '${wp}/certs/http-indexer.pem'
+cp '${secrets}/wazuh-indexer_client.key' '${wp}/certs/http-indexer-key.pem'
+# Verify outputs are non-empty INSIDE the namespace
+[ -s '${wp}/certs/http-ca-bundle.pem' ]
+[ -s '${wp}/certs/wazuh-admin-key.pem' ]
+[ -s '${wp}/certs/wazuh-admin.pem' ]
+[ -s '${wp}/certs/http-indexer.pem' ]
+[ -s '${wp}/certs/http-indexer-key.pem' ]
+WAZUH_UNSHARE_EOF
+)"
+    if podman unshare bash -c "$_wazuh_unshare_script" 2>/dev/null; then
+      log_info "Wazuh steps 1-3 (CA bundle + admin cert + indexer cert) completed via podman unshare (rootless)"
+    else
+      log_warn "podman unshare unavailable or failed for wazuh steps 1-3 — falling back to direct path"
+      _is_rootless_podman=false  # trigger direct block below
+    fi
+  fi
 
-  # 3. indexer HTTP server cert = the bootstrap-issued internal-CA cert (SAN wazuh-indexer)
-  cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
-  cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
+  if [[ "$_is_rootless_podman" == "false" ]]; then
+    # Docker / rootful Podman / macOS / fallback from unshare-unavailable path.
+
+    # 1. CA bundle (intermediate + root) — HTTP-layer trust anchor
+    cat "${secrets}/ca_intermediate.crt" "${secrets}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+
+    # 2. internal-CA admin cert (EC P-256, PKCS#8 key) signed by the internal intermediate
+    openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
+    openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
+    rm -f "${wp}/certs/.admin-sec1.pem"
+    openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
+      -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
+    openssl x509 -req -in "${wp}/certs/.admin.csr" -CA "${secrets}/ca_intermediate.crt" \
+      -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "${wp}/certs/wazuh-admin.pem" \
+      -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+    rm -f "${wp}/certs/.admin.csr" "${secrets}/ca_intermediate.srl"
+
+    # 3. indexer HTTP server cert = the bootstrap-issued internal-CA cert (SAN wazuh-indexer)
+    cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
+    cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
+  fi
+
   # fail-closed: filebeat `full` verification needs SAN=wazuh-indexer on the HTTP cert
+  # wp/certs/ is host-owned so this host-side check is valid on both paths.
   if ! openssl x509 -in "${wp}/certs/http-indexer.pem" -noout -text 2>/dev/null | grep -q 'DNS:wazuh-indexer'; then  # MACOS-WAZUHSAN-001: LibreSSL x509 has no -ext flag; the -text SAN read is portable (BSD/LibreSSL + GNU/OpenSSL)
     log_error "wazuh-indexer_client.crt lacks SAN 'wazuh-indexer' — full mTLS would fail closed; aborting"; return 1
   fi
@@ -5946,10 +6024,20 @@ PYEOF
   # 5. internal_users.yml: admin + kibanaserver = bcrypt(real generated passwords).
   #    Password is passed via the container ENV (never interpolated into a shell string),
   #    so any password charset is injection-safe.
+  #    #ROOTLESS-WAZUH-1: use _safe_read_secret so the cat succeeds on both Docker
+  #    (direct) and rootless Podman (podman unshare cat fallback inside _safe_read_secret).
   local ah kh
-  ah="$("$rt" run --rm -e RAWPW="$(cat "${secrets}/wazuh_indexer_password")" "$idx_img" \
+  local _wazuh_idxpw _wazuh_dashpw
+  _wazuh_idxpw="$(_safe_read_secret "${secrets}/wazuh_indexer_password" "" "" 2>/dev/null)" \
+    || { log_error "Could not read wazuh_indexer_password — aborting"; return 1; }
+  _wazuh_dashpw="$(_safe_read_secret "${secrets}/wazuh_dashboard_password" "" "" 2>/dev/null)" \
+    || { log_error "Could not read wazuh_dashboard_password — aborting"; return 1; }
+  if [[ -z "$_wazuh_idxpw" || -z "$_wazuh_dashpw" ]]; then
+    log_error "wazuh_indexer_password or wazuh_dashboard_password is empty — aborting"; return 1
+  fi
+  ah="$("$rt" run --rm -e RAWPW="${_wazuh_idxpw}" "$idx_img" \
         bash -lc 'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$RAWPW"' 2>/dev/null | tail -1)"
-  kh="$("$rt" run --rm -e RAWPW="$(cat "${secrets}/wazuh_dashboard_password")" "$idx_img" \
+  kh="$("$rt" run --rm -e RAWPW="${_wazuh_dashpw}" "$idx_img" \
         bash -lc 'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$RAWPW"' 2>/dev/null | tail -1)"
   if [[ ! "$ah" =~ ^\$2[aby]\$ ]] || [[ ! "$kh" =~ ^\$2[aby]\$ ]]; then
     log_error "bcrypt hash generation failed (admin/kibanaserver not valid \$2 hashes) — aborting"; return 1
@@ -6006,13 +6094,14 @@ print("[wazuh-mtls] clientcert auth + yashigani_audit_writer (write-only) mapped
 PYEOF
 
   # 6. dashboard config: real indexer password + internal-CA bundle + full verification
+  #    #ROOTLESS-WAZUH-1: _wazuh_idxpw already read via _safe_read_secret above.
   {
     printf 'server.host: "0.0.0.0"\nserver.port: 5601\nserver.ssl.enabled: false\n'
     printf 'opensearch.hosts: ["https://wazuh-indexer:9200"]\n'
     printf 'opensearch.ssl.verificationMode: full\n'
     printf 'opensearch.ssl.certificateAuthorities: ["/usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem"]\n'
     printf 'opensearch.username: "admin"\n'
-    printf 'opensearch.password: "%s"\n' "$(cat "${secrets}/wazuh_indexer_password")"
+    printf 'opensearch.password: "%s"\n' "${_wazuh_idxpw}"
     printf 'opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]\n'
     printf 'opensearch_security.multitenancy.enabled: false\n'
     # Served behind Caddy at /admin/wazuh/* — basePath makes the dashboard
@@ -6067,35 +6156,110 @@ _provision_audit_signing_key() {
     return 1
   fi
   require_cmd openssl
-  ( umask 077   # private key born owner-only
-    mkdir -p "$asd"
-    # EC P-256 key, converted to PKCS#8 (load_pem_private_key in chain.py expects PKCS#8).
-    openssl ecparam -genkey -name prime256v1 -out "${asd}/.audit-sec1.pem" 2>/dev/null
-    openssl pkcs8 -topk8 -nocrypt -in "${asd}/.audit-sec1.pem" -out "$keyf" 2>/dev/null
-    rm -f "${asd}/.audit-sec1.pem"
-    # CSR + leaf signed by the internal intermediate. CN encodes the SPIFFE-ish
-    # signing identity so an auditor can tie a signature to the issuing context.
-    openssl req -new -key "$keyf" -out "${asd}/.audit.csr" \
-      -subj "/O=Agnostic Security/CN=audit-checkpoint-signer" 2>/dev/null
-    openssl x509 -req -in "${asd}/.audit.csr" -CA "${secrets}/ca_intermediate.crt" \
-      -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "$crtf" \
-      -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
-    rm -f "${asd}/.audit.csr" "${secrets}/ca_intermediate.srl"
-  )
-  if [[ ! -s "$keyf" || ! -s "$crtf" ]]; then
-    log_error "Audit signing-key provisioning: openssl produced empty key/cert — aborting"
-    return 1
+
+  # -------------------------------------------------------------------------
+  # Rootless-Podman audit-signing fix (gate #ROOTLESS-AUDIT-1):
+  #
+  # On rootless Podman the PKI issuer step (which ran earlier under podman
+  # unshare) chowns secrets/ to the subuid-mapped host UID (e.g. 165536 for
+  # container root).  The host user (e.g. UID 1001) cannot create a subdir or
+  # write files inside that tree → EPERM → empty key → fail-closed abort.
+  #
+  # Fix: when running rootless Podman, execute the entire mkdir + openssl
+  # block inside `podman unshare bash -c '...'` so it runs as namespace-root
+  # (host 165536) which CAN write into the subuid-owned secrets tree.  The
+  # final chown 1001:1001 inside the unshare maps to the correct subuid host
+  # UID (166537 on a 165536-base system) — identical to how the bind-mount
+  # block and the PKI issuer block do it.
+  #
+  # Process substitution (<(printf ...)) is not reliable inside a bash -c
+  # heredoc delivered over a single-quoted string, so the x509 extfile is
+  # written to a temp path inside audit-signing/ then removed, keeping all
+  # scratch inside the function's own working area (never /tmp — repo policy).
+  #
+  # Fallback: if podman unshare is unavailable (remote client), log_warn and
+  # fall through to the existing direct-path block.
+  # -------------------------------------------------------------------------
+  local _is_rootless_podman=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" || "${YSG_RUNTIME:-}" == "podman" ]] \
+      && [[ "$(id -u)" != "0" ]]; then
+    _is_rootless_podman=true
   fi
-  # Perms: key 0640 owned by the backoffice container UID (1001); cert 0644 (auditor-readable).
-  # cap_drop:[ALL] on backoffice strips DAC_OVERRIDE, so the key must be owner- or
-  # group-readable by the backoffice runtime UID. Backoffice runs as UID 1001 (see
-  # docker-compose backoffice user/_pki_chown_client_keys map). Chown best-effort
-  # (host may lack the UID on macOS virtiofs — the bind mount remaps on read).
-  chmod 0640 "$keyf" 2>/dev/null || true
-  chmod 0644 "$crtf" 2>/dev/null || true
-  chmod 0750 "$asd" 2>/dev/null || true
-  chown 1001:1001 "$keyf" 2>/dev/null || true
-  chown 1001:1001 "$asd"  2>/dev/null || true
+
+  if [[ "$_is_rootless_podman" == "true" ]]; then
+    # Rootless Podman path: run the full openssl block inside podman unshare.
+    # Variables (asd/keyf/crtf/secrets) are expanded host-side before the
+    # string is passed to podman unshare bash -c.
+    local _unshare_script
+    _unshare_script="$(cat <<UNSHARE_EOF
+set -euo pipefail
+umask 077
+mkdir -p '${asd}'
+openssl ecparam -genkey -name prime256v1 -out '${asd}/.audit-sec1.pem' 2>/dev/null
+openssl pkcs8 -topk8 -nocrypt -in '${asd}/.audit-sec1.pem' -out '${keyf}' 2>/dev/null
+rm -f '${asd}/.audit-sec1.pem'
+openssl req -new -key '${keyf}' -out '${asd}/.audit.csr' \
+  -subj '/O=Agnostic Security/CN=audit-checkpoint-signer' 2>/dev/null
+printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+  > '${asd}/.audit-ext.cnf'
+openssl x509 -req -in '${asd}/.audit.csr' -CA '${secrets}/ca_intermediate.crt' \
+  -CAkey '${secrets}/ca_intermediate.key' -CAcreateserial -days 825 -out '${crtf}' \
+  -extfile '${asd}/.audit-ext.cnf' 2>/dev/null
+rm -f '${asd}/.audit.csr' '${asd}/.audit-ext.cnf' '${secrets}/ca_intermediate.srl'
+chmod 0640 '${keyf}'
+chmod 0644 '${crtf}'
+chmod 0750 '${asd}'
+chown 1001:1001 '${keyf}' '${crtf}' '${asd}'
+# Verify non-empty INSIDE the namespace: after chown to the subuid UID + 0750
+# dir, the host user (other) cannot traverse audit-signing/ to stat these, so
+# the host-side -s check would false-fail on a healthy key. Verify here
+# where access works (#ROOTLESS-AUDIT-1); set -e -> non-zero exit -> fallback.
+[ -s '${keyf}' ] && [ -s '${crtf}' ]
+UNSHARE_EOF
+)"
+    if podman unshare bash -c "$_unshare_script" 2>/dev/null; then
+      log_info "Audit signing key generated + verified via podman unshare (rootless)"
+      log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+      return 0
+    else
+      log_warn "podman unshare unavailable or failed — falling back to direct path (rootless Podman without unshare support)"
+      _is_rootless_podman=false   # trigger the direct block below
+    fi
+  fi
+
+  if [[ "$_is_rootless_podman" == "false" ]]; then
+    # Docker / rootful Podman / macOS / fallback from unshare-unavailable path.
+    ( umask 077   # private key born owner-only
+      mkdir -p "$asd"
+      # EC P-256 key, converted to PKCS#8 (load_pem_private_key in chain.py expects PKCS#8).
+      openssl ecparam -genkey -name prime256v1 -out "${asd}/.audit-sec1.pem" 2>/dev/null
+      openssl pkcs8 -topk8 -nocrypt -in "${asd}/.audit-sec1.pem" -out "$keyf" 2>/dev/null
+      rm -f "${asd}/.audit-sec1.pem"
+      # CSR + leaf signed by the internal intermediate. CN encodes the SPIFFE-ish
+      # signing identity so an auditor can tie a signature to the issuing context.
+      openssl req -new -key "$keyf" -out "${asd}/.audit.csr" \
+        -subj "/O=Agnostic Security/CN=audit-checkpoint-signer" 2>/dev/null
+      openssl x509 -req -in "${asd}/.audit.csr" -CA "${secrets}/ca_intermediate.crt" \
+        -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "$crtf" \
+        -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+      rm -f "${asd}/.audit.csr" "${secrets}/ca_intermediate.srl"
+    )
+    if [[ ! -s "$keyf" || ! -s "$crtf" ]]; then
+      log_error "Audit signing-key provisioning: openssl produced empty key/cert — aborting"
+      return 1
+    fi
+    # Perms: key 0640 owned by the backoffice container UID (1001); cert 0644 (auditor-readable).
+    # cap_drop:[ALL] on backoffice strips DAC_OVERRIDE, so the key must be owner- or
+    # group-readable by the backoffice runtime UID. Backoffice runs as UID 1001 (see
+    # docker-compose backoffice user/_pki_chown_client_keys map). Chown best-effort
+    # (host may lack the UID on macOS virtiofs — the bind mount remaps on read).
+    chmod 0640 "$keyf" 2>/dev/null || true
+    chmod 0644 "$crtf" 2>/dev/null || true
+    chmod 0750 "$asd" 2>/dev/null || true
+    chown 1001:1001 "$keyf" 2>/dev/null || true
+    chown 1001:1001 "$asd"  2>/dev/null || true
+  fi
+
   log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
 }
 
@@ -6872,9 +7036,21 @@ compose_up() {
         }
         # CA bundle: root + intermediate (same as _upgrade_postgres_ssl step 1)
         local _tmp_bundle
-        # V232-NEG04: use secrets dir for temp bundle — never /tmp
-        _tmp_bundle=$(mktemp "${_host_secrets}/.ysg_bundle_XXXXXX.crt" 2>/dev/null || echo "${_host_secrets}/.ysg_bundle.crt")
-        cat "${_host_secrets}/ca_root.crt" "${_host_secrets}/ca_intermediate.crt" > "$_tmp_bundle"
+        # V232-NEG04: use tls/ dir for temp bundle (never /tmp); secrets/ is subuid-owned on
+        # rootless Podman so mktemp there would EPERM (#ROOTLESS-WAZUH-1 follow-up).
+        # tls/ is created by _prepare_secrets_dir_for_pki and is host-owned.
+        _tmp_bundle=$(mktemp "${WORK_DIR}/docker/tls/.ysg_bundle_XXXXXX.crt" 2>/dev/null \
+                      || echo "${WORK_DIR}/docker/tls/.ysg_bundle.crt")
+        # Read CA certs via podman unshare (subuid-owned on rootless); write bundle to host-owned tls/.
+        if ! podman unshare bash -c \
+               "cat '${_host_secrets}/ca_root.crt' '${_host_secrets}/ca_intermediate.crt' > '${_tmp_bundle}'" \
+               2>/dev/null; then
+          # Fallback: direct cat (Docker / rootful / macOS paths should not reach here, but be safe)
+          cat "${_host_secrets}/ca_root.crt" "${_host_secrets}/ca_intermediate.crt" > "$_tmp_bundle" 2>/dev/null || {
+            log_error "CA bundle creation failed (direct + unshare) — SSL injection aborted"
+            rm -f "$_tmp_bundle"; return 1
+          }
+        fi
         podman cp "$_tmp_bundle" "${_pg_container_name}:${_pgdata}/root.crt" 2>/dev/null || {
           log_error "podman cp ca bundle failed — SSL injection aborted"; rm -f "$_tmp_bundle"; return 1
         }
@@ -6944,8 +7120,11 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
           return 1
         fi
         # SCRAM re-hash (same as _upgrade_postgres_ssl step 6)
+        # #ROOTLESS-WAZUH-1: postgres_password is subuid-owned on rootless Podman; use
+        # _safe_read_secret (tries direct cat, then podman unshare cat, then .env lookup).
         local _pg_pass
-        _pg_pass=$(cat "${WORK_DIR}/docker/secrets/postgres_password" 2>/dev/null || echo "")
+        _pg_pass="$(_safe_read_secret "${WORK_DIR}/docker/secrets/postgres_password" \
+                    "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "")"
         if [[ -n "$_pg_pass" ]]; then
           "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
               psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
@@ -7805,9 +7984,12 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # Retro N1-HARNESS-003 (2026-05-02): upgrading from v2.22.x leaves the SCRAM
   # hash with parameters that may not match the server's current
   # scram_iterations. A password reset forces postgres to recompute the hash.
+  # #ROOTLESS-WAZUH-1: postgres_password is subuid-owned on rootless Podman; use
+  # _safe_read_secret (direct cat → podman unshare cat → .env lookup) rather than
+  # a bare `cat` that would EPERM on the rootless path.
   local _pg_pass
-  _pg_pass=$(cat "${WORK_DIR}/docker/secrets/postgres_password" 2>/dev/null || \
-             grep -oP '(?<=POSTGRES_PASSWORD=)[^ ]+' "${WORK_DIR}/docker/.env" 2>/dev/null | head -1 || echo "")
+  _pg_pass="$(_safe_read_secret "${WORK_DIR}/docker/secrets/postgres_password" \
+              "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "")"
   if [[ -z "$_pg_pass" ]]; then
     log_warn "postgres SSL upgrade: could not read postgres_password — skipping SCRAM re-hash"
   else
