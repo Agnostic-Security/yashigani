@@ -2144,3 +2144,88 @@ risks:
       Filed as LAURA-300-002 (pentest).
   fix_in_version: v3.0.1
   last_threat_model_review: '2026-06-26'
+
+- id: YSG-RISK-099
+  description: >-
+    Trusted Types not enforced on any path (greenfield gap). Admin vanilla-JS
+    templates use innerHTML calls in dashboard.js, login.js, runtime-settings.js etc.
+    without a TT policy gate. New 4.0 user UI paths (/chat/*, /user/*, /flow/*)
+    will serve Lit-based components that could be vulnerable to mXSS without TT.
+    (CWE-79, ASVS V5.5.3)
+  severity: medium
+  controls_impacted:
+  - ASVS V5.5.3 (DOM XSS / TT)
+  - CWE-79 (XSS)
+  compensating_controls:
+  - Admin paths already have strict-CSP (script-src 'self', no unsafe-inline).
+  - 4.0 user paths get full TT enforcement in Phase 1 (@strict_tt matcher).
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-27'
+  closed_at: '2026-06-27'
+  closure_evidence:
+  - rationale: >-
+      Phase 1: @strict_tt matcher on /chat/* /user/* /flow/* enables
+      require-trusted-types-for 'script' + trusted-types yashigani-render.
+      yashigani-render policy in static/vendor/shared-layer/safe-render.js is
+      the sole registrant; no default policy (fail-closed). Admin paths (vanilla JS)
+      deferred to Phase 6 per spec §2.5 sequencing invariant. Partial closure —
+      RISK-099 fully closed at Phase 6 when @strict_legacy paths gain TT.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-06-27'
+
+- id: YSG-RISK-101
+  description: >-
+    No build-time integrity gate for vendored assets. Zero integrity= attributes
+    in any template, no vendor-integrity.lock, no hash check in Dockerfile.backoffice.
+    The existing swagger-ui-bundle.js (unversioned, eval present, missing .map) is
+    the proof of failure mode. Supply-chain attack: attacker replaces a vendored file
+    on disk without updating a lock — ships undetected. (CWE-494, OWASP CI/CD-SEC-3)
+  severity: high
+  controls_impacted:
+  - CWE-494 (Download of Code Without Integrity Check)
+  - OWASP CI/CD-SEC-3 (Dependency chain abuse)
+  compensating_controls:
+  - 4.0 Phase 1 introduces vendor-integrity.lock + Dockerfile.backoffice build-time
+    SHA-384 verification + eval-audit script.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-27'
+  closed_at: '2026-06-27'
+  closure_evidence:
+  - rationale: >-
+      scripts/vendor-integrity.lock tracks SHA-384 (base64, HTML SRI format) for
+      all vendored files. Dockerfile.backoffice RUN layer verifies every entry via
+      openssl dgst -sha384 after COPY of static/ — build fails on mismatch.
+      scripts/audit-vendor-eval.sh must PASS before any file enters the lock.
+      Lit 3.3.3, DOMPurify 3.4.11, marked 18.0.5 all audited PASS and locked.
+      swagger-ui remediation (RISK-115) deferred but scoped separately.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-06-27'
+
+- id: YSG-RISK-102
+  description: >-
+    Default-to-lenient CSP trap. @strict_ui is an explicit allowlist; @lenient_ui
+    is its catch-all complement. Every new route not added to @strict_ui silently
+    ships under unsafe-eval + unsafe-inline. Structural recurrence of YSG-RISK-081
+    now targeting first-party 4.0 surfaces (/chat/*, /user/*, /flow/*).
+    (SC-NEW-001, CWE-693)
+  severity: high
+  controls_impacted:
+  - CWE-693 (Protection Mechanism Failure)
+  - ASVS V14.4.3 (CSP)
+  compensating_controls:
+  - 4.0 Phase 1 inverts the matcher pattern to strict-as-default.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-27'
+  closed_at: '2026-06-27'
+  closure_evidence:
+  - rationale: >-
+      @lenient_ui catch-all matcher REMOVED from all three Caddyfiles and the Helm
+      configmap. New matcher set: @lenient_subapp (explicit exceptions) + @redoc_ui +
+      @strict_legacy (admin plane) + @strict_tt (4.0 user paths with TT). Any new
+      HTML-serving path must be explicitly placed in one of the four matchers — no
+      silent fallback to lenient. Enforced by scripts/check-caddyfile-csp-parity.sh.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-06-27'

@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (self-signed certificate mode)
-# Last updated: 2026-05-18T00:00:00+00:00 (v2.23.4: add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing)
+# Last updated: 2026-06-27T00:00:00+00:00 (v4.0-phase1: strict CSP/TT — import csp-policies snippet from Caddyfile.csp)
 #
 # ╔══════════════════════════════════════════════════════════╗
 # ║  WARNING: SELF-SIGNED MODE — LOCAL / DEMO USE ONLY      ║
@@ -68,6 +68,14 @@
         strict_sni_host insecure_off
     }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSP policy snippet — defines the four path matchers and their Content-Security-
+# Policy header values as the (csp-policies) named snippet. Imported at the site
+# level with `import csp-policies`. Source of truth: docker/Caddyfile.csp.
+# The Helm chart (configmaps.yaml) hand-codes the equivalent; the parity-check
+# script (scripts/check-caddyfile-csp-parity.sh) enforces drift-prevention.
+import /etc/caddy/Caddyfile.csp
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal mTLS snippet — imported by every reverse_proxy / forward_auth block
@@ -225,47 +233,12 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         -Alt-Svc
     }
 
-    # CSP, set per-path so exactly one policy applies per request.
-    #
-    # STRICT (script-src 'self', style-src 'self', no inline) applies to the
-    # Yashigani-native admin plane ONLY — the backoffice SPA (/admin/*), auth
-    # (/auth/*, /login), and the other first-party backoffice routes. These were
-    # deliberately made strict-CSP-compliant (inline styles moved to CSS classes,
-    # f7a3228); do NOT weaken them.
-    #
-    # LENIENT (unsafe-eval + unsafe-inline) applies to everything else:
-    #  - the proxied observability sub-apps (Grafana, Wazuh/OSD, Prometheus),
-    #    which ship nonce-less inline bootstrap scripts + eval()/inline styles —
-    #    strict CSP stops their SPA mounting ("failed to load application files");
-    #  - the Open WebUI end-user chat surface served at the root catch-all
-    #    (--with-openwebui), whose SvelteKit build emits inline hydration scripts —
-    #    strict CSP blocks them and the page renders blank (YSG-2253 blocker).
-    # curl never shows this (it doesn't enforce CSP).
-    #
-    # The boundary is a single path set used in both matchers so exactly one
-    # policy applies per request. @strict_ui = native admin plane AND NOT a
-    # proxied sub-app subpath; @lenient_ui = the complement (sub-apps + OWUI root).
-    @strict_ui {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
-        # LAURA-2255-006 / LAURA-30-009: exclude ReDoc paths so @redoc_ui is the
-        # sole CSP source for those two routes. Without this, both @strict_ui and
-        # @redoc_ui set a CSP header, producing two headers on every /admin/api-redoc
-        # and /redoc response. Browsers intersect; not exploitable but a config defect.
-        not path /admin/api-redoc /redoc
-    }
-    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
-    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
-    # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
-    # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
-    # to the two ReDoc routes; all other strict_ui paths keep the default CSP.
-    # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
-    # via its web component Shadow DOM at render time.
-    @redoc_ui path /admin/api-redoc /redoc
-    header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
-    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
-    header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    # CSP matchers and headers — strict-by-default (4.0 / RISK-102 / SC-NEW-001)
+    # Source of truth: docker/Caddyfile.csp  (defines the (csp-policies) snippet)
+    # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
+    # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
+    # See Caddyfile.csp for full design rationale.
+    import csp-policies
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {

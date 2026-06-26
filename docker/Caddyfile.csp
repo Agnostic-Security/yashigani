@@ -1,0 +1,59 @@
+# docker/Caddyfile.csp — single source of truth for CSP matchers (4.0)
+#
+# Imported by Caddyfile.selfsigned, Caddyfile.ca, Caddyfile.acme.
+# The Helm chart (helm/yashigani/templates/configmaps.yaml) inlines an
+# equivalent block because Helm ConfigMaps cannot import external files at
+# runtime; the parity-check script (scripts/check-caddyfile-csp-parity.sh)
+# enforces byte-level equivalence between this file and the Helm configmap.
+#
+# DESIGN: strict-by-default
+# Any HTML-serving path MUST be explicitly placed in one of the four matchers
+# below. There is NO catch-all lenient fallback — @lenient_ui has been removed
+# (RISK-102 fix / SC-NEW-001). API paths, healthz, security.txt, etc. receive
+# no CSP header (correct: browsers do not enforce CSP on non-document responses).
+#
+# Matcher inventory (extend ALL four Caddyfiles + Helm configmap in the SAME
+# commit when adding a path — ENUMERATE-BEFORE-EDIT SOP):
+#
+#  @lenient_subapp  — observability sub-apps (Grafana/Wazuh/Prometheus).
+#                     Third-party SPAs that cannot be made strict-CSP-compliant.
+#                     DO NOT add new paths here without a recorded justification.
+#
+#  @redoc_ui        — ReDoc API docs. Needs worker-src blob: + unsafe-inline
+#                     style-src (Shadow DOM inline CSS). Scoped narrowly.
+#
+#  @strict_legacy   — Existing admin plane (vanilla JS until Phase 6 rebuild).
+#                     NO Trusted Types — dashboard.js / runtime-settings.js /
+#                     login.js etc. use innerHTML; TT is added in Phase 6 only.
+#
+#  @strict_tt       — 4.0 first-party user paths (Lit-based, no innerHTML).
+#                     Full strict policy + Trusted Types (yashigani-render).
+#                     Add every new 4.0 user-facing route prefix here before
+#                     deployment.
+
+(csp-policies) {
+    # Lenient exception 1: observability sub-apps (third-party SPAs)
+    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+
+    # Lenient exception 2: ReDoc API docs
+    @redoc_ui path /admin/api-redoc /redoc
+
+    # Strict legacy: existing admin plane (vanilla JS — no TT until Phase 6)
+    @strict_legacy {
+        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+        not path /admin/api-redoc /redoc
+    }
+
+    # Strict + Trusted Types: 4.0 first-party user paths
+    # yashigani-render is the sole named TT policy (R1 / RECONCILIATION-20260627).
+    # No 'default' policy — fail-closed on unreviewed DOM writes.
+    # connect-src 'self' covers SSE (HTTPS fetch). If chat transport moves to
+    # WebSocket, add wss://{$YASHIGANI_TLS_DOMAIN} here (OQ-1 resolution needed).
+    @strict_tt path /chat/* /user/* /flow/*
+
+    header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render; report-uri /api/v1/csp-report; report-to default"
+    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+    header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+}
