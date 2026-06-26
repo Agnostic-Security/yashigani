@@ -979,6 +979,27 @@ def create_backoffice_app() -> FastAPI:
     if _static_dir.exists():
         app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 
+    # ── Yashigani 4.0 shared front-end layer (additive) ─────────────────────
+    # The hardened classes-only / Trusted-Types / safe-render layer that the
+    # 4.0 user UI (Phase 2) and the rebuilt admin UI (Phase 6) import. JS/CSS
+    # are served from the /static/ui4/ mount above; this route serves the
+    # shared-layer canary self-test page (safe-render + XSS / split-chunk /
+    # decode HARD-contract). Admin-gated — it is a verification surface, not an
+    # end-user page. Production CSP/Trusted-Types headers are Su's Caddy domain
+    # (feat/4.0-csp-vendoring); the canary carries its own CSP meta so the TT
+    # pipeline is exercised even before those headers land.
+    _ui4_canary = _static_dir / "ui4" / "canary" / "canary.html"
+    if _ui4_canary.exists():
+        from yashigani.backoffice.middleware import (
+            require_admin_session as _require_admin_session_ui4,
+        )
+
+        @app.get("/ui4/canary", include_in_schema=False)
+        async def ui4_canary_page(
+            session=Depends(_require_admin_session_ui4),  # noqa: ARG001
+        ) -> HTMLResponse:
+            return HTMLResponse(_ui4_canary.read_text(encoding="utf-8"))
+
     # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
     #
     # OpenAPI schema and Swagger/ReDoc UIs are NOT served at the root
