@@ -2050,3 +2050,29 @@ risks:
       CodeQL #1869 dismissed as won't-fix with this rationale.
   fix_in_version: v3.0.0
   last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-093
+  description: >-
+    Trivy CRITICAL CVE-2026-42496 + HIGH CVE-2026-42497 (perl Archive::Tar):
+    Path traversal via crafted symlinks / arbitrary file modification via crafted
+    hardlinks during archive extraction. Present in perl-base/perl/perl-modules-5.40
+    in backoffice and gateway images as an OS dependency of postgresql-client-17.
+    Trivy status: fix_deferred (no upstream Debian fix at time of v3.0.0 release).
+  severity: medium
+  controls_impacted:
+  - Base image OS dependency hygiene (perl transitive dep via postgresql-client)
+  compensating_controls:
+  - Yashigani does not use perl Archive::Tar at any point. Backup/restore uses
+    Python tarfile. No attacker-controlled data is passed to perl tar extraction.
+    No exploitation path exists in the deployed product.
+  - perl binary present but not on any data-flow path from user or agent input.
+  - Containers run with no-new-privileges + seccomp + AppArmor profiles.
+  - Monitoring upstream Debian for a fix; re-assess at next base image bump.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Not exploitable in deployed Yashigani: no code path passes attacker data
+      to perl Archive::Tar. Fix deferred pending upstream Debian perl patch.
+      Identified during v3.0.0 final gate trivy scan (2026-06-26).
+      Re-assess at next base image bump or when Debian fixes become available.
+  fix_in_version: deferred-pending-upstream
+  last_threat_model_review: '2026-06-26'
