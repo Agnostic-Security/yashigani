@@ -1,5 +1,5 @@
 schema_version: '1.0'
-last_updated: '2026-06-25'
+last_updated: '2026-06-26'
 maintainer: lu@agnosticsec.com
 risks:
 - id: YSG-RISK-001
@@ -2075,4 +2075,72 @@ risks:
       Identified during v3.0.0 final gate trivy scan (2026-06-26).
       Re-assess at next base image bump or when Debian fixes become available.
   fix_in_version: deferred-pending-upstream
+  last_threat_model_review: '2026-06-26'
+- id: YSG-RISK-094
+  description: >-
+    Caddy 3.0.0 image contains CRITICAL/HIGH CVEs in inactive code paths discovered
+    during v3.0.0 final gate trivy/Laura scan (2026-06-26):
+    CVE-2026-30836 (smallstep/certificates@v0.30.0-rc3, CRITICAL): unauthenticated SCEP cert
+    issuance bypass — SCEP not configured in Caddyfile; not reachable.
+    CVE-2026-33186 (grpc@v1.79.1, CRITICAL): gRPC authz bypass — no gRPC port configured.
+    CVE-2026-45447 (libcrypto3/libssl3@3.5.6-r0, HIGH): fix available in 3.5.7-r0.
+    CVE-2026-27135 (nghttp2-libs@1.68.0-r0, HIGH): fix in 1.68.1.
+    CVE-2026-45135/52844/52845 (caddy/v2@v2.11.2, HIGH): fix in v2.11.3/v2.11.4.
+    CVE-2026-34986 (go-jose, HIGH), x/crypto HIGH, x/net HIGH, stdlib HIGH subset.
+    DAST disproven for CRITICAL CVEs: SCEP port not exposed; no gRPC in request path.
+    (WSTG-CONF-05, CWE-1395)
+  severity: medium
+  controls_impacted:
+  - CWE-1395
+  - WSTG-CONF-05
+  - OWASP Cloud-Native Top 10 (insecure default configs)
+  compensating_controls:
+  - SCEP not configured in Caddyfile.selfsigned or Caddyfile.prod — CRITICAL CVE-2026-30836 not reachable.
+  - No gRPC port configured — CRITICAL CVE-2026-33186 not reachable via protocol.
+  - Caddy is the sole external TLS terminator (Caddy alone faces internet); downstream
+    services communicate over mTLS with the internal PKI.
+  - Containers run with no-new-privileges + seccomp + AppArmor.
+  status: accepted
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-26'
+  review_by: '2026-07-15'
+  closure_evidence:
+  - rationale: >-
+      CRITICAL CVEs DAST-disproven: SCEP not exposed (no SCEP stanza in Caddyfile);
+      gRPC not configured (HTTP/2 REST only). HIGH CVEs have fixes available but
+      require base-image rebuild. Bump Caddy to >=2.11.4 in v3.0.1.
+      Discovered: Laura v3.0.0 final gate (2026-06-26). Filed as LAURA-300-001 (pentest).
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-26'
+- id: YSG-RISK-095
+  description: >-
+    Audit masking scope writes (PUT /admin/audit/masking/scope, POST/DELETE
+    /admin/audit/masking/scope/<component>) do not require step-up authentication.
+    An attacker with a hijacked admin session (stolen cookie, no TOTP) can alter
+    audit masking scope — e.g. set mask_all_by_default=false to expose previously-masked
+    display data (IP prefixes, account identifiers) in the audit log UI.
+    DAST-proven: PUT /admin/audit/masking/scope succeeds with a fresh session (no step-up).
+    (WSTG-ATHZ-02, ASVS V6.8, CWE-306)
+  severity: low
+  controls_impacted:
+  - ASVS V6.8 (step-up for sensitive operations)
+  - WSTG-ATHZ-02
+  - CWE-306
+  compensating_controls:
+  - Admin session requires TOTP at login — session hijack requires cookie theft of an active session.
+  - Audit data is tamper-evident (SHA-384 hash chain with daily ECDSA-signed Merkle
+    checkpoint); masking affects display only, not the underlying record integrity.
+  - SIEM config (PUT /admin/audit/siem/config) already requires step-up — higher-value target is protected.
+  - Admin sessions allow reading raw audit export without step-up by design.
+  status: accepted
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-26'
+  review_by: '2026-07-15'
+  closure_evidence:
+  - rationale: >-
+      Display-only impact; hash chain intact; no customer data corruption path.
+      Fix: add assert_fresh_stepup() to PUT /admin/audit/masking/scope and scope
+      POST/DELETE endpoints in v3.0.1. Discovered: Laura v3.0.0 final gate (2026-06-26).
+      Filed as LAURA-300-002 (pentest).
+  fix_in_version: v3.0.1
   last_threat_model_review: '2026-06-26'
