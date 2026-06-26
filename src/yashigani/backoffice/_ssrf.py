@@ -89,15 +89,21 @@ def assert_safe_outbound_url(
     if host in internal_allowed:
         return url  # operator has explicitly permitted this internal host
 
-    # Resolve hostname → IP(s); if DNS fails treat the literal as an IP literal
-    # to check.  Unknown hosts that don't resolve are rejected — we refuse to
-    # store URLs for services that aren't reachable at registration time.
+    # Resolve hostname → IP(s).  Unknown hosts that don't resolve are REJECTED:
+    # a name that fails DNS at registration time must not be stored, because the
+    # SSRF category checks below operate on resolved IPs — falling through on a
+    # resolution failure would silently accept attacker-controlled names such as
+    # "metadata.google.internal" that resolve only inside the target's network
+    # (LAURA-300-001 / CWE-918). Matches audit/writer.validate_siem_url().
     try:
         addrinfo = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
         addrs = {info[4][0] for info in addrinfo}
-    except (socket.gaierror, socket.herror):
-        # Hostname didn't resolve — fall through to literal-IP check.
-        addrs = {host}
+    except (socket.gaierror, socket.herror) as exc:
+        raise ValueError(
+            f"{label} host {host!r} does not resolve — refusing to store a URL "
+            "for an unresolvable host; if this is an internal mesh service, add "
+            f"the hostname to {allowlist_env} (CWE-918 / LAURA-300-001)"
+        ) from exc
 
     for addr_str in addrs:
         try:

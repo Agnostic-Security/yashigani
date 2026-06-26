@@ -40,12 +40,13 @@ RUN apt-get update \
         libxmlsec1-openssl \
         postgresql-client-17 \
         age=1.2.1-1+b5 \
-        # docker-cli: the CLI binary only (no daemon). Used by the extractor
-        # sandbox CliContainerBackend to spawn per-job containers via the
-        # docker-socket-proxy (TCP-filtered API, internal network only).
-        # The binary talks to DOCKER_HOST=tcp://socket-proxy:2375 — never the
-        # raw host socket. The raw /var/run/docker.sock is NOT mounted here.
-        docker-cli \
+        # LAURA-300-002: docker-cli REMOVED. The extractor now runs via
+        # HttpExtractorBackend (YASHIGANI_EXTRACTOR_RUNTIME=http) — the legacy
+        # CliContainerBackend that shelled out to docker-cli is no longer wired,
+        # no docker socket/proxy is reachable from this image, and no Python code
+        # invokes the binary. It was therefore dead weight carrying a CRITICAL
+        # BuildKit CVE (CVE-2026-33747). If the CLI extractor path is ever
+        # revived, reinstall docker-cli here AND restore the socket-proxy mount.
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
