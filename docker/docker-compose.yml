@@ -227,6 +227,12 @@ services:
       YASHIGANI_CADDY_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/caddy
     volumes:
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
+      # 4.0-phase1: shared CSP snippet (defines (csp-policies) named snippet).
+      # Imported at the top level of each Caddyfile variant via:
+      #   import /etc/caddy/Caddyfile.csp
+      # and used inside the site block with:
+      #   import csp-policies
+      - ./Caddyfile.csp:/etc/caddy/Caddyfile.csp:ro
       - caddy_data:/data
       - caddy_config:/config
       - ./tls:/etc/caddy/tls:ro    # only used in ca mode

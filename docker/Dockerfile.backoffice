@@ -67,6 +67,52 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
 COPY src/yashigani/backoffice/templates/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/templates/
 COPY src/yashigani/backoffice/static/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/static/
 
+# 4.0-phase1: Build-time vendor integrity gate (RISK-101 / SC-NEW-002)
+# Verifies every file listed in scripts/vendor-integrity.lock against its
+# stored SHA-384 hash. Fails the build if any hash mismatches or if a vendored
+# file listed in the lock is absent. Closes the supply-chain attack path where
+# an attacker replaces a file on disk without updating the lock.
+#
+# Format: sha384-<base64>  <relative-path-from-package-root>
+# Lines starting with '#' or empty are skipped.
+# The lock uses base64-encoded SHA-384 (HTML SRI format); we use openssl to
+# compute the same encoding for comparison (sha384sum -c uses hex format, not
+# base64 — so we recompute via openssl dgst).
+COPY scripts/vendor-integrity.lock /tmp/vendor-integrity.lock
+RUN set -euo pipefail && \
+    STATIC_ROOT="/usr/local/lib/python3.14/site-packages/yashigani/backoffice" && \
+    fail=0 && \
+    while IFS= read -r line || [ -n "$line" ]; do \
+        # Skip comment and blank lines \
+        case "$line" in \
+            '#'*|'') continue ;; \
+        esac; \
+        hash_b64="${line%%  *}"; \
+        filepath="${line#*  }"; \
+        hash_b64="${hash_b64#sha384-}"; \
+        full_path="$STATIC_ROOT/$filepath"; \
+        if [ ! -f "$full_path" ]; then \
+            echo "INTEGRITY FAIL: $filepath not found in image" >&2; \
+            fail=1; \
+            continue; \
+        fi; \
+        actual=$(openssl dgst -sha384 -binary "$full_path" | openssl base64 -A); \
+        if [ "$actual" != "$hash_b64" ]; then \
+            echo "INTEGRITY FAIL: $filepath" >&2; \
+            echo "  expected: $hash_b64" >&2; \
+            echo "  actual:   $actual" >&2; \
+            fail=1; \
+        else \
+            echo "OK: $filepath"; \
+        fi; \
+    done < /tmp/vendor-integrity.lock && \
+    rm /tmp/vendor-integrity.lock && \
+    if [ "$fail" -ne 0 ]; then \
+        echo "Vendor integrity check FAILED — aborting build." >&2; \
+        exit 1; \
+    fi && \
+    echo "Vendor integrity gate PASSED."
+
 # Alembic config — script_location rewritten for installed package path
 COPY alembic.ini /app/alembic.ini
 RUN sed -i 's|script_location = src/yashigani/db/migrations|script_location = /usr/local/lib/python3.14/site-packages/yashigani/db/migrations|' /app/alembic.ini
