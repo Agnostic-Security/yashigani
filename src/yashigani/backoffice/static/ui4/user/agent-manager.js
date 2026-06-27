@@ -19,6 +19,7 @@
 import { ApiClient, installTrustedTypes, widgets } from '/static/ui4/core/index.js';
 import { LitElement, html, nothing } from '/static/vendor/lit/lit-core.min.js';
 import './session-header.js';
+import './agent-generate.js';
 
 installTrustedTypes();
 void widgets;
@@ -34,6 +35,7 @@ export class YsAgentManagerApp extends LitElement {
     _declared: { state: true },      // Set<string> — skill edit buffer
     _rejected: { state: true },      // string[] — last skills PUT rejections
     _creating: { state: true },
+    _generating: { state: true },   // no-code NL generation panel active
     _busy: { state: true },
     _username: { state: true },
   };
@@ -49,6 +51,7 @@ export class YsAgentManagerApp extends LitElement {
     this._declared = new Set();
     this._rejected = [];
     this._creating = false;
+    this._generating = false;
     this._busy = false;
     this._username = '';
     this.api = new ApiClient({
@@ -114,6 +117,7 @@ export class YsAgentManagerApp extends LitElement {
 
   async _select(uaId) {
     this._creating = false;
+    this._generating = false;
     const [agent, mem] = await Promise.all([
       this.api.get(`/user/agents/${encodeURIComponent(uaId)}`),
       this.api.get(`/user/agents/${encodeURIComponent(uaId)}/memories`),
@@ -136,10 +140,29 @@ export class YsAgentManagerApp extends LitElement {
   // ── agent CRUD ─────────────────────────────────────────────
   _startCreate() {
     this._creating = true;
+    this._generating = false;
     this._selectedId = '';
     this._selected = null;
     this._declared = new Set();
     this._rejected = [];
+  }
+
+  // Open the no-code, NL-driven generation panel (<ys-agent-generate>). Nothing
+  // is created here — the panel only POSTs /user/agents on the user's explicit
+  // "Add to my agent templates" click (human-in-the-loop).
+  _startGenerate() {
+    this._generating = true;
+    this._creating = false;
+    this._selectedId = '';
+    this._selected = null;
+  }
+
+  // Fired by <ys-agent-generate> after the user explicitly commits a draft.
+  async _onAgentAdded(e) {
+    this._generating = false;
+    await this._reload();
+    const uaId = e && e.detail ? e.detail.ua_id : '';
+    if (uaId && this._agents.some((a) => a.ua_id === uaId)) await this._select(uaId);
   }
 
   async _createAgent() {
@@ -294,7 +317,8 @@ export class YsAgentManagerApp extends LitElement {
       <div class="ys-builder-col">
         <div>
           <div class="ys-builder-h">Your agents</div>
-          <button class="ys-btn ys-newagent" @click=${() => this._startCreate()}>+ New agent</button>
+          <button class="ys-btn ys-gen-open" @click=${() => this._startGenerate()}>✨ Describe an agent (no-code)</button>
+          <button class="ys-btn ys-btn-secondary ys-newagent" @click=${() => this._startCreate()}>+ New agent</button>
         </div>
         <div class="ys-ablist">
           ${this._agents.length === 0
@@ -441,9 +465,12 @@ export class YsAgentManagerApp extends LitElement {
   }
 
   _renderRight() {
+    if (this._generating) {
+      return html`<ys-agent-generate @ys-agent-added=${(e) => this._onAgentAdded(e)}></ys-agent-generate>`;
+    }
     if (this._creating) return this._renderCreate();
     if (this._selected) return this._renderEditor();
-    return html`<div class="ys-card"><div class="ys-txt-note">Select an agent on the left, or create a new one.</div></div>`;
+    return html`<div class="ys-card"><div class="ys-txt-note">Select an agent on the left, describe a new one, or create one manually.</div></div>`;
   }
 
   render() {

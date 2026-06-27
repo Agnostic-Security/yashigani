@@ -68,6 +68,34 @@
   padding: var(--ys-sp-5); text-align: center; color: var(--ys-ink-muted);
   font-size: var(--ys-fs-sm);
 }
+
+/* ── no-code NL agent generation (agent-generate.js) ─────────── */
+.ys-gen-col { gap: var(--ys-sp-4); }
+.ys-gen-desc { width: 100%; box-sizing: border-box; }
+.ys-gen-loading { margin-top: var(--ys-sp-3); }
+.ys-gen-summary {
+  white-space: pre-wrap; word-break: break-word; margin: 0;
+  padding: var(--ys-sp-3); border-radius: var(--ys-radius-sm);
+  background: var(--ys-surface-alt); border: 1px solid var(--ys-border);
+}
+.ys-gen-graph-host { height: 38vh; min-height: 280px; }
+.ys-gen-node { padding: var(--ys-sp-2); min-width: 120px; }
+.ys-gen-node-type {
+  font-size: var(--ys-fs-sm); font-weight: 700; text-transform: capitalize;
+  margin-bottom: var(--ys-sp-1);
+}
+.ys-gen-node-label {
+  width: 100%; box-sizing: border-box; border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); background: var(--ys-surface); padding: 2px 6px;
+  font-size: var(--ys-fs-sm); pointer-events: none;
+}
+.ys-gen-draft-tag {
+  display: inline-block; margin-left: var(--ys-sp-2);
+  padding: 0 var(--ys-sp-2); border-radius: var(--ys-radius-sm);
+  font-size: var(--ys-fs-sm); font-weight: 600;
+  background: var(--ys-surface-alt); border: 1px solid var(--ys-border);
+  color: var(--ys-ink-muted); vertical-align: middle;
+}
 .ys-app-session { display: flex; align-items: center; gap: var(--ys-sp-3); font-size: var(--ys-fs-sm); }
 .ys-app-session .ys-app-user { color: #cbd5e1; }
 
