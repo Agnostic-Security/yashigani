@@ -112,14 +112,17 @@ export class YsUserApp extends LitElement {
 
   // ── data load ──────────────────────────────────────────────
   async _loadConstructs() {
-    const [agents, budget, memory, conversations, models] = await Promise.all([
-      this.api.get('/user/agents'),
+    // Chat's "agents to chat with" come from /user/models (which returns both
+    // models and the active registry agents). GET /user/agents is owned by the
+    // 4.0 agent-builder surfaces (user-created Letta agents) and is NOT used
+    // here — see app.py router-precedence note.
+    const [budget, memory, conversations, models] = await Promise.all([
       this.api.get('/user/budget'),
       this.api.get('/user/memory'),
       this.api.get('/user/conversations'),
       this.api.get('/user/models'),
     ]);
-    this._agents = this._coerceList(agents, 'agents');
+    this._agents = (models && Array.isArray(models.agents)) ? models.agents : [];
     this._budget = (budget && typeof budget === 'object') ? (budget.budget ?? budget) : null;
     this._memory = this._coerceList(memory, 'memory');
     this._conversations = this._coerceList(conversations, 'conversations');
@@ -247,7 +250,8 @@ export class YsUserApp extends LitElement {
            @ys-conversation-delete=${(e) => this._onConvDelete(e)}
            @ys-open-settings=${() => this._onOpenSettings()}
            @ys-prefs-change=${(e) => this._onPrefsChange(e)}>
-        <ys-session-header .username=${this._username}></ys-session-header>
+        <ys-session-header .username=${this._username}
+          active="chat" .showSettings=${true}></ys-session-header>
         <div class="ys-app-body">
           <ys-user-sidebar
             .api=${this.api}

@@ -1268,19 +1268,29 @@ def create_backoffice_app() -> FastAPI:
     # fix/medlow-findings — cloud provider API key management (KMS-backed)
     app.include_router(cloud_keys_router, tags=["cloud-keys"])
 
+    # 4.0 Letta agent capabilities — /user/agents, /user/memories, /user/skills
+    # (RISK-097/108 scope-intersection; BOLA-enforced; require_user_session).
+    #
+    # PRECEDENCE (4.0 agent-builder): this router is included BEFORE user_ui_router
+    # so that GET /user/agents resolves to the USER-CREATED agent list (ua_id
+    # shape) consumed by the agent-builder surfaces — NOT the older Phase-2
+    # registry-agents stub in user_ui.py (which shares the same path). FastAPI is
+    # first-match-wins, so order is the deconfliction. The chat surface sources
+    # its "agents to chat with" from GET /user/models (which returns both models
+    # and registry agents), so it does not depend on the shadowed stub.
+    from yashigani.backoffice.routes.user_agents import router as _user_agents_router
+    app.include_router(_user_agents_router, tags=["user-agents"])
+
     # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
-    # /chat page + /user/* data endpoints.  All enforce require_user_session.
-    # Mounted without a prefix so routes carry their own /chat and /user/ paths.
+    # /chat + /agents + /builder pages + /user/* data endpoints. All enforce
+    # require_user_session. Mounted without a prefix so routes carry their own
+    # /chat and /user/ paths. (NB: its GET /user/agents registry stub is now
+    # shadowed by the agent-builder router above — see precedence note.)
     app.include_router(user_ui_router, tags=["user-ui"])
 
     # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced via
     # account_id scoping on every per-conversation query).
     app.include_router(user_conversations_router, tags=["user-conversations"])
-
-    # 4.0 Letta agent capabilities — /user/agents, /user/memories, /user/skills
-    # (RISK-097/108 scope-intersection; BOLA-enforced; require_user_session)
-    from yashigani.backoffice.routes.user_agents import router as _user_agents_router
-    app.include_router(_user_agents_router, tags=["user-agents"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:
