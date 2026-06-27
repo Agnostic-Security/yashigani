@@ -2093,14 +2093,17 @@ services:
     restart: unless-stopped
     mem_limit: ${YASHIGANI_LANGFLOW_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_LANGFLOW_CPU_LIMIT:-1.0}
-    # Captain Bucket-C: entrypoint shim reads YASHIGANI_INTERNAL_BEARER from
-    # /run/secrets/yashigani_internal_bearer and exports it as OPENAI_API_KEY.
+    # Phase 5 §C: entrypoint shim reads the per-agent langflow_yashigani_token
+    # (not the shared yashigani_internal_bearer) and exports it as OPENAI_API_KEY.
+    # This token is langflow's P1 credential for outbound calls to gateway:8081/v1.
+    # Phase 3 (GATED): add this token to gateway _TOKEN_ROLE_MAP so the gateway
+    # resolves the P1 role from it (until then gateway falls back to bearer-group check).
     # Langflow 1.9.2 CMD: python -m langflow run --host 0.0.0.0 --port 7860
     # (verified from upstream Dockerfile at tag 1.9.2).
     entrypoint:
       - /bin/sh
       - -c
-      - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && exec "$@"'
+      - 'OPENAI_API_KEY=$(cat /run/secrets/langflow_yashigani_token) && export OPENAI_API_KEY && exec "$@"'
       - '--'
     command: ["python", "-m", "langflow", "run", "--host", "0.0.0.0", "--port", "7860"]
     environment:
@@ -2131,11 +2134,12 @@ services:
     volumes:
       - langflow_data:/app/langflow
     # PROBE-AG1 fix: per-key Docker named-secrets — replaces wholesale ./secrets mount.
-    # langflow only needs yashigani_internal_bearer (entrypoint shim: cat /run/secrets/yashigani_internal_bearer).
+    # Phase 5 §C: langflow uses langflow_yashigani_token (per-agent P1 token) instead
+    # of the shared yashigani_internal_bearer for its OPENAI_API_KEY outbound shim.
     # caddy_internal_hmac, PKI certs, postgres/redis passwords are NOT exposed to langflow.
     secrets:
-      - source: yashigani_internal_bearer
-        target: yashigani_internal_bearer
+      - source: langflow_yashigani_token
+        target: langflow_yashigani_token
         mode: 0440
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:7860/health', timeout=5)\""]
@@ -2161,13 +2165,12 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (agent-bundles.yaml:53).
     # No cap_add: langflow binds port 7860 (non-privileged).
     cap_drop: [ALL]
-    # YSG-SECRETS-DIST-002 CLOSED (Laura A1): langflow UID 1000 cannot read
-    # yashigani_internal_bearer as owner (host file chowned 0:2002 0640) and
-    # cap_drop:[ALL] drops DAC_OVERRIDE. GID 2002 retained on langflow ONLY —
-    # it is the sole remaining group-read consumer. All other services removed.
-    # See: cap_drop+CAP_DAC_OVERRIDE doc note (compose lines 587-591 budget-redis).
-    group_add:
-      - "2002"
+    # Phase 5 §C: langflow now reads langflow_yashigani_token (Docker named secret,
+    # mode 0440, owned root:root inside the container — readable by any UID via
+    # Docker's secret mount, no GID 2002 required).  GID 2002 group_add removed:
+    # langflow is no longer a consumer of the shared yashigani_internal_bearer.
+    # YSG-SECRETS-DIST-002: blast radius unchanged (bearer GID 2002 group reduced
+    # by 1 consumer — strictly tighter). See compose lines 587-591 for original note.
     # YSG-RISK-055 UA-10 (v2.24.1): langflow moves from `data` to
     # `langflow_isolated`. Gateway joins langflow_isolated so langflow can still
     # resolve `gateway` by DNS and route LLM calls via OPENAI_API_BASE.
@@ -2973,6 +2976,12 @@ secrets:
   # langflow + letta entrypoint shim: cat /run/secrets/yashigani_internal_bearer
   yashigani_internal_bearer:
     file: ./secrets/yashigani_internal_bearer
+
+  # Phase 5 §C: per-agent P1 outbound token for langflow → gateway calls.
+  # langflow entrypoint shim reads this instead of the shared yashigani_internal_bearer.
+  # Phase 3 (GATED): wire into gateway _TOKEN_ROLE_MAP to resolve langflow's P1 role.
+  langflow_yashigani_token:
+    file: ./secrets/langflow_yashigani_token
 
   # letta-pgbouncer: wrapper command reads password; pgbouncer-letta.ini reads certs
   pgbouncer_authenticator_password:

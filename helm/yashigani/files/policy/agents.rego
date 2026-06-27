@@ -212,6 +212,21 @@ agent_response_allowed if {
 
     # No PII gate trigger
     not input.response_pii_detected == true
+
+    # Phase 5 §E.11: Langflow callee hard-cap (see _langflow_callee_ceiling_ok).
+    _langflow_callee_ceiling_ok
+}
+
+# ---------------------------------------------------------------------------
+# _langflow_callee_ceiling_ok — Phase 5 / §C §E.11 / RISK-108 analogue.
+# Helm parity: byte-identical to policy/agents.rego (canonical).
+# ---------------------------------------------------------------------------
+_langflow_callee_ceiling_ok if {
+    input.target_agent.agent_id != "agent__langflow"
+}
+_langflow_callee_ceiling_ok if {
+    input.target_agent.agent_id == "agent__langflow"
+    sensitivity_rank(input.response_sensitivity) <= sensitivity_rank("INTERNAL")
 }
 
 # Compound decision object — mirrors v1_routing.rego response_decision shape
@@ -259,6 +274,14 @@ agent_response_deny_reason := "missing_agent_identity" if {
 agent_response_deny_reason := "missing_agent_identity" if {
     not agent_response_allowed
     not input.target_agent.agent_id != ""
+}
+
+# Phase 5 §E.11: Langflow callee ceiling hard-cap deny reason (Helm parity).
+agent_response_deny_reason := "langflow_callee_ceiling_hard_cap" if {
+    not agent_response_allowed
+    input.caller.agent_id != ""
+    input.target_agent.agent_id == "agent__langflow"
+    sensitivity_rank(input.response_sensitivity) > sensitivity_rank("INTERNAL")
 }
 
 # #4 — self-describing denial for the agent-to-agent gate (same package

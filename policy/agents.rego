@@ -243,6 +243,31 @@ agent_response_allowed if {
 
     # No PII gate trigger
     not input.response_pii_detected == true
+
+    # Phase 5 §E.11: Langflow callee hard-cap (see _langflow_callee_ceiling_ok).
+    _langflow_callee_ceiling_ok
+}
+
+# ---------------------------------------------------------------------------
+# _langflow_callee_ceiling_ok — Phase 5 / §C §E.11 / RISK-108 analogue.
+#
+# Hard policy cap: when agent__langflow is the TARGET of an agent call, the
+# response sensitivity must not exceed INTERNAL.  This is enforced in policy
+# (independent of registry sensitivity_ceiling) so the cap cannot be bypassed
+# by a misconfigured registry entry. Analogue of the OpenClaw MF-3 rule.
+#
+# For all OTHER target agents this rule is trivially true (unconstrained).
+# ---------------------------------------------------------------------------
+
+# Non-langflow target: no additional cap.
+_langflow_callee_ceiling_ok if {
+    input.target_agent.agent_id != "agent__langflow"
+}
+
+# Langflow target: allow only when response sensitivity ≤ INTERNAL (rank 1).
+_langflow_callee_ceiling_ok if {
+    input.target_agent.agent_id == "agent__langflow"
+    sensitivity_rank(input.response_sensitivity) <= sensitivity_rank("INTERNAL")
 }
 
 # Compound decision object — mirrors v1_routing.rego response_decision shape
@@ -290,6 +315,17 @@ agent_response_deny_reason := "missing_agent_identity" if {
 agent_response_deny_reason := "missing_agent_identity" if {
     not agent_response_allowed
     not input.target_agent.agent_id != ""
+}
+
+# Phase 5 §E.11: Langflow callee ceiling hard-cap deny reason.
+# Fires when agent__langflow is the target AND response sensitivity > INTERNAL.
+# Takes precedence over the generic response_sensitivity_exceeds_caller_ceiling
+# reason so operators can distinguish the hard-cap from a normal ceiling denial.
+agent_response_deny_reason := "langflow_callee_ceiling_hard_cap" if {
+    not agent_response_allowed
+    input.caller.agent_id != ""
+    input.target_agent.agent_id == "agent__langflow"
+    sensitivity_rank(input.response_sensitivity) > sensitivity_rank("INTERNAL")
 }
 
 # #4 — self-describing denial for the agent-to-agent gate (same package

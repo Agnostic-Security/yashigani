@@ -131,6 +131,16 @@ return 1
         allowed_paths: list,
         allowed_cidrs: list | None = None,
         protocol: str = "openai",
+        # 4.0 Phase 5 §C + §A.3 (additive — backward-compatible defaults).
+        # `kind` distinguishes bundled callee agents ("agent") from NHI instances
+        # ("nhi").  `sensitivity_ceiling` caps what sensitivity class the agent may
+        # receive in a response (None = unrestricted; "INTERNAL" = hard INTERNAL cap).
+        # `allowed_tools` is the NHI-specific explicit tool list (Phase 3 §A.3);
+        # stored here as a stub so the registry schema is consistent before Phase 3
+        # wires the NHI instantiation endpoint.
+        kind: str = "agent",
+        sensitivity_ceiling: Optional[str] = None,
+        allowed_tools: list | None = None,
     ) -> tuple[str, str]:
         """
         Register a new agent atomically via Lua script.
@@ -170,6 +180,11 @@ return 1
             "allowed_caller_groups",   json.dumps(allowed_caller_groups),
             "allowed_paths",           json.dumps(allowed_paths),
             "allowed_cidrs",           json.dumps(allowed_cidrs or []),
+            # 4.0 Phase 5 / §A.3 (additive fields — older entries simply lack them;
+            # _decode_agent() returns defaults for missing keys).
+            "kind",                    kind,
+            "sensitivity_ceiling",     sensitivity_ceiling or "",
+            "allowed_tools",           json.dumps(allowed_tools or []),
         ]
 
         keys = [
@@ -284,6 +299,8 @@ return 1
         allowed_fields = {
             "name", "upstream_url", "groups",
             "allowed_caller_groups", "allowed_paths", "allowed_cidrs",
+            # 4.0 Phase 5 / §A.3 additions (additive)
+            "kind", "sensitivity_ceiling", "allowed_tools",
         }
         reg_key = f"agent:reg:{agent_id}"
         mapping = {}
@@ -360,6 +377,11 @@ return 1
             b"allowed_caller_groups": json.dumps(agent.get("allowed_caller_groups", [])).encode("utf-8"),
             b"allowed_paths": json.dumps(agent.get("allowed_paths", [])).encode("utf-8"),
             b"allowed_cidrs": json.dumps(agent.get("allowed_cidrs", [])).encode("utf-8"),
+            # 4.0 Phase 5 / §A.3: additive fields restored from durable store.
+            # Pre-4.0 durable rows lack these; default to "agent" / "" / [].
+            b"kind": str(agent.get("kind") or "agent").encode("utf-8"),
+            b"sensitivity_ceiling": str(agent.get("sensitivity_ceiling") or "").encode("utf-8"),
+            b"allowed_tools": json.dumps(agent.get("allowed_tools") or []).encode("utf-8"),
         }
         pipe = self._r.pipeline()
         pipe.hset(reg_key, mapping=mapping)
@@ -477,6 +499,11 @@ return 1
         # callers can distinguish pool-managed from externally-deployed agents.
         pool_image = upstream_url[len("pool://"):] if upstream_url.startswith("pool://") else None
 
+        # 4.0 Phase 5 / §A.3: sensitivity_ceiling — stored as empty string when None;
+        # surface as None so callers can use `if agent["sensitivity_ceiling"]`.
+        _raw_ceiling = _b(b"sensitivity_ceiling")
+        _sensitivity_ceiling: Optional[str] = _raw_ceiling if _raw_ceiling else None
+
         return {
             "agent_id": agent_id,
             "name": _b(b"name"),
@@ -494,4 +521,9 @@ return 1
             "token_rotation_schedule": _b(b"token_rotation_schedule"),
             # v2.4.1 — pool_image (None for externally-deployed agents)
             "pool_image": pool_image,
+            # 4.0 Phase 5 / §A.3 — NHI + callee agent metadata (additive; absent in
+            # pre-4.0 entries → default values applied here for backward compat).
+            "kind": _b(b"kind") or "agent",
+            "sensitivity_ceiling": _sensitivity_ceiling,
+            "allowed_tools": _j(b"allowed_tools"),
         }

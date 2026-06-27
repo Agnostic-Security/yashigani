@@ -933,3 +933,86 @@ test_verified_principal_wrong_group_denied if {
         "request": {"remainder_path": "/v1/run"},
     }
 }
+
+# ===========================================================================
+# 11. Phase 5 §C §E.11 — _langflow_callee_ceiling_ok hard-cap tests
+#
+# agent__langflow has a HARD POLICY CAP: response sensitivity must not
+# exceed INTERNAL.  This is independent of the caller's registered
+# sensitivity_ceiling — the cap is enforced in policy so it cannot be
+# bypassed via a misconfigured registry entry.
+#
+# 11a. INTERNAL response to agent__langflow → ALLOW (within cap)
+# 11b. CONFIDENTIAL response to agent__langflow → DENY (hard-cap)
+#      deny reason == "langflow_callee_ceiling_hard_cap" (not generic)
+# 11c. RESTRICTED response to agent__langflow → DENY (hard-cap)
+# 11d. Non-langflow target unaffected: CONFIDENTIAL within CONFIDENTIAL ceiling → ALLOW
+# 11e. Regression: langflow hard-cap does not suppress other deny reasons
+#      (PII gate still fires for langflow when response is within cap)
+# ===========================================================================
+
+# 11a. INTERNAL response to agent__langflow with CONFIDENTIAL caller ceiling → ALLOW.
+#      The hard-cap (≤ INTERNAL) is satisfied; caller ceiling (CONFIDENTIAL ≥ INTERNAL) satisfied.
+test_langflow_callee_internal_response_allows if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11b. CONFIDENTIAL response to agent__langflow → DENY (hard-cap: rank 2 > INTERNAL rank 1).
+test_langflow_callee_confidential_response_denies if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11b-reason. deny reason is "langflow_callee_ceiling_hard_cap" (distinguishable
+# from generic "response_sensitivity_exceeds_caller_ceiling").
+test_langflow_callee_confidential_response_deny_reason if {
+    d := data.yashigani.agent_response_decision with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+    d.allow == false
+    d.reason == "langflow_callee_ceiling_hard_cap"
+}
+
+# 11c. RESTRICTED response to agent__langflow → DENY (rank 3 > INTERNAL rank 1).
+test_langflow_callee_restricted_response_denies if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "RESTRICTED"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+}
+
+# 11d. Non-langflow target: hard-cap rule is trivially true, normal ceiling applies.
+#      A CONFIDENTIAL response to a non-langflow target with CONFIDENTIAL ceiling → ALLOW.
+test_non_langflow_target_unaffected_by_hard_cap if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent-other"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11e. PII gate still fires for langflow when response is within the hard-cap.
+#      (PII beats the hard-cap — both conditions contribute to the deny.)
+test_langflow_callee_pii_still_blocks_within_cap if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": true,
+    }
+}
