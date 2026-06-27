@@ -1075,6 +1075,30 @@ def create_backoffice_app() -> FastAPI:
                 return RedirectResponse(url="/login?next=/chat", status_code=302)
             return HTMLResponse(_ui4_chat.read_text(encoding="utf-8"))
 
+    # ── Yashigani 4.0 ADMIN app (Wave 1) — 3.0 dashboard.js rebuild ──────────
+    # Served at the PARALLEL route /admin4/ so the existing /admin/ keeps
+    # working untouched during the admin rebuild (the final /admin/ → ui4 flip
+    # happens after all Wave-2 module groups land). Same shared-layer stack as
+    # /chat: assets under /static/ui4/, page carries its own strict CSP +
+    # Trusted-Types meta so the safe-render/TT pipeline is enforced even before
+    # Su's Caddy headers land (feat/4.0-csp-vendoring must add /admin4/* to the
+    # strict-TT route set). Admin-session-gated by a lightweight cookie
+    # pre-flight (mirrors admin_dashboard_page / ASVS V1.4.1); cryptographic
+    # session validation happens on every subsequent /dashboard/* and /admin/*
+    # API call (SessionStore.get()).
+    _ui4_admin = _static_dir / "ui4" / "admin" / "admin.html"
+    if _ui4_admin.exists():
+
+        @app.get("/admin4/", include_in_schema=False)
+        async def ui4_admin_page(request: Request):
+            _admin_cookies = (
+                "__Host-yashigani_admin_session",
+                "__Host-yashigani_session",
+            )
+            if not any(request.cookies.get(k) for k in _admin_cookies):
+                return RedirectResponse(url="/admin/login?next=/admin4/", status_code=302)
+            return HTMLResponse(_ui4_admin.read_text(encoding="utf-8"))
+
     # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
     #
     # OpenAPI schema and Swagger/ReDoc UIs are NOT served at the root

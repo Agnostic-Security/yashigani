@@ -1,0 +1,142 @@
+/* Yashigani 4.0 admin shell — layout + module chrome. CLASSES-ONLY.
+ *
+ * Strict CSP (style-src 'self', NO 'unsafe-inline') forbids inline style= and
+ * <style>. Every visual treatment here is a class; the shell + reference module
+ * reference only these + the shared design-system tokens (design-system.css).
+ * No colours/spacing literals beyond the shared --ys-* custom properties.
+ */
+
+/* ── app shell grid: topbar over [nav | content] ─────────────────────────── */
+.ys-admin-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.ys-admin-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── top bar ─────────────────────────────────────────────────────────────── */
+.ys-admin-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--ys-nav-bg);
+  color: #fff;
+  padding: var(--ys-sp-3) var(--ys-sp-5);
+  box-shadow: var(--ys-elev-1);
+}
+.ys-admin-brand { display: flex; align-items: baseline; gap: var(--ys-sp-3); }
+.ys-admin-brand-mark { font-weight: 700; color: var(--ys-brand-orange); letter-spacing: 0.01em; }
+.ys-admin-brand-tag {
+  font-size: var(--ys-fs-sm); font-weight: 600; color: #cbd5e1;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.ys-admin-section-title {
+  margin-left: var(--ys-sp-3); padding-left: var(--ys-sp-3);
+  border-left: 1px solid rgba(255, 255, 255, 0.2);
+  font-size: var(--ys-fs-base); color: #e2e8f0;
+}
+.ys-admin-session { display: flex; align-items: center; gap: var(--ys-sp-3); font-size: var(--ys-fs-sm); }
+.ys-admin-user { color: #cbd5e1; }
+
+/* ── left nav ────────────────────────────────────────────────────────────── */
+.ys-admin-nav {
+  width: 232px;
+  flex-shrink: 0;
+  background: var(--ys-surface);
+  border-right: 1px solid var(--ys-border);
+  padding: var(--ys-sp-3) var(--ys-sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+}
+.ys-admin-nav-empty { padding: var(--ys-sp-3); }
+.ys-admin-nav-link {
+  display: flex; align-items: center; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-2) var(--ys-sp-3);
+  border-radius: var(--ys-radius-sm);
+  color: var(--ys-ink-muted);
+  text-decoration: none;
+  font-size: var(--ys-fs-base); font-weight: 500;
+  cursor: pointer;
+}
+.ys-admin-nav-link:hover { background: var(--ys-surface-alt); color: var(--ys-ink); }
+.ys-admin-nav-active { background: var(--ys-blue-bg); color: var(--ys-brand-blue); }
+.ys-admin-nav-icon { width: 1.2em; text-align: center; }
+.ys-admin-nav-label { flex: 1; }
+
+/* ── content area ────────────────────────────────────────────────────────── */
+.ys-admin-content { flex: 1; min-width: 0; overflow-y: auto; background: var(--ys-bg); }
+.ys-admin-content-pad { padding: var(--ys-sp-5); }
+.ys-admin-2col {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: var(--ys-sp-4);
+}
+@media (max-width: 900px) {
+  .ys-admin-2col { grid-template-columns: 1fr; }
+}
+
+/* ── stat cards ──────────────────────────────────────────────────────────── */
+.ys-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--ys-sp-4);
+  margin-bottom: var(--ys-sp-4);
+}
+.ys-stat-card {
+  background: var(--ys-surface);
+  border-radius: var(--ys-radius);
+  box-shadow: var(--ys-elev-1);
+  padding: var(--ys-sp-4);
+}
+.ys-stat-num { font-size: 1.8rem; font-weight: 700; color: var(--ys-ink); }
+.ys-stat-num--sm { font-size: 1.1rem; }
+.ys-stat-num--warn { color: var(--ys-red-fg); }
+.ys-stat-label { margin-top: var(--ys-sp-1); font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+
+/* ── service health cards ────────────────────────────────────────────────── */
+.ys-svc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--ys-sp-3);
+}
+.ys-svc-card {
+  display: flex; align-items: center; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-3);
+  border: 1px solid var(--ys-border-faint);
+  border-radius: var(--ys-radius-sm);
+  background: var(--ys-surface-alt);
+}
+.ys-svc-meta { flex: 1; min-width: 0; }
+.ys-svc-name { font-weight: 600; font-size: var(--ys-fs-base); }
+
+/* ── semaphores ──────────────────────────────────────────────────────────── */
+.ys-semaphore {
+  display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+  flex-shrink: 0; background: var(--ys-ink-faint);
+}
+.ys-semaphore--ok { background: #22c55e; }
+.ys-semaphore--degraded { background: #f59e0b; }
+.ys-semaphore--critical { background: var(--ys-red-fg); }
+.ys-semaphore--p1 { background: #dc2626; }
+.ys-semaphore--p2 { background: #ea580c; }
+.ys-semaphore--p3 { background: #f59e0b; }
+.ys-semaphore--p4 { background: #3b82f6; }
+.ys-semaphore--p5 { background: var(--ys-ink-faint); }
+
+/* ── alert priority list ─────────────────────────────────────────────────── */
+.ys-alert-list { list-style: none; margin: 0; padding: 0; }
+.ys-alert-item {
+  display: flex; align-items: center; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-2) 0;
+  border-bottom: 1px solid var(--ys-border-faint);
+}
+.ys-alert-item:last-child { border-bottom: none; }
+.ys-alert-label { flex: 1; font-size: var(--ys-fs-base); }
+.ys-alert-count { font-weight: 700; font-variant-numeric: tabular-nums; }
+.ys-alert-count--zero { color: var(--ys-ink-faint); font-weight: 500; }
