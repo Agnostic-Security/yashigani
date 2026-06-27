@@ -1542,9 +1542,13 @@ def _finalize(body, identity, request_id, final_text, transcript, blocked_any,
     # here so the wording is GUARANTEED regardless of which model answered.
     if blocked_any and final_text:
         import re as _re
+        # Strip the transient-retry phrase AND any trailing "... if <clause>" tail it
+        # left dangling (e.g. "try again later if needed" -> ""), then collapse the
+        # double-space the removal leaves. Guaranteed clean regardless of model phrasing.
         final_text = _re.sub(
-            r'\s*(?:please\s+)?try\s+again\s+(?:later|shortly|soon|in\s+a\s+(?:moment|bit|little while|few\s+\w+))\b[.!]?',
-            '', final_text, flags=_re.IGNORECASE).strip()
+            r'\s*(?:please\s+)?try\s+again\s+(?:later|shortly|soon|in\s+a\s+(?:moment|bit|little while|few\s+\w+))\b(?:\s+if\b[^.!?]*)?[.!]?',
+            '', final_text, flags=_re.IGNORECASE)
+        final_text = _re.sub(r'[ \t]{2,}', ' ', final_text).strip()
 
     # Append a COMPACT, OPAQUE coded transcript so the customer "record all
     # outputs" requirement is met inline WITHOUT leaking the security logic
