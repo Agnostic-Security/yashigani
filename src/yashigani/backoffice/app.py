@@ -895,7 +895,11 @@ def create_backoffice_app() -> FastAPI:
         # can legitimately be large; the global 4 MB limit still applies.
         # 4.0 Phase 2: user document upload cap.  Caddy also enforces 10 MB;
         # this middleware is belt-and-braces BEFORE the upload handler runs.
-        ("/user/documents", 10 * 1024 * 1024),  # 10 MB — YASHIGANI_USER_UPLOAD_MAX_MB default
+        # 4.0 Phase 2 JSON upload: the body contains the file as base64
+        # (content_base64 field). base64 inflates by ~4/3, so a 10 MB file
+        # sends ~13.3 MB of JSON. Set the pre-check to 14 MB to give headroom.
+        # The handler enforces the decoded 10 MB limit post-decode.
+        ("/user/documents", 14 * 1024 * 1024),  # 14 MB — covers base64 of 10 MB file
     ]
 
     @app.middleware("http")

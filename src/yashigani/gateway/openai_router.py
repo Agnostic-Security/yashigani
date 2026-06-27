@@ -1181,7 +1181,11 @@ def _encoded_payload_audit(
         logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
 
 
-def _sse_from_completion(completion: dict, headers: dict) -> StreamingResponse:
+def _sse_from_completion(
+    completion: dict,
+    headers: dict,
+    verdict_tail: Optional[dict] = None,
+) -> StreamingResponse:
     """Wrap a buffered OpenAI chat-completion dict as a single-chunk SSE stream.
 
     F-STREAM (2026-06-09): Open WebUI (and any OpenAI-compatible client) sends
@@ -1232,6 +1236,16 @@ def _sse_from_completion(completion: dict, headers: dict) -> StreamingResponse:
         yield f"data: {json.dumps(_frame({'content': content}, None))}\n\n"
         # 3) close with finish_reason and empty delta
         yield f"data: {json.dumps(_frame({}, finish_reason))}\n\n"
+        # 4) optional out-of-band structured verdict tail (RISK-105 anti-spoofing).
+        #    Emitted BEFORE [DONE] so the SSE client can capture it in the same
+        #    stream read loop.  Fields: blocked / user_alert / decision_codes.
+        #    The 4.0 UI sse.js reads these as `structuredTail` and passes them to
+        #    onMessageDone(fullText, structuredTail) → ys-verdict-banner renders them
+        #    as TRUSTED-CHROME, NEVER by scanning message text (spec §4.2).
+        #    NEVER for OPA/client-policy pre-stream blocks — those return HTTP 403
+        #    JSONResponse before this function is called.
+        if verdict_tail:
+            yield f"data: {json.dumps(verdict_tail)}\n\n"
         yield "data: [DONE]\n\n"
 
     # SSE-specific headers; merge the caller's X-Yashigani-* headers on top.
@@ -2812,7 +2826,29 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # success, PII-redacted success, and agent-call success — all funnel here.
     _completion = response.model_dump()
     if body.stream:
-        return _sse_from_completion(_completion, headers)
+        # RISK-105 anti-spoofing: when response inspection blocked the response
+        # (response_verdict == "blocked"), emit a structured out-of-band verdict
+        # tail frame so the 4.0 UI can render ys-verdict-banner from TRUSTED-CHROME
+        # fields — never by scanning the message text for a sentinel string.
+        #
+        # Scope: this covers ONLY in-stream blocks (response inspection, injection
+        # detection) that reach this return point.  Pre-stream OPA / client-policy
+        # blocks return JSONResponse(403) earlier in the handler and never reach
+        # here; those are handled by the UI's onError callback from a non-200 HTTP.
+        _verdict_tail: Optional[dict] = None
+        if response_verdict == "blocked":
+            _verdict_tail = {
+                "blocked": True,
+                "user_alert": {
+                    "user_message": (
+                        "This response was held by the Yashigani security policy. "
+                        "Contact an administrator for details."
+                    ),
+                    "policy_id": "RISK-105",
+                },
+                "decision_codes": [],
+            }
+        return _sse_from_completion(_completion, headers, verdict_tail=_verdict_tail)
 
     return JSONResponse(
         content=_completion,

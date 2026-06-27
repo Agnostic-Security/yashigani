@@ -32,7 +32,10 @@ Last updated: 2026-06-27T00:00:00+00:00
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
+import math
 import os
 import pathlib
 import posixpath
@@ -40,6 +43,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import (
     UserSession,
@@ -82,6 +86,36 @@ _EXT_TO_MIME: dict[str, str] = {
 
 _DEFAULT_MAX_UPLOAD_MB: int = 10
 _BYTES_PER_MB: int = 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# JSON upload body (shared-layer-spec §2; ApiClient.mutate sends JSON base64)
+# ---------------------------------------------------------------------------
+
+class DocumentUploadBody(BaseModel):
+    """
+    JSON body for POST /user/documents (RISK-112).
+
+    The 4.0 user UI sends the file as base64-encoded JSON (never as multipart)
+    so that the audited ApiClient.mutate (same-origin credentials, X-Yashigani-Plane
+    header) is used throughout — not a raw <form> or fetch(multipart).
+
+    Fields
+    ------
+    filename      : original filename from the browser File object (may include
+                    spaces / Unicode — the server guards it via _guard_filename).
+    content_type  : MIME declared by the browser (File.type || 'application/octet-stream').
+    content_base64: standard base64 of the file bytes (from FileReader.readAsDataURL,
+                    data-URL prefix stripped by the UI before sending).
+    route         : doc-OPA route key (see DocumentInspectionPipeline).
+    pseudonymize_mode: 'A' (default) or 'B'.
+    """
+
+    filename: str
+    content_type: str
+    content_base64: str
+    route: str = "ingress-upload"
+    pseudonymize_mode: str = "A"
 
 
 def _user_upload_max_bytes() -> int:
@@ -158,16 +192,19 @@ def _guard_filename(name: str) -> str:
     return safe
 
 
-def _resolve_declared_mime(upload: UploadFile, safe_filename: str) -> str:
+def _check_allowed_mime(declared: str, safe_filename: str) -> str:
     """
-    Resolve the declared MIME from the upload's Content-Type header,
-    falling back to extension-derived MIME, falling back to
-    'application/octet-stream' (authoritative decision is the pipeline sniff).
+    Core MIME allowlist check (pure-string, RISK-112).
 
-    Rejects unknown (non-allowlisted) declared MIME claims immediately so the
-    pipeline never sees content that is obviously wrong-typed.
+    Normalises the declared MIME (strip charset params, lowercase), falls back
+    to extension-derived MIME when the client sent nothing useful, then rejects
+    any MIME not in _ALLOWED_DECLARED_MIMES.
+
+    Separated from _resolve_declared_mime so the JSON body handler can call it
+    directly with a plain string. _resolve_declared_mime remains as a thin
+    wrapper for backward-compatibility with existing callers / contract tests.
     """
-    declared = (upload.content_type or "").split(";")[0].strip().lower()
+    declared = declared.split(";")[0].strip().lower() if declared else ""
     if not declared or declared == "application/octet-stream":
         # Derive from extension if the client sent no useful Content-Type
         ext = pathlib.Path(safe_filename).suffix.lower()
@@ -186,6 +223,23 @@ def _resolve_declared_mime(upload: UploadFile, safe_filename: str) -> str:
         )
 
     return declared
+
+
+def _resolve_declared_mime(upload: UploadFile, safe_filename: str) -> str:
+    """
+    Resolve the declared MIME from the upload's Content-Type header,
+    falling back to extension-derived MIME, falling back to
+    'application/octet-stream' (authoritative decision is the pipeline sniff).
+
+    Rejects unknown (non-allowlisted) declared MIME claims immediately so the
+    pipeline never sees content that is obviously wrong-typed.
+
+    NOTE: This wrapper exists for backward-compatibility with the contract tests
+    (CT-112-6) which call it directly with an UploadFile mock.  New code that
+    has a plain string should call _check_allowed_mime() instead.
+    """
+    declared = (upload.content_type or "")
+    return _check_allowed_mime(declared, safe_filename)
 
 
 def _build_pipeline():
@@ -231,9 +285,9 @@ async def user_chat_page(request: Request):
         return RedirectResponse(url="/login?next=/chat", status_code=302)
 
     _static_dir = pathlib.Path(__file__).parents[2] / "backoffice" / "static"
-    chat_html = _static_dir / "ui4" / "chat.html"
+    chat_html = _static_dir / "ui4" / "user" / "chat.html"
     if not chat_html.exists():
-        logger.error("user_chat_page: ui4/chat.html not found at %s", chat_html)
+        logger.error("user_chat_page: ui4/user/chat.html not found at %s", chat_html)
         raise HTTPException(
             status_code=500,
             detail={"error": "chat_ui_unavailable", "message": "User UI not deployed yet."},
@@ -387,18 +441,21 @@ async def user_memory(session: UserSession):
 @router.post("/user/documents")
 async def user_upload_document(
     session: UserSession,
-    file: UploadFile,
-    route: str = "ingress-upload",
-    pseudonymize_mode: str = "A",
+    upload: DocumentUploadBody,
 ):
     """
     Upload a document for doc-OPA evaluation (RISK-112).
 
+    Accepts JSON body ``{filename, content_type, content_base64, route?,
+    pseudonymize_mode?}`` — matches what the 4.0 shared-layer ApiClient.mutate
+    sends (shared-layer-spec §2). The file bytes are base64-encoded by the
+    browser before sending (FileReader.readAsDataURL, data-URL prefix stripped).
+
     Hardening (pre-pipeline guards, defence-in-depth):
       1. Filename path-traversal guard: null bytes, path separators, dot-only
          names rejected; result clamped to POSIX basename (CWE-22).
-      2. Size cap: YASHIGANI_USER_UPLOAD_MAX_MB (default 10 MB); reads until
-         cap exceeded, then discards and returns 413.
+      2. Size cap: YASHIGANI_USER_UPLOAD_MAX_MB (default 10 MB); the decoded
+         byte length is checked after base64 decode; 413 if exceeded.
       3. Declared content-type must be in the allowed set (unknown MIME →
          422 before the pipeline runs).
 
@@ -409,9 +466,9 @@ async def user_upload_document(
       unsupported format.
 
     Returns:
-      The OPA verdict (action, policy_id, code, user_alert) and a count of
-      matched data classes.  Never returns raw PII values or the
-      correspondence-table map handle.
+      Structured verdict compatible with ApiClient.decode() / ys-verdict-banner
+      (RISK-105): action + decision_codes + user_alert + blocked at top level.
+      Never returns raw PII values or the correspondence-table map handle.
     """
     from yashigani.documents.config import is_document_enforcement_enabled
     from yashigani.documents.pipeline import (
@@ -419,6 +476,9 @@ async def user_upload_document(
         DISPOSITION_LOG,
     )
     from yashigani.documents.opa_decision import evaluate_document_decision
+
+    route = upload.route
+    pseudonymize_mode = upload.pseudonymize_mode
 
     # Validate route and pseudonymize_mode
     if route not in ("ingress-upload", "egress-mcp-result", "json-attachment", "any"):
@@ -442,20 +502,32 @@ async def user_upload_document(
         )
 
     # --- Guard 1: filename path-traversal ---
-    raw_filename = file.filename or "upload"
-    safe_filename = _guard_filename(raw_filename)
+    safe_filename = _guard_filename(upload.filename or "upload")
 
-    # --- Guard 2: size cap (read with ceiling) ---
+    # --- Guard 2: base64 decode + size cap ---
     max_bytes = _user_upload_max_bytes()
-    try:
-        data = await file.read(max_bytes + 1)
-    except Exception as exc:
+    # Pre-check: reject obviously oversized base64 before decoding (DoS guard).
+    # base64 inflates by ~4/3; cap the raw string at ceil(max_bytes * 4/3) + 16.
+    _b64_limit = math.ceil(max_bytes * 4 / 3) + 16
+    if len(upload.content_base64) > _b64_limit:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "upload_read_error", "message": "Could not read uploaded file."},
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "error": "file_too_large",
+                "message": (
+                    f"File exceeds the {max_bytes // _BYTES_PER_MB} MB upload limit. "
+                    "Split the document or contact an administrator to raise the cap."
+                ),
+                "max_bytes": max_bytes,
+            },
+        )
+    try:
+        data = base64.b64decode(upload.content_base64, validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_base64", "message": "content_base64 is not valid base64."},
         ) from exc
-    finally:
-        await file.close()
 
     if len(data) > max_bytes:
         raise HTTPException(
@@ -471,7 +543,7 @@ async def user_upload_document(
         )
 
     # --- Guard 3: content-type declaration ---
-    declared_mime = _resolve_declared_mime(file, safe_filename)
+    declared_mime = _check_allowed_mime(upload.content_type or "", safe_filename)
 
     # --- Route to pipeline ---
     import uuid as _uuid
@@ -544,31 +616,42 @@ async def user_upload_document(
             envelope, _ = safe_error_envelope(exc, public_message="document action failed")
             raise HTTPException(status_code=500, detail=envelope)
 
+    _is_blocked = result.disposition == DISPOSITION_BLOCK
+    _user_alert = (
+        {
+            "code": decision.get("code", "DOCUMENT_BLOCKED"),
+            "policy_id": decision.get("policy_id", "DOC-ENFORCE-001"),
+            "user_message": decision.get(
+                "user_message",
+                "This file was held because it could not be safely cleared: "
+                + (result.block_reason or "policy block"),
+            ),
+        }
+        if _is_blocked
+        else None
+    )
+
     return {
         "request_id": request_id,
         "filename": safe_filename,
         "disposition": result.disposition,
         "detected_format": result.detected_format,
         "match_count": len(result.matches),
+        # Top-level structured verdict fields read by ApiClient.decode()
+        # (decodeVerdict) + ys-verdict-banner (RISK-105).  Never embedded in
+        # or parsed from message text — these are server-minted structured fields.
+        "action": opa_action,
+        "blocked": _is_blocked,
+        "decision_codes": [],          # no orchestration codes for doc-upload
+        "user_alert": _user_alert,
+        # opa_decision kept for backward compat with admin-plane callers.
         "opa_decision": {
             "action": opa_action,
             "policy_id": decision.get("policy_id"),
             "code": decision.get("code"),
         },
-        # Structured user alert (unified decision contract — RISK-105).
-        # Rendered by ys-verdict-banner as TRUSTED-CHROME outside the message
-        # region.  Never embedded in/parsed from message text.
-        "user_alert": (
-            {
-                "code": decision.get("code", "DOCUMENT_BLOCKED"),
-                "policy_id": decision.get("policy_id", "DOC-ENFORCE-001"),
-                "user_message": decision.get(
-                    "user_message",
-                    "This file was held because it could not be safely cleared: "
-                    + (result.block_reason or "policy block"),
-                ),
-            }
-            if result.disposition == DISPOSITION_BLOCK
-            else None
-        ),
+        # processed_content: populated by the pipeline when action is
+        # 'redact' / 'pseudonymize' and the pipeline rewrites the document.
+        # Currently None (pipeline returns raw matches, not rewritten content).
+        "processed_content": None,
     }
