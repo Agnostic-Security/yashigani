@@ -14,9 +14,14 @@
 # update in the same commit. The build-time gate will fail the Docker build
 # if hashes do not match.
 
-sha384-cBzrHZ8u4IIGOvDAM8EvZTPl/pjhSl5VSC5gtkUvAi10eJbxv8gLfqW6Z7E8EceE  static/vendor/lit/lit-all-3.3.3.min.js
-sha384-L4fiZZO0ovDfQmTlw6xSYZzb9ehmGvwXbpu/e+rKu7UFhn2E3NbfiHVAKXw3AqnI  static/vendor/dompurify/purify-3.4.11.min.js
-sha384-uoUU9Qe/2pBp2tX+Izn5kp+Z7J0TjfXlyVEAZY/AQ+NiiaftxNni6grS8JufpRjQ  static/vendor/marked/marked-18.0.5.min.js
+# Phase-1 integration fix (RECONCILIATION-20260627): ESM builds at UI-imported paths
+# All three files audited: 0 eval() occurrences; CSP-clean under no-unsafe-eval.
+# Old UMD/version-stamped files (purify-3.4.11.min.js, marked-18.0.5.min.js,
+# lit-all-3.3.3.min.js) remain in the tree for provenance but are NOT served by
+# the UI and are excluded from this lock (gate checks only ACTUAL served files).
+sha384-78CXiC89zTlJuiThUqPO9bq+aZYATjt07Gu4vQPHmVsGgA1xcSeLOdUMbnJlrpgT  static/vendor/dompurify/purify.es.mjs
+sha384-vdFRmGkHN1y8o9A9ZKPX+Eg7+/zFN16IhGIN9en7KokS0KIXsAmb7vmH9Hk4mChh  static/vendor/marked/marked.esm.js
+sha384-cBzrHZ8u4IIGOvDAM8EvZTPl/pjhSl5VSC5gtkUvAi10eJbxv8gLfqW6Z7E8EceE  static/vendor/lit/lit-core.min.js
 
 # ── Deferred (Phase 4) ───────────────────────────────────────────────────────
 # drawflow — eval audit result UNKNOWN; must be audited before Phase 4 ships.

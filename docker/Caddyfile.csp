@@ -27,7 +27,8 @@
 #                     login.js etc. use innerHTML; TT is added in Phase 6 only.
 #
 #  @strict_tt       — 4.0 first-party user paths (Lit-based, no innerHTML).
-#                     Full strict policy + Trusted Types (yashigani-render).
+#                     Full strict policy + Trusted Types (three policies:
+#                     yashigani-render, dompurify, lit-html — Phase-1 fix).
 #                     Add every new 4.0 user-facing route prefix here before
 #                     deployment.
 
@@ -46,14 +47,19 @@
     }
 
     # Strict + Trusted Types: 4.0 first-party user paths
-    # yashigani-render is the sole named TT policy (R1 / RECONCILIATION-20260627).
-    # No 'default' policy — fail-closed on unreviewed DOM writes.
+    # Three named TT policies (Phase-1 integration fix, RECONCILIATION-20260627):
+    #   yashigani-render — our sole sanitisation sink (safe-render.js)
+    #   dompurify        — DOMPurify's RETURN_TRUSTED_TYPE internal policy (purify.es.mjs)
+    #   lit-html         — Lit's internal template-literal policy (lit-core.min.js)
+    # The latter two bless developer-authored templates / already-sanitised strings
+    # only — they are NOT data sinks. No 'default' policy — fail-closed on
+    # unreviewed DOM writes.
     # connect-src 'self' covers SSE (HTTPS fetch). If chat transport moves to
     # WebSocket, add wss://{$YASHIGANI_TLS_DOMAIN} here (OQ-1 resolution needed).
     @strict_tt path /chat/* /user/* /flow/*
 
     header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render; report-uri /api/v1/csp-report; report-to default"
+    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html; report-uri /api/v1/csp-report; report-to default"
     header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
     header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
 }
