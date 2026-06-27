@@ -66,6 +66,8 @@ from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
 from yashigani.backoffice.routes.user_ui import router as user_ui_router
 # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
 from yashigani.backoffice.routes.user_conversations import router as user_conversations_router
+# 4.0 Workflow run history (wf-exec — BOLA-enforced, user-tier only)
+from yashigani.backoffice.routes.user_workflows import router as user_workflows_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",

@@ -139,6 +139,7 @@ def create_gateway_app(
     principal_signer=None,    # #47/G-NEW-5 — OrchestrationPrincipalSigner | None
     principal_verifier=None,  # #47/G-NEW-5 — OrchestrationPrincipalVerifier | None
     principal_tenant_id="default",  # #47/G-NEW-5 — tenant for caller SPIFFE derivation
+    workflow_scheduler=None,  # 4.0 — WorkflowScheduler | None (wf-exec)
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -172,6 +173,7 @@ def create_gateway_app(
         "principal_signer": principal_signer,
         "principal_verifier": principal_verifier,
         "principal_tenant_id": principal_tenant_id,
+        "workflow_scheduler": workflow_scheduler,  # 4.0 wf-exec
         "http_client": None,
     }
 
@@ -261,7 +263,24 @@ def create_gateway_app(
                     "routes may return agent_not_found until the registry is restored",
                     exc,
                 )
+        # 4.0 — start workflow scheduler (after agent registry is reconciled)
+        _wf_sched = _state.get("workflow_scheduler")
+        if _wf_sched is not None:
+            try:
+                _wf_sched.start()
+                logger.info("WorkflowScheduler: started in gateway lifespan")
+            except Exception as _wf_exc:
+                logger.error("WorkflowScheduler start failed: %s", _wf_exc)
+
         yield
+
+        # 4.0 — stop workflow scheduler (before HTTP client close)
+        if _wf_sched is not None:
+            try:
+                await _wf_sched.stop()
+            except Exception as _wf_stop_exc:
+                logger.warning("WorkflowScheduler stop error: %s", _wf_stop_exc)
+
         # Shutdown: close the HTTP client and DB pool
         # v2.25.2 — drain + stop the DB audit sink first so in-flight audit
         # events flush before the pool closes.
