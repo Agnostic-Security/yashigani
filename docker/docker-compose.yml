@@ -2096,8 +2096,8 @@ services:
     # Phase 5 §C: entrypoint shim reads the per-agent langflow_yashigani_token
     # (not the shared yashigani_internal_bearer) and exports it as OPENAI_API_KEY.
     # This token is langflow's P1 credential for outbound calls to gateway:8081/v1.
-    # Phase 3 (GATED): add this token to gateway _TOKEN_ROLE_MAP so the gateway
-    # resolves the P1 role from it (until then gateway falls back to bearer-group check).
+    # 4.0 Phase 3 LIVE: gateway _load_token_role_map() reads langflow_yashigani_token
+    # from /run/secrets and maps it → (p1_agent, agent__langflow) at startup (RISK-108).
     # Langflow 1.9.2 CMD: python -m langflow run --host 0.0.0.0 --port 7860
     # (verified from upstream Dockerfile at tag 1.9.2).
     entrypoint:
@@ -2979,7 +2979,7 @@ secrets:
 
   # Phase 5 §C: per-agent P1 outbound token for langflow → gateway calls.
   # langflow entrypoint shim reads this instead of the shared yashigani_internal_bearer.
-  # Phase 3 (GATED): wire into gateway _TOKEN_ROLE_MAP to resolve langflow's P1 role.
+  # 4.0 Phase 3 LIVE: wired into gateway _load_token_role_map() → (p1_agent, agent__langflow).
   langflow_yashigani_token:
     file: ./secrets/langflow_yashigani_token
 

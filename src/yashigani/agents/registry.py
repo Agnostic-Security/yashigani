@@ -314,6 +314,8 @@ return 1
             "allowed_caller_groups", "allowed_paths", "allowed_cidrs",
             # 4.0 Phase 5 / §A.3 additions (additive)
             "kind", "sensitivity_ceiling", "allowed_tools",
+            # 4.0 Phase 3: persist minted SPIFFE ID after approve_svid
+            "spiffe_id",
         }
         reg_key = f"agent:reg:{agent_id}"
         mapping = {}

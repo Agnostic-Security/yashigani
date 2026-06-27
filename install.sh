@@ -9690,10 +9690,8 @@ generate_secrets() {
   # --- langflow_yashigani_token (Phase 5 §C — per-agent P1 outbound token) ----
   # Separate from the shared yashigani_internal_bearer: langflow uses this token
   # as its OPENAI_API_KEY when calling gateway:8081/v1 (entrypoint shim).
-  # Phase 3 gateway work (GATED): wire this token into _TOKEN_ROLE_MAP so the
-  # gateway can resolve langflow's P1 role from this token (not the shared bearer).
-  # Until Phase 3 ships, the entrypoint shim reads this file but the gateway still
-  # validates it against the shared bearer group — update when Phase 3 lands.
+  # 4.0 Phase 3 LIVE: gateway _load_token_role_map() reads this file from
+  # /run/secrets at startup and maps it → (p1_agent, agent__langflow) (RISK-108).
   # Idempotent: upgrade path preserves existing token (prevents LLM session breaks).
   local _lf_token_file="${secrets_dir}/langflow_yashigani_token"
   if ! _secret_is_valid "$_lf_token_file"; then
