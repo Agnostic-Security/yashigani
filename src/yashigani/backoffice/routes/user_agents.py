@@ -2091,10 +2091,17 @@ async def commit_agent_template(body: CommitFlowBody, session: UserSession):
         "system_prompt": "",
     }
 
+    # Derive @-handle for the committed flow agent (same logic as create_user_agent).
+    # If alias is taken by another agent, append a short unique suffix to avoid 409.
+    raw_alias = _normalize_alias(body.name)
+    if r.hget(_alias_key(session.account_id), raw_alias) is not None:
+        raw_alias = f"{raw_alias[:56]}_{uuid.uuid4().hex[:6]}"
+
     ua_mapping: dict[bytes, bytes] = {
         b"account_id":        session.account_id.encode(),
         b"name":              body.name.encode(),
         b"description":       body.description.encode(),
+        b"alias":             raw_alias.encode(),
         b"personality":       json.dumps(personality).encode(),
         b"effective_skills":  json.dumps(effective).encode(),
         b"declared_skills":   json.dumps(body.skills).encode(),
@@ -2110,6 +2117,8 @@ async def commit_agent_template(body: CommitFlowBody, session: UserSession):
     pipe = r.pipeline()
     pipe.hset(_meta_key(ua_id), mapping=ua_mapping)
     pipe.sadd(_agents_key(session.account_id), ua_id.encode())
+    # Alias index: ua:alias:{account_id} hash → {alias: ua_id}
+    pipe.hset(_alias_key(session.account_id), raw_alias, ua_id)
     # Consume the draft — committed; TTL would clear it anyway but be explicit.
     pipe.delete(_draft_key(body.draft_id))
     pipe.execute()
