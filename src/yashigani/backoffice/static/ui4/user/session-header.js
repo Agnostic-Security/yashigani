@@ -14,6 +14,7 @@ const NAV = [
   { key: 'chat', href: '/chat', label: 'Chat' },
   { key: 'agents', href: '/agents', label: 'Agents' },
   { key: 'builder', href: '/builder', label: 'Builder' },
+  { key: 'workflows', href: '/workflows', label: 'Workflows' },
 ];
 
 export class YsSessionHeader extends LitElement {
@@ -21,7 +22,8 @@ export class YsSessionHeader extends LitElement {
     // Optional display name for the signed-in user (server-authored). When
     // absent we show a neutral "Signed in" — we never invent an identity.
     username: { type: String },
-    // Which surface is current ('chat' | 'agents' | 'builder'); highlights nav.
+    // Which surface is current ('chat' | 'agents' | 'builder' | 'workflows');
+    // highlights nav.
     active: { type: String },
     // When true, the Settings button is shown (only the chat surface owns the
     // settings panel). Other surfaces omit it.
