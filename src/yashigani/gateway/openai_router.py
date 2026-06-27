@@ -787,6 +787,31 @@ class OpenAIRouterState:
         self.content_relay_detector = None
         # v2.4.1 — PoolManager for container-per-identity dispatch
         self.pool_manager = None          # PoolManager | None
+        # 4.0 Phase 3 — P1/P2 token role map (RISK-108 / FIND-3.1-AGENT-BEARER-
+        # IMPERSONATION).  Maps plaintext_token → (role_class, identity_id) for
+        # fast hmac.compare_digest on every request.
+        #
+        # Role classes:
+        #   "p2_forwarder"   — OWUI trusted forwarder; may set X-OpenWebUI-User-Email
+        #   "p2_orchestrator"— Gateway orchestrator self-call; may set X-Yashigani-
+        #                      Orchestration-Principal
+        #   "p1_agent"       — Bundled agent (Letta, Langflow, OpenClaw); resolves as
+        #                      the named agent identity — CANNOT set P2 headers
+        #   "p1_nhi"         — User-built NHI; resolves as nhi_{id} identity — CANNOT
+        #                      set P2 headers
+        #
+        # The map is populated at lifespan startup by configure_openai_router()
+        # from per-service secret files (Su/compose) and from
+        # AgentRegistry.get_nhi_token_map() for active NHIs.
+        #
+        # BACKWARD COMPAT: YASHIGANI_INTERNAL_BEARER is still loaded at module
+        # import time into _INTERNAL_BEARER (above).  If no dedicated per-service
+        # tokens are configured, ALL token lookups fall through to the existing
+        # hmac.compare_digest(_INTERNAL_BEARER) path (unchanged 3.x behaviour).
+        # Once Su lands the per-service token split in install.sh + compose, the
+        # OWUI forwarder and orchestrator tokens get their own map entries and
+        # _INTERNAL_BEARER can be revoked.
+        self.token_role_map: dict[str, tuple[str, str]] = {}
         # Cloud key resolution: KMS provider + per-provider short-TTL cache.
         # Cache entry: {"value": str | None, "ts": float}; TTL = 60 s so a
         # newly-set key takes effect within one minute without a restart.
@@ -980,6 +1005,14 @@ def configure(
     _state.model_alias_store = model_alias_store            # Track B1
     _state.kms_provider = kms_provider                      # cloud API key resolution
     _state._cloud_key_cache = {}                            # reset cache on reconfigure
+
+    # ── 4.0 Phase 3 — P1/P2 token role map (RISK-108) ──────────────────────
+    # Populate from YASHIGANI_TOKEN_ROLE_MAP env var (JSON dict for dev/test):
+    #   {"<plaintext_token>": ["p1_agent", "agent__letta"]}
+    # In production this is populated from per-service secret files by install.sh.
+    # NHI tokens are added from AgentRegistry.get_nhi_token_map() if the registry
+    # is available at configure time (may also be refreshed at NHI approval).
+    _load_token_role_map(agent_registry)
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -3455,6 +3488,137 @@ async def list_models(request: Request):
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
+def _load_token_role_map(agent_registry=None) -> None:
+    """Populate ``_state.token_role_map`` from env + NHI registry.
+
+    Called once at ``configure()`` time (SOP 1).  Safe to call again after
+    NHI approval to refresh without restarting the gateway.
+
+    Token role map entry format: ``{plaintext_token: (role_class, identity_id)}``
+
+    Role classes: "p2_forwarder" | "p2_orchestrator" | "p1_agent" | "p1_nhi"
+    """
+    new_map: dict[str, tuple[str, str]] = {}
+
+    # Dev/test env-var injection: YASHIGANI_TOKEN_ROLE_MAP (JSON)
+    # Format: {"<token>": ["<role>", "<identity_id>"]}
+    raw = os.environ.get("YASHIGANI_TOKEN_ROLE_MAP", "").strip()
+    if raw:
+        try:
+            env_entries = json.loads(raw)
+            for tok, pair in env_entries.items():
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    new_map[tok] = (str(pair[0]), str(pair[1]))
+                    logger.debug("token_role_map: loaded role=%s id=%s from env", pair[0], pair[1])
+        except Exception as exc:
+            logger.error(
+                "YASHIGANI_TOKEN_ROLE_MAP parse error (ignoring) — "
+                "P1/P2 split will fall through to _INTERNAL_BEARER path: %s", exc,
+            )
+
+    # NHI tokens from the registry (fast plaintext lookup, db/4 index)
+    if agent_registry is not None:
+        try:
+            nhi_map = agent_registry.get_nhi_token_map()  # {plaintext_token: nhi_id}
+            for tok, nhi_id in nhi_map.items():
+                new_map[tok] = ("p1_nhi", nhi_id)
+                logger.debug("token_role_map: loaded p1_nhi entry for %s", nhi_id)
+        except Exception as exc:
+            logger.warning(
+                "token_role_map: NHI registry load failed — NHIs will not be resolvable: %s", exc
+            )
+
+    _state.token_role_map = new_map
+    logger.info(
+        "token_role_map: loaded %d entries (%d from env, %d NHIs)",
+        len(new_map),
+        len(new_map) - (len(new_map) - sum(1 for v in new_map.values() if v[0] == "p1_nhi")),
+        sum(1 for v in new_map.values() if v[0] == "p1_nhi"),
+    )
+
+
+def _resolve_caller_role(bearer_token: str) -> Optional[tuple[str, str]]:
+    """Map a bearer token to its (role_class, identity_id) from ``_state.token_role_map``.
+
+    Uses ``hmac.compare_digest`` for constant-time comparison to avoid timing leaks.
+
+    Returns ``None`` if the token is not in the role map — callers then fall
+    through to the existing ``_INTERNAL_BEARER`` comparison path (backward compat).
+
+    Raises ``HTTPException(401)`` only when called from the enforcement path in
+    ``_resolve_identity`` — this function itself returns None on miss.
+    """
+    for tok, (role, identity_id) in _state.token_role_map.items():
+        if hmac.compare_digest(bearer_token, tok):
+            return role, identity_id
+    return None
+
+
+def _emit_agent_header_stripped(
+    stripped_header: str,
+    caller_token_role: str,
+    agent_identity_id: str,
+) -> None:
+    """Emit AGENT_HEADER_STRIPPED security event to the audit chain (RISK-108).
+
+    This is the regression canary: any appearance in the audit chain means
+    an agent made an impersonation attempt.  Laura's regression probe checks
+    for this event without needing a live exploit.
+    """
+    if _state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import AgentHeaderStrippedEvent
+        _state.audit_writer.write(AgentHeaderStrippedEvent(
+            caller_token_role=caller_token_role,
+            stripped_header=stripped_header,
+            agent_identity_id=agent_identity_id,
+        ))
+    except Exception as exc:
+        logger.warning("AGENT_HEADER_STRIPPED audit write failed: %s", exc)
+
+
+def _resolve_nhi_identity(nhi_id: str) -> Optional[dict]:
+    """Return the NHI identity dict from AgentRegistry, or None if not found.
+
+    The OPA input for NHI hops uses ``input.identity`` (R9 — preserve existing
+    field name) with additional NHI-specific fields (``kind="nhi"``,
+    ``allowed_tools``, ``budget_cap``, ``on_behalf_of`` from delegated ctx).
+    """
+    if _state.agent_registry is None:
+        return None
+    try:
+        nhi = _state.agent_registry.get(nhi_id)
+        if nhi is None or nhi.get("kind") != "nhi":
+            return None
+        if not nhi.get("svid_issued"):
+            # NHI pending admin approval — fail-closed (403 in the caller)
+            logger.warning(
+                "_resolve_nhi_identity: NHI %s has svid_issued=False — pending approval",
+                nhi_id,
+            )
+            return None
+        # Build an identity dict matching the OPA input contract (R9: input.identity)
+        return {
+            "identity_id": nhi_id,
+            "kind": "nhi",
+            "status": nhi.get("status", "active"),
+            "groups": [],
+            "allowed_models": nhi.get("allowed_models", []),
+            "allowed_paths": nhi.get("allowed_paths", []),
+            "allowed_tools": nhi.get("allowed_tools", []),
+            "sensitivity_ceiling": nhi.get("sensitivity_ceiling", "PUBLIC"),
+            "budget_cap": nhi.get("budget_cap", {}),
+            "owner_identity_id": nhi.get("owner_identity_id", ""),
+            "template_id": nhi.get("template_id", ""),
+            "spiffe_id": nhi.get("spiffe_id", ""),
+            "_is_nhi": True,   # fast discriminator for downstream code
+        }
+    except Exception as exc:
+        logger.error("_resolve_nhi_identity: registry lookup failed for %s: %s", nhi_id, exc)
+        return None
+
+
 def _resolve_identity(request: Request) -> Optional[dict]:
     """
     Resolve identity from request.
@@ -3472,12 +3636,101 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     layer guard for this token; it must never be reachable from the
     public-facing port.
     """
-    # Fast path: hardcoded internal service-to-service token (Open WebUI,
-    # in-mesh agents).  Must be checked before identity_registry to avoid
-    # a 401 when the registry Redis is slow to start.
+    # Fast path: service-to-service token resolution.
+    # Priority 1: P1/P2 role map (per-service tokens, 4.0 Phase 3).
+    #             Populated from YASHIGANI_TOKEN_ROLE_MAP env and NHI registry.
+    # Priority 2: Shared _INTERNAL_BEARER (backward compat for 3.x deployments).
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         key = auth[7:]
+
+        # ── P1/P2 role map path (4.0 Phase 3 — RISK-108) ──────────────────
+        # When per-service tokens are configured, route each token to its role.
+        role_entry = _resolve_caller_role(key)
+        if role_entry is not None:
+            role_class, token_identity_id = role_entry
+
+            if role_class == "p2_orchestrator":
+                # P2 orchestrator: same logic as the existing internal-bearer
+                # orchestration-principal path (preserves brain-marker invariant).
+                orch_principal = request.headers.get("x-yashigani-orchestration-principal", "").strip()
+                if orch_principal and _state.identity_registry is not None:
+                    try:
+                        real = _state.identity_registry.get_by_slug(orch_principal)
+                    except Exception:
+                        real = None
+                    if real:
+                        real = dict(real)
+                        real["_orchestration_self_call"] = True
+                        return real
+                return {"identity_id": "internal", "status": "active", "kind": "service",
+                        "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
+                        "_orchestration_self_call": bool(orch_principal)}
+
+            elif role_class == "p2_forwarder":
+                # P2 forwarder: OWUI trusted-forwarder path.
+                # Strip any orchestration-principal header (forwarder is not the brain).
+                orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
+                if orch_hdr:
+                    _emit_agent_header_stripped(
+                        "x-yashigani-orchestration-principal", role_class, token_identity_id
+                    )
+                owui_identity = _resolve_owui_forwarded_user(request)
+                if owui_identity is not None:
+                    return owui_identity
+                return {"identity_id": "internal", "status": "active", "kind": "service",
+                        "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
+
+            elif role_class in ("p1_agent", "p1_nhi"):
+                # P1 agent/NHI: resolve as OWN identity only.
+                # Strip any P2 impersonation headers and emit security event.
+                orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
+                owui_hdr = request.headers.get(_OWUI_USER_EMAIL_HEADER, "")
+                if orch_hdr:
+                    _emit_agent_header_stripped(
+                        "x-yashigani-orchestration-principal", role_class, token_identity_id
+                    )
+                if owui_hdr:
+                    _emit_agent_header_stripped(
+                        _OWUI_USER_EMAIL_HEADER, role_class, token_identity_id
+                    )
+
+                if role_class == "p1_nhi":
+                    nhi_identity = _resolve_nhi_identity(token_identity_id)
+                    if nhi_identity is None:
+                        # NHI pending approval or not found — fail-closed
+                        raise HTTPException(
+                            status_code=403,
+                            detail={"error": "NHI_PENDING_APPROVAL",
+                                    "message": "NHI identity not yet approved or not found."},
+                        )
+                    return nhi_identity
+
+                # p1_agent: resolve as a named agent identity from registry
+                if _state.agent_registry is not None:
+                    try:
+                        agent = _state.agent_registry.get(token_identity_id)
+                        if agent is not None:
+                            return {
+                                "identity_id": token_identity_id,
+                                "kind": "agent",
+                                "status": agent.get("status", "active"),
+                                "groups": agent.get("groups", []),
+                                "allowed_models": [],
+                                "allowed_paths": agent.get("allowed_paths", []),
+                                "sensitivity_ceiling": "INTERNAL",
+                            }
+                    except Exception as exc:
+                        logger.warning(
+                            "_resolve_identity: p1_agent registry lookup failed for %s: %s",
+                            token_identity_id, exc,
+                        )
+                # Fallback: generic P1 agent identity (no elevated privilege)
+                return {"identity_id": token_identity_id, "kind": "agent",
+                        "status": "active", "groups": [], "allowed_models": [],
+                        "sensitivity_ceiling": "INTERNAL"}
+
+        # ── Shared _INTERNAL_BEARER path (backward compat) ─────────────────
         if hmac.compare_digest(key, _INTERNAL_BEARER):
             # Internal service-to-service calls (Open WebUI, agents)
             # Treated as authenticated internal identity — same OPA rules apply.
