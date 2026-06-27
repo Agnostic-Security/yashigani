@@ -105,6 +105,8 @@ from yashigani.backoffice.routes import (
     rbac_sources_router,
     version_check_router,
     cloud_keys_router,
+    # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+    user_ui_router,
 )
 
 
@@ -891,6 +893,9 @@ def create_backoffice_app() -> FastAPI:
         ("/auth/stepup", 4 * 1024),  # 6-digit TOTP code only
         # /v1/chat/completions is intentionally not limited here — LLM prompts
         # can legitimately be large; the global 4 MB limit still applies.
+        # 4.0 Phase 2: user document upload cap.  Caddy also enforces 10 MB;
+        # this middleware is belt-and-braces BEFORE the upload handler runs.
+        ("/user/documents", 10 * 1024 * 1024),  # 10 MB — YASHIGANI_USER_UPLOAD_MAX_MB default
     ]
 
     @app.middleware("http")
@@ -1239,6 +1244,19 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
     # fix/medlow-findings — cloud provider API key management (KMS-backed)
     app.include_router(cloud_keys_router, tags=["cloud-keys"])
+
+    # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+    # /chat page + /user/* data endpoints.  All enforce require_user_session.
+    # Mounted without a prefix so routes carry their own /chat and /user/ paths.
+    app.include_router(user_ui_router, tags=["user-ui"])
+
+    # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
+    # Su's Caddy config for /chat and /user/* will set:
+    #   report-uri /api/v1/csp-report
+    # Unauthenticated — browsers cannot attach cookies to CSP report POSTs.
+    # Same posture as the existing /admin/csp-report (already mounted at /admin).
+    from yashigani.backoffice.routes.csp_report import router as _user_csp_report_router
+    app.include_router(_user_csp_report_router, prefix="/api/v1", tags=["csp"])
 
     # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
     # OpenAPI schema and annotate all /scim/v2/* paths with the scheme reference.
