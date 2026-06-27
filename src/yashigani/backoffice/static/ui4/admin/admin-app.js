@@ -50,6 +50,9 @@ import './modules/kms-pki.js';
 import './modules/backup.js';
 import './modules/secrets-runtime.js';
 import './modules/crypto-inventory.js';
+// Observability module group (feat/4.0-monitoring-ui): Grafana / Wazuh SIEM /
+// Loki logs / Alertmanager, embedded via Su's same-origin admin-gated proxy.
+import './modules/monitoring.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /

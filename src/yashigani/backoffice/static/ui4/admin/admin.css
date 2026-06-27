@@ -139,4 +139,35 @@
 .ys-alert-item:last-child { border-bottom: none; }
 .ys-alert-label { flex: 1; font-size: var(--ys-fs-base); }
 .ys-alert-count { font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* ── monitoring (embedded observability tools) ───────────────────────────── */
+.ys-mon-intro { margin: 0 0 var(--ys-sp-3); }
+.ys-mon-tabs {
+  display: flex; gap: var(--ys-sp-2); flex-wrap: wrap;
+  margin: 0 0 var(--ys-sp-4); border-bottom: 1px solid var(--ys-border);
+}
+.ys-mon-tab {
+  appearance: none; background: none; border: 0;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  padding: var(--ys-sp-2) var(--ys-sp-3);
+  font-size: var(--ys-fs-base); font-weight: 500;
+  color: var(--ys-ink-muted); cursor: pointer;
+}
+.ys-mon-tab:hover { color: var(--ys-ink); }
+.ys-mon-tab--active { color: var(--ys-brand-blue); border-bottom-color: var(--ys-brand-blue); }
+.ys-mon-pane { display: flex; flex-direction: column; gap: var(--ys-sp-3); }
+.ys-mon-pane--hidden { display: none; }
+.ys-mon-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--ys-sp-3); flex-wrap: wrap;
+}
+.ys-mon-newtab { text-decoration: none; white-space: nowrap; }
+.ys-mon-down { margin: 0; }
+.ys-mon-down-body { display: flex; align-items: center; gap: var(--ys-sp-3); }
+.ys-mon-down-msg { flex: 1; font-size: var(--ys-fs-base); }
+.ys-mon-frame {
+  width: 100%; height: calc(100vh - 230px); min-height: 480px;
+  border: 0; border-radius: var(--ys-radius);
+  background: var(--ys-surface); box-shadow: var(--ys-elev-1);
+}
 .ys-alert-count--zero { color: var(--ys-ink-faint); font-weight: 500; }
