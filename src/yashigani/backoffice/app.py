@@ -745,6 +745,51 @@ async def lifespan(app: FastAPI):
             "absent from Redis until restored manually", _ireconcile_exc
         )
 
+    # ISSUE-USER-PLANE-DURABILITY (4.0): wire the user-plane durable store and
+    # run the startup reconciler. ua:* and wf:* keys in Redis db/3 are volatile
+    # (appendonly no / save ""); a Redis recreate loses all user agents, memory
+    # blocks, and workflow definitions. This mirrors the AgentRegistry pattern:
+    # dual-write to Postgres on every mutation + reconcile Postgres → Redis on
+    # every boot. Degrade-safe: if the store cannot connect, the routes continue
+    # Redis-only and user data is not restored (but nothing crashes).
+    try:
+        from yashigani.agents.user_plane_durable_store import UserPlaneDurableStore
+        backoffice_state.user_plane_durable = UserPlaneDurableStore()
+        _logging.getLogger("yashigani.backoffice.lifespan").info(
+            "USER-PLANE-DURABLE: UserPlaneDurableStore wired"
+        )
+    except Exception as _upd_init_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "USER-PLANE-DURABLE: failed to construct UserPlaneDurableStore (%s) — "
+            "user-plane data will NOT be mirrored to Postgres this session", _upd_init_exc
+        )
+
+    try:
+        _upd = getattr(backoffice_state, "user_plane_durable", None)
+        _upd_ir = getattr(backoffice_state, "identity_registry", None)
+        _upd_redis = getattr(_upd_ir, "_r", None) if _upd_ir else None
+        if _upd is not None and _upd_redis is not None:
+            from yashigani.agents.user_plane_reconciler import reconcile_user_plane_from_durable
+            _ua, _mem, _wf = await reconcile_user_plane_from_durable(_upd_redis, _upd)
+            if _ua or _mem or _wf:
+                _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                    "USER-PLANE-RECONCILE: restored %d agents, %d memories, %d workflows "
+                    "from Postgres into Redis db/3", _ua, _mem, _wf,
+                )
+            else:
+                _logging.getLogger("yashigani.backoffice.lifespan").info(
+                    "USER-PLANE-RECONCILE: Redis db/3 already in sync (0 entities restored)"
+                )
+        else:
+            _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                "USER-PLANE-RECONCILE: skipped — user_plane_durable or Redis client not wired"
+            )
+    except Exception as _upd_rec_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "USER-PLANE-RECONCILE: startup reconcile FAILED (%s) — user agents/memories/"
+            "workflows may be absent from Redis until re-created", _upd_rec_exc
+        )
+
     yield
 
     # Shutdown
