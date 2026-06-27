@@ -8093,14 +8093,30 @@ register_agent_bundles() {
   local first=true
   for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
     [[ -z "$_profile" ]] && continue
+    # Phase 5 §C: per-profile caps (groups/paths/kind/ceiling).  Defaults are
+    # empty so letta/openclaw inherit the pre-4.0 open-group behaviour unchanged.
+    local _lf_groups='[]' _lf_caller_groups='[]' _lf_paths='[]'
+    local _lf_kind="" _lf_ceiling=""
     case "$_profile" in
-      langflow)  local _name="langflow"  _url="http://langflow:7860"   _proto="langflow" ;;
+      langflow)  local _name="agent__langflow"  _url="http://langflow:7860"  _proto="openai"
+                 # Phase 5 §C — Langflow callee registration caps (RISK-108 / §E.11)
+                 # agent__langflow is a P1-only callee: only the gateway can be its upstream
+                 # (OPENAI_API_BASE=http://gateway:8081/v1 — enforced in compose/helm).
+                 # allowed_caller_groups: any logged-in user or admin may invoke it.
+                 # allowed_paths: constrained to the OpenAI-compat chat endpoint only.
+                 # sensitivity_ceiling: INTERNAL (hard-cap also enforced in policy/agents.rego).
+                 _lf_kind="agent"
+                 _lf_ceiling="INTERNAL"
+                 _lf_groups='["langflow_callee"]'
+                 _lf_caller_groups='["admin","user"]'
+                 _lf_paths='["/v1/chat/completions"]'
+                 ;;
       letta)     local _name="letta"     _url="http://letta:8283"     _proto="letta" ;;
       openclaw)  local _name="openclaw"  _url="http://openclaw:18789" _proto="openai" ;;
       *) continue ;;
     esac
     $first || agents_json+=','
-    agents_json+="{\"profile\":\"${_profile}\",\"name\":\"${_name}\",\"url\":\"${_url}\",\"protocol\":\"${_proto}\"}"
+    agents_json+="{\"profile\":\"${_profile}\",\"name\":\"${_name}\",\"url\":\"${_url}\",\"protocol\":\"${_proto}\",\"groups\":${_lf_groups},\"allowed_caller_groups\":${_lf_caller_groups},\"allowed_paths\":${_lf_paths},\"kind\":\"${_lf_kind}\",\"sensitivity_ceiling\":\"${_lf_ceiling}\"}"
     first=false
   done
   agents_json+=']'
@@ -8131,10 +8147,16 @@ agents_spec = json.loads(os.environ.get("AGENTS_JSON", "[]"))
 results = []
 
 for agent_spec in agents_spec:
-    profile = agent_spec["profile"]
-    aname   = agent_spec["name"]
-    aurl    = agent_spec["url"]
-    aproto  = agent_spec.get("protocol", "openai")
+    profile        = agent_spec["profile"]
+    aname          = agent_spec["name"]
+    aurl           = agent_spec["url"]
+    aproto         = agent_spec.get("protocol", "openai")
+    # Phase 5 §C: per-profile caps from the bash case statement above.
+    agroups        = agent_spec.get("groups") or []
+    acaller_groups = agent_spec.get("allowed_caller_groups") or []
+    apaths         = agent_spec.get("allowed_paths") or []
+    akind          = agent_spec.get("kind") or "agent"
+    aceiling       = agent_spec.get("sensitivity_ceiling") or None
 
     try:
         from yashigani.agents.registry import AgentRegistry
@@ -8170,10 +8192,13 @@ for agent_spec in agents_spec:
             "upstream_url": aurl,
             "protocol": aproto,
             "status": "active",
-            "groups": [],
-            "allowed_caller_groups": [],
-            "allowed_paths": [],
+            "groups": agroups,
+            "allowed_caller_groups": acaller_groups,
+            "allowed_paths": apaths,
             "allowed_cidrs": [],
+            # Phase 5 §C: callee-class fields (registry.py additive extension).
+            "kind": akind,
+            "sensitivity_ceiling": aceiling,
         }
 
         # 1. Durable write (Postgres) — survives redis recreate
@@ -9660,6 +9685,25 @@ generate_secrets() {
     mv "$tmp_env" "$env_file"
   else
     echo "YASHIGANI_INTERNAL_BEARER=${_bearer_token}" >> "$env_file"
+  fi
+
+  # --- langflow_yashigani_token (Phase 5 §C — per-agent P1 outbound token) ----
+  # Separate from the shared yashigani_internal_bearer: langflow uses this token
+  # as its OPENAI_API_KEY when calling gateway:8081/v1 (entrypoint shim).
+  # Phase 3 gateway work (GATED): wire this token into _TOKEN_ROLE_MAP so the
+  # gateway can resolve langflow's P1 role from this token (not the shared bearer).
+  # Until Phase 3 ships, the entrypoint shim reads this file but the gateway still
+  # validates it against the shared bearer group — update when Phase 3 lands.
+  # Idempotent: upgrade path preserves existing token (prevents LLM session breaks).
+  local _lf_token_file="${secrets_dir}/langflow_yashigani_token"
+  if ! _secret_is_valid "$_lf_token_file"; then
+    local _lf_token
+    _lf_token="$(_gen_password)"
+    printf "%s" "$_lf_token" > "$_lf_token_file"
+    chmod 0600 "$_lf_token_file"
+    log_info "Generated langflow_yashigani_token → ${_lf_token_file} (mode 0600)"
+  else
+    log_info "langflow_yashigani_token already present — preserving (upgrade path)"
   fi
 
   # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
