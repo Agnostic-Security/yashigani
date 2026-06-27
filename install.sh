@@ -148,7 +148,21 @@ fi
 # -----------------------------------------------------------------------------
 # Logging helpers
 # -----------------------------------------------------------------------------
-log_step()    { printf "${C_BLUE}[ %s ] %s${C_RESET}\n" "$1" "$2"; }
+# log_step "N/TOTAL" "message" — renders an ASCII progress bar from N/TOTAL.
+# Falls back to the plain "[ N/TOTAL ]" form for non-numeric labels. Bash-3.2
+# safe (printf width + tr; no seq, no unicode, no bc).
+log_step() {
+  local _frac="$1" _msg="$2" _cur _tot _pct _fill _bar _pad
+  _cur="${_frac%%/*}"; _tot="${_frac##*/}"
+  if [ "$_cur" -eq "$_cur" ] 2>/dev/null && [ "$_tot" -eq "$_tot" ] 2>/dev/null && [ "${_tot:-0}" -gt 0 ]; then
+    _pct=$(( _cur * 100 / _tot )); _fill=$(( _pct * 24 / 100 ))
+    _bar="$(printf '%*s' "$_fill" '' | tr ' ' '#')"
+    _pad="$(printf '%*s' "$(( 24 - _fill ))" '' | tr ' ' '.')"
+    printf "${C_BLUE}[%s%s] %3d%% (step %s) %s${C_RESET}\n" "$_bar" "$_pad" "$_pct" "$_frac" "$_msg"
+  else
+    printf "${C_BLUE}[ %s ] %s${C_RESET}\n" "$_frac" "$_msg"
+  fi
+}
 log_info()    { printf "${C_BOLD}    --> %s${C_RESET}\n" "$1"; }
 log_success() { printf "${C_GREEN}    ok  %s${C_RESET}\n" "$1"; }
 log_warn()    { printf "${C_YELLOW}    !!  WARNING: %s${C_RESET}\n" "$1" >&2; }
@@ -1421,9 +1435,15 @@ resolve_compose_cmd() {
     # paths (Pentest #95 TM-V231-005), security_opt parsing, and a few other places
     # where docker-compose makes Docker-specific assumptions about the socket.
     if command -v podman-compose >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman-compose")
+      # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
+      # podman-compose defaults to one pod per project; the NVIDIA CDI hook
+      # (/usr/bin/nvidia-cdi-hook) fails (exit 1) when the GPU container starts
+      # inside that pod, wedging ollama + everything that depends on it. The same
+      # CDI device works in a standalone `podman run` (no pod), so we disable the
+      # pod. Must be a global arg so up/down/ps are all pod-less + consistent.
+      COMPOSE_CMD=("podman-compose" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (native, sequential)"
+      log_info "Compose tool: podman-compose (native, sequential, --in-pod=false)"
       return 0
     fi
     if podman compose version >/dev/null 2>&1; then
@@ -1843,7 +1863,8 @@ _select_nvidia_gpu() {
     YSG_GPU_NAME="$_name"
     YSG_GPU_VRAM_MB="${_vram:-0}"
     YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
-    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI
+    YSG_GPU_DEV="/dev/nvidia${YSG_GPU_INDEX}"
+    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI YSG_GPU_DEV
     return 0
   fi
 
@@ -1872,7 +1893,8 @@ _select_nvidia_gpu() {
     YSG_GPU_NAME="$_chosen_name"
     YSG_GPU_VRAM_MB="$_chosen_vram"
     YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
-    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI
+    YSG_GPU_DEV="/dev/nvidia${YSG_GPU_INDEX}"
+    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI YSG_GPU_DEV
     log_info "GPU pinned via --gpu-index: [${YSG_GPU_INDEX}] ${YSG_GPU_NAME} ($(_format_gpu_vram))"
     return 0
   fi
@@ -1930,7 +1952,8 @@ _select_nvidia_gpu() {
   YSG_GPU_NAME="$_chosen_name"
   YSG_GPU_VRAM_MB="$_chosen_vram"
   YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
-  export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI
+  YSG_GPU_DEV="/dev/nvidia${YSG_GPU_INDEX}"
+  export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI YSG_GPU_DEV
   log_success "GPU selected: [${YSG_GPU_INDEX}] ${YSG_GPU_NAME} ($(_format_gpu_vram))"
   printf "\n"
 }
@@ -1943,6 +1966,177 @@ _format_gpu_vram_mb() {
   else
     printf "%d MB" "$vram_mb"
   fi
+}
+
+# =============================================================================
+# Podman GPU CDI provisioning — no host sudo (ROOTLESS-CDI-001)
+# =============================================================================
+# nvidia-ctk 1.19.1 always emits cdiVersion 0.7.0. Podman 4.9.3 (Ubuntu)
+# hardcodes /etc/cdi as its ONLY CDI scan directory — cdi_spec_dirs in
+# containers.conf is NOT effective on this version (empirically verified: even
+# with cdi_spec_dirs pointing only to ~/.config/cdi, podman still reads /etc/cdi
+# and ignores the user dir). No /etc/cdi scan means no CDI device resolution.
+#
+# Two blockers from the prior broken attempt:
+#   A. The minimal 0.5.0 spec had no library mounts → ollama sees library=cpu.
+#      A working CDI spec MUST include the containerEdits that mount libcuda.so,
+#      libnvidia-ml.so etc. — what nvidia-ctk normally discovers and emits.
+#   B. /etc/cdi/nvidia.yaml was written 0600 (root-only) → rootless podman
+#      gets EACCES on the CDI registry refresh → all CDI devices unresolvable.
+#
+# Correct fix (no interactive sudo):
+#   1. Run nvidia-ctk cdi generate to produce the COMPLETE 0.7.0 spec including
+#      all CUDA library mounts and hooks. This is the only reliable source for
+#      the correct host library paths and device nodes.
+#   2. Transform 0.7.0 → 0.6.0 in-process (Python3, no extra deps):
+#        - set cdiVersion: "0.6.0"
+#        - strip per-device additionalGids: blocks (0.7.0 addition)
+#        - strip gid: fields from deviceNodes (0.7.0 addition)
+#        - KEEP all hooks, mounts, library containerEdits intact
+#      Podman 4.9.3 accepts 0.6.0 (confirmed via binary string scan: v0.6.0
+#      present; v0.7.0 absent). The stripped fields are display/GID-namespace
+#      features not needed for headless CUDA compute.
+#   3. Write the 0.6.0 spec to /etc/cdi/nvidia.yaml with chmod 0644 via the
+#      Docker Engine daemon (rootful — no interactive user sudo). Without 0644,
+#      rootless podman cannot read the spec and the CDI registry refresh fails.
+#      /etc/cdi/ is created via Docker if it does not exist.
+#
+# Podman ≥5.0 accepts cdiVersion 0.7.0 natively → skip the transform and
+# write the raw nvidia-ctk output directly to /etc/cdi/nvidia.yaml (still with
+# 0644 via Docker, so rootless podman can read it).
+#
+# If nvidia-ctk is missing: WARN loudly and return (CDI unavailable; the
+# install.sh CDI probe will fail → devpath fallback WARNS that GPU is CPU-only).
+# If Docker daemon unavailable: same — WARN and return; do not silently proceed.
+
+# _transform_cdi_spec_060 <input-070-path> <output-060-path>
+# Read a cdiVersion 0.7.0 spec and write a 0.6.0-compatible version by:
+#   - setting cdiVersion to "0.6.0"
+#   - stripping per-device additionalGids: blocks (indent-aware)
+#   - stripping gid: fields from deviceNodes
+# All other content (hooks, mounts, library paths, env) is preserved intact.
+_transform_cdi_spec_060() {
+  local _in="$1" _out="$2"
+  python3 - "${_in}" "${_out}" <<'PYEOF'
+import sys, re
+
+in_path, out_path = sys.argv[1], sys.argv[2]
+with open(in_path) as f:
+    lines = f.readlines()
+
+out = []
+skip_until_indent = None  # set when inside an additionalGids: block
+
+for line in lines:
+    raw = line.rstrip('\n')
+    stripped = raw.lstrip()
+    indent = len(raw) - len(stripped)
+
+    # End-of-additionalGids-block detection: stop skipping when we reach a
+    # line at the SAME or SHALLOWER indentation as the additionalGids: key.
+    if skip_until_indent is not None:
+        if stripped == '' or indent <= skip_until_indent:
+            skip_until_indent = None   # resume output (fall through)
+        else:
+            continue                   # still inside block — skip
+
+    # Rewrite version line
+    if re.match(r'^cdiVersion:\s*0\.7\.0\s*$', stripped):
+        out.append('cdiVersion: "0.6.0"\n')
+        continue
+
+    # Strip additionalGids: block (keyword + deeper-indented list items)
+    if re.match(r'^additionalGids:\s*$', stripped):
+        skip_until_indent = indent
+        continue
+
+    # Strip gid: fields from deviceNodes (0.7.0 addition)
+    if re.match(r'^gid:\s*\d+\s*$', stripped):
+        continue
+
+    out.append(line)
+
+with open(out_path, 'w') as f:
+    f.writelines(out)
+
+removed = len(lines) - len(out)
+print(f"CDI 0.7.0 → 0.6.0 transform: {len(lines)} lines in, {len(out)} out "
+      f"({removed} lines stripped)")
+PYEOF
+}
+
+# _setup_podman_cdi_gpu
+# Generate a complete podman-compatible CDI spec via nvidia-ctk, transform it
+# to cdiVersion 0.6.0 (podman <5.0 compatible) and deploy it to the USER CDI dir
+# (~/.config/cdi), wiring podman to it via cdi_spec_dirs in the USER containers.conf.
+# NO /etc/cdi, NO Docker daemon, NO sudo — pure user-space (proven on podman 4.9.3:
+# libcuda + nvidia-smi visible in-container via cdi_spec_dirs alone).
+# MUST be called before the CDI probe in compose_up() so the probe passes.
+_setup_podman_cdi_gpu() {
+  if [[ "${YSG_GPU_TYPE:-none}" != "nvidia" ]]; then return 0; fi
+
+  log_info "Podman GPU CDI provisioning — user-space, no host writes (ROOTLESS-CDI-001)"
+
+  # nvidia-ctk required to produce a COMPLETE spec (device nodes + driver-library
+  # mounts). A minimal device-only spec does NOT make CUDA work.
+  if ! command -v nvidia-ctk >/dev/null 2>&1; then
+    log_warn "nvidia-ctk not found — cannot generate CDI spec; ollama will run CPU-only"
+    log_warn "Install nvidia-container-toolkit and re-run the installer to enable GPU"
+    return 0
+  fi
+
+  # User-owned CDI dir — podman (rootless) reads it via cdi_spec_dirs in the USER
+  # containers.conf. NO /etc/cdi, NO docker, NO sudo.
+  local _cdi_dir="${HOME}/.config/cdi"
+  local _cdi_raw="${_cdi_dir}/nvidia-raw.yaml"
+  local _cdi_out="${_cdi_dir}/nvidia.yaml"
+  mkdir -p "${_cdi_dir}"
+
+  local _podman_major
+  _podman_major="$(podman version --format '{{.Client.Version}}' 2>/dev/null | cut -d. -f1)" || _podman_major="4"
+  log_info "  podman ${_podman_major}.x detected"
+
+  # Generate the COMPLETE CDI spec (with library mounts) into the user dir.
+  log_info "  nvidia-ctk cdi generate → ${_cdi_raw}"
+  if ! nvidia-ctk cdi generate --output="${_cdi_raw}" 2>/dev/null || [[ ! -s "${_cdi_raw}" ]]; then
+    log_warn "nvidia-ctk cdi generate failed/empty; ollama will run CPU-only"
+    rm -f "${_cdi_raw}"; return 0
+  fi
+  log_info "  raw spec: $(wc -l < "${_cdi_raw}") lines (cdiVersion 0.7.0)"
+
+  # podman <5.0 cannot parse cdiVersion 0.7.0 → transform to 0.6.0 (strip the
+  # 0.7.0-only additionalGids blocks; KEEP all library mounts/hooks). ≥5.0 native.
+  if [[ "${_podman_major:-4}" -ge 5 ]]; then
+    mv -f "${_cdi_raw}" "${_cdi_out}"
+    log_info "  podman ≥5.0: using native cdiVersion 0.7.0 spec"
+  else
+    if ! _transform_cdi_spec_060 "${_cdi_raw}" "${_cdi_out}"; then
+      log_warn "CDI 0.6.0 transform failed; ollama will run CPU-only"; rm -f "${_cdi_raw}"; return 0
+    fi
+    rm -f "${_cdi_raw}"
+    if ! grep -q 'cdiVersion: "0.6.0"' "${_cdi_out}" 2>/dev/null; then
+      log_warn "transform produced no cdiVersion 0.6.0 marker; ollama will run CPU-only"; return 0
+    fi
+  fi
+  log_info "  CDI spec ready: ${_cdi_out} ($(wc -l < "${_cdi_out}") lines)"
+
+  # Point rootless podman at the user CDI dir via the USER containers.conf.
+  # MUST be under [engine] (podman ignores cdi_spec_dirs in other tables — this
+  # was the prior bug) and the user dir ONLY — including /etc/cdi would let a host
+  # 0.7.0 spec poison the CDI registry on podman <5.0. Idempotent; never touches /etc.
+  local _cc="${HOME}/.config/containers/containers.conf"
+  mkdir -p "$(dirname "${_cc}")"
+  if [[ -f "${_cc}" ]] && grep -qE '^[[:space:]]*cdi_spec_dirs' "${_cc}"; then
+    sed -i -E "s|^[[:space:]]*cdi_spec_dirs.*|cdi_spec_dirs = [\"${_cdi_dir}\"]|" "${_cc}"
+    log_info "  updated cdi_spec_dirs in ${_cc}"
+  elif [[ -f "${_cc}" ]] && grep -qE '^\[engine\]' "${_cc}"; then
+    sed -i -E "0,/^\[engine\]/s||[engine]\ncdi_spec_dirs = [\"${_cdi_dir}\"]|" "${_cc}"
+    log_info "  inserted cdi_spec_dirs under [engine] in ${_cc}"
+  else
+    printf '[engine]\ncdi_spec_dirs = ["%s"]\n' "${_cdi_dir}" >> "${_cc}"
+    log_info "  wrote [engine] cdi_spec_dirs to ${_cc}"
+  fi
+  log_success "Podman GPU CDI ready — user-space spec, no /etc/cdi, no docker, no sudo"
 }
 
 # =============================================================================
@@ -6392,10 +6586,37 @@ compose_up() {
     log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
   fi
   # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
+  # ROOTLESS-CDI-001: Provision a complete podman-compatible CDI spec in /etc/cdi/
+  # BEFORE the probe. Spec is generated by nvidia-ctk (full library mounts included),
+  # transformed 0.7.0 → 0.6.0 for podman 4.9.3, then written to /etc/cdi/nvidia.yaml
+  # with 0644 perms via Docker daemon (no interactive sudo). See _setup_podman_cdi_gpu.
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    _setup_podman_cdi_gpu
+  fi
   local _gpu_overlay_podman="${WORK_DIR}/docker/docker-compose.gpu-podman.yml"
-  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && [[ -f "$_gpu_overlay_podman" ]]; then
-    compose_files+=("-f" "$_gpu_overlay_podman")
-    log_info "Applying Podman GPU overlay (docker-compose.gpu-podman.yml) — ollama on CDI ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+  local _gpu_overlay_podman_devpath="${WORK_DIR}/docker/docker-compose.gpu-podman-devpath.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    local _cdi_probe_ok=false
+    if podman run --rm --device "nvidia.com/gpu=0" \
+         --entrypoint "" \
+         alpine:latest echo "cdi-probe" >/dev/null 2>&1; then
+      _cdi_probe_ok=true
+    fi
+    if [[ "$_cdi_probe_ok" == "true" ]] && [[ -f "$_gpu_overlay_podman" ]]; then
+      compose_files+=("-f" "$_gpu_overlay_podman")
+      log_info "CDI probe OK — applying Podman CDI GPU overlay (docker-compose.gpu-podman.yml) — ollama on ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+    elif [[ -f "$_gpu_overlay_podman_devpath" ]]; then
+      # CDI unavailable (probe failed or _setup_podman_cdi_gpu returned early).
+      # devpath overlay passes device nodes only — NO library mounts.
+      # ollama WILL run CPU-only on this path: library=cpu, not library=cuda.
+      log_warn "WARN: CDI probe failed — falling back to device-path passthrough (#ROOTLESS-CDI-001)"
+      log_warn "WARN: Device-path overlay has NO library mounts → ollama will run CPU-only (library=cpu)"
+      log_warn "WARN: GPU acceleration NOT active. Fix: ensure nvidia-ctk + Docker daemon are available."
+      log_info "Applying Podman device-path GPU overlay (docker-compose.gpu-podman-devpath.yml) — ollama on ${YSG_GPU_DEV:-/dev/nvidia0}"
+      compose_files+=("-f" "$_gpu_overlay_podman_devpath")
+    else
+      log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
+    fi
   fi
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
     log_info "Podman detected — configuring rootless deployment"

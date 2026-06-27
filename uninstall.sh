@@ -1281,6 +1281,33 @@ fi
 echo "=== Network assertion passed — all canonical networks removed. ==="
 
 # ---------------------------------------------------------------------------
+# ROOTLESS-CDI-002 (2026-06-27): sweep stale CNI config FILES.
+# On the CNI backend, rootless podman reads ~/.config/cni/net.d/*.conflist.
+# `network rm` usually deletes the matching .conflist, but orphaned project
+# configs accumulate across install/teardown cycles and POISON the next install:
+# a leftover *.conflist referencing a missing plugin (e.g. 'dnsname') wedges
+# every container at create-time, so the stack hangs half-up. Removing networks
+# alone is NOT enough — the config files must go too. Remove OUR project's
+# leftover .conflist here; list foreign ones as WARN (never auto-remove).
+# ---------------------------------------------------------------------------
+_cni_dir="${HOME}/.config/cni/net.d"
+if [ -d "$_cni_dir" ] && [ -n "${_PROJECT_PREFIX:-}" ]; then
+    echo "=== CNI config-file cleanup (${_cni_dir}) ==="
+    _cni_removed=0
+    for _cf in "${_cni_dir}/${_PROJECT_PREFIX}_"*.conflist "${_cni_dir}/ringfence_"*.conflist; do
+        [ -e "$_cf" ] || continue
+        rm -f "$_cf" && { echo "  [removed] $(basename "$_cf")"; _cni_removed=$(( _cni_removed + 1 )); }
+    done
+    echo "  CNI config files removed: ${_cni_removed}"
+    _cni_foreign="$(ls "${_cni_dir}"/*.conflist 2>/dev/null | grep -vE "/(87-podman|${_PROJECT_PREFIX}_|ringfence_)" || true)"
+    if [ -n "$_cni_foreign" ]; then
+        echo "  [WARN] foreign CNI configs remain (not this project — review/remove if unused):" >&2
+        echo "$_cni_foreign" | sed 's/^/    /' >&2
+        echo "    On the CNI backend a stale config (missing plugin) can wedge installs." >&2
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # J12 FIX (Ava 2026-05-30): remove ringfence_<agent> networks created by
 # `yashigani onboard` (Shape-C MCP agents).  These networks are NOT in the
 # hardcoded _CANONICAL_NETWORKS list above because they are dynamically named
@@ -1583,6 +1610,28 @@ echo ""
 # Wipe both files always (not gated on --remove-volumes). They are install-
 # time artefacts; uninstall = inverse of install.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Podman GPU CDI spec cleanup — task #40 / ROOTLESS-CDI-001
+#
+# install.sh generates CDI spec files at docker/cdi/ (nvidia-raw.yaml from
+# nvidia-ctk, nvidia.yaml as the 0.6.0-transformed version) and writes the
+# transformed spec to /etc/cdi/nvidia.yaml with 0644 permissions via the
+# Docker Engine daemon (no interactive sudo).
+#
+# On uninstall: remove the docker/cdi/ working dir. /etc/cdi/nvidia.yaml is
+# intentionally left in place — it is a system-level CDI spec that any CUDA
+# workload on the host can use; clearing it would break non-Yashigani uses.
+# To reset /etc/cdi manually after uninstall: sudo nvidia-ctk cdi generate.
+# ---------------------------------------------------------------------------
+echo "=== Podman GPU CDI spec cleanup (task #40) ==="
+_cdi_dir="${SCRIPT_DIR}/docker/cdi"
+if [ -d "${_cdi_dir}" ]; then
+    rm -rf "${_cdi_dir}" && echo "  [removed] ${_cdi_dir}" || echo "  [WARN] could not remove ${_cdi_dir}" >&2
+else
+    echo "  [ok]    ${_cdi_dir} not present"
+fi
+
 echo "=== Install-time state file cleanup ==="
 _statefile_removed=0
 for _statefile in \
