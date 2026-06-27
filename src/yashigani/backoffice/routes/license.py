@@ -10,7 +10,7 @@ Routes:
   POST   /admin/license/activate       — activate a new license key
   DELETE /admin/license                — revert to community license
 """
-# Last updated: 2026-06-13T00:00:00+01:00 (v2.25.5 R23: /admin/license/entitlements)
+# Last updated: 2026-06-28T00:00:00+00:00 (4.0 fixups: /activate JSON body; RISK-103)
 from __future__ import annotations
 
 import logging
@@ -18,7 +18,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import require_admin_session, require_stepup_admin_session
@@ -407,19 +407,21 @@ async def get_license_entitlements(session=Depends(require_admin_session)):
 
 @license_router.post("/activate")
 async def activate_license(
-    license_content: Optional[str] = Form(default=None),
-    license_file: Optional[UploadFile] = File(default=None),
+    body: ActivateRequest,
     session=Depends(require_stepup_admin_session),
 ):
+    """Activate a new license key.
+
+    Accepts a JSON body with ``license_content`` (the license key text).
+    Requires a fresh step-up TOTP event (ASVS V6.8.4).
+
+    Previously accepted multipart/form-data (Form + File); switched to JSON
+    so the admin UI's audited ApiClient works without a separate form client.
+    """
     from yashigani.licensing import set_license
     from yashigani.licensing.verifier import verify_license
 
-    content: Optional[str] = None
-    if license_file is not None:
-        raw = await license_file.read()
-        content = raw.decode("utf-8").strip()
-    elif license_content is not None:
-        content = license_content.strip()
+    content: Optional[str] = body.license_content.strip() if body.license_content else None
 
     if not content:
         raise HTTPException(

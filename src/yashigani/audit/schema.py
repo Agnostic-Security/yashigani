@@ -400,6 +400,8 @@ class EventType(str, Enum):
     WORKFLOW_RUN_COMPLETED = "WORKFLOW_RUN_COMPLETED"
     # Run aborted: a step was denied, raised an exception, or the actor was missing.
     WORKFLOW_RUN_FAILED = "WORKFLOW_RUN_FAILED"
+    # Admin disabled a user's workflow from the admin oversight plane.
+    WORKFLOW_ADMIN_DISABLED = "WORKFLOW_ADMIN_DISABLED"
 
 
 # ---------------------------------------------------------------------------
@@ -3563,3 +3565,23 @@ class WorkflowRunFailedEvent(AuditEvent):
     session_id: str = ""
     reason: str = ""                # e.g. "step_0_denied" | "step_1_error"
     elapsed_s: float = 0.0
+
+
+@dataclass
+class WorkflowAdminDisabledEvent(AuditEvent):
+    """Emitted when an admin disables a user's workflow from the admin oversight plane.
+
+    Security invariants:
+    - Emitted only via PATCH /admin/workflows/{wf_id} under StepUpAdminSession.
+    - admin_account_id is the authenticated admin's account_id (not the owner).
+    - workflow_name is truncated to 64 chars.
+    - masking_applied is always True.
+    """
+
+    event_type: str = EventType.WORKFLOW_ADMIN_DISABLED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account_id: str = ""      # the admin who performed the action
+    workflow_id: str = ""           # affected workflow
+    owner_identity_id: str = ""     # identity_id of the workflow owner
+    workflow_name: str = ""         # display name (truncated to 64 chars)
