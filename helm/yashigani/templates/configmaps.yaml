@@ -489,14 +489,15 @@ data:
       # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
       # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
       # /admin/loki/* added: Loki query API (JSON, no UI); excluded from @strict_legacy.
-      @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
+      @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
       @redoc_ui path /admin/api-redoc /redoc
       @strict_legacy {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
+        path /admin/* /admin-legacy/ /admin-legacy/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/ /admin4/
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
         not path /admin/api-redoc /redoc
       }
-      @strict_tt path /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
+      @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
       # frame-src 'self': explicit (default-src 'self' already implies it);
       # admin pages iframe /admin/grafana/ and /admin/loki/ — same-origin.
       header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
@@ -642,6 +643,30 @@ data:
           {{- if .Values.mtls.enabled }}
           import internal-mtls-loki
           {{- end }}
+        }
+      }
+      {{- end }}
+      # ── Alertmanager — admin-authenticated access via /admin/alertmanager/* ──
+      # Alertmanager serves plain HTTP on port 9093 (no mTLS). forward_auth gate
+      # mirrors the grafana/loki pattern (verify-admin). @lenient_subapp CSP
+      # covers this path; X-Frame-Options + CSP stripped from upstream so same-
+      # origin iframe embedding from /admin/ works.
+      {{- if .Values.alertmanager.enabled }}
+      handle_path /admin/alertmanager/* {
+        forward_auth https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify-admin
+          @unauthorized status 401
+          handle_response @unauthorized {
+            redir * /admin/login 302
+          }
+        }
+        reverse_proxy http://alertmanager:9093 {
+          header_down -X-Frame-Options
+          header_down -Content-Security-Policy
         }
       }
       {{- end }}

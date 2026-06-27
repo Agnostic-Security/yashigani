@@ -1075,29 +1075,37 @@ def create_backoffice_app() -> FastAPI:
                 return RedirectResponse(url="/login?next=/chat", status_code=302)
             return HTMLResponse(_ui4_chat.read_text(encoding="utf-8"))
 
-    # ── Yashigani 4.0 ADMIN app (Wave 1) — 3.0 dashboard.js rebuild ──────────
-    # Served at the PARALLEL route /admin4/ so the existing /admin/ keeps
-    # working untouched during the admin rebuild (the final /admin/ → ui4 flip
-    # happens after all Wave-2 module groups land). Same shared-layer stack as
-    # /chat: assets under /static/ui4/, page carries its own strict CSP +
-    # Trusted-Types meta so the safe-render/TT pipeline is enforced even before
-    # Su's Caddy headers land (feat/4.0-csp-vendoring must add /admin4/* to the
-    # strict-TT route set). Admin-session-gated by a lightweight cookie
-    # pre-flight (mirrors admin_dashboard_page / ASVS V1.4.1); cryptographic
-    # session validation happens on every subsequent /dashboard/* and /admin/*
-    # API call (SessionStore.get()).
+    # ── Yashigani 4.0 ADMIN app — Lit admin is now the primary /admin/ UI ───────
+    # Phase 6 flip: the new Lit admin is canonical at /admin/. The old vanilla-JS
+    # admin (dashboard.html) is available as a fallback at /admin-legacy/ during
+    # the live-verify transition (do NOT delete yet). /admin4/ now redirects to
+    # /admin/ for back-compat with any bookmarked links from Wave-1 testing.
+    #
+    # Assets under /static/ui4/; page carries its own strict CSP + Trusted-Types
+    # meta so the safe-render/TT pipeline is enforced independently of Caddy.
+    # Admin-session-gated by a lightweight cookie pre-flight (ASVS V1.4.1);
+    # cryptographic session validation happens on every subsequent /dashboard/*
+    # and /admin/* API call (SessionStore.get()).
     _ui4_admin = _static_dir / "ui4" / "admin" / "admin.html"
     if _ui4_admin.exists():
 
-        @app.get("/admin4/", include_in_schema=False)
+        @app.get("/admin/", include_in_schema=False)
         async def ui4_admin_page(request: Request):
+            # 4.0: Lit admin is primary at /admin/. Cookie pre-flight mirrors
+            # the old admin_dashboard_page check (ASVS V1.4.1).
             _admin_cookies = (
                 "__Host-yashigani_admin_session",
                 "__Host-yashigani_session",
             )
             if not any(request.cookies.get(k) for k in _admin_cookies):
-                return RedirectResponse(url="/admin/login?next=/admin4/", status_code=302)
+                return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
             return HTMLResponse(_ui4_admin.read_text(encoding="utf-8"))
+
+        @app.get("/admin4/", include_in_schema=False)
+        async def ui4_admin4_alias(request: Request):
+            # 4.0: /admin4/ was the Wave-1 parallel route. Now redirects to the
+            # canonical /admin/ — preserves bookmarks from the transition period.
+            return RedirectResponse(url="/admin/", status_code=302)
 
     # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
     #
@@ -1187,28 +1195,21 @@ def create_backoffice_app() -> FastAPI:
         async def admin_login_page(request: Request):
             return _templates.TemplateResponse(request, "login.html")
 
-        # Phase 2 / 2.25.5-auth-ingress: /app/webui is now served directly by
-        # Open WebUI (OWUI).  Caddy routes /app/webui* to open-webui:8080 behind
-        # forward_auth → /auth/verify-user.  The backoffice placeholder endpoint
-        # has been removed; OWUI handles all /app/webui/* requests.
-        @app.get("/admin/", include_in_schema=False)
-        async def admin_dashboard_page(request: Request):
-            # Server-side session-presence check before serving the dashboard HTML.
-            # ASVS V1.4.1: access control enforced at trusted enforcement point.
-            # A missing cookie means no valid session → redirect to login.
-            # Note: cryptographic validation of the session token happens in the
-            # API layer (SessionStore.get()) on every subsequent API call; this
-            # check is a lightweight pre-flight to avoid serving the SPA shell to
-            # unauthenticated clients (closes SWEEP-06 / OWASP A07 finding).
-            # Fix: 2026-05-09 (v2.23.3).
+        # 4.0: old vanilla-JS admin is now the LEGACY fallback at /admin-legacy/.
+        # The new Lit admin is at /admin/ (registered above in the ui4_admin block).
+        # Keep this route reachable during the live-verify transition; delete after
+        # Wave-2 sign-off. Same session pre-flight as before (ASVS V1.4.1).
+        @app.get("/admin-legacy/", include_in_schema=False)
+        async def admin_legacy_page(request: Request):
+            # ASVS V1.4.1: cookie pre-flight before serving the SPA shell.
+            # Cryptographic validation happens on every /dashboard/* + /admin/* API call.
             _admin_cookies = (
                 "__Host-yashigani_admin_session",
                 "__Host-yashigani_session",
             )
             if not any(request.cookies.get(k) for k in _admin_cookies):
-                next_path = request.url.path
                 return RedirectResponse(
-                    url=f"/admin/login?next={next_path}",
+                    url="/admin/login?next=/admin-legacy/",
                     status_code=302,
                 )
             return _templates.TemplateResponse(request, "dashboard.html")
