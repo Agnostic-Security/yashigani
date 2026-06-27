@@ -4,7 +4,7 @@ Holds references to shared services injected at startup.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Any
 
 from yashigani.auth.local_auth import LocalAuthService  # noqa: F401 — back-compat
