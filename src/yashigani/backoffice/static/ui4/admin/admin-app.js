@@ -44,6 +44,12 @@ import './modules/sensitivity-pii.js';
 import './modules/documents-docopa.js';
 import './modules/alerts.js';
 import './modules/license.js';
+// "Ops & Crypto" module group (Wave 2).
+import './modules/infrastructure.js';
+import './modules/kms-pki.js';
+import './modules/backup.js';
+import './modules/secrets-runtime.js';
+import './modules/crypto-inventory.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /
