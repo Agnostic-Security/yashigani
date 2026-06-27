@@ -36,6 +36,14 @@ import './modules/nhi-approvals.js';
 import './modules/agent-templates.js';
 import './modules/mcp.js';
 import './modules/budget-models.js';
+// Governance, Data & Workflows module group (Wave-2).
+import './modules/policies-opa.js';
+import './modules/workflows-admin.js';
+import './modules/audit.js';
+import './modules/sensitivity-pii.js';
+import './modules/documents-docopa.js';
+import './modules/alerts.js';
+import './modules/license.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /
