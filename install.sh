@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="3.0.1"
+YASHIGANI_VERSION="4.0.0"
 # GIT_SHA: git short-hash of the current source tree used as a cache-busting
 # build arg (--build-arg GIT_SHA=...) for first-party images (gateway,
 # backoffice, extractor). Consumed as ARG GIT_SHA / LABEL revision in each
@@ -1742,8 +1742,7 @@ print_platform_summary() {
   # Listed so the operator sees exactly what is (and is NOT) being installed, what
   # each does, and that the choice is deploy-time — missing one means re-running
   # the installer. Avoids the "I expected service X" surprise post-install.
-  local _ow=" " _wz=" " _ca=" " _lf=" " _le=" " _oc=" "
-  [[ "${INSTALL_OPENWEBUI:-false}" == true ]] && _ow="x"
+  local _wz=" " _ca=" " _lf=" " _le=" " _oc=" "
   [[ "${INSTALL_WAZUH:-false}" == true ]] && _wz="x"
   [[ "${INSTALL_INTERNAL_CA:-false}" == true ]] && _ca="x"
   printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx langflow && _lf="x"
@@ -1758,7 +1757,7 @@ print_platform_summary() {
   [[ "$_ab" == *",letta,"* ]] && _le="x"
   [[ "$_ab" == *",openclaw,"* ]] && _oc="x"
   printf "  Optional services (deploy-time choice):\n"
-  printf "    [%s] %-12s %s\n" "$_ow" "Open WebUI"  "browser chat UI for end users"
+  printf "    [x] %-12s %s\n" "ui4 chat"    "built-in Lit SPA (chat/agents/builder/workflows) — always on in 4.0"
   printf "    [%s] %-12s %s\n" "$_wz" "Wazuh SIEM"  "security monitoring — SIEM (manager+indexer+dashboard)"
   printf "    [%s] %-12s %s\n" "$_ca" "BYO CA"      "Bring-your-own intermediate CA (default: built-in mesh CA)"
   printf "    [%s] %-12s %s\n" "$_lf" "Langflow"    "visual multi-agent workflow builder"
@@ -2962,16 +2961,6 @@ _write_aes_key_to_env() {
 
   # --- AES encryption key ---
   _env_set "YASHIGANI_DB_AES_KEY" "${DB_AES_KEY}"
-
-  # --- OWUI secret key ---
-  # Required by docker-compose (OWUI_SECRET_KEY has no fallback default
-  # after Compliance review finding #4). Generate a fresh 256-bit key on first
-  # install; preserve existing value across re-runs so cookies survive.
-  local existing_owui_key
-  existing_owui_key="$(grep '^OWUI_SECRET_KEY=' "$env_file" 2>/dev/null | sed 's/^OWUI_SECRET_KEY=//' || echo "")"
-  if [[ -z "$existing_owui_key" ]]; then
-    _env_set "OWUI_SECRET_KEY" "$(openssl rand -hex 32)"
-  fi
 
   # --- Runtime-specific security profile overrides (Compliance review finding #2) ---
   # Seccomp + AppArmor profiles are enabled by default in docker-compose.yml.
@@ -6537,7 +6526,6 @@ compose_up() {
     # Docker). Assemble from agent bundles + the per-flag opt-ins.
     local _enabled_profiles=()
     [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _enabled_profiles+=("${COMPOSE_PROFILES[@]}")
-    [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _enabled_profiles+=("openwebui")
     [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _enabled_profiles+=("wazuh")
     [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _enabled_profiles+=("internal-ca")
     # de-dupe, comma-join
@@ -6719,7 +6707,6 @@ compose_up() {
 
   local _ep_rt=()
   [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _ep_rt+=("${COMPOSE_PROFILES[@]}")
-  [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]] && _ep_rt+=("openwebui")
   [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _ep_rt+=("wazuh")
   [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _ep_rt+=("internal-ca")
   local _ep_csv_rt; _ep_csv_rt="$(printf '%s\n' "${_ep_rt[@]+"${_ep_rt[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
@@ -8288,24 +8275,7 @@ for r in results:
     done
     log_success "Agent bundle registration complete"
 
-    # Pre-populate agents in Open WebUI's database — ONLY when Open WebUI is
-    # actually installed. LIVE-OWUI-SYNC-001 (VM smoke 2026-05-28): this block
-    # previously gated only on the init script existing, so on an install
-    # WITHOUT --with-openwebui it ran `exec ... open-webui` against a container
-    # that does not exist and printed "no container docker_open-webui_1 found"
-    # (non-fatal via || true, but alarming noise in the install log).
-    if [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]]; then
-      log_info "Syncing agents to Open WebUI..."
-      local init_script="${WORK_DIR}/scripts/init-openwebui-agents.py"
-      if [[ -f "$init_script" ]]; then
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" cp "$init_script" open-webui:/tmp/init-agents.py 2>/dev/null || \
-          podman cp "$init_script" docker_open-webui_1:/tmp/init-agents.py 2>/dev/null || true
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T open-webui python3 /tmp/init-agents.py 2>&1 || \
-          podman exec docker_open-webui_1 python3 /tmp/init-agents.py 2>&1 || true
-      fi
-    else
-      log_info "Open WebUI not installed — skipping agent sync (re-run with --with-openwebui to enable)"
-    fi
+    # 4.0: OWUI removed — agent sync via /admin/agents UI or API.
   else
     log_warn "No agents were registered — register manually via /admin/agents"
   fi
@@ -8361,7 +8331,7 @@ _check_ollama_init_exit() {
   local _has_ai_profile=false
   for _p in "${COMPOSE_PROFILES[@]:-}"; do
     case "$_p" in
-      openwebui|langflow|letta|openclaw) _has_ai_profile=true; break ;;
+      langflow|letta|openclaw) _has_ai_profile=true; break ;;
     esac
   done
   if [[ "$_has_ai_profile" != "true" ]]; then
@@ -14465,54 +14435,22 @@ main() {
       fi
     fi
 
-    # Step 8b: Open WebUI — interactive wizard or honour --with-openwebui flag.
-    # Non-interactive: INSTALL_OPENWEBUI is false (default) or true (--with-openwebui).
-    #   No prompt. Honour the flag as-is.
-    # Interactive: ask [Y/n] (default Y). Wizard sets INSTALL_OPENWEBUI=true when Y.
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-      if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
-        COMPOSE_PROFILES+=("openwebui")
-        log_success "Open WebUI enabled (--with-openwebui flag)"
-      else
-        log_info "Open WebUI skipped (default non-interactive; pass --with-openwebui to enable)"
-      fi
-    else
-      printf "\n${C_BOLD}Will Yashigani be used by humans with a web UI?${C_RESET}\n"
-      printf "  Y (default) — Installs Open WebUI as chat surface for human users.\n"
-      printf "                Recommended if any human will log in and chat with MCP-backed LLMs.\n"
-      printf "  N           — API/agent-only deployment. Smaller footprint, no chat UI exposed.\n"
-      printf "                You can add Open WebUI later by re-running install.sh with --with-openwebui.\n"
-      printf "\n"
-      if prompt_yn "Install Open WebUI (human chat UI)?" "y"; then
-        INSTALL_OPENWEBUI=true
-        COMPOSE_PROFILES+=("openwebui")
-        log_success "Open WebUI selected"
-      else
-        log_info "Open WebUI skipped — API/agent-only deployment"
-      fi
+    # Step 8b: 4.0 — ui4 is built-in (no OWUI). --with-openwebui is accepted
+    # but silently ignored for backward-compat with existing operator scripts.
+    if [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]]; then
+      log_info "--with-openwebui is a no-op in 4.0 (ui4 chat surface is built in — Open WebUI removed)"
     fi
 
-    # Step 8b-ii: Write OLLAMA_MODEL to .env when Open WebUI is enabled.
-    # ollama-init (compose) and the ollama-init Job (helm) both read OLLAMA_MODEL
-    # to decide which model to pull. install.sh sets it here so operators get
-    # a working default (qwen2.5:3b, 1.9 GB) without manual .env editing.
-    # Value is written only when INSTALL_OPENWEBUI=true; on API-only installs the
-    # ollama-init service is gated by profiles: [openwebui] and never starts,
-    # so the var is irrelevant there.
-    if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
-      local _env_file="${WORK_DIR}/docker/.env"
-      # BUG-GPU-VRAM-001: pick a model appropriate for the SELECTED GPU's VRAM
-      # (set by _select_nvidia_gpu earlier in this step). Previously this always
-      # defaulted to qwen2.5:3b regardless of available VRAM. OLLAMA_MODEL_OVERRIDE
-      # still wins, preserving explicit operator choice.
-      local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-$(_pick_ollama_model_for_vram)}"
-      # Preserve any operator-supplied OLLAMA_MODEL — only write if absent.
-      if ! grep -q "^OLLAMA_MODEL=" "$_env_file" 2>/dev/null; then
-        echo "OLLAMA_MODEL=${_ollama_model}" >> "$_env_file"
-        log_info "Ollama default model set: ${_ollama_model} (VRAM-tier choice for $(_format_gpu_vram) — will pull on first start)"
-      else
-        log_info "Ollama model already set in .env — preserving operator value"
-      fi
+    # Step 8b-ii: Write OLLAMA_MODEL to .env for the gateway + ui4 chat inference.
+    # ollama-init reads OLLAMA_MODEL and pulls the model when any agent bundle is active.
+    # BUG-GPU-VRAM-001: pick a model appropriate for the SELECTED GPU's VRAM.
+    local _env_file="${WORK_DIR}/docker/.env"
+    local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-$(_pick_ollama_model_for_vram)}"
+    if ! grep -q "^OLLAMA_MODEL=" "$_env_file" 2>/dev/null; then
+      echo "OLLAMA_MODEL=${_ollama_model}" >> "$_env_file"
+      log_info "Ollama default model set: ${_ollama_model} (VRAM-tier choice for $(_format_gpu_vram) — will pull on first start with agent bundles)"
+    else
+      log_info "Ollama model already set in .env — preserving operator value"
     fi
 
     # Step 8c: Wazuh SIEM (opt-in)

@@ -214,29 +214,22 @@
         }
     }
 
-    # ── Open WebUI — catch-all ───────────────────────────────────────────────
+    # ── Root catch-all — 4.0: portal redirect + ui4 proxy ─────────────────────
+    # OWUI removed in 4.0. / → /chat; unmatched paths → backoffice.
     handle {
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
+        import strip-orchestration-headers
 
-        forward_auth backoffice:8443 {
-            import inject-caddy-verified
-            uri /auth/verify
-            copy_headers X-Forwarded-User X-Forwarded-Name
-
-            @unauthorized status 401
-            handle_response @unauthorized {
-                redir * /login?next={http.request.uri} 302
-            }
+        @root_path path /
+        handle @root_path {
+            redir * /chat 302
         }
 
-        # inject-caddy-verified: open-webui does not validate the header but
-        # we inject it uniformly across all reverse_proxy blocks.
-        reverse_proxy open-webui:8080 {
-            import inject-caddy-verified
-            header_up X-Forwarded-Proto https
-            header_up X-Real-IP {remote_host}
+        handle {
+            reverse_proxy backoffice:8443 {
+                import inject-caddy-verified
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+            }
         }
     }
 }

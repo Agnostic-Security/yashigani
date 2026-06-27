@@ -495,12 +495,9 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── /app/webui — Open WebUI user path (Phase 2 / 2.25.5-auth-ingress) ────
-    # See Caddyfile.selfsigned for full commentary.
-    # OWUI is plain HTTP on caddy_internal — no internal-mtls to open-webui:8080.
+    # ── /app/webui — legacy OWUI path (4.0: removed, redirect to /chat) ──────
     handle /app/webui* {
-        # OWUI served at ROOT (root catch-all). Back-compat redirect.
-        redir * / 302
+        redir * /chat 302
     }
 
     # ── Prometheus federation — admin-authenticated ─────────────────────────
@@ -518,79 +515,23 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
-    # OWUI has moved off root onto /app/webui.  See Caddyfile.selfsigned.
+    # ── Root catch-all — 4.0: portal redirect + ui4 proxy ────────────────────
+    # See Caddyfile.selfsigned for commentary. OWUI removed in 4.0.
     handle {
-
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
         import strip-orchestration-headers
 
-        # ── OWUI socket.io WebSocket (Phase 2 / F-WS fix pattern) ──────────
-        @owui_ws {
-            header Connection *Upgrade*
-            header Upgrade websocket
-            path /ws/*
-        }
-        handle @owui_ws {
-            forward_auth https://backoffice:8443 {
-            import internal-mtls
-            import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-                header_up -Connection
-                header_up -Upgrade
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    respond 401
-                }
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    respond 403
-                }
-            }
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
-                header_up X-Forwarded-Proto https
-                header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
-            }
+        @root_path path /
+        handle @root_path {
+            redir * /chat 302
         }
 
-        # ── OWUI HTTP (non-WS) ───────────────────────────────────────────────
         handle {
-            forward_auth https://backoffice:8443 {
+            reverse_proxy https://backoffice:8443 {
+                header_down -Content-Security-Policy  # single CSP at edge
             import internal-mtls
             import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    redir * /login?next={http.request.uri} 302
-                }
-
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    redir * /admin/ 302
-                }
-            }
-
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
                 header_up X-Forwarded-Proto https
                 header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
     }

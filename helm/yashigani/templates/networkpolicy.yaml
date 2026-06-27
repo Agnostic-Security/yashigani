@@ -111,13 +111,19 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # Internal mesh port — open-webui + agent bundle pods (BUG-2 fix v2.23.4; A4 v2.25.0-P2)
+    # Internal mesh port — agent bundle pods (BUG-2 fix v2.23.4; A4 v2.25.0-P2)
     # A4: agent bundles route LLM calls to gateway:8081 (OPENAI_API_BASE in values.yaml).
     # Council finding A4: Laura F-001 + Iris DRIFT-009 + Tom indirect.
+    {{- if .Values.openWebui.enabled }}
     - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: open-webui
+      ports:
+        - protocol: TCP
+          port: 8081
+    {{- end }}
+    - from:
         {{- if .Values.agentBundles.langflow.enabled }}
         - podSelector:
             matchLabels:
@@ -748,6 +754,7 @@ spec:
         - protocol: TCP
           port: 5432
 
+{{- if .Values.openWebui.enabled }}
 ---
 # Open WebUI — accept ingress from caddy / nginx-ingress only
 apiVersion: networking.k8s.io/v1
@@ -780,15 +787,7 @@ spec:
           port: 8080
 
 ---
-# Open WebUI egress — BUG-2 (v2.23.4): LLM calls route directly to gateway's
-# internal mesh port (8081, plain HTTP). The prior design (Caddy:443 routing)
-# was aspirational — the Caddy /v1/* block injects X-Caddy-Verified-Secret,
-# which open-webui does not send; and the gateway's /v1 endpoint requires it.
-# The mesh port (8081) has no CaddyVerified gate; network isolation is the
-# transport guard (this NetworkPolicy enforces the port boundary).
-# open-webui still reaches Caddy:443 for the /open-webui/* catch-all proxy
-# (browser → Caddy → open-webui:8080). That direction is Caddy→open-webui, not
-# open-webui→Caddy.
+# Open WebUI egress
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -803,7 +802,6 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # LLM inference — gateway internal mesh port (plain HTTP, in-cluster only)
     - to:
         - podSelector:
             matchLabels:
@@ -811,6 +809,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
+{{- end }}
 
 ---
 # Prometheus — accept ingress from grafana and from caddy / nginx-ingress
@@ -1487,7 +1486,7 @@ spec:
 # Upstreams (mirrors helm/yashigani/templates/configmaps.yaml :443 site):
 #   - yashigani-gateway:8080      (mTLS, /v1/* + /health)
 #   - yashigani-backoffice:8443   (mTLS, /admin/* + /api/admin/*)
-#   - open-webui:8080             (plain, only when openWebui.enabled)
+#   - open-webui:8080             (plain, only when openWebui.enabled — disabled in 4.0)
 #
 # DNS (UDP/TCP 53) is already covered by allow-dns-egress for all pods.
 # The :8444 / :8445 SPIFFE-gated metrics listeners are *ingress* on Caddy
