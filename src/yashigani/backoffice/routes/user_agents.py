@@ -96,7 +96,7 @@ import logging
 import os
 import re
 import uuid
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -160,6 +160,33 @@ def _meta_key(ua_id: str) -> str:
     return f"ua:meta:{ua_id}"
 
 
+def resolve_user_mention(r, account_id: str, handle: str) -> Optional[dict]:
+    """Look up a user agent by @-handle, scoped to ``account_id``.
+
+    Returns the decoded ua:meta dict with an extra ``_ua_id`` key, or ``None``
+    if no agent with this handle exists for this user.
+
+    BOLA double-check: verifies that ``ua:meta.account_id == account_id`` even
+    if the alias index had a stale/corrupted entry pointing elsewhere.
+
+    Exported for use by the gateway's @-handle routing in ``openai_router.py``
+    (which accesses this Redis db via ``_state.agent_registry._r``).
+    """
+    ua_id_raw = r.hget(_alias_key(account_id), handle)
+    if ua_id_raw is None:
+        return None
+    ua_id = ua_id_raw.decode() if isinstance(ua_id_raw, bytes) else ua_id_raw
+    raw = r.hgetall(_meta_key(ua_id))
+    if not raw:
+        return None
+    meta = _decode_hash(raw)
+    if meta.get("account_id") != account_id:
+        # Stale alias index entry pointing to another account — BOLA guard
+        return None
+    meta["_ua_id"] = ua_id
+    return meta
+
+
 def _agents_key(account_id: str) -> str:
     return f"ua:agents:{account_id}"
 
@@ -174,6 +201,31 @@ def _mem_all_key(account_id: str) -> str:
 
 def _mem_agent_key(ua_id: str) -> str:
     return f"ua:mem:agent:{ua_id}"
+
+
+def _alias_key(account_id: str) -> str:
+    """Redis hash for @-handle → ua_id lookup. Keyed per account (BOLA scope)."""
+    return f"ua:alias:{account_id}"
+
+
+# Valid @-handle pattern: starts with a letter, then alphanumeric + underscore, ≤63 chars.
+_HANDLE_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _normalize_alias(name: str) -> str:
+    """Derive a valid @-handle from a free-text agent name.
+
+    Lowercase, collapses non-alphanumeric runs to single underscores, strips
+    leading/trailing underscores, prepends 'a' if result starts with a digit.
+    Truncated to 63 chars.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
+    slug = slug.strip("_")
+    if not slug:
+        slug = "agent"
+    if slug[0].isdigit():
+        slug = "a" + slug
+    return slug[:63]
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +367,9 @@ def _serialise_agent(ua_id: str, meta: dict) -> dict:
         "ua_id": ua_id,
         "name": meta.get("name", ""),
         "description": meta.get("description", ""),
+        # @-addressing fields
+        "alias": meta.get("alias", ""),
+        "kind": meta.get("kind", "agent"),
         "personality": _j(meta.get("personality", "{}")),
         "effective_skills": _j(meta.get("effective_skills", "[]")),
         "declared_skills": _j(meta.get("declared_skills", "[]")),
@@ -353,11 +408,31 @@ class CreateAgentBody(BaseModel):
     persona: str = Field(default="I am a helpful AI assistant with persistent memory.", max_length=4096)
     system_prompt: str = Field(default="", max_length=8192)
     skills: list[str] = Field(default_factory=list, max_length=50)
+    # @-addressing: alias is the @-handle (e.g. "mimi" → @mimi).
+    # If omitted, derived from name via _normalize_alias().
+    # Must be unique per user; conflicts → HTTP 409.
+    alias: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=63,
+        description="@-handle (lowercase alphanumeric + underscore). Derived from name if omitted.",
+    )
+    # "agent" = governed callee / NHI tool agent
+    # "persona" = Letta conversational persona (routes via per-user Letta pool)
+    kind: Literal["agent", "persona"] = Field(default="agent")
 
 
 class PatchAgentBody(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     description: Optional[str] = Field(default=None, max_length=512)
+    # Changing alias removes the old alias from the index and registers the new one.
+    # Conflict with an existing alias owned by this user → 409.
+    alias: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=63,
+        description="New @-handle; must be unique within the caller's namespace.",
+    )
 
 
 class SetPersonalityBody(BaseModel):
@@ -419,10 +494,37 @@ async def create_user_agent(body: CreateAgentBody, session: UserSession):
     """Create a new user agent.
 
     Computes effective_skills via scope intersection immediately.
+    Alias uniqueness is enforced per user — conflict → HTTP 409.
     Letta provisioning is deferred until the pool seam is wired (503 if
     tried now).  The agent record is created in Redis regardless.
     """
     r = _get_redis()
+
+    # Derive and validate @-handle
+    raw_alias = (body.alias or _normalize_alias(body.name)).lower().strip()
+    if not _HANDLE_RE.fullmatch(raw_alias):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_alias",
+                "message": (
+                    f"Alias {raw_alias!r} is not a valid @-handle. "
+                    "Must match ^[a-z][a-z0-9_]{0,62}$."
+                ),
+            },
+        )
+
+    # Alias uniqueness check (per account — BOLA scope is the key itself)
+    existing = r.hget(_alias_key(session.account_id), raw_alias)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "alias_conflict",
+                "message": f"@{raw_alias} is already in use. Choose a different alias.",
+            },
+        )
+
     ua_id = _new_ua_id()
     now = _now_iso()
 
@@ -431,27 +533,36 @@ async def create_user_agent(body: CreateAgentBody, session: UserSession):
     personality = {"persona": body.persona, "system_prompt": body.system_prompt}
 
     mapping = {
-        b"account_id":      session.account_id.encode(),
-        b"name":            body.name.encode(),
-        b"description":     body.description.encode(),
-        b"personality":     json.dumps(personality).encode(),
+        b"account_id":       session.account_id.encode(),
+        b"name":             body.name.encode(),
+        b"description":      body.description.encode(),
+        b"alias":            raw_alias.encode(),
+        b"kind":             body.kind.encode(),
+        b"personality":      json.dumps(personality).encode(),
         b"effective_skills": json.dumps(effective).encode(),
         b"declared_skills":  json.dumps(body.skills).encode(),
-        b"letta_agent_id":  b"",
-        b"created_at":      now.encode(),
-        b"updated_at":      now.encode(),
+        b"letta_agent_id":   b"",
+        b"created_at":       now.encode(),
+        b"updated_at":       now.encode(),
     }
 
     pipe = r.pipeline()
     pipe.hset(_meta_key(ua_id), mapping=mapping)
     pipe.sadd(_agents_key(session.account_id), ua_id.encode())
+    # Alias index: ua:alias:{account_id} hash → {alias: ua_id}
+    pipe.hset(_alias_key(session.account_id), raw_alias, ua_id)
     pipe.execute()
 
-    logger.info("user_agents: created %s for account %r", ua_id, session.account_id)
+    logger.info(
+        "user_agents: created %s alias=%r kind=%r for account %r",
+        ua_id, raw_alias, body.kind, session.account_id,
+    )
 
     return {
         "ua_id": ua_id,
         "name": body.name,
+        "alias": raw_alias,
+        "kind": body.kind,
         "effective_skills": effective,
         "rejected_skills": rejected,
         "letta_agent_id": None,
@@ -469,40 +580,102 @@ async def get_user_agent(ua_id: str, session: UserSession):
 
 @router.patch("/user/agents/{ua_id}")
 async def patch_user_agent(ua_id: str, body: PatchAgentBody, session: UserSession):
-    """Update agent name or description. 404 on BOLA violation."""
+    """Update agent name, description, or alias. 404 on BOLA violation.
+
+    Alias change:
+    - Validates new alias format.
+    - Checks uniqueness within the caller's alias namespace (409 on conflict).
+    - Atomically removes old alias from index and registers new one.
+    """
     r = _get_redis()
-    _get_agent_or_404(r, ua_id, session.account_id)  # BOLA check
+    meta = _get_agent_or_404(r, ua_id, session.account_id)  # BOLA check
 
     updates: dict[bytes, bytes] = {b"updated_at": _now_iso().encode()}
+    updated_fields: list[str] = []
+
     if body.name is not None:
         updates[b"name"] = body.name.encode()
+        updated_fields.append("name")
+
     if body.description is not None:
         updates[b"description"] = body.description.encode()
+        updated_fields.append("description")
+
+    alias_updated: Optional[str] = None
+    if body.alias is not None:
+        new_alias = body.alias.lower().strip()
+        if not _HANDLE_RE.fullmatch(new_alias):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "invalid_alias",
+                    "message": (
+                        f"Alias {new_alias!r} is not a valid @-handle. "
+                        "Must match ^[a-z][a-z0-9_]{0,62}$."
+                    ),
+                },
+            )
+        old_alias = meta.get("alias", "")
+        if new_alias != old_alias:
+            # Check uniqueness (only when alias is actually changing)
+            existing = r.hget(_alias_key(session.account_id), new_alias)
+            if existing is not None:
+                existing_str = existing.decode() if isinstance(existing, bytes) else existing
+                if existing_str != ua_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "error": "alias_conflict",
+                            "message": f"@{new_alias} is already in use.",
+                        },
+                    )
+            # Update alias index
+            pipe = r.pipeline()
+            if old_alias:
+                pipe.hdel(_alias_key(session.account_id), old_alias)
+            pipe.hset(_alias_key(session.account_id), new_alias, ua_id)
+            pipe.execute()
+            updates[b"alias"] = new_alias.encode()
+            updated_fields.append("alias")
+            alias_updated = new_alias
 
     r.hset(_meta_key(ua_id), mapping=updates)
-    return {"ua_id": ua_id, "updated": list(
-        k.decode() for k in updates if k != b"updated_at"
-    )}
+    logger.info(
+        "user_agents: patched %s fields=%r for account %r",
+        ua_id, updated_fields, session.account_id,
+    )
+    result: dict = {"ua_id": ua_id, "updated": updated_fields}
+    if alias_updated is not None:
+        result["alias"] = alias_updated
+    return result
 
 
 @router.delete("/user/agents/{ua_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user_agent(ua_id: str, session: UserSession):
-    """Delete agent and detach all memory blocks. 404 on BOLA violation."""
+    """Delete agent, detach all memory blocks, and remove alias from index.
+
+    404 on BOLA violation.
+    """
     r = _get_redis()
-    _get_agent_or_404(r, ua_id, session.account_id)  # BOLA check
+    meta = _get_agent_or_404(r, ua_id, session.account_id)  # BOLA check
 
     # Detach all memory blocks from this agent (don't delete the blocks themselves)
     attached = _decode_set(r.smembers(_mem_agent_key(ua_id)))
+
+    # Remove alias from index (if any)
+    old_alias = meta.get("alias", "")
 
     pipe = r.pipeline()
     pipe.delete(_meta_key(ua_id))
     pipe.srem(_agents_key(session.account_id), ua_id.encode())
     pipe.delete(_mem_agent_key(ua_id))
+    if old_alias:
+        pipe.hdel(_alias_key(session.account_id), old_alias)
     pipe.execute()
 
     logger.info(
-        "user_agents: deleted %s for account %r; detached %d memory blocks",
-        ua_id, session.account_id, len(attached),
+        "user_agents: deleted %s alias=%r for account %r; detached %d memory blocks",
+        ua_id, old_alias, session.account_id, len(attached),
     )
 
 
@@ -1028,6 +1201,57 @@ async def list_available_skills(session: UserSession):
         available = sorted(system_ceiling)
 
     return {"available_skills": available, "count": len(available)}
+
+
+# ===========================================================================
+# /user/mentions — @-addressable entity catalog (4.0 mention addressing)
+# ===========================================================================
+
+
+@router.get("/user/mentions")
+async def list_user_mentions(session: UserSession):
+    """Return all @-addressable entities for the calling user.
+
+    The UI autocompletes from this endpoint.  The returned ``handle`` values
+    are exactly the strings that, prefixed with ``@``, can be used as the
+    ``model`` field in a chat request to address that entity.
+
+    Resolution contract (pinned, used by ``openai_router.py``):
+      * ``kind: "agent"``   — governed callee / NHI tool agent.  Routed via the
+                              NHI pool after ``POST /user/agents/{id}/run`` wires it.
+      * ``kind: "persona"`` — Letta conversational persona.  Routed via the
+                              per-user ``LettaClientPool`` (one Letta container per user).
+
+    BOLA: only the calling user's entities are returned.
+    Entities without an alias (legacy records) are omitted.
+
+    Response shape: ``{"mentions": [{handle, kind, display, id}, ...]}``
+    Sorted by handle for deterministic ordering.
+    """
+    r = _get_redis()
+    raw_ids = r.smembers(_agents_key(session.account_id))
+    ua_ids = _decode_set(raw_ids)
+
+    mentions: list[dict] = []
+    for ua_id in sorted(ua_ids):
+        raw = r.hgetall(_meta_key(ua_id))
+        if not raw:
+            continue
+        meta = _decode_hash(raw)
+        if meta.get("account_id") != session.account_id:
+            continue  # BOLA guard (should not occur if index is consistent)
+        alias = meta.get("alias", "")
+        if not alias:
+            continue  # legacy record without alias — skip
+        mentions.append({
+            "handle": alias,
+            "kind": meta.get("kind", "agent"),
+            "display": meta.get("name", ""),
+            "id": ua_id,
+        })
+
+    mentions.sort(key=lambda m: m["handle"])
+    return {"mentions": mentions}
 
 
 # ===========================================================================
