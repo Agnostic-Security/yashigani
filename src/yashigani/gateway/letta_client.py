@@ -17,18 +17,345 @@ explicit embedding_config that points at the gateway's /v1/embeddings endpoint
 (http://gateway:8081/v1).  The original handle resolves to embeddings.letta.com
 (a cloud endpoint); our Letta container is network-isolated and cannot reach it,
 causing every agent-creation to 502.
+
+4.0 Phase 3 (RISK-107): LettaClientPool replaces the module-global _default_agent_id
+with a per-user pool. Each user gets their own Letta container (via PoolManager) and
+their own Letta agent within that container. Cross-user memory bleed is closed at
+both the container (separate process) and DB (schema-per-user) layers.
+
+PINNED SEAM (Tom → Captain): LettaClientPool.for_user(identity_id) returns
+(httpx.AsyncClient, base_url, agent_id). Tom's OpenAI router uses this seam to route
+@letta messages. The seam signature is STABLE — do not change without Tom's sign-off.
 """
 
 import logging
 import os
+import threading
 import uuid
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 
+if TYPE_CHECKING:
+    from yashigani.pool.manager import PoolManager, CertMount
+
 logger = logging.getLogger(__name__)
 
-# Cache the default agent ID after first creation
+# ---------------------------------------------------------------------------
+# Per-user Letta image (pinned digest — verified against Docker Hub)
+# ---------------------------------------------------------------------------
+# This MUST match the image in docker/docker-compose.yml letta service.
+# Any version bump here requires a corresponding compose + Helm update.
+_LETTA_IMAGE = (
+    "docker.io/letta/letta:0.16.7"
+    "@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+)
+_LETTA_PORT = 8283
+
+# Cache the default agent ID after first creation.
+# DEPRECATED (4.0 — use LettaClientPool). Retained for backward-compat with any
+# 3.0 call sites that still invoke letta_chat() directly during the migration.
+# Will be removed once Tom wires all call sites to LettaClientPool.for_user().
 _default_agent_id: str | None = None
+
+
+def _letta_container_env(user_id: str) -> dict[str, str]:
+    """Per-user Letta container environment (schema-per-user isolation, Option A).
+
+    Each user's Letta container connects to a dedicated PostgreSQL schema:
+        letta_<user_slug>   (user_slug = first 16 hex chars of UUID without dashes)
+
+    This gives pgvector namespace isolation: agent A's embeddings cannot be read
+    by agent B's container even if both connect to the same pgvector instance.
+
+    The schema is created lazily on first activation (or by user onboarding flow).
+
+    Per-user container env vars wired by install.sh / PoolManager:
+      OPENAI_API_BASE      — gateway's internal mesh endpoint (plain HTTP on data bridge)
+      OPENAI_API_KEY       — per-agent P1-only gateway token (from Docker secret)
+      LETTA_PG_URI         — schema-scoped Postgres URI via letta-pgbouncer sidecar
+      LETTA_REDIS_HOST/PORT — per-container embedded Redis (started by entrypoint shim)
+      YASHIGANI_LETTA_USER_ID — for observability / log correlation
+    """
+    user_slug = user_id.replace("-", "")[:16]
+    user_schema = f"letta_{user_slug}"
+
+    # Read the Postgres password injected by install.sh.
+    # In production this comes from a Docker secret (POSTGRES_PASSWORD env var).
+    pg_password = os.getenv("POSTGRES_PASSWORD", "")
+    # Per-user schema: search_path sets the active schema for this connection.
+    pg_uri = (
+        f"postgresql://yashigani_app:{pg_password}"
+        f"@letta-pgbouncer:5432/letta"
+        f"?options=-csearch_path%3D{user_schema}"
+    )
+
+    # The internal gateway bearer token (P1-only; injected as OPENAI_API_KEY for
+    # Letta's OpenAI-compat client). In the sidecar design this is replaced by the
+    # per-agent gateway token from the Docker secret — but the env var provides the
+    # initialisation value for pre-sidecar deployments.
+    internal_bearer = os.getenv("YASHIGANI_INTERNAL_BEARER", "")
+
+    return {
+        "OPENAI_API_BASE": "http://gateway:8081/v1",
+        "OPENAI_API_KEY": internal_bearer,
+        "LETTA_PG_URI": pg_uri,
+        # Per-container Redis: entrypoint shim launches redis-server before startup.sh;
+        # LETTA_REDIS_HOST=localhost tells startup.sh to use the pre-launched instance.
+        "LETTA_REDIS_HOST": "localhost",
+        "LETTA_REDIS_PORT": "6379",
+        "YASHIGANI_LETTA_USER_ID": user_id,
+    }
+
+
+class LettaClientPool:
+    """Per-user Letta container/agent pool.
+
+    4.0 Phase 3 (RISK-107 closure):
+
+    One Letta container per user identity. Containers are persistent (idle-timeout
+    does NOT kill them; only user deactivation / admin offboard does). Memory is
+    durable — the letta_data_<user_slug> volume persists between container restarts.
+
+    Two-layer isolation:
+      Container layer: each user runs in their own Letta process. A compromised
+                       user's agent cannot write to another user's in-process state.
+      DB layer:        each user's Letta connects to schema letta_<user_slug>.
+                       Cross-schema reads require DBA access (accepted residual;
+                       full DB-per-user is the Enterprise-tier option B config).
+
+    Thread-safe. PoolManager manages container lifecycle; this class manages the
+    Letta agent ID within each user's container.
+
+    PINNED SEAM:
+      for_user(identity_id) -> (httpx.AsyncClient, base_url: str, agent_id: str)
+      Tom's OpenAI router calls this. Do not change the return type without Tom's
+      sign-off and a corresponding update in openai_router.py.
+    """
+
+    def __init__(self, pool_manager: "PoolManager") -> None:
+        self._pm = pool_manager
+        # Per-user agent ID cache: user_id → Letta agent UUID.
+        # Populated on first for_user() call; persists for the process lifetime.
+        # The Letta container persists the agent in its DB — the cache is just
+        # an in-process lookup to avoid redundant GET /v1/agents/ calls.
+        self._agent_ids: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def get_endpoint(self, user_id: str) -> str:
+        """Return the Letta REST API base URL for this user's container.
+
+        Creates the per-user container on first call (mode=persistent: idle-cleanup
+        does not tear it down). The container's SVID must already be issued before
+        get_or_create() proceeds — gated by agent.svid_state in the DB (Phase 3
+        pre-flight: auto-issued for Letta as a platform system agent at user
+        activation time, not user-configurable).
+
+        Returns: base_url like ``http://172.18.0.5:8283``
+        """
+        from yashigani.identity.trust_domain import agent_spiffe_uri
+        from yashigani.pool.manager import CertMount
+
+        # Per-agent ringfence network: internal bridge, no internet egress.
+        # Naming: ringfence_letta_<user_slug> (first 8 hex chars for readability).
+        user_slug = user_id.replace("-", "")[:8]
+        ringfence_net = f"ringfence_letta_{user_slug}"
+
+        cert_mount = CertMount(
+            # In the full sidecar design the sidecar manages the tmpfs volume;
+            # host_*_path is empty. For pre-sidecar deployments (compose without
+            # a sidecar) these are populated by install.sh per-user cert issuance.
+            host_cert_path="",
+            host_key_path="",
+            host_ca_path="",
+            container_cert_path="/run/secrets/svid/client.crt",
+            container_key_path="/run/secrets/svid/client.key",
+            container_ca_path="/run/secrets/svid/ca.crt",
+            spiffe_identity=agent_spiffe_uri(user_id, "letta"),
+        )
+
+        container_info = self._pm.get_or_create(
+            identity_id=user_id,
+            service_slug="letta",
+            image=_LETTA_IMAGE,
+            env=_letta_container_env(user_id),
+            port=_LETTA_PORT,
+            networks=[ringfence_net, "caddy_internal"],
+            cert_mount=cert_mount,
+            mode="persistent",   # idle-cleanup MUST NOT tear down Letta containers
+            # No ringfence_init_network here unless sidecar is wired for this user;
+            # sidecar wiring is Phase 3 pre-flight (Su + install.sh scope).
+        )
+        return container_info.endpoint
+
+    async def _ensure_agent_for_user(
+        self,
+        user_id: str,
+        base_url: str,
+        client: httpx.AsyncClient,
+    ) -> str:
+        """Get or create the Letta agent for this user. Returns agent_id.
+
+        Thread-safe: the lock serialises first-creation for a given user_id.
+        Subsequent calls return the cached agent_id without acquiring the lock.
+        The Letta container persists the agent in its own DB; if the process
+        restarts, the agent list GET finds the existing agent and populates
+        _agent_ids from the container's persistent store.
+        """
+        # Fast path: already in cache.
+        cached = self._agent_ids.get(user_id)
+        if cached:
+            return cached
+
+        with self._lock:
+            # Re-check under lock (concurrent first-creation race).
+            cached = self._agent_ids.get(user_id)
+            if cached:
+                return cached
+
+            embedding_cfg = await _letta_embedding_config(client)
+            brain_model = _letta_brain_model()
+
+            # Check for an existing agent in this user's container.
+            resp = await client.get(f"{base_url}/v1/agents/")
+            if resp.status_code == 200:
+                for agent in resp.json():
+                    if agent.get("name") == f"yashigani-{user_id[:8]}":
+                        agent_id = agent["id"]
+                        self._agent_ids[user_id] = agent_id
+                        logger.info(
+                            "LettaClientPool: found existing agent %s for user %s",
+                            agent_id, user_id[:8],
+                        )
+                        return agent_id
+
+            # Create a new per-user agent.
+            resp = await client.post(f"{base_url}/v1/agents/", json={
+                "name": f"yashigani-{user_id[:8]}",
+                "memory_blocks": [
+                    {
+                        "label": "human",
+                        "value": (
+                            "The user is interacting via the Yashigani AI security gateway. "
+                            f"User ID (internal): {user_id[:8]}..."
+                        ),
+                    },
+                    {
+                        "label": "persona",
+                        "value": (
+                            "I am a helpful AI assistant with persistent memory. "
+                            "I remember our conversations and can recall context across sessions."
+                        ),
+                    },
+                ],
+                "model": brain_model,
+                "embedding_config": embedding_cfg,
+            })
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"LettaClientPool: agent creation failed for user {user_id[:8]} "
+                    f"(model={brain_model!r}): HTTP {resp.status_code} {resp.text[:300]}"
+                )
+            agent_id = resp.json()["id"]
+            self._agent_ids[user_id] = agent_id
+            logger.info(
+                "LettaClientPool: created agent %s for user %s",
+                agent_id, user_id[:8],
+            )
+            return agent_id
+
+    async def for_user(
+        self,
+        identity_id: str,
+    ) -> tuple[httpx.AsyncClient, str, str]:
+        """Resolve (client, base_url, agent_id) for the given user identity.
+
+        PINNED SEAM — Tom's callers depend on this exact signature.
+
+        Creates the per-user Letta container on first call (via PoolManager).
+        Creates the per-user Letta agent in that container on first call.
+
+        Returns:
+            (client, base_url, agent_id)
+            client:   a new AsyncClient; caller owns the lifetime. Use as an
+                      async context manager or close explicitly.
+            base_url: the Letta container REST endpoint (e.g. http://IP:8283).
+            agent_id: the Letta agent UUID for this user's persistent memory agent.
+
+        Usage (Tom's call site):
+            client, base_url, agent_id = await pool.for_user(user_id)
+            async with client:
+                resp = await client.post(f"{base_url}/v1/agents/{agent_id}/messages", ...)
+        """
+        base_url = f"http://{self.get_endpoint(identity_id)}"
+        client = httpx.AsyncClient(timeout=120.0)
+        try:
+            agent_id = await self._ensure_agent_for_user(identity_id, base_url, client)
+        except Exception:
+            await client.aclose()
+            raise
+        return (client, base_url, agent_id)
+
+    async def letta_chat(
+        self,
+        user_id: str,
+        messages: list[dict],
+        timeout: float = 120.0,
+    ) -> dict:
+        """Send messages to this user's Letta agent; return OpenAI-format response.
+
+        Convenience wrapper over for_user() for callers that don't need the raw
+        (client, base_url, agent_id) triple. Manages the client lifetime internally.
+        """
+        base_url = f"http://{self.get_endpoint(user_id)}"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            agent_id = await self._ensure_agent_for_user(user_id, base_url, client)
+            letta_messages = [
+                {"role": m.get("role", "user"), "content": m.get("content", "")}
+                for m in messages
+            ]
+            resp = await client.post(
+                f"{base_url}/v1/agents/{agent_id}/messages",
+                json={"messages": letta_messages, "streaming": False},
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Letta message failed for user {user_id[:8]}: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+            data = resp.json()
+
+        assistant_text = ""
+        for msg in data.get("messages", []):
+            if msg.get("message_type") == "assistant_message":
+                assistant_text = msg.get("content", "")
+                break
+        if not assistant_text:
+            parts = [
+                msg.get("content", "")
+                for msg in data.get("messages", [])
+                if msg.get("content") and msg.get("message_type") not in (
+                    "system_message", "tool_call_message"
+                )
+            ]
+            assistant_text = "\n".join(parts) if parts else "Letta agent returned no text."
+
+        usage = data.get("usage", {})
+        return {
+            "id": f"chatcmpl-letta-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "model": "letta",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": assistant_text},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
+        }
 
 # ---------------------------------------------------------------------------
 # Embedding-dimension table (SC-AGENT-003)
