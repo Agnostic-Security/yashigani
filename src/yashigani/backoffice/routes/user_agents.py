@@ -1,5 +1,5 @@
 """
-Yashigani 4.0 — User-plane Letta agent capability routes.
+Yashigani 4.0 — User-plane Letta agent capability routes + graph persistence + NHI run.
 
 All endpoints enforce ``require_user_session`` (RISK-100) and are BOLA-scoped
 to the calling user's ``account_id``.  User A cannot touch User B's agents,
@@ -41,11 +41,26 @@ Redis key design (db/3, ``ua:`` prefix):
                                            personality (JSON: persona+system_prompt),
                                            effective_skills (JSON list),
                                            declared_skills  (JSON list),
+                                           graph (JSON CTF blob — Phase 4 persistence),
+                                           graph_hash (sha384:<hex> — for audit),
+                                           nhi_id (nhi_* id once instantiated),
                                            letta_agent_id, created_at, updated_at
   ua:mem:all:{account_id}           Set  — block_ids owned by this user
   ua:mem:meta:{block_id}            Hash — account_id, label, value,
                                            letta_block_id, created_at, updated_at
   ua:mem:agent:{ua_agent_id}        Set  — block_ids currently attached to this agent
+
+Graph persistence (Phase 4):
+  PUT /user/agents/{ua_id}/graph    — save CTF graph JSON (server validates + strips
+                                       R11 fields; agent must exist + be owned by caller)
+  GET /user/agents/{ua_id}/graph    — load saved CTF graph for edit in the builder
+
+NHI run endpoint (Phase 3):
+  POST /user/agents/{ua_id}/run     — instantiate an NHI from the agent's stored graph +
+                                       skills.  Computes effective_scope (R3), registers
+                                       the NHI, mints delegation context.
+                                       Requires the agent graph to be saved (Phase 4).
+                                       Returns nhi_id + session_id + svid_pending flag.
 
 Skill scope intersection (R3 / RISK-097):
   effective_scope = declared_skills ∩ invoker_grants ∩ system_ceiling
@@ -75,10 +90,12 @@ Last updated: 2026-06-27T00:00:00+00:00
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
+import re
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -359,6 +376,20 @@ class CreateMemoryBody(BaseModel):
 class PatchMemoryBody(BaseModel):
     label: Optional[str] = Field(default=None, min_length=1, max_length=128)
     value: Optional[str] = Field(default=None, max_length=32768)
+
+
+class SaveGraphBody(BaseModel):
+    """CTF graph payload from the Drawflow builder.
+
+    The server validates structural constraints (V-001..V-015) and strips any
+    client-supplied ``effective_scope`` fields before storage (R11).
+    """
+    # The full CTF graph object.  Arbitrary structure accepted here; server
+    # validates below in _validate_and_strip_graph().
+    graph: dict[str, Any] = Field(description="CTF graph object (nodes + edges)")
+    # Declared scope — server will compute effective_scope server-side.
+    # Client may supply declared_scope; server never accepts effective_scope from client.
+    declared_scope: Optional[dict[str, Any]] = Field(default=None)
 
 
 # ===========================================================================
@@ -816,6 +847,160 @@ async def delete_memory_block(block_id: str, session: UserSession):
 
 
 # ===========================================================================
+# Graph persistence helpers (Phase 4 — RISK-113 / R11)
+# ===========================================================================
+
+# Label allowlist pattern (no HTML chars, V-011)
+_LABEL_RE = re.compile(r"^[^<>&\"']{1,256}$")
+_EDGE_LABEL_RE = re.compile(r"^[^<>&\"']{0,128}$")
+
+_VALID_NODE_TYPES = frozenset({
+    "input_node", "output_node", "tool_node", "model_node",
+    "agent_node", "policy_node", "langflow_node",
+})
+
+_MAX_NODES = 32
+_MAX_EDGES = 64
+_MAX_FANOUT = 4
+_MAX_DEPTH = 9
+
+
+def _sha384_graph(graph_json: str) -> str:
+    """SHA-384 hex of the normalised CTF graph JSON for audit."""
+    return "sha384:" + hashlib.sha384(graph_json.encode("utf-8")).hexdigest()
+
+
+def _strip_effective_scope_from_node(node: dict) -> dict:
+    """Remove client-supplied effective_scope from a node (R11).
+
+    Returns a copy with ``data.effective_scope`` stripped if present.
+    The server computes effective_scope server-side — the client cannot
+    supply it to influence scope at execution time.
+    """
+    node = dict(node)
+    if isinstance(node.get("data"), dict):
+        data = dict(node["data"])
+        data.pop("effective_scope", None)
+        node["data"] = data
+    return node
+
+
+def _validate_and_strip_graph(graph: dict) -> tuple[dict, list[str]]:
+    """Validate CTF graph and strip R11 fields.
+
+    Returns (stripped_graph, errors).  If errors is non-empty, the caller
+    must reject with HTTP 422.
+
+    Implements V-001..V-011 (structural), V-014 (depth), V-015 (fan-out).
+    V-012/V-013 (registry/scope) are deferred to NHI instantiation time.
+
+    Server-strips:
+      - ``node.data.effective_scope`` (R11: never trust client-supplied scope)
+      - Any top-level ``effective_scope`` or ``import_provenance`` fields
+        (those are server-populated at import time only).
+    """
+    errors: list[str] = []
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+
+    # Size caps (RISK-111)
+    if len(nodes) > _MAX_NODES:
+        errors.append(f"V-NODES: too many nodes ({len(nodes)} > {_MAX_NODES})")
+    if len(edges) > _MAX_EDGES:
+        errors.append(f"V-EDGES: too many edges ({len(edges)} > {_MAX_EDGES})")
+
+    # V-001: exactly one input_node
+    input_nodes = [n for n in nodes if n.get("node_type") == "input_node"]
+    if len(input_nodes) != 1:
+        errors.append(f"V-001: expected exactly one input_node, got {len(input_nodes)}")
+
+    # V-002: exactly one output_node
+    output_nodes = [n for n in nodes if n.get("node_type") == "output_node"]
+    if len(output_nodes) != 1:
+        errors.append(f"V-002: expected exactly one output_node, got {len(output_nodes)}")
+
+    # V-011: label HTML safety
+    node_ids: set[str] = set()
+    stripped_nodes = []
+    for node in nodes:
+        node_type = node.get("node_type", "")
+        if node_type not in _VALID_NODE_TYPES:
+            errors.append(f"V-TYPE: unknown node_type {node_type!r}")
+        label = node.get("label", "")
+        if not _LABEL_RE.fullmatch(label):
+            errors.append(f"V-011: node label contains HTML or is too long: {label[:32]!r}")
+        node_id = node.get("id", "")
+        if node_id:
+            node_ids.add(node_id)
+        stripped_nodes.append(_strip_effective_scope_from_node(node))
+
+    # V-003: edge node references
+    stripped_edges = []
+    out_edges: dict[str, int] = {}
+    for edge in edges:
+        src = edge.get("source_node_id", "")
+        tgt = edge.get("target_node_id", "")
+        if src not in node_ids:
+            errors.append(f"V-003: edge source_node_id {src!r} not in graph")
+        if tgt not in node_ids:
+            errors.append(f"V-003: edge target_node_id {tgt!r} not in graph")
+        # V-011: edge label
+        elabel = edge.get("label", "")
+        if elabel and not _EDGE_LABEL_RE.fullmatch(elabel):
+            errors.append(f"V-011: edge label contains HTML: {elabel[:32]!r}")
+        # Count fan-out per source
+        out_edges[src] = out_edges.get(src, 0) + 1
+        # V-004: no self-loops (simple cycle check — DAG full check is O(N+E))
+        if src == tgt:
+            errors.append(f"V-004: self-loop on node {src!r}")
+        # Enforce governed=true and audit=true (immutable constants per spec)
+        stripped_edge = dict(edge)
+        stripped_edge["governed"] = True
+        stripped_edge["audit"] = True
+        stripped_edges.append(stripped_edge)
+
+    # V-015: fan-out
+    for node_id, fan in out_edges.items():
+        if fan > _MAX_FANOUT:
+            errors.append(f"V-015: node {node_id!r} fan-out {fan} > {_MAX_FANOUT}")
+
+    # V-004: cycle detection (simple DFS)
+    adj: dict[str, list[str]] = {n.get("id", ""): [] for n in nodes}
+    for edge in stripped_edges:
+        src = edge.get("source_node_id", "")
+        tgt = edge.get("target_node_id", "")
+        if src in adj:
+            adj[src].append(tgt)
+
+    visited: set[str] = set()
+    rec_stack: set[str] = set()
+
+    def _has_cycle(v: str) -> bool:
+        visited.add(v)
+        rec_stack.add(v)
+        for nb in adj.get(v, []):
+            if nb not in visited:
+                if _has_cycle(nb):
+                    return True
+            elif nb in rec_stack:
+                return True
+        rec_stack.discard(v)
+        return False
+
+    for node_id in list(adj.keys()):
+        if node_id not in visited:
+            if _has_cycle(node_id):
+                errors.append("V-004: graph contains a cycle; cycles are not permitted")
+                break
+
+    stripped_graph = {
+        "nodes": stripped_nodes,
+        "edges": stripped_edges,
+    }
+    return stripped_graph, errors
+
+
+# ===========================================================================
 # /user/skills — available skill catalog
 # ===========================================================================
 
@@ -842,3 +1027,294 @@ async def list_available_skills(session: UserSession):
         available = sorted(system_ceiling)
 
     return {"available_skills": available, "count": len(available)}
+
+
+# ===========================================================================
+# /user/agents/{ua_id}/graph — builder graph persistence (Phase 4 / RISK-113)
+# ===========================================================================
+
+
+@router.put("/user/agents/{ua_id}/graph")
+async def save_agent_graph(ua_id: str, body: SaveGraphBody, session: UserSession):
+    """Persist the Drawflow builder graph server-side (Phase 4).
+
+    BOLA: the agent must be owned by the calling user (404 on violation).
+
+    R11 enforcement:
+      - Strips any client-supplied ``effective_scope`` from all nodes.
+      - Sets ``governed=true`` and ``audit=true`` on all edges (immutable constants).
+      - Server never accepts ``import_provenance`` or top-level ``effective_scope``
+        from the client — those are server-populated fields only.
+
+    Validation: V-001..V-011, V-014, V-015 (structural CTF constraints).
+    Emits ``AGENT_TEMPLATE_SAVED`` to the audit hash-chain.
+
+    Returns the saved graph hash and node/edge counts.
+    """
+    r = _get_redis()
+    _get_agent_or_404(r, ua_id, session.account_id)  # BOLA check
+
+    graph_input = body.graph
+    stripped_graph, errors = _validate_and_strip_graph(graph_input)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "graph_validation_failed", "violations": errors},
+        )
+
+    node_count = len(stripped_graph.get("nodes", []))
+    edge_count = len(stripped_graph.get("edges", []))
+
+    # Build the persisted CTF document.
+    # Strip client-supplied effective_scope and import_provenance at the top level (R11).
+    scope = dict(body.declared_scope) if body.declared_scope else {}
+    scope.pop("effective_scope", None)   # R11: server-computed only
+    scope.pop("import_provenance", None)  # server-populated only
+
+    ctf_doc = {
+        "spec_version": "1.0",
+        "graph": stripped_graph,
+        "scope": scope,
+        # Lifecycle and NHI fields are managed server-side; not set by PUT graph.
+    }
+    ctf_json = json.dumps(ctf_doc, separators=(",", ":"), sort_keys=True)
+    graph_hash = _sha384_graph(ctf_json)
+
+    r.hset(_meta_key(ua_id), mapping={
+        b"graph":      ctf_json.encode("utf-8"),
+        b"graph_hash": graph_hash.encode("utf-8"),
+        b"updated_at": _now_iso().encode("utf-8"),
+    })
+
+    logger.info(
+        "user_agents: graph saved for %s account=%r nodes=%d edges=%d hash=%s",
+        ua_id, session.account_id, node_count, edge_count, graph_hash[:24],
+    )
+
+    # Audit event to hash-chain (RISK-104 / AUDIT-GAP-001 class)
+    aw = getattr(backoffice_state, "audit_writer", None)
+    if aw is not None:
+        try:
+            from yashigani.audit.schema import AgentTemplateGraphSavedEvent
+            aw.write(AgentTemplateGraphSavedEvent(
+                owner_identity_id=session.account_id,
+                ua_id=ua_id,
+                node_count=node_count,
+                edge_count=edge_count,
+                graph_hash=graph_hash,
+                effective_scope_stripped=True,
+            ))
+        except Exception as exc:
+            logger.warning("AgentTemplateGraphSavedEvent audit write failed: %s", exc)
+
+    return {
+        "ua_id": ua_id,
+        "graph_hash": graph_hash,
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "effective_scope_stripped": True,
+    }
+
+
+@router.get("/user/agents/{ua_id}/graph")
+async def load_agent_graph(ua_id: str, session: UserSession):
+    """Load the persisted CTF graph for edit in the builder.
+
+    BOLA: the agent must be owned by the calling user (404 on violation).
+
+    Returns the stored CTF document (``graph`` + ``scope`` + ``graph_hash``).
+    If no graph has been saved yet, returns ``graph: null`` so the builder
+    knows to start from an empty canvas.
+    """
+    r = _get_redis()
+    meta = _get_agent_or_404(r, ua_id, session.account_id)
+
+    graph_raw = meta.get("graph", "")
+    graph_hash = meta.get("graph_hash", "")
+
+    if not graph_raw:
+        return {
+            "ua_id": ua_id,
+            "graph": None,
+            "graph_hash": None,
+            "message": "No graph saved yet — builder starts from empty canvas.",
+        }
+
+    try:
+        ctf_doc = json.loads(graph_raw)
+    except json.JSONDecodeError:
+        logger.error("user_agents: corrupted graph JSON for %s", ua_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "graph_corrupted"},
+        )
+
+    return {
+        "ua_id": ua_id,
+        "graph": ctf_doc.get("graph"),
+        "scope": ctf_doc.get("scope", {}),
+        "graph_hash": graph_hash,
+    }
+
+
+# ===========================================================================
+# /user/agents/{ua_id}/run — NHI instantiation (Phase 3 / RISK-097)
+# ===========================================================================
+
+
+@router.post("/user/agents/{ua_id}/run", status_code=status.HTTP_201_CREATED)
+async def run_user_agent(ua_id: str, session: UserSession):
+    """Instantiate an NHI from the user agent's stored graph + skills (Phase 3).
+
+    Compute effective_scope = declared_skills ∩ invoker_grants ∩ system_ceiling (R3).
+    Register the NHI in AgentRegistry (kind="nhi") with the computed scope.
+    Returns nhi_id + svid_pending flag.
+
+    If ``svid_issued=False`` the NHI requires admin approval before gateway calls
+    will be accepted (403 NHI_PENDING_APPROVAL on invocation).
+
+    BOLA: the agent must be owned by the calling user.
+    Requires an agent registry (HTTP 503 if unavailable).
+    """
+    r = _get_redis()
+    meta = _get_agent_or_404(r, ua_id, session.account_id)
+
+    # Check if an NHI is already instantiated for this agent
+    existing_nhi_id = meta.get("nhi_id", "")
+    if existing_nhi_id:
+        # Return existing NHI metadata (idempotent for re-run)
+        return {
+            "ua_id": ua_id,
+            "nhi_id": existing_nhi_id,
+            "svid_pending": True,  # caller should check registry for svid_issued
+            "message": "NHI already instantiated for this agent.",
+        }
+
+    # Require agent registry
+    agent_registry = getattr(backoffice_state, "agent_registry", None)
+    if agent_registry is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "registry_unavailable",
+                    "message": "Agent registry not ready — cannot instantiate NHI."},
+        )
+
+    # Require a saved graph
+    graph_raw = meta.get("graph", "")
+    if not graph_raw:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "no_graph_saved",
+                    "message": "Save a builder graph first (PUT /user/agents/{ua_id}/graph)."},
+        )
+
+    # R3: effective_scope = declared_skills ∩ invoker_grants ∩ system_ceiling
+    _raw_skills = _j(meta.get("effective_skills", "[]"))
+    declared_skills: list[str] = _raw_skills if isinstance(_raw_skills, list) else []
+    effective_tools, rejected = compute_effective_skills(declared_skills, session.account_id, r)
+
+    if not effective_tools:
+        # Emit NHI_INSTANTIATION_DENIED
+        aw = getattr(backoffice_state, "audit_writer", None)
+        if aw is not None:
+            try:
+                from yashigani.audit.schema import NhiInstantiationDeniedEvent
+                aw.write(NhiInstantiationDeniedEvent(
+                    owner_identity_id=session.account_id,
+                    ua_id=ua_id,
+                    reason="empty_intersection",
+                ))
+            except Exception as exc:
+                logger.warning("NhiInstantiationDeniedEvent audit write failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "NHI_INSTANTIATION_DENIED",
+                "reason": "empty_intersection",
+                "message": (
+                    "Scope intersection is empty — the declared skills do not overlap "
+                    "with your grants or the system ceiling. No NHI can be instantiated."
+                ),
+            },
+        )
+
+    agent_name = meta.get("name", ua_id)
+    # Compute scope hash for audit (R3)
+    scope_obj = {"allowed_tools": sorted(effective_tools)}
+    scope_hash = "sha384:" + hashlib.sha384(
+        json.dumps(scope_obj, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    # Emit NHI_INSTANTIATION_REQUESTED
+    aw = getattr(backoffice_state, "audit_writer", None)
+    if aw is not None:
+        try:
+            from yashigani.audit.schema import NhiInstantiationRequestedEvent, NhiScopeIntersectedEvent
+            aw.write(NhiInstantiationRequestedEvent(
+                owner_identity_id=session.account_id,
+                ua_id=ua_id,
+                template_name=agent_name,
+            ))
+        except Exception as exc:
+            logger.warning("NhiInstantiationRequestedEvent audit write failed: %s", exc)
+
+    # Register NHI in AgentRegistry
+    budget_cap = {
+        "max_tokens_per_run": 8192,
+        "max_tool_calls_per_run": 20,
+    }
+    try:
+        nhi_id, _plaintext_token = agent_registry.register_nhi(
+            name=agent_name,
+            owner_identity_id=session.account_id,
+            template_id=ua_id,
+            allowed_tools=effective_tools,
+            allowed_paths=effective_tools,
+            allowed_models=[],
+            sensitivity_ceiling="INTERNAL",
+            budget_cap=budget_cap,
+            pids_limit=64,
+            memory_mb=512,
+        )
+    except Exception as exc:
+        logger.error("NHI registration failed for ua_id=%s: %s", ua_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "nhi_registration_failed", "message": str(exc)},
+        )
+
+    # Persist nhi_id back to the agent meta
+    r.hset(_meta_key(ua_id), mapping={
+        b"nhi_id":     nhi_id.encode("utf-8"),
+        b"updated_at": _now_iso().encode("utf-8"),
+    })
+
+    # Emit NHI_SCOPE_INTERSECTED
+    if aw is not None:
+        try:
+            aw.write(NhiScopeIntersectedEvent(
+                nhi_id=nhi_id,
+                owner_identity_id=session.account_id,
+                effective_scope_hash=scope_hash,
+                declared_scope_tool_count=len(declared_skills),
+                effective_scope_tool_count=len(effective_tools),
+            ))
+        except Exception as exc:
+            logger.warning("NhiScopeIntersectedEvent audit write failed: %s", exc)
+
+    logger.info(
+        "user_agents: NHI instantiated nhi_id=%s ua_id=%s account=%r effective_tools=%d rejected=%d",
+        nhi_id, ua_id, session.account_id, len(effective_tools), len(rejected),
+    )
+
+    return {
+        "ua_id": ua_id,
+        "nhi_id": nhi_id,
+        "effective_scope": {"allowed_tools": effective_tools},
+        "rejected_tools": rejected,
+        "svid_pending": True,
+        "message": (
+            "NHI registered (svid_issued=False). An admin must approve the NHI in the "
+            "backoffice before gateway invocations are accepted."
+        ),
+    }

@@ -345,6 +345,30 @@ class EventType(str, Enum):
     # a truncated, sanitised error_type label.
     # OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
     AGENT_UPSTREAM_UNREACHABLE = "AGENT_UPSTREAM_UNREACHABLE"
+    # ---------------------------------------------------------------------------
+    # 4.0 Phase 3 — NHI identity lifecycle + P1/P2 split (RISK-097/108)
+    # All events route to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / CMMC AU.L2-3.3.1 / SOC 2 CC7.1.
+    # ---------------------------------------------------------------------------
+    # NHI instantiation lifecycle
+    NHI_INSTANTIATION_REQUESTED = "NHI_INSTANTIATION_REQUESTED"
+    NHI_SCOPE_INTERSECTED = "NHI_SCOPE_INTERSECTED"
+    NHI_INSTANTIATION_DENIED = "NHI_INSTANTIATION_DENIED"
+    NHI_SVID_APPROVED = "NHI_SVID_APPROVED"
+    # NHI invocation (per-hop OPA decisions)
+    NHI_INVOCATION_ALLOWED = "NHI_INVOCATION_ALLOWED"
+    NHI_INVOCATION_DENIED = "NHI_INVOCATION_DENIED"
+    # P1/P2 header isolation — SECURITY event (HIGH severity)
+    # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
+    # The header is silently stripped; this event is the regression canary.
+    # Laura's regression can detect impersonation attempts without a live exploit.
+    AGENT_HEADER_STRIPPED = "AGENT_HEADER_STRIPPED"
+    # Delegated context (R2 / R12): server-side on-behalf-of record
+    DELEGATED_CTX_MINTED = "DELEGATED_CTX_MINTED"
+    DELEGATED_CTX_EXPIRED = "DELEGATED_CTX_EXPIRED"
+    # Builder graph lifecycle (Phase 4 — builder persistence)
+    AGENT_TEMPLATE_SAVED = "AGENT_TEMPLATE_SAVED"
+    AGENT_TEMPLATE_LOADED = "AGENT_TEMPLATE_LOADED"
 
 
 # ---------------------------------------------------------------------------
@@ -3098,3 +3122,158 @@ class AdminCloudKeySetEvent(AuditEvent):
     admin_account: str = ""
     provider: str = ""     # e.g. "openai" | "anthropic"
     kms_key: str = ""      # KMS key name (e.g. "openai_api_key") — never the value
+
+
+# ---------------------------------------------------------------------------
+# 4.0 Phase 3 — NHI identity lifecycle + P1/P2 split (RISK-097/108)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NhiInstantiationRequestedEvent(AuditEvent):
+    """User requests instantiation of an NHI from a user-agent template (RISK-097).
+
+    Emitted before scope intersection so the request is recorded even if
+    it is subsequently denied by NhiInstantiationDeniedEvent.
+    """
+
+    event_type: str = EventType.NHI_INSTANTIATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""   # the requesting user's identity_id
+    ua_id: str = ""               # user-agent source id (uag_*)
+    template_name: str = ""       # agent name slug
+
+
+@dataclass
+class NhiScopeIntersectedEvent(AuditEvent):
+    """Scope intersection computed for an NHI instantiation (R3 / RISK-097).
+
+    Records the resulting effective_scope so the audit chain proves what
+    the NHI was granted, independently of any later mutation.
+    effective_scope_hash is SHA-384 of the JSON-serialised effective_scope.
+    """
+
+    event_type: str = EventType.NHI_SCOPE_INTERSECTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    nhi_id: str = ""
+    owner_identity_id: str = ""
+    effective_scope_hash: str = ""   # sha384:<hex>
+    declared_scope_tool_count: int = 0
+    effective_scope_tool_count: int = 0
+
+
+@dataclass
+class NhiInstantiationDeniedEvent(AuditEvent):
+    """NHI instantiation denied — empty intersection or admin deny (RISK-097).
+
+    reason: "empty_intersection" | "admin_deny" | "svid_pending".
+    """
+
+    event_type: str = EventType.NHI_INSTANTIATION_DENIED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    ua_id: str = ""
+    reason: str = ""   # empty_intersection | admin_deny | svid_pending
+
+
+@dataclass
+class NhiSvidApprovedEvent(AuditEvent):
+    """Admin approved SVID issuance for an NHI (step-up required, RISK-097).
+
+    step_up_verified is always True — NHI approval requires StepUpAdminSession.
+    """
+
+    event_type: str = EventType.NHI_SVID_APPROVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    nhi_id: str = ""
+    spiffe_id: str = ""
+    step_up_verified: bool = True
+
+
+@dataclass
+class NhiInvocationAllowedEvent(AuditEvent):
+    """OPA allowed an NHI-originated hop (RISK-097 invariant pass)."""
+
+    event_type: str = EventType.NHI_INVOCATION_ALLOWED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    on_behalf_of_identity_id: str = ""   # the invoking user, from delegated ctx
+    path: str = ""
+
+
+@dataclass
+class NhiInvocationDeniedEvent(AuditEvent):
+    """OPA denied an NHI-originated hop — scope containment working (RISK-097)."""
+
+    event_type: str = EventType.NHI_INVOCATION_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    on_behalf_of_identity_id: str = ""
+    path: str = ""
+    deny_reason: str = ""   # scope_ceiling | tool_not_allowed | budget_exceeded
+
+
+@dataclass
+class AgentHeaderStrippedEvent(AuditEvent):
+    """A P1 (agent-only) caller attempted to set a P2 (user-assertion) header.
+
+    Severity: HIGH.  This is a regression canary for FIND-3.1-AGENT-BEARER-
+    IMPERSONATION (RISK-108).  The header was silently stripped; the identity
+    resolved as the agent's own NHI identity (not the claimed user).
+
+    Laura's regression probe checks for this event in the audit chain — any
+    appearance means an agent made an impersonation attempt.
+    """
+
+    event_type: str = EventType.AGENT_HEADER_STRIPPED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_token_role: str = ""        # p1_agent | p1_nhi
+    stripped_header: str = ""          # x-openwebui-user-email | x-yashigani-orchestration-principal
+    agent_identity_id: str = ""        # the resolved agent/NHI id
+    severity: str = "HIGH"             # immutable floor
+
+
+@dataclass
+class DelegatedCtxMintedEvent(AuditEvent):
+    """Gateway minted a server-side delegated context record (R2 / RISK-097).
+
+    Records the binding without exposing the signed nonce value.
+    binding_hash is SHA-384 of (nhi_id + ":" + user_identity_id + ":" + jti).
+    """
+
+    event_type: str = EventType.DELEGATED_CTX_MINTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    user_identity_id: str = ""
+    session_id_hash: str = ""    # SHA-384 of the raw session_id — never raw
+    binding_hash: str = ""       # SHA-384(nhi_id:user_identity_id:jti)
+    ttl_seconds: int = 0
+
+
+@dataclass
+class AgentTemplateGraphSavedEvent(AuditEvent):
+    """Builder graph persisted server-side (Phase 4 / RISK-113).
+
+    raw graph is never stored; only node_count, edge_count, and a SHA-384
+    of the normalised graph JSON are recorded.
+    effective_scope_stripped=True confirms R11 enforcement ran.
+    """
+
+    event_type: str = EventType.AGENT_TEMPLATE_SAVED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    ua_id: str = ""
+    node_count: int = 0
+    edge_count: int = 0
+    graph_hash: str = ""              # sha384:<hex> of normalised CTF graph JSON
+    effective_scope_stripped: bool = True  # always True (R11)
