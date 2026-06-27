@@ -23,11 +23,14 @@ sha384-78CXiC89zTlJuiThUqPO9bq+aZYATjt07Gu4vQPHmVsGgA1xcSeLOdUMbnJlrpgT  static/
 sha384-vdFRmGkHN1y8o9A9ZKPX+Eg7+/zFN16IhGIN9en7KokS0KIXsAmb7vmH9Hk4mChh  static/vendor/marked/marked.esm.js
 sha384-cBzrHZ8u4IIGOvDAM8EvZTPl/pjhSl5VSC5gtkUvAi10eJbxv8gLfqW6Z7E8EceE  static/vendor/lit/lit-core.min.js
 
-# ── Deferred (Phase 4) ───────────────────────────────────────────────────────
-# drawflow — eval audit result UNKNOWN; must be audited before Phase 4 ships.
-# If eval is present, Drawflow must be patched or wrapped. See spec §2.4.
-# sha384-<PENDING>  static/vendor/drawflow/drawflow-<version>.min.js
-# sha384-<PENDING>  static/vendor/drawflow/drawflow-<version>.min.css
+# ── Phase 4: Drawflow 0.0.60 ─────────────────────────────────────────────────
+# drawflow.esm.js — patched ESM shim wrapping the UMD build.
+#   Source: https://registry.npmjs.org/drawflow/-/drawflow-0.0.60.tgz
+#   Eval audit: PASS on source UMD (no eval/Function/setTimeout-str/document.write).
+#   TT patches: 6 innerHTML="" / "x" → textContent; 2 innerHTML=var → __df_tt()
+#   (zero-allowlist DOMPurify + drawflow-label TT policy). See vendor-audit-log.md.
+sha384-8u9QSHa0NpNzUh7hK3NiCiTkf7Uduk/Nhhwh/tw9mG0YnBEOVlEYwpZHsHpyFQxw  static/vendor/drawflow/drawflow.esm.js
+sha384-IFh+Q6zh+LRcTjqVmAKetdGY59dT485vtvWT5DAKQy8iv5+fYWHXisHP7mFKcFqV  static/vendor/drawflow/drawflow.min.css
 
 # ── Deferred (Phase 1 - swagger-ui remediation) ──────────────────────────────
 # swagger-ui-bundle.js KNOWN FAIL on eval audit (webpack eval source-maps).

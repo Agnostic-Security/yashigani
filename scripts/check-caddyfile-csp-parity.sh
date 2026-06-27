@@ -85,6 +85,10 @@ if [ -f "$HELM_CONFIGMAP" ]; then
         echo "DRIFT: Helm configmaps.yaml missing trusted-types yashigani-render" >&2
         fail=1
     fi
+    if ! grep -q 'drawflow-label' "$HELM_CONFIGMAP"; then
+        echo "DRIFT: Helm configmaps.yaml missing drawflow-label in trusted-types (Phase 4 addition)" >&2
+        fail=1
+    fi
     if grep -v '[[:space:]]*#' "$HELM_CONFIGMAP" | grep -q '@lenient_ui'; then
         echo "DRIFT: Helm configmaps.yaml still contains @lenient_ui catch-all" >&2
         fail=1

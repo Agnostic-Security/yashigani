@@ -47,19 +47,24 @@
     }
 
     # Strict + Trusted Types: 4.0 first-party user paths
-    # Three named TT policies (Phase-1 integration fix, RECONCILIATION-20260627):
-    #   yashigani-render — our sole sanitisation sink (safe-render.js)
+    # Four named TT policies (Phase-1 + Phase-4 Drawflow vendoring):
+    #   yashigani-render — our sole sanitisation sink (ui4/core/safe-render.js)
     #   dompurify        — DOMPurify's RETURN_TRUSTED_TYPE internal policy (purify.es.mjs)
     #   lit-html         — Lit's internal template-literal policy (lit-core.min.js)
-    # The latter two bless developer-authored templates / already-sanitised strings
-    # only — they are NOT data sinks. No 'default' policy — fail-closed on
-    # unreviewed DOM writes.
+    #   drawflow-label   — Drawflow's html-param path (zero-allowlist DOMPurify + textContent
+    #                      enforcement; registered in ui4/core/drawflow-safe.js).
+    #                      Added Phase 4 per spec §2.4 conditional + RECONCILIATION R1:
+    #                      Drawflow's 2 innerHTML=variable calls cannot be replaced with
+    #                      textContent without forking the library. See vendor-audit-log.md.
+    # The latter three bless developer-authored templates / already-sanitised strings only
+    # — they are NOT data sinks for user-supplied content. No 'default' policy — fail-closed
+    # on unreviewed DOM writes.
     # connect-src 'self' covers SSE (HTTPS fetch). If chat transport moves to
     # WebSocket, add wss://{$YASHIGANI_TLS_DOMAIN} here (OQ-1 resolution needed).
     @strict_tt path /chat/* /user/* /flow/*
 
     header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html; report-uri /api/v1/csp-report; report-to default"
+    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
     header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
     header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
 }
