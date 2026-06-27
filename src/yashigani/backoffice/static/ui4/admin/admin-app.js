@@ -24,6 +24,12 @@ import { getAdminModules, getAdminModule } from './module-registry.js';
 // Each side-effect import self-registers via registerAdminModule(). Wave 2 adds
 // one line per module group here; the shell discovers them through the registry.
 import './modules/dashboard.js';
+// "Ops & Crypto" module group (Wave 2).
+import './modules/infrastructure.js';
+import './modules/kms-pki.js';
+import './modules/backup.js';
+import './modules/secrets-runtime.js';
+import './modules/crypto-inventory.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /
