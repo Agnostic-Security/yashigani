@@ -63,15 +63,68 @@ and referenced in HTML templates.
 
 ---
 
-## Drawflow — PENDING (Phase 4)
+## Drawflow 0.0.60 — 2026-06-27
 
-- **Audit result:** UNKNOWN — not yet audited
-- **eval-audit.sh output:** NOT RUN — must be run before Phase 4 vendor step
-- **Notes:** Drawflow uses `element.innerHTML = label` internally (RISK-096).
-  If eval is present in the minified bundle, must either patch to use textContent
-  for labels, or use the `drawflow-label` TT policy (DOMPurify zero-allowlist).
-  The Phase 4 implementation spec must resolve this and record the decision here.
-- **File:** NOT YET VENDORED
+- **Audit result:** PASS (source UMD) — see TT decision below
+- **eval-audit.sh output:** PASS — no eval/Function/setTimeout-string/setInterval-string/document.write
+  patterns found in `package/dist/drawflow.min.js` (webpack 4, UMD production build).
+- **DOMPurify TrustedHTML compat check:** N/A for the source UMD directly. The ESM shim imports
+  `purify.es.mjs` (already vendored/audited at 3.4.11) and uses its zero-allowlist mode for
+  the `drawflow-label` TT policy output. DOMPurify >= 2.4.0 confirmed.
+- **Source of download:** `https://registry.npmjs.org/drawflow/-/drawflow-0.0.60.tgz`
+  Extracted: `package/dist/drawflow.min.js` (UMD, no sourceMappingURL) +
+             `package/dist/drawflow.min.css` (1910 bytes, no sourceMappingURL)
+- **No ESM build in package** — Drawflow 0.0.60 ships UMD only (`main: dist/drawflow.min.js`,
+  no `module` field). ESM shim built by wrapping with Python block-scope capture of
+  module/exports (same pattern as Phase 1 Lit shim).
+
+**TT compatibility audit (RISK-096) — innerHTML call inventory:**
+
+Drawflow 0.0.60 contains 8 `innerHTML` assignments:
+
+| # | Pattern | Type | Decision |
+|---|---------|------|----------|
+| 1 | `t.innerHTML="x"` | Literal string (delete icon) | → `t.textContent="x"` |
+| 2 | `h.innerHTML=""` | Empty string (node init) | → `h.textContent=""` |
+| 3 | `_.innerHTML=c` | `html` param when `typenode===false` | → `_.innerHTML=__df_tt(c)` |
+| 4 | `i.innerHTML=""` | Empty string (import node init) | → `i.textContent=""` |
+| 5 | `c.innerHTML=e.html` | `html` field on import when `typenode===false` | → `c.innerHTML=__df_tt(e.html)` |
+| 6–8 | `this.precanvas.innerHTML=""` (×3) | Canvas clear | → `this.precanvas.textContent=""` |
+
+Patches 1,2,4,6,7,8 (6 safe literal/empty assignments): replaced with `textContent`
+equivalents — no TT policy needed, no semantic change.
+
+Patches 3 and 5 (2 variable assignments): `__df_tt()` wrapper injected into the ESM
+shim. `__df_tt()` runs DOMPurify with `ALLOWED_TAGS:[], ALLOWED_ATTR:[]` (zero-allowlist
+— strips ALL HTML, labels are plain-text identifiers per R11), then routes through the
+`drawflow-label` TT policy registered in `ui4/core/drawflow-safe.js`.
+
+**TT policy decision (spec §2.4, RECONCILIATION R1 conditional):**
+R1 specifies: "drawflow-label not created unless a later Drawflow audit proves textContent
+impossible." Audit finding: Drawflow's internal `innerHTML=variable` calls (patches 3+5)
+cannot be replaced with textContent without forking the library's rendering logic (they
+assign node HTML templates, not identifiers). The conditional in R1 is met. `drawflow-label`
+TT policy IS registered (in `ui4/core/drawflow-safe.js`), added to the `trusted-types`
+directive in `docker/Caddyfile.csp` (alongside `yashigani-render dompurify lit-html`).
+
+When `typenode=true` (MANDATORY in the agent builder — enforced by `mountDrawflowSafe()`),
+Drawflow takes the `cloneNode(!0)` path (not innerHTML) for node content. The `__df_tt()`
+wrappers then receive developer-authored template strings (or empty strings during import)
+and sanitize them to plain text. User-supplied labels are assigned via `textContent` by the
+builder UI layer — never through Drawflow's `html` parameter.
+
+- **SHA-384 (ESM shim):**
+  `sha384-8u9QSHa0NpNzUh7hK3NiCiTkf7Uduk/Nhhwh/tw9mG0YnBEOVlEYwpZHsHpyFQxw`
+  (matches `scripts/vendor-integrity.lock`)
+- **SHA-384 (CSS):**
+  `sha384-IFh+Q6zh+LRcTjqVmAKetdGY59dT485vtvWT5DAKQy8iv5+fYWHXisHP7mFKcFqV`
+  (matches `scripts/vendor-integrity.lock`)
+- **Files:**
+  `static/vendor/drawflow/drawflow.esm.js` (50,731 bytes — patched ESM shim)
+  `static/vendor/drawflow/drawflow.min.css` (1,910 bytes)
+  `static/vendor/drawflow/LICENSE` (MIT)
+- **License:** MIT (Jero Soler / jerosoler/Drawflow)
+- **Auditor:** Su / 2026-06-27
 
 ---
 
