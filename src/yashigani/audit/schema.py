@@ -96,6 +96,13 @@ class EventType(str, Enum):
     AGENT_UPDATED = "AGENT_UPDATED"
     AGENT_DEACTIVATED = "AGENT_DEACTIVATED"
     AGENT_TOKEN_ROTATED = "AGENT_TOKEN_ROTATED"
+    # Agent SVID lifecycle — 4.0 Phase 3 (RISK-104 / AUDIT-GAP-001 class)
+    # Emitted by pki/issuer.mint_agent_leaf() and the sidecar rotation callback.
+    # These are governance actions and MUST be on the tamper-evident hash chain.
+    AGENT_SVID_ISSUED = "AGENT_SVID_ISSUED"
+    AGENT_SVID_ROTATED = "AGENT_SVID_ROTATED"
+    AGENT_SVID_REVOKED = "AGENT_SVID_REVOKED"
+    AGENT_SVID_ROTATION_FAILED = "AGENT_SVID_ROTATION_FAILED"
     # Agent auth / routing
     AGENT_AUTH_FAILED = "AGENT_AUTH_FAILED"
     AGENT_CALL_ALLOWED = "AGENT_CALL_ALLOWED"
@@ -991,6 +998,87 @@ class AgentUpstreamUnreachableEvent(AuditEvent):
     remainder_path: str = ""
     request_id: str = ""
     error_type: str = ""     # connect_error | timeout | unknown
+
+
+# ---------------------------------------------------------------------------
+# Agent SVID lifecycle events — 4.0 Phase 3 (RISK-104 / AUDIT-GAP-001 class)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentSvidIssuedEvent(AuditEvent):
+    """Emitted by pki/issuer.mint_agent_leaf() when an agent SVID is issued.
+
+    Closes AUDIT-GAP-001 class for PKI operations. These events are governance
+    actions and MUST be on the tamper-evident SHA-384 hash chain (not plain logs).
+
+    approved_by: identity_id of the admin who approved the agent template.
+    approval_audit_jti: jti from the admin-approval audit event — links this
+                        cert to the approval in the hash chain (non-repudiation).
+    cert_not_after:     ISO 8601 UTC expiry of the issued leaf cert.
+    """
+
+    event_type: str = EventType.AGENT_SVID_ISSUED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # no PII in cert metadata
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    cert_not_after: str = ""        # ISO 8601 UTC
+    approved_by: str = ""           # admin identity_id
+    approval_audit_jti: str = ""    # links to approval event in hash chain
+
+
+@dataclass
+class AgentSvidRotatedEvent(AuditEvent):
+    """Emitted by the SVID sidecar cert-rotation callback on the backoffice.
+
+    Written when the sidecar successfully rotates a leaf cert before expiry.
+    """
+
+    event_type: str = EventType.AGENT_SVID_ROTATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    new_cert_not_after: str = ""    # ISO 8601 UTC
+
+
+@dataclass
+class AgentSvidRevokedEvent(AuditEvent):
+    """Emitted when an admin revokes an agent SVID.
+
+    Sets svid_state=revoked in the agent DB record. The existing cert is not
+    actively invalidated (no CRL/OCSP — YSG-RISK-058 residual); the agent
+    container is torn down immediately by PoolManager.
+    """
+
+    event_type: str = EventType.AGENT_SVID_REVOKED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = False
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    revoked_by: str = ""            # admin identity_id
+    revoke_reason: str = ""
+
+
+@dataclass
+class AgentSvidRotationFailedEvent(AuditEvent):
+    """Emitted when the SVID sidecar fails to rotate a cert (fail-closed path).
+
+    The sidecar exits on rotation failure, killing the agent container.
+    PoolManager health monitor detects the dead container and calls replace().
+    """
+
+    event_type: str = EventType.AGENT_SVID_ROTATION_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    error_type: str = ""            # api_error | timeout | parse_error
 
 
 # ---------------------------------------------------------------------------
