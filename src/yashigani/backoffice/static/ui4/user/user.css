@@ -110,4 +110,59 @@
   border-radius: var(--ys-radius-sm); font-family: inherit; font-size: var(--ys-fs-base);
 }
 .ys-chat-composer .ys-chat-input:focus { outline: 2px solid var(--ys-brand-blue); outline-offset: -1px; }
-.ys-chat-target { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); margin-bottom: var(--ys-sp-2); }
+.ys-chat-target { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+
+/* ── conversation history (OWUI-parity left rail) ────────────── */
+.ys-conv-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--ys-sp-2); }
+.ys-conv-new { font-size: var(--ys-fs-sm); padding: var(--ys-sp-1) var(--ys-sp-2); }
+.ys-conv-list { display: flex; flex-direction: column; gap: var(--ys-sp-1); }
+.ys-conv {
+  display: flex; align-items: center; gap: var(--ys-sp-2);
+  padding: var(--ys-sp-2) var(--ys-sp-3); border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); background: var(--ys-surface);
+  cursor: pointer; font-size: var(--ys-fs-base); min-height: 34px;
+}
+.ys-conv:hover { border-color: var(--ys-brand-blue); }
+.ys-conv.ys-conv-active { border-color: var(--ys-brand-blue); box-shadow: var(--ys-elev-1); }
+.ys-conv-title {
+  flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ys-conv-actions { display: flex; gap: 2px; flex: 0 0 auto; }
+.ys-conv-act { padding: 2px var(--ys-sp-2); font-size: 0.72rem; }
+.ys-conv-rename { flex: 1 1 auto; min-width: 0; padding: 2px var(--ys-sp-2); font-size: var(--ys-fs-sm); }
+.ys-conv-editing, .ys-conv-confirm { cursor: default; }
+
+/* ── composer model selector ─────────────────────────────────── */
+.ys-composer-bar { display: flex; align-items: center; margin-bottom: var(--ys-sp-2); }
+.ys-composer-model { display: flex; align-items: center; gap: var(--ys-sp-2); }
+.ys-composer-model-label {
+  font-size: var(--ys-fs-sm); font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--ys-ink-faint);
+}
+.ys-model-select { font-size: var(--ys-fs-sm); padding: 2px var(--ys-sp-2); max-width: 320px; }
+
+/* ── per-message toolbars (copy / edit / regenerate) ─────────── */
+.ys-chat-user-col { display: flex; flex-direction: column; align-items: flex-end; max-width: 70%; gap: var(--ys-sp-1); }
+.ys-chat-user-col.ys-chat-user-editing { width: 70%; align-items: stretch; }
+.ys-edit-input { width: 100%; resize: vertical; }
+.ys-msg-tools { display: flex; gap: var(--ys-sp-1); opacity: 0; transition: opacity 0.12s ease; }
+.ys-chat-row:hover .ys-msg-tools, .ys-chat-user-editing .ys-msg-tools { opacity: 1; }
+.ys-msg-act { padding: 2px var(--ys-sp-2); font-size: 0.72rem; }
+.ys-chat-assistant-wrap { display: flex; flex-direction: column; gap: var(--ys-sp-1); }
+
+/* ── settings panel ──────────────────────────────────────────── */
+.ys-settings-save { min-width: 72px; }
+
+/* ── dark theme (trivial token overrides; toggled via body class) ── */
+body.ys-theme-dark {
+  --ys-bg: #0b1220;
+  --ys-surface: #111a2b;
+  --ys-surface-alt: #0f1626;
+  --ys-ink: #e2e8f0;
+  --ys-ink-muted: #94a3b8;
+  --ys-ink-faint: #64748b;
+  --ys-border: #1e293b;
+  --ys-border-faint: #172033;
+  --ys-blue-bg: #1e3a5f;
+}
+body.ys-theme-dark .ys-app-main { background: var(--ys-bg); }

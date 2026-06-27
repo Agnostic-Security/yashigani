@@ -8,6 +8,7 @@
 // ids are identifiers, never markdown (spec §3.3).
 import { LitElement, html, nothing } from '/static/vendor/lit/lit-core.min.js';
 import './doc-upload.js';
+import './conversation-list.js';
 
 export class YsUserSidebar extends LitElement {
   static properties = {
@@ -15,6 +16,9 @@ export class YsUserSidebar extends LitElement {
     budget: { type: Object },
     memory: { type: Array },
     activeAgentId: { type: String },
+    conversations: { type: Array },
+    activeConversationId: { type: String },
+    convBusy: { type: Boolean },
     // shared ApiClient instance (for the doc-upload child).
     api: { attribute: false },
   };
@@ -25,6 +29,9 @@ export class YsUserSidebar extends LitElement {
     this.budget = null;
     this.memory = [];
     this.activeAgentId = '';
+    this.conversations = [];
+    this.activeConversationId = '';
+    this.convBusy = false;
     this.api = null;
   }
 
@@ -123,6 +130,10 @@ export class YsUserSidebar extends LitElement {
   render() {
     return html`
       <aside class="ys-app-sidebar">
+        <ys-conversation-list
+          .conversations=${this.conversations}
+          .activeId=${this.activeConversationId}
+          .busy=${this.convBusy}></ys-conversation-list>
         ${this._renderAgents()}
         ${this._renderBudget()}
         ${this._renderMemory()}

@@ -21,6 +21,10 @@ export class YsSessionHeader extends LitElement {
 
   createRenderRoot() { return this; }
 
+  _openSettings() {
+    this.dispatchEvent(new CustomEvent('ys-open-settings', { bubbles: true, composed: true }));
+  }
+
   render() {
     return html`
       <header class="ys-app-header">
@@ -29,6 +33,8 @@ export class YsSessionHeader extends LitElement {
         </div>
         <div class="ys-app-session">
           <span class="ys-app-user">${this.username ? this.username : 'Signed in'}</span>
+          <button class="ys-btn ys-btn-secondary ys-settings-open"
+                  @click=${() => this._openSettings()}>Settings</button>
           <a class="ys-btn ys-btn-secondary" href="/auth/logout-redirect">Sign out</a>
         </div>
       </header>`;
