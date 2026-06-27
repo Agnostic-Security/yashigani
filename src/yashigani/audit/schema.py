@@ -378,6 +378,14 @@ class EventType(str, Enum):
     AGENT_FLOW_GENERATION_REQUESTED = "AGENT_FLOW_GENERATION_REQUESTED"
     AGENT_FLOW_GENERATED = "AGENT_FLOW_GENERATED"
     AGENT_FLOW_COMMITTED = "AGENT_FLOW_COMMITTED"
+    # ---------------------------------------------------------------------------
+    # 4.0 no-code WORKFLOW composer (EU AI Act Art.14)
+    # AI parses NL → governed workflow spec; human decides (WorkflowCommitted anchor).
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14 HITL.
+    # ---------------------------------------------------------------------------
+    WORKFLOW_GENERATION_REQUESTED = "WORKFLOW_GENERATION_REQUESTED"
+    WORKFLOW_GENERATED = "WORKFLOW_GENERATED"
+    WORKFLOW_COMMITTED = "WORKFLOW_COMMITTED"
 
 
 # ---------------------------------------------------------------------------
@@ -3367,3 +3375,76 @@ class AgentFlowCommittedEvent(AuditEvent):
     spec_hash: str = ""               # sha384:<hex> of the committed flow JSON
     callee_registered: bool = False    # True if agent_registry entry was created
     human_decided: bool = True         # always True — immutable field (EU AI Act)
+
+
+# ===========================================================================
+# 4.0 no-code WORKFLOW composer (EU AI Act Art.14)
+# ===========================================================================
+
+
+@dataclass
+class WorkflowGenerationRequestedEvent(AuditEvent):
+    """Emitted before the governed LLM call for workflow spec generation.
+
+    Records the incoming NL description length and the calling principal so
+    the audit chain has a pre-LLM anchor for chain-of-custody.
+
+    EU AI Act Art.14: AI generates; human decides.
+    NIST AU-2 / AU-12 / SOC 2 CC7.1.
+    """
+
+    event_type: str = EventType.WORKFLOW_GENERATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # calling user's account_id
+    description_length: int = 0         # len(body.description) — not the description itself
+    available_handle_count: int = 0     # number of @-handles visible to this user
+
+
+@dataclass
+class WorkflowGeneratedEvent(AuditEvent):
+    """Emitted after the LLM produces a workflow spec that passes validation.
+
+    Records the draft_id + spec_hash for chain-of-custody.  The spec itself
+    is not stored in the audit chain (may contain sensitive handle names).
+
+    Draft is BOLA-scoped (draft.account_id == owner_identity_id).
+    """
+
+    event_type: str = EventType.WORKFLOW_GENERATED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # calling user's account_id
+    draft_id: str = ""                  # wf:draft:{draft_id} key
+    spec_hash: str = ""                 # sha384:<hex> of the spec JSON
+    step_count: int = 0                 # number of steps in the generated spec
+    schedule_kind: str = "none"         # "interval" | "cron" | "none"
+    clamped_handle_count: int = 0       # number of @-handles removed during validation
+
+
+@dataclass
+class WorkflowCommittedEvent(AuditEvent):
+    """Emitted when a user explicitly commits a generated draft to their workflow store.
+
+    THIS IS THE HUMAN-DECIDES AUDIT ANCHOR (EU AI Act Art.14).
+    The AI generated the spec; this event records the human's explicit decision
+    to persist it as a named, scheduled workflow.
+
+    Security invariants:
+    - human_decided is always True — the event cannot be emitted without a
+      live user session (require_user_session) and an explicit POST /user/workflows.
+    - masking_applied is always True.
+    - spec_hash reproduced from the draft for chain-of-custody.
+    """
+
+    event_type: str = EventType.WORKFLOW_COMMITTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # accountable human principal
+    workflow_id: str = ""               # wf:meta:{workflow_id} key
+    draft_id: str = ""                  # consumed draft_id (now deleted)
+    workflow_name: str = ""             # human-supplied name (masked)
+    spec_hash: str = ""                 # sha384:<hex> of the committed spec JSON
+    step_count: int = 0                 # number of steps
+    schedule_kind: str = "none"         # "interval" | "cron" | "none"
+    human_decided: bool = True          # always True — immutable (EU AI Act)

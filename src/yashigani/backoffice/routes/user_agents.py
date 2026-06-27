@@ -1213,36 +1213,56 @@ async def list_user_mentions(session: UserSession):
     """Return all @-addressable entities for the calling user.
 
     The UI autocompletes from this endpoint.  The returned ``handle`` values
-    are exactly the strings that, prefixed with ``@``, can be used as the
-    ``model`` field in a chat request to address that entity.
+    are exactly the strings that, prefixed with ``@``, can be used to address
+    that entity in a workflow description or chat model field.
 
-    Resolution contract (pinned, used by ``openai_router.py``):
+    Resolution contract (pinned, used by ``openai_router.py`` and
+    ``user_workflows.py`` handle-validation):
+
       * ``kind: "agent"``   — governed callee / NHI tool agent.  Routed via the
                               NHI pool after ``POST /user/agents/{id}/run`` wires it.
       * ``kind: "persona"`` — Letta conversational persona.  Routed via the
-                              per-user ``LettaClientPool`` (one Letta container per user).
+                              per-user ``LettaClientPool``.
+      * ``kind: "mcp"``     — registered MCP server the user may address.
+                              Source: ``YASHIGANI_MCP_SERVERS`` env var.
+                              System-wide (same set for all users); gateway enforces
+                              per-call OPA adjudication at invocation time.
+      * ``kind: "api"``     — active agent-registry integration the user may call.
+                              Source: ``AgentRegistry.list_active()`` (kind != nhi/
+                              langflow_callee). Gateway enforces OPA at invocation time.
 
-    BOLA: only the calling user's entities are returned.
-    Entities without an alias (legacy records) are omitted.
+    BOLA:
+      * ``kind:"agent"`` / ``kind:"persona"`` — BOLA-scoped to the calling user's
+        ``ua:agents:{account_id}`` set (only their own agents).
+      * ``kind:"mcp"`` / ``kind:"api"`` — system-wide; no per-user BOLA scope
+        (all users see the same system integrations; OPA per-call is the gate).
 
     Response shape: ``{"mentions": [{handle, kind, display, id}, ...]}``
-    Sorted by handle for deterministic ordering.
+    Sorted by kind priority then handle for deterministic ordering.
     """
+    import os as _os
+    import json as _json
+
     r = _get_redis()
+
+    mentions: list[dict] = []
+
+    # ------------------------------------------------------------------ #
+    # 1. User-owned agents and personas (BOLA-scoped)                     #
+    # ------------------------------------------------------------------ #
     raw_ids = r.smembers(_agents_key(session.account_id))
     ua_ids = _decode_set(raw_ids)
 
-    mentions: list[dict] = []
     for ua_id in sorted(ua_ids):
         raw = r.hgetall(_meta_key(ua_id))
         if not raw:
             continue
         meta = _decode_hash(raw)
         if meta.get("account_id") != session.account_id:
-            continue  # BOLA guard (should not occur if index is consistent)
+            continue  # BOLA guard
         alias = meta.get("alias", "")
         if not alias:
-            continue  # legacy record without alias — skip
+            continue  # legacy record without alias
         mentions.append({
             "handle": alias,
             "kind": meta.get("kind", "agent"),
@@ -1250,7 +1270,60 @@ async def list_user_mentions(session: UserSession):
             "id": ua_id,
         })
 
-    mentions.sort(key=lambda m: m["handle"])
+    # ------------------------------------------------------------------ #
+    # 2. MCP servers (system-wide; source: YASHIGANI_MCP_SERVERS env)     #
+    # ------------------------------------------------------------------ #
+    _mcp_raw = _os.environ.get("YASHIGANI_MCP_SERVERS", "").strip()
+    if _mcp_raw:
+        try:
+            _mcp_entries = _json.loads(_mcp_raw)
+            if isinstance(_mcp_entries, list):
+                for _entry in _mcp_entries:
+                    _agent_name = _entry.get("agent_name", "")
+                    if not _agent_name:
+                        continue
+                    mentions.append({
+                        "handle": _agent_name,
+                        "kind": "mcp",
+                        "display": _entry.get("display_name", _agent_name),
+                        "id": _agent_name,
+                    })
+        except Exception as _exc:
+            logger.warning(
+                "list_user_mentions: failed to parse YASHIGANI_MCP_SERVERS: %s", _exc
+            )
+
+    # ------------------------------------------------------------------ #
+    # 3. API integrations (active agents from AgentRegistry, kind != nhi) #
+    # ------------------------------------------------------------------ #
+    _ar = getattr(backoffice_state, "agent_registry", None)
+    if _ar is not None:
+        try:
+            for _agent in _ar.list_active():
+                _kind = _agent.get("kind", "agent")
+                if _kind in ("nhi", "langflow_callee", "persona"):
+                    continue  # skip NHIs and langflow callees (user created own)
+                _name = _agent.get("name", "")
+                _aid = _agent.get("agent_id", "") or _agent.get("id", "")
+                if not _name or not _aid:
+                    continue
+                # Derive @-handle from agent name (same slug logic as user agents)
+                _handle = _normalize_alias(_name)
+                mentions.append({
+                    "handle": _handle,
+                    "kind": "api",
+                    "display": _name,
+                    "id": _aid,
+                })
+        except Exception as _exc:
+            logger.warning(
+                "list_user_mentions: failed to read agent_registry: %s", _exc
+            )
+
+    # Sort: user-owned agents/personas first (kind in agent/persona), then mcp,
+    # then api — within each kind, alphabetical by handle.
+    _KIND_ORDER = {"agent": 0, "persona": 1, "mcp": 2, "api": 3}
+    mentions.sort(key=lambda m: (_KIND_ORDER.get(m["kind"], 9), m["handle"]))
     return {"mentions": mentions}
 
 
