@@ -73,6 +73,12 @@ spec:
               value: "true"
             - name: GF_AUTH_ANONYMOUS_ORG_ROLE
               value: "Viewer"
+            # 4.0 monitoring-proxy: allow same-origin iframe embedding from /admin/*.
+            # Caddy also strips Grafana's X-Frame-Options via header_down in the
+            # /admin/grafana/* reverse_proxy block. Anonymous Viewer is safe behind
+            # the forward_auth /auth/verify-admin gate.
+            - name: GF_SECURITY_ALLOW_EMBEDDING
+              value: "true"
             - name: GF_SERVER_ROOT_URL
               value: "https://{{ .Values.global.tlsDomain }}/admin/grafana"
             - name: GF_SERVER_SERVE_FROM_SUB_PATH

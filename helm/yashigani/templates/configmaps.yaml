@@ -370,6 +370,25 @@ data:
         tls_server_name backoffice
       }
     }
+    # 4.0 monitoring-proxy: mTLS snippets for Grafana and Loki.
+    # K8s service names (yashigani-grafana / yashigani-loki) differ from cert
+    # SANs (grafana / loki — sourced from service_identities.yaml); override SNI.
+    (internal-mtls-grafana) {
+      transport http {
+        tls
+        tls_trust_pool file /run/secrets/ca_bundle.crt
+        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+        tls_server_name grafana
+      }
+    }
+    (internal-mtls-loki) {
+      transport http {
+        tls
+        tls_trust_pool file /run/secrets/ca_bundle.crt
+        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+        tls_server_name loki
+      }
+    }
     {{- end }}
     # ────────────────────────────────────────────────────────────────────────
     # EX-231-10 Layer B — Caddy HMAC shared-secret marker.
@@ -469,16 +488,19 @@ data:
       # Parity enforced by scripts/check-caddyfile-csp-parity.sh.
       # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
       # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
-      @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+      # /admin/loki/* added: Loki query API (JSON, no UI); excluded from @strict_legacy.
+      @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
       @redoc_ui path /admin/api-redoc /redoc
       @strict_legacy {
         path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
         not path /admin/api-redoc /redoc
       }
       @strict_tt path /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
-      header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-      header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
+      # frame-src 'self': explicit (default-src 'self' already implies it);
+      # admin pages iframe /admin/grafana/ and /admin/loki/ — same-origin.
+      header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+      header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
       header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
       header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       handle /healthz {
@@ -568,6 +590,61 @@ data:
           import inject-caddy-verified
         }
       }
+      # ── Grafana — admin-authenticated access via /admin/grafana/* ───────────
+      # 4.0 monitoring-proxy: same-origin admin-gated proxy, handle (no strip)
+      # + GF_SERVER_SERVE_FROM_SUB_PATH=true + GF_SERVER_ROOT_URL on Grafana side.
+      # Wazuh not in Helm (compose-only — see values.yaml wazuh.enabled=false).
+      {{- if .Values.grafana.enabled }}
+      handle /admin/grafana/* {
+        # Normalise misrouted asset requests (browser resolves relative refs against
+        # dashboard path; strip spurious /d/<uid>/ prefix).
+        @grafana_misroute path_regexp gmis ^/admin/grafana/d/(?:[^/]+/)*?((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
+        forward_auth https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify-admin
+          @unauthorized status 401
+          handle_response @unauthorized {
+            redir * /admin/login?next=/admin/grafana/ 302
+          }
+        }
+        reverse_proxy https://yashigani-grafana:3443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-grafana
+          {{- end }}
+          # Strip Grafana's own X-Frame-Options / CSP so the edge CSP governs
+          # and same-origin iframe embedding from /admin/* works.
+          header_down -X-Frame-Options
+          header_down -Content-Security-Policy
+        }
+      }
+      {{- end }}
+      # ── Loki — admin-authenticated access via /admin/loki/* ─────────────────
+      # Exposes Loki HTTP query API for direct admin use (primary: Grafana datasource).
+      # Loki has no UI; @lenient_subapp CSP covers this path.
+      {{- if .Values.loki.enabled }}
+      handle /admin/loki/* {
+        forward_auth https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify-admin
+          @unauthorized status 401
+          handle_response @unauthorized {
+            redir * /admin/login 302
+          }
+        }
+        reverse_proxy https://yashigani-loki:3100 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-loki
+          {{- end }}
+        }
+      }
+      {{- end }}
       handle /admin/* {
         {{- if .Values.mtls.enabled }}
         # SIDE-001 (2026-05-19): inject Caddy's own SPIFFE identity on the

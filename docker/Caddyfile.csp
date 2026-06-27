@@ -34,7 +34,9 @@
 
 (csp-policies) {
     # Lenient exception 1: observability sub-apps (third-party SPAs)
-    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+    # /admin/loki/* — Loki query API (JSON, no UI); added so it is excluded from
+    # the @strict_legacy matcher and does not receive an HTML-page CSP.
+    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
 
     # Lenient exception 2: ReDoc API docs
     @redoc_ui path /admin/api-redoc /redoc
@@ -42,7 +44,7 @@
     # Strict legacy: existing admin plane (vanilla JS — no TT until Phase 6)
     @strict_legacy {
         path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
         not path /admin/api-redoc /redoc
     }
 
@@ -63,8 +65,11 @@
     # WebSocket, add wss://{$YASHIGANI_TLS_DOMAIN} here (OQ-1 resolution needed).
     @strict_tt path /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
 
-    header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
+    # frame-src 'self': explicit (default-src 'self' already implies it, but
+    # stated for clarity — admin pages iframe /admin/grafana/, /admin/wazuh/,
+    # /admin/loki/ all of which are same-origin).
+    header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
     header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
     header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
 }

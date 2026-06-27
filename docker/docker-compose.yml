@@ -1342,6 +1342,13 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # Allow same-origin iframe embedding from the admin UI.
+      # Caddy already strips Grafana's X-Frame-Options header; this env var also
+      # suppresses the CSP frame-ancestors header Grafana 9+ emits, ensuring the
+      # admin page at /admin/* can iframe /admin/grafana/ without browser block.
+      # The admin-session gate (forward_auth /auth/verify-admin) prevents any
+      # non-admin access — anonymous Viewer role is harmless behind that gate.
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
       GF_SERVER_ROOT_URL: "${YASHIGANI_PUBLIC_URL:-https://${YASHIGANI_TLS_DOMAIN}}/admin/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # retro #83: Grafana ingress mTLS.
