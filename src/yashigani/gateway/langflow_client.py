@@ -367,6 +367,62 @@ async def _ensure_initialized(client: httpx.AsyncClient, base_url: str) -> tuple
     return _api_key, _flow_id
 
 
+async def create_flow(
+    base_url: str,
+    flow_data: dict,
+    flow_name: str,
+    description: str = "",
+    timeout: float = 60.0,
+) -> str:
+    """Create a new Langflow flow and return its flow_id.
+
+    Used by the no-code backend (POST /user/agents/generate) to persist a
+    generated flow draft in Langflow.  The flow is created with the
+    authenticated API key obtained via ``_ensure_initialized``.
+
+    Args:
+        base_url: Langflow upstream URL (e.g. ``http://langflow:7860``).
+        flow_data: Langflow flow JSON dict (``{"nodes": [...], "edges": [...]}``)
+                   already repaired/clamped by the caller.
+        flow_name: Display name for the flow inside Langflow.
+        description: Optional human-readable description.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        The Langflow-assigned UUID for the new flow.
+
+    Raises:
+        RuntimeError: If the Langflow API returns a non-2xx status or
+                      the response carries no ``id`` field.
+    """
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        api_key, _flow_id_unused = await _ensure_initialized(client, base_url)
+
+        resp = await client.post(
+            f"{base_url}/api/v1/flows/",
+            json={
+                "name": flow_name,
+                "description": description,
+                "data": flow_data,
+            },
+            headers={"x-api-key": api_key},
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Langflow create_flow failed for {flow_name!r}: {resp.status_code}"
+            )
+
+        body = resp.json()
+        new_flow_id = body.get("id", "")
+        if not new_flow_id:
+            raise RuntimeError(
+                f"Langflow create_flow response for {flow_name!r} returned no id"
+            )
+
+        logger.info("Langflow: created user flow %r id=%s", flow_name, new_flow_id)
+        return new_flow_id
+
+
 async def langflow_chat(
     base_url: str,
     messages: list[dict],

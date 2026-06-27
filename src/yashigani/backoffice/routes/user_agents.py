@@ -1,5 +1,5 @@
 """
-Yashigani 4.0 — User-plane Letta agent capability routes + graph persistence + NHI run.
+Yashigani 4.0 — User-plane Letta agent capability routes + graph persistence + NHI run + no-code backend.
 
 All endpoints enforce ``require_user_session`` (RISK-100) and are BOLA-scoped
 to the calling user's ``account_id``.  User A cannot touch User B's agents,
@@ -93,6 +93,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from typing import Any, Optional
@@ -1317,4 +1318,608 @@ async def run_user_agent(ua_id: str, session: UserSession):
             "NHI registered (svid_issued=False). An admin must approve the NHI in the "
             "backoffice before gateway invocations are accepted."
         ),
+    }
+
+
+# ===========================================================================
+# 4.0 no-code backend — NL-driven Langflow agent generation
+# EU AI Act Art.14: AI generates, human decides (AGENT_FLOW_COMMITTED anchor).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Draft key helpers (ua:draft:{draft_id})
+# ---------------------------------------------------------------------------
+
+_DRAFT_PREFIX = "udrft_"
+_DRAFT_TTL_SECONDS = 86400  # 24 h
+
+
+def _new_draft_id() -> str:
+    return f"{_DRAFT_PREFIX}{uuid.uuid4().hex[:12]}"
+
+
+def _draft_key(draft_id: str) -> str:
+    return f"ua:draft:{draft_id}"
+
+
+# ---------------------------------------------------------------------------
+# Langflow node types accepted in generated flows
+# (LanguageModelComponent is repaired to OpenAIModel by _repair_flow_data)
+# ---------------------------------------------------------------------------
+
+_LANGFLOW_ALLOWED_COMPONENT_TYPES = frozenset({
+    "ChatInput", "ChatOutput", "Prompt", "TextInput",
+    "OpenAIModel", "LanguageModelComponent",
+    "Memory", "ConversationChain", "LLMChain",
+})
+
+# ---------------------------------------------------------------------------
+# Flow generation prompt
+# ---------------------------------------------------------------------------
+
+_FLOW_GEN_SYSTEM_PROMPT = (
+    "You are a Langflow flow generator for the Yashigani AI security gateway.\n"
+    "Generate a minimal, runnable Langflow flow JSON for the requested capability.\n\n"
+    "OUTPUT: return ONLY a valid JSON object — no markdown fences, no explanation.\n"
+    "FORMAT: {\"nodes\": [...], \"edges\": [...]}\n\n"
+    "Allowed node types: ChatInput, ChatOutput, Prompt, TextInput, OpenAIModel, Memory\n"
+    "All LLM calls route through the Yashigani gateway (OpenAI-compatible API).\n"
+    "Use the minimum nodes needed. The output MUST start with { and end with }."
+)
+
+
+def _build_flow_gen_messages(
+    description: str,
+    allowed_model: str,
+    gateway_base: str,
+) -> list[dict]:
+    """Build the governed-LLM messages list for flow generation."""
+    user_content = (
+        f"Generate a Langflow flow that does:\n\n{description}\n\n"
+        f"Use model: {allowed_model}\n"
+        f"openai_api_base (all model nodes): {gateway_base}\n\n"
+        "Output the Langflow flow JSON object only."
+    )
+    return [
+        {"role": "system", "content": _FLOW_GEN_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Governed gateway LLM call
+# ---------------------------------------------------------------------------
+
+async def _call_governed_gateway_llm(messages: list[dict]) -> str:
+    """Call the gateway mesh /v1/chat/completions (governed, OPA-adjudicated).
+
+    Reads:
+      YASHIGANI_INTERNAL_BEARER  — per-install internal service token
+      YASHIGANI_GATEWAY_MESH_URL — gateway mesh base URL (default http://gateway:8081/v1)
+      YASHIGANI_LANGFLOW_MODEL   — default model (default qwen2.5:3b)
+
+    Returns the assistant content string.
+    Raises HTTPException on misconfiguration (503) or upstream error (502).
+    """
+    import httpx as _httpx
+
+    bearer = os.environ.get("YASHIGANI_INTERNAL_BEARER", "")
+    if not bearer:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "llm_gateway_not_configured",
+                "message": "YASHIGANI_INTERNAL_BEARER is not set — cannot reach governed LLM.",
+            },
+        )
+    gateway_url = os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")
+    model_name = os.environ.get("YASHIGANI_LANGFLOW_MODEL", "qwen2.5:3b")
+
+    try:
+        async with _httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{gateway_url}/chat/completions",
+                json={
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": 0.1,   # low temperature for deterministic JSON
+                },
+                headers={"Authorization": f"Bearer {bearer}"},
+            )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "error": "llm_gateway_error",
+                    "message": f"Governed LLM gateway returned {resp.status_code}.",
+                },
+            )
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("_call_governed_gateway_llm: failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "llm_gateway_unreachable",
+                "message": "Could not reach the governed LLM gateway.",
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# JSON extraction + flow validation + model-name clamping
+# ---------------------------------------------------------------------------
+
+def _extract_json_from_llm_response(text: str) -> dict:
+    """Extract and parse a JSON object from an LLM response string.
+
+    Handles markdown code-fences and leading/trailing prose that small models
+    sometimes emit around the JSON blob.
+
+    Raises:
+        ValueError: If no valid JSON object can be parsed from ``text``.
+    """
+    text = text.strip()
+
+    # 1. Direct parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip markdown fences (```json ... ``` or ``` ... ```)
+    stripped = re.sub(r"```(?:json)?\s*", "", text)
+    stripped = re.sub(r"\s*```", "", stripped).strip()
+    try:
+        result = json.loads(stripped)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Brace extraction: find first { … last }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            result = json.loads(text[start : end + 1])
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        f"No valid JSON object found in LLM response (first 200 chars): {text[:200]!r}"
+    )
+
+
+def _validate_langflow_flow(flow_data: dict) -> list[str]:
+    """Structural validation of a generated Langflow flow JSON.
+
+    Returns a (possibly empty) list of error strings.
+    An empty list means the flow is structurally valid.
+    """
+    errors: list[str] = []
+    if not isinstance(flow_data, dict):
+        errors.append("flow must be a JSON object")
+        return errors
+
+    nodes = flow_data.get("nodes", [])
+    edges = flow_data.get("edges", [])
+
+    if not isinstance(nodes, list):
+        errors.append("flow.nodes must be an array")
+    if not isinstance(edges, list):
+        errors.append("flow.edges must be an array")
+    if errors:
+        return errors
+
+    if len(nodes) == 0:
+        errors.append("flow must have at least one node")
+    if len(nodes) > 32:
+        errors.append(f"flow has too many nodes ({len(nodes)} > 32)")
+    if len(edges) > 64:
+        errors.append(f"flow has too many edges ({len(edges)} > 64)")
+
+    return errors
+
+
+def _clamp_langflow_flow_models(
+    flow_data: dict,
+    allowed_model: str,
+) -> tuple[dict, list[str]]:
+    """Clamp every OpenAIModel node's model_name to ``allowed_model``.
+
+    Any model_name value that differs from ``allowed_model`` is replaced.
+    Returns (clamped_flow_data, warning_strings).
+
+    This is the scope-enforcement step: whatever model name the LLM
+    generated, the executed flow may only use the gateway's allowed model.
+    The actual OPA-per-request enforcement on the gateway mesh is the
+    second layer; this is the first layer (generation-time clamp).
+    """
+    flow_data = json.loads(json.dumps(flow_data))  # deep copy
+    warnings: list[str] = []
+
+    for node in flow_data.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        node_data = node.get("data", {})
+        if not isinstance(node_data, dict):
+            continue
+        node_type = node_data.get("type", "")
+        if node_type != "OpenAIModel":
+            continue
+        template = node_data.get("node", {}).get("template", {})
+        if not isinstance(template, dict):
+            continue
+        model_slot = template.get("model_name")
+        if isinstance(model_slot, dict):
+            current = model_slot.get("value", "")
+            if current and current != allowed_model:
+                warnings.append(
+                    f"model_name {current!r} → {allowed_model!r} (scope clamp)"
+                )
+                model_slot["value"] = allowed_model
+        elif isinstance(model_slot, str) and model_slot and model_slot != allowed_model:
+            warnings.append(
+                f"model_name {model_slot!r} → {allowed_model!r} (scope clamp)"
+            )
+            template["model_name"] = allowed_model
+
+    return flow_data, warnings[:20]  # cap at 20 warning strings
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request bodies (no-code)
+# ---------------------------------------------------------------------------
+
+
+class GenerateFlowBody(BaseModel):
+    """Body for POST /user/agents/generate."""
+
+    description: str = Field(
+        min_length=10,
+        max_length=2000,
+        description="Natural language description of what the agent should do.",
+    )
+
+
+class CommitFlowBody(BaseModel):
+    """Body for POST /user/agents/templates (human-decides step)."""
+
+    draft_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="The draft_id returned by POST /user/agents/generate.",
+    )
+    name: str = Field(min_length=1, max_length=128, description="Display name for the agent.")
+    description: str = Field(default="", max_length=512)
+    skills: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Declared skills for scope intersection (R3).",
+    )
+
+
+# ===========================================================================
+# POST /user/agents/generate — NL description → governed LLM → Langflow flow
+# ===========================================================================
+
+
+@router.post("/user/agents/generate")
+async def generate_user_agent_flow(body: GenerateFlowBody, session: UserSession):
+    """Generate a Langflow flow from a natural-language description.
+
+    Pipeline:
+      1. Call our governed LLM through the gateway mesh (OPA-adjudicated).
+      2. Parse and structurally validate the generated flow JSON.
+      3. Clamp all model-name references to the gateway default (scope enforcement).
+      4. Create the draft flow in Langflow via create_flow().
+      5. Store a draft record in Redis (ua:draft:{draft_id}, TTL 24 h) as BOLA anchor.
+      6. Emit AGENT_FLOW_GENERATION_REQUESTED + AGENT_FLOW_GENERATED audit events.
+      7. Return {draft_id, flow_id, summary, graph, spec_hash, clamp_warnings, draft: true}.
+
+    The draft is NOT added to the template pool.  The caller reviews the
+    preview and explicitly commits via POST /user/agents/templates.
+
+    EU AI Act Art.14: AI generates; human decides.
+    BOLA: draft is scoped by draft_id → account_id in Redis.
+    """
+    r = _get_redis()
+
+    # Derive gateway mesh endpoint and the single allowed model.
+    # All generated flow model nodes are clamped to this model.
+    gateway_base = os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")
+    allowed_model = os.environ.get("YASHIGANI_LANGFLOW_MODEL", "qwen2.5:3b")
+
+    # For the audit pre-record, capture the user's current effective scope.
+    invoker_grants = _get_invoker_grants(session.account_id)
+    system_ceiling = _compute_system_ceiling(r)
+    user_scope = invoker_grants & system_ceiling if invoker_grants else system_ceiling
+    effective_skills_preview = sorted(user_scope)[:10]
+
+    # Emit AGENT_FLOW_GENERATION_REQUESTED before the LLM call (chain-of-custody).
+    aw = getattr(backoffice_state, "audit_writer", None)
+    if aw is not None:
+        try:
+            from yashigani.audit.schema import AgentFlowGenerationRequestedEvent
+            aw.write(AgentFlowGenerationRequestedEvent(
+                owner_identity_id=session.account_id,
+                description_length=len(body.description),
+                effective_skills=effective_skills_preview,
+            ))
+        except Exception as exc:
+            logger.warning("AgentFlowGenerationRequestedEvent audit write failed: %s", exc)
+
+    # --- Step 1: governed LLM call ---
+    messages = _build_flow_gen_messages(body.description, allowed_model, gateway_base)
+    llm_response = await _call_governed_gateway_llm(messages)
+
+    # --- Step 2: parse + validate ---
+    try:
+        flow_data = _extract_json_from_llm_response(llm_response)
+    except ValueError as exc:
+        logger.warning(
+            "generate_user_agent_flow: LLM produced non-JSON for account=%r: %s",
+            session.account_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_flow_generated",
+                "message": (
+                    "The AI could not produce a valid flow for this description. "
+                    "Try rephrasing or adding more detail."
+                ),
+            },
+        )
+
+    validation_errors = _validate_langflow_flow(flow_data)
+    if validation_errors:
+        logger.warning(
+            "generate_user_agent_flow: validation failed for account=%r: %r",
+            session.account_id, validation_errors,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_flow_generated",
+                "message": "Generated flow failed structural validation.",
+                "violations": validation_errors,
+            },
+        )
+
+    # --- Step 3: clamp model names (scope enforcement) ---
+    flow_data, clamp_warnings = _clamp_langflow_flow_models(flow_data, allowed_model)
+
+    # --- Step 4: create draft flow in Langflow ---
+    draft_flow_name = f"draft-{uuid.uuid4().hex[:8]}"
+    summary = (body.description[:200] + "…") if len(body.description) > 200 else body.description
+
+    try:
+        from yashigani.gateway.langflow_client import create_flow as _langflow_create_flow
+        langflow_base = os.environ.get("YASHIGANI_LANGFLOW_URL", "http://langflow:7860")
+        flow_id = await _langflow_create_flow(
+            base_url=langflow_base,
+            flow_data=flow_data,
+            flow_name=draft_flow_name,
+            description=f"Draft: {summary}",
+        )
+    except Exception as exc:
+        logger.error(
+            "generate_user_agent_flow: Langflow create_flow failed for account=%r: %s",
+            session.account_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "langflow_unavailable",
+                "message": "Could not create the draft flow in Langflow. Try again later.",
+            },
+        )
+
+    # --- Step 5: store draft in Redis (BOLA anchor) ---
+    draft_id = _new_draft_id()
+    spec_hash = "sha384:" + hashlib.sha384(
+        json.dumps(flow_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    now = _now_iso()
+
+    draft_mapping: dict[bytes, bytes] = {
+        b"account_id":  session.account_id.encode(),
+        b"flow_id":     flow_id.encode(),
+        b"flow_name":   draft_flow_name.encode(),
+        b"summary":     summary.encode(),
+        b"spec_hash":   spec_hash.encode(),
+        b"spec_json":   json.dumps(flow_data).encode(),
+        b"created_at":  now.encode(),
+    }
+    pipe = r.pipeline()
+    pipe.hset(_draft_key(draft_id), mapping=draft_mapping)
+    pipe.expire(_draft_key(draft_id), _DRAFT_TTL_SECONDS)
+    pipe.execute()
+
+    # --- Step 6: emit AGENT_FLOW_GENERATED ---
+    if aw is not None:
+        try:
+            from yashigani.audit.schema import AgentFlowGeneratedEvent
+            aw.write(AgentFlowGeneratedEvent(
+                owner_identity_id=session.account_id,
+                draft_id=draft_id,
+                flow_id=flow_id,
+                spec_hash=spec_hash,
+                clamp_warnings=clamp_warnings,
+            ))
+        except Exception as exc:
+            logger.warning("AgentFlowGeneratedEvent audit write failed: %s", exc)
+
+    logger.info(
+        "user_agents: flow generated draft_id=%s flow_id=%s for account=%r "
+        "clamp_warnings=%d",
+        draft_id, flow_id, session.account_id, len(clamp_warnings),
+    )
+
+    return {
+        "draft_id": draft_id,
+        "flow_id": flow_id,
+        "summary": summary,
+        "graph": flow_data,
+        "spec_hash": spec_hash,
+        "clamp_warnings": clamp_warnings,
+        "draft": True,
+    }
+
+
+# ===========================================================================
+# POST /user/agents/templates — human commits a draft to the template pool
+# ===========================================================================
+
+
+@router.post("/user/agents/templates", status_code=status.HTTP_201_CREATED)
+async def commit_agent_template(body: CommitFlowBody, session: UserSession):
+    """Explicitly commit a generated draft flow to the user's template pool.
+
+    This is the HUMAN-DECIDES step (EU AI Act Art.14 / HITL invariant).
+    The LLM generated the flow; this endpoint records the human's explicit
+    decision to add it as an agent template.
+
+    Steps:
+      1. Look up ua:draft:{draft_id} (HTTP 404 if missing or expired).
+      2. BOLA: verify draft.account_id == session.account_id (HTTP 404 on violation).
+      3. Compute effective_skills via R3 scope intersection.
+      4. Register a governed Langflow callee in agent_registry (non-fatal).
+      5. Create ua:meta:{ua_id} with langflow_flow_id + callee_agent_id.
+      6. Consume the draft (delete from Redis).
+      7. Emit AGENT_FLOW_COMMITTED to the audit hash-chain.
+
+    BOLA: only the generating user can commit their own draft.
+    """
+    r = _get_redis()
+
+    # --- Step 1+2: look up draft and verify ownership (BOLA) ---
+    raw_draft = r.hgetall(_draft_key(body.draft_id))
+    if not raw_draft:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "draft_not_found",
+                "message": "Draft not found or expired. Generate a new flow first.",
+            },
+        )
+    draft = _decode_hash(raw_draft)
+
+    # BOLA: return 404, not 403 — do not disclose draft existence to other users.
+    if draft.get("account_id") != session.account_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "draft_not_found"},
+        )
+
+    flow_id = draft.get("flow_id", "")
+    spec_hash = draft.get("spec_hash", "")
+    draft_summary = draft.get("summary", body.description)
+
+    # --- Step 3: R3 scope intersection ---
+    effective, rejected = compute_effective_skills(body.skills, session.account_id, r)
+
+    # --- Step 4: register governed Langflow callee ---
+    # Name must satisfy ^[a-z][a-z0-9_-]{0,63}$ (V232-CSCAN-01a).
+    # Use a deterministic short slug derived from a new UUID.
+    callee_slug = f"ucallee{uuid.uuid4().hex[:8]}"
+
+    agent_registry = getattr(backoffice_state, "agent_registry", None)
+    callee_agent_id: Optional[str] = None
+    if agent_registry is not None and flow_id:
+        langflow_base = os.environ.get("YASHIGANI_LANGFLOW_URL", "http://langflow:7860")
+        try:
+            callee_agent_id, _callee_token = agent_registry.register(
+                name=callee_slug,
+                upstream_url=f"{langflow_base}/api/v1/run/{flow_id}",
+                groups=["user_agent_callee"],
+                allowed_caller_groups=["user"],
+                allowed_paths=[f"/api/v1/run/{flow_id}"],
+                protocol="langflow",
+                kind="agent",
+                sensitivity_ceiling="INTERNAL",
+                allowed_tools=effective,
+            )
+        except Exception as exc:
+            # Non-fatal: the agent template is committed to the pool; the
+            # registry entry can be re-created on retry.  Log loudly.
+            logger.error(
+                "commit_agent_template: callee registry.register failed for "
+                "account=%r flow_id=%r: %s",
+                session.account_id, flow_id, exc,
+            )
+            callee_agent_id = None
+
+    # --- Step 5: create ua:meta record ---
+    ua_id = _new_ua_id()
+    now = _now_iso()
+    personality = {
+        "persona": f"A Langflow-based agent: {draft_summary[:200]}",
+        "system_prompt": "",
+    }
+
+    ua_mapping: dict[bytes, bytes] = {
+        b"account_id":        session.account_id.encode(),
+        b"name":              body.name.encode(),
+        b"description":       body.description.encode(),
+        b"personality":       json.dumps(personality).encode(),
+        b"effective_skills":  json.dumps(effective).encode(),
+        b"declared_skills":   json.dumps(body.skills).encode(),
+        b"letta_agent_id":    b"",
+        b"langflow_flow_id":  flow_id.encode(),
+        b"callee_agent_id":   (callee_agent_id or "").encode(),
+        b"spec_hash":         spec_hash.encode(),
+        b"kind":              b"langflow_callee",
+        b"created_at":        now.encode(),
+        b"updated_at":        now.encode(),
+    }
+
+    pipe = r.pipeline()
+    pipe.hset(_meta_key(ua_id), mapping=ua_mapping)
+    pipe.sadd(_agents_key(session.account_id), ua_id.encode())
+    # Consume the draft — committed; TTL would clear it anyway but be explicit.
+    pipe.delete(_draft_key(body.draft_id))
+    pipe.execute()
+
+    # --- Step 6: emit AGENT_FLOW_COMMITTED (human-decides audit anchor) ---
+    aw = getattr(backoffice_state, "audit_writer", None)
+    if aw is not None:
+        try:
+            from yashigani.audit.schema import AgentFlowCommittedEvent
+            aw.write(AgentFlowCommittedEvent(
+                owner_identity_id=session.account_id,
+                ua_id=ua_id,
+                draft_id=body.draft_id,
+                flow_id=flow_id,
+                spec_hash=spec_hash,
+                callee_registered=callee_agent_id is not None,
+                human_decided=True,
+            ))
+        except Exception as exc:
+            logger.warning("AgentFlowCommittedEvent audit write failed: %s", exc)
+
+    logger.info(
+        "user_agents: flow committed ua_id=%s flow_id=%s callee=%s for account=%r",
+        ua_id, flow_id, callee_agent_id, session.account_id,
+    )
+
+    return {
+        "ua_id": ua_id,
+        "name": body.name,
+        "flow_id": flow_id,
+        "effective_skills": effective,
+        "rejected_skills": rejected,
+        "callee_agent_id": callee_agent_id,
+        "governed_callee_registered": callee_agent_id is not None,
+        "spec_hash": spec_hash,
+        "created_at": now,
     }
