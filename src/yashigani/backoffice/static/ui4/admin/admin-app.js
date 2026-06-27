@@ -24,6 +24,12 @@ import { getAdminModules, getAdminModule } from './module-registry.js';
 // Each side-effect import self-registers via registerAdminModule(). Wave 2 adds
 // one line per module group here; the shell discovers them through the registry.
 import './modules/dashboard.js';
+// Identity & Access module group (feat/4.0-admin-iam): accounts/users, RBAC+SCIM,
+// SSO/JWT federation, passkeys/HIBP/rate-limit.
+import './modules/accounts.js';
+import './modules/rbac.js';
+import './modules/sso.js';
+import './modules/security-auth.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /
