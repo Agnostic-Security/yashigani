@@ -1,6 +1,12 @@
 schema_version: '1.0'
 last_updated: '2026-06-26'
 maintainer: lu@agnosticsec.com
+# Severity convention (2026-06-27): `severity` is the RESIDUAL risk to THIS deployment,
+# not the raw NVD/CVE rating. A real CVE in a component never loaded or invoked on any
+# reachable path — e.g. perl-base, libsqlite3, ncurses, perl IO::Compress in the
+# python-slim/Debian-13 base image: present but uncalled (YSG-RISK-093, 096-101) — is
+# rated `informational`; the raw NVD severity stays in the entry description. These
+# clear automatically on base-image rebuild once upstream Debian ships the fix.
 risks:
 - id: YSG-RISK-001
   description: SQL f-string interpolation in scripts/partition_maintenance.py (CWE-89, HIGH). Asyncpg/PostgreSQL
@@ -2057,7 +2063,7 @@ risks:
     hardlinks during archive extraction. Present in perl-base/perl/perl-modules-5.40
     in backoffice and gateway images as an OS dependency of postgresql-client-17.
     Trivy status: fix_deferred (no upstream Debian fix at time of v3.0.0 release).
-  severity: medium
+  severity: informational
   controls_impacted:
   - Base image OS dependency hygiene (perl transitive dep via postgresql-client)
   compensating_controls:
@@ -2151,7 +2157,7 @@ risks:
     The perl-base binary is not on any HTTP request-handling path. Identified during
     Laura's v3.0.1 docker gate sweep (LAURA-301-001). grep confirms no perl invocation
     on any gateway/backoffice request path.
-  severity: critical
+  severity: informational
   controls_impacted:
   - CWE-1395
   - Base image OS dependency hygiene (perl-base transitive dep, Debian 13.5)
@@ -2178,7 +2184,7 @@ risks:
     OS library in the Debian 13.5 base image of yashigani/gateway:3.0.1.
     ncurses is not invoked by any HTTP handler. Identified during Laura's v3.0.1
     docker gate sweep (LAURA-301-001).
-  severity: high
+  severity: informational
   controls_impacted:
   - CWE-1395
   - Base image OS dependency hygiene (ncurses transitive dep, Debian 13.5)
@@ -2205,7 +2211,7 @@ risks:
     OS dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
     grep confirms no `import sqlite` in gateway/backoffice src — sqlite3 is not used
     by the application. Identified during Laura's v3.0.1 docker gate sweep (LAURA-301-001).
-  severity: high
+  severity: informational
   controls_impacted:
   - CWE-1395
   - Base image OS dependency hygiene (libsqlite3-0 transitive dep, Debian 13.5)
@@ -2233,7 +2239,7 @@ risks:
     OS dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
     Companion to CVE-2026-11822 (YSG-RISK-098). grep confirms no `import sqlite` in
     gateway/backoffice src. Identified during Laura's v3.0.1 docker gate sweep (LAURA-301-001).
-  severity: high
+  severity: informational
   controls_impacted:
   - CWE-1395
   - Base image OS dependency hygiene (libsqlite3-0 transitive dep, Debian 13.5)
@@ -2261,7 +2267,7 @@ risks:
     OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
     perl IO::Compress is not invoked on any request path. Identified during Laura's
     v3.0.1 docker gate sweep (LAURA-301-001).
-  severity: high
+  severity: informational
   controls_impacted:
   - CWE-1395
   - Base image OS dependency hygiene (perl IO::Compress transitive dep, Debian 13.5)
@@ -2289,7 +2295,7 @@ risks:
     Same perl Archive::Tar component class as YSG-RISK-093; Yashigani backup/restore uses
     Python tarfile, not perl Archive::Tar. Identified during Laura's v3.0.1 docker gate
     sweep (LAURA-301-001).
-  severity: high
+  severity: informational
   controls_impacted:
   - CWE-1395
   - Base image OS dependency hygiene (perl Archive::Tar transitive dep, Debian 13.5)
