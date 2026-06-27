@@ -1,33 +1,16 @@
 """
-Yashigani 4.0 — Letta Client Pool: per-user resolution seam.
+Yashigani 4.0 — Letta Client Pool: per-user resolution seam (adapter).
 
-PINNED SEAM: Captain is building the full implementation on
-feat/4.0-agent-isolation.  This module defines the interface so that
-user-plane routes can be written and tested NOW, while the concrete pool
-wiring is in progress.
+This module is the stable import path the user-plane routes use
+(``from yashigani.gateway.letta_pool import LettaClientPool``). The concrete
+per-user pool now lives in ``yashigani.gateway.letta_client.LettaClientPool``
+(Captain, feat/4.0-agent-isolation). This adapter delegates to it and
+translates any resolution/availability failure into ``LettaPoolUnavailable``
+so route handlers keep their HTTP 503 (``letta_pool_unavailable``) contract.
 
-Until feat/4.0-agent-isolation merges, ``LettaClientPool.for_user()``
-raises ``LettaPoolUnavailable``.  Route handlers MUST catch this and
-return HTTP 503 with error code ``letta_pool_unavailable``.
-
-Interface contract (Captain must honour this):
-  ``await LettaClientPool.for_user(identity_id)``
-  Returns ``(client, base_url, default_agent_id)`` where:
-    client           — ``httpx.AsyncClient`` configured for the user's Letta
-                       instance (correct base-URL, no auth — gateway-internal)
-    base_url         — Letta REST root (e.g. ``http://letta:8283``)
-    default_agent_id — The Letta agent_id to use when no specific agent is
-                       requested (the user's "primary" Letta agent)
-
-  For multi-agent users, callers obtain ``base_url`` and ``client`` from
-  this call, then pass the specific ``letta_agent_id`` stored in their
-  local metadata (ua:meta:{ua_agent_id}.letta_agent_id) to Letta API calls
-  directly — they do NOT use the returned ``default_agent_id``.
-
-Callers must close the returned client after use::
-    client, base_url, _ = await LettaClientPool.for_user(identity_id)
-    async with client:
-        resp = await client.get(f"{base_url}/v1/agents/")
+Interface (unchanged):
+  ``client, base_url, default_agent_id = await LettaClientPool.for_user(identity_id)``
+  Close the returned client after use (``async with client:``).
 
 Last updated: 2026-06-27T00:00:00+00:00
 """
@@ -35,18 +18,21 @@ from __future__ import annotations
 
 import httpx
 
+from yashigani.gateway.letta_client import LettaClientPool as _RealLettaClientPool
+
 
 class LettaPoolUnavailable(RuntimeError):
-    """Raised when the per-user Letta pool is not yet implemented.
+    """Raised when the per-user Letta pool cannot resolve / is unreachable.
 
     Route handlers catch this and return HTTP 503 (letta_pool_unavailable).
     """
 
 
 class LettaClientPool:
-    """Per-user Letta client resolver.
+    """Adapter over the concrete per-user pool in ``letta_client``.
 
-    Stub until feat/4.0-agent-isolation (Captain) merges.
+    Delegates to the real implementation and normalises failures to
+    ``LettaPoolUnavailable`` so the user-plane 503 contract is preserved.
     """
 
     @staticmethod
@@ -54,10 +40,14 @@ class LettaClientPool:
         """Return (client, base_url, default_agent_id) for ``identity_id``.
 
         Raises:
-            LettaPoolUnavailable: always, until Captain's implementation lands.
+            LettaPoolUnavailable: if the pool cannot provision/resolve the
+            user's Letta instance (container not ready, Letta unreachable, etc.).
         """
-        raise LettaPoolUnavailable(
-            "LettaClientPool is not yet wired. "
-            "Awaiting feat/4.0-agent-isolation (Captain). "
-            f"Requested identity_id={identity_id!r}."
-        )
+        try:
+            return await _RealLettaClientPool.for_user(identity_id)
+        except LettaPoolUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — normalise to the 503 contract
+            raise LettaPoolUnavailable(
+                f"Letta pool resolution failed for identity_id={identity_id!r}: {exc}"
+            ) from exc
