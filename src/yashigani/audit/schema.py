@@ -369,6 +369,15 @@ class EventType(str, Enum):
     # Builder graph lifecycle (Phase 4 — builder persistence)
     AGENT_TEMPLATE_SAVED = "AGENT_TEMPLATE_SAVED"
     AGENT_TEMPLATE_LOADED = "AGENT_TEMPLATE_LOADED"
+    # ---------------------------------------------------------------------------
+    # 4.0 no-code backend — NL-driven agent generation (EU AI Act Art.14)
+    # AI generates; human decides.  The AGENT_FLOW_COMMITTED event is the
+    # audit anchor for the human's explicit decision.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14 HITL.
+    # ---------------------------------------------------------------------------
+    AGENT_FLOW_GENERATION_REQUESTED = "AGENT_FLOW_GENERATION_REQUESTED"
+    AGENT_FLOW_GENERATED = "AGENT_FLOW_GENERATED"
+    AGENT_FLOW_COMMITTED = "AGENT_FLOW_COMMITTED"
 
 
 # ---------------------------------------------------------------------------
@@ -3277,3 +3286,84 @@ class AgentTemplateGraphSavedEvent(AuditEvent):
     edge_count: int = 0
     graph_hash: str = ""              # sha384:<hex> of normalised CTF graph JSON
     effective_scope_stripped: bool = True  # always True (R11)
+
+
+# ---------------------------------------------------------------------------
+# 4.0 no-code backend — NL-driven agent generation (EU AI Act Art.14)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentFlowGenerationRequestedEvent(AuditEvent):
+    """Emitted when a user requests NL-driven Langflow flow generation.
+
+    Records the intent before the governed LLM call so the request is
+    on the audit chain even if generation fails.
+
+    Security invariants:
+    - description is NOT stored (may contain sensitive NL; only length recorded).
+    - masking_applied=True always.
+    - owner_identity_id identifies the accountable human principal.
+    """
+
+    event_type: str = EventType.AGENT_FLOW_GENERATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    description_length: int = 0       # length in chars of the NL description
+    # First 10 effective skills (path strings) — bounded to avoid large records.
+    # No user content (the description) is stored here.
+    effective_skills: "list[str]" = field(default_factory=list)
+
+
+@dataclass
+class AgentFlowGeneratedEvent(AuditEvent):
+    """Emitted after a Langflow flow is successfully generated and created.
+
+    Records the draft flow's identity and scope-clamp outcome.
+    The generated spec is NOT stored (hash only — raw flows may be large
+    and can contain user-description fragments).
+
+    Security invariants:
+    - masking_applied=True always.
+    - spec_hash is SHA-384 of the clamped flow JSON (after model-name clamp).
+    - clamp_warnings records how many model-name substitutions were applied
+      (string list bounded to 20 entries for log hygiene).
+    """
+
+    event_type: str = EventType.AGENT_FLOW_GENERATED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    draft_id: str = ""                 # ua:draft:{draft_id} Redis key prefix
+    flow_id: str = ""                  # Langflow flow UUID
+    spec_hash: str = ""                # sha384:<hex> of the clamped flow JSON
+    clamp_warnings: "list[str]" = field(default_factory=list)   # ≤20 entries
+
+
+@dataclass
+class AgentFlowCommittedEvent(AuditEvent):
+    """Emitted when a user explicitly commits a generated draft to their template pool.
+
+    THIS IS THE HUMAN-DECIDES AUDIT ANCHOR (EU AI Act Art.14).
+    The AI generated the flow; this event records the human's explicit
+    decision to add it to their agent-template pool.  The accountable act
+    is the human's POST /user/agents/templates call, not the LLM generation.
+
+    Security invariants:
+    - human_decided is always True — the event cannot be emitted without a
+      live user session (require_user_session) and an explicit HTTP POST.
+    - masking_applied=True always.
+    - spec_hash from the draft is reproduced here for chain-of-custody audit.
+    """
+
+    event_type: str = EventType.AGENT_FLOW_COMMITTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""        # accountable human principal
+    ua_id: str = ""                    # resulting ua:meta:{ua_id} key
+    draft_id: str = ""                 # consumed draft (now deleted from Redis)
+    flow_id: str = ""                  # Langflow flow UUID
+    spec_hash: str = ""               # sha384:<hex> of the committed flow JSON
+    callee_registered: bool = False    # True if agent_registry entry was created
+    human_decided: bool = True         # always True — immutable field (EU AI Act)
