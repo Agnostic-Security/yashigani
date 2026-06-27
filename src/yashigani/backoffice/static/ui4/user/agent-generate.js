@@ -89,9 +89,11 @@ export class YsAgentGenerate extends LitElement {
     const d = res.data || {};
     // Draft preview ONLY — nothing is added to the user's templates yet.
     this._preview = {
+      draft_id: d.draft_id || '',
       flow_id: d.flow_id || '',
       summary: typeof d.summary === 'string' ? d.summary : '',
       graph: (d.graph && typeof d.graph === 'object') ? d.graph : null,
+      skills: Array.isArray(d.skills) ? d.skills : [],
       draft: d.draft !== false,
     };
     this._graphRendered = false;
@@ -113,16 +115,15 @@ export class YsAgentGenerate extends LitElement {
     if (!name) { this._notify('Give the agent a name before adding it.', 'error'); return; }
     this._busy = true;
     this._phase = 'adding';
-    // The generated spec, committed by an explicit human action (draft:false).
+    // Human-decides commit: send the BOLA-scoped draft_id back to the templates
+    // route — the backend re-reads the draft and registers the governed callee.
     const body = {
+      draft_id: this._preview.draft_id,
       name,
       description: this._val('#ys-gen-summary-edit').trim() || this._preview.summary,
-      flow_id: this._preview.flow_id,
-      graph: this._preview.graph,
-      summary: this._preview.summary,
-      draft: false,
+      skills: this._preview.skills || [],
     };
-    const res = await this.api.mutate('/user/agents', { method: 'POST', body });
+    const res = await this.api.mutate('/user/agents/templates', { method: 'POST', body });
     this._busy = false;
     if (!res.ok) {
       this._phase = 'preview';
