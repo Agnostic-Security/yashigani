@@ -89,6 +89,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+def _get_user_plane_durable():
+    """Return UserPlaneDurableStore if wired; None otherwise (degrade-safe)."""
+    return getattr(backoffice_state, "user_plane_durable", None)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -743,6 +748,25 @@ async def commit_workflow(body: CommitWorkflowBody, session: UserSession):
     pipe.delete(_draft_key(body.draft_id))
     pipe.execute()
 
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.upsert_workflow({
+                "account_id":        session.account_id,
+                "wf_id":             wf_id,
+                "owner_identity_id": session.account_id,
+                "name":              body.name,
+                "description":       body.description,
+                "spec":              spec_raw,
+                "spec_hash":         spec_hash,
+                "enabled":           True,
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_workflow (commit) failed for %s: %s", wf_id, _exc
+            )
+
     # --- Step 6: emit WorkflowCommittedEvent (human-decides anchor) ---
     aw = getattr(backoffice_state, "audit_writer", None)
     if aw is not None:
@@ -856,6 +880,27 @@ async def patch_workflow(wf_id: str, body: PatchWorkflowBody, session: UserSessi
         updated_fields.append("enabled")
 
     r.hset(_wf_key(wf_id), mapping=updates)
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _fresh_wf = _decode_hash(r.hgetall(_wf_key(wf_id)))
+            _upd.upsert_workflow({
+                "account_id":        session.account_id,
+                "wf_id":             wf_id,
+                "owner_identity_id": _fresh_wf.get("owner_identity_id", session.account_id),
+                "name":              _fresh_wf.get("name", ""),
+                "description":       _fresh_wf.get("description", ""),
+                "spec":              _fresh_wf.get("spec"),
+                "spec_hash":         _fresh_wf.get("spec_hash"),
+                "enabled":           _fresh_wf.get("enabled", "1") == "1",
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_workflow (patch) failed for %s: %s", wf_id, _exc
+            )
+
     logger.info(
         "user_workflows: patched wf_id=%s fields=%r for account=%r",
         wf_id, updated_fields, session.account_id,
@@ -882,6 +927,16 @@ async def delete_workflow(wf_id: str, session: UserSession):
     pipe.delete(_wf_key(wf_id))
     pipe.srem(_wf_index_key(session.account_id), wf_id.encode())
     pipe.execute()
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.delete_workflow(wf_id)
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: delete_workflow failed for %s: %s", wf_id, _exc
+            )
 
     logger.info(
         "user_workflows: deleted wf_id=%s for account=%r",

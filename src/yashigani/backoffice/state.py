@@ -62,6 +62,7 @@ class BackofficeState:
     document_policy_store: Optional[Any] = None           # DocumentPolicyStore (2.26)
     document_set_store: Optional[Any] = None               # DocumentSetStore (2.26 set-scoped-salt)
     envelope_pending_store: Optional[Any] = None          # EnvelopePendingStore (3.0 capability-envelope re-approval queue)
+    user_plane_durable: Optional[Any] = None              # UserPlaneDurableStore (4.0 user-plane durability)
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None

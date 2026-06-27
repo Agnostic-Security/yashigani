@@ -143,6 +143,11 @@ def _get_redis():
     return ir._r
 
 
+def _get_user_plane_durable():
+    """Return UserPlaneDurableStore if wired; None otherwise (degrade-safe)."""
+    return getattr(backoffice_state, "user_plane_durable", None)
+
+
 def _decode_hash(raw: dict) -> dict:
     """Decode a Redis hash (bytes keys + values) into a plain str dict."""
     return {
@@ -553,6 +558,28 @@ async def create_user_agent(body: CreateAgentBody, session: UserSession):
     pipe.hset(_alias_key(session.account_id), raw_alias, ua_id)
     pipe.execute()
 
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             body.name,
+                "description":      body.description,
+                "alias":            raw_alias,
+                "kind":             body.kind,
+                "personality":      json.dumps(personality),
+                "effective_skills": json.dumps(effective),
+                "declared_skills":  json.dumps(body.skills),
+                "letta_agent_id":   "",
+                "nhi_id":           "",
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent failed for %s: %s", ua_id, _exc
+            )
+
     logger.info(
         "user_agents: created %s alias=%r kind=%r for account %r",
         ua_id, raw_alias, body.kind, session.account_id,
@@ -640,6 +667,33 @@ async def patch_user_agent(ua_id: str, body: PatchAgentBody, session: UserSessio
             alias_updated = new_alias
 
     r.hset(_meta_key(ua_id), mapping=updates)
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            # Re-read meta to get the full current state for the upsert
+            _fresh = _decode_hash(r.hgetall(_meta_key(ua_id)))
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             _fresh.get("name", ""),
+                "description":      _fresh.get("description", ""),
+                "alias":            _fresh.get("alias", ""),
+                "kind":             _fresh.get("kind", "agent"),
+                "personality":      _fresh.get("personality"),
+                "effective_skills": _fresh.get("effective_skills"),
+                "declared_skills":  _fresh.get("declared_skills"),
+                "graph":            _fresh.get("graph"),
+                "graph_hash":       _fresh.get("graph_hash"),
+                "letta_agent_id":   _fresh.get("letta_agent_id"),
+                "nhi_id":           _fresh.get("nhi_id"),
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent (patch) failed for %s: %s", ua_id, _exc
+            )
+
     logger.info(
         "user_agents: patched %s fields=%r for account %r",
         ua_id, updated_fields, session.account_id,
@@ -672,6 +726,16 @@ async def delete_user_agent(ua_id: str, session: UserSession):
     if old_alias:
         pipe.hdel(_alias_key(session.account_id), old_alias)
     pipe.execute()
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.delete_agent(ua_id)
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: delete_agent failed for %s: %s", ua_id, _exc
+            )
 
     logger.info(
         "user_agents: deleted %s alias=%r for account %r; detached %d memory blocks",
@@ -723,6 +787,31 @@ async def set_agent_personality(ua_id: str, body: SetPersonalityBody, session: U
         b"personality": json.dumps(current).encode(),
         b"updated_at":  _now_iso().encode(),
     })
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _fresh = _decode_hash(r.hgetall(_meta_key(ua_id)))
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             _fresh.get("name", ""),
+                "description":      _fresh.get("description", ""),
+                "alias":            _fresh.get("alias", ""),
+                "kind":             _fresh.get("kind", "agent"),
+                "personality":      _fresh.get("personality"),
+                "effective_skills": _fresh.get("effective_skills"),
+                "declared_skills":  _fresh.get("declared_skills"),
+                "graph":            _fresh.get("graph"),
+                "graph_hash":       _fresh.get("graph_hash"),
+                "letta_agent_id":   _fresh.get("letta_agent_id"),
+                "nhi_id":           _fresh.get("nhi_id"),
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent (personality) failed for %s: %s", ua_id, _exc
+            )
 
     # Attempt live Letta push (no-op if pool not ready)
     letta_agent_id = meta.get("letta_agent_id", "")
@@ -791,6 +880,31 @@ async def set_agent_skills(ua_id: str, body: SetSkillsBody, session: UserSession
         b"updated_at":       _now_iso().encode(),
     })
 
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _fresh = _decode_hash(r.hgetall(_meta_key(ua_id)))
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             _fresh.get("name", ""),
+                "description":      _fresh.get("description", ""),
+                "alias":            _fresh.get("alias", ""),
+                "kind":             _fresh.get("kind", "agent"),
+                "personality":      _fresh.get("personality"),
+                "effective_skills": _fresh.get("effective_skills"),
+                "declared_skills":  _fresh.get("declared_skills"),
+                "graph":            _fresh.get("graph"),
+                "graph_hash":       _fresh.get("graph_hash"),
+                "letta_agent_id":   _fresh.get("letta_agent_id"),
+                "nhi_id":           _fresh.get("nhi_id"),
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent (skills) failed for %s: %s", ua_id, _exc
+            )
+
     logger.info(
         "user_agents: skills set on %s for account %r — effective=%r rejected=%r",
         ua_id, session.account_id, effective, rejected,
@@ -838,6 +952,17 @@ async def attach_memory_to_agent(ua_id: str, block_id: str, session: UserSession
 
     r.sadd(_mem_agent_key(ua_id), block_id.encode())
 
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.set_memory_link(ua_id, block_id, True)
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: set_memory_link (attach) failed ua=%s block=%s: %s",
+                ua_id, block_id, _exc,
+            )
+
     letta_agent_id = agent_meta.get("letta_agent_id", "")
     letta_block_id = block_meta.get("letta_block_id", "")
     letta_synced = False
@@ -869,6 +994,17 @@ async def detach_memory_from_agent(ua_id: str, block_id: str, session: UserSessi
     _get_block_or_404(r, block_id, session.account_id)
 
     r.srem(_mem_agent_key(ua_id), block_id.encode())
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.set_memory_link(ua_id, block_id, False)
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: set_memory_link (detach) failed ua=%s block=%s: %s",
+                ua_id, block_id, _exc,
+            )
 
     letta_agent_id = agent_meta.get("letta_agent_id", "")
     # Best-effort Letta detach (no raise on failure — metadata is authoritative)
@@ -931,6 +1067,22 @@ async def create_memory_block(body: CreateMemoryBody, session: UserSession):
     pipe.sadd(_mem_all_key(session.account_id), block_id.encode())
     pipe.execute()
 
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.upsert_memory({
+                "account_id":     session.account_id,
+                "block_id":       block_id,
+                "label":          body.label,
+                "value":          body.value,
+                "letta_block_id": "",
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_memory failed for %s: %s", block_id, _exc
+            )
+
     logger.info("user_agents: memory block %s created for account %r", block_id, session.account_id)
     return {"block_id": block_id, "label": body.label, "created_at": now}
 
@@ -961,6 +1113,23 @@ async def patch_memory_block(block_id: str, body: PatchMemoryBody, session: User
         updates[b"value"] = body.value.encode()
 
     r.hset(_mem_meta_key(block_id), mapping=updates)
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _fresh_mem = _decode_hash(r.hgetall(_mem_meta_key(block_id)))
+            _upd.upsert_memory({
+                "account_id":     session.account_id,
+                "block_id":       block_id,
+                "label":          _fresh_mem.get("label", ""),
+                "value":          _fresh_mem.get("value", ""),
+                "letta_block_id": _fresh_mem.get("letta_block_id", ""),
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_memory (patch) failed for %s: %s", block_id, _exc
+            )
 
     letta_block_id = meta.get("letta_block_id", "")
     letta_synced = False
@@ -1006,6 +1175,16 @@ async def delete_memory_block(block_id: str, session: UserSession):
     for ua_id in agent_ids:
         pipe.srem(_mem_agent_key(ua_id), block_id.encode())
     pipe.execute()
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.delete_memory(block_id)
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: delete_memory failed for %s: %s", block_id, _exc
+            )
 
     # Best-effort Letta delete
     if letta_block_id:
@@ -1384,6 +1563,31 @@ async def save_agent_graph(ua_id: str, body: SaveGraphBody, session: UserSession
         b"updated_at": _now_iso().encode("utf-8"),
     })
 
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _fresh = _decode_hash(r.hgetall(_meta_key(ua_id)))
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             _fresh.get("name", ""),
+                "description":      _fresh.get("description", ""),
+                "alias":            _fresh.get("alias", ""),
+                "kind":             _fresh.get("kind", "agent"),
+                "personality":      _fresh.get("personality"),
+                "effective_skills": _fresh.get("effective_skills"),
+                "declared_skills":  _fresh.get("declared_skills"),
+                "graph":            ctf_json,
+                "graph_hash":       graph_hash,
+                "letta_agent_id":   _fresh.get("letta_agent_id"),
+                "nhi_id":           _fresh.get("nhi_id"),
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent (graph) failed for %s: %s", ua_id, _exc
+            )
+
     logger.info(
         "user_agents: graph saved for %s account=%r nodes=%d edges=%d hash=%s",
         ua_id, session.account_id, node_count, edge_count, graph_hash[:24],
@@ -1586,6 +1790,31 @@ async def run_user_agent(ua_id: str, session: UserSession):
         b"nhi_id":     nhi_id.encode("utf-8"),
         b"updated_at": _now_iso().encode("utf-8"),
     })
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _fresh = _decode_hash(r.hgetall(_meta_key(ua_id)))
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             _fresh.get("name", ""),
+                "description":      _fresh.get("description", ""),
+                "alias":            _fresh.get("alias", ""),
+                "kind":             _fresh.get("kind", "agent"),
+                "personality":      _fresh.get("personality"),
+                "effective_skills": _fresh.get("effective_skills"),
+                "declared_skills":  _fresh.get("declared_skills"),
+                "graph":            _fresh.get("graph"),
+                "graph_hash":       _fresh.get("graph_hash"),
+                "letta_agent_id":   _fresh.get("letta_agent_id"),
+                "nhi_id":           nhi_id,
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent (run/nhi) failed for %s: %s", ua_id, _exc
+            )
 
     # Emit NHI_SCOPE_INTERSECTED
     if aw is not None:
@@ -2195,6 +2424,29 @@ async def commit_agent_template(body: CommitFlowBody, session: UserSession):
     # Consume the draft — committed; TTL would clear it anyway but be explicit.
     pipe.delete(_draft_key(body.draft_id))
     pipe.execute()
+
+    # 4.0 USER-PLANE-DURABILITY: dual-write to Postgres (best-effort)
+    _upd = _get_user_plane_durable()
+    if _upd is not None:
+        try:
+            _upd.upsert_agent({
+                "account_id":       session.account_id,
+                "ua_id":            ua_id,
+                "name":             body.name,
+                "description":      body.description,
+                "alias":            raw_alias,
+                "kind":             "langflow_callee",
+                "personality":      json.dumps(personality),
+                "effective_skills": json.dumps(effective),
+                "declared_skills":  json.dumps(body.skills),
+                "letta_agent_id":   "",
+                "nhi_id":           "",
+            })
+        except Exception as _exc:
+            logger.error(
+                "USER-PLANE-DURABLE: upsert_agent (commit-template) failed for %s: %s",
+                ua_id, _exc,
+            )
 
     # --- Step 6: emit AGENT_FLOW_COMMITTED (human-decides audit anchor) ---
     aw = getattr(backoffice_state, "audit_writer", None)
