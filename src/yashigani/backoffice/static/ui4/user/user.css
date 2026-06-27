@@ -1,0 +1,113 @@
+/* Yashigani 4.0 user app — page layout. CLASSES-ONLY (no inline styles, CSP-clean).
+ *
+ * Builds on the shared design-system.css tokens (--ys-*). Adds only the app
+ * shell (header + sidebar + chat column) and the user-construct cards; all
+ * colours/spacing come from the shared tokens so admin + user stay identical.
+ */
+
+.ys-app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+}
+
+/* ── top bar / session header ────────────────────────────── */
+.ys-app-header {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--ys-nav-bg); color: #fff;
+  padding: var(--ys-sp-3) var(--ys-sp-5);
+}
+.ys-app-brand { font-weight: 700; letter-spacing: 0.01em; }
+.ys-app-brand .ys-app-brand-mark { color: var(--ys-brand-orange); }
+.ys-app-session { display: flex; align-items: center; gap: var(--ys-sp-3); font-size: var(--ys-fs-sm); }
+.ys-app-session .ys-app-user { color: #cbd5e1; }
+
+/* ── shell: sidebar + chat ───────────────────────────────── */
+.ys-app-body {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: 0;
+}
+.ys-app-sidebar {
+  border-right: 1px solid var(--ys-border);
+  background: var(--ys-surface-alt);
+  overflow-y: auto;
+  padding: var(--ys-sp-4);
+}
+.ys-app-main {
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--ys-bg);
+}
+
+/* ── sidebar sections ────────────────────────────────────── */
+.ys-section { margin-bottom: var(--ys-sp-5); }
+.ys-section-title {
+  font-size: var(--ys-fs-sm); font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--ys-ink-faint); margin-bottom: var(--ys-sp-2);
+}
+.ys-agent-list { display: flex; flex-direction: column; gap: var(--ys-sp-2); }
+.ys-agent {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: var(--ys-sp-2) var(--ys-sp-3); border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); background: var(--ys-surface); cursor: pointer;
+  font-size: var(--ys-fs-base);
+}
+.ys-agent:hover { border-color: var(--ys-brand-blue); }
+.ys-agent.ys-agent-active { border-color: var(--ys-brand-blue); box-shadow: var(--ys-elev-1); }
+.ys-agent-name { font-weight: 600; }
+.ys-agent-meta { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+
+/* budget */
+.ys-budget-line { display: flex; justify-content: space-between; font-size: var(--ys-fs-base); margin-bottom: var(--ys-sp-1); }
+.ys-budget-bar { height: 8px; border-radius: var(--ys-radius-pill); background: var(--ys-border); overflow: hidden; margin-top: var(--ys-sp-1); }
+.ys-budget-bar-fill { height: 100%; background: var(--ys-brand-blue); }
+.ys-budget-bar-fill.ys-over { background: var(--ys-red-fg); }
+
+/* memory */
+.ys-memory-list { display: flex; flex-direction: column; gap: var(--ys-sp-2); }
+.ys-memory-item {
+  padding: var(--ys-sp-2) var(--ys-sp-3); border-radius: var(--ys-radius-sm);
+  background: var(--ys-surface); border: 1px solid var(--ys-border-faint);
+  font-size: var(--ys-fs-sm); color: var(--ys-ink);
+}
+.ys-memory-item .ys-memory-key { color: var(--ys-ink-muted); font-family: var(--ys-mono); font-size: 0.75rem; }
+
+/* doc-OPA upload */
+.ys-doc-drop {
+  border: 1px dashed var(--ys-border); border-radius: var(--ys-radius-sm);
+  padding: var(--ys-sp-3); text-align: center; font-size: var(--ys-fs-sm);
+  color: var(--ys-ink-muted); background: var(--ys-surface);
+}
+.ys-doc-result { margin-top: var(--ys-sp-3); }
+.ys-doc-action { font-size: var(--ys-fs-sm); }
+.ys-doc-action .ys-badge { margin-left: var(--ys-sp-2); }
+
+/* ── chat column ─────────────────────────────────────────── */
+.ys-chat-log {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  padding: var(--ys-sp-5); display: flex; flex-direction: column; gap: var(--ys-sp-3);
+}
+.ys-chat-row { display: flex; }
+.ys-chat-row-user { justify-content: flex-end; }
+.ys-chat-row-assistant { justify-content: flex-start; }
+.ys-chat-user-bubble {
+  max-width: 70%; background: var(--ys-blue-bg); color: var(--ys-ink);
+  padding: var(--ys-sp-2) var(--ys-sp-4); border-radius: var(--ys-radius);
+  white-space: pre-wrap; font-size: var(--ys-fs-base);
+}
+.ys-chat-assistant-wrap { max-width: 80%; }
+.ys-chat-empty { color: var(--ys-ink-faint); text-align: center; margin: auto; font-size: 0.95rem; }
+
+.ys-chat-composer {
+  border-top: 1px solid var(--ys-border); background: var(--ys-surface);
+  padding: var(--ys-sp-3) var(--ys-sp-5); display: flex; gap: var(--ys-sp-3);
+  align-items: flex-end;
+}
+.ys-chat-input-col { flex: 1 1 auto; display: flex; flex-direction: column; }
+.ys-chat-composer .ys-chat-input {
+  width: 100%; resize: none; min-height: 44px; max-height: 160px;
+  padding: var(--ys-sp-2) var(--ys-sp-3); border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); font-family: inherit; font-size: var(--ys-fs-base);
+}
+.ys-chat-composer .ys-chat-input:focus { outline: 2px solid var(--ys-brand-blue); outline-offset: -1px; }
+.ys-chat-target { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); margin-bottom: var(--ys-sp-2); }

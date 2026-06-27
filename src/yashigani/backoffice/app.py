@@ -1005,6 +1005,23 @@ def create_backoffice_app() -> FastAPI:
         ) -> HTMLResponse:
             return HTMLResponse(_ui4_canary.read_text(encoding="utf-8"))
 
+    # ── Yashigani 4.0 user-facing app (Phase 2) — OpenWebUI replacement ──────
+    # The user-tier Lit app served at /chat (assets under /static/ui4/). Built on
+    # the shared layer above. A lightweight session-cookie pre-flight avoids
+    # serving the SPA shell to unauthenticated clients (mirrors the /admin/ shell
+    # check, ASVS V1.4.1) — cryptographic session validation happens on every
+    # subsequent /user/* and /v1/* API call. Production CSP/Trusted-Types headers
+    # are Su's Caddy domain (feat/4.0-csp-vendoring); the page carries its own CSP
+    # meta so the safe-render/TT pipeline is enforced even before those land.
+    _ui4_chat = _static_dir / "ui4" / "user" / "chat.html"
+    if _ui4_chat.exists():
+
+        @app.get("/chat", include_in_schema=False)
+        async def ui4_user_chat_page(request: Request):
+            if not request.cookies.get("__Host-yashigani_session"):
+                return RedirectResponse(url="/login?next=/chat", status_code=302)
+            return HTMLResponse(_ui4_chat.read_text(encoding="utf-8"))
+
     # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
     #
     # OpenAPI schema and Swagger/ReDoc UIs are NOT served at the root
