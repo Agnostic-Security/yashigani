@@ -112,6 +112,15 @@
 }
 .ys-md pre { background: #0f172a; color: #e2e8f0; padding: var(--ys-sp-3); border-radius: var(--ys-radius-sm); overflow-x: auto; font-family: var(--ys-mono); }
 .ys-md code { font-family: var(--ys-mono); font-size: 0.85em; }
+/* copy-code affordance on fenced blocks (TRUSTED-CHROME added imperatively) */
+.ys-code-wrap { position: relative; }
+.ys-code-wrap .ys-code-copy {
+  position: absolute; top: var(--ys-sp-1); right: var(--ys-sp-1);
+  padding: 2px var(--ys-sp-2); font-size: 0.72rem;
+  background: rgba(255, 255, 255, 0.12); color: #e2e8f0;
+  border-radius: var(--ys-radius-sm); opacity: 0; transition: opacity 0.12s ease;
+}
+.ys-code-wrap:hover .ys-code-copy, .ys-code-copy:focus { opacity: 1; }
 .ys-md table { border-collapse: collapse; }
 .ys-md th, .ys-md td { border: 1px solid var(--ys-border); padding: var(--ys-sp-1) var(--ys-sp-2); }
 
