@@ -180,7 +180,26 @@
   padding: var(--ys-sp-3) var(--ys-sp-5); display: flex; gap: var(--ys-sp-3);
   align-items: flex-end;
 }
-.ys-chat-input-col { flex: 1 1 auto; display: flex; flex-direction: column; }
+.ys-chat-input-col { flex: 1 1 auto; display: flex; flex-direction: column; position: relative; }
+
+/* ── @-mention autocomplete popup (mention-menu.js) ──────────── */
+.ys-mention-menu {
+  position: absolute; bottom: 100%; left: 0; right: 0; margin-bottom: var(--ys-sp-1);
+  max-height: 240px; overflow-y: auto; z-index: 30;
+  background: var(--ys-surface); border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); box-shadow: var(--ys-elev-1);
+}
+.ys-mention-item {
+  display: flex; align-items: baseline; gap: var(--ys-sp-2);
+  padding: var(--ys-sp-2) var(--ys-sp-3); cursor: pointer;
+}
+.ys-mention-item:hover, .ys-mention-item.ys-mention-active { background: var(--ys-blue-bg); }
+.ys-mention-display { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ys-mention-handle { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); font-family: var(--ys-mono); }
+.ys-mention-kind {
+  margin-left: auto; flex: 0 0 auto; font-size: 0.7rem; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--ys-ink-faint);
+}
 .ys-chat-composer .ys-chat-input {
   width: 100%; resize: none; min-height: 44px; max-height: 160px;
   padding: var(--ys-sp-2) var(--ys-sp-3); border: 1px solid var(--ys-border);

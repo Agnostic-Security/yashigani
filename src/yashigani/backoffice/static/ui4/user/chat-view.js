@@ -24,9 +24,16 @@
 // the Lit template owns only the static frame + the composer.
 import { LitElement, html, nothing } from '/static/vendor/lit/lit-core.min.js';
 import '/static/ui4/core/widgets/ys-chat-stream.js';
+import './mention-menu.js';
 import { copyText } from '/static/ui4/core/clipboard.js';
 
 const CHAT_PATH = '/v1/chat/completions';
+const MENTIONS_PATH = '/user/mentions';
+
+// Escape a handle for safe use inside a RegExp (handles are untrusted).
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 export class YsChatView extends LitElement {
   static properties = {
@@ -37,6 +44,9 @@ export class YsChatView extends LitElement {
     selectedModel: { type: String },
     conversationId: { type: String },
     _sending: { state: true },
+    _mentionOpen: { state: true },
+    _mentionFiltered: { state: true },
+    _mentionActive: { state: true },
   };
 
   constructor() {
@@ -53,6 +63,15 @@ export class YsChatView extends LitElement {
     this._input = null;
     this._cancel = null;    // active stream canceller
     this._loadedConversationId = null; // guards updated() against self-set ids
+    // @-mention state. _mentions is the per-session cache of GET /user/mentions
+    // (null = not yet fetched); _mentionsPromise de-dupes concurrent fetches so
+    // fast typing can't fire the request twice or race an empty result.
+    this._mentions = null;
+    this._mentionsPromise = null;
+    this._mentionStart = 0;       // index of the '@' in the textarea value
+    this._mentionOpen = false;
+    this._mentionFiltered = [];
+    this._mentionActive = 0;
   }
 
   createRenderRoot() { return this; }
@@ -251,6 +270,73 @@ export class YsChatView extends LitElement {
     });
   }
 
+  // ── @-mention autocomplete ─────────────────────────────────
+  // Fetch the caller's addressable agents+personas once per session (cache).
+  _ensureMentions() {
+    if (!this._mentionsPromise) {
+      this._mentionsPromise = (async () => {
+        if (!this.api) return [];
+        const data = await this.api.get(MENTIONS_PATH);
+        const list = Array.isArray(data)
+          ? data
+          : (data && Array.isArray(data.items) ? data.items
+            : (data && Array.isArray(data.data) ? data.data : []));
+        this._mentions = list; // sync mirror for _resolveMentionTarget()
+        return list;
+      })();
+    }
+    return this._mentionsPromise;
+  }
+
+  // Detect an active "@token" immediately left of the caret and open/refilter
+  // the menu. Called on every textarea input.
+  async _syncMention() {
+    const ta = this._input;
+    if (!ta) return;
+    const caret = ta.selectionStart;
+    const left = ta.value.slice(0, caret);
+    // The @token starts at line-start or after whitespace; no spaces/@ inside it.
+    const m = /(?:^|\s)@([^\s@]*)$/.exec(left);
+    if (!m) { this._closeMention(); return; }
+    this._mentionStart = caret - m[1].length - 1; // position of the '@'
+    const q = m[1].toLowerCase();
+    const items = await this._ensureMentions();
+    // The caret may have moved away from the @token while the fetch was in
+    // flight; re-validate before opening so we don't pop a stale menu.
+    if (!/(?:^|\s)@[^\s@]*$/.test(ta.value.slice(0, ta.selectionStart))) {
+      this._closeMention();
+      return;
+    }
+    this._mentionFiltered = items.filter((it) => {
+      const h = String((it && it.handle) ?? '').toLowerCase();
+      const d = String((it && it.display) ?? '').toLowerCase();
+      return !q || h.includes(q) || d.includes(q);
+    });
+    this._mentionActive = 0;
+    this._mentionOpen = this._mentionFiltered.length > 0;
+  }
+
+  _closeMention() {
+    this._mentionOpen = false;
+    this._mentionFiltered = [];
+    this._mentionActive = 0;
+  }
+
+  // Insert "@handle " over the active @token and close the menu.
+  _pickMention(item) {
+    const ta = this._input;
+    if (!ta || !item) return;
+    const handle = String(item.handle ?? '');
+    const before = ta.value.slice(0, this._mentionStart);
+    const after = ta.value.slice(ta.selectionStart);
+    const insert = `@${handle} `;
+    ta.value = `${before}${insert}${after}`;
+    const pos = before.length + insert.length;
+    ta.setSelectionRange(pos, pos);
+    this._closeMention();
+    ta.focus();
+  }
+
   // ── send / stream ──────────────────────────────────────────
   _apiMessages() {
     return this._history.map((m) => ({ role: m.role, content: m.content }));
@@ -258,6 +344,31 @@ export class YsChatView extends LitElement {
 
   _currentModel() {
     return this.selectedModel || this.activeAgentId || 'default';
+  }
+
+  // If the text addresses a KNOWN @handle, return "@handle" as the chat target
+  // (the gateway resolves it per-user). Only handles we actually fetched count,
+  // so arbitrary "@foo" text is never treated as a route.
+  _resolveMentionTarget(text) {
+    const items = Array.isArray(this._mentions) ? this._mentions : [];
+    const s = String(text || '');
+    for (const it of items) {
+      const h = String((it && it.handle) ?? '');
+      if (!h) continue;
+      const re = new RegExp(`(?:^|\\s)@${escapeRegExp(h)}(?=\\s|$)`);
+      if (re.test(s)) return `@${h}`;
+    }
+    return '';
+  }
+
+  // The model/target for the next request: an addressed @handle in the latest
+  // user turn wins over the composer's model selector.
+  _targetModel() {
+    let lastUser = '';
+    for (let i = this._history.length - 1; i >= 0; i -= 1) {
+      if (this._history[i].role === 'user') { lastUser = this._history[i].content; break; }
+    }
+    return this._resolveMentionTarget(lastUser) || this._currentModel();
   }
 
   async _ensureConversation() {
@@ -284,7 +395,7 @@ export class YsChatView extends LitElement {
     this._sending = true;
     this._scrollToEnd();
 
-    const body = { model: this._currentModel(), messages: this._apiMessages() };
+    const body = { model: this._targetModel(), messages: this._apiMessages() };
     if (this.conversationId) body.conversation_id = this.conversationId;
 
     const handle = this.api.stream(CHAT_PATH, {
@@ -350,6 +461,14 @@ export class YsChatView extends LitElement {
   }
 
   _onKeydown(e) {
+    // While the mention menu is open it captures navigation/commit keys.
+    if (this._mentionOpen && this._mentionFiltered.length) {
+      const n = this._mentionFiltered.length;
+      if (e.key === 'ArrowDown') { e.preventDefault(); this._mentionActive = (this._mentionActive + 1) % n; return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); this._mentionActive = (this._mentionActive - 1 + n) % n; return; }
+      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); this._pickMention(this._mentionFiltered[this._mentionActive]); return; }
+      if (e.key === 'Escape') { e.preventDefault(); this._closeMention(); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       this._send();
@@ -398,9 +517,18 @@ export class YsChatView extends LitElement {
                   : html`<span class="ys-chat-target">${this.activeAgentName || this.activeAgentId || 'default'}</span>`}
               </label>
             </div>
+            ${this._mentionOpen
+              ? html`<ys-mention-menu
+                       .items=${this._mentionFiltered}
+                       .active=${this._mentionActive}
+                       @ys-mention-pick=${(e) => this._pickMention(e.detail.item)}
+                       @ys-mention-active=${(e) => { this._mentionActive = e.detail.index; }}></ys-mention-menu>`
+              : nothing}
             <textarea class="ys-chat-input" rows="1"
-                      placeholder="Send a message…"
-                      @keydown=${(e) => this._onKeydown(e)}></textarea>
+                      placeholder="Send a message… (type @ to address an agent)"
+                      @keydown=${(e) => this._onKeydown(e)}
+                      @input=${() => this._syncMention()}
+                      @blur=${() => this._closeMention()}></textarea>
           </div>
           ${this._sending
             ? html`<button class="ys-btn ys-btn-secondary ys-chat-stop" @click=${() => this._stop()}>Stop</button>`
