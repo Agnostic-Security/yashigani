@@ -1277,6 +1277,11 @@ def create_backoffice_app() -> FastAPI:
     # account_id scoping on every per-conversation query).
     app.include_router(user_conversations_router, tags=["user-conversations"])
 
+    # 4.0 Letta agent capabilities — /user/agents, /user/memories, /user/skills
+    # (RISK-097/108 scope-intersection; BOLA-enforced; require_user_session)
+    from yashigani.backoffice.routes.user_agents import router as _user_agents_router
+    app.include_router(_user_agents_router, tags=["user-agents"])
+
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:
     #   report-uri /api/v1/csp-report
