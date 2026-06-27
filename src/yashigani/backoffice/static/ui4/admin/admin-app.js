@@ -24,6 +24,12 @@ import { getAdminModules, getAdminModule } from './module-registry.js';
 // Each side-effect import self-registers via registerAdminModule(). Wave 2 adds
 // one line per module group here; the shell discovers them through the registry.
 import './modules/dashboard.js';
+// Agents, NHI & Resources module group (Wave-2).
+import './modules/agents.js';
+import './modules/nhi-approvals.js';
+import './modules/agent-templates.js';
+import './modules/mcp.js';
+import './modules/budget-models.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /

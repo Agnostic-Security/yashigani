@@ -258,6 +258,21 @@ class AgentResponse(BaseModel):
     # v0.9.0 — token rotation metadata (F-09)
     token_last_rotated: str = Field(default="")
     token_rotation_schedule: str = Field(default="")
+    # 4.0 admin-UI surfacing (additive, backward-compatible). The registry already
+    # decodes these (see registry._decode_agent); previously _to_response dropped
+    # them so the admin SPA could not distinguish service agents from NHIs /
+    # governed Langflow callees, nor show SVID/cert status. Defaults keep the
+    # shape stable for pre-4.0 ("agent") entries which have no NHI block.
+    #   kind         — "agent" | "nhi" | "persona" (callees register as kind="agent"
+    #                  with the "user_agent_callee" group, see user_agents.commit_agent_template)
+    #   svid_issued  — None for non-NHI; bool for NHI (admin-approval gate, RISK-097)
+    #   spiffe_id    — minted SPIFFE id once an NHI SVID is approved
+    #   owner_identity_id / template_id — NHI/callee lineage (which user/template)
+    kind: str = Field(default="agent")
+    svid_issued: Optional[bool] = Field(default=None)
+    spiffe_id: str = Field(default="")
+    owner_identity_id: str = Field(default="")
+    template_id: str = Field(default="")
 
 
 class AgentRegisterResponse(AgentResponse):
@@ -299,6 +314,11 @@ class IdentityResponse(BaseModel):
     status: str
     created_at: str
     last_seen_at: str = Field(default="")
+
+
+# Pydantic v2: rebuild so Optional hints (with __future__ annotations) resolve.
+AgentResponse.model_rebuild()
+AgentRegisterResponse.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +364,13 @@ def _to_response(agent: dict) -> AgentResponse:
         allowed_cidrs=agent.get("allowed_cidrs", []),
         token_last_rotated=agent.get("token_last_rotated", ""),
         token_rotation_schedule=agent.get("token_rotation_schedule", ""),
+        # 4.0 admin-UI fields (additive). NHI-only fields default sensibly for
+        # plain "agent" entries that have no NHI block in the registry decode.
+        kind=agent.get("kind", "agent"),
+        svid_issued=agent.get("svid_issued"),
+        spiffe_id=agent.get("spiffe_id", ""),
+        owner_identity_id=agent.get("owner_identity_id", ""),
+        template_id=agent.get("template_id", ""),
     )
 
 
