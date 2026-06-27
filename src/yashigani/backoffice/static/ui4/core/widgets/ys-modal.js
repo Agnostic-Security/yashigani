@@ -40,55 +40,77 @@ export class YsModal extends LitElement {
 customElements.define('ys-modal', YsModal);
 
 /**
- * Promise-based TOTP step-up prompt for ApiClient's onStepUp. Renders a modal,
- * resolves with the 6-digit code, or null on cancel. Attaches to <body>.
+ * Promise-based TOTP step-up prompt for ApiClient's onStepUp. Resolves with the
+ * 6-digit code, or null on cancel. Attaches to <body>.
+ *
+ * IMPLEMENTATION NOTE (4.0 step-up fix): the modal markup is built directly here
+ * rather than via the <ys-modal> custom element. <ys-modal> renders in LIGHT DOM
+ * (createRenderRoot() returns `this`) but projects content through <slot> /
+ * <slot name="footer"> — slots only project in SHADOW DOM, so light-DOM slotted
+ * children render OUTSIDE the modal card and are covered by the full-screen
+ * backdrop, making the TOTP input + Verify button unclickable. That broke EVERY
+ * step-up path in the admin SPA (NHI SVID approve, cloud-key set, model RBAC
+ * writes, MCP re-approval). Building the backdrop→card→body/footer tree as real
+ * DOM nodes (createElement + textContent — CSP-clean, no innerHTML, no slots)
+ * sidesteps the projection bug entirely and keeps the same onStepUp contract.
  *
  * @param {object} [spec] server-provided step-up spec (e.g. {action})
  * @returns {Promise<string|null>}
  */
 export function promptStepUp(spec) {
   return new Promise((resolve) => {
-    const modal = document.createElement('ys-modal');
-    modal.heading = 'Step-up verification required';
-    const body = document.createElement('div');
-    const label = document.createElement('div');
-    label.className = 'ys-label';
-    // textContent — server-authored, never markdown.
-    label.textContent = (spec && spec.message)
-      || 'Enter your 6-digit authenticator code to authorise this action.';
-    const input = document.createElement('input');
-    input.className = 'ys-input';
+    const mk = (tag, cls, text) => {
+      const el = document.createElement(tag);
+      if (cls) el.className = cls;
+      if (text != null) el.textContent = text; // textContent — never markdown/innerHTML
+      return el;
+    };
+
+    const backdrop = mk('div', 'ys-modal-backdrop');
+    const card = mk('div', 'ys-modal');
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+
+    const header = mk('div', 'ys-modal-header', 'Step-up verification required');
+
+    const body = mk('div', 'ys-modal-body');
+    const label = mk('div', 'ys-label',
+      (spec && spec.message)
+        || 'Enter your 6-digit authenticator code to authorise this action.');
+    const input = mk('input', 'ys-input');
     input.setAttribute('inputmode', 'numeric');
     input.setAttribute('autocomplete', 'one-time-code');
     input.maxLength = 6;
     body.appendChild(label);
     body.appendChild(input);
-    modal.appendChild(body);
 
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'ys-btn ys-btn-secondary';
-    cancelBtn.setAttribute('slot', 'footer');
-    cancelBtn.textContent = 'Cancel';
-    const okBtn = document.createElement('button');
-    okBtn.className = 'ys-btn';
-    okBtn.setAttribute('slot', 'footer');
-    okBtn.textContent = 'Verify';
-    modal.appendChild(cancelBtn);
-    modal.appendChild(okBtn);
+    const footer = mk('div', 'ys-modal-footer');
+    const cancelBtn = mk('button', 'ys-btn ys-btn-secondary', 'Cancel');
+    const okBtn = mk('button', 'ys-btn', 'Verify');
+    footer.appendChild(cancelBtn);
+    footer.appendChild(okBtn);
+
+    card.appendChild(header);
+    card.appendChild(body);
+    card.appendChild(footer);
+    backdrop.appendChild(card);
 
     const cleanup = (val) => {
-      modal.remove();
+      backdrop.remove();
       resolve(val);
     };
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) cleanup(null); });
     cancelBtn.addEventListener('click', () => cleanup(null));
-    modal.addEventListener('ys-close', () => cleanup(null));
     okBtn.addEventListener('click', () => {
       const v = input.value.trim();
       cleanup(/^\d{6}$/.test(v) ? v : null);
     });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') okBtn.click();
+      else if (e.key === 'Escape') cleanup(null);
+    });
 
-    document.body.appendChild(modal);
-    modal.open = true;
+    document.body.appendChild(backdrop);
     requestAnimationFrame(() => input.focus());
   });
 }
