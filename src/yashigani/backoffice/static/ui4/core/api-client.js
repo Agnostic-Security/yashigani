@@ -169,14 +169,20 @@ export class ApiClient {
     }
   }
 
-  /** Token-stream a chat completion (delegates to sse.js, §4). */
-  stream(path, { body, headers, signal, onToken, onMessageDone, onError } = {}) {
+  /**
+   * Token-stream a chat completion (delegates to sse.js, §4). `onBlocked`
+   * receives the STRUCTURED verdict tail of a pre-stream block (e.g. an HTTP
+   * 403 returned before the SSE opened, RISK-105) so the caller can render the
+   * trusted verdict banner instead of leaving the user with nothing.
+   */
+  stream(path, { body, headers, signal, onToken, onMessageDone, onBlocked, onError } = {}) {
     return streamChat(this._url(path), {
       body,
       headers: { 'X-Yashigani-Plane': this.sessionKind, ...(headers || {}) },
       signal,
       onToken,
       onMessageDone,
+      onBlocked,
       onError,
     });
   }

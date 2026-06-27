@@ -125,6 +125,19 @@ export class YsChatView extends LitElement {
         this._cancel = null;
         this._scrollToEnd();
       },
+      onBlocked: (structured) => {
+        // Pre-stream block (e.g. HTTP 403): the gateway rejected before the SSE
+        // opened, so the verdict arrives as the error body's STRUCTURED fields,
+        // not an in-stream event. Decode via the audited path into the trusted
+        // <ys-verdict-banner> — content stays empty and NO error text is ever
+        // promoted to chrome (RISK-105 anti-spoofing). The blocked turn is not
+        // added to history (no assistant reply was produced).
+        const verdict = this.api.decode(structured || { blocked: true });
+        bubble.finish('', verdict);
+        this._sending = false;
+        this._cancel = null;
+        this._scrollToEnd();
+      },
       onError: (err) => {
         bubble.finish(`_(stream error: ${err && err.message ? err.message : 'unknown'})_`, null);
         this._sending = false;
