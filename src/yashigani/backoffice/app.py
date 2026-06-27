@@ -1283,12 +1283,6 @@ def create_backoffice_app() -> FastAPI:
     from yashigani.backoffice.routes.user_agents import router as _user_agents_router
     app.include_router(_user_agents_router, tags=["user-agents"])
 
-    # 4.0 no-code workflow composer — POST /user/workflows/generate, POST/GET/PATCH/DELETE
-    # /user/workflows/{wf_id}.  All endpoints enforce require_user_session and are
-    # BOLA-scoped to the calling user's account_id (EU AI Act Art.14 human-in-the-loop).
-    from yashigani.backoffice.routes.user_workflows import router as _user_workflows_router
-    app.include_router(_user_workflows_router, tags=["user-workflows"])
-
     # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
     # /chat + /agents + /builder pages + /user/* data endpoints. All enforce
     # require_user_session. Mounted without a prefix so routes carry their own
@@ -1300,8 +1294,10 @@ def create_backoffice_app() -> FastAPI:
     # account_id scoping on every per-conversation query).
     app.include_router(user_conversations_router, tags=["user-conversations"])
 
-    # 4.0 Workflow run history — GET /user/workflows/{id}/runs (BOLA-enforced).
-    # Reads from the WorkflowScheduler's Redis DB 6; 503 if scheduler unavailable.
+    # 4.0 no-code workflow composer + run history (single router) —
+    # POST /user/workflows/generate, POST/GET/PATCH/DELETE /user/workflows/{wf_id},
+    # GET /user/workflows/{id}/runs. require_user_session + BOLA (EU AI Act Art.14 HITL);
+    # runs read the WorkflowScheduler's Redis DB 6 (503 if scheduler unavailable).
     app.include_router(user_workflows_router, tags=["user-workflows"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
