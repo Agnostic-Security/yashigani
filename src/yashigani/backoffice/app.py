@@ -1281,6 +1281,12 @@ def create_backoffice_app() -> FastAPI:
     from yashigani.backoffice.routes.user_agents import router as _user_agents_router
     app.include_router(_user_agents_router, tags=["user-agents"])
 
+    # 4.0 no-code workflow composer — POST /user/workflows/generate, POST/GET/PATCH/DELETE
+    # /user/workflows/{wf_id}.  All endpoints enforce require_user_session and are
+    # BOLA-scoped to the calling user's account_id (EU AI Act Art.14 human-in-the-loop).
+    from yashigani.backoffice.routes.user_workflows import router as _user_workflows_router
+    app.include_router(_user_workflows_router, tags=["user-workflows"])
+
     # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
     # /chat + /agents + /builder pages + /user/* data endpoints. All enforce
     # require_user_session. Mounted without a prefix so routes carry their own
