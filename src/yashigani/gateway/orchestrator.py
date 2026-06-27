@@ -1534,6 +1534,18 @@ def _finalize(body, identity, request_id, final_text, transcript, blocked_any,
     skip them — it relaxes ONLY the brain's internal cognition leg, never the
     tool-result or final-answer egress that this envelope carries.
     """
+    # OPA-UX TRY-AGAIN (deterministic): on a policy BLOCK the brain (a small local
+    # LLM) sometimes ignores its system-prompt instruction and appends transient-
+    # retry phrasing ("please try again later"), which misrepresents a policy
+    # DECISION as a temporary glitch and tells users to retry a request that will
+    # always be denied. Prompt-only control is non-deterministic; strip the phrase
+    # here so the wording is GUARANTEED regardless of which model answered.
+    if blocked_any and final_text:
+        import re as _re
+        final_text = _re.sub(
+            r'\s*(?:please\s+)?try\s+again\s+(?:later|shortly|soon|in\s+a\s+(?:moment|bit|little while|few\s+\w+))\b[.!]?',
+            '', final_text, flags=_re.IGNORECASE).strip()
+
     # Append a COMPACT, OPAQUE coded transcript so the customer "record all
     # outputs" requirement is met inline WITHOUT leaking the security logic
     # (tool names, policy reasons, which leg fired) to whoever can read a chat

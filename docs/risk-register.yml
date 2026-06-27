@@ -2144,3 +2144,170 @@ risks:
       Filed as LAURA-300-002 (pentest).
   fix_in_version: v3.0.1
   last_threat_model_review: '2026-06-26'
+- id: YSG-RISK-096
+  description: >-
+    Trivy CVE-2026-8376 (perl-base heap buffer overflow, NVD: CRITICAL):
+    OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    The perl-base binary is not on any HTTP request-handling path. Identified during
+    Laura's v3.0.1 docker gate sweep (LAURA-301-001). grep confirms no perl invocation
+    on any gateway/backoffice request path.
+  severity: critical
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (perl-base transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — perl-base not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — perl-base not on
+      any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+      as YSG-RISK-093. Identified during Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-097
+  description: >-
+    Trivy CVE-2025-69720 (ncurses buffer overflow, NVD: HIGH):
+    OS library in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    ncurses is not invoked by any HTTP handler. Identified during Laura's v3.0.1
+    docker gate sweep (LAURA-301-001).
+  severity: high
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (ncurses transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — ncurses not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — ncurses not on
+      any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+      as YSG-RISK-093. Identified during Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-098
+  description: >-
+    Trivy CVE-2026-11822 (libsqlite3-0 memory corruption, NVD: HIGH):
+    OS dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    grep confirms no `import sqlite` in gateway/backoffice src — sqlite3 is not used
+    by the application. Identified during Laura's v3.0.1 docker gate sweep (LAURA-301-001).
+  severity: high
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (libsqlite3-0 transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+      any HTTP request-handling path (no `import sqlite` in gateway/backoffice src). Not
+      DAST-exploitable in deployed stack. Same class as YSG-RISK-093. Identified during
+      Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-099
+  description: >-
+    Trivy CVE-2026-11824 (libsqlite3-0 memory corruption variant, NVD: HIGH):
+    OS dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    Companion to CVE-2026-11822 (YSG-RISK-098). grep confirms no `import sqlite` in
+    gateway/backoffice src. Identified during Laura's v3.0.1 docker gate sweep (LAURA-301-001).
+  severity: high
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (libsqlite3-0 transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+      any HTTP request-handling path (no `import sqlite` in gateway/backoffice src). Not
+      DAST-exploitable in deployed stack. Same class as YSG-RISK-093. Identified during
+      Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-100
+  description: >-
+    Trivy CVE-2026-48962 (perl IO::Compress, NVD: HIGH):
+    OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    perl IO::Compress is not invoked on any request path. Identified during Laura's
+    v3.0.1 docker gate sweep (LAURA-301-001).
+  severity: high
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (perl IO::Compress transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — perl IO::Compress not
+    on any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — perl IO::Compress not
+      on any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+      as YSG-RISK-093. Identified during Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-101
+  description: >-
+    Trivy CVE-2026-9538 (perl Archive::Tar memory exhaustion, NVD: HIGH):
+    OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    Same perl Archive::Tar component class as YSG-RISK-093; Yashigani backup/restore uses
+    Python tarfile, not perl Archive::Tar. Identified during Laura's v3.0.1 docker gate
+    sweep (LAURA-301-001).
+  severity: high
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (perl Archive::Tar transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — perl Archive::Tar not
+    on any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — perl Archive::Tar not
+      on any HTTP request-handling path (backup/restore uses Python tarfile). Not
+      DAST-exploitable in deployed stack. Same class as YSG-RISK-093. Identified during
+      Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
