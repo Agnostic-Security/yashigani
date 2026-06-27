@@ -284,15 +284,50 @@ async def user_chat_page(request: Request):
     if not token:
         return RedirectResponse(url="/login?next=/chat", status_code=302)
 
+    return _serve_user_page("chat.html", "chat")
+
+
+def _serve_user_page(filename: str, page_key: str) -> HTMLResponse:
+    """Serve a 4.0 user-plane SPA entry point from ui4/user/.
+
+    Shared by /chat, /agents and /builder. The cookie pre-flight is done by the
+    caller; this helper only resolves + reads the static shell, returning a 500
+    structured error if the page has not been deployed.
+    """
     _static_dir = pathlib.Path(__file__).parents[2] / "backoffice" / "static"
-    chat_html = _static_dir / "ui4" / "user" / "chat.html"
-    if not chat_html.exists():
-        logger.error("user_chat_page: ui4/user/chat.html not found at %s", chat_html)
+    page = _static_dir / "ui4" / "user" / filename
+    if not page.exists():
+        logger.error("user page %r not found at %s", page_key, page)
         raise HTTPException(
             status_code=500,
-            detail={"error": "chat_ui_unavailable", "message": "User UI not deployed yet."},
+            detail={"error": "user_ui_unavailable", "message": "User UI not deployed yet."},
         )
-    return HTMLResponse(chat_html.read_text(encoding="utf-8"))
+    return HTMLResponse(page.read_text(encoding="utf-8"))
+
+
+@router.get("/agents", include_in_schema=False)
+async def user_agents_page(request: Request):
+    """Serve the 4.0 agent-management surface (form-based agent builder).
+
+    Same cookie pre-flight + plane discipline as /chat (RISK-100). The page
+    drives the BOLA-enforced /user/agents, /user/skills and /user/memories
+    routes through the audited ApiClient (sessionKind:'user').
+    """
+    if not request.cookies.get(_USER_SESSION_COOKIE):
+        return RedirectResponse(url="/login?next=/agents", status_code=302)
+    return _serve_user_page("agents.html", "agents")
+
+
+@router.get("/builder", include_in_schema=False)
+async def user_builder_page(request: Request):
+    """Serve the 4.0 visual (Drawflow) agent builder surface.
+
+    Same cookie pre-flight + plane discipline as /chat (RISK-100). The canvas
+    emits an agent-template spec and POSTs it to /user/agents.
+    """
+    if not request.cookies.get(_USER_SESSION_COOKIE):
+        return RedirectResponse(url="/login?next=/builder", status_code=302)
+    return _serve_user_page("builder.html", "builder")
 
 
 # ---------------------------------------------------------------------------
