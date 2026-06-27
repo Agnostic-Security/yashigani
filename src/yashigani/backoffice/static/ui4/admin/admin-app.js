@@ -24,6 +24,14 @@ import { getAdminModules, getAdminModule } from './module-registry.js';
 // Each side-effect import self-registers via registerAdminModule(). Wave 2 adds
 // one line per module group here; the shell discovers them through the registry.
 import './modules/dashboard.js';
+// Governance, Data & Workflows module group (Wave-2).
+import './modules/policies-opa.js';
+import './modules/workflows-admin.js';
+import './modules/audit.js';
+import './modules/sensitivity-pii.js';
+import './modules/documents-docopa.js';
+import './modules/alerts.js';
+import './modules/license.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /
