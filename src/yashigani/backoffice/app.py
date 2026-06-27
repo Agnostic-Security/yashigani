@@ -107,6 +107,8 @@ from yashigani.backoffice.routes import (
     cloud_keys_router,
     # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
     user_ui_router,
+    # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
+    user_conversations_router,
 )
 
 
@@ -1270,6 +1272,10 @@ def create_backoffice_app() -> FastAPI:
     # /chat page + /user/* data endpoints.  All enforce require_user_session.
     # Mounted without a prefix so routes carry their own /chat and /user/ paths.
     app.include_router(user_ui_router, tags=["user-ui"])
+
+    # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced via
+    # account_id scoping on every per-conversation query).
+    app.include_router(user_conversations_router, tags=["user-conversations"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:

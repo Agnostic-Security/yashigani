@@ -64,6 +64,8 @@ from yashigani.backoffice.routes.version_check import router as version_check_ro
 from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
 # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
 from yashigani.backoffice.routes.user_ui import router as user_ui_router
+# 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
+from yashigani.backoffice.routes.user_conversations import router as user_conversations_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -116,4 +118,6 @@ __all__ = [
     "cloud_keys_router",
     # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
     "user_ui_router",
+    # 4.0 Chat persistence — conversation + message CRUD
+    "user_conversations_router",
 ]
