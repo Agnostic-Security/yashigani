@@ -8,6 +8,7 @@ Serves the 4.0 user SPA and data endpoints consumed by the shared ApiClient
 Routes
 ------
   GET  /chat                — user SPA entry point (returns ui4/chat.html)
+  GET  /workflows           — no-code workflow composer (returns ui4/workflows.html)
   GET  /user/agents         — list available agents (user-visible fields only)
   GET  /user/budget         — caller's own budget usage
   GET  /user/memory         — per-user memory entries (Phase-3 Letta stub)
@@ -328,6 +329,22 @@ async def user_builder_page(request: Request):
     if not request.cookies.get(_USER_SESSION_COOKIE):
         return RedirectResponse(url="/login?next=/builder", status_code=302)
     return _serve_user_page("builder.html", "builder")
+
+
+@router.get("/workflows", include_in_schema=False)
+async def user_workflows_page(request: Request):
+    """Serve the 4.0 no-code workflow composer surface.
+
+    Same cookie pre-flight + plane discipline as /chat (RISK-100). The user
+    describes a workflow in plain language with @-handles (agents, personas,
+    MCPs, APIs); the page drives the BOLA-enforced /user/mentions and
+    /user/workflows* routes through the audited ApiClient (sessionKind:'user').
+    Nothing is committed/scheduled without the user's explicit "Add workflow"
+    click (human-in-the-loop, EU AI Act Art.14).
+    """
+    if not request.cookies.get(_USER_SESSION_COOKIE):
+        return RedirectResponse(url="/login?next=/workflows", status_code=302)
+    return _serve_user_page("workflows.html", "workflows")
 
 
 # ---------------------------------------------------------------------------

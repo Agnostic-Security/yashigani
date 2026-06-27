@@ -1282,7 +1282,7 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(_user_agents_router, tags=["user-agents"])
 
     # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
-    # /chat + /agents + /builder pages + /user/* data endpoints. All enforce
+    # /chat + /agents + /builder + /workflows pages + /user/* data endpoints. All enforce
     # require_user_session. Mounted without a prefix so routes carry their own
     # /chat and /user/ paths. (NB: its GET /user/agents registry stub is now
     # shadowed by the agent-builder router above — see precedence note.)
