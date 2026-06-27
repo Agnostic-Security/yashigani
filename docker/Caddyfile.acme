@@ -510,6 +510,30 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── Alertmanager — admin-authenticated access via /admin/alertmanager/* ──
+    # Alertmanager serves plain HTTP on port 9093 (no mTLS). Caddy is on the
+    # obs network and can reach it directly. forward_auth gate mirrors the
+    # grafana/loki/prometheus pattern (verify-admin). @lenient_subapp CSP covers
+    # this path; X-Frame-Options + CSP stripped from upstream so same-origin
+    # iframe embedding from /admin/ works.
+    handle_path /admin/alertmanager/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy http://alertmanager:9093 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+
     # ── Static assets — public, no auth required (CSS/JS for admin UI) ────
     handle /static/* {
         reverse_proxy https://backoffice:8443 {

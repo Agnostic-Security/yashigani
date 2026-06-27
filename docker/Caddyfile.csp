@@ -22,13 +22,16 @@
 #  @redoc_ui        — ReDoc API docs. Needs worker-src blob: + unsafe-inline
 #                     style-src (Shadow DOM inline CSS). Scoped narrowly.
 #
-#  @strict_legacy   — Existing admin plane (vanilla JS until Phase 6 rebuild).
-#                     NO Trusted Types — dashboard.js / runtime-settings.js /
-#                     login.js etc. use innerHTML; TT is added in Phase 6 only.
+#  @strict_legacy   — Legacy admin plane (/admin-legacy/) + all /admin/* API
+#                     sub-paths + /auth/*, /static/*, etc. NO Trusted Types —
+#                     dashboard.js / runtime-settings.js / login.js use innerHTML.
+#                     Excludes /admin/ (shell, now Lit → @strict_tt), /admin4/
+#                     (TT alias → @strict_tt), and /admin/alertmanager/* (subapp).
 #
-#  @strict_tt       — 4.0 first-party user paths (Lit-based, no innerHTML).
-#                     Full strict policy + Trusted Types (three policies:
-#                     yashigani-render, dompurify, lit-html — Phase-1 fix).
+#  @strict_tt       — 4.0 first-party paths (Lit-based, no innerHTML).
+#                     Now includes /admin/ (Phase 6 flip: Lit admin is primary)
+#                     and /admin4/ (redirect alias). Full strict policy + Trusted
+#                     Types (yashigani-render, dompurify, lit-html, drawflow-label).
 #                     Add every new 4.0 user-facing route prefix here before
 #                     deployment.
 
@@ -36,19 +39,27 @@
     # Lenient exception 1: observability sub-apps (third-party SPAs)
     # /admin/loki/* — Loki query API (JSON, no UI); added so it is excluded from
     # the @strict_legacy matcher and does not receive an HTML-page CSP.
-    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
+    # /admin/alertmanager/* — Alertmanager UI (plain HTTP upstream; same lenient
+    # treatment as Grafana/Prometheus — third-party SPA cannot be made strict-CSP).
+    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
 
     # Lenient exception 2: ReDoc API docs
     @redoc_ui path /admin/api-redoc /redoc
 
-    # Strict legacy: existing admin plane (vanilla JS — no TT until Phase 6)
+    # Strict legacy: /admin-legacy/ (old vanilla-JS admin, fallback) + all
+    # /admin/* sub-paths (API endpoints, login page, etc.). NO Trusted Types.
+    # Excludes: /admin/ and /admin4/ (shell pages → @strict_tt); the
+    # observability sub-apps (grafana/wazuh/prometheus/loki/alertmanager →
+    # @lenient_subapp); /admin/api-redoc + /redoc → @redoc_ui.
     @strict_legacy {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/*
+        path /admin/* /admin-legacy/ /admin-legacy/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/ /admin4/
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
         not path /admin/api-redoc /redoc
     }
 
-    # Strict + Trusted Types: 4.0 first-party user paths
+    # Strict + Trusted Types: 4.0 first-party paths — now includes /admin/ and
+    # /admin4/ (Phase 6 flip: Lit admin is primary at /admin/; /admin4/ redirects).
     # Four named TT policies (Phase-1 + Phase-4 Drawflow vendoring):
     #   yashigani-render — our sole sanitisation sink (ui4/core/safe-render.js)
     #   dompurify        — DOMPurify's RETURN_TRUSTED_TYPE internal policy (purify.es.mjs)
@@ -63,7 +74,7 @@
     # on unreviewed DOM writes.
     # connect-src 'self' covers SSE (HTTPS fetch). If chat transport moves to
     # WebSocket, add wss://{$YASHIGANI_TLS_DOMAIN} here (OQ-1 resolution needed).
-    @strict_tt path /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
+    @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
 
     # frame-src 'self': explicit (default-src 'self' already implies it, but
     # stated for clarity — admin pages iframe /admin/grafana/, /admin/wazuh/,
