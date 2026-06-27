@@ -111,6 +111,8 @@ from yashigani.backoffice.routes import (
     user_conversations_router,
     # 4.0 Workflow run history (wf-exec)
     user_workflows_router,
+    # 4.0 Admin workflow-oversight (cross-user read + disable)
+    admin_workflows_router,
 )
 
 
@@ -1368,6 +1370,11 @@ def create_backoffice_app() -> FastAPI:
     # GET /user/workflows/{id}/runs. require_user_session + BOLA (EU AI Act Art.14 HITL);
     # runs read the WorkflowScheduler's Redis DB 6 (503 if scheduler unavailable).
     app.include_router(user_workflows_router, tags=["user-workflows"])
+
+    # 4.0 admin workflow-oversight — GET/PATCH /admin/workflows/{wf_id}
+    # Cross-user read + disable.  AdminSession on GETs; StepUpAdminSession on PATCH.
+    # EU AI Act Art.14 HITL: disabling a governed workflow is a consequential action.
+    app.include_router(admin_workflows_router, tags=["admin-workflows"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:
