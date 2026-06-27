@@ -411,6 +411,83 @@ async def user_budget(session: UserSession):
         }
 
 
+@router.get("/user/models")
+async def user_models(session: UserSession):
+    """
+    Return the models and agents available to the calling user.
+
+    Resolution logic (Track B1 / effective-allowed-models):
+      1. Resolve the caller's Yashigani identity from the identity registry
+         (tries account_id directly, then slug derived from email local-part).
+      2. Call resolve_effective_allowed_models with the live allocation + alias
+         stores to compute the caller's effective allowlist.
+      3. Filter the alias store to aliases NOT denied for this caller.
+      4. Append active agents from the registry (user-visible fields only).
+
+    Returns:
+      ``{"models": [{alias, provider, model, force_local}], "agents": [...]}``
+
+    Falls back gracefully at every step: missing stores / identity / registry
+    return an empty list rather than raising, so the user UI still renders.
+    """
+    from yashigani.models.effective import resolve_effective_allowed_models
+
+    alias_store = backoffice_state.model_alias_store
+    alloc_store = backoffice_state.model_allocation_store
+    agent_registry = backoffice_state.agent_registry
+
+    # --- Resolve identity (best-effort; None → unrestricted) ---
+    identity: Optional[dict] = None
+    id_registry = backoffice_state.identity_registry
+    if id_registry is not None:
+        try:
+            identity = id_registry.get(session.account_id)
+            if identity is None and "@" in session.account_id:
+                slug = session.account_id.split("@")[0].lower()
+                identity = id_registry.get_by_slug(slug)
+        except Exception as exc:
+            logger.debug("user_models: identity resolution failed: %s", exc)
+
+    # --- Effective model allowlist ---
+    try:
+        effective = resolve_effective_allowed_models(identity, alloc_store, alias_store)
+    except Exception as exc:
+        logger.warning("user_models: effective model resolution failed: %s", exc)
+        from yashigani.models.effective import EffectiveModels
+        effective = EffectiveModels()
+
+    # --- Build model list ---
+    models: list[dict] = []
+    if alias_store is not None:
+        try:
+            for alias_name, alias in alias_store.list_all().items():
+                if not effective.is_model_denied(alias_name):
+                    models.append({
+                        "alias": alias_name,
+                        "provider": getattr(alias, "provider", ""),
+                        "model": getattr(alias, "model", ""),
+                        "force_local": bool(getattr(alias, "force_local", False)),
+                    })
+        except Exception as exc:
+            logger.warning("user_models: alias store list failed: %s", exc)
+
+    # --- Active agents (user-visible fields only) ---
+    agents: list[dict] = []
+    if agent_registry is not None:
+        try:
+            for a in agent_registry.list_all():
+                if a.get("status") == "active":
+                    agents.append({
+                        "agent_id": a.get("agent_id", ""),
+                        "name": a.get("name", ""),
+                        "protocol": a.get("protocol", "openai"),
+                    })
+        except Exception as exc:
+            logger.warning("user_models: agent registry list failed: %s", exc)
+
+    return {"models": models, "agents": agents}
+
+
 @router.get("/user/memory")
 async def user_memory(session: UserSession):
     """
