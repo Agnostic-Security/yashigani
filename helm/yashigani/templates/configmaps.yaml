@@ -476,7 +476,7 @@ data:
         not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
         not path /admin/api-redoc /redoc
       }
-      @strict_tt path /chat/* /user/* /flow/*
+      @strict_tt path /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
       header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
       header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
@@ -642,55 +642,25 @@ data:
           import inject-caddy-verified
         }
       }
-      # ── Open WebUI — catch-all (LAURA-V231-010 fix) ──────────────────────────
-      # Strip any externally-supplied identity headers before auth runs.
-      # Prevents X-Forwarded-User spoofing: an unauthenticated client must
-      # not be able to forge the trusted-email header open-webui consumes.
-      # Mirrors docker/Caddyfile.selfsigned catch-all handle block exactly.
+      # ── 4.0 catch-all — ui4 portal redirect + backoffice proxy ─────────────
+      # OWUI removed in 4.0. / → /chat; unmatched paths → backoffice (ui4).
+      # Backoffice owns its own session auth — no forward_auth needed here.
+      # Mirrors docker/Caddyfile.{selfsigned,ca,acme} catch-all handle block.
       handle {
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
-        # Track C (F-B): also strip OWUI forwarded-user headers on the public
-        # path so a browser cannot smuggle them to OWUI (which would re-emit
-        # them upstream). Only OWUI's own authenticated session sets the user.
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
-        # Strip forged orchestration-context headers before they reach OWUI
-        # (which re-emits to gateway:8081 on the internal mesh). Same anti-spoof
-        # rationale as the OWUI user headers above — only the internal mesh path
-        # may carry X-Yashigani-Orchestration-*.
         import strip-orchestration-headers
-
-        # Forward auth: validate session cookie against backoffice.
-        # On 200: copies X-Forwarded-User/Name/Email from auth response.
-        # On 401: redirect to login page.
-        forward_auth https://yashigani-backoffice:8443 {
-          {{- if .Values.mtls.enabled }}
-          import internal-mtls-backoffice
-          {{- end }}
-          import inject-caddy-verified
-          uri /auth/verify
-          copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-          @unauthorized status 401
-          handle_response @unauthorized {
-            redir * /login?next={http.request.uri} 302
-          }
+        @root_path path /
+        handle @root_path {
+          redir * /chat 302
         }
-
-        # inject-caddy-verified: open-webui does not validate the header but
-        # we inject it uniformly across all reverse_proxy blocks. Auth is
-        # enforced by the forward_auth block above. Closes LU-231-10-A.
-        reverse_proxy open-webui:8080 {
-          import inject-caddy-verified
-          header_up X-Forwarded-Proto https
-          header_up X-Real-IP {remote_host}
-          header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-          header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-          header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+        handle {
+          reverse_proxy https://yashigani-backoffice:8443 {
+            {{- if .Values.mtls.enabled }}
+            import internal-mtls-backoffice
+            {{- end }}
+            import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+          }
         }
       }
     }

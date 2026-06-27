@@ -545,27 +545,9 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── /app/webui — Open WebUI user path (Phase 2 / 2.25.5-auth-ingress) ────
-    #
-    # Phase 2: OWUI is served under /app/webui with WEBUI_URL=/app/webui so
-    # SvelteKit assets and API calls are all relative to that prefix.
-    # forward_auth → /auth/verify-user gates the path (user sessions only;
-    # admin sessions get 403 → redirected to /admin/).
-    #
-    # WebSocket (socket.io): OWUI streams tokens over a socket.io WS at
-    # /app/webui/ws/socket.io/.  The @owui_ws matcher handles the 101 upgrade
-    # separately to avoid the forward_auth handle_response wrapping breaking the
-    # upgrade — same fix as the legacy root-catch-all WS handler (F-WS fix, YSG-2253).
-    # Auth subrequest strips Connection/Upgrade so /auth/verify-user sees a
-    # plain GET; the main reverse_proxy retains the original upgrade headers.
-    #
-    # OWUI is plain HTTP on caddy_internal (no mTLS — OWUI is the upstream
-    # Open WebUI image; it does not terminate mTLS).  Do NOT use internal-mtls
-    # here.  inject-caddy-verified is applied for header uniformity but OWUI
-    # does not validate it.
+    # ── /app/webui — legacy OWUI path (4.0: removed, redirect to /chat) ──────
     handle /app/webui* {
-        # OWUI served at ROOT (root catch-all). Back-compat redirect.
-        redir * / 302
+        redir * /chat 302
     }
 
     handle /metrics-federate* {
@@ -581,105 +563,29 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
+    # ── Root catch-all — 4.0: portal redirect + ui4 proxy ────────────────────
     #
-    # Phase 2: OWUI has moved off root onto /app/webui.  Root (/) is now the
-    # portal: redirect unauthenticated visitors to /login and authenticated
-    # users to their role-appropriate surface via /login (which checks the
-    # session and issues a role-based redirect).  Using /login as the target
-    # is safe — if the user is already logged in, /login will detect the
-    # session and redirect them to /admin/ or /app/webui without re-prompting
-    # for credentials.
+    # OWUI removed in 4.0. ui4 (Lit-based chat/agents/builder/workflows) is
+    # served directly by the backoffice. Backoffice enforces its own session
+    # checks on all ui4 routes — no Caddy-level forward_auth required here.
     #
-    # This replaces the former OWUI catch-all (which owned root and caused
-    # the conflated-population + no-working-logout findings).  The explicit
-    # /app/webui* handle above owns all OWUI traffic; this catch-all is now
-    # purely a portal redirect guard.
+    # / → /chat (302, back-compat for existing bookmarks)
+    # All other unmatched paths → backoffice (returns 404 for unknown routes).
     handle {
-
-        # Strip anti-spoof headers before auth subrequest.
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
         import strip-orchestration-headers
 
-        # ── OWUI socket.io WebSocket (Phase 2 / F-WS fix pattern) ──────────
-        # Handles Connection: Upgrade + Upgrade: websocket requests under
-        # /ws/*.  The forward_auth sub-request has the upgrade headers
-        # stripped so /auth/verify-user sees a plain GET and returns a clean
-        # status.  The main reverse_proxy keeps the original upgrade headers and
-        # performs the real 101 to open-webui:8080.
-        @owui_ws {
-            header Connection *Upgrade*
-            header Upgrade websocket
-            path /ws/*
-        }
-        handle @owui_ws {
-            forward_auth https://backoffice:8443 {
-            import internal-mtls
-            import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-                # Strip upgrade headers from the auth subrequest only.
-                header_up -Connection
-                header_up -Upgrade
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    respond 401
-                }
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    respond 403
-                }
-            }
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
-                header_up X-Forwarded-Proto https
-                header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
-            }
+        @root_path path /
+        handle @root_path {
+            redir * /chat 302
         }
 
-        # ── OWUI HTTP (non-WS) ───────────────────────────────────────────────
         handle {
-            forward_auth https://backoffice:8443 {
+            reverse_proxy https://backoffice:8443 {
+                header_down -Content-Security-Policy  # single CSP at edge
             import internal-mtls
             import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    # User not logged in → redirect to /login, preserving next=
-                    redir * /login?next={http.request.uri} 302
-                }
-
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    # Admin trying user path → send to admin console (NOT login page).
-                    # This is a clear authz boundary, not an auth failure.
-                    redir * /admin/ 302
-                }
-            }
-
-            # Phase 2: proxy to open-webui:8080 (plain HTTP, no mTLS).
-            # OWUI is configured with WEBUI_URL=/app/webui so asset paths and
-            # API calls resolve under the subpath.  inject-caddy-verified is
-            # applied for uniformity; OWUI does not validate it.
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
                 header_up X-Forwarded-Proto https
                 header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
     }

@@ -191,7 +191,7 @@ apply_egress_rules() {
     log "egress allow: DNS → 127.0.0.11:53 (Docker embedded resolver, IPv4 only)"
 
     # ── Step 5: Allow Docker bridge subnets (IPv4 only) ────────────────────
-    # Caddy proxies to in-mesh services (gateway, backoffice, open-webui,
+    # Caddy proxies to in-mesh services (gateway, backoffice,
     # grafana, prometheus) on Docker bridge networks. We enumerate IPv4
     # subnets from the kernel routing table. IPv6 routes (if any — `ip -6
     # route show`) are deliberately ignored; compose networks are configured

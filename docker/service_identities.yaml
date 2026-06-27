@@ -194,13 +194,7 @@ services:
     revoked: false
 
   # ── Optional / profile-gated services ─────────────────────────────────────
-  - name: open-webui
-    dns_sans: [open-webui, open-webui.internal, yashigani-open-webui]
-    spiffe_id: spiffe://yashigani.internal/open-webui
-    purpose: "User-facing chat UI (profile: openwebui)"
-    mtls_capable: true
-    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
-    revoked: false
+  # open-webui removed in 4.0 — ui4 (first-party Lit SPA) served by backoffice
 
   - name: langflow
     dns_sans: [langflow, langflow.internal, yashigani-langflow]

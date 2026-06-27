@@ -231,22 +231,6 @@ spec:
             - name: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES
               value: {{ .Values.backoffice.agentUpstreamHostnames | join "," | quote }}
             {{- end }}
-            - name: OWUI_API_URL
-              value: "http://open-webui:8080"
-            # B12 fix (TOM-K8S-001): OWUI_SECRET_KEY was present in the open-webui
-            # Secret (key: secret_key) but was never injected into the backoffice
-            # container. Without it, agent provisioning to Open WebUI silently fails
-            # in K8s because the backoffice cannot authenticate to the OWUI API.
-            # Compose parity: install.sh writes OWUI_SECRET_KEY into .env for the
-            # backoffice container. This secretKeyRef is the K8s equivalent.
-            {{- if .Values.openWebui.enabled }}
-            - name: OWUI_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.openWebui.existingSecretName | default "yashigani-open-webui-secrets" }}
-                  key: {{ .Values.openWebui.env.webuiSecretKeySecretKey | default "secret_key" }}
-                  optional: true
-            {{- end }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:

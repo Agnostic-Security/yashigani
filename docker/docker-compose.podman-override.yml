@@ -142,10 +142,6 @@ services:
     security_opt:
       - label=disable
 
-  open-webui:
-    security_opt:
-      - label=disable
-
   budget-redis:
     security_opt:
       - label=disable
