@@ -420,11 +420,17 @@ Hiring: https://agnosticsec.com/careers
     # retro #83: Grafana now serves HTTPS on port 3443 with mTLS (Pattern B).
     # Caddy presents caddy_client.crt to Grafana; Grafana verifies via
     # ca_intermediate.crt. The forward_auth check still applies (admin only).
-    handle_path /admin/grafana/* {
+    # Parity with Caddyfile.selfsigned: handle (no strip) + verify-admin + misroute fix.
+    handle /admin/grafana/* {
+        # Normalise misrouted asset requests: browsers may resolve relative asset
+        # refs against the dashboard path (e.g. /admin/grafana/d/x/public/build/…).
+        # Strip the spurious /d/<uid>[/<slug>]/ prefix back to the canonical path.
+        @grafana_misroute path_regexp gmis ^/admin/grafana/d/(?:[^/]+/)*?((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login?next=/admin/grafana/ 302
@@ -434,21 +440,52 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+            # Strip Grafana's own X-Frame-Options / CSP so the edge CSP
+            # (@lenient_subapp) governs and same-origin iframe embedding works.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
         }
     }
 
     # ── Wazuh Dashboard — admin-authenticated access via /admin/wazuh/* ────
-    handle_path /admin/wazuh/* {
+    # Parity with Caddyfile.selfsigned: handle (no strip) + verify-admin.
+    # Wazuh dashboard must have server.basePath=/admin/wazuh + rewriteBasePath=true.
+    handle /admin/wazuh/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
             }
         }
         reverse_proxy wazuh-dashboard:5601 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            # Strip Wazuh Dashboard's own X-Frame-Options / CSP so
+            # same-origin iframe embedding works from /admin/*.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+
+    # ── Loki — admin-authenticated access via /admin/loki/* ──────────────
+    # Exposes Loki's HTTP query API for direct admin use (primary consumer: Grafana).
+    # Loki has no UI; @lenient_subapp CSP covers this path.
+    # Loki serves HTTPS on :3100 with mTLS (Pattern B).
+    handle /admin/loki/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy https://loki:3100 {
+            import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
@@ -460,7 +497,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
