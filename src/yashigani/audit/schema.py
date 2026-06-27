@@ -386,6 +386,20 @@ class EventType(str, Enum):
     WORKFLOW_GENERATION_REQUESTED = "WORKFLOW_GENERATION_REQUESTED"
     WORKFLOW_GENERATED = "WORKFLOW_GENERATED"
     WORKFLOW_COMMITTED = "WORKFLOW_COMMITTED"
+    # 4.0 — Workflow scheduler + governed execution (feat/4.0-wf-exec)
+    # Every event routes to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14.
+    # ---------------------------------------------------------------------------
+    # A committed user workflow was triggered by the scheduler.
+    WORKFLOW_RUN_STARTED = "WORKFLOW_RUN_STARTED"
+    # One step completed cleanly (OPA allow + inspection CLEAN).
+    WORKFLOW_STEP_COMPLETED = "WORKFLOW_STEP_COMPLETED"
+    # One step was denied by OPA or response inspection (run halts fail-closed).
+    WORKFLOW_STEP_DENIED = "WORKFLOW_STEP_DENIED"
+    # All steps completed without a deny — run finished.
+    WORKFLOW_RUN_COMPLETED = "WORKFLOW_RUN_COMPLETED"
+    # Run aborted: a step was denied, raised an exception, or the actor was missing.
+    WORKFLOW_RUN_FAILED = "WORKFLOW_RUN_FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -3448,3 +3462,104 @@ class WorkflowCommittedEvent(AuditEvent):
     step_count: int = 0                 # number of steps
     schedule_kind: str = "none"         # "interval" | "cron" | "none"
     human_decided: bool = True          # always True — immutable (EU AI Act)
+# ---------------------------------------------------------------------------
+# 4.0 — Workflow scheduler + governed execution (feat/4.0-wf-exec)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkflowRunStartedEvent(AuditEvent):
+    """Emitted when the scheduler triggers a committed workflow run.
+
+    Records the workflow identity, owner, step count, schedule kind, and
+    trigger source.  Anchors the run on the tamper-evident hash chain.
+
+    NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14.
+    """
+
+    event_type: str = EventType.WORKFLOW_RUN_STARTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""           # stable workflow identifier
+    run_id: str = ""                # per-run UUID
+    identity_id: str = ""          # workflow owner's identity_id
+    session_id: str = ""           # = identity_id (queryable principal)
+    step_count: int = 0            # total steps in this workflow
+    schedule_kind: str = ""        # "interval" | "cron"
+    trigger_kind: str = "scheduler"  # "scheduler" | "manual"
+
+
+@dataclass
+class WorkflowStepCompletedEvent(AuditEvent):
+    """Emitted when one workflow step completes cleanly.
+
+    Records the adjudication triple so the audit chain proves every hop was
+    OPA-gated and inspection-cleared (OPA-every-hop invariant).
+    """
+
+    event_type: str = EventType.WORKFLOW_STEP_COMPLETED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""           # workflow owner
+    session_id: str = ""            # = identity_id
+    step_index: int = 0
+    actor: str = ""                 # @-handle (e.g. "@Mimi")
+    ingress_opa: str = ""           # "allow" | "deny:<reason>"
+    egress_opa: str = ""
+    inspection_verdict: str = ""    # CLEAN | FLAGGED | skipped
+
+
+@dataclass
+class WorkflowStepDeniedEvent(AuditEvent):
+    """Emitted when a workflow step is denied by OPA or response inspection.
+
+    The run halts immediately (fail-closed).  Raw step output is NEVER stored.
+    This is the workflow-layer analogue of OrchestrationBlockedStepEvent.
+    """
+
+    event_type: str = EventType.WORKFLOW_STEP_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    step_index: int = 0
+    actor: str = ""
+    block_source: str = ""          # "opa_ingress" | "opa_egress" | "response_inspection" | ...
+    ingress_opa: str = ""
+    egress_opa: str = ""
+    inspection_verdict: str = ""
+
+
+@dataclass
+class WorkflowRunCompletedEvent(AuditEvent):
+    """Emitted when all workflow steps complete without a deny."""
+
+    event_type: str = EventType.WORKFLOW_RUN_COMPLETED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    steps_completed: int = 0
+    steps_denied: int = 0
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class WorkflowRunFailedEvent(AuditEvent):
+    """Emitted when a workflow run is aborted (denied step, exception, missing actor)."""
+
+    event_type: str = EventType.WORKFLOW_RUN_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    reason: str = ""                # e.g. "step_0_denied" | "step_1_error"
+    elapsed_s: float = 0.0

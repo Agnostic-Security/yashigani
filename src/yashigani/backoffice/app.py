@@ -109,6 +109,8 @@ from yashigani.backoffice.routes import (
     user_ui_router,
     # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
     user_conversations_router,
+    # 4.0 Workflow run history (wf-exec)
+    user_workflows_router,
 )
 
 
@@ -1297,6 +1299,10 @@ def create_backoffice_app() -> FastAPI:
     # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced via
     # account_id scoping on every per-conversation query).
     app.include_router(user_conversations_router, tags=["user-conversations"])
+
+    # 4.0 Workflow run history — GET /user/workflows/{id}/runs (BOLA-enforced).
+    # Reads from the WorkflowScheduler's Redis DB 6; 503 if scheduler unavailable.
+    app.include_router(user_workflows_router, tags=["user-workflows"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:
