@@ -62,6 +62,8 @@ from yashigani.backoffice.routes.rbac_sources import router as rbac_sources_rout
 from yashigani.backoffice.routes.version_check import router as version_check_router
 # fix/medlow-findings — cloud provider API key management
 from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
+# 3.0 — admin-configurable browser Permissions-Policy
+from yashigani.backoffice.routes.capability_policy import router as capability_policy_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -112,4 +114,6 @@ __all__ = [
     "version_check_router",
     # fix/medlow-findings — cloud provider API key management
     "cloud_keys_router",
+    # 3.0 — browser Permissions-Policy
+    "capability_policy_router",
 ]

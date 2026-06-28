@@ -162,7 +162,7 @@ def _sync_app_role_password(conn, logger) -> None:
     # use psycopg2 sql.Literal for correct, injection-safe quoting of the literal.
     try:
         with conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosem: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- DDL utility statement; role name is a static literal, password is quoted via psycopg2 sql.Literal (not user input, read from a secrets file)
                 sql.SQL("ALTER ROLE yashigani_app WITH PASSWORD {}").format(sql.Literal(app_pw))
             )
         logger.info(

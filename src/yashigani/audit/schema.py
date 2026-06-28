@@ -338,6 +338,14 @@ class EventType(str, Enum):
     # a truncated, sanitised error_type label.
     # OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
     AGENT_UPSTREAM_UNREACHABLE = "AGENT_UPSTREAM_UNREACHABLE"
+    # 3.0 — Admin-configurable browser Permissions-Policy (capability-policy feature).
+    # CAPABILITY_POLICY_CHANGED: emitted on every create/update/delete of a
+    # capability-policy setting (global / per-group / per-user).  Security-control
+    # changes MUST appear in the tamper-evident SHA-384 hash chain + signed Merkle
+    # checkpoint ledger.  scope identifies which tier changed ("global" / "group" /
+    # "user"); scope_id carries the group_id or email (empty for global).
+    # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    CAPABILITY_POLICY_CHANGED = "CAPABILITY_POLICY_CHANGED"
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +839,39 @@ class RBACPolicyPushEvent(AuditEvent):
     admin_account: str = ""
     outcome: str = "success"  # success | failure
     error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Capability Policy events (3.0 — browser Permissions-Policy)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CapabilityPolicyChangedEvent(AuditEvent):
+    """
+    Written on every create/update/delete of a capability-policy setting.
+
+    Security invariants:
+    - The policy value IS recorded (it is a non-secret security configuration,
+      not a credential); this matches the RBAC config audit pattern.
+    - masking_applied=True suppresses the record in lower-assurance sinks.
+    - scope: "org" | "group" | "user"
+    - scope_id: org_id (for org scope), group_id (for group scope), or email
+      (for user scope).
+    - change_type: "set" | "deleted"
+    - capabilities_changed: list of capability names that were affected.
+
+    ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.CAPABILITY_POLICY_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    scope: str = ""         # "org" | "group" | "user"
+    scope_id: str = ""      # org_id, group_id, or email (depending on scope)
+    change_type: str = ""   # "set" | "deleted"
+    capabilities_changed: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

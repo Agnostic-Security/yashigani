@@ -139,6 +139,7 @@ def create_gateway_app(
     principal_signer=None,    # #47/G-NEW-5 — OrchestrationPrincipalSigner | None
     principal_verifier=None,  # #47/G-NEW-5 — OrchestrationPrincipalVerifier | None
     principal_tenant_id="default",  # #47/G-NEW-5 — tenant for caller SPIFFE derivation
+    capability_policy_store=None,  # 3.0 — CapabilityPolicyStore | None
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -172,6 +173,7 @@ def create_gateway_app(
         "principal_signer": principal_signer,
         "principal_verifier": principal_verifier,
         "principal_tenant_id": principal_tenant_id,
+        "capability_policy_store": capability_policy_store,  # 3.0 — Permissions-Policy
         "http_client": None,
     }
 
@@ -298,6 +300,31 @@ def create_gateway_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        # ZAP 10015/10049: Dynamic responses (API endpoints, auth flows) must not
+        # be stored in any cache.  Static assets under /static/ (Swagger UI,
+        # fingerprinted resources) are intentionally excluded — they are safe to
+        # cache.
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        # Permissions-Policy: resolve per user identity (3.0).
+        # The gateway receives the user's email via x-yashigani-user-id (set by
+        # Caddy forward_auth after session validation).  Falls back silently if
+        # the store is not wired (dev/test without Redis).
+        _cap_store = _state.get("capability_policy_store")
+        if _cap_store is not None:
+            try:
+                _user_email = request.headers.get("x-yashigani-user-id", "") or None
+                from yashigani.capability_policy.resolver import resolve_policy as _resolve_cap
+                from yashigani.capability_policy.header import render_permissions_policy as _render_pp
+                _resolved = _resolve_cap(
+                    _user_email,
+                    _state.get("rbac_store"),
+                    _cap_store,
+                )
+                response.headers["Permissions-Policy"] = _render_pp(_resolved)
+            except Exception as _pp_exc:
+                logger.debug("cap_policy: gateway security_headers failed: %s", _pp_exc)
         return response
 
     # Internal health check — used by Caddy and container health probe

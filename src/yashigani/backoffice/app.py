@@ -105,6 +105,8 @@ from yashigani.backoffice.routes import (
     rbac_sources_router,
     version_check_router,
     cloud_keys_router,
+    # 3.0 — admin-configurable browser Permissions-Policy
+    capability_policy_router,
 )
 
 
@@ -844,6 +846,13 @@ def create_backoffice_app() -> FastAPI:
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Referrer-Policy"] = "no-referrer"
+        # ZAP 10015/10049: Authenticated/sensitive dynamic responses must not be
+        # stored in any cache.  Fingerprinted static assets (/static/*) are
+        # intentionally excluded — they carry content-hashed filenames and are
+        # safe to cache.
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
         # CSP: strict for all pages — no inline scripts or styles allowed.
         # ASVS 3.4.3: object-src 'none' + base-uri 'none'; 3.4.7: report-uri.
         # N2 (2.25.5): some routes (ReDoc) need a scoped CSP that adds
@@ -854,6 +863,32 @@ def create_backoffice_app() -> FastAPI:
         _strict_csp = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; report-uri /admin/csp-report; report-to default"
         if "content-security-policy" not in response.headers:
             response.headers["Content-Security-Policy"] = _strict_csp
+        # Permissions-Policy: resolve per admin identity (3.0).
+        # Resolve from the capability policy store; fall back silently if the
+        # store is not yet wired (e.g. dev/test without Redis).
+        from yashigani.backoffice.state import backoffice_state  # noqa: PLC0415
+        _cap_store = getattr(backoffice_state, "capability_policy_store", None)
+        if _cap_store is not None:
+            try:
+                _pp_email: str | None = None
+                _session_token = request.cookies.get("__Host-yashigani_admin_session")
+                if _session_token and backoffice_state.session_store is not None:
+                    _sess = backoffice_state.session_store.get(_session_token)
+                    if _sess is not None:
+                        _pp_email = _sess.account_id
+                from yashigani.capability_policy.resolver import resolve_policy as _resolve_cap
+                from yashigani.capability_policy.header import render_permissions_policy as _render_pp
+                _resolved = _resolve_cap(
+                    _pp_email,
+                    backoffice_state.rbac_store,
+                    _cap_store,
+                )
+                response.headers["Permissions-Policy"] = _render_pp(_resolved)
+            except Exception as _pp_exc:
+                import logging as _pplog
+                _pplog.getLogger(__name__).debug(
+                    "cap_policy: backoffice security_headers failed: %s", _pp_exc
+                )
         return response
 
     # Per-endpoint body-size limits (ASVS 4.3.1).
@@ -880,6 +915,7 @@ def create_backoffice_app() -> FastAPI:
         ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
         ("/api/v1/admin/pki", 256),        # PKI rotate body (service name in URL, no body)
         ("/admin/ratelimit", 8 * 1024),
+        ("/admin/api/capability-policy", 8 * 1024),
         ("/admin/rbac", 32 * 1024),
         ("/admin/alerts", 32 * 1024),
         ("/admin/budget", 16 * 1024),
@@ -1218,6 +1254,13 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
     # fix/medlow-findings — cloud provider API key management (KMS-backed)
     app.include_router(cloud_keys_router, tags=["cloud-keys"])
+
+    # 3.0 — admin-configurable browser Permissions-Policy
+    app.include_router(
+        capability_policy_router,
+        prefix="/admin/api/capability-policy",
+        tags=["capability-policy"],
+    )
 
     # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
     # OpenAPI schema and annotate all /scim/v2/* paths with the scheme reference.

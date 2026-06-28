@@ -191,6 +191,7 @@ def _build_app(mesh_mode: bool = False):
     rbac_store = None
     agent_registry = None
     redis_client_rbac = None
+    capability_policy_store = None  # 3.0 — browser Permissions-Policy
     try:
         import redis as _redis
         redis_client_rbac = _redis.from_url(_gw_redis_url(3), decode_responses=False)
@@ -201,6 +202,17 @@ def _build_app(mesh_mode: bool = False):
         logger.info(
             "Gateway agent registry ready: %d agent(s)",
             agent_registry.count("all"),
+        )
+        # 3.0 — Capability policy store shares Redis db/3 (key prefix cap_policy:*)
+        from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
+        _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+        capability_policy_store = _CapPolStore(
+            redis_client=redis_client_rbac,
+            default_org_id=_cap_pol_org_id,
+        )
+        logger.info(
+            "Gateway capability policy store ready (Permissions-Policy, 3.0, org=%s)",
+            _cap_pol_org_id,
         )
     except Exception as exc:
         logger.warning(
@@ -891,6 +903,7 @@ def _build_app(mesh_mode: bool = False):
         principal_signer=_principal_signer,
         principal_verifier=_principal_verifier,
         principal_tenant_id=_principal_tenant_id,
+        capability_policy_store=capability_policy_store,  # 3.0
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 

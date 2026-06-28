@@ -195,6 +195,7 @@ def _bootstrap():
     document_policy_store = None
     document_set_store = None
     envelope_pending_store = None    # 3.0 — capability-envelope re-approval queue
+    _cap_policy_store = None         # 3.0 — browser Permissions-Policy
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -278,6 +279,17 @@ def _bootstrap():
                 len(envelope_pending_store.list_for_tenant(
                     os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
                 )),
+            )
+            # 3.0 — browser Permissions-Policy store (Redis db/3, prefix cap_policy:*)
+            from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
+            _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+            _cap_policy_store = _CapPolStore(
+                redis_client=redis_rbac_client,
+                default_org_id=_cap_pol_org_id,
+            )
+            logger.info(
+                "Capability policy store initialised (browser Permissions-Policy, 3.0, org=%s)",
+                _cap_pol_org_id,
             )
             break  # success
         except Exception as exc:
@@ -563,6 +575,7 @@ def _bootstrap():
     backoffice_state.document_policy_store = document_policy_store
     backoffice_state.document_set_store = document_set_store
     backoffice_state.envelope_pending_store = envelope_pending_store
+    backoffice_state.capability_policy_store = _cap_policy_store  # 3.0 — Permissions-Policy
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
     backoffice_state.opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")

@@ -70,6 +70,8 @@ function showPage(name, triggerEl) {
     // MCP capability-envelope re-approvals — loadEnvelopes is in envelope_reapproval.js (defer).
     if (name === 'envelopes' && typeof window.loadEnvelopes === 'function') window.loadEnvelopes();
     if (name === 'rbac') { loadGroups(); loadRbacSources(); }  // R13: populate path/method catalogues
+    // 3.0 — Permissions-Policy admin page — loadCapabilityPolicy is in capability-policy.js (defer).
+    if (name === 'capability-policy' && typeof window.loadCapabilityPolicy === 'function') window.loadCapabilityPolicy();
 }
 
 // ---------------------------------------------------------------------------
@@ -3211,6 +3213,30 @@ document.addEventListener('click', function(e) {
             break;
         case 'acceptGeneratedPattern':
             acceptGeneratedPattern();
+            break;
+
+        // 3.0 — Capability Policy (browser Permissions-Policy) actions
+        // All functions defined in capability-policy.js (loaded defer).
+        case 'capPolLoad':
+            if (typeof capPolLoad === 'function') capPolLoad();
+            break;
+        case 'capPolSave':
+            if (typeof capPolSave === 'function') capPolSave();
+            break;
+        case 'capPolDelete':
+            if (typeof capPolDelete === 'function') capPolDelete();
+            break;
+        case 'capPolEffective':
+            if (typeof capPolEffective === 'function') capPolEffective();
+            break;
+        case 'capPolAddOrigin':
+            if (typeof capPolAddOrigin === 'function') capPolAddOrigin(actionEl.getAttribute('data-cap'));
+            break;
+        case 'capPolRemoveOrigin':
+            if (typeof capPolRemoveOrigin === 'function') capPolRemoveOrigin(
+                actionEl.getAttribute('data-cap'),
+                actionEl.getAttribute('data-origin')
+            );
             break;
     }
 });

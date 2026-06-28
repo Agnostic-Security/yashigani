@@ -194,6 +194,33 @@ tr:hover { background: #f8fafc; }
 .pki-rotate-result { font-size: 0.85rem; min-height: 1.2em; margin-bottom: 8px; display: none; }
 .pki-chain-detail { display: none; }
 .pki-chain-table { font-size: 0.82rem; width: 100%; border-collapse: collapse; }
+/* PKI JS-generated HTML classes — ZAP 10015/10049 CSP inline-style fix.
+   pki.js dynamically builds HTML via innerHTML; these classes replace every
+   style="..." attribute so the page is compatible with style-src 'self'. */
+.pki-err-text { color: #ef4444; }
+.pki-muted-text { color: #64748b; }
+.pki-camode-banner { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; padding: 12px 14px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; }
+.pki-camode-label { font-size: 0.75rem; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; }
+.pki-camode-value { font-size: 1rem; color: #1e3a8a; }
+.pki-camode-issuer { font-size: 0.78rem; color: #64748b; margin-left: auto; }
+.pki-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.pki-thead-row { background: #f1f5f9; text-align: left; }
+.pki-th { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
+.pki-row { border-bottom: 1px solid #f1f5f9; }
+.pki-td-mono { padding: 8px 12px; font-family: monospace; }
+.pki-td { padding: 8px 12px; }
+.pki-td-exp { padding: 8px 12px; font-size: 0.8rem; color: #475569; }
+.pki-btn-gap { margin-right: 4px; }
+.pki-section-title { margin: 0 0 6px; font-size: 0.95rem; }
+.pki-section-sub { font-weight: 400; color: #64748b; font-size: 0.8rem; }
+.pki-section-title-mt { margin: 16px 0 6px; font-size: 0.95rem; }
+.pki-code { font-size: 0.8rem; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }
+.pki-code-fp { font-size: 0.75rem; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; word-break: break-all; }
+.pki-detail-label { padding: 6px 10px; color: #64748b; white-space: nowrap; font-weight: 500; border-bottom: 1px solid #f1f5f9; width: 140px; }
+.pki-detail-value { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; }
+.pki-chain-panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 16px; margin-top: 12px; }
+.pki-chain-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.pki-chain-close { font-size: 0.75rem; }
 
 /* ── Backup page ────────────────────────────────────────────── */
 .backup-actions { margin-top: 12px; }
@@ -558,3 +585,27 @@ tr:hover { background: #f8fafc; }
 .audit-mini-table th { text-align: left; padding: 4px 8px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
 .audit-mini-table td { padding: 4px 8px; border-bottom: 1px solid #f1f5f9; color: #334155; }
 .audit-mini-table tr:last-child td { border-bottom: none; }
+
+/* ── Capability Policy page (3.0) — browser Permissions-Policy ────────────── */
+/* CSP-safe: classes only, no inline style= attributes.                        */
+.cap-pol-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.cap-pol-table th { text-align: left; padding: 8px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.78rem; }
+.cap-pol-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+.cap-pol-table tr:last-child td { border-bottom: none; }
+.cap-th-name { width: 160px; }
+.cap-th-value { width: 220px; }
+.cap-name-cell { font-weight: 500; }
+.cap-origins-area { font-size: 0.85rem; }
+.cap-chips { display: flex; flex-wrap: wrap; gap: 4px; min-height: 4px; margin-bottom: 4px; }
+.cap-origin-chip { display: inline-flex; align-items: center; gap: 4px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 4px; padding: 2px 8px; font-size: 0.78rem; font-family: monospace; }
+.cap-origin-add { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.cap-origin-err { display: block; font-size: 0.78rem; color: #dc2626; margin-top: 3px; }
+.cap-origins-display { font-family: monospace; font-size: 0.8rem; line-height: 1.6; }
+.cap-pol-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.cap-scope-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 4px; }
+.cap-scope-picker { display: flex; flex-direction: column; gap: 4px; }
+.cap-eff-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; margin-top: 8px; }
+.cap-eff-table th { text-align: left; padding: 6px 10px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.75rem; }
+.cap-eff-table td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+.cap-eff-table tr:last-child td { border-bottom: none; }
+.w-250 { width: 250px; }

@@ -29,6 +29,7 @@
                 <button data-action="showPage" data-param="pki">PKI / Crypto</button>
                 <button data-action="showPage" data-param="settings">Settings</button>
                 <button data-action="showPage" data-param="runtime-settings">Runtime Settings</button>
+                <button data-action="showPage" data-param="capability-policy">Permissions Policy</button>
             </div>
         </div>
         <div class="nav-right">
@@ -1423,6 +1424,86 @@
                 </div>
             </div>
         </div>
+        <!-- 3.0 — Browser Permissions-Policy admin page (capability_policy.py) -->
+        <div class="page" id="page-capability-policy">
+            <h2>Browser Permissions Policy</h2>
+
+            <!-- Scope selector -->
+            <div class="panel">
+                <div class="panel-header">Scope</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Configure which browser capabilities (camera, microphone, etc.) are permitted for users
+                        accessing resources via Yashigani. Policies cascade: user override &gt; most-restrictive
+                        group &gt; org policy &gt; immutable baseline (all <code>self</code>).
+                    </p>
+                    <div class="cap-scope-row">
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Scope type</label>
+                            <select id="cap-scope-type" class="fi-sm">
+                                <option value="org">Organisation (default)</option>
+                                <option value="group">Group</option>
+                                <option value="user">User</option>
+                            </select>
+                        </div>
+                        <div id="cap-group-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">Group</label>
+                            <select id="cap-group-id" class="fi-sm">
+                                <option value="">Loading&hellip;</option>
+                            </select>
+                        </div>
+                        <div id="cap-user-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">User email</label>
+                            <input id="cap-user-email" type="email" placeholder="user@example.com" class="fi w-250">
+                        </div>
+                        <button data-action="capPolLoad" class="btn-sm-primary">Load policy</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Policy editor -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Policy &mdash; <span id="cap-pol-scope-label">Organisation (default)</span></span>
+                    <span id="cap-pol-partial-note" class="txt-note is-hidden">Unset capabilities inherit from the parent scope.</span>
+                </div>
+                <div class="panel-body">
+                    <div id="cap-pol-rows"><span class="loading">Loading&hellip;</span></div>
+                    <div class="cap-pol-actions">
+                        <button data-action="capPolSave" class="btn-sm-save">Save</button>
+                        <button id="cap-pol-delete-btn" data-action="capPolDelete" class="btn-sm-danger is-hidden">Delete override</button>
+                        <span id="cap-pol-result"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Effective policy preview -->
+            <div class="panel">
+                <div class="panel-header">Effective Policy (resolved for a user)</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Shows the resolved capability settings that apply to a specific user after all precedence
+                        rules (user override &gt; most-restrictive group &gt; org &gt; baseline).
+                    </p>
+                    <div class="form-row--wrap-mb">
+                        <input id="cap-eff-user" type="email" placeholder="user@example.com" class="fi w-250">
+                        <button data-action="capPolEffective" class="btn-sm-primary">Resolve</button>
+                    </div>
+                    <div id="cap-eff-result"></div>
+                    <table id="cap-eff-table" class="cap-eff-table is-hidden">
+                        <thead>
+                            <tr>
+                                <th>Capability</th>
+                                <th>Effective Setting</th>
+                                <th>Allowed Origins</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cap-eff-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
         <!-- Runtime Settings Page — v2.24.3 (admin-surfaces-all-runtime-settings Phase 2) -->
         <div class="page" id="page-runtime-settings">
             <h2>Runtime Settings</h2>
@@ -1501,5 +1582,6 @@
     <script src="/static/js/runtime-settings.js" defer></script>
     <script src="/static/js/documents.js" defer></script>
     <script src="/static/js/envelope_reapproval.js" defer></script>
+    <script src="/static/js/capability-policy.js" defer></script>
 </body>
 </html>
