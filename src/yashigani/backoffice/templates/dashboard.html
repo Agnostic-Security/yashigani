@@ -30,6 +30,7 @@
                 <button data-action="showPage" data-param="settings">Settings</button>
                 <button data-action="showPage" data-param="runtime-settings">Runtime Settings</button>
                 <button data-action="showPage" data-param="capability-policy">Permissions Policy</button>
+                <button data-action="showPage" data-param="permissions">Permissions</button>
             </div>
         </div>
         <div class="nav-right">
@@ -1549,6 +1550,192 @@
             <!-- Toast notification -->
             <div id="rs-toast" class="rs-toast"></div>
         </div>
+        <!-- Permissions Page — 3.1 Phase 8: Unified Resource Permission Grant admin UI -->
+        <div class="page" id="page-permissions">
+            <h2>Resource Permissions</h2>
+
+            <!-- Scope + Resource Type selector -->
+            <div class="panel">
+                <div class="panel-header">Scope &amp; Resource Type</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Manage explicit allow/deny grants for blast-radius resource types
+                        (MCP servers, external APIs, cloud models, agents).
+                        Org grant is the ceiling; groups and users may only narrow it.
+                        Browser Permissions-Policy is on the <strong>Permissions Policy</strong> page.
+                    </p>
+                    <div class="cap-scope-row">
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Scope type</label>
+                            <select id="perm-scope-type" class="fi-sm">
+                                <option value="org">Organisation</option>
+                                <option value="group">Group</option>
+                                <option value="user">User</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div id="perm-group-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">Group</label>
+                            <select id="perm-group-id" class="fi-sm">
+                                <option value="">Loading&hellip;</option>
+                            </select>
+                        </div>
+                        <div id="perm-user-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">User email</label>
+                            <input id="perm-user-email" type="email" placeholder="user@example.com" class="fi w-250">
+                        </div>
+                        <div id="perm-agent-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">Agent ID</label>
+                            <input id="perm-agent-id" type="text" placeholder="agent-id" class="fi w-200">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Resource type</label>
+                            <select id="perm-resource-type" class="fi-sm">
+                                <option value="mcp_server">MCP Server</option>
+                                <option value="external_api">External API</option>
+                                <option value="cloud_model">Cloud Model</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <button data-action="permLoad" class="btn-sm-primary">Load grants</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Grants panel -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Grants &mdash; <span id="perm-scope-label">MCP Server &mdash; Organisation</span></span>
+                    <button data-action="permGrantEdit" data-rid="" data-allow="1" data-opa="" class="btn-xs-add">+ Add grant</button>
+                </div>
+                <!-- Add / Edit grant inline form -->
+                <div id="perm-grant-form" class="form-panel">
+                    <p class="lbl perm-grant-form-title" id="perm-grant-form-title">Add grant</p>
+                    <div class="form-row">
+                        <div>
+                            <label class="lbl">Resource ID</label><br>
+                            <input id="perm-grant-rid" type="text" placeholder="server-id / api-host / model-name / agent-id" class="fi w-250">
+                        </div>
+                        <div>
+                            <label class="lbl">Grant</label><br>
+                            <label class="perm-allow-label">
+                                <input id="perm-grant-allow" type="checkbox" checked>
+                                Allow
+                            </label>
+                        </div>
+                    </div>
+                    <div id="perm-grant-opa-row" class="form-row--mt is-hidden">
+                        <div>
+                            <label class="lbl">OPA Policy Ref <span class="perm-required">(required for cloud_model + allow)</span></label><br>
+                            <input id="perm-grant-opa" type="text" placeholder="yashigani/cloud_model/gpt4o" class="fi w-250">
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <button data-action="permSaveGrant" class="btn-sm-save">Save</button>
+                        <button data-action="permGrantEditCancel" class="btn-sm-secondary">Cancel</button>
+                        <span id="perm-grant-result"></span>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div id="perm-grants-container"><span class="loading">Loading&hellip;</span></div>
+                    <div class="perm-grants-actions">
+                        <span id="perm-grants-result"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Effective permission preview -->
+            <div class="panel">
+                <div class="panel-header">Effective Permission (resolved)</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Resolve the effective permission for a subject + resource after org-ceiling rules
+                        (org grant is ceiling; groups and user may narrow it further).
+                        Matches the gateway enforcement path.
+                    </p>
+                    <div class="cap-scope-row">
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Resource type</label>
+                            <select id="perm-eff-rt" class="fi-sm">
+                                <option value="mcp_server">MCP Server</option>
+                                <option value="external_api">External API</option>
+                                <option value="cloud_model">Cloud Model</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Resource ID</label>
+                            <input id="perm-eff-rid" type="text" placeholder="server-id / host / model" class="fi w-200">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Org ID</label>
+                            <input id="perm-eff-org" type="text" value="default" class="fi w-80">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">User email <span class="txt-hint">(optional)</span></label>
+                            <input id="perm-eff-user" type="email" placeholder="user@example.com" class="fi w-200">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Group IDs <span class="txt-hint">(comma-sep, optional)</span></label>
+                            <input id="perm-eff-groups" type="text" placeholder="group1,group2" class="fi w-200">
+                        </div>
+                        <button data-action="permEffective" class="btn-sm-primary">Resolve</button>
+                    </div>
+                    <div id="perm-eff-result" class="perm-eff-result-box"></div>
+                    <div id="perm-eff-path" class="is-hidden"></div>
+                </div>
+            </div>
+
+            <!-- Declarations panel -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Pending Declarations</span>
+                    <button data-action="loadDeclarations" class="btn-xs-add">Refresh</button>
+                </div>
+                <!-- Approve confirm form (EU AI Act Art.14 human-in-the-loop) -->
+                <div id="perm-decl-approve-form" class="form-panel">
+                    <p class="txt-note">
+                        Approving creates an org-level grant.
+                        This is the <strong>human-accountable act</strong> (EU AI Act Art.14 / ASVS V10.3.5).
+                    </p>
+                    <div class="form-row">
+                        <div>
+                            <label class="lbl">Resource</label><br>
+                            <strong id="perm-decl-approve-label"></strong>
+                        </div>
+                        <div>
+                            <label class="lbl">Grant</label><br>
+                            <label class="perm-allow-label">
+                                <input id="perm-decl-approve-allow" type="checkbox" checked>
+                                Allow
+                            </label>
+                        </div>
+                    </div>
+                    <div id="perm-decl-approve-opa-row" class="form-row--mt is-hidden">
+                        <div>
+                            <label class="lbl">OPA Policy Ref <span class="perm-required">(required for cloud_model + allow)</span></label><br>
+                            <input id="perm-decl-approve-opa" type="text" placeholder="yashigani/cloud_model/gpt4o" class="fi w-250">
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <button data-action="permApproveDeclaration" class="btn-sm-save">Confirm approval</button>
+                        <button data-action="permApproveCancelClick" class="btn-sm-secondary">Cancel</button>
+                        <span id="perm-decl-approve-result"></span>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Agent manifests and operators declare resources they need access to.
+                        An admin must approve to create the org-level grant (human-in-the-loop).
+                    </p>
+                    <div id="perm-decl-container"><span class="loading">Loading&hellip;</span></div>
+                    <div class="perm-grants-actions">
+                        <span id="perm-decl-result"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </main>
 
     <!-- V6.8.4 Step-up TOTP modal — shown when a high-value action requires fresh TOTP -->
@@ -1583,5 +1770,6 @@
     <script src="/static/js/documents.js" defer></script>
     <script src="/static/js/envelope_reapproval.js" defer></script>
     <script src="/static/js/capability-policy.js" defer></script>
+    <script src="/static/js/permissions.js" defer></script>
 </body>
 </html>

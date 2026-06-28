@@ -72,6 +72,8 @@ function showPage(name, triggerEl) {
     if (name === 'rbac') { loadGroups(); loadRbacSources(); }  // R13: populate path/method catalogues
     // 3.0 — Permissions-Policy admin page — loadCapabilityPolicy is in capability-policy.js (defer).
     if (name === 'capability-policy' && typeof window.loadCapabilityPolicy === 'function') window.loadCapabilityPolicy();
+    // 3.1 Phase 8 — Resource Permissions admin page — loadPermissions is in permissions.js (defer).
+    if (name === 'permissions' && typeof window.loadPermissions === 'function') window.loadPermissions();
 }
 
 // ---------------------------------------------------------------------------
@@ -3236,6 +3238,53 @@ document.addEventListener('click', function(e) {
             if (typeof capPolRemoveOrigin === 'function') capPolRemoveOrigin(
                 actionEl.getAttribute('data-cap'),
                 actionEl.getAttribute('data-origin')
+            );
+            break;
+
+        // 3.1 Phase 8 — Resource Permissions admin page (defined in permissions.js, loaded defer).
+        case 'permLoad':
+            if (typeof permLoad === 'function') permLoad();
+            break;
+        case 'permGrantEdit':
+            if (typeof permGrantEdit === 'function') permGrantEdit(
+                actionEl.getAttribute('data-rid'),
+                actionEl.getAttribute('data-allow'),
+                actionEl.getAttribute('data-opa')
+            );
+            break;
+        case 'permGrantEditCancel':
+            if (typeof permGrantEditCancel === 'function') permGrantEditCancel();
+            break;
+        case 'permSaveGrant':
+            if (typeof permSaveGrant === 'function') permSaveGrant();
+            break;
+        case 'permDeleteGrant':
+            if (typeof permDeleteGrant === 'function') permDeleteGrant(
+                actionEl.getAttribute('data-rid')
+            );
+            break;
+        case 'permEffective':
+            if (typeof permEffective === 'function') permEffective();
+            break;
+        case 'loadDeclarations':
+            if (typeof window.loadDeclarations === 'function') window.loadDeclarations();
+            break;
+        case 'permApproveClick':
+            if (typeof permApproveClick === 'function') permApproveClick(
+                actionEl.getAttribute('data-rt'),
+                actionEl.getAttribute('data-rid')
+            );
+            break;
+        case 'permApproveDeclaration':
+            if (typeof permApproveDeclaration === 'function') permApproveDeclaration();
+            break;
+        case 'permApproveCancelClick':
+            if (typeof permApproveCancelClick === 'function') permApproveCancelClick();
+            break;
+        case 'permRejectDeclaration':
+            if (typeof permRejectDeclaration === 'function') permRejectDeclaration(
+                actionEl.getAttribute('data-rt'),
+                actionEl.getAttribute('data-rid')
             );
             break;
     }

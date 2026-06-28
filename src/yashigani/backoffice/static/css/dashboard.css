@@ -609,3 +609,22 @@ tr:hover { background: #f8fafc; }
 .cap-eff-table td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
 .cap-eff-table tr:last-child td { border-bottom: none; }
 .w-250 { width: 250px; }
+
+/* ── 3.1 Phase 8 — Resource Permissions admin page ─────────────────────── */
+.perm-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.perm-table th { text-align: left; padding: 8px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.78rem; }
+.perm-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+.perm-table tr:last-child td { border-bottom: none; }
+.perm-decl-just { font-size: 0.8rem; color: #475569; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perm-code { font-family: monospace; font-size: 0.82rem; background: #f1f5f9; border-radius: 3px; padding: 1px 4px; }
+.perm-allow-label { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; cursor: pointer; padding: 6px 0; }
+.perm-required { font-size: 0.72rem; color: #dc2626; font-weight: normal; }
+.perm-grants-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.perm-grant-form-title { font-weight: 600; font-size: 0.85rem; margin-bottom: 8px; color: #1e293b; }
+/* Effective resolution path display */
+.perm-eff-result-box { margin-top: 12px; font-size: 0.85rem; min-height: 20px; }
+.perm-eff-path { margin-top: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; overflow: hidden; font-size: 0.83rem; }
+.perm-eff-path-row { display: flex; align-items: center; gap: 16px; padding: 7px 14px; border-bottom: 1px solid #f1f5f9; }
+.perm-eff-path-row:last-child { border-bottom: none; }
+.perm-eff-path-row--result { background: #eff6ff; font-weight: 600; }
+.perm-eff-path-lbl { font-size: 0.78rem; color: #64748b; min-width: 120px; }
