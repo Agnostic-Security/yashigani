@@ -87,7 +87,7 @@ def _derive_username_from_email(email: str) -> str:
 
 
 class FullResetRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")  # 6 (user SHA256) or 8 (admin SHA512) — Phase 13
 
 
 class ReactivateRequest(BaseModel):

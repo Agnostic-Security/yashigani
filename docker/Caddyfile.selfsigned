@@ -360,6 +360,16 @@ Hiring: https://agnosticsec.com/careers
 
     # ── MCP proxy — /mcp/* ─────────────────────────────────────────────
     handle /mcp/* {
+        # FIND-3.1-003 (LOW, defense-in-depth): strip inbound identity headers to
+        # close the X-Forwarded-User spoof vector at the edge. Mirrors /v1/* treatment.
+        # OPA blocks /mcp/* before these headers are consulted, but stripping here
+        # removes the spoof surface entirely rather than relying solely on the
+        # application-layer gate.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls

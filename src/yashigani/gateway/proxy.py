@@ -90,6 +90,12 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "te", "trailers", "transfer-encoding", "upgrade",
 })
 
+# FIND-3.1-004: single-segment /mcp/* path suffixes that are gateway-owned
+# endpoints (not MCP agent names).  These must never be dispatched via
+# dispatch_mcp_call(); the dedicated routes registered before the catch-all
+# handle them.  Evaluated once at module load (frozenset constant).
+_MCP_INFO_RESERVED: frozenset[str] = frozenset({"health"})
+
 
 def _content_hash(content: str) -> str:
     """SHA-256 hex digest of a string — used for privacy-safe hashing."""
@@ -438,6 +444,64 @@ def create_gateway_app(
             title="Yashigani Gateway — API Reference (ReDoc)",
             redoc_js_url="/static/swagger-ui/redoc.standalone.js",
             favicon_url="/static/swagger-ui/favicon.png",
+        )
+
+    # ── FIND-3.1-004/005: JWKS + /mcp/health gateway-owned endpoint guards ────
+    #
+    # These routes ensure that /.well-known/yashigani-mcp-jwks.json and
+    # /mcp/health are ALWAYS handled by the gateway and NEVER forwarded to
+    # the upstream (demo-mcp or any configured MCP server).
+    #
+    # Primary defence: the mcp_info_router in extra_routers (registered above via
+    # include_router) handles both paths when MCP servers are configured.  These
+    # guards are the belt-and-suspenders for the case where no MCP servers are
+    # configured and mcp_info_router is therefore absent from extra_routers.
+    #
+    # Both endpoints are public (no auth required):
+    #   - JWKS: upstream verifiers fetch it without Yashigani credentials.
+    #   - /mcp/health: monitoring probe used by Caddy and operators.
+    #
+    # Both are registered BEFORE the catch-all so they match first, bypassing
+    # the catch-all's rate-limit / OPA / upstream-forwarding pipeline entirely.
+    @app.get("/.well-known/yashigani-mcp-jwks.json", include_in_schema=False)
+    async def _gateway_mcp_jwks_guard(response: Response):
+        """JWKS guard — always gateway-handled, never forwarded to upstream."""
+        store = _state.get("mcp_jwks_store")
+        if store is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "mcp_not_configured",
+                         "detail": "No MCP servers are configured on this gateway."},
+            )
+        from yashigani.mcp._jwks import JWKS_CACHE_CONTROL
+        response.headers["Cache-Control"] = JWKS_CACHE_CONTROL
+        response.headers["Content-Type"] = "application/json"
+        return store.response()
+
+    @app.get("/mcp/health", include_in_schema=False)
+    async def _gateway_mcp_health_guard():
+        """MCP health guard — always gateway-handled, never forwarded to upstream."""
+        reg = _state.get("mcp_broker_registry")
+        if reg is None:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "mcp_not_configured"},
+            )
+        try:
+            brokers = reg.all_brokers()  # type: ignore[attr-defined]
+        except Exception:
+            brokers = []
+        if not brokers:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "mcp_no_brokers"},
+            )
+        opa_ok = await brokers[0].opa_health()  # type: ignore[attr-defined]
+        if opa_ok:
+            return {"status": "ok", "opa": "healthy"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "detail": "opa_unreachable"},
         )
 
     # Catch-all reverse proxy route
@@ -883,8 +947,11 @@ async def _proxy_request_body(
     mcp_broker_registry = state.get("mcp_broker_registry")
     if mcp_broker_registry is not None and norm_path.startswith("/mcp/"):
         _mcp_suffix = norm_path[len("/mcp/"):]   # e.g. "filesystem-mcp"
-        if _mcp_suffix and "/" not in _mcp_suffix:
+        if _mcp_suffix and "/" not in _mcp_suffix and _mcp_suffix not in _MCP_INFO_RESERVED:
             # Valid single-segment agent_name — dispatch to the MCP handler.
+            # _MCP_INFO_RESERVED excludes "health" (FIND-3.1-004 belt-and-suspenders):
+            # /mcp/health is a gateway-owned endpoint handled by the route registered
+            # before the catch-all and must never be dispatched as an agent name.
             # Pass response_inspection_pipeline so the G-ORCH-OPA-1 egress gate
             # can classify the tool result sensitivity before calling enforce_result().
             #

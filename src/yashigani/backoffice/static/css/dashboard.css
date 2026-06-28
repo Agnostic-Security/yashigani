@@ -252,6 +252,11 @@ tr:hover { background: #f8fafc; }
 .hibp-key-result { font-size: 0.8rem; min-height: 1.2em; margin-bottom: 4px; }
 .hibp-probe-result { font-size: 0.8rem; min-height: 1.2em; color: #334155; }
 .hibp-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+/* HIBP JS-generated HTML classes — CSP inline-style fix (FIND-3.1-001).
+   hibp.js builds status HTML via innerHTML; these classes replace every
+   style="..." attribute so the page is compatible with style-src 'self'. */
+.hibp-status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.hibp-source-lbl { font-size: 0.85rem; color: #334155; }
 
 /* ── Classify textarea ──────────────────────────────────────── */
 .classify-textarea { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; resize: vertical; }
