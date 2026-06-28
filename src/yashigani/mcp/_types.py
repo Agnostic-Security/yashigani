@@ -140,6 +140,18 @@ class McpCallContext:
     # Phase 1 is ADDITIVE — unbound policies are no-ops on this field.
     caller_agent_id: Optional[str] = None
 
+    # 3.1 Phase 3 — per-caller tool allowlist.
+    # Populated by the MCP router runtime from the identity registry (field
+    # IdentityRecord.allowed_tools for the caller identified by caller_agent_id).
+    # Enforcement in McpBroker.enforce():
+    #   - None / empty list → no per-caller tool restriction (all tools allowed
+    #     for this caller, subject to OPA and other gates).
+    #   - Non-empty list → only tools in the list are permitted for this caller;
+    #     any other tool_name results in deny_reason="tool_not_permitted".
+    # "gateway:orchestrator" is exempt from this check (unrestricted access to
+    # all tools on any registered MCP server).
+    caller_allowed_tools: Optional[list[str]] = None
+
 
 @dataclass
 class OpaDecision:

@@ -116,6 +116,8 @@ def build_registry_from_env(
     audit_writer: Optional[object] = None,
     semantic_intent_sidecar: Optional[object] = None,
     envelope_service: Optional[object] = None,
+    permission_store: Optional[object] = None,  # PermissionStore — 3.1 Phase 4
+    org_id: str = "default",                    # 3.1 Phase 4 — org ceiling
 ) -> tuple[McpBrokerRegistry, object]:  # (registry, jwks_store | None)
     """
     Parse YASHIGANI_MCP_SERVERS and build a McpBrokerRegistry.
@@ -264,6 +266,10 @@ def build_registry_from_env(
             # the capability-envelope durable store.  None ⇒ triage no-ops.
             semantic_intent_sidecar=semantic_intent_sidecar,
             envelope_service=envelope_service,
+            # 3.1 Phase 4 — connection allow-list enforcement.
+            # When permission_store is None (dev/test), the check is a no-op.
+            permission_store=permission_store,
+            org_id=org_id,
         )
         broker = McpBroker(config=broker_cfg)
 

@@ -192,6 +192,7 @@ def _build_app(mesh_mode: bool = False):
     agent_registry = None
     redis_client_rbac = None
     capability_policy_store = None  # 3.0 — browser Permissions-Policy
+    permission_store = None          # 3.1 Phase 4 — MCP connection allow-list
     try:
         import redis as _redis
         redis_client_rbac = _redis.from_url(_gw_redis_url(3), decode_responses=False)
@@ -212,6 +213,14 @@ def _build_app(mesh_mode: bool = False):
         )
         logger.info(
             "Gateway capability policy store ready (Permissions-Policy, 3.0, org=%s)",
+            _cap_pol_org_id,
+        )
+        # 3.1 Phase 4 — Unified Permission Store shares Redis db/3 (key prefix
+        # perm:grant:*).  Used by the MCP broker connection allow-list check.
+        from yashigani.permissions import PermissionStore as _PermStore
+        permission_store = _PermStore(redis_client=redis_client_rbac)
+        logger.info(
+            "Gateway permission store ready (Phase 4 MCP allow-list, org=%s)",
             _cap_pol_org_id,
         )
     except Exception as exc:
@@ -819,9 +828,17 @@ def _build_app(mesh_mode: bool = False):
         # The call router is no longer mounted as an extra_router (Fix-1).
         # proxy.py dispatches /mcp/<agent> via dispatch_mcp_call() in the catch-all.
 
+        # 3.1 Phase 4 — org ID for permission store seeding.
+        # Reuse the same YASHIGANI_ORG_ID that the capability policy store uses.
+        _perm_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+
         _mcp_registry, _mcp_jwks_store = build_registry_from_env(
             opa_url=opa_url,
             audit_writer=audit_writer,
+            # 3.1 Phase 4 — wire permission store + org_id for connection allow-list.
+            # When permission_store is None (Redis unavailable), the check no-ops.
+            permission_store=permission_store,
+            org_id=_perm_org_id,
         )
         _extra_routers: list = [openai_router]
 
@@ -841,6 +858,42 @@ def _build_app(mesh_mode: bool = False):
                 "(call routes wired through catch-all — Fix-1)",
                 len(_mcp_registry),
             )
+
+            # 3.1 Phase 4 — seed org-level MCP server grants (B1 / auto-seed).
+            # Idempotent; runs at every startup so grants stay in sync with
+            # YASHIGANI_MCP_SERVERS.  Only runs when permission_store is available.
+            if permission_store is not None:
+                try:
+                    from yashigani.permissions import seed_mcp_grants
+                    import json as _json
+                    _mcp_raw = os.environ.get("YASHIGANI_MCP_SERVERS", "").strip()
+                    _server_ids: list = []
+                    if _mcp_raw:
+                        try:
+                            _server_ids = [
+                                str(e.get("agent_name", ""))
+                                for e in _json.loads(_mcp_raw)
+                                if isinstance(e, dict) and e.get("agent_name")
+                            ]
+                        except Exception:
+                            pass
+                    seed_mcp_grants(
+                        perm_store=permission_store,
+                        server_ids=_server_ids,
+                        org_id=_perm_org_id,
+                    )
+                    logger.info(
+                        "MCP permission seeder: seeded %d server grant(s) for org=%s",
+                        len(_server_ids), _perm_org_id,
+                    )
+                except Exception as _seed_exc:
+                    # Seeding failure is non-fatal at startup but deny-by-default
+                    # will apply to ALL MCP servers until next restart seeds them.
+                    logger.warning(
+                        "MCP permission seeder FAILED (%s) — deny-by-default "
+                        "applies to all MCP servers until next restart",
+                        _seed_exc,
+                    )
         else:
             _mcp_registry = None
             _mcp_jwks_store = None

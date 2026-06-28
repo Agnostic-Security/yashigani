@@ -900,6 +900,9 @@ async def _proxy_request_body(
                 registry=mcp_broker_registry,
                 response_inspection_pipeline=state.get("response_inspection_pipeline"),
                 identity_registry=_openai_router._state.identity_registry,
+                # 3.1 Phase 3 — pass agent_registry so caller allowed_tools
+                # can be resolved from the identity registry at call time.
+                agent_registry=state.get("agent_registry"),
             )
         # Multi-segment or empty suffix falls through to generic upstream forwarding
 

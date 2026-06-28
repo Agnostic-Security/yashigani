@@ -197,6 +197,18 @@ class McpBrokerConfig:
     # Set to True for the git bundle (metadata.name == "git").
     is_git_agent: bool = False
 
+    # 3.1 Phase 4 — connection allow-list: PermissionStore for org-level MCP
+    # server access control.  When provided, ``broker.enforce()`` calls
+    # ``resolve_boolean_grant(MCP_SERVER, ctx.server_id, org_id, ...)`` before
+    # the OPA query to verify the caller's org has permission to reach this
+    # server.  Deny-by-default: servers with no org grant are denied.
+    # When None, the check is a no-op (backwards-compatible dev/test mode).
+    permission_store: Optional[Any] = None  # PermissionStore
+
+    # 3.1 Phase 4 — org ID used for the connection allow-list check.
+    # Should match YASHIGANI_ORG_ID.  Defaults to "default" when unset.
+    org_id: str = "default"
+
 
 class McpBroker:
     """
@@ -330,6 +342,71 @@ class McpBroker:
                 )
                 await self._emit_audit(ctx, decision)
                 return decision
+
+        # Step 1a: Phase 4 — connection allow-list (3.1).
+        #
+        # Before querying OPA, verify that the caller's org is permitted to
+        # reach this MCP server at all.  Deny-by-default: only servers seeded
+        # with an org-level grant (via seed_mcp_grants at startup) are allowed.
+        # Unregistered / mis-configured servers are denied here.
+        #
+        # Keyed on org_id only (user_email=None → org-ceiling check only);
+        # group/user narrowing is not applied at this layer so gateway:orchestrator
+        # is implicitly allowed when the org grant exists.
+        conn_deny = self._check_connection_permit(ctx)
+        if conn_deny is not None:
+            conn_elapsed = int((time.monotonic() - t0) * 1000)
+            conn_decision = BrokerDecision(
+                call_id=call_id,
+                allow=False,
+                deny_reason=conn_deny,
+                opa_decision=OpaDecision(
+                    allow=False, deny_reason=conn_deny, redact_args=set(),
+                    audit_capture=True, rate_limit_key=None,
+                ),
+                chain_depth=len(upstream_chain),
+                elapsed_ms=conn_elapsed,
+                error=None,
+            )
+            logger.info(
+                "mcp-broker: [P4] connection not permitted call_id=%s server=%s "
+                "caller=%s reason=%s",
+                call_id, ctx.server_id or ctx.agent_name,
+                ctx.caller_agent_id, conn_deny,
+            )
+            await self._emit_audit(ctx, conn_decision)
+            return conn_decision
+
+        # Step 1b: Phase 3 — tool allow-list (3.1).
+        #
+        # If the caller has a non-empty allowed_tools list in their identity
+        # record (McpCallContext.caller_allowed_tools, populated by the runtime
+        # from the identity registry), enforce it: only tools in the list may be
+        # invoked.  "gateway:orchestrator" is exempt (unrestricted access).
+        # When caller_allowed_tools is None/empty, no per-caller restriction.
+        tool_deny = self._check_tool_permit(ctx)
+        if tool_deny is not None:
+            tool_elapsed = int((time.monotonic() - t0) * 1000)
+            tool_decision = BrokerDecision(
+                call_id=call_id,
+                allow=False,
+                deny_reason=tool_deny,
+                opa_decision=OpaDecision(
+                    allow=False, deny_reason=tool_deny, redact_args=set(),
+                    audit_capture=True, rate_limit_key=None,
+                ),
+                chain_depth=len(upstream_chain),
+                elapsed_ms=tool_elapsed,
+                error=None,
+            )
+            logger.info(
+                "mcp-broker: [P3] tool not permitted call_id=%s tool=%s "
+                "caller=%s allowed=%s reason=%s",
+                call_id, ctx.tool_name, ctx.caller_agent_id,
+                ctx.caller_allowed_tools, tool_deny,
+            )
+            await self._emit_audit(ctx, tool_decision)
+            return tool_decision
 
         # Step 2: query OPA (fail-closed).  MI-6 (YSG-RISK-061): build the agent
         # SPIFFE URI in THIS instance's trust domain so OPA adjudicates the
@@ -872,6 +949,71 @@ class McpBroker:
                     "mcp-broker: envelope-blocked audit write failed server=%s: %s",
                     ctx.server_id, exc,
                 )
+
+    def _check_connection_permit(self, ctx: McpCallContext) -> Optional[str]:
+        """
+        3.1 Phase 4 — connection allow-list.
+
+        Returns None (permitted) or a deny_reason string.
+
+        Logic:
+          - No permission_store configured → no-op (None), backwards-compatible.
+          - Call resolve_boolean_grant(MCP_SERVER, server_id, org_id,
+              group_ids=[], user_email=None) — org-level check only.
+          - Returns "mcp_server_not_permitted" when no org grant or org denies.
+
+        Fail-closed: any exception from the resolver is already caught inside
+        resolve_boolean_grant (it returns False on any error).
+        """
+        if self._config.permission_store is None:
+            return None
+
+        from yashigani.permissions import ResourceType, resolve_boolean_grant
+
+        server_key = ctx.server_id or ctx.agent_name
+        if not server_key:
+            # No server identifier — deny (fail-closed on missing context).
+            return "mcp_server_not_permitted"
+
+        org_id = self._config.org_id or "default"
+
+        allowed = resolve_boolean_grant(
+            ResourceType.MCP_SERVER,
+            server_key,
+            org_id=org_id,
+            group_ids=[],
+            user_email=None,  # org-level only; no group/user narrowing
+            store=self._config.permission_store,  # type: ignore[arg-type]
+        )
+        return None if allowed else "mcp_server_not_permitted"
+
+    def _check_tool_permit(self, ctx: McpCallContext) -> Optional[str]:
+        """
+        3.1 Phase 3 — per-caller tool allow-list.
+
+        Returns None (permitted) or a deny_reason string.
+
+        Skip conditions (all result in None / no restriction):
+          - caller is "gateway:orchestrator" (unrestricted).
+          - caller_agent_id is None (unauthenticated / unidentified path).
+          - tool_name is None (not a tools/call action).
+          - caller_allowed_tools is None or empty (no restriction configured).
+
+        When caller_allowed_tools is set and tool_name is NOT in the list,
+        returns "tool_not_permitted".
+        """
+        if ctx.caller_agent_id == "gateway:orchestrator":
+            return None
+        if ctx.caller_agent_id is None:
+            return None
+        if ctx.tool_name is None:
+            return None
+        if not ctx.caller_allowed_tools:
+            return None  # Empty / None list → no per-caller restriction
+
+        if ctx.tool_name not in ctx.caller_allowed_tools:
+            return "tool_not_permitted"
+        return None
 
     async def _verify_upstream_jwt(self, ctx: McpCallContext) -> Optional[str]:
         """

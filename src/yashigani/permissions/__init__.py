@@ -39,6 +39,7 @@ from yashigani.permissions.resolver import (
     resolve_browser_capability_set,
     DEFAULT_ORG_ID,
 )
+from yashigani.permissions.seeder import seed_mcp_grants
 
 __all__ = [
     # Model
@@ -59,4 +60,6 @@ __all__ = [
     "resolve_boolean_grant",
     "resolve_browser_capability_set",
     "DEFAULT_ORG_ID",
+    # Seeder
+    "seed_mcp_grants",
 ]

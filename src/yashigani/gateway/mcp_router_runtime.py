@@ -129,6 +129,7 @@ async def dispatch_mcp_call(
     registry: object,  # McpBrokerRegistry — typed as object to avoid circular imports
     response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
     identity_registry: Optional[object] = None,  # IdentityRegistry | None — for ceiling lookup
+    agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3 tool permit
 ) -> Response:
     """
     Core MCP call handler.  Called DIRECTLY from the proxy catch-all AFTER the
@@ -166,6 +167,12 @@ async def dispatch_mcp_call(
         ctx.caller_sensitivity_ceiling remains None → OPA fails-closed.
         Passed from the proxy (openai_router._state.identity_registry) —
         no new store introduced (Option A / G-ORCH-OPA-1).
+    agent_registry:
+        Optional AgentRegistry instance.  When provided, the caller's
+        ``allowed_tools`` list is looked up from the identity registry (keyed
+        by caller_agent_id slug) and set on McpCallContext.caller_allowed_tools
+        before broker.enforce().  When absent or caller not found, no per-caller
+        tool restriction applies.  3.1 Phase 3 — tool allow-list enforcement.
     """
     return await _handle_mcp_call_inner(
         agent_name=agent_name,
@@ -173,6 +180,7 @@ async def dispatch_mcp_call(
         registry=registry,
         response_inspection_pipeline=response_inspection_pipeline,
         identity_registry=identity_registry,
+        agent_registry=agent_registry,
     )
 
 
@@ -182,6 +190,7 @@ async def _handle_mcp_call_inner(
     registry: object,
     response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
     identity_registry: Optional[object] = None,  # IdentityRegistry | None
+    agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3
 ) -> Response:
     """
     Core MCP call processing logic — shared by dispatch_mcp_call (catch-all path)
@@ -318,6 +327,48 @@ async def _handle_mcp_call_inner(
                 user_id, reg_exc,
             )
 
+    # 3.1 Phase 3 — resolve the caller's allowed_tools list from the identity
+    # registry.  Lookup path:
+    #   caller_agent_id (slug) → identity_registry.get_by_slug() → allowed_tools
+    # Fallback: identity_registry.get(caller_agent_id) if get_by_slug misses.
+    # "gateway:orchestrator" is exempt (unrestricted — skip lookup).
+    # When caller_agent_id is None or identity_registry is absent, no restriction.
+    caller_allowed_tools: Optional[list[str]] = None
+    if (
+        _caller_agent_id is not None
+        and _caller_agent_id != "gateway:orchestrator"
+        and identity_registry is not None
+    ):
+        try:
+            # Primary: look up by slug (caller_agent_id is usually the slug/name)
+            _caller_rec = identity_registry.get_by_slug(  # type: ignore[attr-defined]
+                _caller_agent_id
+            )
+            if _caller_rec is None:
+                # Fallback: look up by raw ID
+                _caller_rec = identity_registry.get(  # type: ignore[attr-defined]
+                    _caller_agent_id
+                )
+            if _caller_rec is not None:
+                # IdentityRecord dataclass or dict from Redis-backed registry
+                if hasattr(_caller_rec, "allowed_tools"):
+                    _at = _caller_rec.allowed_tools
+                elif isinstance(_caller_rec, dict):
+                    _at = _caller_rec.get("allowed_tools")
+                else:
+                    _at = None
+                # Only use it if it's a non-empty list — empty list = no restriction
+                if _at:
+                    caller_allowed_tools = list(_at)
+        except Exception as _at_exc:
+            # Lookup failure → no per-caller restriction (fail-open for tools
+            # lookup specifically; the connection deny-by-default still applies).
+            logger.warning(
+                "mcp-runtime: [P3] caller allowed_tools lookup failed "
+                "caller=%r: %s — no per-caller tool restriction applied",
+                _caller_agent_id, _at_exc,
+            )
+
     # ── 5. Route by method ────────────────────────────────────────────────
     if method in _GATED_METHODS:
         # tools/call — full broker.enforce() pipeline
@@ -341,6 +392,8 @@ async def _handle_mcp_call_inner(
             caller_sensitivity_ceiling=caller_sensitivity_ceiling,
             # 3.1 Phase 1 — caller identity for OPA input.
             caller_agent_id=_caller_agent_id,
+            # 3.1 Phase 3 — per-caller tool allow-list (None = no restriction).
+            caller_allowed_tools=caller_allowed_tools,
         )
 
         try:
