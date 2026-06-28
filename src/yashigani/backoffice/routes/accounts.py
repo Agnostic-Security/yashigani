@@ -229,10 +229,22 @@ async def create_admin(body: CreateAdminRequest, session: AdminSession):
 
     # Generate TOTP secret for provisioning — installer-privileged path
     # because another admin is onboarding this account out-of-band.
-    from yashigani.auth.totp import generate_provisioning
+    # Phase 13: admin tier → SHA-512/8-digit TOTP.
+    from yashigani.auth.totp import (
+        generate_provisioning,
+        TOTP_ALGO_SHA512,
+        TOTP_DIGITS_ADMIN,
+    )
 
-    totp = generate_provisioning(account_name=body.username, issuer="Yashigani")
-    await state.auth_service.set_totp_secret_direct(body.username, totp.secret_b32)
+    totp = generate_provisioning(
+        account_name=body.username,
+        issuer="Yashigani",
+        algorithm=TOTP_ALGO_SHA512,
+        digits=TOTP_DIGITS_ADMIN,
+    )
+    await state.auth_service.set_totp_secret_direct(
+        body.username, totp.secret_b32, algorithm=TOTP_ALGO_SHA512
+    )
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned
 

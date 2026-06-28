@@ -8705,17 +8705,22 @@ _gen_totp_secret() {
 }
 
 _gen_totp_uri() {
-  # otpauth://totp/Yashigani:username?secret=SECRET&issuer=Yashigani&digits=6&period=30
-  # RFC 6238 default algorithm is SHA-1. Omitting the algorithm parameter ensures
-  # universal compatibility — all authenticator apps (Google Authenticator, Authy,
-  # Microsoft Authenticator, Aegis, 1Password, etc.) default to SHA-1 TOTP.
-  # Supersedes P0-10 / SHA-256 minimum policy (reverted 2026-06-14, see YSG-RISK-078):
-  # HMAC-SHA1 TOTP is cryptographically secure; SHA-1 collision attacks do not
-  # affect HMAC. SHA-256 was a usability blocker (19/20 test users' apps unsupported).
+  # Phase 13 (Yashigani 3.1): Admin-tier TOTP upgraded to HMAC-SHA-512, 8 digits.
+  # otpauth://totp/Yashigani:username?secret=SECRET&issuer=Yashigani&algorithm=SHA512&digits=8&period=30
+  #
+  # All Yashigani admin accounts use SHA-512/8-digit TOTP from v3.1.
+  # User-tier accounts use SHA-256/6-digit; those are provisioned via the web UI.
+  #
+  # REQUIRED AUTHENTICATOR APP: agnosticOTP (iOS/Android) or Aegis — reads the
+  # algorithm= and digits= URI parameters. Classic Google Authenticator (SHA-1 only)
+  # is NOT compatible with SHA-512/8-digit TOTP and MUST NOT be used.
+  #
+  # YSG-RISK-078 context: the original SHA-256 reversion was driven by SHA-1-only
+  # apps failing silently. Phase 13 mandates agnosticOTP specifically to avoid this.
   local username="$1"
   local secret="$2"
   local issuer="${DOMAIN:-Yashigani}"
-  echo "otpauth://totp/Yashigani:${username}?secret=${secret}&issuer=${issuer}&digits=6&period=30"
+  echo "otpauth://totp/Yashigani:${username}?secret=${secret}&issuer=${issuer}&algorithm=SHA512&digits=8&period=30"
 }
 
 # Generate two distinct admin usernames from curated word lists

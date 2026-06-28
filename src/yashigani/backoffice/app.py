@@ -146,9 +146,10 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
         totp_secret = open(totp_file).read().strip()
         if totp_secret:
             # installer-privileged bootstrap path — see docstring on
-            # PostgresLocalAuthService.set_totp_secret_direct
-            await auth_service.set_totp_secret_direct(admin_username, totp_secret)
-            _log.info("Bootstrap: TOTP pre-provisioned from installer secret")
+            # PostgresLocalAuthService.set_totp_secret_direct.
+            # Phase 13: admin accounts use SHA-512/8-digit TOTP.
+            await auth_service.set_totp_secret_direct(admin_username, totp_secret, algorithm="SHA512")
+            _log.info("Bootstrap: TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
     _log.info("Bootstrap: initial admin account created — %s", admin_username)
 
     # --- Admin 2 (backup — anti-lockout) -------------------------------------
@@ -167,8 +168,9 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
             if _os.path.exists(totp2_file):
                 totp2_secret = open(totp2_file).read().strip()
                 if totp2_secret:
-                    await auth_service.set_totp_secret_direct(admin2_username, totp2_secret)
-                    _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret")
+                    # Phase 13: admin tier → SHA-512/8-digit TOTP.
+                    await auth_service.set_totp_secret_direct(admin2_username, totp2_secret, algorithm="SHA512")
+                    _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
             _log.info("Bootstrap: backup admin account created — %s", admin2_username)
 
 

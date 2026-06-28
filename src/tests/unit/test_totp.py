@@ -33,6 +33,13 @@ def _import_totp():
             verify_totp,
             verify_recovery_code,
             codes_remaining,
+            TOTP_ALGO_SHA1,
+            TOTP_ALGO_SHA256,
+            TOTP_ALGO_SHA512,
+            LEGACY_TOTP_ALGO,
+            ROLE_TOTP_ALGO,
+            ROLE_TOTP_DIGITS,
+            _totp_at,
         )
         return (
             TotpProvisioning, RecoveryCodeSet, _RECOVERY_CODE_COUNT, _RECOVERY_CODE_FORMAT,

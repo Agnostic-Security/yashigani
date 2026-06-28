@@ -23,7 +23,11 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
-from yashigani.auth.totp import generate_provisioning
+from yashigani.auth.totp import (
+    generate_provisioning,
+    TOTP_ALGO_SHA256,
+    TOTP_DIGITS_USER,
+)
 from yashigani.backoffice.schemas.bopla import UserAccountPublic, UserCreateResponse
 
 router = APIRouter()
@@ -280,8 +284,16 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
 
     # Generate TOTP secret for provisioning — installer-privileged path
     # because the admin is performing an out-of-band TOTP delivery.
-    totp = generate_provisioning(account_name=effective_username, issuer="Yashigani")
-    await state.auth_service.set_totp_secret_direct(effective_username, totp.secret_b32)
+    # Phase 13: user tier → SHA-256/6-digit TOTP.
+    totp = generate_provisioning(
+        account_name=effective_username,
+        issuer="Yashigani",
+        algorithm=TOTP_ALGO_SHA256,
+        digits=TOTP_DIGITS_USER,
+    )
+    await state.auth_service.set_totp_secret_direct(
+        effective_username, totp.secret_b32, algorithm=TOTP_ALGO_SHA256
+    )
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned, user just needs the URI
 
@@ -499,10 +511,15 @@ async def full_reset_user(
 
     # full_reset_user handles admin-TOTP verification + target reset atomically
     # inside a single tenant_transaction, using the Postgres-backed replay cache.
+    # Phase 13: pass admin's algorithm and digit count so verify_totp uses the right HMAC.
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _FRU_ROLE_DIGITS
+    _fru_admin_digits = _FRU_ROLE_DIGITS.get(admin_record.account_tier, 8)
     success, reason = await state.auth_service.full_reset_user(
         username,
         admin_totp_secret=admin_record.totp_secret,
         admin_totp_code=body.totp_code,
+        admin_totp_algorithm=admin_record.totp_algorithm,
+        admin_totp_digits=_fru_admin_digits,
     )
     if not success:
         if reason == "invalid_admin_totp":

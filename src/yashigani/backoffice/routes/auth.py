@@ -328,7 +328,11 @@ def _reset_ip_auth_failures(client_ip: str) -> None:
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1)
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 digits (users/SHA-256) or 8 digits (admins/SHA-512).
+    # The server validates the exact count against the account's totp_algorithm
+    # after role resolution — the route cannot know the tier before looking up
+    # the account.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 class PasswordChangeRequest(BaseModel):
@@ -337,12 +341,14 @@ class PasswordChangeRequest(BaseModel):
 
 
 class TotpConfirmRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 class SelfServiceResetRequest(BaseModel):
     username: str = Field(min_length=3)
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 @router.post("/login")
@@ -637,9 +643,18 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
 
     # Use the auth service's Postgres-backed replay cache so the self-service
     # path can't be abused for TOTP replay.
+    # Phase 13: pass the account's enrolled algorithm and role digit count.
     # pylint: disable=protected-access
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _SELF_RESET_ROLE_DIGITS
+    _self_reset_digits = _SELF_RESET_ROLE_DIGITS.get(record.account_tier, 6)
     async with _pg_tenant_transaction() as conn:
-        if not await state.auth_service._verify_totp_with_replay(conn, record.totp_secret, body.totp_code):
+        if not await state.auth_service._verify_totp_with_replay(
+            conn,
+            record.totp_secret,
+            body.totp_code,
+            algorithm=record.totp_algorithm,
+            digits=_self_reset_digits,
+        ):
             raise generic_error
 
     # TOTP valid — generate new temporary password and persist via the
@@ -1106,17 +1121,30 @@ async def provision_totp_start(
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
+    # Phase 13: include algorithm and digit count in the response so the client
+    # can display role-appropriate instructions.
+    _digit_word = f"{prov.digits}-digit"
+    _algo_note = (
+        "IMPORTANT: Classic Google Authenticator (SHA-1 only) is not compatible "
+        "with this account's TOTP tier. Use agnosticOTP (iOS/Android), Aegis, "
+        "or any authenticator that reads the 'algorithm' field from the "
+        "otpauth:// URI."
+    )
+
     return {
         "status": "pending_confirmation",
         "qr_code_png_b64": prov.qr_code_png_b64,
         "provisioning_uri": prov.provisioning_uri,
         "recovery_codes": prov.recovery_codes,  # shown once — client must acknowledge
         "recovery_codes_count": len(prov.recovery_codes),
+        "totp_algorithm": prov.algorithm,
+        "totp_digits": prov.digits,
         "message": (
-            "Scan the QR code with your authenticator app, then POST the "
-            "current 6-digit code to /auth/totp/provision/confirm to "
-            "complete enrolment. Store the recovery codes securely — "
-            "they will not be shown again."
+            f"Scan the QR code with agnosticOTP or a compatible authenticator app, "
+            f"then POST the current {_digit_word} code to "
+            f"/auth/totp/provision/confirm to complete enrolment. "
+            f"Store the recovery codes securely — they will not be shown again. "
+            f"{_algo_note}"
         ),
     }
 
@@ -1230,7 +1258,8 @@ async def provision_totp(
 
 
 class StepUpRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 @router.post("/stepup")
@@ -1314,8 +1343,17 @@ async def stepup_verify(
         )
 
     # Verify against Postgres-backed replay cache (same path as login).
+    # Phase 13: pass the account's enrolled algorithm and role digit count.
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _ROLE_TOTP_DIGITS
+    _stepup_digits = _ROLE_TOTP_DIGITS.get(admin_record.account_tier, 6)
     async with _pg_tenant_transaction() as conn:
-        ok = await state.auth_service._verify_totp_with_replay(conn, admin_record.totp_secret, body.totp_code)
+        ok = await state.auth_service._verify_totp_with_replay(
+            conn,
+            admin_record.totp_secret,
+            body.totp_code,
+            algorithm=admin_record.totp_algorithm,
+            digits=_stepup_digits,
+        )
 
     if not ok:
         try:

@@ -7,6 +7,10 @@ from yashigani.auth.password import (
     hibp_check_enabled, hibp_api_url,
 )
 from yashigani.auth.totp import (
+    TOTP_ALGO_SHA1, TOTP_ALGO_SHA256, TOTP_ALGO_SHA512,
+    LEGACY_TOTP_ALGO,
+    ROLE_TOTP_ALGO, ROLE_TOTP_DIGITS,
+    TOTP_DIGITS_ADMIN, TOTP_DIGITS_USER,
     generate_provisioning, generate_recovery_code_set,
     verify_totp, verify_recovery_code, codes_remaining,
     TotpProvisioning, RecoveryCodeSet,
@@ -36,6 +40,9 @@ __all__ = [
     "PasswordBreachedError", "PasswordContextError",
     "check_hibp", "validate_password_not_breached",
     "hibp_check_enabled", "hibp_api_url",
+    "TOTP_ALGO_SHA1", "TOTP_ALGO_SHA256", "TOTP_ALGO_SHA512",
+    "LEGACY_TOTP_ALGO", "ROLE_TOTP_ALGO", "ROLE_TOTP_DIGITS",
+    "TOTP_DIGITS_ADMIN", "TOTP_DIGITS_USER",
     "generate_provisioning", "generate_recovery_code_set",
     "verify_totp", "verify_recovery_code", "codes_remaining",
     "TotpProvisioning", "RecoveryCodeSet",
