@@ -163,6 +163,7 @@ registerAdminModule({
   id: 'license',
   label: 'License',
   icon: '⬡',
-  order: 90,
+  order: 40,
+  group: 'platform',
   render: (ctx) => html`<ys-admin-license .api=${ctx.api} .app=${ctx.app}></ys-admin-license>`,
 });

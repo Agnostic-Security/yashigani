@@ -3,20 +3,17 @@
 // Admin read + disable for user-authored no-code workflows and the scheduler's
 // run history, surfacing the per-step governance trail (ingress/egress OPA +
 // inspection verdict) the scheduler records for every governed step:
-//   GET   /user/workflows                       → workflow list
-//   GET   /user/workflows/{id}                  → full spec (steps + schedule)
-//   GET   /user/workflows/{id}/runs             → scheduler run history
-//   GET   /user/workflows/{id}/runs/{run_id}    → per-step detail
-//   PATCH /user/workflows/{id} {enabled:false}  → admin disable
+//   GET   /admin/workflows                       → workflow list (ALL owners)
+//   GET   /admin/workflows/{id}                  → full spec (steps + schedule)
+//   GET   /admin/workflows/{id}/runs             → scheduler run history
+//   GET   /admin/workflows/{id}/runs/{run_id}    → per-step detail
+//   PATCH /admin/workflows/{id} {enabled:false}  → admin disable
 //
-// ⚠ BACKEND GAP (flagged): these routes are user_workflows_router endpoints gated
-// by UserSession and BOLA-scoped to the *calling* identity (account_id ==
-// owner). There is NO admin-plane / cross-user oversight endpoint yet, so an
-// admin ApiClient (sessionKind:'admin') cannot enumerate OTHER users' workflows
-// through them — it would 401 (UserSession) or only ever see its own. This module
-// is the UI half of the contract; it needs a backend admin-oversight route
-// (e.g. GET /admin/workflows + /admin/workflows/{id}/runs with admin auth) to be
-// fully functional. Until then it renders the empty/locked state honestly.
+// These are the admin-plane oversight routes (gated by AdminSession): they
+// enumerate EVERY owner's workflows, not just the calling identity. The admin
+// ApiClient (sessionKind:'admin') reaches them directly. If a read fails / is
+// unauthorised the module renders the empty/locked state honestly (see
+// _renderGapBanner).
 //
 // SAFE-RENDER: workflow names/descriptions + step output are user-authored. All
 // fields render via Lit auto-escape (ys-table / ${value} / <pre> textContent) —
@@ -66,7 +63,7 @@ export class YsAdminWorkflows extends LitElement {
 
   async _load() {
     this._loading = true;
-    const res = await this.api.get('/user/workflows');
+    const res = await this.api.get('/admin/workflows');
     if (res == null) {
       // null = read failed / not authorised on the admin plane (the backend gap).
       this._unavailable = true;
@@ -81,12 +78,12 @@ export class YsAdminWorkflows extends LitElement {
   async _viewRuns(wfId) {
     this._selected = wfId;
     this._runDetail = null;
-    const res = await this.api.get(`/user/workflows/${encodeURIComponent(wfId)}/runs?limit=50`);
+    const res = await this.api.get(`/admin/workflows/${encodeURIComponent(wfId)}/runs?limit=50`);
     this._runs = (res && Array.isArray(res.runs)) ? res.runs : [];
   }
 
   async _disable(wfId) {
-    const res = await this.api.mutate(`/user/workflows/${encodeURIComponent(wfId)}`, {
+    const res = await this.api.mutate(`/admin/workflows/${encodeURIComponent(wfId)}`, {
       method: 'PATCH', body: { enabled: false },
     });
     if (res.ok) { this.app && this.app.toast('Workflow disabled.', 'success'); this._load(); }
@@ -100,12 +97,11 @@ export class YsAdminWorkflows extends LitElement {
   _renderGapBanner() {
     return html`
       <div class="ys-system-chrome" role="note">
-        <div class="ys-system-chrome-sentinel">Admin oversight — backend route required</div>
+        <div class="ys-system-chrome-sentinel">Admin oversight — workflows unavailable</div>
         <div class="ys-system-chrome-msg">
-          The workflow + run-history routes are user-plane (UserSession, BOLA-scoped
-          to the owner). Cross-user admin oversight needs a dedicated admin endpoint
-          (e.g. GET /admin/workflows). This panel is the UI half; wire the backend to
-          enumerate all owners.
+          Could not read the admin workflow oversight endpoint (GET /admin/workflows).
+          The session may have expired or lack the required step-up; re-authenticate
+          and retry. No cross-user workflows are visible until the read succeeds.
         </div>
       </div>`;
   }
@@ -198,6 +194,7 @@ registerAdminModule({
   id: 'workflows',
   label: 'Workflow oversight',
   icon: '⛓',
-  order: 35,
+  order: 40,
+  group: 'agents',
   render: (ctx) => html`<ys-admin-workflows .api=${ctx.api} .app=${ctx.app}></ys-admin-workflows>`,
 });

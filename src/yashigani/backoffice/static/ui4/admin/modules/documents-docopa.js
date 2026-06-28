@@ -230,6 +230,7 @@ registerAdminModule({
   id: 'documents',
   label: 'Document protection',
   icon: '🗎',
-  order: 55,
+  order: 20,
+  group: 'governance',
   render: (ctx) => html`<ys-admin-documents .api=${ctx.api} .app=${ctx.app}></ys-admin-documents>`,
 });

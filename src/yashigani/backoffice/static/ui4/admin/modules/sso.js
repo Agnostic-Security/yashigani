@@ -223,6 +223,7 @@ registerAdminModule({
   id: 'sso',
   label: 'SSO & federation',
   icon: '🌐',
-  order: 34,
+  order: 40,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-sso .api=${ctx.api} .app=${ctx.app}></ys-admin-sso>`,
 });

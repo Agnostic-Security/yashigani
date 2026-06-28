@@ -181,6 +181,7 @@ registerAdminModule({
   id: 'mcp',
   label: 'MCP Registry',
   icon: '⧉',
-  order: 26,
+  order: 30,
+  group: 'agents',
   render: (ctx) => html`<ys-admin-mcp .api=${ctx.api} .app=${ctx.app}></ys-admin-mcp>`,
 });

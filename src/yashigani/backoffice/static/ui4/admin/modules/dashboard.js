@@ -288,6 +288,7 @@ registerAdminModule({
   label: 'Dashboard',
   icon: '◧',
   order: 0,
+  group: 'overview',
   render: (ctx) => html`
     <ys-admin-dashboard .api=${ctx.api} .app=${ctx.app}></ys-admin-dashboard>`,
 });
