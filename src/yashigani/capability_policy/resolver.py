@@ -1,31 +1,35 @@
 """
-Yashigani Capability Policy — Resolution logic.
+Yashigani Capability Policy — Resolution logic (Phase 2: org-ceiling semantics).
 
-Resolution is per-capability (user may override only one capability and
-inherit the rest):
+Delegates to yashigani.permissions.resolver.resolve_browser_capability_set which
+enforces:
 
-    1. User override    — if explicitly set for this capability
-    2. Group override   — most-restrictive across user's groups that override
-                          this capability.
-                          Ordering: off (0) < self (1) < allow_list (2) — lowest wins.
-    3. Org policy       — the policy stored for the principal's org
-                          (cap_policy:org:{org_id} in Redis)
-    4. BASELINE         — immutable hardcoded fallback (default_policy(); self×5)
-                          used only when no org policy exists for the org
+    ORG IS THE CEILING — most-restrictive-wins.
 
-Unauthenticated callers (email=None or "") → org policy (not baseline),
-so operators can restrict unauthenticated sessions at the org level.
+    Effective setting per capability = most-restrictive of {org, group, user}
+    where off=0 < self=1 < allow_list=2.
 
-DEFAULT_ORG_ID is read from YASHIGANI_ORG_ID (default "default").  In
-single-instance deployments every principal belongs to this one org.
+    A lower-level (group, user) grant can only make a capability MORE
+    restrictive than the org setting, never less restrictive.
 
-Enterprise multi-org seam:
-    Pass an explicit org_id to resolve_policy(), or override _lookup_org() to
-    derive the org from the principal's attributes (e.g. via the RBAC store).
-    No other change required — the per-capability loop already falls through
-    cleanly from group → org → baseline.
+Phase 2 behaviour change vs Phase 1
+-------------------------------------
+    BEFORE (Phase 1):
+        Precedence was user > most-restrictive group > org > baseline.
+        A user-level setting could WIDEN above the org (e.g. user="allow_list"
+        overrides org="self").
 
-Last updated: 2026-06-27T00:00:00+00:00
+    AFTER (Phase 2, this module):
+        Most-restrictive-wins across all tiers.  Org is the ceiling.
+        User "allow_list" is capped at org "self" → effective = "self".
+        User "off" still works (narrows below org "self" → effective = "off").
+
+DEFAULT_ORG_ID is read from YASHIGANI_ORG_ID (default "default").
+
+Unauthenticated callers (email=None or "")
+    Group and user tiers are skipped; org policy (or baseline) is returned.
+
+Last updated: 2026-06-28T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -34,21 +38,13 @@ import os
 from typing import Optional
 
 from yashigani.capability_policy.model import (
-    CapabilitySetting,
     CapabilityPolicySet,
-    CAPABILITY_NAMES,
     default_policy,
 )
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Default org configuration
-# ---------------------------------------------------------------------------
-
 #: The org ID used when no explicit org_id is passed to resolve_policy().
-#: Set YASHIGANI_ORG_ID in the environment to override (e.g. for multi-org
-#: Enterprise where the caller must always supply an explicit org_id).
 DEFAULT_ORG_ID: str = os.getenv("YASHIGANI_ORG_ID", "default")
 
 
@@ -56,96 +52,66 @@ def _lookup_org(email: Optional[str], rbac_store) -> str:
     """
     Return the org_id for *email*.
 
-    In single-instance: always returns DEFAULT_ORG_ID.
-    Enterprise multi-org seam: override this function (or pass org_id
-    explicitly to resolve_policy) to derive the org from the RBAC store or
-    a directory attribute.
+    Single-instance: always returns DEFAULT_ORG_ID.
+    Enterprise multi-org seam: override this or pass org_id explicitly to
+    resolve_policy() to derive the org from a directory attribute.
     """
-    # single-instance: constant default org
     return DEFAULT_ORG_ID
 
 
-# ---------------------------------------------------------------------------
-# Resolver
-# ---------------------------------------------------------------------------
-
 def resolve_policy(
     email: Optional[str],
-    rbac_store,    # RBACStore | None  (typed Any to avoid circular import)
-    policy_store,  # CapabilityPolicyStore
+    rbac_store,
+    policy_store,
     org_id: Optional[str] = None,
 ) -> CapabilityPolicySet:
     """
-    Resolve the full Permissions-Policy for *email*.
+    Resolve the full Permissions-Policy for *email* using org-ceiling semantics.
 
-    Precedence per capability (highest → lowest):
-        user > most-restrictive group > org(of principal) > BASELINE
+    Delegates to yashigani.permissions.resolver.resolve_browser_capability_set.
 
     Always returns a complete CapabilityPolicySet (all 5 capabilities).
-    Falls back gracefully on any internal error — never propagates exceptions
-    to the caller (middleware must not blow up a response that has already
-    been produced by the route handler).
+    Falls back gracefully on any internal error.
 
     Parameters
     ----------
     email:
-        Principal email.  None or "" → unauthenticated; org policy is returned
-        (group and user tiers are skipped).
+        Principal email.  None or "" → unauthenticated; group and user tiers
+        are skipped; org policy (or baseline) is returned.
     rbac_store:
-        RBACStore instance used for group membership lookup.  None → group
-        tier is skipped.
+        RBACStore instance for group-membership lookup.  None → group tier
+        is skipped.
     policy_store:
-        CapabilityPolicyStore instance.
+        CapabilityPolicyStore (or the underlying PermissionStore).
     org_id:
-        Explicit org identifier.  None → derived via _lookup_org() which
-        returns DEFAULT_ORG_ID in single-instance deployments.
+        Explicit org identifier.  None → derived via _lookup_org().
     """
+    from yashigani.permissions.resolver import resolve_browser_capability_set
+
     try:
-        effective_org_id: str = org_id if org_id is not None else _lookup_org(email, rbac_store)
-        org_policy: CapabilityPolicySet = policy_store.get_org(effective_org_id)
+        effective_org_id: str = (
+            org_id if org_id is not None else _lookup_org(email, rbac_store)
+        )
 
-        # Unauthenticated → org policy (already contains all 5 capabilities)
-        if not email:
-            return org_policy
-
-        user_overrides: dict[str, CapabilitySetting] = policy_store.get_user(email)
-
-        # Collect per-capability group settings
-        group_settings_by_cap: dict[str, list[CapabilitySetting]] = {
-            cap: [] for cap in CAPABILITY_NAMES
-        }
-        if rbac_store is not None:
+        # Resolve group membership for the principal.
+        group_ids: list[str] = []
+        if email and rbac_store is not None:
             try:
                 groups = rbac_store.get_user_groups(email)
-                for group in groups:
-                    grp_policy = policy_store.get_group(group.id)
-                    for cap, setting in grp_policy.items():
-                        group_settings_by_cap[cap].append(setting)
+                group_ids = [g.id for g in groups]
             except Exception as grp_exc:
                 logger.warning(
                     "cap_policy: group lookup failed for %s: %s", email, grp_exc
                 )
 
-        result: CapabilityPolicySet = {}
-        for cap in CAPABILITY_NAMES:
-            # Tier 1 — explicit user override
-            if cap in user_overrides:
-                result[cap] = user_overrides[cap]
-                continue
-
-            # Tier 2 — most-restrictive group override
-            candidates = group_settings_by_cap[cap]
-            if candidates:
-                most_restrictive = min(candidates, key=lambda s: s.restrictiveness())
-                result[cap] = most_restrictive
-                continue
-
-            # Tier 3 — org policy (operator-configurable)
-            result[cap] = org_policy[cap]
-            # Tier 4 (BASELINE) is already merged into org_policy by get_org(),
-            # so no explicit baseline lookup is needed here.
-
-        return result
+        # Delegate to the unified resolver which enforces org-ceiling.
+        perm_store = getattr(policy_store, "perm_store", policy_store)
+        return resolve_browser_capability_set(
+            org_id=effective_org_id,
+            group_ids=group_ids,
+            user_email=email,
+            store=perm_store,
+        )
 
     except Exception as exc:
         logger.error(

@@ -116,8 +116,17 @@ class TestResolverPrecedence:
         assert result["camera"].value == "off"  # org override
         assert result["microphone"].value == "self"  # baseline via org
 
-    def test_user_override_wins_over_org(self):
-        """User-level override takes precedence over org policy."""
+    def test_org_ceiling_caps_user_widen_attempt(self):
+        """
+        Phase 2 (org-ceiling): user cannot widen above org.
+        Org sets camera="off"; user tries to widen to "self".
+        Effective = most-restrictive of {org="off", user="self"} = "off".
+
+        Changed from Phase 1 test_user_override_wins_over_org which asserted
+        result["camera"].value == "self" (user won).  Under the new org-ceiling
+        semantics, org="off" caps the user's "self" attempt — the user can only
+        NARROW, never widen.
+        """
         from yashigani.capability_policy.resolver import resolve_policy
         from yashigani.capability_policy.model import CapabilitySetting
         store = _make_store(
@@ -126,10 +135,19 @@ class TestResolverPrecedence:
         )
         rbac = _make_rbac_store({})
         result = resolve_policy("alice@example.com", rbac, store)
-        assert result["camera"].value == "self"  # user wins over org "off"
+        assert result["camera"].value == "off"  # org ceiling: "off" caps user "self"
 
-    def test_user_override_wins_over_group(self):
-        """User-level override wins even if group is more restrictive."""
+    def test_group_deny_caps_user_widen_attempt(self):
+        """
+        Phase 2 (org-ceiling): user cannot widen above group.
+        Group sets microphone="off"; user tries to widen to "self".
+        Effective = most-restrictive of {org="self"(baseline), group="off", user="self"} = "off".
+
+        Changed from Phase 1 test_user_override_wins_over_group which asserted
+        result["microphone"].value == "self" (user won over group "off").
+        Under the new most-restrictive-wins semantics, the more restrictive
+        group setting "off" takes precedence — user can only narrow, not widen.
+        """
         from yashigani.capability_policy.resolver import resolve_policy
         from yashigani.capability_policy.model import CapabilitySetting
         store = _make_store(
@@ -138,7 +156,7 @@ class TestResolverPrecedence:
         )
         rbac = _make_rbac_store({"bob@example.com": ["group-1"]})
         result = resolve_policy("bob@example.com", rbac, store)
-        assert result["microphone"].value == "self"  # user explicit wins
+        assert result["microphone"].value == "off"  # group "off" is more restrictive than user "self"
 
     def test_group_override_wins_over_org(self):
         """Group override takes precedence over the org policy."""
@@ -181,7 +199,26 @@ class TestResolverPrecedence:
         assert result["camera"].value == "off"  # most restrictive = off (restrictiveness 0)
 
     def test_per_capability_inheritance_three_levels(self):
-        """User overrides only one capability; others are inherited from group or org."""
+        """
+        Phase 2 (org-ceiling): per-capability most-restrictive wins.
+
+        Setup:
+          org: fullscreen="off"  (org overrides only fullscreen)
+          group grp-x: microphone="off"
+          user eve: camera="allow_list"  (tries to widen above org baseline "self")
+
+        Expected (org-ceiling, most-restrictive-wins):
+          camera:        org="self" (baseline), user="allow_list" →
+                         most-restrictive=min(self=1, allow_list=2)="self"
+                         User "allow_list" is capped at org's "self". [CHANGED from Phase 1]
+          microphone:    org="self", group="off" → min(self=1, off=0)="off"
+          fullscreen:    org="off" → "off"
+          geolocation:   org="self" (baseline), no overrides → "self"
+          display-capture: org="self" (baseline), no overrides → "self"
+
+        Phase 1 asserted camera="allow_list" (user won).  Phase 2 corrects this:
+        the user's attempt to widen above the org baseline "self" is blocked.
+        """
         from yashigani.capability_policy.resolver import resolve_policy
         from yashigani.capability_policy.model import CapabilitySetting
 
@@ -193,21 +230,28 @@ class TestResolverPrecedence:
         rbac = _make_rbac_store({"eve@example.com": ["grp-x"]})
         result = resolve_policy("eve@example.com", rbac, store)
 
-        assert result["camera"].value == "allow_list"        # user override
-        assert result["camera"].allow_list == ["https://cam.example.com"]
-        assert result["microphone"].value == "off"           # group override
+        # camera: org="self" caps user "allow_list" — org ceiling enforced [CHANGED]
+        assert result["camera"].value == "self"
+        assert result["camera"].allow_list == []
+        assert result["microphone"].value == "off"           # group override (most-restrictive)
         assert result["fullscreen"].value == "off"           # org override
         assert result["geolocation"].value == "self"         # baseline (via org)
         assert result["display-capture"].value == "self"     # baseline (via org)
 
     def test_full_precedence_chain_all_four_tiers(self):
         """
-        Full 4-tier chain — one capability at each tier:
-            camera      → user override (allow_list)
-            microphone  → group override (off)
-            geolocation → org override (off)
-            fullscreen  → baseline (self — org untouched)
-            display-capture → baseline (self — org untouched)
+        Phase 2 (org-ceiling): full most-restrictive-wins chain across all tiers.
+
+        Setup (demonstrates narrowing at each tier, not widening):
+            camera:          user sets "off" (user narrowing below org baseline "self")
+            microphone:      group sets "off" (group narrowing below org baseline "self")
+            geolocation:     org sets "off" (org ceiling)
+            fullscreen:      no override → baseline "self" (via org)
+            display-capture: no override → baseline "self" (via org)
+
+        Phase 1 used camera="allow_list" to show "user wins".  Phase 2 corrects
+        this: the test now shows user NARROWING (user="off") rather than widening.
+        Under org-ceiling semantics only narrowing is meaningful at the user tier.
         """
         from yashigani.capability_policy.resolver import resolve_policy
         from yashigani.capability_policy.model import CapabilitySetting
@@ -216,20 +260,19 @@ class TestResolverPrecedence:
             org_overrides={"geolocation": CapabilitySetting("off")},
             group_overrides={"grp-a": {"microphone": CapabilitySetting("off")}},
             user_overrides={"test@example.com": {
-                "camera": CapabilitySetting("allow_list", ["https://trusted.example.com"])
+                "camera": CapabilitySetting("off")  # user narrows (off < org-baseline self)
             }},
         )
         rbac = _make_rbac_store({"test@example.com": ["grp-a"]})
         result = resolve_policy("test@example.com", rbac, store)
 
-        # Tier 1 — user
-        assert result["camera"].value == "allow_list"
-        assert result["camera"].allow_list == ["https://trusted.example.com"]
-        # Tier 2 — group
+        # User tier — user set "off" which narrows below org baseline "self"
+        assert result["camera"].value == "off"
+        # Group tier — group "off" narrows below org baseline "self"
         assert result["microphone"].value == "off"
-        # Tier 3 — org
+        # Org tier — org ceiling at "off"
         assert result["geolocation"].value == "off"
-        # Tier 4 — baseline (via org which defaults to self)
+        # Baseline via org — no override, org baseline = "self"
         assert result["fullscreen"].value == "self"
         assert result["display-capture"].value == "self"
 
@@ -291,17 +334,29 @@ class TestResolverPrecedence:
         assert result_after["camera"].value == "self"
 
     def test_allow_list_origins_preserved_in_resolution(self):
-        """allow_list entries are preserved through the resolver."""
+        """
+        allow_list entries are preserved through the resolver.
+
+        Phase 2 note: Under org-ceiling semantics a user cannot widen above org.
+        To test allow_list origin round-trip, the org-level policy must itself
+        carry allow_list origins (org is the ceiling).  The user tier can then
+        either inherit or narrow further.
+
+        Here the ORG sets display-capture=allow_list with specific origins and
+        the user has no override → the org allow_list origins must come through
+        unchanged.
+        """
         from yashigani.capability_policy.resolver import resolve_policy
-        from yashigani.capability_policy.model import CapabilitySetting
+        from yashigani.capability_policy.model import CapabilitySetting, default_policy
 
         origins = ["https://app1.example.com", "https://app2.example.com"]
         store = _make_store(
-            user_overrides={"frank@example.com": {
+            org_overrides={
                 "display-capture": CapabilitySetting("allow_list", origins)
-            }},
+            },
         )
         rbac = _make_rbac_store({})
+        # frank has no user/group override → inherits org allow_list
         result = resolve_policy("frank@example.com", rbac, store)
         assert result["display-capture"].value == "allow_list"
         assert result["display-capture"].allow_list == origins

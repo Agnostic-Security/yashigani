@@ -346,6 +346,13 @@ class EventType(str, Enum):
     # "user"); scope_id carries the group_id or email (empty for global).
     # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
     CAPABILITY_POLICY_CHANGED = "CAPABILITY_POLICY_CHANGED"
+    # 3.1 — Unified permission store (Phase 2 core model).
+    # PERMISSION_GRANT_CHANGED generalises CAPABILITY_POLICY_CHANGED to cover all
+    # resource_types (mcp_server, external_api, cloud_model, agent,
+    # browser_capability).  One event type covers any grant create/update/delete
+    # on any scope (org/group/user/agent).
+    # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    PERMISSION_GRANT_CHANGED = "PERMISSION_GRANT_CHANGED"
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +879,47 @@ class CapabilityPolicyChangedEvent(AuditEvent):
     scope_id: str = ""      # org_id, group_id, or email (depending on scope)
     change_type: str = ""   # "set" | "deleted"
     capabilities_changed: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Unified permission grant events (3.1 — Phase 2 core model)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PermissionGrantChangedEvent(AuditEvent):
+    """
+    Written on every create/update/delete of a permission grant in the unified
+    PermissionStore (Phase 2, yashigani.permissions).
+
+    Generalises CapabilityPolicyChangedEvent to cover all resource_types:
+        mcp_server, external_api, cloud_model, agent, browser_capability.
+
+    Security invariants:
+    - The grant value IS recorded (non-secret security configuration — matches
+      the RBAC config audit pattern).
+    - masking_applied=True suppresses the record in lower-assurance sinks.
+    - resource_type: one of the ResourceType enum values.
+    - resource_id:   server_id / api_id / model_name / agent_id / capability_name.
+    - scope:         "org" | "group" | "user" | "agent".
+    - scope_id:      org_id, group_id, email, or agent_id.
+    - change_type:   "set" | "deleted".
+
+    ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.PERMISSION_GRANT_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    resource_type: str = ""    # ResourceType value
+    resource_id: str = ""      # per-resource identifier
+    scope: str = ""            # "org" | "group" | "user" | "agent"
+    scope_id: str = ""         # org_id, group_id, email, or agent_id
+    change_type: str = ""      # "set" | "deleted"
+    # For boolean grants: {"allow": True/False, "opa_policy_ref": ...}
+    # For browser_capability: {"value": "off|self|allow_list", "allow_list": [...]}
+    grant_value: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
