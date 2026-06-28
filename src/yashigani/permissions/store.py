@@ -370,3 +370,91 @@ class PermissionStore:
                 resource_type.value, scope_kind, scope_id, exc,
             )
             return 0
+
+    # ------------------------------------------------------------------
+    # Pending declarations — declare→approve flow (Phase 8 admin API)
+    # ------------------------------------------------------------------
+    #
+    # Key schema:
+    #   perm:pending:{resource_type}:{resource_id}  → JSON blob
+    #   perm:pending_idx:{resource_type}            → SADD resource_id
+    #
+    # "Pending" means: declared but not yet approved at org level.
+    # The approval step (POST /declarations/.../approve) creates the org-level
+    # grant and removes the declaration from the pending queue.
+
+    def declare_pending(
+        self,
+        resource_type: ResourceType,
+        resource_id: str,
+        *,
+        declared_by: str,
+        justification: str,
+        declared_at: str,
+    ) -> None:
+        """
+        Record a pending declaration for (resource_type, resource_id).
+
+        declared_by:   identity that submitted the declaration
+                       (e.g. "agent:my-agent" or admin account_id)
+        justification: short human-readable reason
+        declared_at:   ISO-8601 UTC timestamp
+        """
+        key = "perm:pending:{}:{}".format(resource_type.value, resource_id)
+        idx = "perm:pending_idx:{}".format(resource_type.value)
+        self._redis.set(key, json.dumps({
+            "resource_type": resource_type.value,
+            "resource_id": resource_id,
+            "declared_by": declared_by,
+            "justification": justification,
+            "declared_at": declared_at,
+        }))
+        self._redis.sadd(idx, resource_id)
+
+    def get_pending_declarations(
+        self,
+        resource_type: Optional[ResourceType] = None,
+    ) -> list[dict]:
+        """
+        Return all pending declarations.
+
+        If resource_type is given, returns only that type.
+        Otherwise returns all types across all ResourceType values.
+
+        Each entry is a dict with keys:
+            resource_type, resource_id, declared_by, justification, declared_at
+        """
+        types_to_query = [resource_type] if resource_type is not None else list(ResourceType)
+        results: list[dict] = []
+        try:
+            for rt in types_to_query:
+                idx = "perm:pending_idx:{}".format(rt.value)
+                resource_ids = self._redis.smembers(idx) or set()
+                for rid_bytes in resource_ids:
+                    rid = rid_bytes.decode() if isinstance(rid_bytes, bytes) else rid_bytes
+                    key = "perm:pending:{}:{}".format(rt.value, rid)
+                    raw = self._redis.get(key)
+                    if raw is not None:
+                        try:
+                            results.append(json.loads(raw))
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger.error("perm: get_pending_declarations failed: %s", exc)
+        return sorted(results, key=lambda d: (d.get("resource_type", ""), d.get("resource_id", "")))
+
+    def remove_pending_declaration(
+        self,
+        resource_type: ResourceType,
+        resource_id: str,
+    ) -> bool:
+        """
+        Remove a pending declaration.  Returns True if the declaration existed.
+        """
+        key = "perm:pending:{}:{}".format(resource_type.value, resource_id)
+        idx = "perm:pending_idx:{}".format(resource_type.value)
+        n: int = self._redis.delete(key)
+        if n > 0:
+            self._redis.srem(idx, resource_id)
+            return True
+        return False

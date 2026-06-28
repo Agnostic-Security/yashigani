@@ -107,6 +107,8 @@ from yashigani.backoffice.routes import (
     cloud_keys_router,
     # 3.0 — admin-configurable browser Permissions-Policy
     capability_policy_router,
+    # 3.1 Phase 8 — unified permission grant admin API
+    permissions_router,
 )
 
 
@@ -917,6 +919,7 @@ def create_backoffice_app() -> FastAPI:
         ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
         ("/api/v1/admin/pki", 256),        # PKI rotate body (service name in URL, no body)
         ("/admin/ratelimit", 8 * 1024),
+        ("/admin/api/permissions", 16 * 1024),
         ("/admin/api/capability-policy", 8 * 1024),
         ("/admin/rbac", 32 * 1024),
         ("/admin/alerts", 32 * 1024),
@@ -1262,6 +1265,13 @@ def create_backoffice_app() -> FastAPI:
         capability_policy_router,
         prefix="/admin/api/capability-policy",
         tags=["capability-policy"],
+    )
+
+    # 3.1 Phase 8 — unified permission grant admin API
+    app.include_router(
+        permissions_router,
+        prefix="/admin/api/permissions",
+        tags=["permissions"],
     )
 
     # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
