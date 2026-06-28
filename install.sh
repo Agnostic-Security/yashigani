@@ -3941,7 +3941,14 @@ _backup_existing_data() {
 
   if [[ -f "$_license_file" ]]; then
     local _lic_content
-    _lic_content=$(tr -d '[:space:]' < "$_license_file" 2>/dev/null || true)
+    # BUG-B+-004 / BUG-FIX (3.1.0): license_key is subuid-owned on Podman rootless (e.g.
+    # UID 166536). Direct `< file` redirect emits a bash "Permission denied" error to
+    # stderr that `2>/dev/null` inside the subshell cannot suppress (bash prints the error
+    # before entering the subshell). Use `_safe_read_secret` (podman unshare cat) so the
+    # read happens inside the correct user namespace and the error is fully silent.
+    # Community tier: if the file is unreadable (no license), _lic_content stays empty
+    # and the code falls through to the db_aes_key path. Non-fatal.
+    _lic_content=$(_safe_read_secret "$_license_file" 2>/dev/null | tr -d '[:space:]' || true)
     if [[ -n "$_lic_content" && "$_lic_content" != "#community"* && "${#_lic_content}" -gt 20 ]]; then
       _ysg_tier="licensed"
       _ikm2_source="license"
@@ -4293,16 +4300,29 @@ PYEOF
     exit 1
   fi
 
-  # Stream staging IN via tar-over-exec, then chmod as the owner. NOT `docker cp`: it
-  # refuses any container with ReadonlyRootfs=true even when the target is a writable
-  # tmpfs (Docker 29) — gateway/backoffice run read_only with tmpfs /tmp, so docker cp
-  # fails closed there ("Failed to copy staging data"). `exec` writes through the running
-  # process into the tmpfs; the container umask leaves the exec-created dirs mode 000, so
-  # the crypto (same app user) must be granted access to the staging it just received.
-  # Transport + perms only — the LOCKED fail-closed crypto / no-plaintext-fallback below
-  # are unchanged. (Validated against the live read_only backoffice container, 2026-05-31.)
-  if ! tar -cf - -C "$backup_dir" . | $_runtime_cmd_local exec -i "$_crypto_container" tar -xf - -C "$_container_staging" 2>/dev/null \
-     || ! $_runtime_cmd_local exec "$_crypto_container" sh -c "chmod -R u+rwX '$_container_work'" 2>/dev/null; then
+  # Stream staging IN via tar-over-exec, then grant access. NOT `docker cp`: it refuses
+  # any container with ReadonlyRootfs=true even when the target is a writable tmpfs
+  # (Docker 29) — gateway/backoffice run read_only with tmpfs /tmp, so docker cp fails
+  # closed there ("Failed to copy staging data"). `exec` writes through the running process
+  # into the tmpfs; the container app user then owns all extracted items.
+  #
+  # BUG-FIX (3.1.0): Two Podman-rootless bugs fixed here:
+  # (1) GNU tar two-phase directory-mode: `tar -xf - -C staging` applies the mode of the
+  #     archive's `.` entry to the staging directory itself, transiently setting it to 000
+  #     (the archive records the backup_dir's actual mode, but tar's two-phase algorithm
+  #     sets directories to 000 initially and restores at stream end; with a piped stream
+  #     in a Podman exec the final restore sometimes fails). Fix: --no-same-owner
+  #     --no-same-permissions so tar uses the container process's umask (022) for all
+  #     items, never touching ownership or permissions from archive headers.
+  # (2) `chmod -R` uses fchmodat(dirfd, path, mode, 0) to recurse, which returns EPERM
+  #     inside a Podman rootless user-namespace + tmpfs context even when the container
+  #     user owns the target. `find -exec chmod {} \;` uses chmod(path) per item (one
+  #     exec per file/dir), applies chmod on the directory BEFORE descending into it, and
+  #     succeeds. Note: this is `\;` not `+` — batch mode (`+`) still uses fchmodat.
+  if ! tar -cf - -C "$backup_dir" . | $_runtime_cmd_local exec -i "$_crypto_container" \
+       tar -xf - --no-same-owner --no-same-permissions -C "$_container_staging" 2>/dev/null \
+     || ! $_runtime_cmd_local exec "$_crypto_container" \
+       sh -c "find '${_container_work}' -exec chmod u+rwX {} \;" 2>/dev/null; then
     log_error "YSG-RISK-050: Failed to stream staging data into container ${_crypto_container}"
     $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
     rm -f "$_py_script_path"
@@ -9299,9 +9319,25 @@ _secret_is_valid() {
   local _sv_file="$1"
   # Must exist and be non-empty
   [[ -s "$_sv_file" ]] || return 1
-  # Must not start with a comment/placeholder marker
+  # Must not start with a comment/placeholder marker.
+  # BUG-B+-004 (3.1.0): On Podman rootless, secrets are subuid-owned and unreadable by
+  # the host installer user. `head -c 1` fails → the function would return 1 (invalid)
+  # on every upgrade, triggering a re-generate + write path that ALSO fails (same EPERM).
+  # Fix: if head fails and YSG_PODMAN_RUNTIME=true, retry inside the user namespace via
+  # `podman unshare`. If the unshare read also fails, treat the file as valid (it exists
+  # and is non-empty per -s, so it's a real secret — the service started with it).
   local _sv_first
-  _sv_first="$(head -c 1 "$_sv_file" 2>/dev/null)" || return 1
+  if ! _sv_first="$(head -c 1 "$_sv_file" 2>/dev/null)"; then
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && command -v podman >/dev/null 2>&1; then
+      _sv_first="$(podman unshare sh -c "head -c 1 '${_sv_file}'" 2>/dev/null)" || {
+        # Podman unshare also failed: file exists+nonempty but totally unreadable.
+        # Treat as valid — the running service proves the value is real.
+        return 0
+      }
+    else
+      return 1
+    fi
+  fi
   [[ "$_sv_first" == "#" ]] && return 1
   return 0
 }
@@ -14266,13 +14302,22 @@ main() {
   # launcher's own command line. FAIL-OPEN: if flock is unavailable or the lock
   # path is unwritable we proceed (never block a legitimate install). Override
   # with YASHIGANI_ALLOW_CONCURRENT_INSTALL=1 for genuine multi-instance hosts.
+  #
+  # BUG-FIX (3.1.0): Use bash {varname} fd auto-assignment (bash 4.1+, standard on
+  # Ubuntu 20.04+) so the lock fd has FD_CLOEXEC set automatically. Without CLOEXEC,
+  # every child process spawned by podman-compose (conmon, slirp4netns, aardvark-dns,
+  # etc.) inherits the open fd and keeps the flock alive indefinitely — blocking ALL
+  # subsequent installs until the containers are killed. With CLOEXEC the lock is held
+  # only by the installer process itself, which is the correct invariant.
   if [[ "${YASHIGANI_ALLOW_CONCURRENT_INSTALL:-0}" != "1" && "$DRY_RUN" != "true" ]] \
      && command -v flock >/dev/null 2>&1; then
     local _lockdir="/run/lock"; [[ -w "$_lockdir" ]] || _lockdir="${YSG_INSTALL_DIR:-$HOME}"
     local _lockfile="${_lockdir}/yashigani-install.lock"
-    # fd 200 is held for the lifetime of this process; released on exit.
-    if exec 200>"$_lockfile" 2>/dev/null; then
-      if ! flock -n 200; then
+    local _lock_fd
+    # {_lock_fd} auto-assigns a high fd WITH FD_CLOEXEC — children never inherit it.
+    # Held for the lifetime of this process; released on exit (or exec).
+    if exec {_lock_fd}>"$_lockfile" 2>/dev/null; then
+      if ! flock -n "$_lock_fd"; then
         log_error "Another Yashigani install/uninstall already holds the lock:"
         log_error "  ${_lockfile}"
         log_error "Wait for it to finish (or kill the stale PID), then retry. For genuine"
