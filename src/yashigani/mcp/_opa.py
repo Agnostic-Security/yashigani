@@ -209,6 +209,11 @@ def _build_opa_input(
     # normalised before OPA evaluation.  Redaction is applied separately
     # to tool_args_redacted.
     tool_args: Optional[dict] = None,
+    # 3.1 Phase 1 — caller identity dict, e.g.
+    #   {"agent_id": "agent-foo", "user_id": "user-1"}
+    # Purely additive: existing OPA policies that do not reference input.caller
+    # are no-ops; the field is ignored.  Passed from McpCallContext.caller_agent_id.
+    caller: Optional[dict] = None,
 ) -> dict:
     """
     Build the OPA input document.
@@ -240,6 +245,10 @@ def _build_opa_input(
         "action": action,
         "identity": identity,
     }
+
+    # 3.1 Phase 1 — caller identity: purely additive, no-op for unbound policies.
+    if caller is not None:
+        doc["caller"] = caller
 
     # FIX-P3-ENFORCE / Iris F2: embed agent.name so per-agent rego packages
     # can inspect it (e.g. package yashigani.agents.filesystem allow rule).
@@ -316,6 +325,10 @@ async def query_mcp_decision(
     prompt_sensitivity: Optional[str] = None,
     agent_name: Optional[str] = None,
     http_client: Optional[httpx.AsyncClient] = None,
+    # 3.1 Phase 1 — caller identity forwarded from McpCallContext.caller_agent_id.
+    # Purely additive: absent callers leave the field undefined in OPA input;
+    # unbound policies are no-ops.
+    caller: Optional[dict] = None,
 ) -> OpaDecisionResult:
     """
     Query OPA for an MCP call decision. Fail-closed on any failure.
@@ -344,6 +357,7 @@ async def query_mcp_decision(
             resource_sensitivity=resource_sensitivity,
             prompt_sensitivity=prompt_sensitivity,
             agent_name=agent_name,
+            caller=caller,
         )
     except ValueError as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)

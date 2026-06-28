@@ -127,6 +127,19 @@ class McpCallContext:
     # from the authenticated caller identity before the egress check.
     caller_sensitivity_ceiling: Optional[str] = None
 
+    # 3.1 Phase 1 — calling agent's identity for MCP authorization decisions.
+    # Populated by the transport layer; flows into the OPA input so policies
+    # can make caller-aware decisions (e.g. per-caller rate limits, allow-lists).
+    # Values:
+    #   - agent_id string: from AgentAuthMiddleware (request.state.agent_id)
+    #     for authenticated agent-originated MCP calls.
+    #   - "gateway:orchestrator": reserved service identity for the gateway's
+    #     own orchestrator when it issues MCP calls via the gateway-mediated
+    #     self-call path (detected via X-Yashigani-Orchestration-Depth header).
+    #   - None (default): caller not identified / unauthenticated path.
+    # Phase 1 is ADDITIVE — unbound policies are no-ops on this field.
+    caller_agent_id: Optional[str] = None
+
 
 @dataclass
 class OpaDecision:

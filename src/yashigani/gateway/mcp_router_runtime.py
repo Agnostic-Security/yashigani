@@ -271,6 +271,24 @@ async def _handle_mcp_call_inner(
     call_id = str(uuid.uuid4())
     request_id = str(uuid.uuid4())
 
+    # 3.1 Phase 1 — resolve the calling agent's identity for the OPA input.
+    #
+    # Priority 1: AgentAuthMiddleware sets request.state.agent_id for requests
+    #   authenticated via the agent PSK pathway (X-Yashigani-Caller-Agent-Id +
+    #   Authorization: Bearer <PSK>).  This is the normal agent→MCP path.
+    #
+    # Priority 2: X-Yashigani-Orchestration-Depth header marks a gateway
+    #   orchestrator self-call (see orchestrator._self_call_headers).  The
+    #   reserved identity "gateway:orchestrator" is used so OPA policies can
+    #   distinguish internal-gateway MCP hops from external agent hops.
+    #
+    # Priority 3: None — caller is unauthenticated or not yet identified.
+    #   Phase 1 is additive: unbound policies treat an absent caller as no-op.
+    _caller_agent_id: Optional[str] = getattr(request.state, "agent_id", None)
+    if not _caller_agent_id:
+        if _raw_headers.get("x-yashigani-orchestration-depth") is not None:
+            _caller_agent_id = "gateway:orchestrator"
+
     # G-ORCH-OPA-1 / Option A: look up the caller's sensitivity_ceiling from
     # the identity registry (keyed by the X-Forwarded-User slug).  This is the
     # SAME registry the openai_router uses for identity resolution — no new store.
@@ -321,6 +339,8 @@ async def _handle_mcp_call_inner(
             # G-ORCH-OPA-1 / Option A: populate from identity registry lookup.
             # None when registry absent or user not found → fail-closed at egress.
             caller_sensitivity_ceiling=caller_sensitivity_ceiling,
+            # 3.1 Phase 1 — caller identity for OPA input.
+            caller_agent_id=_caller_agent_id,
         )
 
         try:
@@ -513,6 +533,8 @@ async def _handle_mcp_call_inner(
             call_id=call_id,
             request_id=request_id,
             server_id=agent_name,
+            # 3.1 Phase 1 — caller identity for session context (informational).
+            caller_agent_id=_caller_agent_id,
         )
 
         # Issue a session-level JWT directly (no OPA gate for session messages)

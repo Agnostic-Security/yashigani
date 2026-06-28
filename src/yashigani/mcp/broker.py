@@ -355,6 +355,9 @@ class McpBroker:
             resource_sensitivity=ctx.resource_sensitivity,
             prompt_sensitivity=ctx.prompt_sensitivity,
             agent_name=ctx.agent_name,
+            # 3.1 Phase 1 — caller identity: additive, no-op for unbound policies.
+            # Mirrors the agent_router.py:326 caller+target pattern for MCP.
+            caller={"agent_id": ctx.caller_agent_id or "", "user_id": ctx.user_id or ""},
         )
 
         elapsed = int((time.monotonic() - t0) * 1000)
@@ -472,7 +475,9 @@ class McpBroker:
         _ce = await evaluate_client_policies(
             _types.SimpleNamespace(opa_url=self._opa_url), "mcp_server", ctx.agent_name, "ingress",
             {"identity": {"agent": ctx.agent_name},
-             "request": {"action": ctx.action, "tool": ctx.tool_name or ""}},
+             "request": {"action": ctx.action, "tool": ctx.tool_name or ""},
+             # 3.1 Phase 1 — caller identity: additive, mirrors agent_router.py:326.
+             "caller": {"agent_id": ctx.caller_agent_id or "", "user_id": ctx.user_id or ""}},
         )
         if not _ce.get("allow", False):
             _ce_reason = ("client_policy:" + ",".join(_ce.get("deny", []) or ["denied"])).encode("ascii", "replace").decode("ascii")
