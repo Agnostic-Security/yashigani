@@ -320,6 +320,7 @@ registerAdminModule({
   id: 'audit',
   label: 'Audit & SIEM',
   icon: '▤',
-  order: 40,
+  order: 30,
+  group: 'governance',
   render: (ctx) => html`<ys-admin-audit .api=${ctx.api} .app=${ctx.app}></ys-admin-audit>`,
 });

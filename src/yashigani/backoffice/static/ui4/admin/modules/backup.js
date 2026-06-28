@@ -183,7 +183,8 @@ registerAdminModule({
   id: 'backup',
   label: 'Backup & Restore',
   icon: '💾',
-  order: 64,
+  order: 30,
+  group: 'platform',
   render: (ctx) => html`
     <ys-admin-backup .api=${ctx.api} .app=${ctx.app}></ys-admin-backup>`,
 });

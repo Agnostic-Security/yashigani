@@ -12,15 +12,17 @@ import { LitElement, html } from '/static/vendor/lit/lit-core.min.js';
 
 export class YsAdminNav extends LitElement {
   static properties = {
-    // [{id, label, icon, order, render}] from getAdminModules().
-    modules: { type: Array },
+    // [{key, label, modules:[{id, label, icon, order}]}] from
+    // getAdminModulesGrouped() — sections in render order, each module sorted
+    // by order. key + section label are trusted chrome.
+    groups: { type: Array },
     // id of the active module (highlights the entry).
     active: { type: String },
   };
 
   constructor() {
     super();
-    this.modules = [];
+    this.groups = [];
     this.active = '';
   }
 
@@ -38,21 +40,30 @@ export class YsAdminNav extends LitElement {
     }));
   }
 
+  _renderLink(m) {
+    return html`
+      <a class="ys-admin-nav-link ${m.id === this.active ? 'ys-admin-nav-active' : ''}"
+         href="#${m.id}"
+         aria-current=${m.id === this.active ? 'page' : 'false'}
+         @click=${(e) => this._select(m.id, e)}
+         @keydown=${(e) => { if (e.key === 'Enter' || e.key === ' ') this._select(m.id, e); }}>
+        <span class="ys-admin-nav-icon" aria-hidden="true">${m.icon}</span>
+        <span class="ys-admin-nav-label">${m.label}</span>
+      </a>`;
+  }
+
   render() {
-    const mods = Array.isArray(this.modules) ? this.modules : [];
+    const groups = Array.isArray(this.groups) ? this.groups : [];
+    const total = groups.reduce((n, g) => n + (Array.isArray(g.modules) ? g.modules.length : 0), 0);
     return html`
       <nav class="ys-admin-nav" aria-label="Admin sections">
-        ${mods.length === 0
+        ${total === 0
           ? html`<div class="ys-txt-note ys-admin-nav-empty">No modules registered.</div>`
-          : mods.map((m) => html`
-              <a class="ys-admin-nav-link ${m.id === this.active ? 'ys-admin-nav-active' : ''}"
-                 href="#${m.id}"
-                 aria-current=${m.id === this.active ? 'page' : 'false'}
-                 @click=${(e) => this._select(m.id, e)}
-                 @keydown=${(e) => { if (e.key === 'Enter' || e.key === ' ') this._select(m.id, e); }}>
-                <span class="ys-admin-nav-icon" aria-hidden="true">${m.icon}</span>
-                <span class="ys-admin-nav-label">${m.label}</span>
-              </a>`)}
+          : groups.map((g) => html`
+              <div class="ys-admin-nav-group" role="group" aria-labelledby="ys-admin-nav-grp-${g.key}">
+                <h2 class="ys-admin-nav-group-header" id="ys-admin-nav-grp-${g.key}">${g.label}</h2>
+                ${(Array.isArray(g.modules) ? g.modules : []).map((m) => this._renderLink(m))}
+              </div>`)}
       </nav>`;
   }
 }

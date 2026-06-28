@@ -154,6 +154,7 @@ registerAdminModule({
   id: 'agent-templates',
   label: 'Agent Templates',
   icon: '⌬',
-  order: 24,
+  order: 20,
+  group: 'agents',
   render: (ctx) => html`<ys-admin-agent-templates .api=${ctx.api} .app=${ctx.app}></ys-admin-agent-templates>`,
 });

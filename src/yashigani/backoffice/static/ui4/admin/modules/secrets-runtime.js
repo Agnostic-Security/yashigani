@@ -251,7 +251,8 @@ registerAdminModule({
   id: 'secrets-runtime',
   label: 'Secrets & Runtime',
   icon: '⚙',
-  order: 66,
+  order: 20,
+  group: 'platform',
   render: (ctx) => html`
     <ys-admin-secrets-runtime .api=${ctx.api} .app=${ctx.app}></ys-admin-secrets-runtime>`,
 });

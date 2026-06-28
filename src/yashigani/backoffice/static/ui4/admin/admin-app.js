@@ -18,7 +18,7 @@ import { ApiClient, installTrustedTypes, widgets } from '../core/index.js';
 import { LitElement, html } from '/static/vendor/lit/lit-core.min.js';
 import './admin-topbar.js';
 import './admin-nav.js';
-import { getAdminModules, getAdminModule } from './module-registry.js';
+import { getAdminModules, getAdminModulesGrouped, getAdminModule } from './module-registry.js';
 
 // ── MODULES (Wave-2 plug-in point) ───────────────────────────────────────────
 // Each side-effect import self-registers via registerAdminModule(). Wave 2 adds
@@ -63,13 +63,17 @@ void widgets;
 export class YsAdminApp extends LitElement {
   static properties = {
     _modules: { state: true },
+    _groups: { state: true },
     _activeId: { state: true },
     _username: { state: true },
   };
 
   constructor() {
     super();
+    // Flat list drives hash routing / initial-active resolution; grouped list
+    // drives the sectioned left nav (same registry, two projections).
     this._modules = getAdminModules();
+    this._groups = getAdminModulesGrouped();
     this._username = '';
     // Active module: from the URL hash if it names a registered module, else the
     // first registered module (Dashboard, order:0).
@@ -155,7 +159,7 @@ export class YsAdminApp extends LitElement {
           .sectionLabel=${active ? active.label : ''}></ys-admin-topbar>
         <div class="ys-admin-body">
           <ys-admin-nav
-            .modules=${this._modules}
+            .groups=${this._groups}
             .active=${this._activeId}></ys-admin-nav>
           <main class="ys-admin-content">
             ${this._renderActive()}

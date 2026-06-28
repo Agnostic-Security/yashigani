@@ -363,6 +363,7 @@ registerAdminModule({
   id: 'budget-models',
   label: 'Budget & Models',
   icon: '⛁',
-  order: 28,
+  order: 50,
+  group: 'agents',
   render: (ctx) => html`<ys-admin-budget-models .api=${ctx.api} .app=${ctx.app}></ys-admin-budget-models>`,
 });

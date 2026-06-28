@@ -153,6 +153,7 @@ registerAdminModule({
   id: 'nhi-approvals',
   label: 'NHI Approvals',
   icon: '◆',
-  order: 22,
+  order: 10,
+  group: 'agents',
   render: (ctx) => html`<ys-admin-nhi-approvals .api=${ctx.api} .app=${ctx.app}></ys-admin-nhi-approvals>`,
 });

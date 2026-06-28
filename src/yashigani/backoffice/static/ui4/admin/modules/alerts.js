@@ -266,6 +266,7 @@ registerAdminModule({
   id: 'alerts',
   label: 'Alerts & Events',
   icon: '◔',
-  order: 60,
+  order: 40,
+  group: 'governance',
   render: (ctx) => html`<ys-admin-alerts .api=${ctx.api} .app=${ctx.app}></ys-admin-alerts>`,
 });

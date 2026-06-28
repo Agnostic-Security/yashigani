@@ -420,7 +420,8 @@ registerAdminModule({
   id: 'webauthn',
   label: 'Passkeys',
   icon: '🔑',
-  order: 35,
+  order: 50,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-webauthn .api=${ctx.api} .app=${ctx.app}></ys-admin-webauthn>`,
 });
 
@@ -428,7 +429,8 @@ registerAdminModule({
   id: 'hibp',
   label: 'Breach check',
   icon: '🛡️',
-  order: 36,
+  order: 60,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-hibp .api=${ctx.api} .app=${ctx.app}></ys-admin-hibp>`,
 });
 
@@ -436,6 +438,7 @@ registerAdminModule({
   id: 'ratelimit',
   label: 'Rate limiting',
   icon: '🚦',
-  order: 37,
+  order: 70,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-ratelimit .api=${ctx.api} .app=${ctx.app}></ys-admin-ratelimit>`,
 });

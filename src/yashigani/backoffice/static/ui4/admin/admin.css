@@ -55,6 +55,22 @@
   overflow-y: auto;
 }
 .ys-admin-nav-empty { padding: var(--ys-sp-3); }
+.ys-admin-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ys-admin-nav-group + .ys-admin-nav-group { margin-top: var(--ys-sp-3); }
+.ys-admin-nav-group-header {
+  margin: 0;
+  padding: var(--ys-sp-2) var(--ys-sp-3) var(--ys-sp-1);
+  font-size: var(--ys-fs-xs, 0.6875rem);
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ys-ink-faint, var(--ys-ink-muted));
+}
 .ys-admin-nav-link {
   display: flex; align-items: center; gap: var(--ys-sp-3);
   padding: var(--ys-sp-2) var(--ys-sp-3);

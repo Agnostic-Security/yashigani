@@ -352,6 +352,7 @@ registerAdminModule({
   id: 'agents',
   label: 'Agents',
   icon: '⬡',
-  order: 20,
+  order: 0,
+  group: 'agents',
   render: (ctx) => html`<ys-admin-agents .api=${ctx.api} .app=${ctx.app}></ys-admin-agents>`,
 });

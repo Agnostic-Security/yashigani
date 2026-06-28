@@ -65,8 +65,26 @@
  * @property {string} label                       nav text (trusted chrome)
  * @property {string} [icon]                       short glyph (trusted chrome)
  * @property {number} [order]                      sort weight (asc, default 100)
+ * @property {string} [group]                      nav section key (see ADMIN_NAV_GROUPS);
+ *                                                 unknown/missing → trailing "Other"
  * @property {(ctx: AdminModuleCtx) => unknown} render  → Lit TemplateResult
  */
+
+/**
+ * Ordered nav sections (render order + section labels). A module's `group` key
+ * selects its section; the array order is the section render order. Labels are
+ * TRUSTED-CHROME (rendered via Lit textContent). Modules whose group is missing
+ * or not listed here fall into a trailing synthetic "Other" section so nothing
+ * silently disappears from the nav.
+ * @type {ReadonlyArray<{key: string, label: string}>}
+ */
+export const ADMIN_NAV_GROUPS = Object.freeze([
+  { key: 'overview',   label: 'Overview' },
+  { key: 'agents',     label: 'Agents & Orchestration' },
+  { key: 'identity',   label: 'Identity & Access' },
+  { key: 'governance', label: 'Governance & Data' },
+  { key: 'platform',   label: 'Platform & Ops' },
+]);
 
 /** @type {Map<string, AdminModule>} insertion-ordered, deduped by id. */
 const _modules = new Map();
@@ -104,6 +122,7 @@ export function registerAdminModule(mod) {
     label,
     icon: typeof mod.icon === 'string' && mod.icon ? mod.icon : '•',
     order: Number.isFinite(mod.order) ? Number(mod.order) : 100,
+    group: typeof mod.group === 'string' && mod.group ? mod.group : '',
     render,
   }));
   return true;
@@ -118,6 +137,27 @@ export function getAdminModules() {
   return [..._modules.values()].sort(
     (a, b) => (a.order - b.order) || a.label.localeCompare(b.label),
   );
+}
+
+/**
+ * Return the nav grouped into sections for the left navigation. Sections render
+ * in ADMIN_NAV_GROUPS order, each with its modules sorted by `order` then
+ * `label`. Any module whose group is missing or not a known section is collected
+ * into a trailing synthetic "Other" section so nothing disappears from the nav.
+ * Empty sections are omitted. The returned data is a fresh copy.
+ * @returns {Array<{key: string, label: string, modules: AdminModule[]}>}
+ */
+export function getAdminModulesGrouped() {
+  const all = getAdminModules(); // already sorted by order then label
+  const known = new Set(ADMIN_NAV_GROUPS.map((g) => g.key));
+  const sections = ADMIN_NAV_GROUPS.map((g) => ({
+    key: g.key,
+    label: g.label,
+    modules: all.filter((m) => m.group === g.key),
+  }));
+  const other = all.filter((m) => !m.group || !known.has(m.group));
+  if (other.length) sections.push({ key: 'other', label: 'Other', modules: other });
+  return sections.filter((s) => s.modules.length > 0);
 }
 
 /** Look up a single module by id (or null). */

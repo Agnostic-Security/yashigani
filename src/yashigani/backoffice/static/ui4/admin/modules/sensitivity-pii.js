@@ -284,6 +284,7 @@ registerAdminModule({
   id: 'sensitivity',
   label: 'Sensitivity & PII',
   icon: '◈',
-  order: 50,
+  order: 10,
+  group: 'governance',
   render: (ctx) => html`<ys-admin-sensitivity .api=${ctx.api} .app=${ctx.app}></ys-admin-sensitivity>`,
 });

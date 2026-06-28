@@ -308,6 +308,7 @@ registerAdminModule({
   id: 'policies',
   label: 'Policies & OPA',
   icon: '⚖',
-  order: 30,
+  order: 0,
+  group: 'governance',
   render: (ctx) => html`<ys-admin-policies .api=${ctx.api} .app=${ctx.app}></ys-admin-policies>`,
 });

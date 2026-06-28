@@ -493,7 +493,8 @@ registerAdminModule({
   id: 'rbac',
   label: 'Access control',
   icon: '🔐',
-  order: 32,
+  order: 20,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-rbac .api=${ctx.api} .app=${ctx.app}></ys-admin-rbac>`,
 });
 
@@ -501,6 +502,7 @@ registerAdminModule({
   id: 'scim',
   label: 'SCIM provisioning',
   icon: '🔁',
-  order: 33,
+  order: 30,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-scim .api=${ctx.api} .app=${ctx.app}></ys-admin-scim>`,
 });

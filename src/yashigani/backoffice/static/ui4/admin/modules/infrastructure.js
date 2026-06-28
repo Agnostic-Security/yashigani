@@ -359,7 +359,8 @@ registerAdminModule({
   id: 'infrastructure',
   label: 'Infrastructure',
   icon: '🏗',
-  order: 60,
+  order: 0,
+  group: 'platform',
   render: (ctx) => html`
     <ys-admin-infrastructure .api=${ctx.api} .app=${ctx.app}></ys-admin-infrastructure>`,
 });

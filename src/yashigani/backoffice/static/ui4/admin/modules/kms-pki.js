@@ -299,7 +299,8 @@ registerAdminModule({
   id: 'pki',
   label: 'PKI',
   icon: '🔑',
-  order: 62,
+  order: 10,
+  group: 'platform',
   render: (ctx) => html`
     <ys-admin-kms-pki .api=${ctx.api} .app=${ctx.app}></ys-admin-kms-pki>`,
 });

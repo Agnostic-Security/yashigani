@@ -437,7 +437,8 @@ registerAdminModule({
   id: 'accounts',
   label: 'Admin accounts',
   icon: '👤',
-  order: 30,
+  order: 0,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-accounts .api=${ctx.api} .app=${ctx.app}></ys-admin-accounts>`,
 });
 
@@ -445,6 +446,7 @@ registerAdminModule({
   id: 'users',
   label: 'User accounts',
   icon: '🧑',
-  order: 31,
+  order: 10,
+  group: 'identity',
   render: (ctx) => html`<ys-admin-users .api=${ctx.api} .app=${ctx.app}></ys-admin-users>`,
 });

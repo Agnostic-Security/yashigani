@@ -197,7 +197,8 @@ registerAdminModule({
   id: 'monitoring',
   label: 'Monitoring',
   icon: '📈',
-  order: 70,
+  order: 10,
+  group: 'overview',
   render: (ctx) => html`
     <ys-admin-monitoring .api=${ctx.api} .app=${ctx.app}></ys-admin-monitoring>`,
 });
