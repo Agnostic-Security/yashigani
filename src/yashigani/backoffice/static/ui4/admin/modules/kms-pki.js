@@ -279,14 +279,16 @@ export class YsAdminKmsPki extends LitElement {
 
   render() {
     if (this._loading) {
-      return html`<div class="ys-admin-content-pad"><div class="ys-txt-note">Loading KMS & PKI…</div></div>`;
+      return html`<div class="ys-admin-content-pad"><div class="ys-txt-note">Loading PKI…</div></div>`;
     }
     return html`
       <div class="ys-admin-content-pad">
-        <h2 class="ys-admin-section-title">KMS &amp; PKI</h2>
+        <h2 class="ys-admin-section-title">PKI</h2>
         ${this._renderPki()}
         ${this._renderKms()}
         ${this._renderVault()}
+        <!-- Crypto & Integrity consolidated under PKI (Tiago 2026-06-28) -->
+        <ys-admin-crypto-inventory .api=${this.api} .app=${this.app}></ys-admin-crypto-inventory>
       </div>`;
   }
 }
@@ -294,8 +296,8 @@ export class YsAdminKmsPki extends LitElement {
 customElements.define('ys-admin-kms-pki', YsAdminKmsPki);
 
 registerAdminModule({
-  id: 'kms-pki',
-  label: 'KMS & PKI',
+  id: 'pki',
+  label: 'PKI',
   icon: '🔑',
   order: 62,
   render: (ctx) => html`

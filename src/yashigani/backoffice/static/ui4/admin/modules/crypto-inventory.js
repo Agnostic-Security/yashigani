@@ -17,7 +17,7 @@
 // intentionally not exposed in-console (parallels the agent-token-rotate non-gap).
 import { LitElement, html, nothing } from '/static/vendor/lit/lit-core.min.js';
 import { widgets } from '../../core/index.js';
-import { registerAdminModule } from '../module-registry.js';
+// (registerAdminModule no longer imported — Crypto is embedded under PKI, not a nav entry.)
 
 void widgets;
 
@@ -259,11 +259,7 @@ export class YsAdminCryptoInventory extends LitElement {
 
 customElements.define('ys-admin-crypto-inventory', YsAdminCryptoInventory);
 
-registerAdminModule({
-  id: 'crypto-inventory',
-  label: 'Crypto & Integrity',
-  icon: '🔬',
-  order: 68,
-  render: (ctx) => html`
-    <ys-admin-crypto-inventory .api=${ctx.api} .app=${ctx.app}></ys-admin-crypto-inventory>`,
-});
+// Crypto & Integrity is NO LONGER a standalone nav entry — it is consolidated
+// under the PKI module (kms-pki.js renders <ys-admin-crypto-inventory>) per
+// Tiago 2026-06-28 ("KMS, PKI and Crypto all under the same — PKI").
+// The custom element + its admin-app.js import are retained so PKI can embed it.

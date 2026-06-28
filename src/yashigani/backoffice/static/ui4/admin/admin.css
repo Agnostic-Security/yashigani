@@ -171,3 +171,11 @@
   background: var(--ys-surface); box-shadow: var(--ys-elev-1);
 }
 .ys-alert-count--zero { color: var(--ys-ink-faint); font-weight: 500; }
+
+/* Dashboard "Action required" alerts (pending NHI / MCP approvals) */
+.ys-panel--action { border-left: 3px solid var(--ys-amber, #c77700); }
+.ys-action-list { list-style: none; margin: 0; padding: 0; }
+.ys-action-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0; }
+.ys-action-count { font-weight: 700; font-size: 1.1rem; min-width: 1.75rem; text-align: center; color: var(--ys-amber, #c77700); }
+.ys-action-label { flex: 1; }
+.ys-action-cta { white-space: nowrap; text-decoration: none; font-weight: 600; }

@@ -56,6 +56,8 @@ export class YsAdminDashboard extends LitElement {
     _traffic: { state: true },
     _admins: { state: true },     // {total, active, below_active_minimum}
     _agentCount: { state: true },
+    _pendingNhi: { state: true },   // NHIs awaiting SVID approval (Action required)
+    _pendingMcp: { state: true },   // MCP envelopes awaiting re-approval (Action required)
   };
 
   constructor() {
@@ -70,6 +72,8 @@ export class YsAdminDashboard extends LitElement {
     this._traffic = null;
     this._admins = null;
     this._agentCount = null;
+    this._pendingNhi = 0;
+    this._pendingMcp = 0;
   }
 
   createRenderRoot() { return this; }
@@ -85,13 +89,14 @@ export class YsAdminDashboard extends LitElement {
     // Parallel fan-out (mirrors 3.0 loadDashboard()'s Promise.all). Every read
     // is null-tolerant: a missing/410 subsystem renders an empty card, never a
     // hard error (community-tier deploys omit several subsystems).
-    const [svc, sec, budget, traffic, enforcement, agents] = await Promise.all([
+    const [svc, sec, budget, traffic, enforcement, agents, mcpPending] = await Promise.all([
       this.api.get('/dashboard/services-health'),
       this.api.get('/dashboard/security-metrics'),
       this.api.get('/dashboard/budget-summary'),
       this.api.get('/dashboard/traffic-metrics'),
       this.api.get('/admin/accounts/enforcement'),
       this.api.get('/admin/agents'),
+      this.api.get('/admin/mcp/envelopes/pending'),
     ]);
 
     this._rollup = (svc && svc.rollup) || 'unknown';
@@ -100,9 +105,16 @@ export class YsAdminDashboard extends LitElement {
     this._budget = (budget && typeof budget === 'object') ? budget : null;
     this._traffic = (traffic && typeof traffic === 'object') ? traffic : null;
     this._admins = (enforcement && typeof enforcement === 'object') ? enforcement : null;
-    this._agentCount = Array.isArray(agents)
-      ? agents.length
-      : (agents && Array.isArray(agents.agents) ? agents.agents.length : null);
+    const agentList = Array.isArray(agents)
+      ? agents
+      : (agents && Array.isArray(agents.agents) ? agents.agents : []);
+    this._agentCount = Array.isArray(agents) || (agents && Array.isArray(agents.agents))
+      ? agentList.length
+      : null;
+
+    // Pending-action counts surfaced as "Action required" alerts on the dashboard.
+    this._pendingNhi = agentList.filter((a) => a && a.kind === 'nhi' && a.svid_issued === false).length;
+    this._pendingMcp = (mcpPending && Array.isArray(mcpPending.pending)) ? mcpPending.pending.length : 0;
 
     this._loading = false;
   }
@@ -145,6 +157,30 @@ export class YsAdminDashboard extends LitElement {
         <div class="ys-stat-card">
           <div class="ys-stat-num ys-stat-num--sm">${this._budgetLine()}</div>
           <div class="ys-stat-label">Budget used</div>
+        </div>
+      </div>`;
+  }
+
+  _renderActionRequired() {
+    // Actionable pending-approval alerts; shown only when something needs action.
+    // Links use hash routing — the shell switches module on #<id>.
+    const items = [
+      { n: this._pendingNhi, label: 'agent identity(ies) awaiting SVID approval', href: '#nhi-approvals', cta: 'Review NHI approvals' },
+      { n: this._pendingMcp, label: 'MCP envelope(s) awaiting re-approval', href: '#mcp', cta: 'Review MCP registry' },
+    ].filter((i) => i.n > 0);
+    if (items.length === 0) return nothing;
+    return html`
+      <div class="ys-panel ys-panel--action">
+        <div class="ys-panel-header">Action required</div>
+        <div class="ys-panel-body">
+          <ul class="ys-action-list">
+            ${items.map((i) => html`
+              <li class="ys-action-item">
+                <span class="ys-action-count">${i.n}</span>
+                <span class="ys-action-label">${i.label}</span>
+                <a class="ys-action-cta" href=${i.href}>${i.cta} →</a>
+              </li>`)}
+          </ul>
         </div>
       </div>`;
   }
@@ -211,6 +247,7 @@ export class YsAdminDashboard extends LitElement {
     return html`
       <div class="ys-admin-content-pad">
         ${this._renderStatCards()}
+        ${this._renderActionRequired()}
         ${this._renderHealthRollup()}
         <div class="ys-admin-2col">
           ${this._renderAlerts()}
