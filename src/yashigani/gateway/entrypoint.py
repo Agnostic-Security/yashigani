@@ -815,6 +815,7 @@ def _build_app(mesh_mode: bool = False):
         model_allocation_store=model_allocation_store,
         model_alias_store=model_alias_store,
         kms_provider=kms_provider,
+        permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
     )
 
     # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────

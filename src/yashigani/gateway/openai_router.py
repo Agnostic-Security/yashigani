@@ -184,6 +184,13 @@ _OWUI_DENY_MESSAGES: dict[str, str] = {
         "The maximum number of concurrent sessions for this agent has been reached. Please try again shortly.",
     "pool_backend_unavailable":
         "The agent's container backend is temporarily unavailable. Contact an administrator.",
+    # 3.1 Phase 6 — cloud-model deny-by-default gate (INV-1 + INV-2)
+    "cloud_model_not_granted":
+        "Access to this cloud model is not permitted. Contact an administrator to enable cloud model access.",
+    "cloud_model_opa_coupling_failed":
+        "The data-protection policy for this cloud model could not be verified. Contact an administrator.",
+    "cloud_model_no_opa_policy_ref":
+        "The data-protection policy for this cloud model is not configured. Contact an administrator.",
 }
 
 _OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
@@ -794,6 +801,16 @@ class OpenAIRouterState:
         # existing Helm/env-only deployments working unchanged.
         self.kms_provider = None   # KSMProvider | None
         self._cloud_key_cache: dict[str, dict] = {}  # provider -> {value, ts}
+        # 3.1 Phase 6+7 — cloud-model deny-by-default gate + strict dial.
+        # permission_store: PermissionStore | None — resolves boolean grants for
+        #   blast-radius resource types (cloud_model, mcp_server, agent, external_api).
+        # permission_strict: when True (YASHIGANI_PERMISSION_STRICT=true), local
+        #   Ollama models also require an explicit grant (deny-unless-permitted for ALL
+        #   models).  Default False so local-LLM usage works out of the box.
+        self.permission_store = None
+        self.permission_strict: bool = (
+            os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
+        )
         # F-T10-001: low-confidence step-up threshold.  When response-inspection
         # confidence falls below this value AND sensitivity >= CONFIDENTIAL,
         # X-Yashigani-Low-Confidence-Stepup: required is added to the response.
@@ -945,6 +962,7 @@ def configure(
     model_allocation_store=None,  # Track B1 — ModelAllocationStore | None
     model_alias_store=None,       # Track B1 — ModelAliasStore | None
     kms_provider=None,            # KSMProvider | None — for cloud API key resolution
+    permission_store=None,        # 3.1 Phase 6 — PermissionStore | None (cloud-model gate)
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -980,6 +998,10 @@ def configure(
     _state.model_alias_store = model_alias_store            # Track B1
     _state.kms_provider = kms_provider                      # cloud API key resolution
     _state._cloud_key_cache = {}                            # reset cache on reconfigure
+    _state.permission_store = permission_store              # 3.1 Phase 6 — cloud-model gate
+    _state.permission_strict = (
+        os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
+    )
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -1687,6 +1709,142 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         route_reason = "fallback_local"
         if sensitivity_level in ("CONFIDENTIAL", "RESTRICTED"):
             route_reason = "sensitivity_local"
+
+    # ── 6a-perm. Cloud-model deny-by-default gate (Phase 6+7 / INV-1 + INV-2) ──
+    #
+    # Phase 6 — INV-1 (deny by default for blast-radius types):
+    #   Cloud providers are deny-by-default.  A request routed to ANY cloud
+    #   provider (openai / anthropic) MUST have an explicit org-level cloud_model
+    #   grant for the resolved model.  No grant → 403, fail-closed.
+    #
+    # Phase 6 — INV-2 (OPA coupling):
+    #   A cloud_model grant carries a mandatory opa_policy_ref.  At runtime, the
+    #   referenced OPA data-protection policy is traversed.  If the policy is
+    #   absent/unresolvable the cloud call is DENIED (never sent in the clear).
+    #   INV-2 is enforced at write time (store.set_boolean_grant) AND here at
+    #   runtime as a belt-and-braces guard.
+    #
+    # Phase 7 — strict dial (YASHIGANI_PERMISSION_STRICT=true, default OFF):
+    #   When strict mode is on, LOCAL Ollama models also require an explicit
+    #   cloud_model grant (deny-unless-permitted for ALL models).  Default OFF
+    #   so out-of-the-box local-LLM usage works without any grant configuration.
+    #
+    # Exemptions — must NOT be gated:
+    #   • Agent calls (is_agent_call=True) — use their own MCP/auth path.
+    #   • Brain-reasoning leg (brain_reasoning_leg=True) — server-minted, UNFORGEABLE;
+    #     internal cognition, never delivered to a user; holds no allocation.
+    #
+    # Anti-masquerade: classification is derived solely from selected_provider
+    # (server-resolved, never from caller input) — _CLOUD_PROVIDER_CONFIG contains
+    # only "openai"/"anthropic"; "ollama" and "agent" are always local.
+    _perm_is_cloud = selected_provider in _CLOUD_PROVIDER_CONFIG
+    _perm_needs_check = (
+        not is_agent_call
+        and not brain_reasoning_leg
+        and _state.permission_store is not None
+        and (_perm_is_cloud or _state.permission_strict)
+    )
+
+    if _perm_needs_check:
+        from yashigani.permissions import resolve_boolean_grant as _resolve_grant
+        from yashigani.permissions import ResourceType as _RT
+        from yashigani.permissions import DEFAULT_ORG_ID as _PERM_ORG_ID
+
+        _perm_org_id = _PERM_ORG_ID
+        _perm_groups: list = identity.get("groups", []) if identity else []
+        # User-level grants for narrowing — only for human/user principals.
+        # Service/agent/gateway identities use org+group tiers only.
+        _perm_kind = identity.get("kind", "") if identity else ""
+        _perm_user_email: Optional[str] = (
+            (identity.get("_owui_email") or identity.get("email") or identity.get("identity_id"))
+            if _perm_kind in ("human", "user") else None
+        )
+
+        _perm_allowed = _resolve_grant(
+            _RT.CLOUD_MODEL,
+            selected_model,
+            org_id=_perm_org_id,
+            group_ids=_perm_groups,
+            user_email=_perm_user_email,
+            store=_state.permission_store,
+        )
+        if not _perm_allowed:
+            _perm_deny_reason = "cloud_model_not_granted"
+            logger.warning(
+                "PERM DENIED (cloud-model gate INV-1): provider=%s model=%s "
+                "identity=%s org=%s%s — no org grant",
+                selected_provider, selected_model, identity_id, _perm_org_id,
+                " [strict-dial: local model]" if not _perm_is_cloud else "",
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": _owui_deny_message(_perm_deny_reason),
+                        "type": "policy_denied",
+                        "code": _perm_deny_reason,
+                    }
+                },
+                headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+            )
+
+        # INV-2 coupling: cloud models only.  Local models in strict mode do NOT
+        # require an OPA data-protection policy (no egress risk).
+        if _perm_is_cloud:
+            # Read the org-level grant to retrieve the mandatory opa_policy_ref.
+            _org_grant = _state.permission_store.get_boolean_grant(
+                _RT.CLOUD_MODEL, "org", _perm_org_id, selected_model
+            )
+            _opa_ref = (_org_grant.opa_policy_ref or "").strip() if _org_grant else ""
+
+            if not _opa_ref:
+                # Belt-and-braces: INV-2 should have been enforced at write time,
+                # but defend here too (fail-closed).
+                logger.error(
+                    "PERM DENIED (INV-2 runtime): cloud_model grant for model=%s "
+                    "(org=%s) missing opa_policy_ref — fail-closed",
+                    selected_model, _perm_org_id,
+                )
+                _perm_deny_reason = "cloud_model_no_opa_policy_ref"
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": _owui_deny_message(_perm_deny_reason),
+                            "type": "policy_denied",
+                            "code": _perm_deny_reason,
+                        }
+                    },
+                    headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+                )
+
+            # Traverse the OPA data-protection policy (INV-2 runtime gate).
+            _opa_dp_result = await _opa_cloud_model_policy_check(
+                _opa_ref,
+                identity=identity,
+                model=selected_model,
+                provider=selected_provider,
+                sensitivity_level=sensitivity_level,
+            )
+            if not _opa_dp_result.get("allow", False):
+                _perm_deny_reason = "cloud_model_opa_coupling_failed"
+                logger.warning(
+                    "PERM DENIED (INV-2 OPA coupling): provider=%s model=%s "
+                    "policy_ref=%s identity=%s reason=%s — cloud call blocked",
+                    selected_provider, selected_model, _opa_ref, identity_id,
+                    _opa_dp_result.get("reason", "unknown"),
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": _owui_deny_message(_perm_deny_reason),
+                            "type": "policy_denied",
+                            "code": _perm_deny_reason,
+                        }
+                    },
+                    headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+                )
 
     # ── Track B1: BIND the FINALLY-SELECTED model to the allocation ──────
     # Runs on the model that will ACTUALLY be served (after optimisation OR the
@@ -3631,6 +3789,96 @@ def model_denied_for_caller(
         _state.model_alias_store,
         brain_leg=brain_leg,
     )
+
+
+async def _opa_cloud_model_policy_check(
+    policy_ref: str,
+    *,
+    identity: dict | None,
+    model: str,
+    provider: str,
+    sensitivity_level: str,
+) -> dict:
+    """INV-2 runtime coupling: traverse the OPA data-protection policy referenced
+    by a cloud_model grant's opa_policy_ref (Phase 6 / 3.1).
+
+    Fail-closed: returns {"allow": False} on any error, missing OPA path, empty
+    policy result, or invalid policy_ref.  A grant with a valid opa_policy_ref
+    pointing at an OPA bundle path that evaluates to {"allow": true} is the ONLY
+    passing case.
+
+    Dev opt-in: when YASHIGANI_OPA_OPTIONAL=true (non-production) and OPA is not
+    configured, the coupling check is bypassed so local dev works without a full
+    OPA bundle (consistent with _opa_v1_check dev-opt-in handling).
+
+    policy_ref format: "yashigani/cloud_model/gpt4o"
+        → OPA path: {opa_url}/v1/data/yashigani/cloud_model/gpt4o
+    """
+    import re as _re
+
+    if not _state.opa_url:
+        _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+        _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+        if _opa_optional and _ysg_env != "production":
+            logger.warning(
+                "cloud_model OPA coupling skipped — OPA not configured "
+                "(YASHIGANI_OPA_OPTIONAL=true, env=%s)",
+                _ysg_env,
+            )
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+        return {"allow": False, "reason": "opa_not_configured"}
+
+    # Sanitise policy_ref to prevent path traversal / injection.
+    # Valid chars: alphanumeric, underscore, hyphen, forward-slash.
+    if not policy_ref or not _re.match(r'^[a-zA-Z0-9_/\-]+$', policy_ref.strip()):
+        logger.warning(
+            "cloud_model OPA coupling: invalid policy_ref %r — fail-closed", policy_ref,
+        )
+        return {"allow": False, "reason": "invalid_policy_ref"}
+
+    opa_input = {
+        "identity": {
+            "status": identity.get("status", "active") if identity else "anonymous",
+            "kind": identity.get("kind", "unknown") if identity else "unknown",
+            "groups": identity.get("groups", []) if identity else [],
+            "sensitivity_ceiling": (
+                identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "RESTRICTED"
+            ),
+        },
+        "model": model,
+        "provider": provider,
+        "sensitivity": sensitivity_level,
+    }
+
+    policy_path = policy_ref.strip("/")
+    try:
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                _state.opa_url.rstrip("/") + f"/v1/data/{policy_path}",
+                json={"input": opa_input},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            if not result:
+                # Empty result: OPA path does not exist in the bundle → fail-closed.
+                logger.warning(
+                    "cloud_model OPA coupling: policy_ref=%r resolved to empty result "
+                    "(path not defined in OPA bundle) — fail-closed",
+                    policy_ref,
+                )
+                return {"allow": False, "reason": "policy_not_found"}
+            allowed = bool(result.get("allow", False))
+            return {
+                "allow": allowed,
+                "reason": result.get("reason", "policy_evaluated"),
+            }
+    except Exception as exc:
+        logger.error(
+            "cloud_model OPA coupling: policy check failed (ref=%r): %s — fail-closed",
+            policy_ref, exc,
+        )
+        return {"allow": False, "reason": "opa_unreachable"}
 
 
 async def _opa_v1_check(
