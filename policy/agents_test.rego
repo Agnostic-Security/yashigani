@@ -933,3 +933,360 @@ test_verified_principal_wrong_group_denied if {
         "request": {"remainder_path": "/v1/run"},
     }
 }
+
+# ===========================================================================
+# 11. Phase 5 §C §E.11 — _langflow_callee_ceiling_ok hard-cap tests
+#
+# agent__langflow has a HARD POLICY CAP: response sensitivity must not
+# exceed INTERNAL.  This is independent of the caller's registered
+# sensitivity_ceiling — the cap is enforced in policy so it cannot be
+# bypassed via a misconfigured registry entry.
+#
+# 11a. INTERNAL response to agent__langflow → ALLOW (within cap)
+# 11b. CONFIDENTIAL response to agent__langflow → DENY (hard-cap)
+#      deny reason == "langflow_callee_ceiling_hard_cap" (not generic)
+# 11c. RESTRICTED response to agent__langflow → DENY (hard-cap)
+# 11d. Non-langflow target unaffected: CONFIDENTIAL within CONFIDENTIAL ceiling → ALLOW
+# 11e. Regression: langflow hard-cap does not suppress other deny reasons
+#      (PII gate still fires for langflow when response is within cap)
+# ===========================================================================
+
+# 11a. INTERNAL response to agent__langflow with CONFIDENTIAL caller ceiling → ALLOW.
+#      The hard-cap (≤ INTERNAL) is satisfied; caller ceiling (CONFIDENTIAL ≥ INTERNAL) satisfied.
+test_langflow_callee_internal_response_allows if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11b. CONFIDENTIAL response to agent__langflow → DENY (hard-cap: rank 2 > INTERNAL rank 1).
+test_langflow_callee_confidential_response_denies if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11b-reason. deny reason is "langflow_callee_ceiling_hard_cap" (distinguishable
+# from generic "response_sensitivity_exceeds_caller_ceiling").
+test_langflow_callee_confidential_response_deny_reason if {
+    d := data.yashigani.agent_response_decision with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+    d.allow == false
+    d.reason == "langflow_callee_ceiling_hard_cap"
+}
+
+# 11c. RESTRICTED response to agent__langflow → DENY (rank 3 > INTERNAL rank 1).
+test_langflow_callee_restricted_response_denies if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "RESTRICTED"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+}
+
+# 11d. Non-langflow target: hard-cap rule is trivially true, normal ceiling applies.
+#      A CONFIDENTIAL response to a non-langflow target with CONFIDENTIAL ceiling → ALLOW.
+test_non_langflow_target_unaffected_by_hard_cap if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent-other"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11e. PII gate still fires for langflow when response is within the hard-cap.
+#      (PII beats the hard-cap — both conditions contribute to the deny.)
+test_langflow_callee_pii_still_blocks_within_cap if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": true,
+    }
+}
+
+# ===========================================================================
+# 12. NHI request enforcement (4.0 Phase 3 — RISK-097/108)
+#
+# Tests nhi_tool_allowed, nhi_budget_ok, nhi_ceiling_ok,
+# nhi_request_allowed, nhi_request_decision, and nhi_deny_reason rules.
+#
+# 12a. Allowed tool — nhi_tool_allowed = true
+# 12b. Out-of-scope tool — nhi_tool_allowed = false; deny_reason = tool_not_in_allowed_tools
+# 12c. Budget tokens exceeded — nhi_budget_ok = false; deny_reason = nhi_budget_exceeded
+# 12d. Budget tool_calls exceeded — nhi_budget_ok = false
+# 12e. Sensitivity ceiling exceeded — nhi_ceiling_ok = false; deny_reason = nhi_sensitivity_ceiling_exceeded
+# 12f. All gates pass — nhi_request_allowed = true; deny_reason = ok
+# 12g. Empty tool string (direct LLM chat) → nhi_tool_allowed = true
+# 12h. Empty allowed_tools list → nhi_tool_allowed = false (fail-closed)
+# 12i. Non-NHI identity → nhi_tool_allowed = false; nhi_request_allowed = false
+# ===========================================================================
+
+# Shared NHI fixture helper fields (repeated inline per test — OPA test idiom)
+# NHI identity: allowed_tools=["search", "database.read"], ceiling=INTERNAL,
+#               budget: max_tokens=8192, max_tool_calls=20
+
+# 12a. Allowed tool passes nhi_tool_allowed.
+test_nhi_tool_allowed_passes if {
+    data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search", "database.read"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 1,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12b. Out-of-scope tool — DENY + deny_reason = tool_not_in_allowed_tools.
+test_nhi_tool_out_of_scope_denies if {
+    not data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "admin.write",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_tool_out_of_scope_deny_reason if {
+    data.yashigani.nhi_deny_reason == "tool_not_in_allowed_tools" with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "admin.write",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12c. Budget tokens exceeded — nhi_budget_ok = false; deny_reason = nhi_budget_exceeded.
+test_nhi_budget_tokens_exceeded if {
+    not data.yashigani.nhi_budget_ok with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 1000, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 1001,
+            "tool_calls_used": 1,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_budget_tokens_exceeded_deny_reason if {
+    data.yashigani.nhi_deny_reason == "nhi_budget_exceeded" with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 1000, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 1001,
+            "tool_calls_used": 1,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12d. Budget tool_calls exceeded — nhi_budget_ok = false.
+test_nhi_budget_tool_calls_exceeded if {
+    not data.yashigani.nhi_budget_ok with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 5},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 6,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12e. Sensitivity ceiling exceeded — nhi_ceiling_ok = false;
+#      deny_reason = nhi_sensitivity_ceiling_exceeded.
+test_nhi_ceiling_exceeded if {
+    not data.yashigani.nhi_ceiling_ok with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 1,
+            "response_sensitivity": "CONFIDENTIAL",
+        },
+    }
+}
+
+test_nhi_ceiling_exceeded_deny_reason if {
+    data.yashigani.nhi_deny_reason == "nhi_sensitivity_ceiling_exceeded" with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 1,
+            "response_sensitivity": "CONFIDENTIAL",
+        },
+    }
+}
+
+# 12f. All gates pass — nhi_request_allowed = true; deny_reason = "ok".
+test_nhi_all_gates_pass_allows if {
+    data.yashigani.nhi_request_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search", "database.read"],
+            "sensitivity_ceiling": "CONFIDENTIAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "database.read",
+            "tokens_used": 500,
+            "tool_calls_used": 3,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_all_gates_pass_deny_reason_ok if {
+    d := data.yashigani.nhi_request_decision with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search", "database.read"],
+            "sensitivity_ceiling": "CONFIDENTIAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "database.read",
+            "tokens_used": 500,
+            "tool_calls_used": 3,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+    d.allow == true
+    d.tool_ok == true
+    d.budget_ok == true
+    d.ceiling_ok == true
+    d.deny_reason == "ok"
+}
+
+# 12g. Empty tool string (direct LLM chat, no explicit tool) → nhi_tool_allowed = true.
+test_nhi_empty_tool_string_allowed if {
+    data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12h. Empty allowed_tools list → fail-closed (nhi_tool_allowed = false).
+test_nhi_empty_allowed_tools_fail_closed if {
+    not data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": [],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12i. Non-NHI identity → nhi rules do not fire.
+test_nhi_non_nhi_identity_not_allowed if {
+    not data.yashigani.nhi_request_allowed with input as {
+        "identity": {
+            "kind": "agent",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_non_nhi_identity_tool_not_allowed if {
+    not data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "agent",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}

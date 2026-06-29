@@ -109,6 +109,14 @@ from yashigani.backoffice.routes import (
     capability_policy_router,
     # 3.1 Phase 8 — unified permission grant admin API
     permissions_router,
+    # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+    user_ui_router,
+    # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
+    user_conversations_router,
+    # 4.0 Workflow run history (wf-exec)
+    user_workflows_router,
+    # 4.0 Admin workflow-oversight (cross-user read + disable)
+    admin_workflows_router,
 )
 
 
@@ -745,6 +753,51 @@ async def lifespan(app: FastAPI):
             "absent from Redis until restored manually", _ireconcile_exc
         )
 
+    # ISSUE-USER-PLANE-DURABILITY (4.0): wire the user-plane durable store and
+    # run the startup reconciler. ua:* and wf:* keys in Redis db/3 are volatile
+    # (appendonly no / save ""); a Redis recreate loses all user agents, memory
+    # blocks, and workflow definitions. This mirrors the AgentRegistry pattern:
+    # dual-write to Postgres on every mutation + reconcile Postgres → Redis on
+    # every boot. Degrade-safe: if the store cannot connect, the routes continue
+    # Redis-only and user data is not restored (but nothing crashes).
+    try:
+        from yashigani.agents.user_plane_durable_store import UserPlaneDurableStore
+        backoffice_state.user_plane_durable = UserPlaneDurableStore()
+        _logging.getLogger("yashigani.backoffice.lifespan").info(
+            "USER-PLANE-DURABLE: UserPlaneDurableStore wired"
+        )
+    except Exception as _upd_init_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "USER-PLANE-DURABLE: failed to construct UserPlaneDurableStore (%s) — "
+            "user-plane data will NOT be mirrored to Postgres this session", _upd_init_exc
+        )
+
+    try:
+        _upd = getattr(backoffice_state, "user_plane_durable", None)
+        _upd_ir = getattr(backoffice_state, "identity_registry", None)
+        _upd_redis = getattr(_upd_ir, "_r", None) if _upd_ir else None
+        if _upd is not None and _upd_redis is not None:
+            from yashigani.agents.user_plane_reconciler import reconcile_user_plane_from_durable
+            _ua, _mem, _wf = await reconcile_user_plane_from_durable(_upd_redis, _upd)
+            if _ua or _mem or _wf:
+                _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                    "USER-PLANE-RECONCILE: restored %d agents, %d memories, %d workflows "
+                    "from Postgres into Redis db/3", _ua, _mem, _wf,
+                )
+            else:
+                _logging.getLogger("yashigani.backoffice.lifespan").info(
+                    "USER-PLANE-RECONCILE: Redis db/3 already in sync (0 entities restored)"
+                )
+        else:
+            _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                "USER-PLANE-RECONCILE: skipped — user_plane_durable or Redis client not wired"
+            )
+    except Exception as _upd_rec_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "USER-PLANE-RECONCILE: startup reconcile FAILED (%s) — user agents/memories/"
+            "workflows may be absent from Redis until re-created", _upd_rec_exc
+        )
+
     yield
 
     # Shutdown
@@ -932,6 +985,13 @@ def create_backoffice_app() -> FastAPI:
         ("/auth/stepup", 4 * 1024),  # 6-digit TOTP code only
         # /v1/chat/completions is intentionally not limited here — LLM prompts
         # can legitimately be large; the global 4 MB limit still applies.
+        # 4.0 Phase 2: user document upload cap.  Caddy also enforces 10 MB;
+        # this middleware is belt-and-braces BEFORE the upload handler runs.
+        # 4.0 Phase 2 JSON upload: the body contains the file as base64
+        # (content_base64 field). base64 inflates by ~4/3, so a 10 MB file
+        # sends ~13.3 MB of JSON. Set the pre-check to 14 MB to give headroom.
+        # The handler enforces the decoded 10 MB limit post-decode.
+        ("/user/documents", 14 * 1024 * 1024),  # 14 MB — covers base64 of 10 MB file
     ]
 
     @app.middleware("http")
@@ -1019,6 +1079,76 @@ def create_backoffice_app() -> FastAPI:
     _static_dir = pathlib.Path(__file__).parent / "static"
     if _static_dir.exists():
         app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
+    # ── Yashigani 4.0 shared front-end layer (additive) ─────────────────────
+    # The hardened classes-only / Trusted-Types / safe-render layer that the
+    # 4.0 user UI (Phase 2) and the rebuilt admin UI (Phase 6) import. JS/CSS
+    # are served from the /static/ui4/ mount above; this route serves the
+    # shared-layer canary self-test page (safe-render + XSS / split-chunk /
+    # decode HARD-contract). Admin-gated — it is a verification surface, not an
+    # end-user page. Production CSP/Trusted-Types headers are Su's Caddy domain
+    # (feat/4.0-csp-vendoring); the canary carries its own CSP meta so the TT
+    # pipeline is exercised even before those headers land.
+    _ui4_canary = _static_dir / "ui4" / "canary" / "canary.html"
+    if _ui4_canary.exists():
+        from yashigani.backoffice.middleware import (
+            require_admin_session as _require_admin_session_ui4,
+        )
+
+        @app.get("/ui4/canary", include_in_schema=False)
+        async def ui4_canary_page(
+            session=Depends(_require_admin_session_ui4),  # noqa: ARG001
+        ) -> HTMLResponse:
+            return HTMLResponse(_ui4_canary.read_text(encoding="utf-8"))
+
+    # ── Yashigani 4.0 user-facing app (Phase 2) — OpenWebUI replacement ──────
+    # The user-tier Lit app served at /chat (assets under /static/ui4/). Built on
+    # the shared layer above. A lightweight session-cookie pre-flight avoids
+    # serving the SPA shell to unauthenticated clients (mirrors the /admin/ shell
+    # check, ASVS V1.4.1) — cryptographic session validation happens on every
+    # subsequent /user/* and /v1/* API call. Production CSP/Trusted-Types headers
+    # are Su's Caddy domain (feat/4.0-csp-vendoring); the page carries its own CSP
+    # meta so the safe-render/TT pipeline is enforced even before those land.
+    _ui4_chat = _static_dir / "ui4" / "user" / "chat.html"
+    if _ui4_chat.exists():
+
+        @app.get("/chat", include_in_schema=False)
+        async def ui4_user_chat_page(request: Request):
+            if not request.cookies.get("__Host-yashigani_session"):
+                return RedirectResponse(url="/login?next=/chat", status_code=302)
+            return HTMLResponse(_ui4_chat.read_text(encoding="utf-8"))
+
+    # ── Yashigani 4.0 ADMIN app — Lit admin is now the primary /admin/ UI ───────
+    # Phase 6 flip: the new Lit admin is canonical at /admin/. The old vanilla-JS
+    # admin (dashboard.html) is available as a fallback at /admin-legacy/ during
+    # the live-verify transition (do NOT delete yet). /admin4/ now redirects to
+    # /admin/ for back-compat with any bookmarked links from Wave-1 testing.
+    #
+    # Assets under /static/ui4/; page carries its own strict CSP + Trusted-Types
+    # meta so the safe-render/TT pipeline is enforced independently of Caddy.
+    # Admin-session-gated by a lightweight cookie pre-flight (ASVS V1.4.1);
+    # cryptographic session validation happens on every subsequent /dashboard/*
+    # and /admin/* API call (SessionStore.get()).
+    _ui4_admin = _static_dir / "ui4" / "admin" / "admin.html"
+    if _ui4_admin.exists():
+
+        @app.get("/admin/", include_in_schema=False)
+        async def ui4_admin_page(request: Request):
+            # 4.0: Lit admin is primary at /admin/. Cookie pre-flight mirrors
+            # the old admin_dashboard_page check (ASVS V1.4.1).
+            _admin_cookies = (
+                "__Host-yashigani_admin_session",
+                "__Host-yashigani_session",
+            )
+            if not any(request.cookies.get(k) for k in _admin_cookies):
+                return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
+            return HTMLResponse(_ui4_admin.read_text(encoding="utf-8"))
+
+        @app.get("/admin4/", include_in_schema=False)
+        async def ui4_admin4_alias(request: Request):
+            # 4.0: /admin4/ was the Wave-1 parallel route. Now redirects to the
+            # canonical /admin/ — preserves bookmarks from the transition period.
+            return RedirectResponse(url="/admin/", status_code=302)
 
     # ── Auth-gated OpenAPI schema + Swagger UI (v2.23.4) ────────────────────
     #
@@ -1108,28 +1238,21 @@ def create_backoffice_app() -> FastAPI:
         async def admin_login_page(request: Request):
             return _templates.TemplateResponse(request, "login.html")
 
-        # Phase 2 / 2.25.5-auth-ingress: /app/webui is now served directly by
-        # Open WebUI (OWUI).  Caddy routes /app/webui* to open-webui:8080 behind
-        # forward_auth → /auth/verify-user.  The backoffice placeholder endpoint
-        # has been removed; OWUI handles all /app/webui/* requests.
-        @app.get("/admin/", include_in_schema=False)
-        async def admin_dashboard_page(request: Request):
-            # Server-side session-presence check before serving the dashboard HTML.
-            # ASVS V1.4.1: access control enforced at trusted enforcement point.
-            # A missing cookie means no valid session → redirect to login.
-            # Note: cryptographic validation of the session token happens in the
-            # API layer (SessionStore.get()) on every subsequent API call; this
-            # check is a lightweight pre-flight to avoid serving the SPA shell to
-            # unauthenticated clients (closes SWEEP-06 / OWASP A07 finding).
-            # Fix: 2026-05-09 (v2.23.3).
+        # 4.0: old vanilla-JS admin is now the LEGACY fallback at /admin-legacy/.
+        # The new Lit admin is at /admin/ (registered above in the ui4_admin block).
+        # Keep this route reachable during the live-verify transition; delete after
+        # Wave-2 sign-off. Same session pre-flight as before (ASVS V1.4.1).
+        @app.get("/admin-legacy/", include_in_schema=False)
+        async def admin_legacy_page(request: Request):
+            # ASVS V1.4.1: cookie pre-flight before serving the SPA shell.
+            # Cryptographic validation happens on every /dashboard/* + /admin/* API call.
             _admin_cookies = (
                 "__Host-yashigani_admin_session",
                 "__Host-yashigani_session",
             )
             if not any(request.cookies.get(k) for k in _admin_cookies):
-                next_path = request.url.path
                 return RedirectResponse(
-                    url=f"/admin/login?next={next_path}",
+                    url="/admin/login?next=/admin-legacy/",
                     status_code=302,
                 )
             return _templates.TemplateResponse(request, "dashboard.html")
@@ -1273,6 +1396,49 @@ def create_backoffice_app() -> FastAPI:
         prefix="/admin/api/permissions",
         tags=["permissions"],
     )
+
+    # 4.0 Letta agent capabilities — /user/agents, /user/memories, /user/skills
+    # (RISK-097/108 scope-intersection; BOLA-enforced; require_user_session).
+    #
+    # PRECEDENCE (4.0 agent-builder): this router is included BEFORE user_ui_router
+    # so that GET /user/agents resolves to the USER-CREATED agent list (ua_id
+    # shape) consumed by the agent-builder surfaces — NOT the older Phase-2
+    # registry-agents stub in user_ui.py (which shares the same path). FastAPI is
+    # first-match-wins, so order is the deconfliction. The chat surface sources
+    # its "agents to chat with" from GET /user/models (which returns both models
+    # and registry agents), so it does not depend on the shadowed stub.
+    from yashigani.backoffice.routes.user_agents import router as _user_agents_router
+    app.include_router(_user_agents_router, tags=["user-agents"])
+
+    # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+    # /chat + /agents + /builder + /workflows pages + /user/* data endpoints. All enforce
+    # require_user_session. Mounted without a prefix so routes carry their own
+    # /chat and /user/ paths. (NB: its GET /user/agents registry stub is now
+    # shadowed by the agent-builder router above — see precedence note.)
+    app.include_router(user_ui_router, tags=["user-ui"])
+
+    # 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced via
+    # account_id scoping on every per-conversation query).
+    app.include_router(user_conversations_router, tags=["user-conversations"])
+
+    # 4.0 no-code workflow composer + run history (single router) —
+    # POST /user/workflows/generate, POST/GET/PATCH/DELETE /user/workflows/{wf_id},
+    # GET /user/workflows/{id}/runs. require_user_session + BOLA (EU AI Act Art.14 HITL);
+    # runs read the WorkflowScheduler's Redis DB 6 (503 if scheduler unavailable).
+    app.include_router(user_workflows_router, tags=["user-workflows"])
+
+    # 4.0 admin workflow-oversight — GET/PATCH /admin/workflows/{wf_id}
+    # Cross-user read + disable.  AdminSession on GETs; StepUpAdminSession on PATCH.
+    # EU AI Act Art.14 HITL: disabling a governed workflow is a consequential action.
+    app.include_router(admin_workflows_router, tags=["admin-workflows"])
+
+    # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
+    # Su's Caddy config for /chat and /user/* will set:
+    #   report-uri /api/v1/csp-report
+    # Unauthenticated — browsers cannot attach cookies to CSP report POSTs.
+    # Same posture as the existing /admin/csp-report (already mounted at /admin).
+    from yashigani.backoffice.routes.csp_report import router as _user_csp_report_router
+    app.include_router(_user_csp_report_router, prefix="/api/v1", tags=["csp"])
 
     # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
     # OpenAPI schema and annotate all /scim/v2/* paths with the scheme reference.

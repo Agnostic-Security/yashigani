@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (CA-signed certificate mode)
-# Last updated: 2026-05-18T00:00:00+00:00 (v2.23.4: add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing)
+# Last updated: 2026-06-27T00:00:00+00:00 (v4.0-phase1: strict CSP/TT — import csp-policies snippet from Caddyfile.csp)
 # Use this for enterprise / on-prem deployments with an internal CA.
 #
 # Before starting:
@@ -55,6 +55,11 @@
         strict_sni_host insecure_off
     }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSP policy snippet — see docker/Caddyfile.csp for full design rationale.
+# Defines (csp-policies) named snippet; used via `import csp-policies` in site block.
+import /etc/caddy/Caddyfile.csp
 
 # ─── Internal mTLS snippet (imported by every upstream block that targets a
 #     service terminating mTLS: gateway:8080, backoffice:8443). ─────────────
@@ -174,44 +179,12 @@
         -Alt-Svc
     }
 
-    # CSP, set per-path so exactly one policy applies per request.
-    #
-    # STRICT (script-src 'self', style-src 'self', no inline) applies to the
-    # Yashigani-native admin plane ONLY — the backoffice SPA (/admin/*), auth
-    # (/auth/*, /login), and the other first-party backoffice routes. These were
-    # deliberately made strict-CSP-compliant (inline styles moved to CSS classes,
-    # f7a3228); do NOT weaken them.
-    #
-    # LENIENT (unsafe-eval + unsafe-inline) applies to everything else:
-    #  - the proxied observability sub-apps (Grafana, Wazuh/OSD, Prometheus),
-    #    which ship nonce-less inline bootstrap scripts + eval()/inline styles;
-    #  - the Open WebUI end-user chat surface served at the root catch-all
-    #    (--with-openwebui), whose SvelteKit build emits inline hydration scripts —
-    #    strict CSP blocks them and the page renders blank (YSG-2253 blocker).
-    #
-    # The boundary is a single path set used in both matchers so exactly one
-    # policy applies per request.
-    @strict_ui {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
-        # LAURA-2255-006 / LAURA-30-009: exclude ReDoc paths so @redoc_ui is the
-        # sole CSP source for those two routes. Without this, both @strict_ui and
-        # @redoc_ui set a CSP header, producing two headers on every /admin/api-redoc
-        # and /redoc response. Browsers intersect; not exploitable but a config defect.
-        not path /admin/api-redoc /redoc
-    }
-    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
-    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
-    # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
-    # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
-    # to the two ReDoc routes; all other strict_ui paths keep the default CSP.
-    # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
-    # via its web component Shadow DOM at render time.
-    @redoc_ui path /admin/api-redoc /redoc
-    header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
-    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
-    header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    # CSP matchers and headers — strict-by-default (4.0 / RISK-102 / SC-NEW-001)
+    # Source of truth: docker/Caddyfile.csp  (defines the (csp-policies) snippet)
+    # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
+    # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
+    # See Caddyfile.csp for full design rationale.
+    import csp-policies
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
@@ -432,11 +405,17 @@ Hiring: https://agnosticsec.com/careers
     # retro #83: Grafana now serves HTTPS on port 3443 with mTLS (Pattern B).
     # Caddy presents caddy_client.crt to Grafana; Grafana verifies via
     # ca_intermediate.crt. The forward_auth check still applies (admin only).
-    handle_path /admin/grafana/* {
+    # Parity with Caddyfile.selfsigned: handle (no strip) + verify-admin + misroute fix.
+    handle /admin/grafana/* {
+        # Normalise misrouted asset requests: browsers may resolve relative asset
+        # refs against the dashboard path (e.g. /admin/grafana/d/x/public/build/…).
+        # Strip the spurious /d/<uid>[/<slug>]/ prefix back to the canonical path.
+        @grafana_misroute path_regexp gmis ^/admin/grafana/d/(?:[^/]+/)*?((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login?next=/admin/grafana/ 302
@@ -446,21 +425,52 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+            # Strip Grafana's own X-Frame-Options / CSP so the edge CSP
+            # (@lenient_subapp) governs and same-origin iframe embedding works.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
         }
     }
 
     # ── Wazuh Dashboard — admin-authenticated access via /admin/wazuh/* ────
-    handle_path /admin/wazuh/* {
+    # Parity with Caddyfile.selfsigned: handle (no strip) + verify-admin.
+    # Wazuh dashboard must have server.basePath=/admin/wazuh + rewriteBasePath=true.
+    handle /admin/wazuh/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
             }
         }
         reverse_proxy wazuh-dashboard:5601 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            # Strip Wazuh Dashboard's own X-Frame-Options / CSP so
+            # same-origin iframe embedding works from /admin/*.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+
+    # ── Loki — admin-authenticated access via /admin/loki/* ──────────────
+    # Exposes Loki's HTTP query API for direct admin use (primary consumer: Grafana).
+    # Loki has no UI; @lenient_subapp CSP covers this path.
+    # Loki serves HTTPS on :3100 with mTLS (Pattern B).
+    handle /admin/loki/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy https://loki:3100 {
+            import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
@@ -472,7 +482,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
@@ -482,6 +492,30 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── Alertmanager — admin-authenticated access via /admin/alertmanager/* ──
+    # Alertmanager serves plain HTTP on port 9093 (no mTLS). Caddy is on the
+    # obs network and can reach it directly. forward_auth gate mirrors the
+    # grafana/loki/prometheus pattern (verify-admin). @lenient_subapp CSP covers
+    # this path; X-Frame-Options + CSP stripped from upstream so same-origin
+    # iframe embedding from /admin/ works.
+    handle_path /admin/alertmanager/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy http://alertmanager:9093 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
         }
     }
 
@@ -507,12 +541,9 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── /app/webui — Open WebUI user path (Phase 2 / 2.25.5-auth-ingress) ────
-    # See Caddyfile.selfsigned for full commentary.
-    # OWUI is plain HTTP on caddy_internal — no internal-mtls to open-webui:8080.
+    # ── /app/webui — legacy OWUI path (4.0: removed, redirect to /chat) ──────
     handle /app/webui* {
-        # OWUI served at ROOT (root catch-all). Back-compat redirect.
-        redir * / 302
+        redir * /chat 302
     }
 
     # ── Prometheus federation — admin-authenticated ─────────────────────────
@@ -529,79 +560,23 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
-    # OWUI has moved off root onto /app/webui.  See Caddyfile.selfsigned.
+    # ── Root catch-all — 4.0: portal redirect + ui4 proxy ────────────────────
+    # See Caddyfile.selfsigned for commentary. OWUI removed in 4.0.
     handle {
-
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
         import strip-orchestration-headers
 
-        # ── OWUI socket.io WebSocket (Phase 2 / F-WS fix pattern) ──────────
-        @owui_ws {
-            header Connection *Upgrade*
-            header Upgrade websocket
-            path /ws/*
-        }
-        handle @owui_ws {
-            forward_auth https://backoffice:8443 {
-            import internal-mtls
-            import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-                header_up -Connection
-                header_up -Upgrade
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    respond 401
-                }
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    respond 403
-                }
-            }
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
-                header_up X-Forwarded-Proto https
-                header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
-            }
+        @root_path path /
+        handle @root_path {
+            redir * /chat 302
         }
 
-        # ── OWUI HTTP (non-WS) ───────────────────────────────────────────────
         handle {
-            forward_auth https://backoffice:8443 {
+            reverse_proxy https://backoffice:8443 {
+                header_down -Content-Security-Policy  # single CSP at edge
             import internal-mtls
             import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    redir * /login?next={http.request.uri} 302
-                }
-
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    redir * /admin/ 302
-                }
-            }
-
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
                 header_up X-Forwarded-Proto https
                 header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
     }

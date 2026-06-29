@@ -243,6 +243,31 @@ agent_response_allowed if {
 
     # No PII gate trigger
     not input.response_pii_detected == true
+
+    # Phase 5 §E.11: Langflow callee hard-cap (see _langflow_callee_ceiling_ok).
+    _langflow_callee_ceiling_ok
+}
+
+# ---------------------------------------------------------------------------
+# _langflow_callee_ceiling_ok — Phase 5 / §C §E.11 / RISK-108 analogue.
+#
+# Hard policy cap: when agent__langflow is the TARGET of an agent call, the
+# response sensitivity must not exceed INTERNAL.  This is enforced in policy
+# (independent of registry sensitivity_ceiling) so the cap cannot be bypassed
+# by a misconfigured registry entry. Analogue of the OpenClaw MF-3 rule.
+#
+# For all OTHER target agents this rule is trivially true (unconstrained).
+# ---------------------------------------------------------------------------
+
+# Non-langflow target: no additional cap.
+_langflow_callee_ceiling_ok if {
+    input.target_agent.agent_id != "agent__langflow"
+}
+
+# Langflow target: allow only when response sensitivity ≤ INTERNAL (rank 1).
+_langflow_callee_ceiling_ok if {
+    input.target_agent.agent_id == "agent__langflow"
+    sensitivity_rank(input.response_sensitivity) <= sensitivity_rank("INTERNAL")
 }
 
 # Compound decision object — mirrors v1_routing.rego response_decision shape
@@ -292,6 +317,17 @@ agent_response_deny_reason := "missing_agent_identity" if {
     not input.target_agent.agent_id != ""
 }
 
+# Phase 5 §E.11: Langflow callee ceiling hard-cap deny reason.
+# Fires when agent__langflow is the target AND response sensitivity > INTERNAL.
+# Takes precedence over the generic response_sensitivity_exceeds_caller_ceiling
+# reason so operators can distinguish the hard-cap from a normal ceiling denial.
+agent_response_deny_reason := "langflow_callee_ceiling_hard_cap" if {
+    not agent_response_allowed
+    input.caller.agent_id != ""
+    input.target_agent.agent_id == "agent__langflow"
+    sensitivity_rank(input.response_sensitivity) > sensitivity_rank("INTERNAL")
+}
+
 # #4 — self-describing denial for the agent-to-agent gate (same package
 # `yashigani`; deny_agent_call is defined in yashigani.rego).
 denials contains {
@@ -301,3 +337,120 @@ denials contains {
     "code": 403,
     "action": "DENIED",
 } if { deny_agent_call }
+
+# ---------------------------------------------------------------------------
+# NHI request enforcement (4.0 Phase 3 — RISK-097/108)
+#
+# Enforces Non-Human Identity constraints for every NHI-originated gateway call.
+# The NHI is always evaluated as the caller (input.identity, per R9 — never
+# the building user).
+#
+# Input contract (built by the gateway when identity.kind == "nhi"):
+#   input.identity.kind                              == "nhi"
+#   input.identity.allowed_tools                     — list of permitted tool names
+#   input.identity.sensitivity_ceiling               — "PUBLIC"|"INTERNAL"|"CONFIDENTIAL"|"RESTRICTED"
+#   input.identity.budget_cap.max_tokens_per_run     — integer ceiling
+#   input.identity.budget_cap.max_tool_calls_per_run — integer ceiling
+#   input.request.tool                — tool name requested ("" = no specific tool)
+#   input.request.tokens_used         — tokens consumed so far in this NHI run
+#   input.request.tool_calls_used     — tool calls made so far in this NHI run
+#   input.request.response_sensitivity — sensitivity label on the pending response
+#
+# Evaluated at: /v1/data/yashigani/nhi_request_decision
+# ---------------------------------------------------------------------------
+
+# ── Tool allowlist ─────────────────────────────────────────────────────────
+
+# Fail-closed default: tool not allowed unless a positive rule fires.
+default nhi_tool_allowed := false
+
+# Allowed when the NHI's requested tool is in its allowed_tools list.
+# An empty allowed_tools list = no tools granted (strict fail-closed, RISK-097).
+nhi_tool_allowed if {
+    input.identity.kind == "nhi"
+    count(input.identity.allowed_tools) > 0
+    input.request.tool in input.identity.allowed_tools
+}
+
+# A non-tool gateway call (blank tool = direct LLM chat, no explicit tool invocation).
+# Still gated on kind=="nhi"; the tools constraint only applies to explicit tool calls.
+nhi_tool_allowed if {
+    input.identity.kind == "nhi"
+    input.request.tool == ""
+}
+
+# ── Budget cap ─────────────────────────────────────────────────────────────
+
+# Fail-closed: budget not ok unless every cap is satisfied.
+default nhi_budget_ok := false
+
+nhi_budget_ok if {
+    input.identity.kind == "nhi"
+    input.request.tokens_used <= input.identity.budget_cap.max_tokens_per_run
+    input.request.tool_calls_used <= input.identity.budget_cap.max_tool_calls_per_run
+}
+
+# ── Sensitivity ceiling ────────────────────────────────────────────────────
+
+# Fail-closed: ceiling not ok unless content rank ≤ NHI's declared ceiling rank.
+# Uses _ceiling_rank (undefined for unknown ceiling strings → deny, ASVS V4.1.3).
+default nhi_ceiling_ok := false
+
+nhi_ceiling_ok if {
+    input.identity.kind == "nhi"
+    resp_rank := sensitivity_rank(input.request.response_sensitivity)
+    ceil_rank := _ceiling_rank(input.identity.sensitivity_ceiling)
+    resp_rank <= ceil_rank
+}
+
+# ── Compound allow ─────────────────────────────────────────────────────────
+
+# All three gates must pass for the NHI request to be allowed.
+default nhi_request_allowed := false
+
+nhi_request_allowed if {
+    nhi_tool_allowed
+    nhi_budget_ok
+    nhi_ceiling_ok
+}
+
+# ── Deny reason (single-valued, mutually exclusive precedence) ─────────────
+#
+# Precedence: tool_not_in_allowed_tools > nhi_budget_exceeded >
+#             nhi_sensitivity_ceiling_exceeded > ok
+#
+# Each arm gates on the previous passing so exactly one reason fires
+# (no eval_conflict_error). Mirrors agent_call_deny_reason ordering.
+
+nhi_deny_reason := "tool_not_in_allowed_tools" if {
+    not nhi_tool_allowed
+    input.identity.kind == "nhi"
+}
+
+nhi_deny_reason := "nhi_budget_exceeded" if {
+    nhi_tool_allowed
+    not nhi_budget_ok
+    input.identity.kind == "nhi"
+}
+
+nhi_deny_reason := "nhi_sensitivity_ceiling_exceeded" if {
+    nhi_tool_allowed
+    nhi_budget_ok
+    not nhi_ceiling_ok
+    input.identity.kind == "nhi"
+}
+
+nhi_deny_reason := "ok" if {
+    nhi_request_allowed
+}
+
+# ── Compound decision object ───────────────────────────────────────────────
+# Queried by the gateway at /v1/data/yashigani/nhi_request_decision.
+
+nhi_request_decision := {
+    "allow": nhi_request_allowed,
+    "tool_ok": nhi_tool_allowed,
+    "budget_ok": nhi_budget_ok,
+    "ceiling_ok": nhi_ceiling_ok,
+    "deny_reason": nhi_deny_reason,
+}

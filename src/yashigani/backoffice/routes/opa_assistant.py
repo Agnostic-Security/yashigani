@@ -8,10 +8,10 @@ The assistant only generates the data document (JSON).
 It never generates or modifies Rego files.
 
 Routes:
-  POST /admin/opa-assistant/suggest   — generate suggestion from NL description
-  POST /admin/opa-assistant/apply     — apply a validated suggestion to OPA
-  POST /admin/opa-assistant/reject    — reject a suggestion (audit log only)
-  GET  /admin/opa-assistant/schema    — return RBAC document JSON schema
+  POST /admin/opa-assistant/suggest   — generate suggestion from NL description (AdminSession)
+  POST /admin/opa-assistant/apply     — apply a validated suggestion to OPA (StepUpAdminSession)
+  POST /admin/opa-assistant/reject    — reject a suggestion, audit log only (AdminSession)
+  GET  /admin/opa-assistant/schema    — return RBAC document JSON schema (AdminSession)
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from yashigani.backoffice.middleware import AdminSession
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
 
@@ -136,12 +136,16 @@ async def suggest(
 @router.post("/apply", status_code=200)
 async def apply_suggestion(
     body: ApplyRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,
 ):
     """
     Apply a validated RBAC suggestion to OPA.
     The suggestion must pass schema validation before being accepted.
     Admin must have reviewed it before calling this endpoint.
+
+    Requires a fresh step-up TOTP event (ASVS V6.8.4 / EU AI Act Art.14).
+    Applying AI-generated policy is a consequential action — equivalent to
+    policy promotion/activate which already require step-up.
     """
     from yashigani.opa_assistant.validator import validate_rbac_document
     from yashigani.rbac.opa_push import push_rbac_data

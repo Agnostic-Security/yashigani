@@ -96,6 +96,13 @@ class EventType(str, Enum):
     AGENT_UPDATED = "AGENT_UPDATED"
     AGENT_DEACTIVATED = "AGENT_DEACTIVATED"
     AGENT_TOKEN_ROTATED = "AGENT_TOKEN_ROTATED"
+    # Agent SVID lifecycle — 4.0 Phase 3 (RISK-104 / AUDIT-GAP-001 class)
+    # Emitted by pki/issuer.mint_agent_leaf() and the sidecar rotation callback.
+    # These are governance actions and MUST be on the tamper-evident hash chain.
+    AGENT_SVID_ISSUED = "AGENT_SVID_ISSUED"
+    AGENT_SVID_ROTATED = "AGENT_SVID_ROTATED"
+    AGENT_SVID_REVOKED = "AGENT_SVID_REVOKED"
+    AGENT_SVID_ROTATION_FAILED = "AGENT_SVID_ROTATION_FAILED"
     # Agent auth / routing
     AGENT_AUTH_FAILED = "AGENT_AUTH_FAILED"
     AGENT_CALL_ALLOWED = "AGENT_CALL_ALLOWED"
@@ -353,6 +360,63 @@ class EventType(str, Enum):
     # on any scope (org/group/user/agent).
     # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
     PERMISSION_GRANT_CHANGED = "PERMISSION_GRANT_CHANGED"
+    # ---------------------------------------------------------------------------
+    # 4.0 Phase 3 — NHI identity lifecycle + P1/P2 split (RISK-097/108)
+    # All events route to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / CMMC AU.L2-3.3.1 / SOC 2 CC7.1.
+    # ---------------------------------------------------------------------------
+    # NHI instantiation lifecycle
+    NHI_INSTANTIATION_REQUESTED = "NHI_INSTANTIATION_REQUESTED"
+    NHI_SCOPE_INTERSECTED = "NHI_SCOPE_INTERSECTED"
+    NHI_INSTANTIATION_DENIED = "NHI_INSTANTIATION_DENIED"
+    NHI_SVID_APPROVED = "NHI_SVID_APPROVED"
+    # NHI invocation (per-hop OPA decisions)
+    NHI_INVOCATION_ALLOWED = "NHI_INVOCATION_ALLOWED"
+    NHI_INVOCATION_DENIED = "NHI_INVOCATION_DENIED"
+    # P1/P2 header isolation — SECURITY event (HIGH severity)
+    # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
+    # The header is silently stripped; this event is the regression canary.
+    # Laura's regression can detect impersonation attempts without a live exploit.
+    AGENT_HEADER_STRIPPED = "AGENT_HEADER_STRIPPED"
+    # Delegated context (R2 / R12): server-side on-behalf-of record
+    DELEGATED_CTX_MINTED = "DELEGATED_CTX_MINTED"
+    DELEGATED_CTX_EXPIRED = "DELEGATED_CTX_EXPIRED"
+    # Builder graph lifecycle (Phase 4 — builder persistence)
+    AGENT_TEMPLATE_SAVED = "AGENT_TEMPLATE_SAVED"
+    AGENT_TEMPLATE_LOADED = "AGENT_TEMPLATE_LOADED"
+    # ---------------------------------------------------------------------------
+    # 4.0 no-code backend — NL-driven agent generation (EU AI Act Art.14)
+    # AI generates; human decides.  The AGENT_FLOW_COMMITTED event is the
+    # audit anchor for the human's explicit decision.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14 HITL.
+    # ---------------------------------------------------------------------------
+    AGENT_FLOW_GENERATION_REQUESTED = "AGENT_FLOW_GENERATION_REQUESTED"
+    AGENT_FLOW_GENERATED = "AGENT_FLOW_GENERATED"
+    AGENT_FLOW_COMMITTED = "AGENT_FLOW_COMMITTED"
+    # ---------------------------------------------------------------------------
+    # 4.0 no-code WORKFLOW composer (EU AI Act Art.14)
+    # AI parses NL → governed workflow spec; human decides (WorkflowCommitted anchor).
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14 HITL.
+    # ---------------------------------------------------------------------------
+    WORKFLOW_GENERATION_REQUESTED = "WORKFLOW_GENERATION_REQUESTED"
+    WORKFLOW_GENERATED = "WORKFLOW_GENERATED"
+    WORKFLOW_COMMITTED = "WORKFLOW_COMMITTED"
+    # 4.0 — Workflow scheduler + governed execution (feat/4.0-wf-exec)
+    # Every event routes to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14.
+    # ---------------------------------------------------------------------------
+    # A committed user workflow was triggered by the scheduler.
+    WORKFLOW_RUN_STARTED = "WORKFLOW_RUN_STARTED"
+    # One step completed cleanly (OPA allow + inspection CLEAN).
+    WORKFLOW_STEP_COMPLETED = "WORKFLOW_STEP_COMPLETED"
+    # One step was denied by OPA or response inspection (run halts fail-closed).
+    WORKFLOW_STEP_DENIED = "WORKFLOW_STEP_DENIED"
+    # All steps completed without a deny — run finished.
+    WORKFLOW_RUN_COMPLETED = "WORKFLOW_RUN_COMPLETED"
+    # Run aborted: a step was denied, raised an exception, or the actor was missing.
+    WORKFLOW_RUN_FAILED = "WORKFLOW_RUN_FAILED"
+    # Admin disabled a user's workflow from the admin oversight plane.
+    WORKFLOW_ADMIN_DISABLED = "WORKFLOW_ADMIN_DISABLED"
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1144,87 @@ class AgentUpstreamUnreachableEvent(AuditEvent):
     remainder_path: str = ""
     request_id: str = ""
     error_type: str = ""     # connect_error | timeout | unknown
+
+
+# ---------------------------------------------------------------------------
+# Agent SVID lifecycle events — 4.0 Phase 3 (RISK-104 / AUDIT-GAP-001 class)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentSvidIssuedEvent(AuditEvent):
+    """Emitted by pki/issuer.mint_agent_leaf() when an agent SVID is issued.
+
+    Closes AUDIT-GAP-001 class for PKI operations. These events are governance
+    actions and MUST be on the tamper-evident SHA-384 hash chain (not plain logs).
+
+    approved_by: identity_id of the admin who approved the agent template.
+    approval_audit_jti: jti from the admin-approval audit event — links this
+                        cert to the approval in the hash chain (non-repudiation).
+    cert_not_after:     ISO 8601 UTC expiry of the issued leaf cert.
+    """
+
+    event_type: str = EventType.AGENT_SVID_ISSUED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # no PII in cert metadata
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    cert_not_after: str = ""        # ISO 8601 UTC
+    approved_by: str = ""           # admin identity_id
+    approval_audit_jti: str = ""    # links to approval event in hash chain
+
+
+@dataclass
+class AgentSvidRotatedEvent(AuditEvent):
+    """Emitted by the SVID sidecar cert-rotation callback on the backoffice.
+
+    Written when the sidecar successfully rotates a leaf cert before expiry.
+    """
+
+    event_type: str = EventType.AGENT_SVID_ROTATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    new_cert_not_after: str = ""    # ISO 8601 UTC
+
+
+@dataclass
+class AgentSvidRevokedEvent(AuditEvent):
+    """Emitted when an admin revokes an agent SVID.
+
+    Sets svid_state=revoked in the agent DB record. The existing cert is not
+    actively invalidated (no CRL/OCSP — YSG-RISK-058 residual); the agent
+    container is torn down immediately by PoolManager.
+    """
+
+    event_type: str = EventType.AGENT_SVID_REVOKED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = False
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    revoked_by: str = ""            # admin identity_id
+    revoke_reason: str = ""
+
+
+@dataclass
+class AgentSvidRotationFailedEvent(AuditEvent):
+    """Emitted when the SVID sidecar fails to rotate a cert (fail-closed path).
+
+    The sidecar exits on rotation failure, killing the agent container.
+    PoolManager health monitor detects the dead container and calls replace().
+    """
+
+    event_type: str = EventType.AGENT_SVID_ROTATION_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    error_type: str = ""            # api_error | timeout | parse_error
 
 
 # ---------------------------------------------------------------------------
@@ -3099,3 +3244,433 @@ class AdminCloudKeySetEvent(AuditEvent):
     admin_account: str = ""
     provider: str = ""     # e.g. "openai" | "anthropic"
     kms_key: str = ""      # KMS key name (e.g. "openai_api_key") — never the value
+
+
+# ---------------------------------------------------------------------------
+# 4.0 Phase 3 — NHI identity lifecycle + P1/P2 split (RISK-097/108)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NhiInstantiationRequestedEvent(AuditEvent):
+    """User requests instantiation of an NHI from a user-agent template (RISK-097).
+
+    Emitted before scope intersection so the request is recorded even if
+    it is subsequently denied by NhiInstantiationDeniedEvent.
+    """
+
+    event_type: str = EventType.NHI_INSTANTIATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""   # the requesting user's identity_id
+    ua_id: str = ""               # user-agent source id (uag_*)
+    template_name: str = ""       # agent name slug
+
+
+@dataclass
+class NhiScopeIntersectedEvent(AuditEvent):
+    """Scope intersection computed for an NHI instantiation (R3 / RISK-097).
+
+    Records the resulting effective_scope so the audit chain proves what
+    the NHI was granted, independently of any later mutation.
+    effective_scope_hash is SHA-384 of the JSON-serialised effective_scope.
+    """
+
+    event_type: str = EventType.NHI_SCOPE_INTERSECTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    nhi_id: str = ""
+    owner_identity_id: str = ""
+    effective_scope_hash: str = ""   # sha384:<hex>
+    declared_scope_tool_count: int = 0
+    effective_scope_tool_count: int = 0
+
+
+@dataclass
+class NhiInstantiationDeniedEvent(AuditEvent):
+    """NHI instantiation denied — empty intersection or admin deny (RISK-097).
+
+    reason: "empty_intersection" | "admin_deny" | "svid_pending".
+    """
+
+    event_type: str = EventType.NHI_INSTANTIATION_DENIED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    ua_id: str = ""
+    reason: str = ""   # empty_intersection | admin_deny | svid_pending
+
+
+@dataclass
+class NhiSvidApprovedEvent(AuditEvent):
+    """Admin approved SVID issuance for an NHI (step-up required, RISK-097).
+
+    step_up_verified is always True — NHI approval requires StepUpAdminSession.
+    """
+
+    event_type: str = EventType.NHI_SVID_APPROVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    nhi_id: str = ""
+    spiffe_id: str = ""
+    step_up_verified: bool = True
+
+
+@dataclass
+class NhiInvocationAllowedEvent(AuditEvent):
+    """OPA allowed an NHI-originated hop (RISK-097 invariant pass)."""
+
+    event_type: str = EventType.NHI_INVOCATION_ALLOWED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    on_behalf_of_identity_id: str = ""   # the invoking user, from delegated ctx
+    path: str = ""
+
+
+@dataclass
+class NhiInvocationDeniedEvent(AuditEvent):
+    """OPA denied an NHI-originated hop — scope containment working (RISK-097)."""
+
+    event_type: str = EventType.NHI_INVOCATION_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    on_behalf_of_identity_id: str = ""
+    path: str = ""
+    deny_reason: str = ""   # scope_ceiling | tool_not_allowed | budget_exceeded
+
+
+@dataclass
+class AgentHeaderStrippedEvent(AuditEvent):
+    """A P1 (agent-only) caller attempted to set a P2 (user-assertion) header.
+
+    Severity: HIGH.  This is a regression canary for FIND-3.1-AGENT-BEARER-
+    IMPERSONATION (RISK-108).  The header was silently stripped; the identity
+    resolved as the agent's own NHI identity (not the claimed user).
+
+    Laura's regression probe checks for this event in the audit chain — any
+    appearance means an agent made an impersonation attempt.
+    """
+
+    event_type: str = EventType.AGENT_HEADER_STRIPPED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_token_role: str = ""        # p1_agent | p1_nhi
+    stripped_header: str = ""          # x-openwebui-user-email | x-yashigani-orchestration-principal
+    agent_identity_id: str = ""        # the resolved agent/NHI id
+    severity: str = "HIGH"             # immutable floor
+
+
+@dataclass
+class DelegatedCtxMintedEvent(AuditEvent):
+    """Gateway minted a server-side delegated context record (R2 / RISK-097).
+
+    Records the binding without exposing the signed nonce value.
+    binding_hash is SHA-384 of (nhi_id + ":" + user_identity_id + ":" + jti).
+    """
+
+    event_type: str = EventType.DELEGATED_CTX_MINTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    user_identity_id: str = ""
+    session_id_hash: str = ""    # SHA-384 of the raw session_id — never raw
+    binding_hash: str = ""       # SHA-384(nhi_id:user_identity_id:jti)
+    ttl_seconds: int = 0
+
+
+@dataclass
+class AgentTemplateGraphSavedEvent(AuditEvent):
+    """Builder graph persisted server-side (Phase 4 / RISK-113).
+
+    raw graph is never stored; only node_count, edge_count, and a SHA-384
+    of the normalised graph JSON are recorded.
+    effective_scope_stripped=True confirms R11 enforcement ran.
+    """
+
+    event_type: str = EventType.AGENT_TEMPLATE_SAVED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    ua_id: str = ""
+    node_count: int = 0
+    edge_count: int = 0
+    graph_hash: str = ""              # sha384:<hex> of normalised CTF graph JSON
+    effective_scope_stripped: bool = True  # always True (R11)
+
+
+# ---------------------------------------------------------------------------
+# 4.0 no-code backend — NL-driven agent generation (EU AI Act Art.14)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentFlowGenerationRequestedEvent(AuditEvent):
+    """Emitted when a user requests NL-driven Langflow flow generation.
+
+    Records the intent before the governed LLM call so the request is
+    on the audit chain even if generation fails.
+
+    Security invariants:
+    - description is NOT stored (may contain sensitive NL; only length recorded).
+    - masking_applied=True always.
+    - owner_identity_id identifies the accountable human principal.
+    """
+
+    event_type: str = EventType.AGENT_FLOW_GENERATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    description_length: int = 0       # length in chars of the NL description
+    # First 10 effective skills (path strings) — bounded to avoid large records.
+    # No user content (the description) is stored here.
+    effective_skills: "list[str]" = field(default_factory=list)
+
+
+@dataclass
+class AgentFlowGeneratedEvent(AuditEvent):
+    """Emitted after a Langflow flow is successfully generated and created.
+
+    Records the draft flow's identity and scope-clamp outcome.
+    The generated spec is NOT stored (hash only — raw flows may be large
+    and can contain user-description fragments).
+
+    Security invariants:
+    - masking_applied=True always.
+    - spec_hash is SHA-384 of the clamped flow JSON (after model-name clamp).
+    - clamp_warnings records how many model-name substitutions were applied
+      (string list bounded to 20 entries for log hygiene).
+    """
+
+    event_type: str = EventType.AGENT_FLOW_GENERATED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    draft_id: str = ""                 # ua:draft:{draft_id} Redis key prefix
+    flow_id: str = ""                  # Langflow flow UUID
+    spec_hash: str = ""                # sha384:<hex> of the clamped flow JSON
+    clamp_warnings: "list[str]" = field(default_factory=list)   # ≤20 entries
+
+
+@dataclass
+class AgentFlowCommittedEvent(AuditEvent):
+    """Emitted when a user explicitly commits a generated draft to their template pool.
+
+    THIS IS THE HUMAN-DECIDES AUDIT ANCHOR (EU AI Act Art.14).
+    The AI generated the flow; this event records the human's explicit
+    decision to add it to their agent-template pool.  The accountable act
+    is the human's POST /user/agents/templates call, not the LLM generation.
+
+    Security invariants:
+    - human_decided is always True — the event cannot be emitted without a
+      live user session (require_user_session) and an explicit HTTP POST.
+    - masking_applied=True always.
+    - spec_hash from the draft is reproduced here for chain-of-custody audit.
+    """
+
+    event_type: str = EventType.AGENT_FLOW_COMMITTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""        # accountable human principal
+    ua_id: str = ""                    # resulting ua:meta:{ua_id} key
+    draft_id: str = ""                 # consumed draft (now deleted from Redis)
+    flow_id: str = ""                  # Langflow flow UUID
+    spec_hash: str = ""               # sha384:<hex> of the committed flow JSON
+    callee_registered: bool = False    # True if agent_registry entry was created
+    human_decided: bool = True         # always True — immutable field (EU AI Act)
+
+
+# ===========================================================================
+# 4.0 no-code WORKFLOW composer (EU AI Act Art.14)
+# ===========================================================================
+
+
+@dataclass
+class WorkflowGenerationRequestedEvent(AuditEvent):
+    """Emitted before the governed LLM call for workflow spec generation.
+
+    Records the incoming NL description length and the calling principal so
+    the audit chain has a pre-LLM anchor for chain-of-custody.
+
+    EU AI Act Art.14: AI generates; human decides.
+    NIST AU-2 / AU-12 / SOC 2 CC7.1.
+    """
+
+    event_type: str = EventType.WORKFLOW_GENERATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # calling user's account_id
+    description_length: int = 0         # len(body.description) — not the description itself
+    available_handle_count: int = 0     # number of @-handles visible to this user
+
+
+@dataclass
+class WorkflowGeneratedEvent(AuditEvent):
+    """Emitted after the LLM produces a workflow spec that passes validation.
+
+    Records the draft_id + spec_hash for chain-of-custody.  The spec itself
+    is not stored in the audit chain (may contain sensitive handle names).
+
+    Draft is BOLA-scoped (draft.account_id == owner_identity_id).
+    """
+
+    event_type: str = EventType.WORKFLOW_GENERATED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # calling user's account_id
+    draft_id: str = ""                  # wf:draft:{draft_id} key
+    spec_hash: str = ""                 # sha384:<hex> of the spec JSON
+    step_count: int = 0                 # number of steps in the generated spec
+    schedule_kind: str = "none"         # "interval" | "cron" | "none"
+    clamped_handle_count: int = 0       # number of @-handles removed during validation
+
+
+@dataclass
+class WorkflowCommittedEvent(AuditEvent):
+    """Emitted when a user explicitly commits a generated draft to their workflow store.
+
+    THIS IS THE HUMAN-DECIDES AUDIT ANCHOR (EU AI Act Art.14).
+    The AI generated the spec; this event records the human's explicit decision
+    to persist it as a named, scheduled workflow.
+
+    Security invariants:
+    - human_decided is always True — the event cannot be emitted without a
+      live user session (require_user_session) and an explicit POST /user/workflows.
+    - masking_applied is always True.
+    - spec_hash reproduced from the draft for chain-of-custody.
+    """
+
+    event_type: str = EventType.WORKFLOW_COMMITTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # accountable human principal
+    workflow_id: str = ""               # wf:meta:{workflow_id} key
+    draft_id: str = ""                  # consumed draft_id (now deleted)
+    workflow_name: str = ""             # human-supplied name (masked)
+    spec_hash: str = ""                 # sha384:<hex> of the committed spec JSON
+    step_count: int = 0                 # number of steps
+    schedule_kind: str = "none"         # "interval" | "cron" | "none"
+    human_decided: bool = True          # always True — immutable (EU AI Act)
+# ---------------------------------------------------------------------------
+# 4.0 — Workflow scheduler + governed execution (feat/4.0-wf-exec)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkflowRunStartedEvent(AuditEvent):
+    """Emitted when the scheduler triggers a committed workflow run.
+
+    Records the workflow identity, owner, step count, schedule kind, and
+    trigger source.  Anchors the run on the tamper-evident hash chain.
+
+    NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14.
+    """
+
+    event_type: str = EventType.WORKFLOW_RUN_STARTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""           # stable workflow identifier
+    run_id: str = ""                # per-run UUID
+    identity_id: str = ""          # workflow owner's identity_id
+    session_id: str = ""           # = identity_id (queryable principal)
+    step_count: int = 0            # total steps in this workflow
+    schedule_kind: str = ""        # "interval" | "cron"
+    trigger_kind: str = "scheduler"  # "scheduler" | "manual"
+
+
+@dataclass
+class WorkflowStepCompletedEvent(AuditEvent):
+    """Emitted when one workflow step completes cleanly.
+
+    Records the adjudication triple so the audit chain proves every hop was
+    OPA-gated and inspection-cleared (OPA-every-hop invariant).
+    """
+
+    event_type: str = EventType.WORKFLOW_STEP_COMPLETED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""           # workflow owner
+    session_id: str = ""            # = identity_id
+    step_index: int = 0
+    actor: str = ""                 # @-handle (e.g. "@Mimi")
+    ingress_opa: str = ""           # "allow" | "deny:<reason>"
+    egress_opa: str = ""
+    inspection_verdict: str = ""    # CLEAN | FLAGGED | skipped
+
+
+@dataclass
+class WorkflowStepDeniedEvent(AuditEvent):
+    """Emitted when a workflow step is denied by OPA or response inspection.
+
+    The run halts immediately (fail-closed).  Raw step output is NEVER stored.
+    This is the workflow-layer analogue of OrchestrationBlockedStepEvent.
+    """
+
+    event_type: str = EventType.WORKFLOW_STEP_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    step_index: int = 0
+    actor: str = ""
+    block_source: str = ""          # "opa_ingress" | "opa_egress" | "response_inspection" | ...
+    ingress_opa: str = ""
+    egress_opa: str = ""
+    inspection_verdict: str = ""
+
+
+@dataclass
+class WorkflowRunCompletedEvent(AuditEvent):
+    """Emitted when all workflow steps complete without a deny."""
+
+    event_type: str = EventType.WORKFLOW_RUN_COMPLETED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    steps_completed: int = 0
+    steps_denied: int = 0
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class WorkflowRunFailedEvent(AuditEvent):
+    """Emitted when a workflow run is aborted (denied step, exception, missing actor)."""
+
+    event_type: str = EventType.WORKFLOW_RUN_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    reason: str = ""                # e.g. "step_0_denied" | "step_1_error"
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class WorkflowAdminDisabledEvent(AuditEvent):
+    """Emitted when an admin disables a user's workflow from the admin oversight plane.
+
+    Security invariants:
+    - Emitted only via PATCH /admin/workflows/{wf_id} under StepUpAdminSession.
+    - admin_account_id is the authenticated admin's account_id (not the owner).
+    - workflow_name is truncated to 64 chars.
+    - masking_applied is always True.
+    """
+
+    event_type: str = EventType.WORKFLOW_ADMIN_DISABLED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account_id: str = ""      # the admin who performed the action
+    workflow_id: str = ""           # affected workflow
+    owner_identity_id: str = ""     # identity_id of the workflow owner
+    workflow_name: str = ""         # display name (truncated to 64 chars)

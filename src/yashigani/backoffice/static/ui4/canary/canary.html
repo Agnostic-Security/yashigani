@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    Yashigani 4.0 shared-layer canary. The CSP below activates Trusted-Types so
+    the safe-render pipeline is exercised under enforcement even without Su's
+    Caddy headers (production CSP/TT is Su's domain — feat/4.0-csp-vendoring).
+    The trusted-types allowlist names three policies (NO `default` policy →
+    fail-closed): `yashigani-render` (our sole SANITISATION sink, §6),
+    `dompurify` (DOMPurify's RETURN_TRUSTED_TYPE policy, §3.1), and `lit-html`
+    (Lit's internal template policy). The latter two are framework plumbing that
+    only bless developer-authored templates / already-sanitised strings — they
+    are NOT data sinks. Su's production CSP must list the same three.
+    No 'unsafe-inline' / 'unsafe-eval'.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html">
+  <title>Yashigani 4.0 — shared-layer canary</title>
+  <link rel="stylesheet" href="/static/ui4/css/design-system.css">
+  <link rel="stylesheet" href="/static/ui4/canary/canary.css">
+</head>
+<body class="ys-root">
+  <main class="ys-canary-main">
+    <h2>Yashigani 4.0 shared-layer canary</h2>
+    <p class="ys-txt-note">Safe-render pipeline + XSS / split-chunk / decode HARD-contract self-test.</p>
+
+    <div class="ys-panel">
+      <div class="ys-panel-header">Self-test results</div>
+      <div class="ys-panel-body" id="results"></div>
+    </div>
+
+    <div class="ys-panel">
+      <div class="ys-panel-header">Rendered verdict banner (structured fields only)</div>
+      <div class="ys-panel-body" id="banner"></div>
+    </div>
+
+    <div class="ys-panel">
+      <div class="ys-panel-header">Rendered markdown (payload inert)</div>
+      <div class="ys-panel-body" id="md"></div>
+    </div>
+  </main>
+  <script type="module" src="/static/ui4/canary/canary.js"></script>
+</body>
+</html>

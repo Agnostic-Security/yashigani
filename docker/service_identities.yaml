@@ -194,13 +194,7 @@ services:
     revoked: false
 
   # ── Optional / profile-gated services ─────────────────────────────────────
-  - name: open-webui
-    dns_sans: [open-webui, open-webui.internal, yashigani-open-webui]
-    spiffe_id: spiffe://yashigani.internal/open-webui
-    purpose: "User-facing chat UI (profile: openwebui)"
-    mtls_capable: true
-    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
-    revoked: false
+  # open-webui removed in 4.0 — ui4 (first-party Lit SPA) served by backoffice
 
   - name: langflow
     dns_sans: [langflow, langflow.internal, yashigani-langflow]
@@ -254,6 +248,38 @@ services:
     spiffe_id: spiffe://yashigani.internal/openclaw
     purpose: "Personal AI w/ messaging channel integrations (profile: openclaw)"
     mtls_capable: false       # upstream image. Uses CA as client.
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
+    revoked: false
+
+  # ── Agent-namespace system identities (4.0 Phase 0 / R10) ────────────────
+  #
+  # These are the STATIC system-agent SPIFFE IDs for named platform agents
+  # (langflow, openclaw) that run in shared containers (not per-user).  They
+  # use the spiffe://…/agents/system/<name> namespace to distinguish them from
+  # per-user agent containers (which use spiffe://…/agents/<tenant_id>/<name>
+  # and are issued at runtime via mint_agent_leaf() → runtime manifest).
+  #
+  # dns_sans: [] — system agents are not addressed by hostname from other mesh
+  # services; they call out via mTLS as clients only.
+  # mtls_capable: false — these are upstream images without TLS termination.
+  # The client cert is presented outbound by install.sh / sidecar; the agent
+  # container itself does not terminate TLS.
+  #
+  # RECONCILIATION-20260627.md R10: 2-component agent SPIFFE URI.
+
+  - name: langflow-system
+    dns_sans: []
+    spiffe_id: spiffe://yashigani.internal/agents/system/langflow
+    purpose: "System-agent SPIFFE identity for the langflow platform service (4.0 Phase 0)"
+    mtls_capable: false
+    bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
+    revoked: false
+
+  - name: openclaw-system
+    dns_sans: []
+    spiffe_id: spiffe://yashigani.internal/agents/system/openclaw
+    purpose: "System-agent SPIFFE identity for the openclaw platform service (4.0 Phase 0)"
+    mtls_capable: false
     bootstrap_token_sha256: ""  # populated by install.sh in docker/var/runtime/ (not committed)
     revoked: false
 
@@ -352,6 +378,35 @@ endpoint_acls:
     allowed_spiffe_ids:
       - spiffe://yashigani.internal/caddy
       - spiffe://yashigani.internal/backoffice
+
+  # 4.0 Phase 0 / §2 of svid-mesh-container-spec.md — Agent cert rotation ACL.
+  #
+  # POST /admin/agents/{agent_id}/cert/rotate is the admin-approval endpoint
+  # that calls mint_agent_leaf() and issues a new leaf cert for the agent.
+  # Restricted to:
+  #   caddy        — admin UI browser sessions (via Caddy mTLS leg)
+  #   backoffice   — programmatic rotation via the backoffice lifespan/cron
+  #
+  # allowed_spiffe_prefix: guards the sidecar's own rotation call.  The sidecar
+  # holds the CURRENT agent cert (spiffe://…/agents/<tenant_id>/<agent_name>)
+  # and calls the backoffice rotation endpoint on expiry.  The prefix check
+  # (spiffe://yashigani.internal/agents/) allows all live agent identities to
+  # self-rotate without listing every per-user SPIFFE URI in IaC.
+  # verify_spiffe_matches_agent_id: true — the gate must confirm the calling
+  # agent's SPIFFE <agent_name> component matches the {agent_id} path param,
+  # preventing one agent from rotating another agent's cert.
+  "/admin/agents/*/cert/rotate":
+    allowed_spiffe_ids:
+      - spiffe://yashigani.internal/caddy
+      - spiffe://yashigani.internal/backoffice
+    allowed_spiffe_prefix: "spiffe://yashigani.internal/agents/"
+    verify_spiffe_matches_agent_id: true
+
+  # SVID status poll — used by the sidecar to check its own cert expiry window
+  # without going through the admin plane.  Read-only; returns not_after + fraction.
+  "/internal/agents/*/svid/status":
+    allowed_spiffe_prefix: "spiffe://yashigani.internal/agents/"
+    verify_spiffe_matches_agent_id: true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cert policy — two-tier PKI (root → intermediate → leaf).

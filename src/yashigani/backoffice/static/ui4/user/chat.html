@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    Yashigani 4.0 user-facing app (Phase 2) — the OpenWebUI replacement.
+    Built ON the Phase-1 shared layer (/static/ui4/core/). The CSP below
+    activates Trusted-Types so the safe-render pipeline runs under enforcement
+    even before Su's Caddy headers land (production CSP/TT is Su's domain —
+    feat/4.0-csp-vendoring). It MUST stay in lock-step with the canary + Su's
+    header policy:
+      - NO 'unsafe-inline' / 'unsafe-eval' (classes-only CSS, ES-modules only).
+      - require-trusted-types-for 'script' (DOM-XSS → CSP violation, fail-closed).
+      - trusted-types allowlist names exactly three policies, NO `default`:
+          yashigani-render  — our sole sanitisation sink (safe-render.js, §6)
+          dompurify         — DOMPurify RETURN_TRUSTED_TYPE policy (§3.1)
+          lit-html          — Lit's internal template policy (framework plumbing)
+      - connect-src 'self' permits the same-origin /user/* reads and the
+        OpenAI-compatible SSE chat endpoint (/v1/chat/completions).
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html">
+  <title>Yashigani</title>
+  <link rel="stylesheet" href="/static/ui4/css/design-system.css">
+  <link rel="stylesheet" href="/static/ui4/user/user.css">
+</head>
+<body class="ys-root">
+  <ys-user-app></ys-user-app>
+  <script type="module" src="/static/ui4/user/user-app.js"></script>
+</body>
+</html>

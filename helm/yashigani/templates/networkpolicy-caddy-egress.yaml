@@ -5,7 +5,7 @@
 #
 # PURPOSE
 #   Restricts Caddy's external egress to:
-#     1. In-mesh upstreams (gateway, backoffice, open-webui, obs services) —
+#     1. In-mesh upstreams (gateway, backoffice, obs services) —
 #        already covered by allow-caddy-egress in networkpolicy.yaml.
 #     2. ACME providers (Let's Encrypt + staging) — TCP:443 to external only.
 #     3. OCSP stapling responders (Let's Encrypt OCSP) — TCP:80 to external only.
@@ -13,7 +13,7 @@
 #
 # RELATIONSHIP TO allow-caddy-egress
 #   allow-caddy-egress (networkpolicy.yaml) covers in-cluster pod-to-pod egress
-#   (gateway:8080, backoffice:8443, open-webui:8080). That policy does NOT include
+#   (gateway:8080, backoffice:8443). That policy does NOT include
 #   any ipBlock rules — meaning external internet egress from Caddy is fully blocked
 #   under the default-deny-egress policy unless THIS policy adds it.
 #

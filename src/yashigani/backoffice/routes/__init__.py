@@ -66,6 +66,14 @@ from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
 from yashigani.backoffice.routes.capability_policy import router as capability_policy_router
 # 3.1 Phase 8 — unified permission grant admin API
 from yashigani.backoffice.routes.permissions import router as permissions_router
+# 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+from yashigani.backoffice.routes.user_ui import router as user_ui_router
+# 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
+from yashigani.backoffice.routes.user_conversations import router as user_conversations_router
+# 4.0 Workflow run history (wf-exec — BOLA-enforced, user-tier only)
+from yashigani.backoffice.routes.user_workflows import router as user_workflows_router
+# 4.0 Admin workflow-oversight (cross-user read + disable; AdminSession / StepUpAdminSession)
+from yashigani.backoffice.routes.admin_workflows import router as admin_workflows_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -120,4 +128,12 @@ __all__ = [
     "capability_policy_router",
     # 3.1 Phase 8 — unified permission grant admin API
     "permissions_router",
+    # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+    "user_ui_router",
+    # 4.0 Chat persistence — conversation + message CRUD
+    "user_conversations_router",
+    # 4.0 Workflow run history (wf-exec — BOLA-enforced)
+    "user_workflows_router",
+    # 4.0 Admin workflow-oversight (cross-user read + disable)
+    "admin_workflows_router",
 ]

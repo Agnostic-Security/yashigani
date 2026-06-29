@@ -134,18 +134,67 @@ class ContainerBackend:
         network: str,
         labels: dict,
         detach: bool = True,
+        *,
+        # 4.0 Phase 3 — resource limits + security context (RISK-109)
+        # mem_limit / memswap_limit: string suffixes (e.g. "512m") or None for no limit.
+        mem_limit: Optional[str] = None,
+        memswap_limit: Optional[str] = None,
+        pids_limit: Optional[int] = None,
+        nano_cpus: Optional[int] = None,
+        read_only: bool = False,
+        security_opt: Optional[list] = None,
+        cap_drop: Optional[list] = None,
+        cap_add: Optional[list] = None,
+        # volumes: {host_path: {"bind": container_path, "mode": "ro"}}
+        volumes: Optional[dict] = None,
+        tmpfs: Optional[dict] = None,
+        user: Optional[str] = None,
     ) -> ContainerHandle:
-        """Create and start a container."""
+        """Create and start a container.
+
+        Resource limit params (4.0 Phase 3) are keyword-only and default to None
+        (no change from prior behaviour for callers that do not pass them).
+        None means "no limit applied" — the runtime default applies.
+
+        Docker SDK: passes all non-None kwargs directly to containers.run().
+        Podman SDK: connects to network after creation (Podman 3.x limitation).
+        """
+        run_kwargs: dict = dict(
+            image=image,
+            name=name,
+            environment=environment,
+            detach=detach,
+            remove=False,
+            labels=labels,
+        )
+        # Inject resource limits only when explicitly provided (preserve prior behaviour).
+        if mem_limit is not None:
+            run_kwargs["mem_limit"] = mem_limit
+        if memswap_limit is not None:
+            run_kwargs["memswap_limit"] = memswap_limit
+        if pids_limit is not None:
+            run_kwargs["pids_limit"] = pids_limit
+        if nano_cpus is not None:
+            run_kwargs["nano_cpus"] = nano_cpus
+        if read_only:
+            run_kwargs["read_only"] = True
+        if security_opt:
+            run_kwargs["security_opt"] = list(security_opt)
+        if cap_drop:
+            run_kwargs["cap_drop"] = list(cap_drop)
+        if cap_add:
+            run_kwargs["cap_add"] = list(cap_add)
+        if volumes:
+            run_kwargs["volumes"] = volumes
+        if tmpfs:
+            run_kwargs["tmpfs"] = tmpfs
+        if user is not None:
+            run_kwargs["user"] = user
+
         if self.name == "podman":
-            container = self._client.containers.run(
-                image=image,
-                name=name,
-                environment=environment,
-                detach=detach,
-                remove=False,
-                labels=labels,
-            )
-            # Podman: connect to network after creation
+            # Podman SDK: connect to network after creation (Podman 3.x does not
+            # support ``network=`` in containers.run kwargs the same way Docker does).
+            container = self._client.containers.run(**run_kwargs)
             try:
                 net = self._client.networks.get(network)
                 net.connect(container)
@@ -153,16 +202,71 @@ class ContainerBackend:
                 logger.warning("Podman: failed to connect %s to network %s: %s", name, network, exc)
             return ContainerHandle(container, self.name)
         else:
-            container = self._client.containers.run(
-                image=image,
-                name=name,
-                environment=environment,
-                network=network,
-                detach=detach,
-                remove=False,
-                labels=labels,
-            )
+            run_kwargs["network"] = network
+            container = self._client.containers.run(**run_kwargs)
             return ContainerHandle(container, self.name)
+
+    def connect_network(self, handle: "ContainerHandle", network_name: str) -> None:
+        """Connect a running container to an additional network.
+
+        Used after container creation to attach to ringfence or caddy_internal
+        networks beyond the primary network passed to run().
+        Logs a warning (not raises) on failure — a connection miss is observable
+        via the container's network list; it does not prevent startup.
+        """
+        try:
+            net = self._client.networks.get(network_name)
+            net.connect(handle._raw)
+            logger.debug("ContainerBackend: connected %s to %s", handle.id[:12], network_name)
+        except Exception as exc:
+            logger.warning(
+                "ContainerBackend: failed to connect %s to %s: %s",
+                handle.id[:12], network_name, exc,
+            )
+
+    def ensure_network(
+        self,
+        network_name: str,
+        *,
+        internal: bool = True,
+        driver: str = "bridge",
+        labels: Optional[dict] = None,
+    ) -> None:
+        """Create a Docker/Podman network if it does not already exist.
+
+        ``internal=True`` creates a bridge with no internet egress — correct for
+        per-agent ringfence networks. Idempotent: a pre-existing network with the
+        same name is accepted without error.
+        """
+        try:
+            self._client.networks.get(network_name)
+            return  # already exists
+        except Exception:
+            pass  # will create below
+
+        try:
+            self._client.networks.create(
+                name=network_name,
+                driver=driver,
+                internal=internal,
+                labels=dict(labels) if labels else {},
+            )
+            logger.info("ContainerBackend: created network %s (internal=%s)", network_name, internal)
+        except Exception as exc:
+            logger.warning("ContainerBackend: failed to create network %s: %s", network_name, exc)
+
+    def teardown_network(self, network_name: str) -> None:
+        """Remove a network after all its containers have been stopped.
+
+        Fails gracefully — if the network has live endpoints or does not exist,
+        the warning is logged but no exception is raised.
+        """
+        try:
+            net = self._client.networks.get(network_name)
+            net.remove()
+            logger.info("ContainerBackend: removed network %s", network_name)
+        except Exception as exc:
+            logger.debug("ContainerBackend: could not remove network %s: %s", network_name, exc)
 
     def get(self, container_id: str) -> ContainerHandle:
         """Get an existing container by ID."""

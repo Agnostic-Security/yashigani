@@ -48,7 +48,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -117,6 +117,29 @@ class IssuerPaths:
 
     def bootstrap_token(self, service: str) -> Path:
         return self.secrets_dir / f"{service}_bootstrap_token"
+
+    @property
+    def runtime_manifest(self) -> Path:
+        """Path to the runtime-writable agent identity manifest.
+
+        The static ``service_identities.yaml`` (committed IaC, self.manifest_path)
+        is read-only at runtime. Agent leaf certs are dynamically issued and their
+        identities are appended to this separate runtime manifest. The backoffice
+        lifespan loader merges both into the live ServiceIdentityManifest object.
+
+        Layout: <secrets_dir>/var/runtime/service_identities.yaml
+        Created by install.sh (empty agents: [] stub) on first install.
+        Written by mint_agent_leaf() at runtime.
+        """
+        return self.secrets_dir / "var" / "runtime" / "service_identities.yaml"
+
+    def agent_cert(self, tenant_id: str, agent_name: str) -> Path:
+        """Leaf cert path for a dynamically-issued agent identity."""
+        return self.secrets_dir / f"agent_{tenant_id}_{agent_name}_client.crt"
+
+    def agent_key(self, tenant_id: str, agent_name: str) -> Path:
+        """Leaf key path for a dynamically-issued agent identity."""
+        return self.secrets_dir / f"agent_{tenant_id}_{agent_name}_client.key"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,7 +629,12 @@ def build_leaf(
             x509.KeyUsage(
                 digital_signature=True,
                 content_commitment=False,
-                key_encipherment=True,
+                # RFC 5480 §3: key_encipherment MUST be False for EC keys.
+                # EC keys use key_agreement for ECDH; key_encipherment is
+                # RSA-only (RSA-PKCS1 / RSA-OAEP transport of symmetric keys).
+                # Setting it True on EC caused CRL/policy failures in some TLS
+                # stacks. Nico finding, 4.0 Phase 0 (RECONCILIATION-20260627.md §10).
+                key_encipherment=False,
                 data_encipherment=False,
                 key_agreement=False,
                 key_cert_sign=False,
@@ -1005,6 +1033,199 @@ def rotate_root(
     )
 
 
+def _append_agent_identity_to_runtime_manifest(
+    paths: IssuerPaths,
+    tenant_id: str,
+    agent_name: str,
+    spiffe_id: str,
+    cert_not_after_iso: str,
+) -> None:
+    """Append a new agent identity entry to the runtime manifest (YAML append).
+
+    The runtime manifest lives at paths.runtime_manifest (separate from the
+    committed IaC manifest at paths.manifest_path). It is created empty by
+    install.sh and never committed to git.
+
+    Format appended:
+        - name: agent_<tenant_id>_<agent_name>
+          spiffe_id: spiffe://…/agents/<tenant_id>/<agent_name>
+          dns_sans: []
+          purpose: agent-identity
+          mtls_capable: true
+          revoked: false
+          cert_not_after: <ISO datetime>
+
+    Idempotent: if an entry with the same name already exists it is left
+    unchanged (the cert file on disk has already been updated by _write_leaf).
+    """
+    runtime_path = paths.runtime_manifest
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+
+    entry_name = f"agent_{tenant_id}_{agent_name}"
+
+    # Load existing runtime manifest content (may be empty on first call).
+    existing_text = runtime_path.read_text() if runtime_path.exists() else "agent_identities: []\n"
+
+    # Idempotency check: don't append if the name already exists.
+    if f"name: {entry_name}" in existing_text:
+        logger.info(
+            "internal-pki: agent identity %r already present in runtime manifest — skipping append",
+            entry_name,
+        )
+        return
+
+    # YAML block to append.  We write raw YAML rather than round-tripping through
+    # pyyaml to preserve existing comments and ordering in the file.
+    entry_yaml = (
+        f"  - name: {entry_name}\n"
+        f"    spiffe_id: {spiffe_id}\n"
+        f"    dns_sans: []\n"
+        f"    purpose: agent-identity\n"
+        f"    mtls_capable: true\n"
+        f"    revoked: false\n"
+        f"    cert_not_after: \"{cert_not_after_iso}\"\n"
+    )
+
+    # Replace the `agent_identities: []` stub (first install) with a proper list,
+    # or append to an existing agent_identities block.
+    if "agent_identities: []" in existing_text:
+        new_text = existing_text.replace(
+            "agent_identities: []",
+            "agent_identities:\n" + entry_yaml,
+        )
+    else:
+        # File already has agent_identities: block — find its end and append there.
+        # Simple heuristic: if the file ends with a newline, append directly.
+        new_text = existing_text.rstrip("\n") + "\n" + entry_yaml
+
+    _write_secret(runtime_path, new_text.encode("utf-8"), 0o640)
+    logger.info(
+        "internal-pki: appended agent identity %r to runtime manifest at %s",
+        entry_name, runtime_path,
+    )
+
+
+def mint_agent_leaf(
+    paths: IssuerPaths,
+    tenant_id: str,
+    agent_name: str,
+    *,
+    leaf_lifetime_days: Optional[int] = None,
+    approved_by: str = "",
+    approval_audit_jti: str = "",
+    audit_writer: Any = None,
+) -> str:
+    """Issue a per-agent leaf cert and append the identity to the runtime manifest.
+
+    4.0 Phase 0 / §2 of svid-mesh-container-spec.md (RECONCILIATION-20260627.md R10):
+    Each agent gets a 2-component SPIFFE ID:
+        spiffe://<trust_domain>/agents/<tenant_id>/<agent_name>
+
+    This function:
+      1. Generates a new EC P-256 key pair.
+      2. Signs a leaf cert against the existing intermediate CA.
+         - SPIFFE URI SAN set to the agent SPIFFE ID.
+         - key_encipherment=False (RFC 5480, EC keys — Nico finding).
+         - No DNS SANs (agents are not externally addressable by hostname).
+      3. Writes cert+key to secrets_dir/agent_<tenant_id>_<agent_name>_client.{crt,key}.
+      4. Appends the new identity to paths.runtime_manifest.
+      5. Emits AgentSvidIssuedEvent on audit_writer (AUDIT-GAP-001 class).
+
+    Returns:
+        The SPIFFE ID string of the issued cert (for the admin API response).
+
+    Args:
+        paths:               IssuerPaths pointing at the live secrets dir.
+        tenant_id:           Tenant/user ID slug (used in SPIFFE URI + file name).
+        agent_name:          Agent name slug (e.g. "letta", "langflow").
+        leaf_lifetime_days:  Override default leaf lifetime from cert policy.
+        approved_by:         Admin identity who approved this issuance (for audit).
+        approval_audit_jti:  JTI of the admin's approval audit event (for audit chain).
+        audit_writer:        Optional audit writer (Any to avoid circular import).
+                             CLI callers pass None. Admin API callers pass the live writer.
+    """
+    from yashigani.identity.trust_domain import agent_spiffe_uri
+
+    manifest = load_manifest(str(paths.manifest_path))
+    policy = manifest.cert_policy
+    lifetime = leaf_lifetime_days or policy.leaf_lifetime_days_default
+
+    # Load intermediate CA.
+    intermediate_cert = _load_cert(paths.intermediate_cert)
+    intermediate_key = _load_key(paths.intermediate_key)
+
+    # Build a synthetic ServiceIdentity for this agent.  We do NOT add it to the
+    # committed manifest — it goes into the runtime manifest only.
+    spiffe_id = agent_spiffe_uri(tenant_id, agent_name)
+    synthetic_identity = ServiceIdentity(
+        name=f"agent_{tenant_id}_{agent_name}",
+        dns_sans=[],
+        purpose="agent-identity",
+        mtls_capable=True,
+        bootstrap_token_sha256="",
+        revoked=False,
+        spiffe_id=spiffe_id,
+    )
+
+    leaf_cert, leaf_key = build_leaf(
+        intermediate_cert,
+        intermediate_key,
+        synthetic_identity,
+        policy,
+        leaf_lifetime_days=lifetime,
+    )
+
+    # Write cert+key.  Use agent_cert/agent_key path helpers (separate namespace from
+    # regular service leaves to avoid collisions with service names like "gateway").
+    cert_path = paths.agent_cert(tenant_id, agent_name)
+    key_path = paths.agent_key(tenant_id, agent_name)
+    bundle = _pem_cert(leaf_cert) + _pem_cert(intermediate_cert)
+    _write_secret(cert_path, bundle, _FILE_MODE_CERT)
+    _write_secret(key_path, _pem_key(leaf_key), _FILE_MODE_KEY)
+
+    cert_not_after = leaf_cert.not_valid_after_utc.isoformat()
+
+    # Append to runtime manifest.
+    _append_agent_identity_to_runtime_manifest(
+        paths, tenant_id, agent_name, spiffe_id, cert_not_after,
+    )
+
+    logger.info(
+        "internal-pki: minted agent leaf | spiffe_id=%s | not_after=%s | approved_by=%r",
+        spiffe_id, cert_not_after, approved_by or "cli",
+    )
+
+    # Emit audit event (AUDIT-GAP-001: agent SVID issuance must appear in the
+    # tamper-evident hash chain, not plain app logs).  audit_writer is None for
+    # CLI invocations (no DB / audit chain available); the admin API passes the
+    # live writer.
+    if audit_writer is not None:
+        try:
+            # Import lazily to keep issuer.py free of app-layer imports at module load.
+            # This module is safe to import in install.sh / CLI context where the audit
+            # DB is not initialised.
+            from yashigani.audit.schema import AgentSvidIssuedEvent
+            event = AgentSvidIssuedEvent(
+                agent_name=agent_name,
+                tenant_id=tenant_id,
+                spiffe_id=spiffe_id,
+                cert_not_after=cert_not_after,
+                approved_by=approved_by,
+                approval_audit_jti=approval_audit_jti,
+            )
+            audit_writer.write(event)
+        except Exception as exc:
+            # Never let audit failure block cert issuance.  Log at ERROR so it
+            # shows in the AUDIT-GAP-001 sweep but does not propagate.
+            logger.error(
+                "internal-pki: audit write failed for AgentSvidIssuedEvent | "
+                "spiffe_id=%s | error=%s",
+                spiffe_id, exc,
+            )
+
+    return spiffe_id
+
+
 def status(paths: IssuerPaths) -> list[dict]:
     """Return expiry/renewal status for root, intermediate, and every leaf."""
     out: list[dict] = []
@@ -1110,6 +1331,16 @@ def _build_parser() -> argparse.ArgumentParser:
     ml.add_argument("service", help="Service name from the manifest")
     ml.add_argument("--leaf-lifetime-days", type=int)
 
+    mal = sub.add_parser(
+        "mint-agent-leaf",
+        help="Issue a per-agent SVID leaf cert (4.0 Phase 0 / agent-isolation)",
+    )
+    mal.add_argument("--tenant-id", required=True, help="Tenant/user ID (slug; used in SPIFFE URI + filename)")
+    mal.add_argument("--agent-name", required=True, help="Agent name slug (e.g. letta, langflow)")
+    mal.add_argument("--leaf-lifetime-days", type=int, help="Override leaf cert lifetime")
+    mal.add_argument("--approved-by", default="", help="Admin identity who approved issuance (audit trail)")
+    mal.add_argument("--approval-audit-jti", default="", help="JTI of admin approval audit event")
+
     sub.add_parser("status", help="Print cert expiry status table")
 
     return p
@@ -1166,6 +1397,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"Service {args.service!r} not found or revoked.", file=sys.stderr)
                 return 2
             print(f"Minted leaf for {rotated[0]}.")
+        elif args.cmd == "mint-agent-leaf":
+            spiffe_id = mint_agent_leaf(
+                paths,
+                args.tenant_id,
+                args.agent_name,
+                leaf_lifetime_days=args.leaf_lifetime_days,
+                approved_by=args.approved_by,
+                approval_audit_jti=args.approval_audit_jti,
+                audit_writer=None,  # CLI: no live audit writer
+            )
+            print(f"Minted agent leaf: {spiffe_id}")
         elif args.cmd == "status":
             for row in status(paths):
                 print(row)

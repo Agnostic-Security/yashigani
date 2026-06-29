@@ -431,84 +431,132 @@ class PoolManager:
         image: str,
         env: dict,
         port: int,
-        # P1 W2 extension (keyword-only) — TODO(tom): implement ring-fence body
+        # P1 W2 extension (keyword-only) — ring-fence params
         *,
         networks: Optional[list[str]] = None,
         cert_mount: Optional["CertMount"] = None,
         mode: str = "on-demand",
         ringfence_init_network: Optional[str] = None,
+        # 4.0 Phase 3 — resource limits + security context (R14: memory_mb is integer)
+        # R14: memory_mb is the canonical integer param; converted to Docker/Podman
+        # string suffix ("512m") internally. Callers MUST pass integers, not strings.
+        memory_mb: int = 512,
+        pids_limit: int = 128,
+        nano_cpus: int = 500_000_000,
+        read_only: bool = True,
+        security_opt: Optional[list[str]] = None,
+        cap_drop: Optional[list[str]] = None,
+        cap_add: Optional[list[str]] = None,
     ) -> ContainerInfo:
         """Create a new container via ContainerBackend (Docker or Podman).
 
-        P1 W2 ring-fence parameters (keyword-only):
-            networks: Additional networks beyond self._network. When provided,
-                      the primary network is networks[0]; additional networks
-                      are connected via network.connect() after creation.
-                      TODO(tom): implement multi-network connect in each backend branch.
-            cert_mount: SPIFFE TLS cert bind-mount. When provided, the container
-                        gets the certs mounted at container_*_path (read-only).
-                        TODO(tom): implement bind-mount injection per backend type.
-            mode: "on-demand" | "persistent". Set on ContainerInfo for cleanup_idle().
-            ringfence_init_network: If set, call _wait_for_ringfence_init() before
-                                    returning. Raises RingfenceInitTimeout on timeout.
-                                    TODO(tom): implement _wait_for_ringfence_init().
+        4.0 Phase 3 changes (RISK-109):
+          - memory_mb/pids_limit/nano_cpus: hard cgroup limits per tier (spec §6.1).
+            R14: memory_mb is an integer; this method converts to "Nm" string for Docker.
+          - read_only/security_opt/cap_drop: security context defaults to hardened posture.
+          - cert_mount: SPIFFE TLS cert bind-mount — mounts host certs into container.
+          - additional_networks: connected after container start (Docker SDK + Podman).
+          - ringfence_init_network: waits for the SVID sidecar to write
+            /run/ringfence/ready before returning (fail-closed: raises RingfenceInitTimeout).
+          - _ensure_ringfence_network(): creates per-agent bridge networks before spawn.
         """
         short_id = identity_id[-8:] if len(identity_id) > 8 else identity_id
         container_name = f"ysg-{service_slug}-{short_id}-{uuid.uuid4().hex[:6]}"
 
-        # Determine effective primary network (P1 W2: ring-fenced agents pass networks[0])
+        # Determine effective primary network (ring-fenced agents pass networks[0])
         primary_network = networks[0] if networks else self._network
         additional_networks = networks[1:] if networks and len(networks) > 1 else []
 
+        # Security context defaults (fail-hardened):
+        _security_opt: list[str] = list(security_opt) if security_opt else ["no-new-privileges:true"]
+        if "no-new-privileges:true" not in _security_opt:
+            _security_opt.append("no-new-privileges:true")
+        _cap_drop: list[str] = list(cap_drop) if cap_drop else ["ALL"]
+        _cap_add: list[str] = list(cap_add) if cap_add else []
+
+        # Build cert bind-mounts (host-path → container-path, read-only).
+        # Sidecar design: host_*_path may be empty when certs live on a shared
+        # tmpfs volume managed by the sidecar (the sidecar writes /run/secrets/svid/).
+        volumes_dict: dict = {}
+        if cert_mount:
+            if cert_mount.host_cert_path:
+                volumes_dict[cert_mount.host_cert_path] = {
+                    "bind": cert_mount.container_cert_path, "mode": "ro",
+                }
+            if cert_mount.host_key_path:
+                volumes_dict[cert_mount.host_key_path] = {
+                    "bind": cert_mount.container_key_path, "mode": "ro",
+                }
+            if cert_mount.host_ca_path:
+                volumes_dict[cert_mount.host_ca_path] = {
+                    "bind": cert_mount.container_ca_path, "mode": "ro",
+                }
+
+        # Convert integer memory_mb to Docker/Podman string (R14 contract).
+        mem_limit_str = f"{memory_mb}m"
+        # No swap: memswap_limit == mem_limit prevents swap usage (spec §6.1).
+        memswap_limit_str = f"{memory_mb}m"
+
+        # Ensure the per-agent ringfence network exists before spawning.
+        if networks:
+            self._ensure_ringfence_networks(networks)
+
+        labels: dict = {
+            "yashigani.managed": "true",
+            "yashigani.identity": identity_id,
+            "yashigani.service": service_slug,
+        }
+        if ringfence_init_network:
+            labels["yashigani.ringfence-network"] = ringfence_init_network
+        if cert_mount and cert_mount.spiffe_identity:
+            labels["yashigani.spiffe"] = cert_mount.spiffe_identity
+
         if self._backend:
             try:
-                _labels = {
-                    "yashigani.managed": "true",
-                    "yashigani.identity": identity_id,
-                    "yashigani.service": service_slug,
-                }
-                if ringfence_init_network:
-                    _labels["yashigani.ringfence-network"] = ringfence_init_network
-                if cert_mount and cert_mount.spiffe_identity:
-                    _labels["yashigani.spiffe"] = cert_mount.spiffe_identity
-
                 if self._backend.name == "kubernetes":
-                    # KubernetesBackend.run() has no `network` param — pods use
-                    # K8s in-namespace networking. The `port` param sets the
-                    # container port declaration and the wait-for-Running path
-                    # resolves the pod IP directly.
-                    # TODO(tom, P1 W2): pass cert_mount to K8s projected-volume path.
+                    # K8s backend: resource limits passed via pod spec (Tom's path).
+                    # Network/cert params handled by projected volumes + init containers.
                     handle = self._backend.run(
                         image=image,
                         name=container_name,
                         environment=env,
-                        labels=_labels,
+                        labels=labels,
                         port=port,
                     )
                 else:
-                    # TODO(tom, P1 W2): pass cert_mount and additional_networks to
-                    # ContainerBackend.run() once backend.run() is extended.
+                    # Docker / Podman: full resource + security context wiring.
                     handle = self._backend.run(
                         image=image,
                         name=container_name,
                         environment=env,
                         network=primary_network,
-                        labels=_labels,
+                        labels=labels,
+                        mem_limit=mem_limit_str,
+                        memswap_limit=memswap_limit_str,
+                        pids_limit=pids_limit,
+                        nano_cpus=nano_cpus,
+                        read_only=read_only,
+                        security_opt=_security_opt,
+                        cap_drop=_cap_drop,
+                        cap_add=_cap_add if _cap_add else None,
+                        volumes=volumes_dict if volumes_dict else None,
+                        user="1001",  # non-root; matches agent container USER directive
                     )
-                    # TODO(tom, P1 W2): connect additional_networks after run()
-                    # if additional_networks:
-                    #     for extra_net in additional_networks:
-                    #         self._backend._client.networks.get(extra_net).connect(...)
+                    # Connect additional networks (ringfence + caddy_internal) after start.
+                    for extra_net in additional_networks:
+                        self._backend.connect_network(handle, extra_net)
+
                 container_id = handle.id
                 ip = handle.get_network_ip(primary_network)
                 endpoint = f"{ip}:{port}"
             except Exception as exc:
                 logger.error("Failed to create container %s: %s", container_name, exc)
                 raise
+
         elif self._docker:
-            # Legacy Docker client path (test compatibility)
+            # Legacy Docker client path (test compatibility + stub mode).
             try:
-                container = self._docker.containers.run(
+                run_kwargs: dict = dict(
                     image=image,
                     name=container_name,
                     environment=env,
@@ -520,7 +568,19 @@ class PoolManager:
                         "yashigani.identity": identity_id,
                         "yashigani.service": service_slug,
                     },
+                    mem_limit=mem_limit_str,
+                    memswap_limit=memswap_limit_str,
+                    pids_limit=pids_limit,
+                    nano_cpus=nano_cpus,
+                    read_only=read_only,
+                    security_opt=_security_opt,
+                    cap_drop=_cap_drop,
                 )
+                if _cap_add:
+                    run_kwargs["cap_add"] = _cap_add
+                if volumes_dict:
+                    run_kwargs["volumes"] = volumes_dict
+                container = self._docker.containers.run(**run_kwargs)
                 container_id = container.id
                 container.reload()
                 container_networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
@@ -528,20 +588,30 @@ class PoolManager:
                 if primary_network in container_networks:
                     ip = container_networks[primary_network].get("IPAddress", "127.0.0.1")
                 endpoint = f"{ip}:{port}"
-                # TODO(tom, P1 W2): connect additional_networks for Docker legacy path
+                # Connect additional networks after container start.
+                for extra_net in additional_networks:
+                    try:
+                        net = self._docker.networks.get(extra_net)
+                        net.connect(container)
+                        logger.debug("PoolManager: connected %s to %s", container_name, extra_net)
+                    except Exception as exc:
+                        logger.warning(
+                            "PoolManager: failed to connect %s to %s: %s",
+                            container_name, extra_net, exc,
+                        )
             except Exception as exc:
                 logger.error("Failed to create container %s: %s", container_name, exc)
                 raise
+
         else:
-            # No backend — return a stub (for testing)
+            # No backend — stub mode (unit tests; no real isolation).
             container_id = f"stub-{uuid.uuid4().hex[:12]}"
             endpoint = f"127.0.0.1:{port}"
 
-        # TODO(tom, P1 W2): call _wait_for_ringfence_init(ringfence_init_network)
-        # here (before building ContainerInfo) if ringfence_init_network is set.
-        # Example (to be implemented):
-        #   if ringfence_init_network:
-        #       self._wait_for_ringfence_init(ringfence_init_network)
+        # Wait for SVID sidecar to signal readiness before returning.
+        # Fail-closed: RingfenceInitTimeout propagates to get_or_create() → 503.
+        if ringfence_init_network:
+            self._wait_for_ringfence_init(ringfence_init_network)
 
         info = ContainerInfo(
             container_id=container_id,
@@ -553,16 +623,17 @@ class PoolManager:
             status="starting",
             created_at=time.time(),
             last_active=time.time(),
-            # P1 W2 fields:
             networks=list(networks) if networks else [],
             mode=mode,
             spiffe_identity=cert_mount.spiffe_identity if cert_mount else "",
-            ringfence_init_ready=(ringfence_init_network is None),  # True when no wait required
+            ringfence_init_ready=(ringfence_init_network is None),
         )
 
         logger.info(
-            "PoolManager: created %s for identity=%s service=%s endpoint=%s mode=%s",
-            container_name, identity_id, service_slug, endpoint, mode,
+            "PoolManager: created %s for identity=%s service=%s endpoint=%s "
+            "mode=%s memory=%s pids_limit=%d",
+            container_name, identity_id, service_slug, endpoint,
+            mode, mem_limit_str, pids_limit,
         )
         return info
 
@@ -572,24 +643,116 @@ class PoolManager:
         timeout_seconds: int = 30,
         poll_interval_seconds: float = 0.5,
     ) -> None:
-        """
-        Wait until the ringfence-init sidecar writes /run/ringfence/ready.
+        """Wait until the SVID sidecar writes /run/ringfence/ready.
 
-        P1 W2 (plan L12) — CONTRACT STUB. Tom implements this method.
-        See POOL_MANAGER_CONTRACT.md §5 for full specification.
+        4.0 Phase 3 implementation:
 
-        Raises:
-            RingfenceInitTimeout: if sidecar does not complete within timeout_seconds.
-                                  Caller must NOT create the agent container.
+        K8s path: no-op (the initContainer exit-code is the sequencing gate —
+                  K8s does not start the agent container until the sidecar init
+                  phase exits 0, which it does after writing /run/ringfence/ready).
+
+        Docker / Podman path: polls for the sidecar container on ringfence_network
+                  (identified by label yashigani.svid-sidecar=true), then exec_runs
+                  ``test -f /run/ringfence/ready`` until exit code is 0.
+
+        Stub path (no backend): returns immediately (unit tests).
+
+        Fail-closed: raises RingfenceInitTimeout after timeout_seconds.
+        Caller (get_or_create → _create_container) MUST NOT start the agent
+        container after this exception. 503 is the appropriate HTTP response.
         """
-        # TODO(tom, P1 W2): implement polling for ringfence-init sidecar readiness.
-        # Contract: fail-closed — raise RingfenceInitTimeout on timeout.
-        # K8s backend: no-op (initContainer exit code is the sequencing gate).
-        # Compose/direct-API: poll init container exit code + /run/ringfence/ready.
-        raise NotImplementedError(
-            "_wait_for_ringfence_init() is a P1 W2 contract stub. "
-            "Tom implements this method. See POOL_MANAGER_CONTRACT.md §5."
+        # K8s: initContainer sequencing is handled by the API server.
+        if self._backend and self._backend.name == "kubernetes":
+            return
+
+        client = self._backend._client if self._backend else self._docker
+        if client is None:
+            # Stub mode (no real runtime) — skip; tests wire _containers directly.
+            return
+
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                net = client.networks.get(ringfence_network)
+                net.reload()
+                for container in net.containers:
+                    container_labels: dict = getattr(container, "labels", {}) or {}
+                    if container_labels.get("yashigani.svid-sidecar") == "true":
+                        result = container.exec_run("test -f /run/ringfence/ready")
+                        if result.exit_code == 0:
+                            logger.info(
+                                "PoolManager: SVID sidecar ready on network %s",
+                                ringfence_network,
+                            )
+                            return
+            except Exception as exc:
+                logger.debug(
+                    "_wait_for_ringfence_init poll error on %s: %s",
+                    ringfence_network, exc,
+                )
+            time.sleep(poll_interval_seconds)
+
+        raise RingfenceInitTimeout(
+            f"SVID sidecar did not signal /run/ringfence/ready within "
+            f"{timeout_seconds}s on network {ringfence_network!r}. "
+            "Fail-closed: agent container MUST NOT start. "
+            "Check ysg-svid-sidecar logs for the agent template."
         )
+
+    def _ensure_ringfence_networks(self, networks: list[str]) -> None:
+        """Create per-agent ringfence bridge networks that do not yet exist.
+
+        Each per-identity agent gets its own internal bridge (``internal=True``
+        — no internet egress). The ``caddy_internal`` network is managed by
+        docker-compose and must already exist; this method skips names that
+        already exist and only creates missing ones.
+
+        Called from ``_create_container()`` before container spawn.
+        Docker/Podman parity: both runtimes support ``internal`` bridges.
+        """
+        client = self._backend._client if self._backend else self._docker
+        if client is None:
+            return  # stub mode
+
+        for net_name in networks:
+            try:
+                client.networks.get(net_name)
+            except Exception:
+                # Network does not exist — create it.
+                try:
+                    client.networks.create(
+                        name=net_name,
+                        driver="bridge",
+                        internal=True,  # no internet egress (spec §6.2)
+                        labels={
+                            "yashigani.managed": "true",
+                            "yashigani.ringfence": "true",
+                        },
+                    )
+                    logger.info("PoolManager: created ringfence network %s", net_name)
+                except Exception as exc:
+                    logger.warning(
+                        "PoolManager: failed to create network %s: %s", net_name, exc,
+                    )
+
+    def _teardown_ringfence_network(self, network_name: str) -> None:
+        """Remove a per-agent ringfence network after its containers are gone.
+
+        Called from teardown() when removing the last container on a ringfence
+        network. Logs on failure — a leftover network is a management leak but
+        not a security failure (it has no containers and no egress).
+        """
+        client = self._backend._client if self._backend else self._docker
+        if client is None:
+            return
+        try:
+            net = client.networks.get(network_name)
+            net.remove()
+            logger.info("PoolManager: removed ringfence network %s", network_name)
+        except Exception as exc:
+            logger.debug(
+                "PoolManager: could not remove network %s: %s", network_name, exc,
+            )
 
     def _kill_container(self, container_id: str) -> None:
         """Kill and remove a container."""

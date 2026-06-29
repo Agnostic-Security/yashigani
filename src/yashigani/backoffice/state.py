@@ -4,7 +4,7 @@ Holds references to shared services injected at startup.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Any
 
 from yashigani.auth.local_auth import LocalAuthService  # noqa: F401 — back-compat
@@ -63,6 +63,7 @@ class BackofficeState:
     document_set_store: Optional[Any] = None               # DocumentSetStore (2.26 set-scoped-salt)
     envelope_pending_store: Optional[Any] = None          # EnvelopePendingStore (3.0 capability-envelope re-approval queue)
     capability_policy_store: Optional[Any] = None         # CapabilityPolicyStore (3.0 browser Permissions-Policy)
+    user_plane_durable: Optional[Any] = None              # UserPlaneDurableStore (4.0 user-plane durability)
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None

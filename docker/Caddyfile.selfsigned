@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (self-signed certificate mode)
-# Last updated: 2026-05-18T00:00:00+00:00 (v2.23.4: add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing)
+# Last updated: 2026-06-27T00:00:00+00:00 (v4.0-phase1: strict CSP/TT — import csp-policies snippet from Caddyfile.csp)
 #
 # ╔══════════════════════════════════════════════════════════╗
 # ║  WARNING: SELF-SIGNED MODE — LOCAL / DEMO USE ONLY      ║
@@ -68,6 +68,14 @@
         strict_sni_host insecure_off
     }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSP policy snippet — defines the four path matchers and their Content-Security-
+# Policy header values as the (csp-policies) named snippet. Imported at the site
+# level with `import csp-policies`. Source of truth: docker/Caddyfile.csp.
+# The Helm chart (configmaps.yaml) hand-codes the equivalent; the parity-check
+# script (scripts/check-caddyfile-csp-parity.sh) enforces drift-prevention.
+import /etc/caddy/Caddyfile.csp
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal mTLS snippet — imported by every reverse_proxy / forward_auth block
@@ -232,47 +240,12 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         -Alt-Svc
     }
 
-    # CSP, set per-path so exactly one policy applies per request.
-    #
-    # STRICT (script-src 'self', style-src 'self', no inline) applies to the
-    # Yashigani-native admin plane ONLY — the backoffice SPA (/admin/*), auth
-    # (/auth/*, /login), and the other first-party backoffice routes. These were
-    # deliberately made strict-CSP-compliant (inline styles moved to CSS classes,
-    # f7a3228); do NOT weaken them.
-    #
-    # LENIENT (unsafe-eval + unsafe-inline) applies to everything else:
-    #  - the proxied observability sub-apps (Grafana, Wazuh/OSD, Prometheus),
-    #    which ship nonce-less inline bootstrap scripts + eval()/inline styles —
-    #    strict CSP stops their SPA mounting ("failed to load application files");
-    #  - the Open WebUI end-user chat surface served at the root catch-all
-    #    (--with-openwebui), whose SvelteKit build emits inline hydration scripts —
-    #    strict CSP blocks them and the page renders blank (YSG-2253 blocker).
-    # curl never shows this (it doesn't enforce CSP).
-    #
-    # The boundary is a single path set used in both matchers so exactly one
-    # policy applies per request. @strict_ui = native admin plane AND NOT a
-    # proxied sub-app subpath; @lenient_ui = the complement (sub-apps + OWUI root).
-    @strict_ui {
-        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
-        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
-        # LAURA-2255-006 / LAURA-30-009: exclude ReDoc paths so @redoc_ui is the
-        # sole CSP source for those two routes. Without this, both @strict_ui and
-        # @redoc_ui set a CSP header, producing two headers on every /admin/api-redoc
-        # and /redoc response. Browsers intersect; not exploitable but a config defect.
-        not path /admin/api-redoc /redoc
-    }
-    @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
-    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
-    # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
-    # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
-    # to the two ReDoc routes; all other strict_ui paths keep the default CSP.
-    # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
-    # via its web component Shadow DOM at render time.
-    @redoc_ui path /admin/api-redoc /redoc
-    header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-    header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
-    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
-    header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    # CSP matchers and headers — strict-by-default (4.0 / RISK-102 / SC-NEW-001)
+    # Source of truth: docker/Caddyfile.csp  (defines the (csp-policies) snippet)
+    # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
+    # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
+    # See Caddyfile.csp for full design rationale.
+    import csp-policies
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
@@ -528,6 +501,11 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+            # Strip Grafana's own X-Frame-Options / CSP so the edge CSP
+            # (Caddyfile.csp @lenient_subapp) is the sole governing policy
+            # and same-origin iframe embedding works from /admin/*.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
         }
     }
 
@@ -543,6 +521,32 @@ Hiring: https://agnosticsec.com/careers
             }
         }
         reverse_proxy wazuh-dashboard:5601 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            # Strip Wazuh Dashboard's own X-Frame-Options / CSP so
+            # same-origin iframe embedding works from /admin/*.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+
+    # ── Loki — admin-authenticated access via /admin/loki/* ──────────────
+    # Exposes Loki's HTTP query API for direct admin use.  The primary consumer
+    # is Grafana (datasource) — /admin/loki/* also allows admin curl/API access.
+    # Loki has no UI; the @lenient_subapp CSP matcher covers this path.
+    # Loki serves HTTPS on :3100 with mTLS (Pattern B).
+    handle /admin/loki/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy https://loki:3100 {
+            import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
@@ -564,6 +568,30 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── Alertmanager — admin-authenticated access via /admin/alertmanager/* ──
+    # Alertmanager serves plain HTTP on port 9093 (no mTLS). Caddy is on the
+    # obs network and can reach it directly. forward_auth gate mirrors the
+    # grafana/loki/prometheus pattern (verify-admin). @lenient_subapp CSP covers
+    # this path; X-Frame-Options + CSP stripped from upstream so same-origin
+    # iframe embedding from /admin/ works.
+    handle_path /admin/alertmanager/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy http://alertmanager:9093 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
         }
     }
 
@@ -589,27 +617,9 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── /app/webui — Open WebUI user path (Phase 2 / 2.25.5-auth-ingress) ────
-    #
-    # Phase 2: OWUI is served under /app/webui with WEBUI_URL=/app/webui so
-    # SvelteKit assets and API calls are all relative to that prefix.
-    # forward_auth → /auth/verify-user gates the path (user sessions only;
-    # admin sessions get 403 → redirected to /admin/).
-    #
-    # WebSocket (socket.io): OWUI streams tokens over a socket.io WS at
-    # /app/webui/ws/socket.io/.  The @owui_ws matcher handles the 101 upgrade
-    # separately to avoid the forward_auth handle_response wrapping breaking the
-    # upgrade — same fix as the legacy root-catch-all WS handler (F-WS fix, YSG-2253).
-    # Auth subrequest strips Connection/Upgrade so /auth/verify-user sees a
-    # plain GET; the main reverse_proxy retains the original upgrade headers.
-    #
-    # OWUI is plain HTTP on caddy_internal (no mTLS — OWUI is the upstream
-    # Open WebUI image; it does not terminate mTLS).  Do NOT use internal-mtls
-    # here.  inject-caddy-verified is applied for header uniformity but OWUI
-    # does not validate it.
+    # ── /app/webui — legacy OWUI path (4.0: removed, redirect to /chat) ──────
     handle /app/webui* {
-        # OWUI served at ROOT (root catch-all). Back-compat redirect.
-        redir * / 302
+        redir * /chat 302
     }
 
     handle /metrics-federate* {
@@ -625,105 +635,29 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Root catch-all — portal redirect (Phase 2 / 2.25.5-auth-ingress) ────
+    # ── Root catch-all — 4.0: portal redirect + ui4 proxy ────────────────────
     #
-    # Phase 2: OWUI has moved off root onto /app/webui.  Root (/) is now the
-    # portal: redirect unauthenticated visitors to /login and authenticated
-    # users to their role-appropriate surface via /login (which checks the
-    # session and issues a role-based redirect).  Using /login as the target
-    # is safe — if the user is already logged in, /login will detect the
-    # session and redirect them to /admin/ or /app/webui without re-prompting
-    # for credentials.
+    # OWUI removed in 4.0. ui4 (Lit-based chat/agents/builder/workflows) is
+    # served directly by the backoffice. Backoffice enforces its own session
+    # checks on all ui4 routes — no Caddy-level forward_auth required here.
     #
-    # This replaces the former OWUI catch-all (which owned root and caused
-    # the conflated-population + no-working-logout findings).  The explicit
-    # /app/webui* handle above owns all OWUI traffic; this catch-all is now
-    # purely a portal redirect guard.
+    # / → /chat (302, back-compat for existing bookmarks)
+    # All other unmatched paths → backoffice (returns 404 for unknown routes).
     handle {
-
-        # Strip anti-spoof headers before auth subrequest.
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
         import strip-orchestration-headers
 
-        # ── OWUI socket.io WebSocket (Phase 2 / F-WS fix pattern) ──────────
-        # Handles Connection: Upgrade + Upgrade: websocket requests under
-        # /ws/*.  The forward_auth sub-request has the upgrade headers
-        # stripped so /auth/verify-user sees a plain GET and returns a clean
-        # status.  The main reverse_proxy keeps the original upgrade headers and
-        # performs the real 101 to open-webui:8080.
-        @owui_ws {
-            header Connection *Upgrade*
-            header Upgrade websocket
-            path /ws/*
-        }
-        handle @owui_ws {
-            forward_auth https://backoffice:8443 {
-            import internal-mtls
-            import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-                # Strip upgrade headers from the auth subrequest only.
-                header_up -Connection
-                header_up -Upgrade
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    respond 401
-                }
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    respond 403
-                }
-            }
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
-                header_up X-Forwarded-Proto https
-                header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
-            }
+        @root_path path /
+        handle @root_path {
+            redir * /chat 302
         }
 
-        # ── OWUI HTTP (non-WS) ───────────────────────────────────────────────
         handle {
-            forward_auth https://backoffice:8443 {
+            reverse_proxy https://backoffice:8443 {
+                header_down -Content-Security-Policy  # single CSP at edge
             import internal-mtls
             import inject-caddy-verified
-                uri /auth/verify-user
-                copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-                @unauthorized status 401
-                handle_response @unauthorized {
-                    # User not logged in → redirect to /login, preserving next=
-                    redir * /login?next={http.request.uri} 302
-                }
-
-                @admin_on_user_path status 403
-                handle_response @admin_on_user_path {
-                    # Admin trying user path → send to admin console (NOT login page).
-                    # This is a clear authz boundary, not an auth failure.
-                    redir * /admin/ 302
-                }
-            }
-
-            # Phase 2: proxy to open-webui:8080 (plain HTTP, no mTLS).
-            # OWUI is configured with WEBUI_URL=/app/webui so asset paths and
-            # API calls resolve under the subpath.  inject-caddy-verified is
-            # applied for uniformity; OWUI does not validate it.
-            reverse_proxy open-webui:8080 {
-                import inject-caddy-verified
                 header_up X-Forwarded-Proto https
                 header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-                header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-                header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
             }
         }
     }

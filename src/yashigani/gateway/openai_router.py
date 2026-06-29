@@ -794,6 +794,31 @@ class OpenAIRouterState:
         self.content_relay_detector = None
         # v2.4.1 — PoolManager for container-per-identity dispatch
         self.pool_manager = None          # PoolManager | None
+        # 4.0 Phase 3 — P1/P2 token role map (RISK-108 / FIND-3.1-AGENT-BEARER-
+        # IMPERSONATION).  Maps plaintext_token → (role_class, identity_id) for
+        # fast hmac.compare_digest on every request.
+        #
+        # Role classes:
+        #   "p2_forwarder"   — OWUI trusted forwarder; may set X-OpenWebUI-User-Email
+        #   "p2_orchestrator"— Gateway orchestrator self-call; may set X-Yashigani-
+        #                      Orchestration-Principal
+        #   "p1_agent"       — Bundled agent (Letta, Langflow, OpenClaw); resolves as
+        #                      the named agent identity — CANNOT set P2 headers
+        #   "p1_nhi"         — User-built NHI; resolves as nhi_{id} identity — CANNOT
+        #                      set P2 headers
+        #
+        # The map is populated at lifespan startup by configure_openai_router()
+        # from per-service secret files (Su/compose) and from
+        # AgentRegistry.get_nhi_token_map() for active NHIs.
+        #
+        # BACKWARD COMPAT: YASHIGANI_INTERNAL_BEARER is still loaded at module
+        # import time into _INTERNAL_BEARER (above).  If no dedicated per-service
+        # tokens are configured, ALL token lookups fall through to the existing
+        # hmac.compare_digest(_INTERNAL_BEARER) path (unchanged 3.x behaviour).
+        # Once Su lands the per-service token split in install.sh + compose, the
+        # OWUI forwarder and orchestrator tokens get their own map entries and
+        # _INTERNAL_BEARER can be revoked.
+        self.token_role_map: dict[str, tuple[str, str]] = {}
         # Cloud key resolution: KMS provider + per-provider short-TTL cache.
         # Cache entry: {"value": str | None, "ts": float}; TTL = 60 s so a
         # newly-set key takes effect within one minute without a restart.
@@ -1003,6 +1028,14 @@ def configure(
         os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
     )
 
+    # ── 4.0 Phase 3 — P1/P2 token role map (RISK-108) ──────────────────────
+    # Populate from YASHIGANI_TOKEN_ROLE_MAP env var (JSON dict for dev/test):
+    #   {"<plaintext_token>": ["p1_agent", "agent__letta"]}
+    # In production this is populated from per-service secret files by install.sh.
+    # NHI tokens are added from AgentRegistry.get_nhi_token_map() if the registry
+    # is available at configure time (may also be refreshed at NHI approval).
+    _load_token_role_map(agent_registry)
+
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
     # default; opt into fail-open with YASHIGANI_OPA_OPTIONAL=true (explicit,
@@ -1203,7 +1236,11 @@ def _encoded_payload_audit(
         logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
 
 
-def _sse_from_completion(completion: dict, headers: dict) -> StreamingResponse:
+def _sse_from_completion(
+    completion: dict,
+    headers: dict,
+    verdict_tail: Optional[dict] = None,
+) -> StreamingResponse:
     """Wrap a buffered OpenAI chat-completion dict as a single-chunk SSE stream.
 
     F-STREAM (2026-06-09): Open WebUI (and any OpenAI-compatible client) sends
@@ -1254,6 +1291,16 @@ def _sse_from_completion(completion: dict, headers: dict) -> StreamingResponse:
         yield f"data: {json.dumps(_frame({'content': content}, None))}\n\n"
         # 3) close with finish_reason and empty delta
         yield f"data: {json.dumps(_frame({}, finish_reason))}\n\n"
+        # 4) optional out-of-band structured verdict tail (RISK-105 anti-spoofing).
+        #    Emitted BEFORE [DONE] so the SSE client can capture it in the same
+        #    stream read loop.  Fields: blocked / user_alert / decision_codes.
+        #    The 4.0 UI sse.js reads these as `structuredTail` and passes them to
+        #    onMessageDone(fullText, structuredTail) → ys-verdict-banner renders them
+        #    as TRUSTED-CHROME, NEVER by scanning message text (spec §4.2).
+        #    NEVER for OPA/client-policy pre-stream blocks — those return HTTP 403
+        #    JSONResponse before this function is called.
+        if verdict_tail:
+            yield f"data: {json.dumps(verdict_tail)}\n\n"
         yield "data: [DONE]\n\n"
 
     # SSE-specific headers; merge the caller's X-Yashigani-* headers on top.
@@ -1496,100 +1543,484 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     agent_protocol = "openai"
     if is_agent_call and _state.agent_registry:
         agent_name = selected_model[1:]  # strip @
-        for agent in _state.agent_registry.list_all():
-            if agent.get("name") == agent_name and agent.get("status") == "active":
-                stored_url = agent.get("upstream_url", "")
-                agent_protocol = agent.get("protocol", "openai")
 
-                # v2.4.1 — Pool-managed agent: upstream_url stored as pool://<image>
-                # Resolve to a per-identity container endpoint via PoolManager.
-                if stored_url.startswith("pool://"):
-                    pool_image = stored_url[len("pool://"):]
+        # ── v4.0: Per-user @-handle resolution ────────────────────────────────
+        # Check the calling user's alias namespace BEFORE the global registry.
+        # ua:alias:{identity_id} is a Redis hash: {alias → ua_id}.
+        # BOLA: the lookup key is derived from the validated identity_id, not
+        # the user-supplied model string — a caller can only address their own
+        # entities even if they guess another user's alias.
+        if identity and identity_id and identity_id != "internal":
+            _ua_meta: dict | None = None
+            try:
+                _r_ua = _state.agent_registry._r
+                _ua_id_raw = _r_ua.hget(f"ua:alias:{identity_id}", agent_name)
+                if _ua_id_raw is not None:
+                    _ua_id = (
+                        _ua_id_raw.decode()
+                        if isinstance(_ua_id_raw, bytes)
+                        else _ua_id_raw
+                    )
+                    _raw_meta = _r_ua.hgetall(f"ua:meta:{_ua_id}")
+                    if _raw_meta:
+                        _decoded = {
+                            (k.decode() if isinstance(k, bytes) else k): (
+                                v.decode() if isinstance(v, bytes) else v
+                            )
+                            for k, v in _raw_meta.items()
+                        }
+                        if _decoded.get("account_id") == identity_id:
+                            _ua_meta = _decoded
+                            _ua_meta["_ua_id"] = _ua_id
+                        else:
+                            # Stale alias index entry — BOLA: deny and log
+                            logger.warning(
+                                "UA @-handle stale alias: handle=%r identity=%s "
+                                "meta.account_id=%s — denying",
+                                agent_name,
+                                identity_id,
+                                _decoded.get("account_id"),
+                            )
+                            return JSONResponse(
+                                status_code=404,
+                                content={
+                                    "error": {
+                                        "message": (
+                                            f"Agent {selected_model} not found"
+                                        ),
+                                        "type": "agent_error",
+                                        "code": "agent_not_found",
+                                    }
+                                },
+                            )
+            except Exception as _uam_exc:
+                logger.warning(
+                    "Per-user @-handle lookup failed for %r identity=%s: %s",
+                    agent_name,
+                    identity_id,
+                    _uam_exc,
+                )
+                _ua_meta = None
+
+            if _ua_meta is not None:
+                _ua_kind = _ua_meta.get("kind", "agent")
+
+                if _ua_kind == "persona":
+                    # ── Route to the caller's per-user Letta container ──────
                     if _state.pool_manager is None:
-                        logger.error(
-                            "Pool-managed agent %s requested but PoolManager is unavailable",
-                            agent_name,
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": {
+                                    "message": (
+                                        f"Persona {selected_model} requires the Letta "
+                                        "per-user pool (feat/4.0-agent-isolation). "
+                                        "Pool manager is not available in this deployment."
+                                    ),
+                                    "type": "agent_error",
+                                    "agent": selected_model,
+                                    "code": "letta_pool_unavailable",
+                                }
+                            },
                         )
-                        if _state.audit_writer is not None:
-                            try:
-                                _state.audit_writer.write(PoolBackendUnavailableEvent(
-                                    request_id=request_id,
-                                    identity_id=identity_id,
-                                    agent_name=agent_name,
-                                    reason="pool_manager_none",
-                                ))
-                            except Exception:
-                                pass
+                    try:
+                        from yashigani.gateway.letta_client import (
+                            LettaClientPool as _PerUserLCPool,
+                        )
+                        _lcp = _PerUserLCPool(_state.pool_manager)
+                        _lc_client, _lc_base, _lc_agent_id = await _lcp.for_user(
+                            identity_id
+                        )
+                        # Use the agent's specific letta_agent_id if provisioned;
+                        # otherwise use the default per-user agent.
+                        _specific_lid = _ua_meta.get("letta_agent_id", "")
+                        if _specific_lid:
+                            _lc_agent_id = _specific_lid
+
+                        # Build messages, injecting persona context as system message
+                        _ua_messages: list[dict] = [
+                            {"role": m.role, "content": m.content or ""}
+                            for m in body.messages
+                        ]
+                        _persona_system = ""
+                        try:
+                            _pers = json.loads(_ua_meta.get("personality", "{}"))
+                            _persona_system = (
+                                _pers.get("system_prompt", "")
+                                or _pers.get("persona", "")
+                            )
+                        except Exception:
+                            pass
+                        if _persona_system:
+                            _ua_messages = [
+                                {"role": "system", "content": _persona_system},
+                                *_ua_messages,
+                            ]
+
+                        _asst_text = ""
+                        try:
+                            async with _lc_client:
+                                _lc_resp = await _lc_client.post(
+                                    f"{_lc_base}/v1/agents/{_lc_agent_id}/messages",
+                                    json={
+                                        "messages": _ua_messages,
+                                        "streaming": False,
+                                    },
+                                )
+                            if _lc_resp.status_code != 200:
+                                raise RuntimeError(
+                                    f"Letta per-user HTTP {_lc_resp.status_code}: "
+                                    f"{_lc_resp.text[:200]}"
+                                )
+                            _lc_data = _lc_resp.json()
+                            for _lc_msg in _lc_data.get("messages", []):
+                                if (
+                                    _lc_msg.get("message_type")
+                                    == "assistant_message"
+                                ):
+                                    _asst_text = _lc_msg.get("content", "")
+                                    break
+                            if not _asst_text:
+                                _parts = [
+                                    _lc_msg.get("content", "")
+                                    for _lc_msg in _lc_data.get("messages", [])
+                                    if _lc_msg.get("content")
+                                    and _lc_msg.get("message_type")
+                                    not in (
+                                        "system_message",
+                                        "tool_call_message",
+                                    )
+                                ]
+                                _asst_text = (
+                                    "\n".join(_parts)
+                                    if _parts
+                                    else "Persona returned no text."
+                                )
+                        except Exception as _pe:
+                            logger.exception(
+                                "Letta persona %s failed for identity=%s",
+                                selected_model,
+                                identity_id,
+                            )
+                            return JSONResponse(
+                                status_code=502,
+                                content={
+                                    "error": {
+                                        "message": (
+                                            f"Persona {selected_model} unreachable"
+                                        ),
+                                        "type": "agent_error",
+                                        "agent": selected_model,
+                                        "code": "agent_unreachable",
+                                    }
+                                },
+                                headers={"X-Yashigani-Agent-Error": "true"},
+                            )
+
+                        return JSONResponse(
+                            content={
+                                "id": f"chatcmpl-persona-{uuid.uuid4().hex[:8]}",
+                                "object": "chat.completion",
+                                "model": selected_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": _asst_text,
+                                        },
+                                        "finish_reason": "stop",
+                                    }
+                                ],
+                                "usage": {
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 0,
+                                },
+                            },
+                            headers={
+                                "X-Yashigani-Agent": selected_model,
+                                "X-Yashigani-Route-Reason": (
+                                    f"user_persona:{agent_name}"
+                                ),
+                            },
+                        )
+                    except (ImportError, Exception) as _persona_exc:
+                        if isinstance(_persona_exc, ImportError):
+                            logger.error(
+                                "LettaClientPool import failed for persona routing: %s",
+                                _persona_exc,
+                            )
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "error": {
+                                        "message": "Letta client not available.",
+                                        "type": "agent_error",
+                                        "code": "letta_pool_unavailable",
+                                    }
+                                },
+                            )
+                        # Already returned from the inner try (or re-raised); log
+                        logger.exception(
+                            "Persona routing outer exception for %s", selected_model
+                        )
                         return JSONResponse(
                             status_code=502,
                             content={
                                 "error": {
-                                    "message": f"Agent {selected_model} requires container pool but PoolManager is unavailable",
+                                    "message": (
+                                        f"Persona {selected_model} routing failed"
+                                    ),
                                     "type": "agent_error",
-                                    "agent": selected_model,
-                                    "code": "pool_backend_unavailable",
+                                    "code": "agent_unreachable",
                                 }
                             },
-                            headers={"X-Yashigani-Agent-Error": "true"},
                         )
 
-                    try:
-                        from yashigani.pool.manager import PoolLimitExceeded
-                        container_info = _state.pool_manager.get_or_create(
-                            identity_id=identity_id,
-                            service_slug=agent_name,
-                            image=pool_image,
-                        )
-                        agent_upstream = f"http://{container_info.endpoint}"
-                        logger.info(
-                            "Pool dispatch: agent=%s identity=%s container=%s endpoint=%s",
-                            agent_name, identity_id,
-                            container_info.container_name, container_info.endpoint,
-                        )
-                    except PoolLimitExceeded as _ple:
-                        logger.warning(
-                            "Pool limit exceeded for identity=%s agent=%s: %s",
-                            identity_id, agent_name, _ple,
-                        )
+                elif _ua_kind == "agent":
+                    # ── Route via NHI in agent_registry ────────────────────
+                    _nhi_id = _ua_meta.get("nhi_id", "")
+                    if not _nhi_id:
                         return JSONResponse(
-                            status_code=402,
-                            content={
-                                "error": "pool_limit_exceeded",
-                                "limit": _state.pool_manager._limits.total_concurrent,
-                                "current": _state.pool_manager.count(identity_id),
-                            },
-                        )
-                    except Exception as _pool_exc:
-                        logger.error(
-                            "Pool backend error for agent=%s identity=%s: %s",
-                            agent_name, identity_id, _pool_exc,
-                        )
-                        if _state.audit_writer is not None:
-                            try:
-                                _state.audit_writer.write(PoolBackendUnavailableEvent(
-                                    request_id=request_id,
-                                    identity_id=identity_id,
-                                    agent_name=agent_name,
-                                    reason=type(_pool_exc).__name__,
-                                ))
-                            except Exception:
-                                pass
-                        return JSONResponse(
-                            status_code=502,
+                            status_code=503,
                             content={
                                 "error": {
-                                    "message": f"Agent {selected_model} container backend failed",
+                                    "message": (
+                                        f"User agent {selected_model!r} has not been "
+                                        "instantiated. Call POST "
+                                        "/user/agents/{id}/run first."
+                                    ),
                                     "type": "agent_error",
                                     "agent": selected_model,
-                                    "code": "pool_backend_unavailable",
+                                    "code": "agent_not_instantiated",
                                 }
                             },
-                            headers={"X-Yashigani-Agent-Error": "true"},
                         )
+                    _nhi_entry = _state.agent_registry.get(_nhi_id)
+                    if _nhi_entry is None or _nhi_entry.get("status") != "active":
+                        return JSONResponse(
+                            status_code=404,
+                            content={
+                                "error": {
+                                    "message": (
+                                        f"Agent {selected_model} not found or not active"
+                                    ),
+                                    "type": "agent_error",
+                                    "agent": selected_model,
+                                    "code": "agent_not_found",
+                                }
+                            },
+                        )
+                    # Ceiling: NHI must be approved (svid_issued=1) before
+                    # gateway invocations are accepted.
+                    _svid = _nhi_entry.get("svid_issued", "0")
+                    if _svid in (False, "0", 0):
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": {
+                                    "message": "NHI pending approval",
+                                    "type": "agent_error",
+                                    "agent": selected_model,
+                                    "code": "NHI_PENDING_APPROVAL",
+                                }
+                            },
+                        )
+                    _nhi_url = _nhi_entry.get("upstream_url", "")
+                    if _nhi_url.startswith("pool://"):
+                        _nhi_image = _nhi_url[len("pool://"):]
+                        if _state.pool_manager is None:
+                            return JSONResponse(
+                                status_code=502,
+                                content={
+                                    "error": {
+                                        "message": (
+                                            f"Agent {selected_model} requires container "
+                                            "pool but PoolManager is unavailable"
+                                        ),
+                                        "type": "agent_error",
+                                        "agent": selected_model,
+                                        "code": "pool_backend_unavailable",
+                                    }
+                                },
+                                headers={"X-Yashigani-Agent-Error": "true"},
+                            )
+                        try:
+                            from yashigani.pool.manager import (
+                                PoolLimitExceeded as _NhiPoolLimitExceeded,
+                            )
+                            _nhi_ci = _state.pool_manager.get_or_create(
+                                identity_id=identity_id,
+                                service_slug=f"nhi_{_nhi_id}",
+                                image=_nhi_image,
+                            )
+                            agent_upstream = f"http://{_nhi_ci.endpoint}"
+                        except _NhiPoolLimitExceeded as _ple:
+                            return JSONResponse(
+                                status_code=402,
+                                content={
+                                    "error": "pool_limit_exceeded",
+                                    "limit": (
+                                        _state.pool_manager._limits.total_concurrent
+                                    ),
+                                    "current": _state.pool_manager.count(identity_id),
+                                },
+                            )
+                        except Exception as _npe:
+                            logger.error(
+                                "NHI pool dispatch failed agent=%s nhi=%s: %s",
+                                agent_name,
+                                _nhi_id,
+                                _npe,
+                            )
+                            return JSONResponse(
+                                status_code=502,
+                                content={
+                                    "error": {
+                                        "message": (
+                                            f"Agent {selected_model} container "
+                                            "backend failed"
+                                        ),
+                                        "type": "agent_error",
+                                        "code": "pool_backend_unavailable",
+                                    }
+                                },
+                                headers={"X-Yashigani-Agent-Error": "true"},
+                            )
+                    elif _nhi_url:
+                        agent_upstream = _nhi_url
+                    else:
+                        # NHI registered but no upstream_url yet
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": {
+                                    "message": (
+                                        f"User agent {selected_model} is registered "
+                                        "but not yet provisioned (no upstream URL). "
+                                        "Container provisioning may be in progress."
+                                    ),
+                                    "type": "agent_error",
+                                    "code": "agent_not_provisioned",
+                                }
+                            },
+                        )
+                    agent_protocol = _nhi_entry.get("protocol", "openai")
+                    # agent_upstream is now set; skip the global registry loop below
+
                 else:
-                    # Normal externally-deployed agent — backward compatible path.
-                    agent_upstream = stored_url
-                break
+                    # Unknown kind — treat as not found
+                    return JSONResponse(
+                        status_code=404,
+                        content={
+                            "error": {
+                                "message": (
+                                    f"Agent {selected_model} not found"
+                                ),
+                                "type": "agent_error",
+                                "code": "agent_not_found",
+                            }
+                        },
+                    )
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Global registry lookup — only if per-user resolution did not resolve
+        if not agent_upstream:
+            for agent in _state.agent_registry.list_all():
+                if agent.get("name") == agent_name and agent.get("status") == "active":
+                    stored_url = agent.get("upstream_url", "")
+                    agent_protocol = agent.get("protocol", "openai")
+
+                    # v2.4.1 — Pool-managed agent: upstream_url stored as pool://<image>
+                    # Resolve to a per-identity container endpoint via PoolManager.
+                    if stored_url.startswith("pool://"):
+                        pool_image = stored_url[len("pool://"):]
+                        if _state.pool_manager is None:
+                            logger.error(
+                                "Pool-managed agent %s requested but PoolManager is unavailable",
+                                agent_name,
+                            )
+                            if _state.audit_writer is not None:
+                                try:
+                                    _state.audit_writer.write(PoolBackendUnavailableEvent(
+                                        request_id=request_id,
+                                        identity_id=identity_id,
+                                        agent_name=agent_name,
+                                        reason="pool_manager_none",
+                                    ))
+                                except Exception:
+                                    pass
+                            return JSONResponse(
+                                status_code=502,
+                                content={
+                                    "error": {
+                                        "message": f"Agent {selected_model} requires container pool but PoolManager is unavailable",
+                                        "type": "agent_error",
+                                        "agent": selected_model,
+                                        "code": "pool_backend_unavailable",
+                                    }
+                                },
+                                headers={"X-Yashigani-Agent-Error": "true"},
+                            )
+
+                        try:
+                            from yashigani.pool.manager import PoolLimitExceeded
+                            container_info = _state.pool_manager.get_or_create(
+                                identity_id=identity_id,
+                                service_slug=agent_name,
+                                image=pool_image,
+                            )
+                            agent_upstream = f"http://{container_info.endpoint}"
+                            logger.info(
+                                "Pool dispatch: agent=%s identity=%s container=%s endpoint=%s",
+                                agent_name, identity_id,
+                                container_info.container_name, container_info.endpoint,
+                            )
+                        except PoolLimitExceeded as _ple:
+                            logger.warning(
+                                "Pool limit exceeded for identity=%s agent=%s: %s",
+                                identity_id, agent_name, _ple,
+                            )
+                            return JSONResponse(
+                                status_code=402,
+                                content={
+                                    "error": "pool_limit_exceeded",
+                                    "limit": _state.pool_manager._limits.total_concurrent,
+                                    "current": _state.pool_manager.count(identity_id),
+                                },
+                            )
+                        except Exception as _pool_exc:
+                            logger.error(
+                                "Pool backend error for agent=%s identity=%s: %s",
+                                agent_name, identity_id, _pool_exc,
+                            )
+                            if _state.audit_writer is not None:
+                                try:
+                                    _state.audit_writer.write(PoolBackendUnavailableEvent(
+                                        request_id=request_id,
+                                        identity_id=identity_id,
+                                        agent_name=agent_name,
+                                        reason=type(_pool_exc).__name__,
+                                    ))
+                                except Exception:
+                                    pass
+                            return JSONResponse(
+                                status_code=502,
+                                content={
+                                    "error": {
+                                        "message": f"Agent {selected_model} container backend failed",
+                                        "type": "agent_error",
+                                        "agent": selected_model,
+                                        "code": "pool_backend_unavailable",
+                                    }
+                                },
+                                headers={"X-Yashigani-Agent-Error": "true"},
+                            )
+                    else:
+                        # Normal externally-deployed agent — backward compatible path.
+                        agent_upstream = stored_url
+                    break
 
         if not agent_upstream:
             return JSONResponse(
@@ -2970,7 +3401,29 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # success, PII-redacted success, and agent-call success — all funnel here.
     _completion = response.model_dump()
     if body.stream:
-        return _sse_from_completion(_completion, headers)
+        # RISK-105 anti-spoofing: when response inspection blocked the response
+        # (response_verdict == "blocked"), emit a structured out-of-band verdict
+        # tail frame so the 4.0 UI can render ys-verdict-banner from TRUSTED-CHROME
+        # fields — never by scanning the message text for a sentinel string.
+        #
+        # Scope: this covers ONLY in-stream blocks (response inspection, injection
+        # detection) that reach this return point.  Pre-stream OPA / client-policy
+        # blocks return JSONResponse(403) earlier in the handler and never reach
+        # here; those are handled by the UI's onError callback from a non-200 HTTP.
+        _verdict_tail: Optional[dict] = None
+        if response_verdict == "blocked":
+            _verdict_tail = {
+                "blocked": True,
+                "user_alert": {
+                    "user_message": (
+                        "This response was held by the Yashigani security policy. "
+                        "Contact an administrator for details."
+                    ),
+                    "policy_id": "RISK-105",
+                },
+                "decision_codes": [],
+            }
+        return _sse_from_completion(_completion, headers, verdict_tail=_verdict_tail)
 
     return JSONResponse(
         content=_completion,
@@ -3577,6 +4030,182 @@ async def list_models(request: Request):
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
+def _load_token_role_map(agent_registry=None) -> None:
+    """Populate ``_state.token_role_map`` from env + per-agent secret files + NHI registry.
+
+    Called once at ``configure()`` time (SOP 1).  Safe to call again after
+    NHI approval to refresh without restarting the gateway.
+
+    Token role map entry format: ``{plaintext_token: (role_class, identity_id)}``
+
+    Role classes: "p2_forwarder" | "p2_orchestrator" | "p1_agent" | "p1_nhi"
+
+    Per-agent secret files (4.0 Phase 3 — RISK-108):
+    Each bundled P1 agent (Letta, Langflow, …) has a per-service token file under
+    ``YASHIGANI_SECRETS_DIR`` (default ``/run/secrets``).  The gateway mounts
+    ``./secrets:/run/secrets:ro`` so every generated token file is available.
+    """
+    new_map: dict[str, tuple[str, str]] = {}
+
+    # Dev/test env-var injection: YASHIGANI_TOKEN_ROLE_MAP (JSON)
+    # Format: {"<token>": ["<role>", "<identity_id>"]}
+    raw = os.environ.get("YASHIGANI_TOKEN_ROLE_MAP", "").strip()
+    if raw:
+        try:
+            env_entries = json.loads(raw)
+            for tok, pair in env_entries.items():
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    new_map[tok] = (str(pair[0]), str(pair[1]))
+                    logger.debug("token_role_map: loaded role=%s id=%s from env", pair[0], pair[1])
+        except Exception as exc:
+            logger.error(
+                "YASHIGANI_TOKEN_ROLE_MAP parse error (ignoring) — "
+                "P1/P2 split will fall through to _INTERNAL_BEARER path: %s", exc,
+            )
+
+    # Per-agent secret files: bundled P1 agents (Langflow, Letta, …)
+    # Each entry: (secret_filename, role_class, identity_id)
+    # 4.0 Phase 3 — RISK-108 / impersonation prevention.
+    _PER_AGENT_SECRET_FILES: list[tuple[str, str, str]] = [
+        # Langflow — P1 bundled agent; resolves as agent__langflow identity.
+        # Token generated by install.sh (langflow_yashigani_token secret).
+        ("langflow_yashigani_token", "p1_agent", "agent__langflow"),
+    ]
+    _secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    for secret_name, role_class, identity_id in _PER_AGENT_SECRET_FILES:
+        secret_path = os.path.join(_secrets_dir, secret_name)
+        try:
+            with open(secret_path, "r", encoding="utf-8") as fh:
+                tok = fh.read().strip()
+            if tok:
+                new_map[tok] = (role_class, identity_id)
+                logger.info(
+                    "token_role_map: loaded %s → role=%s id=%s from secret %s",
+                    secret_name, role_class, identity_id, secret_path,
+                )
+            else:
+                logger.warning(
+                    "token_role_map: secret file %s is empty — "
+                    "%s will not be resolvable as %s",
+                    secret_path, identity_id, role_class,
+                )
+        except FileNotFoundError:
+            logger.warning(
+                "token_role_map: secret file %s not found — "
+                "%s will not be resolvable as %s (normal before first install)",
+                secret_path, identity_id, role_class,
+            )
+        except Exception as exc:
+            logger.error(
+                "token_role_map: error reading secret file %s — "
+                "%s will not be resolvable as %s: %s",
+                secret_path, identity_id, role_class, exc,
+            )
+
+    # NHI tokens from the registry (fast plaintext lookup, db/4 index)
+    if agent_registry is not None:
+        try:
+            nhi_map = agent_registry.get_nhi_token_map()  # {plaintext_token: nhi_id}
+            for tok, nhi_id in nhi_map.items():
+                new_map[tok] = ("p1_nhi", nhi_id)
+                logger.debug("token_role_map: loaded p1_nhi entry for %s", nhi_id)
+        except Exception as exc:
+            logger.warning(
+                "token_role_map: NHI registry load failed — NHIs will not be resolvable: %s", exc
+            )
+
+    _state.token_role_map = new_map
+    n_env = sum(1 for _tok, v in new_map.items() if v[0] not in ("p1_nhi", "p1_agent"))
+    n_agents = sum(1 for v in new_map.values() if v[0] == "p1_agent")
+    n_nhi = sum(1 for v in new_map.values() if v[0] == "p1_nhi")
+    logger.info(
+        "token_role_map: loaded %d entries (env=%d p1_agent=%d p1_nhi=%d)",
+        len(new_map), n_env, n_agents, n_nhi,
+    )
+
+
+def _resolve_caller_role(bearer_token: str) -> Optional[tuple[str, str]]:
+    """Map a bearer token to its (role_class, identity_id) from ``_state.token_role_map``.
+
+    Uses ``hmac.compare_digest`` for constant-time comparison to avoid timing leaks.
+
+    Returns ``None`` if the token is not in the role map — callers then fall
+    through to the existing ``_INTERNAL_BEARER`` comparison path (backward compat).
+
+    Raises ``HTTPException(401)`` only when called from the enforcement path in
+    ``_resolve_identity`` — this function itself returns None on miss.
+    """
+    for tok, (role, identity_id) in _state.token_role_map.items():
+        if hmac.compare_digest(bearer_token, tok):
+            return role, identity_id
+    return None
+
+
+def _emit_agent_header_stripped(
+    stripped_header: str,
+    caller_token_role: str,
+    agent_identity_id: str,
+) -> None:
+    """Emit AGENT_HEADER_STRIPPED security event to the audit chain (RISK-108).
+
+    This is the regression canary: any appearance in the audit chain means
+    an agent made an impersonation attempt.  Laura's regression probe checks
+    for this event without needing a live exploit.
+    """
+    if _state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import AgentHeaderStrippedEvent
+        _state.audit_writer.write(AgentHeaderStrippedEvent(
+            caller_token_role=caller_token_role,
+            stripped_header=stripped_header,
+            agent_identity_id=agent_identity_id,
+        ))
+    except Exception as exc:
+        logger.warning("AGENT_HEADER_STRIPPED audit write failed: %s", exc)
+
+
+def _resolve_nhi_identity(nhi_id: str) -> Optional[dict]:
+    """Return the NHI identity dict from AgentRegistry, or None if not found.
+
+    The OPA input for NHI hops uses ``input.identity`` (R9 — preserve existing
+    field name) with additional NHI-specific fields (``kind="nhi"``,
+    ``allowed_tools``, ``budget_cap``, ``on_behalf_of`` from delegated ctx).
+    """
+    if _state.agent_registry is None:
+        return None
+    try:
+        nhi = _state.agent_registry.get(nhi_id)
+        if nhi is None or nhi.get("kind") != "nhi":
+            return None
+        if not nhi.get("svid_issued"):
+            # NHI pending admin approval — fail-closed (403 in the caller)
+            logger.warning(
+                "_resolve_nhi_identity: NHI %s has svid_issued=False — pending approval",
+                nhi_id,
+            )
+            return None
+        # Build an identity dict matching the OPA input contract (R9: input.identity)
+        return {
+            "identity_id": nhi_id,
+            "kind": "nhi",
+            "status": nhi.get("status", "active"),
+            "groups": [],
+            "allowed_models": nhi.get("allowed_models", []),
+            "allowed_paths": nhi.get("allowed_paths", []),
+            "allowed_tools": nhi.get("allowed_tools", []),
+            "sensitivity_ceiling": nhi.get("sensitivity_ceiling", "PUBLIC"),
+            "budget_cap": nhi.get("budget_cap", {}),
+            "owner_identity_id": nhi.get("owner_identity_id", ""),
+            "template_id": nhi.get("template_id", ""),
+            "spiffe_id": nhi.get("spiffe_id", ""),
+            "_is_nhi": True,   # fast discriminator for downstream code
+        }
+    except Exception as exc:
+        logger.error("_resolve_nhi_identity: registry lookup failed for %s: %s", nhi_id, exc)
+        return None
+
+
 def _resolve_identity(request: Request) -> Optional[dict]:
     """
     Resolve identity from request.
@@ -3594,12 +4223,101 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     layer guard for this token; it must never be reachable from the
     public-facing port.
     """
-    # Fast path: hardcoded internal service-to-service token (Open WebUI,
-    # in-mesh agents).  Must be checked before identity_registry to avoid
-    # a 401 when the registry Redis is slow to start.
+    # Fast path: service-to-service token resolution.
+    # Priority 1: P1/P2 role map (per-service tokens, 4.0 Phase 3).
+    #             Populated from YASHIGANI_TOKEN_ROLE_MAP env and NHI registry.
+    # Priority 2: Shared _INTERNAL_BEARER (backward compat for 3.x deployments).
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         key = auth[7:]
+
+        # ── P1/P2 role map path (4.0 Phase 3 — RISK-108) ──────────────────
+        # When per-service tokens are configured, route each token to its role.
+        role_entry = _resolve_caller_role(key)
+        if role_entry is not None:
+            role_class, token_identity_id = role_entry
+
+            if role_class == "p2_orchestrator":
+                # P2 orchestrator: same logic as the existing internal-bearer
+                # orchestration-principal path (preserves brain-marker invariant).
+                orch_principal = request.headers.get("x-yashigani-orchestration-principal", "").strip()
+                if orch_principal and _state.identity_registry is not None:
+                    try:
+                        real = _state.identity_registry.get_by_slug(orch_principal)
+                    except Exception:
+                        real = None
+                    if real:
+                        real = dict(real)
+                        real["_orchestration_self_call"] = True
+                        return real
+                return {"identity_id": "internal", "status": "active", "kind": "service",
+                        "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
+                        "_orchestration_self_call": bool(orch_principal)}
+
+            elif role_class == "p2_forwarder":
+                # P2 forwarder: OWUI trusted-forwarder path.
+                # Strip any orchestration-principal header (forwarder is not the brain).
+                orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
+                if orch_hdr:
+                    _emit_agent_header_stripped(
+                        "x-yashigani-orchestration-principal", role_class, token_identity_id
+                    )
+                owui_identity = _resolve_owui_forwarded_user(request)
+                if owui_identity is not None:
+                    return owui_identity
+                return {"identity_id": "internal", "status": "active", "kind": "service",
+                        "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
+
+            elif role_class in ("p1_agent", "p1_nhi"):
+                # P1 agent/NHI: resolve as OWN identity only.
+                # Strip any P2 impersonation headers and emit security event.
+                orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
+                owui_hdr = request.headers.get(_OWUI_USER_EMAIL_HEADER, "")
+                if orch_hdr:
+                    _emit_agent_header_stripped(
+                        "x-yashigani-orchestration-principal", role_class, token_identity_id
+                    )
+                if owui_hdr:
+                    _emit_agent_header_stripped(
+                        _OWUI_USER_EMAIL_HEADER, role_class, token_identity_id
+                    )
+
+                if role_class == "p1_nhi":
+                    nhi_identity = _resolve_nhi_identity(token_identity_id)
+                    if nhi_identity is None:
+                        # NHI pending approval or not found — fail-closed
+                        raise HTTPException(
+                            status_code=403,
+                            detail={"error": "NHI_PENDING_APPROVAL",
+                                    "message": "NHI identity not yet approved or not found."},
+                        )
+                    return nhi_identity
+
+                # p1_agent: resolve as a named agent identity from registry
+                if _state.agent_registry is not None:
+                    try:
+                        agent = _state.agent_registry.get(token_identity_id)
+                        if agent is not None:
+                            return {
+                                "identity_id": token_identity_id,
+                                "kind": "agent",
+                                "status": agent.get("status", "active"),
+                                "groups": agent.get("groups", []),
+                                "allowed_models": [],
+                                "allowed_paths": agent.get("allowed_paths", []),
+                                "sensitivity_ceiling": "INTERNAL",
+                            }
+                    except Exception as exc:
+                        logger.warning(
+                            "_resolve_identity: p1_agent registry lookup failed for %s: %s",
+                            token_identity_id, exc,
+                        )
+                # Fallback: generic P1 agent identity (no elevated privilege)
+                return {"identity_id": token_identity_id, "kind": "agent",
+                        "status": "active", "groups": [], "allowed_models": [],
+                        "sensitivity_ceiling": "INTERNAL"}
+
+        # ── Shared _INTERNAL_BEARER path (backward compat) ─────────────────
         if hmac.compare_digest(key, _INTERNAL_BEARER):
             # Internal service-to-service calls (Open WebUI, agents)
             # Treated as authenticated internal identity — same OPA rules apply.

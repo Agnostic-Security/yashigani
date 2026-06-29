@@ -792,6 +792,27 @@ def _build_app(mesh_mode: bool = False):
             "only be matched by name, not expanded to concrete models", exc,
         )
 
+    # ── 4.0 — Workflow Scheduler (Redis DB 6, separate namespace) ────────────
+    # Builds and pre-loads the scheduler; actual start() is called from the
+    # gateway lifespan (proxy.py) AFTER the agent registry is reconciled.
+    workflow_scheduler = None
+    try:
+        import redis as _redis
+        from yashigani.gateway.workflow_scheduler import build_workflow_scheduler
+        redis_client_wf = _redis.from_url(_gw_redis_url(6), decode_responses=False)
+        redis_client_wf.ping()
+        workflow_scheduler = build_workflow_scheduler(
+            redis_client_wf,
+            audit_writer=audit_writer,
+            identity_registry=identity_registry,
+            agent_registry=agent_registry,
+        )
+        logger.info("WorkflowScheduler: built and pre-loaded from Redis DB 6")
+    except Exception as exc:
+        logger.warning(
+            "WorkflowScheduler unavailable (%s) — scheduled workflows disabled", exc
+        )
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -958,6 +979,7 @@ def _build_app(mesh_mode: bool = False):
         principal_verifier=_principal_verifier,
         principal_tenant_id=_principal_tenant_id,
         capability_policy_store=capability_policy_store,  # 3.0
+        workflow_scheduler=workflow_scheduler,
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 
