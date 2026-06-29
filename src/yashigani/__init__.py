@@ -13,4 +13,4 @@ Modules:
 """
 # Last updated: 2026-06-26T00:00:00+01:00 (v3.0.1: post-GA hardening bump — SSRF/installer/risk-register)
 
-__version__ = "3.1.0"
+__version__ = "3.1.1"

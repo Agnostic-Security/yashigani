@@ -574,9 +574,25 @@ spec:
 {{- end }}
 ---
 # Ollama egress — allow outbound to pull models from registry.ollama.ai
-# SECURITY NOTE: Ollama requires external internet access for model pulls.
-# Restrict to the ollama registry CIDR in production if possible, or use
-# an OCI mirror to avoid this egress rule entirely.
+#
+# FIND-3.1-F1 (K8s architectural gap, 2026-06-29):
+# The compose fix for FIND-3.1-F1 removes `edge` from the long-running ollama
+# service entirely — ollama-init runs a self-contained local serve on the edge
+# network, writes models to the shared volume, then exits before ollama starts.
+# K8s NetworkPolicy applies at the Pod level: initContainers and the main
+# container share the same policy. There is no standard K8s mechanism to grant
+# internet egress to an initContainer while denying it to the main container in
+# the same Pod. The correct long-term K8s fix is a pre-install Helm hook Job
+# (separate Pod, separate NetworkPolicy) that pre-provisions the ollama PVC with
+# models; the StatefulSet NetworkPolicy then carries no internet egress. This
+# requires PVC pre-provisioning + Helm hook ordering and is tracked as a backlog
+# item. Until then, this egress rule is required for Helm deployments.
+# Operators with a private OCI mirror should remove this rule and configure
+# ollama to use their internal registry.
+#
+# SECURITY NOTE: Restrict to the registry.ollama.ai CIDR in production if
+# possible (resolve `dig registry.ollama.ai` and narrow the ipBlock accordingly).
+# Using a private OCI mirror eliminates this rule entirely.
 #
 # LAURA-V243-003 / Gap 2: the prior port-only rule (no `to:` ipBlock) allowed
 # egress to ANY destination including IPv6 addresses on dual-stack clusters.
