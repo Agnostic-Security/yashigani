@@ -9935,6 +9935,15 @@ generate_secrets() {
   else
     log_info "langflow_yashigani_token already present — preserving (upgrade path)"
   fi
+  # BUG-4.0-LANGFLOW-TOKEN-PERMS: langflow runs uid=1000 gid=0; the Docker
+  # named-secret mode: 0440 in compose is ignored by Podman (Podman inherits
+  # host file permissions for file secrets).  Fix: chown 0:0 + chmod 0440 so
+  # the file is root-group readable — langflow's gid=0 grants read access.
+  # Letta uses yashigani_internal_bearer (already handled); openclaw uses an
+  # env var — only langflow_yashigani_token has this uid mismatch.
+  _do_chown "0:0" "$_lf_token_file" "langflow_yashigani_token" "0440" "${secrets_dir}" || \
+    log_warn "BUG-4.0-LANGFLOW-TOKEN-PERMS: chown 0:0 failed for langflow_yashigani_token — langflow may fail to read its token (EACCES)"
+  log_info "langflow_yashigani_token → chown 0:0 chmod 0440 (gid=0 readable for langflow uid=1000 gid=0)"
 
   # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
   # YSG-RISK-049 is now CLOSED by the auth_query design (v2.24.0).
@@ -9984,6 +9993,18 @@ generate_secrets() {
     mv "$tmp_env" "$env_file"
   else
     echo "YASHIGANI_VERSION=${YASHIGANI_VERSION}" >> "$env_file"
+  fi
+
+  # BUG-4.0-GPU-CDI-NO-ENV: YSG_GPU_CDI is exported at install time but was
+  # never written to docker/.env, so `docker compose up` outside install.sh
+  # (e.g. upgrade scripts, health checks, manual re-up) lost the GPU overlay.
+  # Write it unconditionally; empty string when no GPU detected (no-op for overlays).
+  if grep -q "^YSG_GPU_CDI=" "$env_file" 2>/dev/null; then
+    local tmp_cdi; tmp_cdi="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+    sed "s|^YSG_GPU_CDI=.*|YSG_GPU_CDI=${YSG_GPU_CDI:-}|" "$env_file" > "$tmp_cdi"
+    mv "$tmp_cdi" "$env_file"
+  else
+    echo "YSG_GPU_CDI=${YSG_GPU_CDI:-}" >> "$env_file"
   fi
 
   # Cache-busting SHA — keep in sync with the value written by _write_aes_key_to_env.
@@ -15097,6 +15118,11 @@ main() {
       printf 'INSTALL_USER=%s\n'       "$(id -un)"
       printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
+      # BUG-4.0-GPU-CDI-NO-ENV: persist GPU CDI device + overlay list so
+      # upgrade/health scripts reconstruct the same compose overlay set without
+      # re-running GPU detection (nvidia-smi may not be in PATH for health checks).
+      # YSG_GPU_CDI='' when no GPU was detected (overlays not applied).
+      printf 'YSG_GPU_CDI=%s\n'        "${YSG_GPU_CDI:-}"
     } > "$_state_path"
     chmod 0644 "$_state_path"
     log_info "Install state written: ${_state_path}"

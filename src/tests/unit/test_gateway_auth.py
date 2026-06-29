@@ -117,3 +117,44 @@ class TestAgentRegistry:
         assert registry.count("active") == 0
         registry.register("A", "http://a:8080", [], [], ["**"])
         assert registry.count("active") == 1
+
+    def test_approve_svid_with_fakeredis(self, mock_redis):
+        """approve_svid() must work with the real fakeredis pipeline.
+
+        Re-enabled after BUG-4.0 fix: approve_svid() previously used the old
+        positional pipe.hset(key, field, val) form which is incompatible with
+        some fakeredis pipeline implementations.  The fix changes it to the
+        mapping= form (mapping={b"svid_issued": b"1"}) used everywhere else in
+        registry.py.  This test proves the fix against real fakeredis (not the
+        custom _FakeRedis stub in test_nhi_approve_gate.py).
+        """
+        from yashigani.agents.registry import AgentRegistry
+        registry = AgentRegistry(redis_client=mock_redis)
+
+        nhi_id, token = registry.register_nhi(
+            name="test-svid-fakeredis",
+            owner_identity_id="user__test",
+            template_id="tmpl_base",
+            allowed_tools=["search"],
+            allowed_paths=["/v1/chat/completions"],
+            allowed_models=["gpt-4o-mini"],
+            sensitivity_ceiling="INTERNAL",
+            budget_cap={"max_tokens_per_run": 1000, "max_tool_calls_per_run": 5},
+        )
+
+        # Before approval: not in token map (fail-closed)
+        assert token not in registry.get_nhi_token_map(), (
+            "Un-approved NHI token must not appear in the gateway token-role-map."
+        )
+
+        # The fix: pipe.hset(reg_key, mapping={b"svid_issued": b"1"}) works with fakeredis
+        registry.approve_svid(nhi_id)
+
+        # After approval: in token map + svid_issued=True
+        token_map = registry.get_nhi_token_map()
+        assert token in token_map, "After approve_svid() NHI token must appear in token-role-map."
+        assert token_map[token] == nhi_id
+
+        nhi = registry.get(nhi_id)
+        assert nhi is not None
+        assert nhi.get("svid_issued") is True

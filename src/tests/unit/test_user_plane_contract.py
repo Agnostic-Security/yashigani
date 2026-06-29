@@ -168,8 +168,18 @@ class TestRisk100SourceInvariants:
 
         assert handler_names, "CT-100-4: No route handlers found in user_ui.py — check AST walk"
 
-        # /chat page uses cookie-presence check (lightweight pre-flight; documented)
-        # All others must have UserSession in their signature.
+        # SPA page routes (/chat, /agents, /builder, /workflows) use a cookie-presence
+        # pre-flight (lightweight redirect to /login) — the same documented pattern.
+        # These handlers serve HTML shells only; actual data enforcement happens on the
+        # /user/* API routes that carry UserSession. All four must use _USER_SESSION_COOKIE
+        # directly (no AnySession leak — CT-100-5 covers that separately).
+        # All other route handlers must have UserSession in their signature.
+        _SPA_PAGE_HANDLERS = {
+            "user_chat_page",
+            "user_agents_page",
+            "user_builder_page",
+            "user_workflows_page",
+        }
         user_session_handlers = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -179,8 +189,8 @@ class TestRisk100SourceInvariants:
                     if arg.annotation and "UserSession" in ast.unparse(arg.annotation):
                         user_session_handlers.add(node.name)
 
-        # Every handler except the /chat page must have UserSession
-        api_handlers = handler_names - {"user_chat_page"}
+        # Every handler except the SPA page routes must have UserSession.
+        api_handlers = handler_names - _SPA_PAGE_HANDLERS
         missing = api_handlers - user_session_handlers
         assert not missing, (
             f"CT-100-4 FAIL: User-plane route handlers missing UserSession dependency: {missing}. "

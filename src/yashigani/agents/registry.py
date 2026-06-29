@@ -617,7 +617,11 @@ return 1
             raise KeyError(f"{nhi_id!r} is not an NHI entry (kind={kind!r})")
 
         pipe = self._r.pipeline()
-        pipe.hset(reg_key, b"svid_issued", b"1")
+        # BUG-4.0-LANGFLOW-TOKEN-PERMS / consistent mapping form:
+        # Use mapping= kwarg (redis-py v4+ canonical; compatible with all
+        # fakeredis versions). The old positional pipe.hset(key, field, val)
+        # form is incompatible with some fakeredis pipeline implementations.
+        pipe.hset(reg_key, mapping={b"svid_issued": b"1"})
         pipe.sadd("agent:index:active", nhi_id.encode("utf-8"))
         pipe.sadd("nhi:index:active", nhi_id.encode("utf-8"))
         pipe.execute()
