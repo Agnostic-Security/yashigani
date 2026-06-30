@@ -293,6 +293,18 @@ async def promote_policy(name: str, session: StepUpAdminSession):
     entry = _lifecycle_store.set_status(name, next_status, promoted_by=session.account_id)
     _log.info("Admin %s promoted policy clients/%s: %s → %s",
               session.account_id, name, current_status, next_status)
+    try:
+        from yashigani.audit.schema import PolicyPromotedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyPromotedEvent(
+            admin_account=session.account_id,
+            policy_name=name,
+            previous_status=current_status,
+            new_status=next_status,
+        ))
+    except Exception as _exc:
+        _log.error("PolicyPromotedEvent audit write failed: %s", _exc)
     return {"status": "ok", "name": name, "previous": current_status, "lifecycle_status": next_status,
             **{k: v for k, v in entry.items() if k not in ("status",)}}
 
@@ -307,6 +319,17 @@ async def archive_policy(name: str, session: StepUpAdminSession):
     current_status = current.get("status", "draft")
     entry = _lifecycle_store.set_status(name, "archived", promoted_by=session.account_id)
     _log.info("Admin %s archived policy clients/%s (was %s)", session.account_id, name, current_status)
+    try:
+        from yashigani.audit.schema import PolicyArchivedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyArchivedEvent(
+            admin_account=session.account_id,
+            policy_name=name,
+            previous_status=current_status,
+        ))
+    except Exception as _exc:
+        _log.error("PolicyArchivedEvent audit write failed: %s", _exc)
     return {"status": "ok", "name": name, "previous": current_status,
             "lifecycle_status": "archived", **{k: v for k, v in entry.items() if k not in ("status",)}}
 
@@ -512,6 +535,17 @@ async def duplicate_template(body: DuplicateTemplateRequest, session: StepUpAdmi
 
     _log.info("Admin %s duplicated template '%s' → clients/%s",
               session.account_id, body.template_id, new_name)
+    try:
+        from yashigani.audit.schema import PolicyDuplicatedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyDuplicatedEvent(
+            admin_account=session.account_id,
+            source_template=body.template_id,
+            policy_name=new_name,
+        ))
+    except Exception as _exc:
+        _log.error("PolicyDuplicatedEvent audit write failed: %s", _exc)
     return {
         "status": "ok",
         "source_template": body.template_id,
@@ -605,6 +639,18 @@ async def edit_custom_policy_rego(
 
     _log.info("Admin %s edited Rego for clients/%s (%d warnings, confirmed=%s)",
               session.account_id, name, len(warnings), body.confirm_warnings)
+    try:
+        from yashigani.audit.schema import PolicyRegoEditedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyRegoEditedEvent(
+            admin_account=session.account_id,
+            policy_name=name,
+            warnings_count=len(warnings),
+            high_warnings_confirmed=body.confirm_warnings,
+        ))
+    except Exception as _exc:
+        _log.error("PolicyRegoEditedEvent audit write failed: %s", _exc)
     return {
         "status": "ok",
         "id": pol_id,
@@ -722,6 +768,17 @@ async def edit_core_policy(
         "CORE POLICY EDIT: admin=%s policy=%s reason=%r (danger confirmed)",
         session.account_id, pid, body.reason,
     )
+    try:
+        from yashigani.audit.schema import PolicyCoreEditedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyCoreEditedEvent(
+            admin_account=session.account_id,
+            policy_id=pid,
+            reason=body.reason[:500],
+        ))
+    except Exception as _exc:
+        _log.error("PolicyCoreEditedEvent audit write failed: %s", _exc)
     return {
         "status": "ok",
         "id": pid,
@@ -863,6 +920,18 @@ async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # 
 
     _log.info("Admin %s saved client policy %s (%d warning(s), confirmed=%s)",
               session.account_id, pol_id, len(warnings), body.confirm_warnings)
+    try:
+        from yashigani.audit.schema import PolicySavedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicySavedEvent(
+            admin_account=session.account_id,
+            policy_name=name,
+            warnings_count=len(warnings),
+            high_warnings_confirmed=body.confirm_warnings,
+        ))
+    except Exception as _exc:
+        _log.error("PolicySavedEvent audit write failed: %s", _exc)
     return {
         "status": "ok",
         "id": pol_id,
@@ -1098,6 +1167,16 @@ async def activate_policy(body: ActivateRequest, session: StepUpAdminSession):  
         raise HTTPException(status_code=404, detail={"error": "policy_not_loaded",
                             "message": f"clients/{name} is not loaded in OPA — save it first."})
     _log.info("Admin %s activated client policy clients/%s", session.account_id, name)
+    try:
+        from yashigani.audit.schema import PolicyActivatedEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyActivatedEvent(
+            admin_account=session.account_id,
+            policy_name=name,
+        ))
+    except Exception as _exc:
+        _log.error("PolicyActivatedEvent audit write failed: %s", _exc)
     return {"status": "ok", "name": name, "loaded": True}
 
 
@@ -1129,6 +1208,20 @@ async def bind_policy(body: BindRequest, session: StepUpAdminSession):
     await _push_bindings()
     _log.info("Admin %s bound clients/%s -> %s (%s)", session.account_id, name,
               binding.scope_key(), binding.direction)
+    try:
+        from yashigani.audit.schema import PolicyBoundEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyBoundEvent(
+            admin_account=session.account_id,
+            policy_name=name,
+            scope_kind=binding.scope_kind,
+            scope_id=binding.scope_id,
+            direction=binding.direction,
+            binding_id=binding.id if hasattr(binding, "id") else "",
+        ))
+    except Exception as _exc:
+        _log.error("PolicyBoundEvent audit write failed: %s", _exc)
     return {"status": "ok", "binding": binding.to_dict()}
 
 
@@ -1142,4 +1235,14 @@ async def unbind_policy(binding_id: str, session: StepUpAdminSession):
         raise HTTPException(status_code=404, detail={"error": "binding_not_found"})
     await _push_bindings()
     _log.info("Admin %s removed binding %s", session.account_id, binding_id)
+    try:
+        from yashigani.audit.schema import PolicyUnboundEvent
+        aw = backoffice_state.audit_writer
+        assert aw is not None
+        aw.write(PolicyUnboundEvent(
+            admin_account=session.account_id,
+            binding_id=binding_id,
+        ))
+    except Exception as _exc:
+        _log.error("PolicyUnboundEvent audit write failed: %s", _exc)
     return {"status": "ok", "removed": binding_id}

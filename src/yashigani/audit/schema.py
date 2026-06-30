@@ -417,6 +417,23 @@ class EventType(str, Enum):
     WORKFLOW_RUN_FAILED = "WORKFLOW_RUN_FAILED"
     # Admin disabled a user's workflow from the admin oversight plane.
     WORKFLOW_ADMIN_DISABLED = "WORKFLOW_ADMIN_DISABLED"
+    # ---------------------------------------------------------------------------
+    # 4.0 — LAURA-V400-002 / AUDIT-GAP-001: OPA client-policy lifecycle events.
+    # All state-changing policy operations MUST appear in the tamper-evident
+    # SHA-384 hash chain so that policy promotion/binding cannot be silently
+    # altered.  Admin identity + policy name + transition are captured on every
+    # event.
+    # NIST AU-2 / AU-12 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2 / ASVS V7.2.1.
+    # ---------------------------------------------------------------------------
+    POLICY_SAVED = "POLICY_SAVED"
+    POLICY_DUPLICATED = "POLICY_DUPLICATED"
+    POLICY_REGO_EDITED = "POLICY_REGO_EDITED"
+    POLICY_CORE_EDITED = "POLICY_CORE_EDITED"
+    POLICY_PROMOTED = "POLICY_PROMOTED"
+    POLICY_ARCHIVED = "POLICY_ARCHIVED"
+    POLICY_ACTIVATED = "POLICY_ACTIVATED"
+    POLICY_BOUND = "POLICY_BOUND"
+    POLICY_UNBOUND = "POLICY_UNBOUND"
 
 
 # ---------------------------------------------------------------------------
@@ -3674,3 +3691,128 @@ class WorkflowAdminDisabledEvent(AuditEvent):
     workflow_id: str = ""           # affected workflow
     owner_identity_id: str = ""     # identity_id of the workflow owner
     workflow_name: str = ""         # display name (truncated to 64 chars)
+
+
+# ---------------------------------------------------------------------------
+# 4.0 — LAURA-V400-002 / AUDIT-GAP-001: OPA client-policy lifecycle events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PolicySavedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/save (create or update a client policy).
+
+    Captures admin identity, policy name, lifecycle transition to draft, and
+    whether high-severity sanity warnings were overridden.
+    """
+
+    event_type: str = EventType.POLICY_SAVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""     # session.account_id
+    policy_name: str = ""       # clients/<name>
+    warnings_count: int = 0     # total sanity warnings
+    high_warnings_confirmed: bool = False  # confirm_warnings flag
+
+
+@dataclass
+class PolicyDuplicatedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/templates/duplicate (save-as template)."""
+
+    event_type: str = EventType.POLICY_DUPLICATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    source_template: str = ""   # template_id duplicated from
+    policy_name: str = ""       # new clients/<name>
+
+
+@dataclass
+class PolicyRegoEditedEvent(AuditEvent):
+    """Emitted on PUT /admin/policies/custom/<name>/rego (edit client policy Rego)."""
+
+    event_type: str = EventType.POLICY_REGO_EDITED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    warnings_count: int = 0
+    high_warnings_confirmed: bool = False
+
+
+@dataclass
+class PolicyCoreEditedEvent(AuditEvent):
+    """Emitted on PUT /admin/policies/core/<policy_id> (edit load-bearing core policy).
+
+    Core policy edits are dangerous and require confirm_danger=true + step-up.
+    The reason field carries the operator-supplied justification.
+    """
+
+    event_type: str = EventType.POLICY_CORE_EDITED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_id: str = ""         # full OPA id (e.g. 'yashigani/main')
+    reason: str = ""            # operator-supplied justification (max 500 chars)
+
+
+@dataclass
+class PolicyPromotedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/lifecycle/<name>/promote."""
+
+    event_type: str = EventType.POLICY_PROMOTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    previous_status: str = ""   # e.g. "draft"
+    new_status: str = ""        # e.g. "staging" or "production"
+
+
+@dataclass
+class PolicyArchivedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/lifecycle/<name>/archive."""
+
+    event_type: str = EventType.POLICY_ARCHIVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    previous_status: str = ""
+
+
+@dataclass
+class PolicyActivatedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/activate (confirm policy is loaded in OPA)."""
+
+    event_type: str = EventType.POLICY_ACTIVATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+
+
+@dataclass
+class PolicyBoundEvent(AuditEvent):
+    """Emitted on POST /admin/policies/bind (bind a policy to a subject scope)."""
+
+    event_type: str = EventType.POLICY_BOUND
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    scope_kind: str = ""
+    scope_id: str = ""
+    direction: str = ""
+    binding_id: str = ""
+
+
+@dataclass
+class PolicyUnboundEvent(AuditEvent):
+    """Emitted on DELETE /admin/policies/bind/<binding_id>."""
+
+    event_type: str = EventType.POLICY_UNBOUND
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    binding_id: str = ""

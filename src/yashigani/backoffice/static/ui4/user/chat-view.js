@@ -27,7 +27,12 @@ import '/static/ui4/core/widgets/ys-chat-stream.js';
 import './mention-menu.js';
 import { copyText } from '/static/ui4/core/clipboard.js';
 
-const CHAT_PATH = '/v1/chat/completions';
+// FIND-4.0-CHAT-001: route through the backoffice trusted-forwarder proxy
+// instead of hitting /v1/chat/completions directly.  Direct access 401s
+// because the gateway requires Authorization: Bearer which must not be
+// exposed in the browser.  The proxy (UserSession-gated) adds the internal
+// bearer + X-OpenWebUI-User-Email server-side and streams SSE back unchanged.
+const CHAT_PATH = '/user/chat/completions';
 const MENTIONS_PATH = '/user/mentions';
 
 // Escape a handle for safe use inside a RegExp (handles are untrusted).

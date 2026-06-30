@@ -76,11 +76,12 @@ export function promptStepUp(spec) {
     const body = mk('div', 'ys-modal-body');
     const label = mk('div', 'ys-label',
       (spec && spec.message)
-        || 'Enter your 6-digit authenticator code to authorise this action.');
+        || 'Enter your authenticator code (6 or 8 digits) to authorise this action.');
     const input = mk('input', 'ys-input');
     input.setAttribute('inputmode', 'numeric');
     input.setAttribute('autocomplete', 'one-time-code');
-    input.maxLength = 6;
+    input.setAttribute('pattern', '[0-9]{6,8}');
+    input.maxLength = 8;
     body.appendChild(label);
     body.appendChild(input);
 
@@ -103,7 +104,7 @@ export function promptStepUp(spec) {
     cancelBtn.addEventListener('click', () => cleanup(null));
     okBtn.addEventListener('click', () => {
       const v = input.value.trim();
-      cleanup(/^\d{6}$/.test(v) ? v : null);
+      cleanup(/^\d{6,8}$/.test(v) ? v : null);
     });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') okBtn.click();
