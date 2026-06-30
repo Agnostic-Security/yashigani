@@ -85,6 +85,8 @@ from yashigani.backoffice.routes import (
     documents_router,
     # 3.0 — Capability-envelope re-approval admin surface (YSG-RISK-060)
     envelope_reapproval_router,
+    # 4.0 — MCP Server Registry admin surface (list + import ceremony)
+    mcp_servers_router,
     # v2.23.2 — Backup status + verify (#47)
     backup_router,
     # v2.23.3 — Admin-triggered secret rotation
@@ -1311,6 +1313,10 @@ def create_backoffice_app() -> FastAPI:
     # 3.0 — Capability-envelope re-approval admin surface (YSG-RISK-060)
     app.include_router(
         envelope_reapproval_router, prefix="/admin/mcp/envelopes", tags=["mcp-envelopes"]
+    )
+    # 4.0 — MCP Server Registry admin surface (list + import ceremony)
+    app.include_router(
+        mcp_servers_router, prefix="/admin/mcp/servers", tags=["mcp-servers"]
     )
     # v2.1 — SSO / OIDC login flow (no auth required — serves anonymous users)
     app.include_router(sso_router, prefix="/auth", tags=["sso"])

@@ -1,30 +1,37 @@
-// Yashigani 4.0 admin shell — MCP Registry / capability-envelope re-approvals.
+// Yashigani 4.0 admin shell — MCP Registry.
 //
-// Imported MCP servers are pinned at import behind a capability envelope (typed
-// tool surface + egress posture). When an upstream MCP's tool surface drifts
-// (the anti-rug-pull case), the refresh is BLOCKED and queued here for an
-// operator re-approval decision. The broker keeps the MCP hard-gated
-// (fail-closed) until an admin re-pins a new baseline or rejects.
+// Two panels:
+//   1. Registered MCP Servers — active approved envelopes (GET /admin/mcp/servers/).
+//      Shows each server, its tool count, effect classes, and egress posture.
+//      The cloud-9 demo MCP appears here after populate-demo.py seeds the import.
 //
-// Endpoints (routes/envelope_reapproval.py, prefix /admin/mcp/envelopes):
-//   GET  /pending                          — blocked refreshes for this tenant
-//   GET  /pending/{provenance_id}          — field-level diff vs original + prior
-//   POST /pending/{provenance_id}/approve  — re-pin new baseline (step-up gate)
-//   POST /pending/{provenance_id}/reject   — keep blocked (step-up gate)
+//   2. Tool-surface re-approvals — blocked refreshes pending operator decision
+//      (GET /admin/mcp/envelopes/pending).  When an upstream MCP's tool surface
+//      drifts (the anti-rug-pull case), the refresh is BLOCKED until an operator
+//      re-pins a new baseline or rejects.
 //
-// The approve/reject routes enforce assert_privileged_mutation server-side and
-// raise 401 step_up_required → the shared TOTP modal fires via ctx.api.
+// Import ceremony (admin action — step-up gated):
+//   POST /admin/mcp/servers/import  →  fetch tools/list + mint v1 envelope.
+//   Used by the "Import MCP Server" form (admin must provide server_id + URL).
+//   In demo mode populate-demo.py calls this API directly at deploy time.
 //
-// TRUSTED-CHROME header views; the diff tool_key/detail strings are UNTRUSTED
-// (attacker-influenced MCP metadata) but are still rendered via Lit textContent
-// auto-escape — never a markdown/innerHTML sink — so they are inert.
+// Endpoints (envelope re-approval):
+//   GET  /admin/mcp/envelopes/pending                    — blocked refreshes
+//   GET  /admin/mcp/envelopes/pending/{provenance_id}   — field-level diff
+//   POST /admin/mcp/envelopes/pending/{prov}/approve    — step-up re-approve
+//   POST /admin/mcp/envelopes/pending/{prov}/reject     — keep blocked
+//
+// TRUSTED-CHROME header views; tool_key/detail strings are UNTRUSTED
+// (attacker-influenced MCP metadata) but rendered via Lit textContent
+// auto-escape — never a markdown/innerHTML sink.
 import { LitElement, html, nothing } from '/static/vendor/lit/lit-core.min.js';
 import { widgets } from '../../core/index.js';
 import { registerAdminModule } from '../module-registry.js';
 
 void widgets;
 
-const BASE = '/admin/mcp/envelopes';
+const SERVERS_BASE = '/admin/mcp/servers';
+const ENVELOPES_BASE = '/admin/mcp/envelopes';
 
 function sevBadge(sev) {
   if (sev === 'high') return 'ys-badge ys-badge-red';
@@ -32,14 +39,28 @@ function sevBadge(sev) {
   return 'ys-badge ys-badge-blue';
 }
 
+function postureBadge(posture) {
+  if (!posture || posture === 'NONE') return 'ys-badge ys-badge-blue';
+  if (posture === 'OPEN') return 'ys-badge ys-badge-red';
+  return 'ys-badge ys-badge-amber';
+}
+
 export class YsAdminMcp extends LitElement {
   static properties = {
-    api: { attribute: false },
-    app: { attribute: false },
-    _loading: { state: true },
-    _pending: { state: true },
-    _diff: { state: true },     // loaded diff for the open provenance, or null
-    _busy: { state: true },
+    api:       { attribute: false },
+    app:       { attribute: false },
+    _loading:  { state: true },
+    _servers:  { state: true },   // active registered servers
+    _pending:  { state: true },   // pending re-approval queue
+    _diff:     { state: true },   // loaded diff for open provenance, or null
+    _busy:     { state: true },
+    _showImport: { state: true }, // show the import form
+    _importing:  { state: true },
+    _importError: { state: true },
+    _importServerId: { state: true },
+    _importUrl:      { state: true },
+    _importTopology: { state: true },
+    _importEgress:   { state: true },
   };
 
   constructor() {
@@ -47,9 +68,17 @@ export class YsAdminMcp extends LitElement {
     this.api = null;
     this.app = null;
     this._loading = true;
+    this._servers = [];
     this._pending = [];
     this._diff = null;
     this._busy = '';
+    this._showImport = false;
+    this._importing = false;
+    this._importError = '';
+    this._importServerId = '';
+    this._importUrl = '';
+    this._importTopology = 'ring_fenced';
+    this._importEgress = 'NONE';
   }
 
   createRenderRoot() { return this; }
@@ -62,30 +91,78 @@ export class YsAdminMcp extends LitElement {
   async _load() {
     if (!this.api) return;
     this._loading = true;
-    const data = await this.api.get(`${BASE}/pending`);
-    this._pending = (data && Array.isArray(data.pending)) ? data.pending : [];
+    const [svData, envData] = await Promise.all([
+      this.api.get(`${SERVERS_BASE}/`),
+      this.api.get(`${ENVELOPES_BASE}/pending`),
+    ]);
+    this._servers = (svData && Array.isArray(svData.servers)) ? svData.servers : [];
+    this._pending = (envData && Array.isArray(envData.pending)) ? envData.pending : [];
     this._loading = false;
   }
 
+  // ── Re-approval queue actions ─────────────────────────────────────────────
+
   async _openDiff(row) {
     const pid = row.provenance_id;
-    const data = await this.api.get(`${BASE}/pending/${encodeURIComponent(pid)}`);
+    const data = await this.api.get(`${ENVELOPES_BASE}/pending/${encodeURIComponent(pid)}`);
     if (data) this._diff = data;
     else this.app && this.app.toast('Could not load diff.', 'error');
   }
 
   async _decide(pid, action) {
     this._busy = `${pid}:${action}`;
-    const res = await this.api.mutate(`${BASE}/pending/${encodeURIComponent(pid)}/${action}`, { method: 'POST' });
+    const res = await this.api.mutate(
+      `${ENVELOPES_BASE}/pending/${encodeURIComponent(pid)}/${action}`,
+      { method: 'POST' }
+    );
     this._busy = '';
     if (res.ok) {
-      this.app && this.app.toast(action === 'approve' ? 'Envelope re-pinned; block cleared.' : 'Mutation rejected; MCP stays blocked.', 'success');
+      this.app && this.app.toast(
+        action === 'approve'
+          ? 'Envelope re-pinned; block cleared.'
+          : 'Mutation rejected; MCP stays blocked.',
+        'success'
+      );
       this._diff = null;
       await this._load();
     } else {
       this.app && this.app.toast((res.error && res.error.message) || 'Decision failed.', 'error');
     }
   }
+
+  // ── Import ceremony ──────────────────────────────────────────────────────
+
+  async _importServer() {
+    this._importing = true;
+    this._importError = '';
+    const body = {
+      server_id: this._importServerId.trim(),
+      upstream_url: this._importUrl.trim(),
+      topology: this._importTopology,
+      egress_posture: this._importEgress,
+    };
+    const res = await this.api.mutate(`${SERVERS_BASE}/import`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    this._importing = false;
+    if (res.ok) {
+      this.app && this.app.toast(
+        `Imported ${res.data.server_id}: ${res.data.tool_count} tool(s) enveloped.`,
+        'success'
+      );
+      this._showImport = false;
+      this._importServerId = '';
+      this._importUrl = '';
+      await this._load();
+    } else {
+      const msg = (res.error && res.error.message) || 'Import failed.';
+      this._importError = msg;
+      this.app && this.app.toast(msg, 'error');
+    }
+  }
+
+  // ── Render helpers ────────────────────────────────────────────────────────
 
   _renderFindings(title, findings) {
     return html`
@@ -138,21 +215,147 @@ export class YsAdminMcp extends LitElement {
       </div>`;
   }
 
+  _renderImportModal() {
+    if (!this._showImport) return nothing;
+    return html`
+      <div class="ys-modal-backdrop" @click=${(ev) => { if (ev.target === ev.currentTarget) this._showImport = false; }}>
+        <div class="ys-modal" role="dialog" aria-modal="true">
+          <div class="ys-modal-header">Import MCP Server (step-up required)</div>
+          <div class="ys-modal-body">
+            <div class="ys-txt-note">
+              Imports a new MCP server: fetches its tool surface, projects the capability
+              envelope, and mints v1 (the approved baseline). Requires a fresh TOTP stamp.
+            </div>
+            <div class="ys-field">
+              <label class="ys-label" for="import-sid">Server ID</label>
+              <input class="ys-input" id="import-sid" type="text"
+                     placeholder="cloud9-demo"
+                     .value=${this._importServerId}
+                     @input=${(e) => { this._importServerId = e.target.value; }} />
+              <div class="ys-txt-note">Must match the agent_name in YASHIGANI_MCP_SERVERS.</div>
+            </div>
+            <div class="ys-field">
+              <label class="ys-label" for="import-url">Upstream URL</label>
+              <input class="ys-input" id="import-url" type="text"
+                     placeholder="http://demo-mcp:8000"
+                     .value=${this._importUrl}
+                     @input=${(e) => { this._importUrl = e.target.value; }} />
+              <div class="ys-txt-note">JSON-RPC endpoint the backoffice will call for tools/list.</div>
+            </div>
+            <div class="ys-field">
+              <label class="ys-label" for="import-topo">Topology</label>
+              <select class="ys-select" id="import-topo"
+                      .value=${this._importTopology}
+                      @change=${(e) => { this._importTopology = e.target.value; }}>
+                <option value="ring_fenced">ring_fenced (compose-internal)</option>
+                <option value="external_relay">external_relay (public/cloud)</option>
+              </select>
+            </div>
+            <div class="ys-field">
+              <label class="ys-label" for="import-egress">Egress Posture</label>
+              <select class="ys-select" id="import-egress"
+                      .value=${this._importEgress}
+                      @change=${(e) => { this._importEgress = e.target.value; }}>
+                <option value="NONE">NONE (no egress)</option>
+                <option value="CONTROLLED">CONTROLLED (declared egress only)</option>
+                <option value="OPEN">OPEN (unrestricted egress)</option>
+              </select>
+            </div>
+            ${this._importError
+              ? html`<div class="ys-txt-note" style="color:var(--ys-danger);">${this._importError}</div>`
+              : nothing}
+          </div>
+          <div class="ys-modal-footer">
+            <button class="ys-btn ys-btn-secondary"
+                    @click=${() => { this._showImport = false; this._importError = ''; }}>
+              Cancel
+            </button>
+            <button class="ys-btn"
+                    ?disabled=${this._importing || !this._importServerId.trim() || !this._importUrl.trim()}
+                    @click=${() => this._importServer()}>
+              ${this._importing ? 'Importing…' : 'Import (step-up)'}
+            </button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  _renderServerRow(s) {
+    return html`
+      <tr>
+        <td><strong>${s.server_id}</strong></td>
+        <td>${s.tool_count}</td>
+        <td>
+          <span class=${postureBadge(s.egress_posture)}>${s.egress_posture || 'NONE'}</span>
+        </td>
+        <td>${s.topology || '—'}</td>
+        <td>v${s.envelope_version}</td>
+        <td>${s.approved_by || '—'}</td>
+      </tr>
+      ${s.tools && s.tools.length > 0 ? html`
+        <tr>
+          <td colspan="6" style="padding:0 0 8px 16px;">
+            <div class="ys-txt-note" style="font-size:0.8em;">
+              Tools: ${s.tools.map((t) => html`
+                <span class="ys-badge" style="margin:1px 2px;">${t.tool_key}</span>
+              `)}
+            </div>
+          </td>
+        </tr>` : nothing}`;
+  }
+
   render() {
     if (this._loading) {
-      return html`<div class="ys-admin-content-pad"><div class="ys-txt-note">Loading MCP re-approval queue…</div></div>`;
+      return html`<div class="ys-admin-content-pad"><div class="ys-txt-note">Loading MCP registry…</div></div>`;
     }
     return html`
       <div class="ys-admin-content-pad">
+
+        <!-- Panel 1: Registered MCP Servers -->
         <div class="ys-panel">
+          <div class="ys-panel-header" style="display:flex;align-items:center;gap:8px;">
+            Registered MCP Servers (${this._servers.length})
+            <button class="ys-btn" style="margin-left:auto;font-size:0.85em;"
+                    @click=${() => { this._showImport = true; this._importError = ''; }}>
+              Import server
+            </button>
+          </div>
+          <div class="ys-panel-body">
+            <div class="ys-txt-note">
+              MCP servers onboarded through the capability-envelope import ceremony.
+              Each server is pinned to an approved tool surface (effect classes + egress posture).
+              Tool-surface drift is blocked and queued for re-approval below.
+            </div>
+            ${this._servers.length === 0
+              ? html`<div class="ys-txt-note">
+                  No MCP servers registered yet.
+                  In demo mode, run <code>python3 scripts/populate-demo.py</code> to seed the cloud-9 demo server,
+                  or click <strong>Import server</strong> to onboard one manually.
+                </div>`
+              : html`<table class="ys-table">
+                  <thead>
+                    <tr>
+                      <th>Server</th><th>Tools</th><th>Egress</th>
+                      <th>Topology</th><th>Envelope</th><th>Approved by</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${this._servers.map((s) => this._renderServerRow(s))}
+                  </tbody>
+                </table>`}
+          </div>
+        </div>
+
+        <!-- Panel 2: Tool-surface re-approval queue -->
+        <div class="ys-panel" style="margin-top:16px;">
           <div class="ys-panel-header">
             MCP tool-surface re-approvals (${this._pending.length})
             ${this._pending.length ? html`<span class="ys-badge ys-badge-amber">action required</span>` : nothing}
           </div>
           <div class="ys-panel-body">
             <div class="ys-txt-note">
-              Imported MCP servers are pinned to an approved capability envelope. A drifted
-              tool surface is blocked (fail-closed) until you re-pin a new baseline or reject.
+              When a registered MCP server's tool surface drifts from its approved baseline,
+              the refresh is blocked (fail-closed) until you re-pin a new baseline or reject.
             </div>
             ${this._pending.length === 0
               ? html`<div class="ys-txt-note">Queue empty — no blocked MCP refreshes.</div>`
@@ -164,13 +367,20 @@ export class YsAdminMcp extends LitElement {
                         <td>${r.server_id || '—'}</td>
                         <td>${r.provenance_id}</td>
                         <td>${r.triage_class || '—'}</td>
-                        <td><button class="ys-btn" data-act="view" @click=${() => this._openDiff(r)}>Review diff</button></td>
+                        <td>
+                          <button class="ys-btn" data-act="view"
+                                  @click=${() => this._openDiff(r)}>
+                            Review diff
+                          </button>
+                        </td>
                       </tr>`)}
                   </tbody>
                 </table>`}
           </div>
         </div>
+
         ${this._renderDiffModal()}
+        ${this._renderImportModal()}
       </div>`;
   }
 }

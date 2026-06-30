@@ -1295,6 +1295,78 @@ def step13b_cloud9_demo_wire() -> None:
 
 
 # ---------------------------------------------------------------------------
+# STEP 13c — MCP Registry import ceremony (demo-mcp envelope seeding)
+# ---------------------------------------------------------------------------
+
+def step13c_mcp_import_ceremony() -> None:
+    """
+    4.0 — Seed the cloud-9 demo MCP's initial capability envelope via the governed
+    import ceremony (POST /admin/mcp/servers/import, step-up gated).
+
+    This is the ONLY path that mints the v1 envelope (the ORIGINAL approved baseline).
+    After this call:
+      - GET /admin/mcp/servers/ returns the cloud9-demo entry
+      - The admin MCP Registry module shows the server and its tool surface
+      - Subsequent tool-surface refreshes are triage'd against this baseline
+
+    Idempotent: re-running this step mints a new envelope version (prior is superseded)
+    which is safe because the operator (orchid) is explicitly re-approving the surface.
+
+    Pre-conditions (verified earlier in populate-demo.py):
+      - demo-mcp container is healthy (step13)
+      - orchid admin session is active in `S`
+      - Step-up is refreshed before the import POST (StepUpAdminSession required)
+    """
+    print("\n=== STEP 13c: MCP Registry import ceremony (cloud9-demo envelope) ===")
+
+    # Ensure step-up is fresh before the import (StepUpAdminSession required).
+    _do_stepup_inline()
+
+    r = S.post(
+        f"{BASE_URL}/admin/mcp/servers/import",
+        json={
+            "server_id": "cloud9-demo",
+            "upstream_url": "http://demo-mcp:8000",
+            "topology": "ring_fenced",
+            "egress_posture": "NONE",
+            "display_name": "Cloud-9 Demo MCP",
+        },
+    )
+
+    if r.status_code == 200:
+        data = r.json()
+        print(f"  [PASS] cloud9-demo envelope minted:")
+        print(f"         envelope_id={data.get('envelope_id')}  "
+              f"tool_count={data.get('tool_count')}  "
+              f"approved_by={data.get('approved_by')}")
+        tools = data.get("tools", [])
+        if tools:
+            print(f"         tools: {', '.join(tools)}")
+    elif r.status_code == 422 and "no_tools_returned" in r.text:
+        print("  WARN: demo-mcp returned empty tools/list — envelope not seeded.")
+        print("        Ensure demo-mcp is fully started and reachable from the backoffice network.")
+        print(f"        Detail: {r.text[:400]}")
+    elif r.status_code == 403 and "step_up_required" in r.text:
+        print("  FAIL: step-up TOTP expired before import — retry the script.")
+        print(f"        {r.text[:200]}")
+    else:
+        print(f"  FAIL: import ceremony returned HTTP {r.status_code}: {r.text[:400]}")
+
+    # Verify the server now appears in the registry.
+    rv = S.get(f"{BASE_URL}/admin/mcp/servers/")
+    if rv.status_code == 200:
+        servers = rv.json().get("servers", [])
+        ids = [s["server_id"] for s in servers]
+        if "cloud9-demo" in ids:
+            print(f"  [PASS] GET /admin/mcp/servers/ confirms cloud9-demo registered "
+                  f"({len(servers)} server(s) total)")
+        else:
+            print(f"  WARN: cloud9-demo NOT in registry after import. Current servers: {ids}")
+    else:
+        print(f"  WARN: GET /admin/mcp/servers/ returned HTTP {rv.status_code}: {rv.text[:200]}")
+
+
+# ---------------------------------------------------------------------------
 # STEP 14 — Aspen break-glass verify (one-shot, no mutation)
 # ---------------------------------------------------------------------------
 
@@ -1432,6 +1504,10 @@ def main() -> None:
 
     # Step 13b: cloud-9 demo wiring verification (read-only, API-level)
     step13b_cloud9_demo_wire()
+
+    # Step 13c: MCP Registry import ceremony (seed cloud9-demo capability envelope)
+    # Must run AFTER step13 confirms demo-mcp is healthy.
+    step13c_mcp_import_ceremony()
 
     # Step 14: aspen break-glass verify (LAST, separate session, no mutation)
     step14_verify_aspen()

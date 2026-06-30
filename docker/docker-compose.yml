@@ -772,11 +772,17 @@ services:
     # obs (#21): also joins obs to forward audit events to wazuh-indexer:9200
     # (obs-plane only). Outbound mesh-mTLS only; no inbound exposure. Does NOT join edge.
     # extractor_svc: backoffice → extractor-svc:8090 for doc enforcement (Design A).
+    # demo_mcp_isolated: 4.0 — backoffice import ceremony (POST /admin/mcp/servers/import)
+    #   fetches tools/list from demo-mcp:8000 to seed the capability envelope. Same
+    #   internal:true, no-internet-egress posture as the gateway's broker dispatch path.
+    #   Harmless when the demo-mcp profile is not active: the bridge exists, the service
+    #   does not. Step-up gated on the admin side (StepUpAdminSession).
     networks:
       - caddy_internal
       - data
       - obs
       - extractor_svc
+      - demo_mcp_isolated
 
   # ---------------------------------------------------------------------------
   # Extractor Service — pre-spawned hardened document extraction worker

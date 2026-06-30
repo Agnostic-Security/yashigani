@@ -3258,6 +3258,19 @@ _write_aes_key_to_env() {
     _env_set "YASHIGANI_ORCH_BRAIN_MODEL"  "${YASHIGANI_ORCH_BRAIN_MODEL:-qwen2.5:3b}"
     _env_set "YASHIGANI_INSPECT_RESPONSES" "${YASHIGANI_INSPECT_RESPONSES:-true}"
     log_info "Demo mode: cloud-9 demo wired (cloud9-orchestrate model + response inspection ON)"
+
+    # 4.0 — Register the cloud-9 demo MCP in YASHIGANI_MCP_SERVERS so the broker
+    # registry picks it up at gateway startup and @-handles appear in the user surface.
+    # Only set if not already present (upgrade-safe: preserve operator-configured servers).
+    local _demo_mcp_entry='[{"agent_name":"cloud9-demo","upstream_url":"http://demo-mcp:8000","tenant_id":"default","is_filesystem_agent":false,"is_git_agent":false,"display_name":"Cloud-9 Demo MCP"}]'
+    local _existing_mcp_servers
+    _existing_mcp_servers="$(grep -m1 '^YASHIGANI_MCP_SERVERS=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ -z "$_existing_mcp_servers" || "$_existing_mcp_servers" == "[]" || "$_existing_mcp_servers" == "" ]]; then
+      _env_set "YASHIGANI_MCP_SERVERS" "${_demo_mcp_entry}"
+      log_info "Demo mode: YASHIGANI_MCP_SERVERS set to cloud9-demo (broker registry + @-handles enabled)"
+    else
+      log_info "Demo mode: YASHIGANI_MCP_SERVERS already set — skipping demo-mcp injection (existing: ${_existing_mcp_servers:0:60}...)"
+    fi
   fi
 
   # --- Domain ---

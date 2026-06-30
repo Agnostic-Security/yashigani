@@ -399,6 +399,24 @@ class CapabilityEnvelopeService:
             return None
         return self._row_to_record(row)
 
+    async def list_active(self, tenant_id: str) -> list[EnvelopeRecord]:
+        """Return all ACTIVE (approved, not blocked/superseded) envelopes for a tenant.
+
+        Used by the admin MCP registry panel to list registered MCP servers.
+        Returns one row per registered server (only the active version).
+        Ordered by server_id for deterministic display.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM mcp_tool_surface_pins
+                WHERE  tenant_id = $1 AND status = 'active'
+                ORDER  BY server_id ASC
+                """,
+                tenant_id,
+            )
+        return [self._row_to_record(r) for r in rows]
+
     async def history(
         self, tenant_id: str, limit: int = 50, offset: int = 0
     ) -> list[EnvelopeRecord]:
