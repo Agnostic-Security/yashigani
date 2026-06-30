@@ -470,9 +470,15 @@ data:
         curves x25519mlkem768 x25519 secp384r1 secp256r1
       }
       {{- end }}
+      # X-Frame-Options scoped: monitoring embed paths (Grafana/Alertmanager) must
+      # be iframeable from the admin shell (same origin). XFO: DENY on those
+      # responses blocks the embed. CSP frame-ancestors 'self' (@lenient_subapp)
+      # is the primary guard; this matcher ensures XFO is also absent on embed
+      # paths for legacy browsers.
+      @not_embed not path /admin/grafana/* /admin/alertmanager/*
+      header @not_embed X-Frame-Options "DENY"
       header {
         X-Content-Type-Options    "nosniff"
-        X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
         # CSP is set per-path below (NOT here) — a global SET would produce a
         # second CSP header when the per-path @redoc_ui override also fires.
@@ -502,7 +508,9 @@ data:
       # admin pages iframe /admin/grafana/ and /admin/loki/ — same-origin.
       header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
-      header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+      # frame-ancestors 'self': admin-gated same-origin embeds (Grafana/Alertmanager
+      # iframed from the admin shell). 'none' blocked the embed — fixed here.
+      header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'self'; object-src 'none'; base-uri 'none'"
       header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       handle /healthz {
         import strip-orchestration-headers

@@ -25,8 +25,8 @@
 #  @strict_legacy   — Legacy admin plane (/admin-legacy/) + all /admin/* API
 #                     sub-paths + /auth/*, /static/*, etc. NO Trusted Types —
 #                     dashboard.js / runtime-settings.js / login.js use innerHTML.
-#                     Excludes /admin/ (shell, now Lit → @strict_tt), /admin4/
-#                     (TT alias → @strict_tt), and /admin/alertmanager/* (subapp).
+#                     Excludes /admin/ (shell, now Lit -> @strict_tt), /admin4/
+#                     (TT alias -> @strict_tt), and /admin/alertmanager/* (subapp).
 #
 #  @strict_tt       — 4.0 first-party paths (Lit-based, no innerHTML).
 #                     Now includes /admin/ (Phase 6 flip: Lit admin is primary)
@@ -48,9 +48,9 @@
 
     # Strict legacy: /admin-legacy/ (old vanilla-JS admin, fallback) + all
     # /admin/* sub-paths (API endpoints, login page, etc.). NO Trusted Types.
-    # Excludes: /admin/ and /admin4/ (shell pages → @strict_tt); the
-    # observability sub-apps (grafana/wazuh/prometheus/loki/alertmanager →
-    # @lenient_subapp); /admin/api-redoc + /redoc → @redoc_ui.
+    # Excludes: /admin/ and /admin4/ (shell pages -> @strict_tt); the
+    # observability sub-apps (grafana/wazuh/prometheus/loki/alertmanager ->
+    # @lenient_subapp); /admin/api-redoc + /redoc -> @redoc_ui.
     @strict_legacy {
         path /admin/* /admin-legacy/ /admin-legacy/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
         not path /admin/ /admin4/
@@ -58,29 +58,19 @@
         not path /admin/api-redoc /redoc
     }
 
-    # Strict + Trusted Types: 4.0 first-party paths — now includes /admin/ and
-    # /admin4/ (Phase 6 flip: Lit admin is primary at /admin/; /admin4/ redirects).
-    # Four named TT policies (Phase-1 + Phase-4 Drawflow vendoring):
-    #   yashigani-render — our sole sanitisation sink (ui4/core/safe-render.js)
-    #   dompurify        — DOMPurify's RETURN_TRUSTED_TYPE internal policy (purify.es.mjs)
-    #   lit-html         — Lit's internal template-literal policy (lit-core.min.js)
-    #   drawflow-label   — Drawflow's html-param path (zero-allowlist DOMPurify + textContent
-    #                      enforcement; registered in ui4/core/drawflow-safe.js).
-    #                      Added Phase 4 per spec §2.4 conditional + RECONCILIATION R1:
-    #                      Drawflow's 2 innerHTML=variable calls cannot be replaced with
-    #                      textContent without forking the library. See vendor-audit-log.md.
-    # The latter three bless developer-authored templates / already-sanitised strings only
-    # — they are NOT data sinks for user-supplied content. No 'default' policy — fail-closed
-    # on unreviewed DOM writes.
-    # connect-src 'self' covers SSE (HTTPS fetch). If chat transport moves to
-    # WebSocket, add wss://{$YASHIGANI_TLS_DOMAIN} here (OQ-1 resolution needed).
+    # Strict + Trusted Types: 4.0 first-party paths.
+    # Four named TT policies: yashigani-render, dompurify, lit-html, drawflow-label.
     @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
 
     # frame-src 'self': explicit (default-src 'self' already implies it, but
-    # stated for clarity — admin pages iframe /admin/grafana/, /admin/wazuh/,
+    # stated for clarity -- admin pages iframe /admin/grafana/, /admin/wazuh/,
     # /admin/loki/ all of which are same-origin).
     header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
     header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
-    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+    # frame-ancestors 'self': admin-gated same-origin embeds. The admin shell at
+    # /admin/ (same origin) must be able to iframe these. 'none' blocked the
+    # Grafana/Alertmanager iframe -- fixed here. 'self' is safe: the forward_auth
+    # gate ensures only authenticated admins can load this content.
+    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'self'; object-src 'none'; base-uri 'none'"
     header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
 }
