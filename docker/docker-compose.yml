@@ -1119,11 +1119,25 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (ollama.yaml:42).
     # No cap_add: ollama binds port 11434 (non-privileged).
     cap_drop: [ALL]
-    # EX-231-10: ollama is a data-plane dep. Joins `data` for gateway/backoffice
-    # calls and `edge` for model pulls from registry.ollama.ai (needs internet).
+    # FIND-3.1-F1 fix (2026-06-29): `edge` removed from the long-running ollama
+    # service. Model pulls are now handled entirely by ollama-init, which runs a
+    # self-contained `ollama serve` in its own edge-attached container, writes
+    # models to the shared ollama_data volume, and exits before this service starts.
+    # Long-running ollama has zero internet egress post-install. cap_drop:[ALL]
+    # and no NET_ADMIN (L2 posture unchanged). EX-231-10: gateway/backoffice reach
+    # ollama on `data`; no edge attachment needed at runtime.
+    depends_on:
+      ollama-init:
+        # required:false — ollama-init is profile-gated [openwebui,langflow,letta,
+        # openclaw]. When no AI profile is active this dependency is skipped and
+        # ollama starts immediately (base install: no models, but service is up).
+        # When a profile IS active, ollama waits for ollama-init to exit 0 (models
+        # fully written to ollama_data) before starting — ensures strict sequential
+        # volume access (no two ollama processes on the same volume at once).
+        condition: service_completed_successfully
+        required: false
     networks:
       - data
-      - edge    # Required for model pulls from registry.ollama.ai
     # Uncomment for NVIDIA GPU:
     # deploy:
     #   resources:
@@ -1147,9 +1161,10 @@ services:
     # gate V232-SMOKE-018 — same rationale as `ollama` service above.
     user: "0:0"
     restart: on-failure:3
-    # mem_limit: 256m is sufficient — the init container is a thin CLI client;
-    # it sends an HTTP pull request to ollama:11434 and streams the model there.
-    # The 1.9 GB model data is written to the ollama volume, not into this container.
+    # FIND-3.1-F1: ollama-init now runs a self-contained `ollama serve` (not a
+    # thin API client). It needs enough memory to stage model layer decompression
+    # in /tmp (tmpfs 512 m). 256 m covers the serve overhead; the model data itself
+    # is written to the ollama_data volume via /root/.ollama, not held in container RAM.
     mem_limit: ${YASHIGANI_OLLAMA_INIT_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_OLLAMA_INIT_CPU_LIMIT:-0.25}
     environment:
@@ -1163,25 +1178,50 @@ services:
       # always logged as loud WARNINGs; they never hard-fail so agents stay healthy.
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
       OLLAMA_MODEL_DIGEST: ${OLLAMA_MODEL_DIGEST:-skip}
+    volumes:
+      # FIND-3.1-F1: mount the shared ollama_data volume so the self-contained
+      # local serve can write pulled models here. The long-running `ollama`
+      # service reads the same volume after ollama-init exits. Access is strictly
+      # sequential (ollama.depends_on: ollama-init: service_completed_successfully).
+      - ollama_data:/root/.ollama
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        until </dev/tcp/ollama/11434 2>/dev/null; do
-          echo "waiting for ollama..."; sleep 3
+        # FIND-3.1-F1 fix (2026-06-29): self-contained model pull.
+        # ollama-init now runs its own temporary `ollama serve` (in this container,
+        # on the edge network) and pulls models directly to the ollama_data volume
+        # mounted at /root/.ollama. The long-running `ollama` service (data network
+        # only, no internet) starts after this container exits 0. Volume access is
+        # strictly sequential — no two ollama processes on the same volume at once.
+        echo "FIND-3.1-F1: starting self-contained ollama serve for model pull..."
+        OLLAMA_HOST=0.0.0.0:11434 ollama serve &
+        _SERVE_PID=$$!
+        # Wait up to 90 s for local server to be ready.
+        _retries=30
+        until bash -c "</dev/tcp/127.0.0.1/11434" 2>/dev/null || [ "$$_retries" -le 0 ]; do
+          echo "  waiting for local ollama serve... ($$_retries attempts left)"; sleep 3
+          _retries=$$(( _retries - 1 ))
         done
-        echo "ollama is ready, checking disk space..."
+        if [ "$$_retries" -le 0 ]; then
+          echo "ERROR: local ollama serve did not become ready within 90 s" >&2
+          kill "$$_SERVE_PID" 2>/dev/null || true
+          wait "$$_SERVE_PID" 2>/dev/null || true
+          exit 1
+        fi
+        echo "Local serve ready. Checking disk space..."
         # Disk-space pre-check: require ≥3 GB free on the ollama data volume.
         # The model (qwen2.5:3b) is 1.9 GB; 3 GB leaves headroom for staging.
-        # Uses df on /data (the ollama volume mount) in 1K blocks.
-        AVAIL_KB=$$(df -k /data 2>/dev/null | awk 'NR==2{print $$4}')
+        AVAIL_KB=$$(df -k /root/.ollama 2>/dev/null | awk 'NR==2{print $$4}')
         REQUIRED_KB=3145728  # 3 GB in KB
         if [ -n "$$AVAIL_KB" ] && [ "$$AVAIL_KB" -lt "$$REQUIRED_KB" ]; then
           AVAIL_GB=$$(( AVAIL_KB / 1024 / 1024 ))
           echo "WARNING: Ollama volume has only ~$$AVAIL_GB GB free (need ≥3 GB for model pull)."
           echo "Skipping model pull to avoid failed install. Free space on the docker volume and re-run install.sh."
+          kill "$$_SERVE_PID" 2>/dev/null || true
+          wait "$$_SERVE_PID" 2>/dev/null || true
           exit 0
         fi
-        echo "Disk space OK ($$AVAIL_KB KB free). Pulling model..."
+        echo "Disk space OK ($$AVAIL_KB KB free). Pulling models..."
         # SF-QWEN-001 (ordering fix): pull qwen2.5:3b FIRST, unconditionally, before
         # any digest check on the VRAM-tier primary model. Previously qwen was pulled
         # AFTER the primary digest gate — a stale digest on the primary caused exit 1
@@ -1190,11 +1230,11 @@ services:
         # of which tier model is selected; it must always land in ollama.
         if [ "${OLLAMA_MODEL:-qwen2.5:3b}" != "qwen2.5:3b" ]; then
           echo "Pulling required base model: qwen2.5:3b (agent/gateway dependency — SF-QWEN-001)"
-          OLLAMA_HOST=http://ollama:11434 ollama pull qwen2.5:3b
+          OLLAMA_HOST=http://127.0.0.1:11434 ollama pull qwen2.5:3b
           echo "Base model pull complete: qwen2.5:3b"
         fi
         # Pull the operator-selected VRAM-tier model.
-        OLLAMA_HOST=http://ollama:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
+        OLLAMA_HOST=http://127.0.0.1:11434 ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
         # Verify model digest — detect tampered/poisoned models (SOL-SC-03).
         # DIGEST POLICY: default is "skip" (see env comment above).
         # A mismatch is a loud WARNING, never exit 1 — Ollama republishes models
@@ -1203,7 +1243,7 @@ services:
         # who need strict enforcement set OLLAMA_MODEL_DIGEST=<prefix> in .env;
         # the warning gives them a clear signal to review + repin.
         EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-skip}"
-        ACTUAL_DIGEST=$$(OLLAMA_HOST=http://ollama:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $$2}')
+        ACTUAL_DIGEST=$$(OLLAMA_HOST=http://127.0.0.1:11434 ollama list | grep "${OLLAMA_MODEL:-qwen2.5:3b}" | awk '{print $$2}')
         if [ -n "$$EXPECTED_DIGEST" ] && [ "$$EXPECTED_DIGEST" != "skip" ]; then
           if echo "$$ACTUAL_DIGEST" | grep -q "$$EXPECTED_DIGEST"; then
             echo "Model digest verified: $$ACTUAL_DIGEST"
@@ -1221,13 +1261,15 @@ services:
           fi
         fi
         echo "Model pull complete: ${OLLAMA_MODEL:-qwen2.5:3b}"
-    depends_on:
-      ollama:
-        condition: service_healthy
+        # Stop local serve cleanly before exiting so ollama_data volume is consistent.
+        echo "Stopping local ollama serve..."
+        kill "$$_SERVE_PID" 2>/dev/null || true
+        wait "$$_SERVE_PID" 2>/dev/null || true
+        echo "Done. Models written to /root/.ollama (ollama_data volume). Long-running ollama service may now start."
     read_only: true
     tmpfs:
       # YSG-RISK-008 (v2.23.4): ollama-init is a one-shot pull job.
-      # /tmp needed for download staging before writing to ollama:/data via HTTP.
+      # /tmp needed for model decompression staging during local ollama serve pull.
       - /tmp:size=512m,mode=1777
     # YSG-RISK-008: no-new-privileges hardening (v2.23.4).
     security_opt:
@@ -1237,12 +1279,15 @@ services:
     # openWebui.enabled OR any agentBundles.*.enabled — SF-011 parity fix).
     # No cap_add: no privileged-port binding.
     cap_drop: [ALL]
-    # EX-231-10: ollama-init needs data (ollama DNS) + edge (model pull).
+    # FIND-3.1-F1 fix: ollama-init only needs `edge` (internet access to pull
+    # models via its self-contained local serve). `data` removed — ollama-init
+    # no longer connects to the long-running `ollama` service at all.
     networks:
-      - data
-      - edge    # Required for model registry DNS resolution
+      - edge    # FIND-3.1-F1: ollama-init only needs edge (internet for model pulls);
+                # data network removed — ollama-init does not connect to the live ollama service
     # SF-011: ollama-init runs when any AI workload that needs the model is active.
     # Removed openwebui profile — OWUI removed in 4.0 (ui4 serves chat directly).
+    # FIND-3.1-F1 fix: edge-only network posture (zero runtime internet via long-running ollama).
     profiles:
       - langflow
       - letta
