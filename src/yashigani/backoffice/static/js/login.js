@@ -101,8 +101,13 @@ document.addEventListener('DOMContentLoaded', function() {
                     // Defence-in-depth: JS safeNext guard runs first; server-side
                     // /auth/post-login-redirect is the trust-boundary enforcement
                     // point (drift audit finding #6 — ASVS V5.1.5 / CWE-601).
-                    var serverDefault = (data.redirect_to && safeNext(data.redirect_to)) || '/';
-                    var clientValidated = (next && safeNext(next)) || serverDefault;
+                    var serverDefault = (data.redirect_to && safeNext(data.redirect_to)) || '/admin/';
+                    // Honour ?next= ONLY if it stays in the SAME plane as the role's
+                    // home. An admin must never be bounced to a user-plane next (or
+                    // vice-versa) — redirect_to encodes the plane (RISK-100 SoD).
+                    var n = next && safeNext(next);
+                    var sameP = n && ((n.indexOf('/admin') === 0) === (serverDefault.indexOf('/admin') === 0));
+                    var clientValidated = sameP ? n : serverDefault;
                     window.location.href = '/auth/post-login-redirect?next=' + encodeURIComponent(clientValidated);
                 }
             } else {

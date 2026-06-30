@@ -89,8 +89,13 @@ document.addEventListener('DOMContentLoaded', function() {
                     // Phase 1 (2.25.5-auth-ingress) — role-based redirect.
                     // data.redirect_to from server: "/app/webui" for user tier,
                     // "/admin/" for admin.  Honour ?next= if present (Caddy bounce).
-                    var serverDefault = (data.redirect_to && safeNext(data.redirect_to)) || '/app/webui';
-                    window.location.href = (next && safeNext(next)) || serverDefault;
+                    var serverDefault = (data.redirect_to && safeNext(data.redirect_to)) || '/chat';
+                    // Honour ?next= ONLY if it stays in the SAME plane as the role's
+                    // home. A user must never be bounced to an admin-plane next (or
+                    // vice-versa) — redirect_to encodes the plane (RISK-100 SoD).
+                    var n = next && safeNext(next);
+                    var sameP = n && ((n.indexOf('/admin') === 0) === (serverDefault.indexOf('/admin') === 0));
+                    window.location.href = sameP ? n : serverDefault;
                 }
             } else {
                 showMsg('error', parseError(data));

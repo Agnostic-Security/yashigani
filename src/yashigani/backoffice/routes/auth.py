@@ -1409,7 +1409,13 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
             max_age=14400,  # 4 hours absolute
             path="/",  # __Host- prefix requires Path=/
         )
-    # Always set the user-level cookie (used by forward_auth for Open WebUI)
+        # RISK-100 SoD: admins get ONLY the admin-plane cookie. OWUI is removed in
+        # 4.0, so the legacy "always set the user cookie for forward_auth" line is
+        # dead — and issuing a user-plane cookie to an admin let the admin session
+        # pass the /chat presence gate and load the user UI. Admins must not hold a
+        # user-plane session at all.
+        return
+    # User / totp_provisioning tiers get ONLY the user-plane cookie.
     response.set_cookie(
         key=_USER_SESSION_COOKIE,
         value=token,
