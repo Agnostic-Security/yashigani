@@ -40,6 +40,7 @@ export class YsAdminBudgetModels extends LitElement {
     _cloudKeys: { state: true },
     _override: { state: true },
     _usage: { state: true },       // {identity_id, usage} result of a drill-down
+    _localInventory: { state: true }, // 4.0 Ollama local-model inventory
   };
 
   constructor() {
@@ -57,6 +58,7 @@ export class YsAdminBudgetModels extends LitElement {
     this._cloudKeys = [];
     this._override = null;
     this._usage = null;
+    this._localInventory = null;
   }
 
   createRenderRoot() { return this; }
@@ -75,7 +77,7 @@ export class YsAdminBudgetModels extends LitElement {
   async _load() {
     if (!this.api) return;
     this._loading = true;
-    const [org, grp, ind, tree, aliases, avail, alloc, ckeys, ovr] = await Promise.all([
+    const [org, grp, ind, tree, aliases, avail, alloc, ckeys, ovr, localInv] = await Promise.all([
       this.api.get('/admin/budget/org-caps'),
       this.api.get('/admin/budget/groups'),
       this.api.get('/admin/budget/individuals'),
@@ -85,6 +87,7 @@ export class YsAdminBudgetModels extends LitElement {
       this.api.get('/admin/models/allocations'),
       this.api.get('/admin/cloud-keys'),
       this.api.get('/admin/cloud-override/status'),
+      this.api.get('/admin/budget/models/local-inventory'),
     ]);
     this._orgCaps = this._arr(org, 'org_caps');
     this._groupBudgets = this._arr(grp, 'groups');
@@ -95,6 +98,7 @@ export class YsAdminBudgetModels extends LitElement {
     this._allocations = this._arr(alloc, 'allocations');
     this._cloudKeys = (ckeys && Array.isArray(ckeys.providers)) ? ckeys.providers : [];
     this._override = ovr || null;
+    this._localInventory = localInv || null;
     this._loading = false;
   }
 
@@ -344,6 +348,86 @@ export class YsAdminBudgetModels extends LitElement {
       </div>`;
   }
 
+  // ── Local Ollama inventory ─────────────────────────────────────────────────
+
+  _fitsBadge(fits) {
+    if (fits === true)  return html`<span class="ys-badge ys-badge-blue">fits GPU</span>`;
+    if (fits === false) return html`<span class="ys-badge ys-badge-amber">too large</span>`;
+    return html`<span class="ys-badge">VRAM unknown</span>`;
+  }
+
+  _renderLocalInventory() {
+    const inv = this._localInventory;
+    if (!inv) {
+      return html`
+        <div class="ys-panel" style="margin-top:16px;">
+          <div class="ys-panel-header">Local Ollama model inventory</div>
+          <div class="ys-panel-body">
+            <div class="ys-txt-note">Inventory unavailable — Ollama may not be running.</div>
+          </div>
+        </div>`;
+    }
+
+    const gpus = Array.isArray(inv.gpus) ? inv.gpus : [];
+    const models = Array.isArray(inv.models) ? inv.models : [];
+    const totalVram = inv.total_vram_mib;
+    const detection = inv.vram_detection || 'unavailable';
+
+    return html`
+      <div class="ys-panel" style="margin-top:16px;">
+        <div class="ys-panel-header">Local Ollama model inventory (${models.length})</div>
+        <div class="ys-panel-body">
+
+          <!-- GPU summary -->
+          <div class="ys-txt-note" style="margin-bottom:8px;">
+            <strong>GPU(s):</strong>
+            ${gpus.length === 0
+              ? 'none detected'
+              : gpus.map((g) => html`
+                  ${g.name}
+                  ${g.vram_mib != null
+                    ? html` — <strong>${g.vram_mib} MiB</strong>`
+                    : html` — VRAM unknown`}
+                  <span style="color:var(--ys-txt-muted);"> (GPU ${g.index})</span>
+                  &ensp;`)}
+            ${totalVram != null
+              ? html`&nbsp;· total <strong>${totalVram} MiB</strong>`
+              : nothing}
+            <span class="ys-txt-note" style="font-size:0.8em;"> &nbsp;(detected via ${detection})</span>
+          </div>
+
+          <!-- Model table -->
+          ${models.length === 0
+            ? html`<div class="ys-txt-note">No models installed in Ollama yet.
+                Use "Pull model" above or <code>ollama pull &lt;name&gt;</code>.</div>`
+            : html`<table class="ys-table">
+                <thead>
+                  <tr>
+                    <th>Model</th><th>Family</th><th>Params</th>
+                    <th>Quant</th><th>Size (GiB)</th><th>Est. VRAM (MiB)</th><th>GPU fit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${models.map((m) => html`
+                    <tr>
+                      <td><strong>${m.name}</strong></td>
+                      <td>${m.family || '—'}</td>
+                      <td>${m.parameter_size || '—'}</td>
+                      <td>${m.quantization || '—'}</td>
+                      <td>${m.size_gib != null ? m.size_gib : '—'}</td>
+                      <td>${m.vram_estimated_mib != null ? m.vram_estimated_mib : '—'}</td>
+                      <td>${this._fitsBadge(m.fits_gpu)}</td>
+                    </tr>`)}
+                </tbody>
+              </table>`}
+
+          <div class="ys-txt-note" style="font-size:0.8em;margin-top:6px;">
+            ${inv.note || ''}
+          </div>
+        </div>
+      </div>`;
+  }
+
   render() {
     if (this._loading) {
       return html`<div class="ys-admin-content-pad"><div class="ys-txt-note">Loading budgets &amp; models…</div></div>`;
@@ -352,6 +436,7 @@ export class YsAdminBudgetModels extends LitElement {
       <div class="ys-admin-content-pad">
         ${this._renderBudget()}
         ${this._renderModels()}
+        ${this._renderLocalInventory()}
         ${this._renderCloud()}
       </div>`;
   }
