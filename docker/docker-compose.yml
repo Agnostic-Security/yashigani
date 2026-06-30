@@ -777,12 +777,18 @@ services:
     #   internal:true, no-internet-egress posture as the gateway's broker dispatch path.
     #   Harmless when the demo-mcp profile is not active: the bridge exists, the service
     #   does not. Step-up gated on the admin side (StepUpAdminSession).
+    # langflow_isolated: 4.0 — backoffice hosts POST /user/agents/generate which calls
+    #   langflow_client.create_flow() at http://langflow:7860.  Backoffice must join
+    #   langflow_isolated so Langflow is DNS-resolvable from the backoffice process.
+    #   Same internal:true posture; Langflow cannot reach anything outside this bridge
+    #   except gateway (which is also a member). Harmless when langflow profile inactive.
     networks:
       - caddy_internal
       - data
       - obs
       - extractor_svc
       - demo_mcp_isolated
+      - langflow_isolated
 
   # ---------------------------------------------------------------------------
   # Extractor Service — pre-spawned hardened document extraction worker
