@@ -19,7 +19,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
-from yashigani.backoffice.middleware import AdminSession
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.rbac.model import RBACGroup, ResourcePattern, RateLimitOverride
 
@@ -185,7 +185,7 @@ async def list_groups(session: AdminSession):
 @router.post("/groups", status_code=status.HTTP_201_CREATED)
 async def create_group(
     body: CreateGroupRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,
 ):
     store = _get_store()
 
@@ -233,7 +233,7 @@ async def get_group(group_id: str, session: AdminSession):
 async def update_group(
     group_id: str,
     body: UpdateGroupRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,
 ):
     store = _get_store()
     group = store.get_group(group_id)
@@ -273,7 +273,7 @@ async def update_group(
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_group(group_id: str, session: AdminSession):
+async def delete_group(group_id: str, session: StepUpAdminSession):
     store = _get_store()
     group = store.get_group(group_id)
     if group is None:
@@ -296,7 +296,7 @@ async def delete_group(group_id: str, session: AdminSession):
 async def add_member(
     group_id: str,
     body: AddMemberRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,
 ):
     store = _get_store()
     try:
@@ -320,7 +320,7 @@ async def add_member(
 async def remove_member(
     group_id: str,
     email: str,
-    session: AdminSession,
+    session: StepUpAdminSession,
 ):
     store = _get_store()
     try:
@@ -350,7 +350,7 @@ async def get_user_groups(email: str, session: AdminSession):
 
 
 @router.post("/policy/push")
-async def force_push(session: AdminSession):
+async def force_push(session: StepUpAdminSession):
     store = _get_store()
     _push(store, session.account_id)
     doc = store.to_opa_document()

@@ -42,8 +42,10 @@ import pathlib
 import posixpath
 from typing import Optional
 
+import httpx
+
 from fastapi import APIRouter, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import (
@@ -784,3 +786,125 @@ async def user_upload_document(
         # Currently None (pipeline returns raw matches, not rewritten content).
         "processed_content": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# FIND-4.0-CHAT-001 — Trusted-forwarder chat proxy
+# ---------------------------------------------------------------------------
+# The 4.0 ui4 chat sends requests using the session cookie, but the gateway
+# mesh requires an Authorization: Bearer header.  Forwarding the user's API
+# key to the browser is explicitly off-limits (RISK-100 class).
+#
+# Solution: a UserSession-gated backoffice proxy that:
+#   1. Validates the caller's user-tier session (cookie, server-side).
+#   2. Adds the per-install internal bearer  (YASHIGANI_INTERNAL_BEARER).
+#   3. Adds X-OpenWebUI-User-Email: <session.account_id> so the gateway can
+#      resolve per-user identity (the same trusted-forwarder pattern OWUI used).
+#      The gateway honours this header ONLY when the internal bearer is present
+#      (spoofing defence: without the bearer the header is ignored).
+#   4. Streams the gateway SSE response back to the browser unchanged.
+#
+# The user's API key never leaves the server; the browser sees only the
+# session cookie and the SSE event stream.  Verdict / block events arrive in
+# the stream structured tail exactly as with direct gateway access.
+#
+# Security:
+#   - UserSession dependency: rejects admin sessions (wrong_plane) and
+#     unauthenticated requests (401).
+#   - YASHIGANI_INTERNAL_BEARER absent → 503 at request time (fail-closed).
+#   - All gateway errors (4xx/5xx) are forwarded verbatim so the browser
+#     can render the correct verdict banner.
+#
+# FIND-4.0-CHAT-001 / AUDIT-GAP: this proxy is the sole path for browser
+# chat; direct /v1/chat/completions from the browser 401s (correct).
+# ---------------------------------------------------------------------------
+
+_GATEWAY_STREAM_TIMEOUT_S = 300  # 5-minute timeout for streaming responses
+
+
+@router.post("/user/chat/completions")
+async def user_chat_proxy(request: Request, session: UserSession):
+    """FIND-4.0-CHAT-001 — Trusted-forwarder chat proxy.
+
+    Accepts the session cookie, adds the internal bearer + user identity
+    headers, and streams the gateway SSE response back verbatim.  The
+    user's API key is never exposed to the browser.
+
+    Body: OpenAI-compatible chat completion JSON (model, messages, …).
+    Response: text/event-stream (SSE) mirrored from the gateway.
+    """
+    bearer = os.environ.get("YASHIGANI_INTERNAL_BEARER", "")
+    if not bearer:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "chat_proxy_not_configured",
+                "message": (
+                    "YASHIGANI_INTERNAL_BEARER is not set — the chat proxy cannot "
+                    "reach the governed gateway.  Contact your administrator."
+                ),
+            },
+        )
+
+    gateway_base = os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")
+    target_url = gateway_base.rstrip("/") + "/chat/completions"
+
+    # Read and forward the request body as-is (JSON validated by the gateway).
+    try:
+        body_bytes = await request.body()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_request_body", "message": str(exc)},
+        )
+
+    forward_headers = {
+        "Authorization": f"Bearer {bearer}",
+        # Trusted-forwarder identity: gateway resolves per-user RBAC from this
+        # header when the internal bearer is present (spoofing defence preserved).
+        "X-OpenWebUI-User-Email": session.account_id,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+
+    async def _stream_gateway():
+        """Async generator: iterate gateway SSE chunks and yield to client."""
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(
+                connect=10.0,
+                read=_GATEWAY_STREAM_TIMEOUT_S,
+                write=30.0,
+                pool=5.0,
+            )) as client:
+                async with client.stream(
+                    "POST",
+                    target_url,
+                    content=body_bytes,
+                    headers=forward_headers,
+                ) as resp:
+                    # Forward non-2xx as a synthetic SSE error event so the
+                    # browser's onBlocked / onError handlers fire correctly.
+                    if resp.status_code not in (200, 201, 206):
+                        error_body = await resp.aread()
+                        yield (
+                            f"data: {error_body.decode('utf-8', errors='replace')}\n\n"
+                        ).encode("utf-8")
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
+        except httpx.ConnectError as exc:
+            logger.error("user_chat_proxy: gateway unreachable: %s", exc)
+            yield b'data: {"error":"gateway_unreachable","message":"Could not connect to the governed gateway."}\n\n'
+        except Exception as exc:
+            logger.error("user_chat_proxy: stream error: %s", exc)
+            yield b'data: {"error":"stream_error","message":"Unexpected error streaming from gateway."}\n\n'
+
+    return StreamingResponse(
+        _stream_gateway(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx/Caddy buffering for SSE
+        },
+    )

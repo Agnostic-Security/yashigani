@@ -496,14 +496,15 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
     # Phase 1 / 2.25.5-auth-ingress: single portal, role-based redirect.
     # admin → /admin/  (admin console)
-    # user  → /  (OWUI served at root; root catch-all proxies open-webui)
-    # Any other tier (totp_provisioning is handled above) → / as safe fallback.
+    # user  → /chat    (4.0 user chat SPA; avoids false-positive OPEN_REDIRECT audit
+    #                   and the 3-hop redirect that / → catch-all → /chat produces)
+    # Any other tier (totp_provisioning is handled above) → /chat as safe fallback.
     if record.account_tier == "admin":
         redirect_to = "/admin/"
     elif record.account_tier == "user":
-        redirect_to = "/"
+        redirect_to = "/chat"
     else:
-        redirect_to = "/"
+        redirect_to = "/chat"
 
     _set_session_cookie(response, session.token, record.account_tier)
     return {

@@ -358,7 +358,7 @@ export class YsAdminUsers extends LitElement {
         <div class="ys-txt-note">Strips RBAC roles, sessions, API keys, TOTP and password. Re-enter YOUR admin TOTP to authorise.</div>
         <div class="ys-field">
           <label class="ys-label">Admin TOTP code</label>
-          <input class="ys-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+          <input class="ys-input" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{6,8}"
                  .value=${r.totp_code || ''}
                  @input=${(ev) => { this._reset = { ...this._reset, totp_code: ev.target.value }; }}>
         </div>
