@@ -169,7 +169,7 @@ async def list_users(session: AdminSession):
 
 
 @router.post("")
-async def create_user(body: CreateUserRequest, session: AdminSession):
+async def create_user(body: CreateUserRequest, session: StepUpAdminSession):
     """
     Create a user account. Server generates a 16-char temporary password
     and a TOTP secret. Both are returned once — admin shares them
@@ -179,6 +179,10 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     Gap 1 / v2.23.4: email is now the canonical identity for user-tier
     accounts. The `email` field is REQUIRED. `username` is derived from
     the email local part if not supplied.
+
+    LAURA-V400-NEW-001 (ASVS V6.8.4): step-up TOTP required — a stolen
+    admin session must not be able to create a backdoor user account without
+    fresh TOTP verification. Step-up fires BEFORE the license-limit check.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -566,13 +570,15 @@ async def disable_user(username: str, session: StepUpAdminSession):
 
 
 @router.post("/{username}/enable")
-async def enable_user(username: str, session: AdminSession):
+async def enable_user(username: str, session: StepUpAdminSession):
     """
     Re-enable a disabled user account.
 
     Iris MISSING-04 / GROUP-2-6: enforce end-user seat limit before re-enabling.
     A disabled user is not counted in the canonical end-user count, so re-enabling
     one could push the deployment over the licensed seat limit.
+    LAURA-V400-NEW-001 (ASVS V6.8.4): step-up TOTP required — re-enabling a
+    disabled account restores full access; equivalent impact to account creation.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup

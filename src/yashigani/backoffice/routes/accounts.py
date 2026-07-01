@@ -139,11 +139,16 @@ async def list_admins(session: AdminSession):
 
 
 @router.post("")
-async def create_admin(body: CreateAdminRequest, session: AdminSession):
+async def create_admin(body: CreateAdminRequest, session: StepUpAdminSession):
     """
     Create an admin account. Server generates a 36-char temporary password
     and a TOTP secret. Both are returned once — caller shares them
     out-of-band. Admin must change password and provision TOTP at first login.
+
+    LAURA-V400-NEW-001 (ASVS V6.8.4): step-up TOTP required — account creation
+    is a high-value mutation that a stolen session must not be able to perform
+    without fresh TOTP verification. Step-up is checked BEFORE the license-limit
+    guard to ensure 401 (step_up_required) is always returned before 402.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -319,11 +324,13 @@ async def disable_admin(username: str, session: StepUpAdminSession):
 
 
 @router.post("/{username}/enable")
-async def enable_admin(username: str, session: AdminSession):
+async def enable_admin(username: str, session: StepUpAdminSession):
     """
     Re-enable a disabled admin account.
 
     Iris MISSING-04 / GROUP-2-6: enforce admin seat limit before re-enabling.
+    LAURA-V400-NEW-001 (ASVS V6.8.4): step-up TOTP required — re-enabling a
+    disabled backdoor account is equivalent in impact to creating one.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
