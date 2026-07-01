@@ -124,6 +124,10 @@ class EventType(str, Enum):
     OPA_ASSISTANT_SUGGESTION_GENERATED = "OPA_ASSISTANT_SUGGESTION_GENERATED"
     OPA_ASSISTANT_SUGGESTION_APPLIED = "OPA_ASSISTANT_SUGGESTION_APPLIED"
     OPA_ASSISTANT_SUGGESTION_REJECTED = "OPA_ASSISTANT_SUGGESTION_REJECTED"
+    # SEC-OPA-001 Mode B — Rego module authoring
+    OPA_ASSISTANT_REGO_GENERATED = "OPA_ASSISTANT_REGO_GENERATED"
+    OPA_ASSISTANT_REGO_APPLIED = "OPA_ASSISTANT_REGO_APPLIED"
+    OPA_ASSISTANT_REGO_REJECTED = "OPA_ASSISTANT_REGO_REJECTED"
     # v0.9.0 — Response-path inspection
     RESPONSE_INJECTION_DETECTED = "RESPONSE_INJECTION_DETECTED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
@@ -1370,6 +1374,50 @@ class OPAAssistantSuggestionRejectedEvent(AuditEvent):
     event_type: str = EventType.OPA_ASSISTANT_SUGGESTION_REJECTED
     account_tier: str = AccountTier.ADMIN
     admin_account: str = ""
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# SEC-OPA-001 / Mode B — Rego module authoring audit events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OPAAssistantRegoGeneratedEvent(AuditEvent):
+    """Written when the OPA assistant generates a Rego module draft (before admin review)."""
+
+    event_type: str = EventType.OPA_ASSISTANT_REGO_GENERATED
+    account_tier: str = AccountTier.ADMIN
+    admin_account: str = ""
+    policy_name: str = ""          # intended clients.<policy_name> slug
+    description_length: int = 0    # length of NL description (not the text itself)
+    rego_valid: bool = False        # True if the generated Rego compiled against OPA
+    validation_error: Optional[str] = None
+
+
+@dataclass
+class OPAAssistantRegoAppliedEvent(AuditEvent):
+    """
+    Written when admin approves and applies an AI-drafted Rego policy module.
+    Requires step-up TOTP (StepUpAdminSession). This is the accountable human
+    act per EU AI Act Art.14.
+    """
+
+    event_type: str = EventType.OPA_ASSISTANT_REGO_APPLIED
+    account_tier: str = AccountTier.ADMIN
+    admin_account: str = ""
+    policy_name: str = ""          # clients/<policy_name> applied to OPA
+    rego_length: int = 0           # length of the Rego module applied
+
+
+@dataclass
+class OPAAssistantRegoRejectedEvent(AuditEvent):
+    """Written when admin explicitly rejects an AI-drafted Rego module."""
+
+    event_type: str = EventType.OPA_ASSISTANT_REGO_REJECTED
+    account_tier: str = AccountTier.ADMIN
+    admin_account: str = ""
+    policy_name: str = ""
     reason: str = ""
 
 
