@@ -11,6 +11,12 @@
 // ever added, it would be the single most dangerous op and MUST be step-up gated
 // (RISK-103). This is a deliberate non-gap, recorded here rather than faked.
 //
+// Encryption: ALL on-demand backups are AES-256-GCM encrypted + HMAC-SHA384
+// signed (B12 policy, see backup.py _encrypt_and_sign_backup).  The key is the
+// per-install YASHIGANI_DB_AES_KEY — no passphrase is required and unencrypted
+// backups are not offered.  The create modal makes this explicit rather than
+// hiding it inside a window.confirm().
+//
 // TRUSTED-CHROME: backup names, sizes, timestamps and integrity verdicts are
 // server-authored and rendered via Lit auto-escape — no §3 markdown sink. The
 // dangerous op (create) is StepUpAdminSession server-side, so ctx.api.mutate
@@ -41,10 +47,11 @@ export class YsAdminBackup extends LitElement {
   static properties = {
     api: { attribute: false },
     app: { attribute: false },
-    _loading: { state: true },
-    _status: { state: true },
-    _verify: { state: true },   // last verify result | null
-    _busy: { state: true },
+    _loading:     { state: true },
+    _status:      { state: true },
+    _verify:      { state: true },   // last verify result | null
+    _busy:        { state: true },
+    _showCreate:  { state: true },   // create-backup confirmation modal open
   };
 
   constructor() {
@@ -55,6 +62,7 @@ export class YsAdminBackup extends LitElement {
     this._status = null;
     this._verify = null;
     this._busy = false;
+    this._showCreate = false;
   }
 
   createRenderRoot() { return this; }
@@ -77,16 +85,46 @@ export class YsAdminBackup extends LitElement {
     return (this._status && Array.isArray(this._status.backups)) ? this._status.backups : [];
   }
 
-  async _create() {
+  // ── Create backup ─────────────────────────────────────────────────────────
+
+  // Open the confirmation modal instead of using window.confirm().
+  _openCreate() {
+    this._showCreate = true;
+  }
+
+  async _doCreate() {
+    this._showCreate = false;
     if (this._busy) return;
-    if (!window.confirm('Create a new backup snapshot now? This will take a consistent DB + state snapshot.')) return;
     this._busy = true;
     // STEP-UP gated server-side (StepUpAdminSession) → TOTP modal fires via mutate.
     const res = await this.api.mutate('/admin/backup/create', { method: 'POST' });
     this._busy = false;
-    if (res.ok) { this._toast('Backup created.', 'success'); await this._load(); }
-    else this._toast((res.error && res.error.message) || 'Backup creation failed.', 'error');
+    if (res.ok) {
+      this._toast('Backup created.', 'success');
+      // Refresh the backup list from the server.
+      await this._load();
+      // Fallback: if _load() returned null (transient GET error), synthesize
+      // the new entry from the create response so it appears immediately.
+      if (!this._status && res.data && res.data.backup_name) {
+        this._status = {
+          backups: [{
+            name: res.data.backup_name,
+            type: res.data.type || 'ondemand',
+            created_at: res.data.created_at || null,
+            manifest_state: res.data.signed ? 'signed' : 'unsigned',
+            size_bytes: res.data.size_bytes || 0,
+            files: [],
+          }],
+          latest: null,
+          backups_dir: 'backups',
+        };
+      }
+    } else {
+      this._toast((res.error && res.error.message) || 'Backup creation failed.', 'error');
+    }
   }
+
+  // ── Verify backup ─────────────────────────────────────────────────────────
 
   async _verifyBackup(name) {
     if (this._busy) return;
@@ -102,6 +140,8 @@ export class YsAdminBackup extends LitElement {
       this._toast((res.error && res.error.message) || 'Verify failed.', 'error');
     }
   }
+
+  // ── Render helpers ─────────────────────────────────────────────────────────
 
   _renderVerifyResult() {
     const v = this._verify;
@@ -126,6 +166,50 @@ export class YsAdminBackup extends LitElement {
       </div>`;
   }
 
+  _renderCreateModal() {
+    if (!this._showCreate) return nothing;
+    return html`
+      <div class="ys-modal-backdrop"
+           @click=${(ev) => { if (ev.target === ev.currentTarget) this._showCreate = false; }}>
+        <div class="ys-modal" role="dialog" aria-modal="true">
+          <div class="ys-modal-header">Create backup snapshot</div>
+          <div class="ys-modal-body">
+
+            <!-- Encryption status — always on, no opt-out (B12 policy) -->
+            <div class="ys-field">
+              <label class="ys-label">
+                <input type="checkbox" checked disabled aria-disabled="true">
+                &nbsp;Encrypt backup
+              </label>
+              <div class="ys-txt-note">
+                Always-on per B12 security policy — backups are
+                <strong>AES-256-GCM encrypted</strong> (per-backup DEK wrapped under
+                an HKDF-SHA384 KEK) and <strong>HMAC-SHA384 signed</strong>.
+                The encryption key is the per-install
+                <code class="ys-system-chrome-code">YASHIGANI_DB_AES_KEY</code>;
+                recovery requires that key — no passphrase is involved.
+              </div>
+            </div>
+
+            <div class="ys-txt-note">
+              A consistent database snapshot will be taken now.
+              This is a <strong>step-up action</strong> — a fresh TOTP code is
+              required to confirm.
+            </div>
+          </div>
+          <div class="ys-modal-footer">
+            <button class="ys-btn ys-btn-secondary"
+                    @click=${() => { this._showCreate = false; }}>Cancel</button>
+            <button class="ys-btn"
+                    ?disabled=${this._busy}
+                    @click=${() => this._doCreate()}>
+              ${this._busy ? 'Creating…' : 'Create backup (step-up)'}
+            </button>
+          </div>
+        </div>
+      </div>`;
+  }
+
   render() {
     if (this._loading) {
       return html`<div class="ys-admin-content-pad"><div class="ys-txt-note">Loading backups…</div></div>`;
@@ -137,8 +221,8 @@ export class YsAdminBackup extends LitElement {
         <div class="ys-panel">
           <div class="ys-panel-header">Backups</div>
           <div class="ys-panel-body">
-            <button class="ys-btn" ?disabled=${this._busy} @click=${() => this._create()}>
-              ${this._busy ? 'Working…' : 'Create backup (step-up)'}
+            <button class="ys-btn" ?disabled=${this._busy} @click=${() => this._openCreate()}>
+              ${this._busy ? 'Working…' : 'Create backup'}
             </button>
             ${backups.length === 0
               ? html`<div class="ys-txt-note">No backups found in ${this._status ? this._status.backups_dir : 'backups/'}.</div>`
@@ -173,6 +257,7 @@ export class YsAdminBackup extends LitElement {
             </div>
           </div>
         </div>
+        ${this._renderCreateModal()}
       </div>`;
   }
 }
