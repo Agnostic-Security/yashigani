@@ -188,6 +188,39 @@
 }
 .ys-alert-count--zero { color: var(--ys-ink-faint); font-weight: 500; }
 
+/* ── CSP-INL-001: extracted inline styles (mcp.js + budget-models.js) ────── */
+/* All inline style= attributes in ui4/admin/modules/ must map to a class here. */
+
+/* Error / danger text colour (replaces style="color:var(--ys-danger)" in mcp.js) */
+.ys-txt-danger { color: var(--ys-red-fg); }
+
+/* Small text modifier — 0.8em of the element's context (replaces font-size:0.8em) */
+.ys-txt-sm { font-size: 0.8em; }
+
+/* Muted colour on an inline span without an existing ys-txt-note parent class */
+.ys-txt-muted { color: var(--ys-ink-muted); }
+
+/* .ys-txt-note with bottom margin (GPU summary separator in budget-models.js) */
+.ys-txt-note--mb { margin-bottom: var(--ys-sp-2); }
+
+/* .ys-txt-note with small top margin (inventory footer note in budget-models.js) */
+.ys-txt-note--mt-sm { margin-top: var(--ys-sp-1); }
+
+/* Badge with inline horizontal gap (tool-key chips in mcp.js tool-surface row) */
+.ys-badge--gap { margin: 1px var(--ys-sp-1); }
+
+/* Sub-row cell holding the tool badge list in the MCP server table */
+.ys-mcp-tools-cell { padding: 0 0 var(--ys-sp-2) var(--ys-sp-4); }
+
+/* Panel header that contains a right-aligned action button (display:flex layout) */
+.ys-panel-header--flex { display: flex; align-items: center; gap: var(--ys-sp-2); }
+
+/* Action button styled smaller and pushed to the far right inside .ys-panel-header--flex */
+.ys-btn-header { margin-left: auto; font-size: 0.85em; }
+
+/* Panel with an explicit top margin for visual separation between stacked panels */
+.ys-panel--mt { margin-top: var(--ys-sp-4); }
+
 /* Dashboard "Action required" alerts (pending NHI / MCP approvals) */
 .ys-panel--action { border-left: 3px solid var(--ys-amber, #c77700); }
 .ys-action-list { list-style: none; margin: 0; padding: 0; }

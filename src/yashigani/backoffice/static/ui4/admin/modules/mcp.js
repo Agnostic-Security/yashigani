@@ -262,7 +262,7 @@ export class YsAdminMcp extends LitElement {
               </select>
             </div>
             ${this._importError
-              ? html`<div class="ys-txt-note" style="color:var(--ys-danger);">${this._importError}</div>`
+              ? html`<div class="ys-txt-note ys-txt-danger">${this._importError}</div>`
               : nothing}
           </div>
           <div class="ys-modal-footer">
@@ -294,10 +294,10 @@ export class YsAdminMcp extends LitElement {
       </tr>
       ${s.tools && s.tools.length > 0 ? html`
         <tr>
-          <td colspan="6" style="padding:0 0 8px 16px;">
-            <div class="ys-txt-note" style="font-size:0.8em;">
+          <td colspan="6" class="ys-mcp-tools-cell">
+            <div class="ys-txt-note ys-txt-sm">
               Tools: ${s.tools.map((t) => html`
-                <span class="ys-badge" style="margin:1px 2px;">${t.tool_key}</span>
+                <span class="ys-badge ys-badge--gap">${t.tool_key}</span>
               `)}
             </div>
           </td>
@@ -313,9 +313,9 @@ export class YsAdminMcp extends LitElement {
 
         <!-- Panel 1: Registered MCP Servers -->
         <div class="ys-panel">
-          <div class="ys-panel-header" style="display:flex;align-items:center;gap:8px;">
+          <div class="ys-panel-header ys-panel-header--flex">
             Registered MCP Servers (${this._servers.length})
-            <button class="ys-btn" style="margin-left:auto;font-size:0.85em;"
+            <button class="ys-btn ys-btn-header"
                     @click=${() => { this._showImport = true; this._importError = ''; }}>
               Import server
             </button>
@@ -347,7 +347,7 @@ export class YsAdminMcp extends LitElement {
         </div>
 
         <!-- Panel 2: Tool-surface re-approval queue -->
-        <div class="ys-panel" style="margin-top:16px;">
+        <div class="ys-panel ys-panel--mt">
           <div class="ys-panel-header">
             MCP tool-surface re-approvals (${this._pending.length})
             ${this._pending.length ? html`<span class="ys-badge ys-badge-amber">action required</span>` : nothing}

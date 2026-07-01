@@ -360,7 +360,7 @@ export class YsAdminBudgetModels extends LitElement {
     const inv = this._localInventory;
     if (!inv) {
       return html`
-        <div class="ys-panel" style="margin-top:16px;">
+        <div class="ys-panel ys-panel--mt">
           <div class="ys-panel-header">Local Ollama model inventory</div>
           <div class="ys-panel-body">
             <div class="ys-txt-note">Inventory unavailable — Ollama may not be running.</div>
@@ -374,12 +374,12 @@ export class YsAdminBudgetModels extends LitElement {
     const detection = inv.vram_detection || 'unavailable';
 
     return html`
-      <div class="ys-panel" style="margin-top:16px;">
+      <div class="ys-panel ys-panel--mt">
         <div class="ys-panel-header">Local Ollama model inventory (${models.length})</div>
         <div class="ys-panel-body">
 
           <!-- GPU summary -->
-          <div class="ys-txt-note" style="margin-bottom:8px;">
+          <div class="ys-txt-note ys-txt-note--mb">
             <strong>GPU(s):</strong>
             ${gpus.length === 0
               ? 'none detected'
@@ -388,12 +388,12 @@ export class YsAdminBudgetModels extends LitElement {
                   ${g.vram_mib != null
                     ? html` — <strong>${g.vram_mib} MiB</strong>`
                     : html` — VRAM unknown`}
-                  <span style="color:var(--ys-txt-muted);"> (GPU ${g.index})</span>
+                  <span class="ys-txt-muted"> (GPU ${g.index})</span>
                   &ensp;`)}
             ${totalVram != null
               ? html`&nbsp;· total <strong>${totalVram} MiB</strong>`
               : nothing}
-            <span class="ys-txt-note" style="font-size:0.8em;"> &nbsp;(detected via ${detection})</span>
+            <span class="ys-txt-note ys-txt-sm"> &nbsp;(detected via ${detection})</span>
           </div>
 
           <!-- Model table -->
@@ -421,7 +421,7 @@ export class YsAdminBudgetModels extends LitElement {
                 </tbody>
               </table>`}
 
-          <div class="ys-txt-note" style="font-size:0.8em;margin-top:6px;">
+          <div class="ys-txt-note ys-txt-sm ys-txt-note--mt-sm">
             ${inv.note || ''}
           </div>
         </div>
