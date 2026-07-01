@@ -80,7 +80,7 @@ export class YsAdminAgents extends LitElement {
     const [agents, identities, bundles] = await Promise.all([
       this.api.get('/admin/agents'),
       this.api.get('/admin/identities'),
-      this.api.get('/admin/agent-bundles'),
+      this.api.get('/admin/agent-bundles/'),
     ]);
     this._agents = Array.isArray(agents) ? agents : [];
     this._identities = Array.isArray(identities) ? identities : [];

@@ -37,6 +37,7 @@ export class YsAdminDocuments extends LitElement {
     app: { attribute: false },
     _loading: { state: true },
     _status: { state: true },
+    _enforcement: { state: true },
     _policies: { state: true },
     _sets: { state: true },
     _new: { state: true },
@@ -50,6 +51,7 @@ export class YsAdminDocuments extends LitElement {
     this.app = null;
     this._loading = true;
     this._status = null;
+    this._enforcement = null;
     this._policies = [];
     this._sets = [];
     this._new = {
@@ -70,31 +72,59 @@ export class YsAdminDocuments extends LitElement {
 
   async _load() {
     this._loading = true;
-    const [status, policies, sets] = await Promise.all([
+    const [status, enforcement, policies, sets] = await Promise.all([
       this.api.get('/admin/documents/status'),
+      this.api.get('/admin/documents/enforcement'),
       this.api.get('/admin/documents/policies'),
       this.api.get('/admin/documents/sets'),
     ]);
     this._status = status || null;
+    this._enforcement = enforcement || null;
     this._policies = (policies && Array.isArray(policies.policies)) ? policies.policies : [];
     this._sets = (sets && Array.isArray(sets.sets)) ? sets.sets : [];
     this._loading = false;
+  }
+
+  async _toggleEnforcement(enabled) {
+    const res = await this.api.mutate('/admin/documents/enforcement', { method: 'PUT', body: { enabled } });
+    if (res.ok) {
+      this._enforcement = { ...this._enforcement, enabled };
+      this._status = { ...this._status, enabled };
+      this.app && this.app.toast(`Document enforcement ${enabled ? 'enabled' : 'disabled'}.`, 'success');
+    } else {
+      this.app && this.app.toast(res.error ? res.error.message : 'Toggle failed.', 'error');
+    }
   }
 
   _set(k, v) { this._new = { ...this._new, [k]: v }; }
 
   async _create() {
     const n = this._new;
-    if (!n.description || !n.policy_id || !n.user_message) {
-      this.app && this.app.toast('description, policy_id and user_message are required.', 'error');
+    if (!n.description || !n.policy_id || !n.user_message || !n.code) {
+      this.app && this.app.toast('description, policy_id, code and user_message are required.', 'error');
+      return;
+    }
+    if (!/^[A-Z][A-Z0-9_]+$/.test(n.code)) {
+      this.app && this.app.toast('Code must start with A–Z and contain only uppercase letters, digits, and underscores (e.g. DOCUMENT_BLOCKED).', 'error');
       return;
     }
     const res = await this.api.mutate('/admin/documents/policies', { method: 'POST', body: n });
     if (res.ok) {
       this.app && this.app.toast('Document policy added.', 'success');
       this._new = { ...this._new, description: '', policy_id: '', user_message: '', name: '', code: '' };
-      this._load();
-    } else { this.app && this.app.toast(res.error ? res.error.message : 'Failed.', 'error'); }
+      await this._load();
+    } else {
+      // Map Pydantic field-path errors to friendly messages (DOC-007).
+      let msg = res.error ? res.error.message : 'Failed.';
+      if (msg && /body\.code|code.*String/.test(msg)) {
+        msg = 'Code is invalid — must start with A–Z and contain only uppercase letters, digits, and underscores (e.g. DOCUMENT_BLOCKED).';
+      } else if (msg && /body\.policy_id/.test(msg)) {
+        msg = 'Policy ID is invalid — use uppercase letters/digits separated by hyphens (e.g. DOC-OP-001).';
+      } else if (msg && /document_enforcement_disabled|409/.test(msg)) {
+        msg = 'Document enforcement is disabled. Enable it via the toggle above, then retry.';
+      }
+      this.app && this.app.toast(msg, 'error');
+    }
   }
 
   async _delete(id) {
@@ -118,11 +148,12 @@ export class YsAdminDocuments extends LitElement {
 
   _renderStatus() {
     const s = this._status || {};
+    const enabled = this._enforcement ? this._enforcement.enabled : s.enabled;
     return html`
       <div class="ys-panel">
         <div class="ys-panel-header">
-          <span class="ys-semaphore ${s.enabled ? 'ys-semaphore--ok' : 'ys-semaphore--degraded'}"></span>
-          Document enforcement — ${s.enabled ? 'enabled' : 'disabled'}
+          <span class="ys-semaphore ${enabled ? 'ys-semaphore--ok' : 'ys-semaphore--degraded'}"></span>
+          Document enforcement — ${enabled ? 'enabled' : 'disabled'}
         </div>
         <div class="ys-panel-body">
           <div class="ys-txt-note">
@@ -130,6 +161,14 @@ export class YsAdminDocuments extends LitElement {
             ${(s.supported_formats || []).map((f) => f.ext).join(', ') || '—'}.
             Parked (fail-closed BLOCK): ${(s.parked_formats || []).map((f) => f.ext).join(', ') || '—'}.
           </div>
+          <label class="ys-svc-card">
+            <input type="checkbox" id="doc-enforcement-toggle"
+              ?checked=${enabled}
+              @change=${(e) => this._toggleEnforcement(e.target.checked)}>
+            <span class="ys-svc-name">Enable document enforcement (step-up required)</span>
+          </label>
+          ${this._enforcement && this._enforcement.source === 'env' ? html`
+            <div class="ys-txt-note">Initial state from environment variable YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED. Toggle overrides for this container lifetime.</div>` : nothing}
         </div>
       </div>`;
   }
@@ -179,6 +218,9 @@ export class YsAdminDocuments extends LitElement {
               ${this._opt(['A', 'B'], n.pseudonymize_mode, (v) => this._set('pseudonymize_mode', v))}</div>` : nothing}
           <div class="ys-field"><label class="ys-label">Policy ID (e.g. DOC-OP-001)</label>
             <input class="ys-input" id="doc-pid" .value=${n.policy_id} @input=${(e) => this._set('policy_id', e.target.value)}></div>
+          <div class="ys-field"><label class="ys-label">Code (e.g. DOCUMENT_BLOCKED)</label>
+            <input class="ys-input" id="doc-code" placeholder="DOCUMENT_BLOCKED — A–Z, 0–9, underscore only"
+              .value=${n.code} @input=${(e) => this._set('code', e.target.value)}></div>
           <div class="ys-field"><label class="ys-label">Name</label>
             <input class="ys-input" .value=${n.name} @input=${(e) => this._set('name', e.target.value)}></div>
           <div class="ys-field"><label class="ys-label">Description</label>

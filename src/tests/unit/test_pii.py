@@ -51,7 +51,9 @@ class TestEnums:
         assert {t.value for t in PiiType} == expected
 
     def test_pii_mode_values(self):
-        assert {m.value for m in PiiMode} == {"log", "redact", "block"}
+        # PASS and PSEUDONYMIZE added (GAP PII-01..05 / 2026-07-02):
+        # all four verdict actions now supported at the PII detector layer.
+        assert {m.value for m in PiiMode} == {"pass", "log", "redact", "pseudonymize", "block"}
 
 
 # ---------------------------------------------------------------------------
@@ -666,3 +668,115 @@ class TestInternationalFormats:
         det = PiiDetector(enabled_types={PiiType.IBAN})
         _, result = det.process("FR7630006000011234567890189")
         assert result.detected is True
+
+
+# ---------------------------------------------------------------------------
+# PASS mode — regression (GAP PII-01..05 / 2026-07-02)
+# ---------------------------------------------------------------------------
+
+class TestPassMode:
+    """PiiMode.PASS — explicit no-op / allow-through mode.
+
+    PASS means the detector performs NO scan and returns the original text
+    unchanged with detected=False.  This is the "allow through" verdict action.
+    """
+
+    def test_text_unchanged_on_clean(self):
+        det = PiiDetector(mode=PiiMode.PASS)
+        out, result = det.process("Hello world")
+        assert out == "Hello world"
+
+    def test_text_unchanged_with_pii(self):
+        # PASS must NOT scan; original text is returned even with PII present.
+        det = PiiDetector(mode=PiiMode.PASS)
+        pii_text = "SSN: 123-45-6789, email: john@example.com"
+        out, result = det.process(pii_text)
+        assert out == pii_text
+
+    def test_detected_false(self):
+        det = PiiDetector(mode=PiiMode.PASS)
+        _, result = det.process("SSN: 123-45-6789")
+        assert result.detected is False
+
+    def test_findings_empty(self):
+        det = PiiDetector(mode=PiiMode.PASS)
+        _, result = det.process("SSN: 123-45-6789")
+        assert result.findings == []
+
+    def test_action_taken_passed(self):
+        det = PiiDetector(mode=PiiMode.PASS)
+        _, result = det.process("Hello world")
+        assert result.action_taken == "passed"
+
+    def test_mode_stored_in_result(self):
+        det = PiiDetector(mode=PiiMode.PASS)
+        _, result = det.process("Hello world")
+        assert result.mode == PiiMode.PASS
+
+
+# ---------------------------------------------------------------------------
+# PSEUDONYMIZE mode — regression (GAP PII-01..05 / 2026-07-02)
+# ---------------------------------------------------------------------------
+
+class TestPseudonymizeMode:
+    """PiiMode.PSEUDONYMIZE — replace PII matches with [PSEUDONYMIZED:<TYPE>].
+
+    Non-reversible at the detector layer.  Full reversible pseudonymisation
+    (reversible via pointer file) is at the doc-OPA document pipeline.
+    """
+
+    def test_email_replaced(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE)
+        out, result = det.process("Contact: john@example.com please")
+        assert "[PSEUDONYMIZED:EMAIL]" in out
+        assert "john@example.com" not in out
+
+    def test_ssn_replaced(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE, enabled_types={PiiType.SSN})
+        out, result = det.process("SSN 123-45-6789 here")
+        assert "[PSEUDONYMIZED:SSN]" in out
+        assert "123-45-6789" not in out
+
+    def test_placeholder_format(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE, enabled_types={PiiType.EMAIL})
+        out, _ = det.process("a@b.com")
+        assert out == "[PSEUDONYMIZED:EMAIL]"
+
+    def test_action_taken_pseudonymized(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE)
+        _, result = det.process("john@example.com")
+        assert result.action_taken == "pseudonymized"
+
+    def test_detected_true(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE)
+        _, result = det.process("john@example.com")
+        assert result.detected is True
+
+    def test_clean_text_unchanged(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE)
+        out, result = det.process("Hello world")
+        assert out == "Hello world"
+        assert result.detected is False
+
+    def test_multiple_matches_all_replaced(self):
+        text = "alice@example.com and bob@example.com"
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE, enabled_types={PiiType.EMAIL})
+        out, result = det.process(text)
+        assert "alice@example.com" not in out
+        assert "bob@example.com" not in out
+        assert out.count("[PSEUDONYMIZED:EMAIL]") == 2
+
+    def test_different_placeholder_from_redact(self):
+        """PSEUDONYMIZED and REDACTED must use distinct placeholders."""
+        det_p = PiiDetector(mode=PiiMode.PSEUDONYMIZE, enabled_types={PiiType.EMAIL})
+        det_r = PiiDetector(mode=PiiMode.REDACT, enabled_types={PiiType.EMAIL})
+        out_p, _ = det_p.process("a@b.com")
+        out_r, _ = det_r.process("a@b.com")
+        assert out_p != out_r
+        assert "PSEUDONYMIZED" in out_p
+        assert "REDACTED" in out_r
+
+    def test_mode_stored_in_result(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE)
+        _, result = det.process("a@b.com")
+        assert result.mode == PiiMode.PSEUDONYMIZE

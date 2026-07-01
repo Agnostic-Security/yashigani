@@ -30,9 +30,14 @@ from yashigani.pii.patterns import PATTERN_REGISTRY
 # ---------------------------------------------------------------------------
 
 class PiiMode(str, Enum):
-    LOG    = "log"
-    REDACT = "redact"
-    BLOCK  = "block"
+    PASS         = "pass"           # allow through; no scan (explicit opt-out)
+    LOG          = "log"            # detect and record; return original text
+    REDACT       = "redact"         # detect and replace with [REDACTED:<TYPE>]
+    PSEUDONYMIZE = "pseudonymize"   # detect and replace with [PSEUDONYMIZED:<TYPE>]
+                                    # (non-reversible at this layer; reversible
+                                    # pseudonymisation via pointer is at the
+                                    # doc-OPA pipeline layer)
+    BLOCK        = "block"          # detect; caller decides to drop payload
 
 
 class PiiType(str, Enum):
@@ -249,6 +254,11 @@ class PiiDetector:
         """
         result = self.detect_decoded(text)
 
+        if self.mode == PiiMode.PASS:
+            return text, PiiResult(
+                detected=False, findings=[], mode=self.mode, action_taken="passed",
+            )
+
         if self.mode == PiiMode.REDACT:
             raw_findings = [f for f in result.findings if f.view == "raw"]
             redacted = self._apply_redactions(text, raw_findings)
@@ -257,6 +267,23 @@ class PiiDetector:
             # place — escalate to blocked so the caller refuses the payload.
             action = "blocked" if encoded_only else "redacted"
             return redacted, PiiResult(
+                detected=result.detected,
+                findings=result.findings,
+                mode=self.mode,
+                action_taken=action,
+                matched_views=result.matched_views,
+                suspicious_blob=result.suspicious_blob,
+                suspicious_tokens=result.suspicious_tokens,
+            )
+
+        if self.mode == PiiMode.PSEUDONYMIZE:
+            raw_findings = [f for f in result.findings if f.view == "raw"]
+            pseudonymized = self._apply_pseudonymization(text, raw_findings)
+            encoded_only = result.detected and not raw_findings
+            # Same escalation as REDACT: encoded-only PII cannot be pseudonymised
+            # in-place — caller must block the payload.
+            action = "blocked" if encoded_only else "pseudonymized"
+            return pseudonymized, PiiResult(
                 detected=result.detected,
                 findings=result.findings,
                 mode=self.mode,
@@ -297,13 +324,23 @@ class PiiDetector:
     def process(self, text: str) -> tuple[str, PiiResult]:
         """Mode-aware dispatcher.
 
-        - LOG:    detect only; return original text unchanged, action_taken="logged".
-        - REDACT: replace matches; return redacted text, action_taken="redacted".
-        - BLOCK:  detect only; return original text unchanged, action_taken="blocked".
-                  Caller inspects result.detected to decide whether to drop the payload.
+        - PASS:         no scan; return original text, action_taken="passed".
+        - LOG:          detect only; return original text unchanged, action_taken="logged".
+        - REDACT:       replace matches with [REDACTED:<TYPE>], action_taken="redacted".
+        - PSEUDONYMIZE: replace matches with [PSEUDONYMIZED:<TYPE>] (non-reversible at
+                        this layer; reversible pseudonymisation via pointer is handled
+                        at the doc-OPA pipeline layer), action_taken="pseudonymized".
+        - BLOCK:        detect only; return original text unchanged, action_taken="blocked".
+                        Caller inspects result.detected to decide whether to drop payload.
         """
+        if self.mode == PiiMode.PASS:
+            return text, PiiResult(
+                detected=False, findings=[], mode=self.mode, action_taken="passed",
+            )
         if self.mode == PiiMode.REDACT:
             return self.redact(text)
+        if self.mode == PiiMode.PSEUDONYMIZE:
+            return self._pseudonymize(text)
 
         findings = self._scan(text)
         action = "blocked" if self.mode == PiiMode.BLOCK else "logged"
@@ -343,6 +380,22 @@ class PiiDetector:
 
         return _deduplicate_findings(raw_findings)
 
+    def _pseudonymize(self, text: str) -> tuple[str, PiiResult]:
+        """Detect PII and replace each match with ``[PSEUDONYMIZED:<TYPE>]``.
+
+        Non-reversible at this layer.  Full reversible pseudonymisation
+        (reversible via pointer file) is at the doc-OPA document pipeline.
+        Returns the pseudonymised text and a PiiResult.
+        """
+        findings = self._scan(text)
+        pseudonymized = self._apply_pseudonymization(text, findings)
+        return pseudonymized, PiiResult(
+            detected=bool(findings),
+            findings=findings,
+            mode=self.mode,
+            action_taken="pseudonymized",
+        )
+
     def _apply_redactions(self, text: str, findings: list[PiiFinding]) -> str:
         """Replace each finding span with ``[REDACTED:<TYPE>]``.
 
@@ -356,6 +409,22 @@ class PiiDetector:
         result = text
         for finding in ordered:
             placeholder = f"[REDACTED:{finding.pii_type.value}]"
+            result = result[: finding.start] + placeholder + result[finding.end :]
+
+        return result
+
+    def _apply_pseudonymization(self, text: str, findings: list[PiiFinding]) -> str:
+        """Replace each finding span with ``[PSEUDONYMIZED:<TYPE>]``.
+
+        Applied in reverse order so indices remain valid.
+        """
+        if not findings:
+            return text
+
+        ordered = sorted(findings, key=lambda f: f.start, reverse=True)
+        result = text
+        for finding in ordered:
+            placeholder = f"[PSEUDONYMIZED:{finding.pii_type.value}]"
             result = result[: finding.start] + placeholder + result[finding.end :]
 
         return result

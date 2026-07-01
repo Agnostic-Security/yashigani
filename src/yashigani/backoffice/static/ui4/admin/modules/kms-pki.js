@@ -253,8 +253,15 @@ export class YsAdminKmsPki extends LitElement {
           <button class="ys-btn ys-btn-danger" @click=${() => this._rotateNow()}>Rotate now</button>
           <div class="ys-panel-header">Tracked secret keys</div>
           ${secrets.length
-            ? html`<ul class="ys-alert-list">${secrets.map((s) => html`
-                <li class="ys-alert-item"><span class="ys-alert-label">${s}</span></li>`)}</ul>`
+            ? html`<table class="ys-table">
+                <thead><tr><th>Key name</th><th>Version</th><th>Created</th></tr></thead>
+                <tbody>${secrets.map((s) => html`
+                  <tr>
+                    <td>${s.key || '—'}</td>
+                    <td>${s.version != null ? String(s.version) : '—'}</td>
+                    <td>${cleanTs(s.created_at)}</td>
+                  </tr>`)}</tbody>
+              </table>`
             : html`<div class="ys-txt-note">No tracked secret keys (values are never returned).</div>`}
         </div>
       </div>`;

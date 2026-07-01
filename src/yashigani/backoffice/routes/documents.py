@@ -221,14 +221,32 @@ class InspectRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
+def _is_enforcement_on() -> bool:
+    """Runtime toggle truth — backoffice_state override takes precedence over env.
+
+    The runtime override (set via PUT /admin/documents/enforcement) persists
+    in backoffice_state for the container lifetime, honouring the env var as
+    the initial value.  This is the admin-UI truth; the gateway document path
+    continues to call is_document_enforcement_enabled() directly from config.py.
+    """
+    override = getattr(backoffice_state, "document_enforcement_enabled", None)
+    if override is not None:
+        return bool(override)
+    return is_document_enforcement_enabled()
+
+
 def _require_enabled() -> None:
     """Fail-closed 409 for mutation/inspect routes when the feature is dark."""
-    if not is_document_enforcement_enabled():
+    if not _is_enforcement_on():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "error": "document_enforcement_disabled",
-                "message": "Set YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true to enable.",
+                "message": (
+                    "Document enforcement is disabled. "
+                    "Enable it via PUT /admin/documents/enforcement or "
+                    "set YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true."
+                ),
             },
         )
 
@@ -373,6 +391,10 @@ async def _admin_in_detokenize_role(account_id: str, role: str) -> bool:
 
 # ── Status / catalogue ─────────────────────────────────────────────────────
 
+class EnforcementRequest(BaseModel):
+    enabled: bool
+
+
 @router.get("/status")
 async def document_status(session: AdminSession):
     """Feature-flag state + supported/parked format catalogue + action vocab.
@@ -380,7 +402,7 @@ async def document_status(session: AdminSession):
     Always 200 (renders the disabled state when dark).  No mutation."""
     cfg = DocumentEnforcementConfig.from_env()
     return {
-        "enabled": cfg.enabled,
+        "enabled": _is_enforcement_on(),
         "max_document_bytes": cfg.max_document_bytes,
         "max_segments": cfg.max_segments,
         "supported_formats": SUPPORTED_FORMATS,
@@ -390,6 +412,48 @@ async def document_status(session: AdminSession):
         "routes": ROUTES,
         "pseudonymize_modes": PSEUDONYMIZE_MODES,
     }
+
+
+@router.get("/enforcement")
+async def get_enforcement(session: AdminSession):
+    """Return the current document enforcement state (runtime override or env).
+
+    Always 200.  The enforcement state controls whether mutation/inspect routes
+    are active.  Use PUT /admin/documents/enforcement (step-up) to toggle.
+    """
+    return {
+        "enabled": _is_enforcement_on(),
+        "source": "override" if getattr(backoffice_state, "document_enforcement_enabled", None) is not None else "env",
+    }
+
+
+@router.put("/enforcement")
+async def set_enforcement(body: EnforcementRequest, session: StepUpAdminSession):
+    """Toggle document enforcement on/off at runtime (step-up required).
+
+    Persists the override in backoffice_state for the container lifetime —
+    the env var YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED remains the startup
+    default; the runtime toggle takes precedence until the container restarts.
+    Emits a ConfigChangedEvent to the audit chain.
+    """
+    previous = _is_enforcement_on()
+    backoffice_state.document_enforcement_enabled = body.enabled  # type: ignore[attr-defined]
+    logger.info(
+        "document enforcement toggled: %s -> %s (admin=%s)",
+        previous, body.enabled, session.account_id,
+    )
+    if backoffice_state.audit_writer is not None:
+        try:
+            from yashigani.audit.schema import ConfigChangedEvent
+            backoffice_state.audit_writer.write(ConfigChangedEvent(
+                admin_account=session.account_id,
+                setting="document_enforcement_enabled",
+                previous_value=str(previous),
+                new_value=str(body.enabled),
+            ))
+        except Exception as exc:
+            logger.error("Failed to write ConfigChangedEvent for document enforcement toggle: %s", exc)
+    return {"status": "ok", "enabled": body.enabled}
 
 
 # ── Policy configuration (Redis-backed DocumentPolicyStore + OPA re-push) ─────

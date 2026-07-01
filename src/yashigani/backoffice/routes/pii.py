@@ -72,8 +72,8 @@ def _set_cloud_bypass(enabled: bool) -> None:
 
 class PiiConfigRequest(BaseModel):
     mode: str = Field(
-        description="Detection mode: log | redact | block",
-        pattern=r"^(log|redact|block)$",
+        description="Detection mode: pass | log | redact | pseudonymize | block",
+        pattern=r"^(pass|log|redact|pseudonymize|block)$",
     )
     enabled_types: list[str] = Field(
         description="List of PiiType values to enable. Empty list enables all.",
@@ -94,9 +94,9 @@ class PiiTestRequest(BaseModel):
     text: str = Field(min_length=1, max_length=10_000)
     mode: Optional[str] = Field(
         default=None,
-        description="Override mode for this test call (log | redact | block). "
+        description="Override mode for this test call (pass | log | redact | pseudonymize | block). "
                     "Defaults to the currently configured mode.",
-        pattern=r"^(log|redact|block)$",
+        pattern=r"^(pass|log|redact|pseudonymize|block)$",
     )
 
 
@@ -216,8 +216,8 @@ async def test_pii_detection(
         "mode": result.mode.value,
         "finding_count": len(findings_out),
         "findings": findings_out,
-        # Return redacted text only in REDACT mode so admins can preview output.
-        "output_text": output_text if test_mode == PiiMode.REDACT else None,
+        # Return transformed text for REDACT and PSEUDONYMIZE so admins can preview output.
+        "output_text": output_text if test_mode in (PiiMode.REDACT, PiiMode.PSEUDONYMIZE) else None,
     }
 
 

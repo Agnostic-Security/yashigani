@@ -61,16 +61,22 @@ except Exception:
     pass  # prometheus_client not installed — safe to skip
 
 _CRYPTO_INVENTORY = {
+    # PKI-002 (2026-07-02): Removed stale HMAC-SHA-1 TOTP entry (was RFC 6238
+    # default); Yashigani uses role-tiered TOTP since v3.1:
+    #   - Users:  HMAC-SHA-256 6-digit (pyotp default=SHA1 overridden via hashlib)
+    #   - Admins: HMAC-SHA-512 8-digit
+    # Also consolidated duplicate SHA-256/HMAC-SHA256 entries into a single
+    # correctly-named HMAC-SHA-256 entry covering all HMAC uses.
     "algorithms": [
         {"name": "Argon2id", "usage": "password hashing", "strength": "256-bit"},
         {"name": "ECDSA P-256", "usage": "license signing", "strength": "128-bit equivalent"},
         {"name": "AES-256-GCM", "usage": "database column encryption", "strength": "256-bit"},
-        {"name": "HMAC-SHA-1", "usage": "TOTP digest (RFC 6238 default)", "strength": "160-bit"},
-        {"name": "SHA-256", "usage": "HMAC email hashing", "strength": "256-bit"},
+        {"name": "HMAC-SHA-256", "usage": "User TOTP digest (6-digit, RFC 6238)", "strength": "256-bit"},
+        {"name": "HMAC-SHA-512", "usage": "Admin TOTP digest (8-digit, RFC 6238)", "strength": "512-bit"},
+        {"name": "HMAC-SHA-256", "usage": "email hashing, API signing", "strength": "256-bit"},
         {"name": "SHA-384", "usage": "audit chain integrity", "strength": "384-bit"},
         {"name": "X25519+ML-KEM-768", "usage": "TLS key exchange (hybrid PQ)", "strength": "256-bit + PQ"},
         {"name": "bcrypt", "usage": "agent token hashing", "strength": "184-bit"},
-        {"name": "HMAC-SHA256", "usage": "email hashing, API signing", "strength": "256-bit"},
         {"name": "ChaCha20 (CSPRNG)", "usage": "session token generation (via /dev/urandom)", "strength": "256-bit"},
     ],
     "deprecated": [],

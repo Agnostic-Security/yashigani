@@ -230,7 +230,13 @@ export class YsAdminSensitivity extends LitElement {
           <div class="ys-field"><label class="ys-label">Mode</label>
             <select class="ys-select" id="pii-mode" .value=${pii.mode}
               @change=${(e) => { this._pii = { ...pii, mode: e.target.value }; }}>
-              ${['log', 'redact', 'block'].map((m) => html`<option value=${m}>${m}</option>`)}
+              ${[
+                { v: 'pass',         label: 'pass — allow through (no scan)' },
+                { v: 'log',          label: 'log — detect and record only' },
+                { v: 'redact',       label: 'redact — replace with [REDACTED:TYPE]' },
+                { v: 'pseudonymize', label: 'pseudonymize — replace with [PSEUDONYMIZED:TYPE]' },
+                { v: 'block',        label: 'block — detect and signal caller to drop payload' },
+              ].map(({ v, label }) => html`<option value=${v}>${label}</option>`)}
             </select></div>
           <div class="ys-field"><label class="ys-label">Enabled types (empty = all)</label>
             <div class="ys-svc-grid">
