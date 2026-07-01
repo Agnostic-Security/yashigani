@@ -475,6 +475,55 @@ async def login(body: LoginRequest, request: Request, response: Response):
             record.force_password_change = True
             _log.info("Password expired: user=%s age=%d days, max=%d", record.username, int(age_days), max_age_days)
 
+    # LAURA-V400-NEW-002 (ASVS V2.1.7): enforce force_password_change server-side
+    # for user-tier accounts.  A user whose account has force_password_change=True
+    # (set by an admin force-reset or by password expiry above) receives a
+    # RESTRICTED session with account_tier="password_change_required".
+    #
+    # This mirrors the totp_provisioning tier pattern:
+    #   - "password_change_required" sessions are accepted by require_any_session
+    #     (so /auth/password/change and /auth/logout remain reachable).
+    #   - "password_change_required" sessions are REJECTED by require_user_session
+    #     (all /user/* and data-plane endpoints are blocked).
+    #   - Once the user changes their password (/auth/password/change), ALL sessions
+    #     are invalidated (ASVS V2.1.4); the user must log in again to get a full
+    #     session.
+    #
+    # Admin accounts with force_password_change=True are NOT restricted here —
+    # they already go through the totp_provisioning path if applicable, and the
+    # admin plane has separate controls. This fix targets user-plane bypass only.
+    if record.force_password_change and record.account_tier == "user":
+        restricted_session = state.session_store.create(
+            account_id=record.account_id,
+            account_tier="password_change_required",
+            client_ip=client_ip,
+        )
+        state.audit_writer.write(
+            _make_login_event(
+                body.username,
+                "password_change_restricted",
+                None,
+                account_tier=record.account_tier,
+            )
+        )
+        _log.info(
+            "LAURA-V400-NEW-002: password_change_required session issued for %s "
+            "(force_password_change=True). All /user/* endpoints blocked until "
+            "password is changed via /auth/password/change.",
+            body.username,
+        )
+        _set_session_cookie(response, restricted_session.token, "password_change_required")
+        return {
+            "status": "ok",
+            "force_password_change": True,
+            "force_totp_provision": record.force_totp_provision,
+            "redirect_to": "/chat",
+            "message": (
+                "Your password must be changed before you can access this account. "
+                "POST to /auth/password/change to set a new password."
+            ),
+        }
+
     # Gap 3 / v2.23.4 arch-completion: register HUMAN identity before session
     # creation so a seat-limit rejection prevents session issuance (fail-closed).
     # Skips silently when identity_registry is None (community-tier).
@@ -754,6 +803,22 @@ async def verify_session(request: Request):
             },
         )
 
+    # LAURA-V400-NEW-002: defence-in-depth — block password_change_required sessions
+    # at the Caddy forward_auth layer so they cannot reach any data-plane resource.
+    # The primary enforcement is at require_user_session in middleware.py; this is
+    # the early-rejection layer (Caddy sees 403 → does not forward the request).
+    if session.account_tier == "password_change_required":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "password_change_required",
+                "message": (
+                    "You must change your password before accessing this resource. "
+                    "POST to /auth/password/change to set a new password."
+                ),
+            },
+        )
+
     # Resolve account from account_id
     record = await state.auth_service.get_account_by_id(session.account_id)
 
@@ -875,6 +940,21 @@ async def verify_user_session(request: Request):
             detail={
                 "error": "totp_provisioning_incomplete",
                 "message": "Complete TOTP enrolment before accessing this resource.",
+            },
+        )
+
+    # LAURA-V400-NEW-002: reject password_change_required sessions.
+    # User must change their temporary/expired password via /auth/password/change
+    # before accessing any data-plane resource.
+    if session.account_tier == "password_change_required":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "password_change_required",
+                "message": (
+                    "You must change your password before accessing this resource. "
+                    "POST to /auth/password/change to set a new password."
+                ),
             },
         )
 

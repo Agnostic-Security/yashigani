@@ -175,6 +175,23 @@ def require_user_session(
             },
         )
 
+    # LAURA-V400-NEW-002 (ASVS V2.1.7): block sessions issued during the
+    # force_password_change flow.  These sessions are confined to
+    # /auth/password/change and /auth/logout (both accept AnySession).
+    # No /user/* endpoint is reachable until the password is changed and a
+    # full session is issued on re-login.
+    if session.account_tier == "password_change_required":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "password_change_required",
+                "message": (
+                    "You must change your password before accessing this resource. "
+                    "POST to /auth/password/change to set a new password."
+                ),
+            },
+        )
+
     if session.account_tier != "user":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
