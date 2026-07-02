@@ -26,7 +26,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
-from yashigani.backoffice.middleware import AdminSession
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 # ENT-001: LicenseFeatureGated / require_feature no longer used in this module
 #          (PII is always available); imports removed to keep ruff clean.
@@ -146,7 +146,7 @@ async def get_pii_config(session: AdminSession):
 @router.put("/config")
 async def update_pii_config(
     body: PiiConfigRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,  # LAURA-V400-R2-001: disabling PII scanning is a data-protection control change
 ):
     """Update PII detection mode and enabled types."""
     _require_pii_feature(body.mode)
@@ -241,7 +241,7 @@ async def get_pii_cloud_bypass(session: AdminSession):
 @router.put("/cloud-bypass")
 async def update_pii_cloud_bypass(
     body: PiiCloudBypassRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,  # LAURA-V400-R2-001: enabling cloud bypass disables PII scanning for cloud paths
 ):
     """Toggle the PII cloud bypass setting.
 
