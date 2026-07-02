@@ -183,9 +183,7 @@ For SBOM attestation, every release artifact carries a Sigstore-signed SBOM publ
 
 ## 6. Compliance and Security Posture
 
-Yashigani publishes per-control compliance evidence under `docs/compliance-reports/`. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in an internal risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
-
-For a more detailed explanation, see the [Compliance Reports](docs/compliance-reports/README.md).
+Yashigani is engineered against OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, and OWASP Agentic AI / LLM Top 10, plus framework-specific controls. Open exceptions are tracked in an internal risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
 
 ### Static analysis & secure-SDLC tooling
 

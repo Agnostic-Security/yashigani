@@ -131,5 +131,4 @@ commit `9d867be`.
 
 ---
 
-*For controls not covered here, refer to [`docs/compliance-reports/per-framework/owasp-asvs-v5.md`](../compliance-reports/per-framework/owasp-asvs-v5.md) (ASVS v5 L3 mapping)
-and the internal compliance archive.*
+*For controls not covered here, refer to the internal compliance archive.*
