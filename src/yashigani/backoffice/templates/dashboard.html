@@ -22,6 +22,7 @@
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
                 <button data-action="showPage" data-param="documents">Documents</button>
                 <button data-action="showPage" data-param="envelopes">MCP Re-approvals</button>
+                <button data-action="showPage" data-param="data-protection" id="dp-nav-btn">Data Protection</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
                 <button data-action="showPage" data-param="monitoring">Monitoring</button>
@@ -48,6 +49,23 @@
                 Add a second admin to meet NIST AC-2 / SOC 2 CC6.2 requirements.
             </span>
             <button class="n1-banner-btn" data-action="showPage" data-param="accounts">Add second admin</button>
+        </div>
+
+        <!-- LAURA-V400-R2-001 — Data-protection warning banner -->
+        <!-- Shown when any data-protection control is in a weakened state. -->
+        <!-- Populated by loadDpProtectionStatus() on DOMContentLoaded + page load. -->
+        <div id="dp-protection-banner" class="dp-protection-banner" style="display:none">
+            <span class="dp-protection-banner-icon">&#9888;</span>
+            <span class="dp-protection-banner-text" id="dp-protection-banner-text"></span>
+            <button class="n1-banner-btn" data-action="showPage" data-param="pii">PII Settings</button>
+        </div>
+
+        <!-- LAURA-V400-R2-001 — Pending data-protection weaken requests banner -->
+        <!-- Shown to admins when there are weaken requests awaiting a second approval. -->
+        <div id="dp-weaken-pending-banner" class="dp-protection-banner dp-weaken-pending-banner" style="display:none">
+            <span class="dp-protection-banner-icon">&#128274;</span>
+            <span class="dp-protection-banner-text" id="dp-weaken-pending-text"></span>
+            <button class="n1-banner-btn" id="dp-weaken-pending-btn" data-action="showPage" data-param="data-protection">Review</button>
         </div>
 
         <!-- Dashboard Page — R25 redesign -->
@@ -1551,6 +1569,56 @@
             <div id="rs-toast" class="rs-toast"></div>
         </div>
         <!-- Permissions Page — 3.1 Phase 8: Unified Resource Permission Grant admin UI -->
+        <!-- LAURA-V400-R2-001 — Data Protection admin page -->
+        <div class="page" id="page-data-protection">
+            <h2>Data Protection</h2>
+            <p class="txt-note">
+                Disabling any data-protection control requires <strong>two admin approvals</strong>
+                (maker-checker). An admin submits a weaken request; a <em>different</em> admin must
+                approve it. Re-enabling protection is single-admin step-up only.
+            </p>
+
+            <!-- Current state panel -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Current Protection State</span>
+                    <button data-action="dpRefresh" class="btn-xs-add">Refresh</button>
+                </div>
+                <div class="panel-body">
+                    <div id="dp-status-result"></div>
+                </div>
+            </div>
+
+            <!-- Pending weaken requests panel -->
+            <div class="panel">
+                <div class="panel-header">Pending Weaken Requests (Action Required)</div>
+                <div class="panel-body">
+                    <p class="txt-note">These requests are awaiting a second admin approval.
+                    You can approve or reject any request that you did not submit.</p>
+                    <div id="dp-pending-result"></div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Control</th>
+                                <th>Requested by</th>
+                                <th>From state</th>
+                                <th>To state</th>
+                                <th>Requested at</th>
+                                <th>Expires</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="dp-pending-tbody">
+                            <tr><td colspan="7" class="empty">Loading&hellip;</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Decision result -->
+            <div id="dp-decision-result"></div>
+        </div>
+
         <div class="page" id="page-permissions">
             <h2>Resource Permissions</h2>
 
@@ -1764,6 +1832,7 @@
     </div>
 
     <script src="/static/js/dashboard.js"></script>
+    <script src="/static/js/dp_weaken.js" defer></script>
     <script src="/static/js/hibp.js" defer></script>
     <script src="/static/js/pki.js" defer></script>
     <script src="/static/js/runtime-settings.js" defer></script>

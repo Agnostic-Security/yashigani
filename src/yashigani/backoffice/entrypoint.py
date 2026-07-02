@@ -195,6 +195,7 @@ def _bootstrap():
     document_policy_store = None
     document_set_store = None
     envelope_pending_store = None    # 3.0 — capability-envelope re-approval queue
+    _dp_weaken_store = None          # 4.0 — dual-admin data-protection maker-checker
     _cap_policy_store = None         # 3.0 — browser Permissions-Policy
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
@@ -279,6 +280,20 @@ def _bootstrap():
                 len(envelope_pending_store.list_for_tenant(
                     os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
                 )),
+            )
+            # 4.0 — Data-protection weaken pending store (LAURA-V400-R2-001).
+            # Shares Redis db/3 (key namespace "dp_weaken:").  Holds pending
+            # maker-checker weaken requests for pii_config, pii_cloud_bypass,
+            # and doc_enforcement until a second admin approves or rejects.
+            # No seeding — entries are created on-demand via the admin API.
+            from yashigani.protection.weaken_pending_store import DpWeakenPendingStore as _DpWeakenStore
+            _dp_weaken_store = _DpWeakenStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Data-protection weaken store initialised (dual-admin maker-checker, 4.0): "
+                "%d pending request(s)",
+                _dp_weaken_store.count_for_tenant(
+                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+                ),
             )
             # 3.0 — browser Permissions-Policy store (Redis db/3, prefix cap_policy:*)
             from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
@@ -575,6 +590,7 @@ def _bootstrap():
     backoffice_state.document_policy_store = document_policy_store
     backoffice_state.document_set_store = document_set_store
     backoffice_state.envelope_pending_store = envelope_pending_store
+    backoffice_state.dp_weaken_store = _dp_weaken_store  # 4.0 — dual-admin data-protection maker-checker
     backoffice_state.capability_policy_store = _cap_policy_store  # 3.0 — Permissions-Policy
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store

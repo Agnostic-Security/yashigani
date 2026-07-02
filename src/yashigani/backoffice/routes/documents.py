@@ -431,11 +431,75 @@ async def get_enforcement(session: AdminSession):
 async def set_enforcement(body: EnforcementRequest, session: StepUpAdminSession):
     """Toggle document enforcement on/off at runtime (step-up required).
 
+    WEAKEN direction (enabled=False) — creates a pending dual-admin weaken
+    request (LAURA-V400-R2-001). Change is NOT applied until a second admin
+    approves via POST /admin/data-protection/weaken-requests/{id}/approve.
+
+    STRENGTHEN direction (enabled=True) — applied immediately (single-admin
+    step-up is sufficient for re-enabling protection).
+
     Persists the override in backoffice_state for the container lifetime —
     the env var YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED remains the startup
     default; the runtime toggle takes precedence until the container restarts.
     Emits a ConfigChangedEvent to the audit chain.
     """
+    # DUAL-ADMIN: disabling enforcement is a weakening — requires second admin.
+    if not body.enabled:
+        from yashigani.backoffice.routes.dp_weaken import (
+            _dp_store,
+            _current_doc_enforcement,
+            _install_tenant,
+            _require_at_least_two_active_admins,
+        )
+        from yashigani.audit.schema import DataProtectionWeakenRequestedEvent
+
+        await _require_at_least_two_active_admins()
+
+        from_state = _current_doc_enforcement()
+        to_state = {"enabled": False}
+        store = _dp_store()
+        row = store.create_request(
+            tenant_id=_install_tenant(),
+            requester_id=session.account_id,
+            control="doc_enforcement",
+            from_state=from_state,
+            to_state=to_state,
+        )
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(DataProtectionWeakenRequestedEvent(
+                    admin_account=session.account_id,
+                    request_id=row["request_id"],
+                    control="doc_enforcement",
+                    from_state=from_state,
+                    to_state=to_state,
+                ))
+            except Exception as exc:
+                logger.error("Failed to write DataProtectionWeakenRequestedEvent for doc_enforcement: %s", exc)
+
+        logger.warning(
+            "doc_enforcement DISABLE REQUESTED (not applied): requester=%s request_id=%s",
+            session.account_id, row["request_id"],
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "request_id": row["request_id"],
+                "control": "doc_enforcement",
+                "from_state": from_state,
+                "to_state": to_state,
+                "message": (
+                    "Disabling document enforcement is a data-protection weakening. "
+                    "A second admin must approve via POST "
+                    f"/admin/data-protection/weaken-requests/{row['request_id']}/approve. "
+                    "Enforcement has NOT been disabled."
+                ),
+            },
+        )
+
+    # STRENGTHEN direction (enable enforcement) — apply immediately.
     previous = _is_enforcement_on()
     backoffice_state.document_enforcement_enabled = body.enabled  # type: ignore[attr-defined]
     logger.info(

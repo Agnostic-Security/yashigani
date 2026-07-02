@@ -120,6 +120,8 @@ from yashigani.backoffice.routes import (
     # 4.0 Admin workflow-oversight (cross-user read + disable)
     admin_workflows_router,
 )
+# 4.0 LAURA-V400-R2-001 — Dual-admin data-protection maker-checker (lazy import)
+from yashigani.backoffice.routes.dp_weaken import router as dp_weaken_router
 
 
 async def _bootstrap_admin_accounts(auth_service, state) -> None:
@@ -1325,6 +1327,13 @@ def create_backoffice_app() -> FastAPI:
     from yashigani.backoffice.routes.pii import router as pii_router
 
     app.include_router(pii_router, prefix="/admin/pii", tags=["pii"])
+
+    # 4.0 LAURA-V400-R2-001 — Dual-admin data-protection maker-checker
+    app.include_router(
+        dp_weaken_router,
+        prefix="/admin/data-protection",
+        tags=["data-protection"],
+    )
 
     # v2.3 — Cryptographic inventory (ASVS 11.1.3)
     from yashigani.backoffice.routes.crypto_inventory import router as crypto_inventory_router

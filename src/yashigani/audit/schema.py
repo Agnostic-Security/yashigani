@@ -438,6 +438,16 @@ class EventType(str, Enum):
     POLICY_ACTIVATED = "POLICY_ACTIVATED"
     POLICY_BOUND = "POLICY_BOUND"
     POLICY_UNBOUND = "POLICY_UNBOUND"
+    # LAURA-V400-R2-001 — dual-admin data-protection maker-checker (4.0)
+    # Three events cover the full lifecycle of a pending weaken request:
+    # REQUESTED  — admin A (maker) submits a weaken request (step-up required).
+    # APPROVED   — admin B (checker) approves (step-up + distinct-admin required).
+    # REJECTED   — admin B (checker) rejects (step-up + distinct-admin required).
+    # The actual config change (applied state) is recorded as a ConfigChangedEvent
+    # in the existing chain, cross-referenced via request_id.
+    DATA_PROTECTION_WEAKEN_REQUESTED = "DATA_PROTECTION_WEAKEN_REQUESTED"
+    DATA_PROTECTION_WEAKEN_APPROVED = "DATA_PROTECTION_WEAKEN_APPROVED"
+    DATA_PROTECTION_WEAKEN_REJECTED = "DATA_PROTECTION_WEAKEN_REJECTED"
 
 
 # ---------------------------------------------------------------------------
@@ -3864,3 +3874,87 @@ class PolicyUnboundEvent(AuditEvent):
     masking_applied: bool = True
     admin_account: str = ""
     binding_id: str = ""
+
+
+# ---------------------------------------------------------------------------
+# LAURA-V400-R2-001 — Dual-admin data-protection maker-checker events (4.0)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DataProtectionWeakenRequestedEvent(AuditEvent):
+    """Emitted when admin A (maker) submits a data-protection weaken request.
+
+    The change is NOT applied yet — it sits in the DpWeakenPendingStore until
+    a DIFFERENT admin (admin B, checker) approves or rejects it.
+
+    Compliance anchor: disabling data-protection controls is compliance-critical
+    (GDPR Art. 32, NIST SP 800-53 SI-12, SOC 2 CC6.1).  Every weaken request
+    MUST be on the tamper-evident hash chain regardless of whether it is
+    ultimately approved.
+    """
+
+    event_type: str = EventType.DATA_PROTECTION_WEAKEN_REQUESTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""      # maker (requester) account_id
+    request_id: str = ""         # pending store UUID
+    control: str = ""            # pii_config | pii_cloud_bypass | doc_enforcement
+    from_state: Optional[dict] = None   # current enforcing state
+    to_state: Optional[dict] = None     # desired weakened state
+    rule_id: str = "yashigani.data-protection.weaken.requested"
+    user_message: str = (
+        "A data-protection weaken request was submitted and is pending "
+        "approval by a second admin."
+    )
+    code: int = 202
+
+
+@dataclass
+class DataProtectionWeakenApprovedEvent(AuditEvent):
+    """Emitted when admin B (checker) approves a pending weaken request.
+
+    The change IS applied immediately after this event is written.  The
+    resulting config change is also recorded as a ConfigChangedEvent so the
+    change appears in both the approval chain and the config-change chain.
+    """
+
+    event_type: str = EventType.DATA_PROTECTION_WEAKEN_APPROVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""      # checker (approver) account_id
+    requester_id: str = ""       # maker account_id (for cross-reference)
+    request_id: str = ""
+    control: str = ""
+    from_state: Optional[dict] = None
+    to_state: Optional[dict] = None    # the state now applied
+    rule_id: str = "yashigani.data-protection.weaken.approved"
+    user_message: str = (
+        "A data-protection weaken request was approved by a second admin "
+        "and the configuration change has been applied."
+    )
+    code: int = 200
+
+
+@dataclass
+class DataProtectionWeakenRejectedEvent(AuditEvent):
+    """Emitted when admin B (checker) rejects a pending weaken request.
+
+    No config change is applied.  The control remains in its enforcing state.
+    """
+
+    event_type: str = EventType.DATA_PROTECTION_WEAKEN_REJECTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""      # checker (rejector) account_id
+    requester_id: str = ""       # maker account_id (for cross-reference)
+    request_id: str = ""
+    control: str = ""
+    from_state: Optional[dict] = None
+    to_state: Optional[dict] = None    # the state that was NOT applied
+    rule_id: str = "yashigani.data-protection.weaken.rejected"
+    user_message: str = (
+        "A data-protection weaken request was rejected. "
+        "The protection control remains in its enforcing state."
+    )
+    code: int = 200

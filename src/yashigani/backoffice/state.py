@@ -62,6 +62,7 @@ class BackofficeState:
     document_policy_store: Optional[Any] = None           # DocumentPolicyStore (2.26)
     document_set_store: Optional[Any] = None               # DocumentSetStore (2.26 set-scoped-salt)
     envelope_pending_store: Optional[Any] = None          # EnvelopePendingStore (3.0 capability-envelope re-approval queue)
+    dp_weaken_store: Optional[Any] = None                 # DpWeakenPendingStore (4.0 dual-admin data-protection maker-checker)
     capability_policy_store: Optional[Any] = None         # CapabilityPolicyStore (3.0 browser Permissions-Policy)
     user_plane_durable: Optional[Any] = None              # UserPlaneDurableStore (4.0 user-plane durability)
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)

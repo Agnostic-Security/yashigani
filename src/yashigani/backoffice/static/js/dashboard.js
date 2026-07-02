@@ -69,6 +69,8 @@ function showPage(name, triggerEl) {
     if (name === 'documents' && typeof window.loadDocuments === 'function') window.loadDocuments();
     // MCP capability-envelope re-approvals — loadEnvelopes is in envelope_reapproval.js (defer).
     if (name === 'envelopes' && typeof window.loadEnvelopes === 'function') window.loadEnvelopes();
+    // LAURA-V400-R2-001 — Data-protection dual-admin page
+    if (name === 'data-protection' && typeof window.loadDpPage === 'function') window.loadDpPage();
     if (name === 'rbac') { loadGroups(); loadRbacSources(); }  // R13: populate path/method catalogues
     // 3.0 — Permissions-Policy admin page — loadCapabilityPolicy is in capability-policy.js (defer).
     if (name === 'capability-policy' && typeof window.loadCapabilityPolicy === 'function') window.loadCapabilityPolicy();
@@ -754,18 +756,72 @@ document.addEventListener('DOMContentLoaded', function() {
     loadVersionCheck();
     // N1: second-admin enforcement banner — fires on load; re-fires when accounts page is shown
     loadEnforcementBanner();
+    // LAURA-V400-R2-001: data-protection warning banners — fire on load.
+    loadDpProtectionStatus();
 });
 
 // Dashboard
 async function loadDashboard() {
     // R25: orchestrate all five dashboard widgets in parallel for fast render.
+    // LAURA-V400-R2-001: data-protection status loaded in parallel.
     await Promise.all([
         loadDashServicesHealth(),
         loadDashAlerts(),
         loadDashBudget(),
         loadDashSecurity(),
         loadDashTraffic(),
+        loadDpProtectionStatus(),
     ]);
+}
+
+// ---------------------------------------------------------------------------
+// LAURA-V400-R2-001 — Data-Protection warning banner (dashboard + nav badge)
+// ---------------------------------------------------------------------------
+
+async function loadDpProtectionStatus() {
+    var data = await api('/admin/data-protection/status');
+    if (!data) return;
+
+    // Warning banner — any weakened control.
+    var banner = document.getElementById('dp-protection-banner');
+    var bannerText = document.getElementById('dp-protection-banner-text');
+    if (banner && bannerText) {
+        if (data.any_weakened && data.warnings && data.warnings.length) {
+            var msgs = data.warnings.map(function(w) {
+                return '⚠ ' + escapeHtml(w.message);
+            }).join(' | ');
+            bannerText.textContent = msgs;
+            banner.style.display = '';
+        } else {
+            banner.style.display = 'none';
+        }
+    }
+
+    // Pending weaken-requests badge/banner.
+    var pendingBanner = document.getElementById('dp-weaken-pending-banner');
+    var pendingText = document.getElementById('dp-weaken-pending-text');
+    var n = data.pending_weaken_requests || 0;
+    if (pendingBanner && pendingText) {
+        if (n > 0) {
+            pendingText.textContent = n + ' data-protection weaken request' +
+                (n === 1 ? '' : 's') + ' pending second-admin approval.';
+            pendingBanner.style.display = '';
+        } else {
+            pendingBanner.style.display = 'none';
+        }
+    }
+
+    // Nav badge — add a count badge to the Data Protection nav button.
+    var navBtn = document.getElementById('dp-nav-btn');
+    if (navBtn) {
+        if (n > 0) {
+            navBtn.textContent = 'Data Protection (' + n + ')';
+            navBtn.title = n + ' pending weaken request(s) require a second-admin approval';
+        } else {
+            navBtn.textContent = 'Data Protection';
+            navBtn.title = '';
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

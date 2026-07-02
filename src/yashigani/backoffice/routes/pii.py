@@ -148,10 +148,75 @@ async def update_pii_config(
     body: PiiConfigRequest,
     session: StepUpAdminSession,  # LAURA-V400-R2-001: disabling PII scanning is a data-protection control change
 ):
-    """Update PII detection mode and enabled types."""
+    """Update PII detection mode and enabled types.
+
+    STRENGTHEN direction (redact/pseudonymize/block) — applied immediately.
+    WEAKEN direction (pass/log) — creates a pending dual-admin weaken request
+    instead of applying immediately (LAURA-V400-R2-001 dual-admin requirement).
+    """
     _require_pii_feature(body.mode)
 
     enabled = body.enabled_types if body.enabled_types else [t.value for t in PiiType]
+
+    # DUAL-ADMIN: weaken direction (pass or log) requires a second admin to approve.
+    _WEAKENED_MODES = frozenset({"pass", "log"})
+    if body.mode in _WEAKENED_MODES:
+        from yashigani.backoffice.routes.dp_weaken import (
+            _dp_store,
+            _current_pii_config,
+            _install_tenant,
+            _require_at_least_two_active_admins,
+        )
+        from yashigani.audit.schema import DataProtectionWeakenRequestedEvent
+
+        await _require_at_least_two_active_admins()
+
+        from_state = _current_pii_config()
+        to_state = {"mode": body.mode, "enabled_types": enabled}
+        store = _dp_store()
+        row = store.create_request(
+            tenant_id=_install_tenant(),
+            requester_id=session.account_id,
+            control="pii_config",
+            from_state=from_state,
+            to_state=to_state,
+        )
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(DataProtectionWeakenRequestedEvent(
+                    admin_account=session.account_id,
+                    request_id=row["request_id"],
+                    control="pii_config",
+                    from_state=from_state,
+                    to_state=to_state,
+                ))
+            except Exception as exc:
+                logger.error("Failed to write DataProtectionWeakenRequestedEvent: %s", exc)
+
+        logger.warning(
+            "pii_config WEAKEN REQUESTED (not applied): mode=%s requester=%s request_id=%s",
+            body.mode, session.account_id, row["request_id"],
+        )
+        from fastapi import Response
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "request_id": row["request_id"],
+                "control": "pii_config",
+                "from_state": from_state,
+                "to_state": to_state,
+                "message": (
+                    f"Setting PII mode to {body.mode!r} is a data-protection weakening. "
+                    "A second admin must approve via POST "
+                    f"/admin/data-protection/weaken-requests/{row['request_id']}/approve. "
+                    "The change has NOT been applied."
+                ),
+            },
+        )
+
+    # STRENGTHEN direction — apply immediately (single-admin step-up sufficient).
     cfg = {"mode": body.mode, "enabled_types": enabled}
     _set_config(cfg)
 
@@ -250,9 +315,70 @@ async def update_pii_cloud_bypass(
     Local (Ollama) traffic is NEVER affected — it is always filtered.
     This setting only controls whether PII filtering runs for requests
     that the optimization engine routes to cloud providers.
+
+    WEAKEN direction (enabled=True) — creates a pending dual-admin weaken
+    request (LAURA-V400-R2-001).
+    STRENGTHEN direction (enabled=False) — applied immediately.
     """
     _require_pii_feature("redact" if body.enabled else "log")  # no-op (ENT-001)
 
+    # DUAL-ADMIN: enabling bypass is a weakening — requires second admin approval.
+    if body.enabled:
+        from yashigani.backoffice.routes.dp_weaken import (
+            _dp_store,
+            _current_pii_cloud_bypass,
+            _install_tenant,
+            _require_at_least_two_active_admins,
+        )
+        from yashigani.audit.schema import DataProtectionWeakenRequestedEvent
+
+        await _require_at_least_two_active_admins()
+
+        from_state = _current_pii_cloud_bypass()
+        to_state = {"enabled": True}
+        store = _dp_store()
+        row = store.create_request(
+            tenant_id=_install_tenant(),
+            requester_id=session.account_id,
+            control="pii_cloud_bypass",
+            from_state=from_state,
+            to_state=to_state,
+        )
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(DataProtectionWeakenRequestedEvent(
+                    admin_account=session.account_id,
+                    request_id=row["request_id"],
+                    control="pii_cloud_bypass",
+                    from_state=from_state,
+                    to_state=to_state,
+                ))
+            except Exception as exc:
+                logger.error("Failed to write DataProtectionWeakenRequestedEvent for pii_cloud_bypass: %s", exc)
+
+        logger.warning(
+            "pii_cloud_bypass ENABLE REQUESTED (not applied): requester=%s request_id=%s",
+            session.account_id, row["request_id"],
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "request_id": row["request_id"],
+                "control": "pii_cloud_bypass",
+                "from_state": from_state,
+                "to_state": to_state,
+                "message": (
+                    "Enabling PII cloud bypass is a data-protection weakening. "
+                    "A second admin must approve via POST "
+                    f"/admin/data-protection/weaken-requests/{row['request_id']}/approve. "
+                    "Cloud bypass has NOT been enabled."
+                ),
+            },
+        )
+
+    # STRENGTHEN direction (disable bypass) — apply immediately.
     previous = _get_cloud_bypass()
     _set_cloud_bypass(body.enabled)
 
@@ -278,8 +404,5 @@ async def update_pii_cloud_bypass(
     return {
         "status": "ok",
         "cloud_bypass_enabled": body.enabled,
-        "warning": (
-            "PII may now reach cloud LLM providers. "
-            "Local (Ollama) traffic remains filtered at all times."
-        ) if body.enabled else None,
+        "warning": None,
     }
