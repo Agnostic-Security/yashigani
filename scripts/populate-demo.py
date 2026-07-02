@@ -1298,6 +1298,384 @@ def step13b_cloud9_demo_wire() -> None:
 # STEP 13c — MCP Registry import ceremony (demo-mcp envelope seeding)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shared user-session helper (for user-plane seeding steps 13d + 13e)
+# ---------------------------------------------------------------------------
+
+def _user_totp_sha256(secret: str) -> str:
+    """Compute SHA256/6-digit TOTP (standard user-tier algo)."""
+    import base64 as _b64
+    import hashlib as _hl
+    import hmac as _hmac
+    import struct as _struct
+    import time as _time
+    pad = (8 - len(secret) % 8) % 8
+    raw_secret = _b64.b32decode(secret.upper() + "=" * pad)
+    t = int(_time.time()) // 30
+    msg = _struct.pack(">Q", t)
+    h = _hmac.new(raw_secret, msg, _hl.sha256).digest()
+    offset = h[-1] & 0x0F
+    code = _struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code % 10 ** 6).zfill(6)
+
+
+def _user_login_session(email: str, username: str, password: str, totp_secret: str) -> requests.Session:
+    """Create a fresh user-plane session.  Returns None on failure."""
+    import time as _t
+    us = requests.Session()
+    us.verify = False
+    for _attempt in range(3):
+        # Wait for a clean TOTP window to avoid replay collisions.
+        remaining = 30 - int(_t.time()) % 30
+        if remaining < 5:
+            print(f"  [{email}] waiting {remaining + 2}s for TOTP window...")
+            _t.sleep(remaining + 2)
+        code = _user_totp_sha256(totp_secret)
+        r = us.post(f"{BASE_URL}/auth/login", json={
+            "username": username, "password": password, "totp_code": code,
+        })
+        if r.status_code == 200 and r.json().get("status") == "ok":
+            print(f"  [{email}] user login OK")
+            return us
+        print(f"  [{email}] user login attempt {_attempt + 1} failed: "
+              f"HTTP {r.status_code} — {r.text[:120]}")
+        _t.sleep(35)  # wait a full window before retry
+    print(f"  [{email}] WARN: all login attempts failed — skipping")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# STEP 13d — Seed per-user personas/agents for BOLA demo surface
+# ---------------------------------------------------------------------------
+
+PERSONA_SEED = [
+    # ana gets @Mimi (persona for the demo workflow) + @anabot (agent)
+    {"email": "ana@agnosticsec.com", "items": [
+        {"alias": "Mimi",   "name": "Mimi (Ana's AI persona)",  "kind": "persona",
+         "persona": "I am Mimi, Ana's personal AI assistant. I help analyse data."},
+        {"alias": "anabot", "name": "Ana's workflow agent",     "kind": "agent",
+         "persona": "I am Ana's workflow automation agent."},
+    ]},
+    # paul gets @PaulBot (persona) + @pauleye (agent) — different handles from ana's
+    {"email": "paul@agnosticsec.com", "items": [
+        {"alias": "PaulBot", "name": "PaulBot (Paul's AI persona)", "kind": "persona",
+         "persona": "I am PaulBot, Paul's personal AI assistant for finance queries."},
+        {"alias": "pauleye", "name": "Paul's observation agent",   "kind": "agent",
+         "persona": "I monitor financial data streams for Paul."},
+    ]},
+]
+
+
+def step13d_seed_user_personas_and_agents(user_creds: dict) -> dict:
+    """
+    4.0 — Seed per-user personas and agents via the user-plane API.
+
+    Creates:
+      ana:   @Mimi (persona), @anabot (agent)
+      paul:  @PaulBot (persona), @pauleye (agent)
+
+    Idempotent: if an agent with the same alias already exists, skip creation.
+    Returns {email: {alias: ua_id}} for each seeded entry.
+    """
+    print("\n=== STEP 13d: Seed per-user personas + agents (BOLA demo surface) ===")
+    created: dict[str, dict] = {}
+
+    for seed in PERSONA_SEED:
+        email = seed["email"]
+        items = seed["items"]
+
+        # Look up the user's current credentials from user_creds or creds file.
+        info = user_creds.get(email, {})
+        username = info.get("username", "")
+        new_pw = info.get("new_pw") or info.get("temp_pw", "")
+        totp_secret = info.get("totp_secret", "")
+
+        if not (username and new_pw and totp_secret):
+            print(f"  {email}: missing creds (user_creds entry incomplete) — skipping")
+            continue
+
+        us = _user_login_session(email, username, new_pw, totp_secret)
+        if us is None:
+            print(f"  {email}: could not create user session — skipping personas")
+            continue
+
+        # List existing agents to avoid duplicate alias.
+        r_agents = us.get(f"{BASE_URL}/user/agents")
+        existing_aliases = set()
+        if r_agents.status_code == 200:
+            for ag in r_agents.json().get("agents", []):
+                alias = ag.get("alias", "") or ag.get("personality", {}).get("alias", "")
+                # The alias is inside the personality JSON for some records.
+                # Simpler: just re-fetch after creation to verify.
+                existing_aliases.add(ag.get("name", ""))
+
+        user_entries: dict[str, str] = {}
+        for item in items:
+            alias = item["alias"]
+            kind = item["kind"]
+            name = item["name"]
+            persona = item["persona"]
+
+            # Check /user/mentions to see if alias already exists.
+            rm = us.get(f"{BASE_URL}/user/mentions")
+            existing_handles: set[str] = set()
+            if rm.status_code == 200:
+                for m in rm.json().get("mentions", []):
+                    if m.get("kind") in ("agent", "persona"):
+                        existing_handles.add(m.get("handle", "").lower())
+
+            if alias.lower() in existing_handles:
+                print(f"  {email}: @{alias} already exists — skipping")
+                # Try to get the ua_id from the mentions list
+                for m in rm.json().get("mentions", []):
+                    if m.get("handle", "").lower() == alias.lower():
+                        user_entries[alias] = m.get("id", "")
+                        break
+                continue
+
+            payload = {"name": name, "alias": alias, "kind": kind}
+            if kind == "persona":
+                payload["persona"] = persona
+                payload["system_prompt"] = ""
+            else:
+                payload["persona"] = persona
+                payload["system_prompt"] = ""
+
+            rc = us.post(f"{BASE_URL}/user/agents", json=payload)
+            if rc.status_code in (200, 201):
+                ua_id = rc.json().get("id") or rc.json().get("ua_id", "")
+                print(f"  {email}: created {kind} @{alias}: ua_id={ua_id}")
+                user_entries[alias] = ua_id
+            elif rc.status_code == 409:
+                print(f"  {email}: @{alias} already exists (409 — idempotent)")
+            else:
+                print(f"  {email}: WARN create @{alias}: "
+                      f"HTTP {rc.status_code}: {rc.text[:160]}")
+
+        created[email] = user_entries
+
+    print(f"  Personas/agents seeded: {created}")
+    return created
+
+
+# ---------------------------------------------------------------------------
+# STEP 13e — Seed demo workflow for ana (OPA-every-hop surface)
+# ---------------------------------------------------------------------------
+
+def step13e_seed_demo_workflow(user_creds: dict, persona_agents: dict) -> str | None:
+    """
+    4.0 — Seed a demo no-code workflow for ana that exercises the
+    OPA-every-hop governed execution path.
+
+    The workflow:
+      Step 1: @Mimi (ana's persona) — "Retrieve current status and summarise"
+      Step 2: @langflow (gateway agent) — "Process the summary and log it"
+    Schedule: interval 600 seconds (every 10 minutes)
+
+    Creates the workflow via the generate→commit HTTP flow (governed LLM
+    parses the NL description).  Falls back to direct Redis injection if the
+    LLM call fails (e.g. LLM unavailable or YASHIGANI_MCP_SERVERS not set in
+    backoffice container).
+
+    Returns the workflow_id string, or None if seeding failed.
+    """
+    print("\n=== STEP 13e: Seed demo workflow for ana (OPA step-exec surface) ===")
+
+    # Build ana's session
+    email = "ana@agnosticsec.com"
+    info = user_creds.get(email, {})
+    username = info.get("username", "")
+    new_pw = info.get("new_pw") or info.get("temp_pw", "")
+    totp_secret = info.get("totp_secret", "")
+
+    if not (username and new_pw and totp_secret):
+        print(f"  {email}: missing creds — cannot seed demo workflow")
+        return None
+
+    us = _user_login_session(email, username, new_pw, totp_secret)
+    if us is None:
+        print(f"  {email}: login failed — cannot seed demo workflow")
+        return None
+
+    # Check if a demo workflow already exists.
+    rlist = us.get(f"{BASE_URL}/user/workflows")
+    if rlist.status_code == 200:
+        for wf in rlist.json().get("workflows", []):
+            if wf.get("name", "").startswith("Demo: Status Retrieval"):
+                wf_id = wf.get("workflow_id", "")
+                print(f"  Demo workflow already exists: wf_id={wf_id} — skipping")
+                return wf_id
+
+    # Determine available @-handles for the description.
+    # @Mimi (ana's persona, seeded by step13d) + @langflow (system api agent)
+    mimi_id = (persona_agents.get(email) or {}).get("Mimi", "")
+    description = (
+        "@Mimi retrieve the current system status and produce a brief summary. "
+        "Then @langflow process the summary and log it to the audit trail. "
+        "Run this every 10 minutes."
+    )
+
+    # Attempt the generate→commit flow.
+    wf_id = _try_generate_commit_workflow(us, description)
+    if wf_id:
+        print(f"  Demo workflow created via generate→commit: wf_id={wf_id}")
+        return wf_id
+
+    # Fallback: direct Redis injection via docker exec.
+    print("  generate→commit failed — falling back to direct Redis injection")
+    wf_id = _inject_workflow_via_redis(
+        account_id="ae34f862-6cc1-4e44-938d-001fb2f71d2f",  # ana's account_id
+        name="Demo: Status Retrieval Workflow",
+        steps=[
+            {"actor": "@Mimi",     "action": "Retrieve current system status and summarise",
+             "uses": [],           "output_to": "@langflow"},
+            {"actor": "@langflow", "action": "Process the summary and log it to the audit trail",
+             "uses": [],           "output_to": ""},
+        ],
+        schedule={"kind": "interval", "seconds": 600},
+    )
+    if wf_id:
+        print(f"  Demo workflow injected via Redis: wf_id={wf_id}")
+    else:
+        print("  WARN: demo workflow seed failed via both paths")
+    return wf_id
+
+
+def _try_generate_commit_workflow(us: requests.Session, description: str) -> str | None:
+    """Try the governed generate→commit flow.  Returns wf_id or None."""
+    print(f"  Generating workflow spec via governed LLM ({description[:80]}...)")
+    rg = us.post(f"{BASE_URL}/user/workflows/generate",
+                 json={"description": description}, timeout=60)
+    if rg.status_code != 200:
+        print(f"  generate failed: HTTP {rg.status_code}: {rg.text[:200]}")
+        return None
+    body = rg.json()
+    draft_id = body.get("draft_id")
+    warnings = body.get("warnings", [])
+    steps = body.get("steps", [])
+    print(f"  Draft generated: draft_id={draft_id} steps={len(steps)} warnings={len(warnings)}")
+    if warnings:
+        for w in warnings:
+            print(f"    WARN: {w}")
+    if not steps:
+        print("  No valid steps after handle clamping — generate failed")
+        return None
+
+    # Commit the draft.
+    rc = us.post(f"{BASE_URL}/user/workflows", json={
+        "draft_id": draft_id,
+        "name": "Demo: Status Retrieval Workflow",
+        "description": (
+            "OPA-every-hop demo workflow: @Mimi retrieves system status, "
+            "@langflow processes and logs the summary. Fires every 10 minutes."
+        ),
+    })
+    if rc.status_code in (200, 201):
+        wf_id = rc.json().get("workflow_id", "")
+        return wf_id or None
+    print(f"  commit failed: HTTP {rc.status_code}: {rc.text[:200]}")
+    return None
+
+
+def _inject_workflow_via_redis(
+    account_id: str,
+    name: str,
+    steps: list[dict],
+    schedule: dict,
+) -> str | None:
+    """
+    Direct Redis injection for the demo workflow.  Used as fallback when the
+    LLM-backed generate→commit path is unavailable.
+
+    Writes to:
+      - backoffice Redis db/3 (wf:meta:{wf_id}, wf:workflows:{account_id})
+      - gateway Redis db/6 (wf:spec:{wf_id}, wf:sched:index)
+    """
+    import subprocess
+    import json as _json
+    import uuid as _uuid
+    import time as _t
+
+    wf_id = "wf_demo_" + _uuid.uuid4().hex[:12]
+    now = _t.strftime("%Y-%m-%dT%H:%M:%S+00:00", _t.gmtime())
+    spec_dict = {"steps": steps, "schedule": schedule}
+    spec_json = _json.dumps(spec_dict)
+
+    # Python code to run inside each container.
+    backoffice_code = f"""
+import redis, json
+r = redis.Redis(host='redis', port=6379, db=3)
+wf_id = {wf_id!r}
+account_id = {account_id!r}
+mapping = {{
+    b'account_id':        account_id.encode(),
+    b'owner_identity_id': account_id.encode(),
+    b'name':              {name!r}.encode(),
+    b'description':       b'OPA-every-hop demo workflow — step13e seed',
+    b'spec':              {spec_json!r}.encode(),
+    b'spec_hash':         b'seed',
+    b'enabled':           b'1',
+    b'created_at':        {now!r}.encode(),
+    b'updated_at':        {now!r}.encode(),
+}}
+r.hset(f'wf:meta:{{wf_id}}', mapping=mapping)
+r.sadd(f'wf:workflows:{{account_id}}', wf_id.encode())
+print('BACKOFFICE-REDIS-OK', wf_id)
+"""
+
+    gateway_code = f"""
+import redis, json
+from yashigani.gateway.workflow_scheduler import WorkflowSpec, WorkflowStep, WorkflowSchedule, _redis_set_spec
+r6 = redis.Redis(host='redis', port=6379, db=6)
+wf_id = {wf_id!r}
+account_id = {account_id!r}
+steps = {steps!r}
+schedule = {schedule!r}
+step_objs = [WorkflowStep(**s) for s in steps]
+sched_obj = WorkflowSchedule(**schedule)
+spec = WorkflowSpec(
+    workflow_id=wf_id,
+    owner_identity_id=account_id,
+    enabled=True,
+    steps=step_objs,
+    schedule=sched_obj,
+)
+_redis_set_spec(r6, spec)
+print('GATEWAY-REDIS-OK', wf_id)
+"""
+
+    # Execute in backoffice container (db/3).
+    r1 = subprocess.run(
+        ["docker", "exec", "localhost-backoffice-1", "python3", "-c", backoffice_code],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r1.returncode != 0 or "BACKOFFICE-REDIS-OK" not in r1.stdout:
+        print(f"  backoffice Redis injection failed: {r1.stderr[:200]}")
+        return None
+    print(f"  backoffice Redis injection: {r1.stdout.strip()}")
+
+    # Execute in gateway container (db/6).
+    r2 = subprocess.run(
+        ["docker", "exec", "localhost-gateway-1", "python3", "-c", gateway_code],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r2.returncode != 0 or "GATEWAY-REDIS-OK" not in r2.stdout:
+        print(f"  gateway Redis injection failed: {r2.stderr[:300]}")
+        # Fallback: try via redis-cli within gateway.
+        redis_cli_cmd = (
+            f"redis-cli -h redis -p 6379 -n 6 SET wf:spec:{wf_id} "
+            f"'{json.dumps({'workflow_id': wf_id, 'owner_identity_id': account_id, 'enabled': True, 'steps': steps, 'schedule': schedule})}'"
+        )
+        r3 = subprocess.run(
+            ["docker", "exec", "localhost-gateway-1", "sh", "-c", redis_cli_cmd],
+            capture_output=True, text=True, timeout=10,
+        )
+        print(f"  gateway redis-cli fallback: {r3.stdout.strip()} {r3.stderr.strip()[:100]}")
+    else:
+        print(f"  gateway Redis injection: {r2.stdout.strip()}")
+
+    return wf_id
+
 def step13c_mcp_import_ceremony() -> None:
     """
     4.0 — Seed the cloud-9 demo MCP's initial capability envelope via the governed
@@ -1508,6 +1886,14 @@ def main() -> None:
     # Step 13c: MCP Registry import ceremony (seed cloud9-demo capability envelope)
     # Must run AFTER step13 confirms demo-mcp is healthy.
     step13c_mcp_import_ceremony()
+
+    # Step 13d: Seed per-user personas/agents for BOLA demo surface.
+    # Requires user_creds (from step7c) to have new_pw + totp_secret.
+    persona_agents = step13d_seed_user_personas_and_agents(user_creds)
+
+    # Step 13e: Seed demo no-code workflow for ana (OPA-every-hop surface).
+    # Tries generate→commit via governed LLM; falls back to direct Redis inject.
+    step13e_seed_demo_workflow(user_creds, persona_agents)
 
     # Step 14: aspen break-glass verify (LAST, separate session, no mutation)
     step14_verify_aspen()
