@@ -389,6 +389,40 @@ return 1
                 return self.get(identity_id)
         return None
 
+    def get_by_account_id(self, account_id: str) -> Optional[dict]:
+        """Look up identity by account_id (UUID from the auth accounts table).
+
+        Returns None if no mapping exists (user has never logged in since the
+        account_id→idnt_ index was introduced, or link_account_id was never called).
+
+        Redis key: identity:account:{account_id} → identity_id (String)
+        """
+        if not account_id:
+            return None
+        identity_id = self._r.get(f"identity:account:{account_id}")
+        if not identity_id:
+            return None
+        if isinstance(identity_id, bytes):
+            identity_id = identity_id.decode("utf-8")
+        return self.get(identity_id)
+
+    def link_account_id(self, account_id: str, identity_id: str) -> None:
+        """Store a mapping from account_id (UUID) to identity_id (idnt_ PK).
+
+        Called by auth.py on successful human login to enable the workflow
+        scheduler to resolve owner_identity_id (stored as account_id UUID) to
+        the real identity (idnt_ PK) that OPA scope keys are keyed on.
+
+        Idempotent — safe to call on every login.
+        """
+        if not account_id or not identity_id:
+            return
+        self._r.set(f"identity:account:{account_id}", identity_id)
+        logger.debug(
+            "IdentityRegistry: linked account_id=%s -> identity_id=%s",
+            account_id, identity_id,
+        )
+
     def list_all(self, kind: IdentityKind | None = None) -> list[dict]:
         """List all identities, optionally filtered by kind."""
         if kind:

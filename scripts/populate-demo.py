@@ -469,7 +469,9 @@ def step7c_onboard_users(user_creds: dict) -> dict:
             continue
         us = _rq.Session(); us.verify = False
         _wait_next_totp_window(f"{username}-login")
-        code = _totp(totp_secret)
+        # LAURA-4.0-S1-001: user-tier accounts use SHA-256/6-digit TOTP (Phase 13).
+        # _totp() is SHA-1 (admin-side default); _user_totp_sha256() is correct here.
+        code = _user_totp_sha256(totp_secret)
         r = us.post(f"{BASE_URL}/auth/login", json={"username": username, "password": temp_pw, "totp_code": code})
         if r.status_code != 200:
             print(f"  {email}: first-login FAILED {r.status_code}: {r.text[:160]}"); continue
@@ -481,8 +483,10 @@ def step7c_onboard_users(user_creds: dict) -> dict:
                 print(f"  {email}: pw-change FAILED {rc.status_code}: {rc.text[:160]}"); continue
             creds["new_pw"] = new_pw
             # re-login with new pw to confirm + ensure active session/identity
+            # (this triggers _register_human_identity_on_login + link_account_id:
+            # LAURA-4.0-S1-001 — identity must exist in registry before binding).
             _wait_next_totp_window(f"{username}-relogin")
-            us.post(f"{BASE_URL}/auth/login", json={"username": username, "password": new_pw, "totp_code": _totp(totp_secret)})
+            us.post(f"{BASE_URL}/auth/login", json={"username": username, "password": new_pw, "totp_code": _user_totp_sha256(totp_secret)})
         print(f"  {email}: first-login OK, identity registered")
         # Admin-issue API key (titan session S, step-up). Ensure step-up fresh.
         _do_stepup_inline()
@@ -1047,6 +1051,13 @@ def step10_bind_policies() -> None:
             print("  Step-up expired — refreshing...")
             _do_stepup_inline()
             r = S.post(f"{BASE_URL}/admin/policies/bind", json=bdef)
+        # LAURA-4.0-S1-001: bind endpoint now normalises email scope_id → idnt_ PK.
+        # On re-run the duplicate-check above misses it (email != stored idnt_ PK)
+        # and the server returns 409.  Allow 409 as idempotent "already bound".
+        if r.status_code == 409:
+            print(f"  binding already exists (409 — scope_id normalised to idnt_ PK on prior run): "
+                  f"{bdef['policy_name']} -> {bdef['scope_kind']}:{bdef['scope_id']}")
+            continue
         body = _ok(r, f"bind-{bdef['policy_name']}->{bdef['scope_kind']}:{bdef['scope_id']}")
         print(f"  bound '{bdef['policy_name']}' -> {bdef['scope_kind']}:{bdef['scope_id']} ({bdef['direction']})")
 

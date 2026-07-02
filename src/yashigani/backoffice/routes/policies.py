@@ -1196,11 +1196,67 @@ async def bind_policy(body: BindRequest, session: StepUpAdminSession):
     if not await _client_policy_loaded(name):
         raise HTTPException(status_code=404, detail={"error": "policy_not_loaded",
                             "message": f"clients/{name} is not loaded in OPA — save+activate it first."})
+
+    scope_kind = body.scope_kind.strip().lower()
+    scope_id = body.scope_id.strip()
+
+    # LAURA-4.0-S1-001: normalize scope_id for human bindings to the identity
+    # registry PK (idnt_...).  OPA evaluates per-user policies against
+    # ``human:{identity_id}`` where identity_id = idnt_ PK; an email or slug
+    # as scope_id would never match and the binding would be silently ineffective.
+    #
+    # Normalization rules (scope_kind="human", scope_id non-empty):
+    #   - Already an idnt_ PK → accepted as-is.
+    #   - Email address → resolve via email_to_slug → registry.get_by_slug → idnt_.
+    #   - Slug (no "@") → resolve via registry.get_by_slug → idnt_.
+    #   - Unresolvable → 400 (reject rather than silently accept a no-op binding).
+    if scope_kind == "human" and scope_id and not scope_id.startswith("idnt_"):
+        id_registry = getattr(backoffice_state, "identity_registry", None)
+        if id_registry is not None:
+            resolved_id: Optional[str] = None
+            try:
+                if "@" in scope_id:
+                    # Treat as email → derive canonical slug → look up idnt_.
+                    from yashigani.identity.slug import email_to_slug
+                    candidate_slug = email_to_slug(scope_id)
+                    identity = id_registry.get_by_slug(candidate_slug)
+                else:
+                    # Treat as slug → direct slug lookup.
+                    identity = id_registry.get_by_slug(scope_id)
+                if identity:
+                    resolved_id = identity.get("identity_id", "")
+            except Exception as exc:
+                _log.warning(
+                    "bind_policy: scope_id resolution failed for %r (scope_kind=human): %s",
+                    scope_id, exc,
+                )
+            if resolved_id and resolved_id.startswith("idnt_"):
+                _log.info(
+                    "bind_policy: normalized scope_id %r -> %r (LAURA-4.0-S1-001)",
+                    scope_id, resolved_id,
+                )
+                scope_id = resolved_id
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_scope_id",
+                        "message": (
+                            f"human scope_id {scope_id!r} could not be resolved to an "
+                            "identity registry entry (idnt_ PK). "
+                            "For email/slug inputs the user must have logged in at least "
+                            "once to register their identity. "
+                            "Alternatively, pass the idnt_ PK directly "
+                            "(from GET /admin/identities)."
+                        ),
+                    },
+                )
+
     try:
         binding = store.add(PolicyBinding(
             policy_name=name,
-            scope_kind=body.scope_kind.strip().lower(),
-            scope_id=body.scope_id.strip(),
+            scope_kind=scope_kind,
+            scope_id=scope_id,
             direction=body.direction.strip().lower(),
         ))
     except ValueError as exc:

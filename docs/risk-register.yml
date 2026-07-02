@@ -2402,3 +2402,45 @@ risks:
       silent fallback to lenient. Enforced by scripts/check-caddyfile-csp-parity.sh.
   fix_in_version: v4.0
   last_threat_model_review: '2026-06-27'
+
+- id: YSG-RISK-106
+  description: >-
+    LAURA-4.0-S1-001: Fail-OPEN OPA bypass in scheduled workflow execution.
+    workflow_scheduler._make_scheduled_identity called non-existent
+    identity_registry.get_by_id() (AttributeError silently caught), fell back to a
+    synthetic identity whose slug was the raw account_id UUID. get_by_slug(UUID) returns
+    None, causing fallback to {"identity_id":"internal","kind":"service"} in the router.
+    OPA scope key becomes service:internal — human:idnt_* bindings never match.
+    All per-user client policies were silently bypassed on every workflow step, while the
+    same policies fired correctly on interactive chat/API calls. CVSS 8.2 (HIGH).
+    (LAURA-4.0-S1-001, CWE-284, CWE-273)
+  severity: high
+  controls_impacted:
+  - CWE-284 (Improper Access Control)
+  - CWE-273 (Improper Check for Dropped Privileges)
+  - ASVS V1.4.1 (Access Control Policy)
+  - ASVS V4.1.1 (General Access Control)
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-02'
+  closed_at: '2026-07-02'
+  closure_evidence:
+  - rationale: >-
+      Four-layer fix shipped in single commit referencing LAURA-4.0-S1-001:
+      (1) identity/registry.py: added get_by_account_id() with Redis index
+      identity:account:{account_id} and link_account_id() to populate the index on login.
+      (2) gateway/workflow_scheduler.py: _make_scheduled_identity rewritten fail-closed.
+      Primary lookup: get_by_account_id(owner_identity_id); fallback: get(owner_identity_id)
+      for SSO users where account_id == identity_id. Any failure returns _IDENTITY_UNRESOLVABLE
+      sentinel. _execute_workflow_run blocks immediately on sentinel (run.status=blocked)
+      and emits WorkflowRunFailedEvent. The silent except+synthetic-identity path is removed.
+      (3) backoffice/routes/auth.py: link_account_id() called after every successful login
+      in _register_human_identity_on_login() — backfills existing users on first login
+      post-upgrade. Idempotent.
+      (4) backoffice/routes/policies.py: bind_policy() normalizes human scope_id from
+      email/slug to idnt_ PK at bind time; rejects unresolvable inputs with HTTP 400.
+      Tests: 9/9 contract tests pass; 3 new tests (F1/F2/G) fail precisely on bypass regression.
+      populate-demo.py: step7c_onboard_users uses SHA-256/6-digit TOTP for user logins;
+      step10_bind_policies allows 409 (idempotent re-run after scope normalisation).
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-02'

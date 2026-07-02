@@ -48,6 +48,8 @@ from yashigani.gateway.workflow_scheduler import (
     WorkflowStepRecord,
     _redis_set_spec,
     _execute_workflow_run,
+    _make_scheduled_identity,
+    _IDENTITY_UNRESOLVABLE,
 )
 
 
@@ -120,11 +122,21 @@ async def test_execute_tool_call_invoked_for_every_step():
     """
     r = fakeredis.FakeRedis()
     n_steps = 3
-    spec = _make_spec(steps=[
+    owner_id = "user-opa-test"
+    spec = _make_spec(owner_id=owner_id, steps=[
         {"actor": f"@agent{i}", "action": f"step {i}", "uses": [], "output_to": ""}
         for i in range(n_steps)
     ])
     _redis_set_spec(r, spec)
+
+    # LAURA-4.0-S1-001: must provide a resolvable identity or the fail-closed guard
+    # blocks the run before any steps execute (which is the correct behaviour for
+    # unresolved principals, but would cause this OPA-invocation test to fail).
+    fake_registry = MagicMock()
+    fake_registry.get_by_account_id.return_value = {
+        "identity_id": owner_id, "slug": owner_id, "account_tier": "user", "groups": [],
+    }
+    fake_registry.get.return_value = None
 
     call_log: list[str] = []
 
@@ -140,6 +152,7 @@ async def test_execute_tool_call_invoked_for_every_step():
         run = await _execute_workflow_run(
             spec=spec,
             redis_client=r,
+            identity_registry=fake_registry,
             audit_writer=_NoopWriter(),
         )
 
@@ -169,11 +182,19 @@ async def test_step_record_opa_fields_populated_after_clean_run():
     would retain their empty default values).
     """
     r = fakeredis.FakeRedis()
-    spec = _make_spec(steps=[
+    owner_id = "user-opa-test"
+    spec = _make_spec(owner_id=owner_id, steps=[
         {"actor": "@Mimi", "action": "retrieve current status",
          "uses": [], "output_to": "@langflow"},
     ])
     _redis_set_spec(r, spec)
+
+    # LAURA-4.0-S1-001: must provide a resolvable identity.
+    fake_registry = MagicMock()
+    fake_registry.get_by_account_id.return_value = {
+        "identity_id": owner_id, "slug": owner_id, "account_tier": "user", "groups": [],
+    }
+    fake_registry.get.return_value = None
 
     # Return a clean result with explicit OPA verdicts
     async def _stub(*, tool_name, args, catalog, identity,
@@ -187,6 +208,7 @@ async def test_step_record_opa_fields_populated_after_clean_run():
         run = await _execute_workflow_run(
             spec=spec,
             redis_client=r,
+            identity_registry=fake_registry,
             audit_writer=_NoopWriter(),
         )
 
@@ -264,12 +286,20 @@ async def test_denied_step_halts_run_and_remaining_steps_not_called():
     ignores a deny verdict and continues, OPA policy is effectively bypassed.
     """
     r = fakeredis.FakeRedis()
-    spec = _make_spec(steps=[
+    owner_id = "user-opa-test"
+    spec = _make_spec(owner_id=owner_id, steps=[
         {"actor": "@Mimi",   "action": "step0-denied", "uses": [], "output_to": "@Juno"},
         {"actor": "@Juno",   "action": "step1-skipped", "uses": [], "output_to": ""},
         {"actor": "@Oracle", "action": "step2-skipped", "uses": [], "output_to": ""},
     ])
     _redis_set_spec(r, spec)
+
+    # LAURA-4.0-S1-001: must provide a resolvable identity.
+    fake_registry = MagicMock()
+    fake_registry.get_by_account_id.return_value = {
+        "identity_id": owner_id, "slug": owner_id, "account_tier": "user", "groups": [],
+    }
+    fake_registry.get.return_value = None
 
     executed_actors: list[str] = []
     audit_events: list[str] = []
@@ -292,6 +322,7 @@ async def test_denied_step_halts_run_and_remaining_steps_not_called():
         run = await _execute_workflow_run(
             spec=spec,
             redis_client=r,
+            identity_registry=fake_registry,
             audit_writer=_CapturingWriter(),
         )
 
@@ -338,12 +369,20 @@ async def test_empty_actor_produces_error_not_completed():
     which would allow an empty tool_name to be passed to _execute_tool_call.
     """
     r = fakeredis.FakeRedis()
-    spec = _make_spec(steps=[
+    owner_id = "user-opa-test"
+    spec = _make_spec(owner_id=owner_id, steps=[
         # Empty actor after stripping '@' — triggers the actor_not_found path.
         {"actor": "@", "action": "should not execute",
          "uses": [], "output_to": ""},
     ])
     _redis_set_spec(r, spec)
+
+    # LAURA-4.0-S1-001: must provide a resolvable identity.
+    fake_registry = MagicMock()
+    fake_registry.get_by_account_id.return_value = {
+        "identity_id": owner_id, "slug": owner_id, "account_tier": "user", "groups": [],
+    }
+    fake_registry.get.return_value = None
 
     executed: list[str] = []
 
@@ -359,6 +398,7 @@ async def test_empty_actor_produces_error_not_completed():
         run = await _execute_workflow_run(
             spec=spec,
             redis_client=r,
+            identity_registry=fake_registry,
             audit_writer=_NoopWriter(),
         )
 
@@ -405,13 +445,18 @@ async def test_step_execution_uses_owner_identity():
         captured_identities.append(dict(identity) if identity else {})
         return _clean_result()
 
+    # LAURA-4.0-S1-001: the CORRECT resolution path uses get_by_account_id (primary)
+    # then get() (fallback). Mocking the non-existent get_by_id (the old bug) would
+    # silently pass because MagicMock auto-creates unknown attribute access — which
+    # is precisely why the bypass was invisible until Laura's live pentest.
     fake_registry = MagicMock()
-    fake_registry.get_by_id.return_value = {
+    fake_registry.get_by_account_id.return_value = {
         "identity_id": owner_id,
         "slug": owner_id,
         "account_tier": "user",
         "groups": ["data-team"],
     }
+    fake_registry.get.return_value = None  # fallback should not be needed
 
     with patch(
         "yashigani.gateway.workflow_scheduler._execute_tool_call",
@@ -443,4 +488,125 @@ async def test_step_execution_uses_owner_identity():
     assert ident.get("_service_account") is None, (
         "INVARIANT E violated: identity carries _service_account marker. "
         "Scheduled hops must not use a shared service token."
+    )
+    # LAURA-4.0-S1-001: synthetic identities (the old bypass) carry _synthetic=True.
+    # If the bypass regresses, this assertion fails.
+    assert ident.get("_synthetic") is not True, (
+        "INVARIANT E violated: identity carries _synthetic=True. "
+        "The old bypass (get_by_id AttributeError → synthetic UUID slug) has regressed. "
+        "LAURA-4.0-S1-001 fix must be in place."
+    )
+
+
+# ---------------------------------------------------------------------------
+# F. Unresolvable owner identity MUST return the sentinel (unit-level)
+#    LAURA-4.0-S1-001
+# ---------------------------------------------------------------------------
+
+def test_make_scheduled_identity_returns_sentinel_when_registry_none():
+    """
+    INVARIANT F (unit): _make_scheduled_identity returns _IDENTITY_UNRESOLVABLE when
+    no registry is provided.
+
+    FAILS if the old bypass is re-introduced: returning a synthetic identity with
+    slug=owner_id instead of the sentinel causes _execute_workflow_run to continue
+    with a `service:internal` scope key, bypassing all per-user OPA policies.
+    """
+    result = _make_scheduled_identity("some-account-uuid", identity_registry=None)
+    assert result is _IDENTITY_UNRESOLVABLE or result.get("_unresolvable") is True, (
+        "LAURA-4.0-S1-001 regressed: _make_scheduled_identity returned a non-sentinel "
+        "when registry=None.  An unresolvable identity MUST deny, not pass."
+    )
+    assert result.get("identity_id") != "internal", (
+        "LAURA-4.0-S1-001 regressed: returned identity_id='internal' (service:internal scope). "
+        "This is the old bypass — all per-user OPA bindings are skipped when scope=service:internal."
+    )
+
+
+def test_make_scheduled_identity_returns_sentinel_when_lookups_return_none():
+    """
+    INVARIANT F (unit): _make_scheduled_identity returns _IDENTITY_UNRESOLVABLE when
+    both get_by_account_id AND get() return None (user not found in registry).
+
+    FAILS if any synthetic-identity fallback is re-introduced after a failed lookup.
+    """
+    fake_registry = MagicMock()
+    fake_registry.get_by_account_id.return_value = None
+    fake_registry.get.return_value = None
+
+    result = _make_scheduled_identity("unknown-account-uuid", identity_registry=fake_registry)
+    assert result is _IDENTITY_UNRESOLVABLE or result.get("_unresolvable") is True, (
+        "LAURA-4.0-S1-001 regressed: _make_scheduled_identity returned a non-sentinel "
+        "when both registry lookups returned None.  Must fail-closed."
+    )
+
+
+# ---------------------------------------------------------------------------
+# G. Unresolvable identity MUST block the run at the executor level
+#    LAURA-4.0-S1-001
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unresolvable_owner_identity_blocks_run():
+    """
+    INVARIANT G (integration): when _make_scheduled_identity returns the unresolvable
+    sentinel, _execute_workflow_run MUST:
+      - set run.status = "blocked"
+      - NOT call _execute_tool_call (OPA hops must not run for an unresolved principal)
+      - emit a WorkflowRunFailedEvent with reason containing "unresolvable"
+
+    FAILS if the sentinel check is removed from _execute_workflow_run:
+      - The run would proceed with an unresolved/synthetic identity
+      - OPA would evaluate using service:internal scope
+      - All per-user bindings would be silently bypassed (the original LAURA-4.0-S1-001 bug)
+    """
+    r = fakeredis.FakeRedis()
+    owner_id = "nonexistent-account-" + uuid.uuid4().hex[:8]
+    spec = _make_spec(owner_id=owner_id, steps=[
+        {"actor": "@Mimi", "action": "should not execute", "uses": [], "output_to": ""},
+    ])
+    _redis_set_spec(r, spec)
+
+    tool_call_log: list[str] = []
+    audit_events: list = []
+
+    async def _stub(*, tool_name, args, catalog, identity,
+                    depth, root_rid, iteration=0):
+        tool_call_log.append(tool_name)
+        return _clean_result()
+
+    class _CapturingWriter:
+        def write(self, event) -> None:
+            audit_events.append(event)
+
+    # Registry that cannot resolve the owner
+    fake_registry = MagicMock()
+    fake_registry.get_by_account_id.return_value = None
+    fake_registry.get.return_value = None
+
+    with patch(
+        "yashigani.gateway.workflow_scheduler._execute_tool_call",
+        new=_stub,
+    ):
+        run = await _execute_workflow_run(
+            spec=spec,
+            redis_client=r,
+            identity_registry=fake_registry,
+            audit_writer=_CapturingWriter(),
+        )
+
+    assert run.status == "blocked", (
+        f"INVARIANT G violated: run.status={run.status!r}, expected 'blocked'. "
+        "An unresolvable owner identity must block the run (fail-closed). "
+        "LAURA-4.0-S1-001: removing this check re-opens the OPA bypass."
+    )
+    assert tool_call_log == [], (
+        "INVARIANT G violated: _execute_tool_call was called despite unresolvable identity. "
+        "No OPA hop must fire for a run whose principal cannot be established."
+    )
+    # Verify audit event was emitted for the denial
+    event_names = [type(e).__name__ for e in audit_events]
+    assert "WorkflowRunFailedEvent" in event_names, (
+        "INVARIANT G violated: WorkflowRunFailedEvent not emitted for blocked run. "
+        "Unresolvable identity blocks must be audited."
     )

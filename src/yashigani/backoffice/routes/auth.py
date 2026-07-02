@@ -2405,6 +2405,17 @@ def _register_human_identity_on_login(record, state) -> None:
             slug,
             identity_id,
         )
+        # LAURA-4.0-S1-001: ensure account_id → idnt_ index is populated even
+        # for users whose identity already existed before this fix was deployed.
+        # link_account_id is idempotent — safe to call on every login.
+        try:
+            registry.link_account_id(record.account_id, identity_id)
+        except Exception as exc:
+            _log.warning(
+                "link_account_id failed for existing identity %s (account_id=%s): %s — "
+                "workflow scheduler may not resolve this user until next login",
+                identity_id, record.account_id, exc,
+            )
         return
 
     # New user — register with HUMAN kind.
@@ -2436,6 +2447,18 @@ def _register_human_identity_on_login(record, state) -> None:
                 "max": exc.max_val,
             },
         ) from exc
+
+    # LAURA-4.0-S1-001: store account_id → identity_id mapping so the workflow
+    # scheduler can resolve owner_identity_id (stored as account_id UUID) to the
+    # real identity PK that OPA scope keys are built from (human:{idnt_...}).
+    try:
+        registry.link_account_id(record.account_id, identity_id)
+    except Exception as exc:
+        _log.warning(
+            "link_account_id failed for new identity %s (account_id=%s): %s — "
+            "workflow scheduler may not resolve this user",
+            identity_id, record.account_id, exc,
+        )
 
     _log.info(
         "HUMAN identity registered on local-auth login: "

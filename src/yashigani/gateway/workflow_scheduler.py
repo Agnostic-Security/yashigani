@@ -273,38 +273,80 @@ def _cron_field_match(field: str, value: int, lo: int, hi: int) -> bool:
 # Identity helpers
 # ---------------------------------------------------------------------------
 
-def _make_scheduled_identity(owner_identity_id: str, identity_registry=None) -> dict:
-    """Build an identity dict for the workflow owner.
+# Sentinel returned by _make_scheduled_identity when the owner identity cannot
+# be resolved.  Callers MUST treat this as a deny (fail-closed): a scheduled
+# workflow step MUST NOT execute if the owner identity is unresolvable because
+# there is no real principal to evaluate per-user OPA policies against.
+# LAURA-4.0-S1-001: removing the synthetic fallback that previously allowed
+# workflows to bypass per-user client policies entirely.
+_IDENTITY_UNRESOLVABLE: dict = {"_unresolvable": True}
 
-    Prefers the live identity from the registry.  Falls back to a minimal
-    synthetic dict (scheduler cannot be blocked by a stale/unavailable registry).
-    The synthetic identity is marked account_tier='user' and has no extra groups —
-    OPA will evaluate it conservatively.
+
+def _make_scheduled_identity(owner_identity_id: str, identity_registry=None) -> dict:
+    """Resolve the workflow owner identity from the registry.
+
+    Returns the real identity dict on success (with ``_scheduled_workflow=True``
+    injected), or ``_IDENTITY_UNRESOLVABLE`` on failure.
+
+    FAIL-CLOSED (LAURA-4.0-S1-001): callers MUST deny execution when this
+    sentinel is returned.  A synthetic identity is NEVER returned because a
+    synthetic slug (e.g. an account_id UUID) cannot match any OPA binding,
+    which silently bypasses all per-user client policies.
+
+    Resolution order:
+      1. get_by_account_id(owner_identity_id) — primary path: owner_identity_id
+         is the account_id UUID stored at workflow-create time; the registry
+         index (identity:account:{account_id}) is populated by auth.py on login.
+      2. get(owner_identity_id) — fallback: if owner_identity_id was stored as
+         the idnt_ PK directly (forward-compatible path), resolve it directly.
     """
-    if identity_registry is not None:
+    if identity_registry is None:
+        logger.error(
+            "workflow: identity_registry unavailable — cannot resolve owner %r — "
+            "run will be denied (fail-closed, LAURA-4.0-S1-001)",
+            owner_identity_id,
+        )
+        return _IDENTITY_UNRESOLVABLE
+
+    real: Optional[dict] = None
+
+    # Primary path: account_id UUID → idnt_ PK (populated by auth.py on login).
+    if hasattr(identity_registry, "get_by_account_id"):
         try:
-            real = identity_registry.get_by_id(owner_identity_id)
-            if real:
-                d = real if isinstance(real, dict) else real.__dict__
-                # Ensure the identity signals it is operating as a scheduled NHI.
-                d = dict(d)
-                d["_scheduled_workflow"] = True
-                return d
+            real = identity_registry.get_by_account_id(owner_identity_id)
         except Exception as exc:
-            logger.warning(
-                "workflow: identity registry lookup failed for %s: %s — using synthetic",
+            logger.error(
+                "workflow: get_by_account_id(%r) raised %s — "
+                "falling through to get() before denying",
                 owner_identity_id, exc,
             )
-    # Synthetic minimal identity — conservative defaults.
-    return {
-        "identity_id": owner_identity_id,
-        "slug": owner_identity_id,
-        "account_tier": "user",
-        "groups": [],
-        "active": True,
-        "_scheduled_workflow": True,
-        "_synthetic": True,
-    }
+
+    # Fallback: direct idnt_ PK lookup (if owner_identity_id was already an idnt_ PK).
+    if real is None:
+        try:
+            real = identity_registry.get(owner_identity_id)
+        except Exception as exc:
+            logger.error(
+                "workflow: get(%r) raised %s — run will be denied "
+                "(fail-closed, LAURA-4.0-S1-001)",
+                owner_identity_id, exc,
+            )
+            return _IDENTITY_UNRESOLVABLE
+
+    if real is None:
+        logger.error(
+            "workflow: owner identity %r not found in registry (tried "
+            "get_by_account_id + get) — run will be denied "
+            "(fail-closed, LAURA-4.0-S1-001). "
+            "Ensure the user has logged in since v4.0 was deployed so that "
+            "the account_id→idnt_ index (identity:account:{id}) is populated.",
+            owner_identity_id,
+        )
+        return _IDENTITY_UNRESOLVABLE
+
+    d = dict(real if isinstance(real, dict) else vars(real))
+    d["_scheduled_workflow"] = True
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +742,23 @@ async def _execute_workflow_run(
 
     _redis_save_run(redis_client, run)
     identity = _make_scheduled_identity(spec.owner_identity_id, identity_registry)
+
+    # FAIL-CLOSED (LAURA-4.0-S1-001): if the owner identity cannot be resolved,
+    # deny the entire run immediately.  An unresolvable principal means there is
+    # no real identity to evaluate per-user OPA policies against — allowing the
+    # run to proceed would bypass all per-user client policy bindings.
+    if identity.get("_unresolvable"):
+        run.status = "blocked"
+        run.finished_at = time.time()
+        _redis_save_run(redis_client, run)
+        _emit_run_failed(audit_writer, run, reason="owner_identity_unresolvable")
+        logger.error(
+            "workflow: run %s BLOCKED — owner identity %r unresolvable "
+            "(fail-closed, LAURA-4.0-S1-001). No steps executed.",
+            run_id, spec.owner_identity_id,
+        )
+        return run
+
     _emit_run_started(audit_writer, run, spec)
 
     steps = spec.steps[:_MAX_STEPS]
@@ -1015,6 +1074,8 @@ __all__ = [
     "build_workflow_scheduler",
     "_execute_workflow_run",
     "_execute_tool_call",   # module-level patchable hook
+    "_make_scheduled_identity",
+    "_IDENTITY_UNRESOLVABLE",
     "_redis_list_runs",
     "_redis_get_run",
     "_redis_set_spec",
