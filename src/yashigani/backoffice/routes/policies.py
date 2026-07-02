@@ -1200,41 +1200,53 @@ async def bind_policy(body: BindRequest, session: StepUpAdminSession):
     scope_kind = body.scope_kind.strip().lower()
     scope_id = body.scope_id.strip()
 
-    # LAURA-4.0-S1-001: normalize scope_id for human bindings to the identity
-    # registry PK (idnt_...).  OPA evaluates per-user policies against
-    # ``human:{identity_id}`` where identity_id = idnt_ PK; an email or slug
-    # as scope_id would never match and the binding would be silently ineffective.
+    # LAURA-4.0-S1-001: normalize and validate scope_id for human bindings.
+    # OPA evaluates per-user policies against ``human:{identity_id}`` where
+    # identity_id = idnt_ PK.  An email, slug, or phantom idnt_ value as
+    # scope_id would never match and the binding would be silently ineffective.
     #
-    # Normalization rules (scope_kind="human", scope_id non-empty):
-    #   - Already an idnt_ PK → accepted as-is.
+    # Validation rules (scope_kind="human", scope_id non-empty):
     #   - Email address → resolve via email_to_slug → registry.get_by_slug → idnt_.
-    #   - Slug (no "@") → resolve via registry.get_by_slug → idnt_.
-    #   - Unresolvable → 400 (reject rather than silently accept a no-op binding).
-    if scope_kind == "human" and scope_id and not scope_id.startswith("idnt_"):
+    #   - Slug (no "@", no "idnt_" prefix) → resolve via registry.get_by_slug → idnt_.
+    #   - Already an idnt_ PK → STILL validate it exists in the registry (LOW:
+    #     a phantom idnt_ that was never registered creates a no-op binding).
+    #   - Unresolvable / not-found → 400 (reject, never silently accept a no-op binding).
+    if scope_kind == "human" and scope_id:
         id_registry = getattr(backoffice_state, "identity_registry", None)
         if id_registry is not None:
             resolved_id: Optional[str] = None
             try:
-                if "@" in scope_id:
+                if scope_id.startswith("idnt_"):
+                    # Already PK-form: validate it maps to a real identity.
+                    # LOW (LAURA-4.0-S1-001): a phantom idnt_ value that has no
+                    # registry entry creates a silently-ineffective additive-deny
+                    # binding.  Reject with 400 rather than accept the no-op.
+                    identity = id_registry.get(scope_id)
+                    if identity:
+                        resolved_id = scope_id  # valid — pass through unchanged
+                elif "@" in scope_id:
                     # Treat as email → derive canonical slug → look up idnt_.
                     from yashigani.identity.slug import email_to_slug
                     candidate_slug = email_to_slug(scope_id)
                     identity = id_registry.get_by_slug(candidate_slug)
+                    if identity:
+                        resolved_id = identity.get("identity_id", "")
                 else:
                     # Treat as slug → direct slug lookup.
                     identity = id_registry.get_by_slug(scope_id)
-                if identity:
-                    resolved_id = identity.get("identity_id", "")
+                    if identity:
+                        resolved_id = identity.get("identity_id", "")
             except Exception as exc:
                 _log.warning(
-                    "bind_policy: scope_id resolution failed for %r (scope_kind=human): %s",
+                    "bind_policy: scope_id validation failed for %r (scope_kind=human): %s",
                     scope_id, exc,
                 )
             if resolved_id and resolved_id.startswith("idnt_"):
-                _log.info(
-                    "bind_policy: normalized scope_id %r -> %r (LAURA-4.0-S1-001)",
-                    scope_id, resolved_id,
-                )
+                if resolved_id != scope_id:
+                    _log.info(
+                        "bind_policy: normalized scope_id %r -> %r (LAURA-4.0-S1-001)",
+                        scope_id, resolved_id,
+                    )
                 scope_id = resolved_id
             else:
                 raise HTTPException(
@@ -1242,12 +1254,17 @@ async def bind_policy(body: BindRequest, session: StepUpAdminSession):
                     detail={
                         "error": "invalid_scope_id",
                         "message": (
-                            f"human scope_id {scope_id!r} could not be resolved to an "
-                            "identity registry entry (idnt_ PK). "
-                            "For email/slug inputs the user must have logged in at least "
-                            "once to register their identity. "
-                            "Alternatively, pass the idnt_ PK directly "
-                            "(from GET /admin/identities)."
+                            f"human scope_id {scope_id!r} could not be resolved to a "
+                            "registered identity (idnt_ PK). "
+                            + (
+                                "The identity PK was not found in the registry — "
+                                "verify the idnt_ value is correct (GET /admin/identities)."
+                                if scope_id.startswith("idnt_") else
+                                "For email/slug inputs the user must have logged in at least "
+                                "once to register their identity. "
+                                "Alternatively, pass the idnt_ PK directly "
+                                "(from GET /admin/identities)."
+                            )
                         ),
                     },
                 )

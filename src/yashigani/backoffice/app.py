@@ -757,6 +757,49 @@ async def lifespan(app: FastAPI):
             "absent from Redis until restored manually", _ireconcile_exc
         )
 
+    # LAURA-4.0-S1-001 (MEDIUM): normalise stale email/slug scope_ids in policy
+    # bindings to the canonical idnt_ PK so they actually enforce.
+    # MUST run AFTER identity reconcile (above) so the full registry is in Redis
+    # before we attempt slug/email lookups.  If any bindings are rewritten the
+    # corrected document is re-pushed to OPA immediately (no wait for next mutation).
+    try:
+        _brid_store = backoffice_state.binding_store
+        _brid_registry = getattr(backoffice_state, "identity_registry", None)
+        if _brid_store is not None and _brid_registry is not None:
+            from yashigani.policy_bindings.reconcile import reconcile_binding_scope_ids
+            _brid_result = reconcile_binding_scope_ids(
+                binding_store=_brid_store,
+                identity_registry=_brid_registry,
+                opa_url=backoffice_state.opa_url,
+                audit_writer=backoffice_state.audit_writer,
+            )
+            if _brid_result["rewritten"] > 0 or _brid_result["unresolvable"] > 0:
+                _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                    "BINDING-RECONCILE: %d stale binding(s) rewritten to idnt_ PK, "
+                    "%d unresolvable (scope_id cannot be resolved — see audit log). "
+                    "OPA re-pushed: %s (LAURA-4.0-S1-001)",
+                    _brid_result["rewritten"],
+                    _brid_result["unresolvable"],
+                    _brid_result["opa_re_pushed"],
+                )
+            else:
+                _logging.getLogger("yashigani.backoffice.lifespan").info(
+                    "BINDING-RECONCILE: all %d human-scoped binding(s) already use "
+                    "idnt_ PKs — no rewrites needed (LAURA-4.0-S1-001)",
+                    _brid_result["already_pk"],
+                )
+        else:
+            _logging.getLogger("yashigani.backoffice.lifespan").warning(
+                "BINDING-RECONCILE: binding_store or identity_registry not wired — "
+                "stale scope_id normalisation skipped (LAURA-4.0-S1-001)"
+            )
+    except Exception as _brid_exc:
+        _logging.getLogger("yashigani.backoffice.lifespan").error(
+            "BINDING-RECONCILE: startup reconcile FAILED (%s) — stale email/slug "
+            "bindings may not enforce until the next redeploy (LAURA-4.0-S1-001)",
+            _brid_exc,
+        )
+
     # ISSUE-USER-PLANE-DURABILITY (4.0): wire the user-plane durable store and
     # run the startup reconciler. ua:* and wf:* keys in Redis db/3 are volatile
     # (appendonly no / save ""); a Redis recreate loses all user agents, memory

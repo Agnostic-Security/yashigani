@@ -448,6 +448,9 @@ class EventType(str, Enum):
     DATA_PROTECTION_WEAKEN_REQUESTED = "DATA_PROTECTION_WEAKEN_REQUESTED"
     DATA_PROTECTION_WEAKEN_APPROVED = "DATA_PROTECTION_WEAKEN_APPROVED"
     DATA_PROTECTION_WEAKEN_REJECTED = "DATA_PROTECTION_WEAKEN_REJECTED"
+    # LAURA-4.0-S1-001 (MEDIUM): startup reconcile rewrites stale email/slug
+    # scope_ids in policy bindings to the canonical idnt_ PK so they enforce.
+    BINDING_SCOPE_ID_RECONCILE = "BINDING_SCOPE_ID_RECONCILE"
 
 
 # ---------------------------------------------------------------------------
@@ -3874,6 +3877,30 @@ class PolicyUnboundEvent(AuditEvent):
     masking_applied: bool = True
     admin_account: str = ""
     binding_id: str = ""
+
+
+@dataclass
+class BindingScopeIdReconcileEvent(AuditEvent):
+    """Emitted by the startup reconciler that normalises stale policy-binding
+    scope_ids (email / slug) to canonical idnt_ PKs (LAURA-4.0-S1-001 MEDIUM).
+
+    Fields:
+      checked       — total human-scoped bindings examined.
+      rewritten     — bindings whose scope_id was rewritten to an idnt_ PK.
+      already_pk    — bindings already carrying an idnt_ PK (skipped).
+      unresolvable  — bindings whose scope_id could not be resolved to any
+                      registered identity (left in place, logged as WARNING).
+      opa_re_pushed — True if OPA was re-pushed after rewrites.
+    """
+
+    event_type: str = EventType.BINDING_SCOPE_ID_RECONCILE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    checked: int = 0
+    rewritten: int = 0
+    already_pk: int = 0
+    unresolvable: int = 0
+    opa_re_pushed: bool = False
 
 
 # ---------------------------------------------------------------------------

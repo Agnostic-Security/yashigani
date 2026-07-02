@@ -126,6 +126,24 @@ class BindingStore:
     def list(self) -> list[PolicyBinding]:
         return list(self._bindings.values())
 
+    def rewrite_scope_id(self, binding_id: str, new_scope_id: str) -> Optional[PolicyBinding]:
+        """Rewrite the scope_id of an existing binding in-place (idempotent).
+
+        LAURA-4.0-S1-001 (MEDIUM): used by the startup reconciler to normalise
+        stale email/slug scope_ids to the canonical idnt_ PK without changing
+        the binding's id or created_at.  The caller is responsible for
+        triggering an OPA re-push after calling this if OPA sync is needed.
+
+        Returns the updated binding, or None if binding_id is not found.
+        """
+        with self._lock:
+            binding = self._bindings.get(binding_id)
+            if binding is None:
+                return None
+            binding.scope_id = new_scope_id
+            self._redis.set(_KEY_BINDING.format(binding_id), json.dumps(binding.to_dict()))
+        return binding
+
     # -- OPA document -------------------------------------------------------
     def to_opa_document(self) -> dict:
         """Build the data document OPA expects at data.client_bindings:
