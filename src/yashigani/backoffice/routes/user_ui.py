@@ -798,10 +798,16 @@ async def user_upload_document(
 # Solution: a UserSession-gated backoffice proxy that:
 #   1. Validates the caller's user-tier session (cookie, server-side).
 #   2. Adds the per-install internal bearer  (YASHIGANI_INTERNAL_BEARER).
-#   3. Adds X-OpenWebUI-User-Email: <session.account_id> so the gateway can
-#      resolve per-user identity (the same trusted-forwarder pattern OWUI used).
-#      The gateway honours this header ONLY when the internal bearer is present
-#      (spoofing defence: without the bearer the header is ignored).
+#   3. Resolves the caller's Yashigani identity_id (idnt_ PK) from the
+#      identity registry via session.account_id → identity:account:{id} →
+#      identity_id.  Forwards as X-Yashigani-Identity-Id: <idnt_...>.
+#      The gateway honours this header ONLY when the internal bearer is
+#      present (spoofing defence: without the bearer the header is ignored;
+#      Caddy also strips it at the public edge).
+#      FAIL-CLOSED: if no identity_id can be resolved (registry down or no
+#      account→identity mapping) the proxy returns 503/403 rather than
+#      forwarding the account UUID as an email (the original FIND-4.0-CHAT-001
+#      residual that let email leak into the gateway's slug resolver).
 #   4. Streams the gateway SSE response back to the browser unchanged.
 #
 # The user's API key never leaves the server; the browser sees only the
@@ -812,6 +818,9 @@ async def user_upload_document(
 #   - UserSession dependency: rejects admin sessions (wrong_plane) and
 #     unauthenticated requests (401).
 #   - YASHIGANI_INTERNAL_BEARER absent → 503 at request time (fail-closed).
+#   - identity_registry unavailable → 503 (fail-closed, not degraded).
+#   - account_id not linked to an identity_id → 403 (user must log in once
+#     to populate the identity:account index, or admin must provision them).
 #   - All gateway errors (4xx/5xx) are forwarded verbatim so the browser
 #     can render the correct verdict banner.
 #
@@ -821,14 +830,21 @@ async def user_upload_document(
 
 _GATEWAY_STREAM_TIMEOUT_S = 300  # 5-minute timeout for streaming responses
 
+# Header name must match the constant in gateway/openai_router.py.
+# Caddy MUST strip this at the public edge (Su's Caddyfile task).
+_YASHIGANI_IDENTITY_ID_HEADER = "X-Yashigani-Identity-Id"
+
 
 @router.post("/user/chat/completions")
 async def user_chat_proxy(request: Request, session: UserSession):
     """FIND-4.0-CHAT-001 — Trusted-forwarder chat proxy.
 
-    Accepts the session cookie, adds the internal bearer + user identity
-    headers, and streams the gateway SSE response back verbatim.  The
-    user's API key is never exposed to the browser.
+    Accepts the session cookie, resolves the caller's Yashigani identity_id,
+    adds the internal bearer + identity header, and streams the gateway SSE
+    response back verbatim.  The user's API key is never exposed to the browser.
+
+    Fail-closed: if the identity_registry is unavailable or the caller's
+    account_id has no linked identity, returns 503/403 respectively.
 
     Body: OpenAI-compatible chat completion JSON (model, messages, …).
     Response: text/event-stream (SSE) mirrored from the gateway.
@@ -843,6 +859,81 @@ async def user_chat_proxy(request: Request, session: UserSession):
                     "YASHIGANI_INTERNAL_BEARER is not set — the chat proxy cannot "
                     "reach the governed gateway.  Contact your administrator."
                 ),
+            },
+        )
+
+    # ── Resolve caller's Yashigani identity_id (fail-closed) ────────────────
+    # session.account_id is the auth accounts UUID.  The identity:account:{id}
+    # Redis index maps it to the canonical idnt_ PK.  Populated by auth.py on
+    # every login (idempotent).  A None result means the account has never
+    # logged in since identity linking was introduced (3.1+) or the registry
+    # is unavailable — both are fail-closed.
+    id_registry = backoffice_state.identity_registry
+    if id_registry is None:
+        logger.error(
+            "user_chat_proxy: identity_registry unavailable — "
+            "cannot resolve identity_id for account %s (fail-closed 503)",
+            session.account_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "identity_registry_unavailable",
+                "message": (
+                    "Identity service temporarily unavailable. "
+                    "Try again shortly or contact your administrator."
+                ),
+            },
+        )
+
+    try:
+        caller_identity = id_registry.get_by_account_id(session.account_id)
+    except Exception as exc:
+        logger.error(
+            "user_chat_proxy: identity_registry.get_by_account_id(%s) raised %s — "
+            "fail-closed 503",
+            session.account_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "identity_registry_error",
+                "message": "Identity lookup failed. Try again shortly.",
+            },
+        )
+
+    if caller_identity is None:
+        logger.warning(
+            "user_chat_proxy: no identity linked to account_id=%s — "
+            "fail-closed 403 (account has not completed identity onboarding, "
+            "or identity:account index is not yet populated for this user)",
+            session.account_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "identity_not_found",
+                "message": (
+                    "Your Yashigani identity could not be resolved. "
+                    "Please log out and log back in, or contact your administrator."
+                ),
+            },
+        )
+
+    identity_id = caller_identity.get("identity_id", "")
+    if not identity_id or not identity_id.startswith("idnt_"):
+        # Registry returned a record without a valid idnt_ PK — should not
+        # happen in a well-provisioned install; fail-closed.
+        logger.error(
+            "user_chat_proxy: identity record for account %s has invalid "
+            "identity_id %r — fail-closed 503",
+            session.account_id, identity_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "identity_id_malformed",
+                "message": "Internal identity configuration error. Contact your administrator.",
             },
         )
 
@@ -861,8 +952,9 @@ async def user_chat_proxy(request: Request, session: UserSession):
     forward_headers = {
         "Authorization": f"Bearer {bearer}",
         # Trusted-forwarder identity: gateway resolves per-user RBAC from this
-        # header when the internal bearer is present (spoofing defence preserved).
-        "X-OpenWebUI-User-Email": session.account_id,
+        # header on the internal-bearer path (spoofing defence: without the bearer
+        # the gateway ignores this header; Caddy strips it at the public edge).
+        _YASHIGANI_IDENTITY_ID_HEADER: identity_id,
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
     }

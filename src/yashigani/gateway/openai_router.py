@@ -298,6 +298,121 @@ _OWUI_DEFAULT_SLUG: str = os.environ.get(
 ).strip()
 _OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
 
+# ---------------------------------------------------------------------------
+# 4.0 native WebUI trusted-forwarder header (LAURA-4.0-S1-001 close / identity_id contract)
+# ---------------------------------------------------------------------------
+# The 4.0 backoffice chat proxy resolves the caller's Yashigani identity_id
+# from the identity registry (keyed on session.account_id via the
+# identity:account:{account_id} Redis index) and forwards it as this header.
+#
+# Contract:
+#   - Value: idnt_ PK string (e.g. "idnt_abc123")
+#   - Trust boundary: honoured ONLY on the internal-bearer path (p2_forwarder
+#     or _INTERNAL_BEARER) — same trust gate as X-OpenWebUI-User-Email.
+#   - Caddy MUST strip this header at the public edge (Su's Caddyfile task).
+#   - If the header is present but the identity cannot be resolved: fail-closed
+#     (HTTP 403), do NOT fall back to the email path or an unauthenticated principal.
+# ---------------------------------------------------------------------------
+_YASHIGANI_IDENTITY_ID_HEADER = "x-yashigani-identity-id"
+
+
+def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]":
+    """Resolve identity from X-Yashigani-Identity-Id header on the trusted path.
+
+    CALLED ONLY from the internal-bearer fast-path (p2_forwarder or
+    _INTERNAL_BEARER branch) — i.e. the request is already proven to come
+    from the trusted backoffice forwarder.
+
+    Returns:
+        identity dict (with _identity_id_header marker) when the idnt_ key is
+        found in the registry.
+        None when the header is absent (fall through to other resolvers).
+
+    Raises:
+        HTTPException(403) when the header is present but the identity is not
+        found or the value is malformed.  Fail-closed: we NEVER fall back to
+        a lower-privilege path when the caller explicitly supplied an idnt_ key
+        that doesn't resolve — that is a bug in the forwarder, not a graceful
+        degradation scenario.
+        HTTPException(503) when the header is present but the identity registry
+        is unavailable.
+    """
+    from fastapi import HTTPException as _HTTPException
+
+    identity_id = request.headers.get(_YASHIGANI_IDENTITY_ID_HEADER, "").strip()
+    if not identity_id:
+        return None  # header absent — let caller fall through to email/API-key path
+
+    # Validate format: must start with "idnt_" prefix to distinguish from
+    # slugs, emails, or other values that could be injected.
+    if not identity_id.startswith("idnt_"):
+        logger.warning(
+            "_resolve_yashigani_identity_id_header: malformed identity_id %r — "
+            "expected idnt_ prefix; rejecting (fail-closed)",
+            identity_id,
+        )
+        raise _HTTPException(
+            status_code=403,
+            detail={
+                "error": "IDENTITY_ID_MALFORMED",
+                "message": (
+                    "X-Yashigani-Identity-Id value is malformed. "
+                    "Contact your administrator."
+                ),
+            },
+        )
+
+    if _state.identity_registry is None:
+        logger.error(
+            "_resolve_yashigani_identity_id_header: identity_id %r forwarded but "
+            "identity_registry is unavailable — fail-closed 503",
+            identity_id,
+        )
+        raise _HTTPException(
+            status_code=503,
+            detail={
+                "error": "IDENTITY_REGISTRY_UNAVAILABLE",
+                "message": "Identity registry unavailable. Try again shortly.",
+            },
+        )
+
+    try:
+        identity = _state.identity_registry.get(identity_id)
+    except Exception as exc:
+        logger.error(
+            "_resolve_yashigani_identity_id_header: registry lookup for %r raised %s — "
+            "fail-closed 503",
+            identity_id, exc,
+        )
+        raise _HTTPException(
+            status_code=503,
+            detail={
+                "error": "IDENTITY_REGISTRY_ERROR",
+                "message": "Identity registry error. Contact your administrator.",
+            },
+        )
+
+    if identity is None:
+        logger.warning(
+            "_resolve_yashigani_identity_id_header: identity %r not found in registry — "
+            "fail-closed 403 (no fallback to email/anonymous path)",
+            identity_id,
+        )
+        raise _HTTPException(
+            status_code=403,
+            detail={
+                "error": "IDENTITY_NOT_FOUND",
+                "message": (
+                    "Your Yashigani identity could not be resolved. "
+                    "Contact your administrator."
+                ),
+            },
+        )
+
+    identity = dict(identity)
+    identity["_yashigani_identity_header"] = True
+    return identity
+
 
 def _load_owui_slug_map() -> dict[str, str]:
     """Parse YASHIGANI_OWUI_SLUG_MAP (JSON object email->slug). Fail-safe: {}."""
@@ -4255,13 +4370,21 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                         "_orchestration_self_call": bool(orch_principal)}
 
             elif role_class == "p2_forwarder":
-                # P2 forwarder: OWUI trusted-forwarder path.
+                # P2 forwarder: backoffice/OWUI trusted-forwarder path.
                 # Strip any orchestration-principal header (forwarder is not the brain).
                 orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
                 if orch_hdr:
                     _emit_agent_header_stripped(
                         "x-yashigani-orchestration-principal", role_class, token_identity_id
                     )
+                # 4.0: prefer X-Yashigani-Identity-Id (idnt_ PK) over the email header.
+                # _resolve_yashigani_identity_id_header raises 403/503 on failure so
+                # control NEVER falls through to the email path when the idnt_ header
+                # is present (fail-closed per LAURA-4.0-S1-001).
+                yashigani_identity = _resolve_yashigani_identity_id_header(request)
+                if yashigani_identity is not None:
+                    return yashigani_identity
+                # Backward compat: 3.x OWUI forwarder sends X-OpenWebUI-User-Email.
                 owui_identity = _resolve_owui_forwarded_user(request)
                 if owui_identity is not None:
                     return owui_identity
@@ -4273,6 +4396,7 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                 # Strip any P2 impersonation headers and emit security event.
                 orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
                 owui_hdr = request.headers.get(_OWUI_USER_EMAIL_HEADER, "")
+                identity_id_hdr = request.headers.get(_YASHIGANI_IDENTITY_ID_HEADER, "")
                 if orch_hdr:
                     _emit_agent_header_stripped(
                         "x-yashigani-orchestration-principal", role_class, token_identity_id
@@ -4280,6 +4404,10 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                 if owui_hdr:
                     _emit_agent_header_stripped(
                         _OWUI_USER_EMAIL_HEADER, role_class, token_identity_id
+                    )
+                if identity_id_hdr:
+                    _emit_agent_header_stripped(
+                        _YASHIGANI_IDENTITY_ID_HEADER, role_class, token_identity_id
                     )
 
                 if role_class == "p1_nhi":
@@ -4343,23 +4471,24 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     real["_orchestration_self_call"] = True
                     return real
 
-            # ── Track C (F-B): OWUI trusted-forwarder per-user resolution ──
-            # The internal bearer establishes OWUI as a TRUSTED FORWARDER. Only
-            # here — having proven the bearer — do we honour OWUI's forwarded
-            # user header (X-OpenWebUI-User-Email) and resolve the ACTUAL
-            # per-user Yashigani identity so per-user/group/org RBAC applies.
+            # ── Track C (F-B): trusted-forwarder per-user resolution ──
+            # Priority 1 (4.0 native WebUI): X-Yashigani-Identity-Id (idnt_ PK).
+            #   The 4.0 backoffice chat proxy resolves identity_id from the session's
+            #   account_id and forwards the idnt_ PK directly.  No slug/email
+            #   derivation needed — the PK is looked up directly in the registry.
+            #   Fail-closed: if header present but identity not found → 403 (no fallback).
             #
-            # ORDERING: this runs AFTER the orchestration-principal check (which
-            # is the brain/orchestration self-call path) and is gated on the
-            # forwarded-user header being present. The brain reasoning leg and
-            # in-mesh agent self-calls carry NO X-OpenWebUI-User-* header, so
-            # they return None here and fall through to the flat `internal`
-            # identity below — the brain-reasoning marker (keys on identity_id
-            # == "internal") is preserved byte-for-byte.
+            # Priority 2 (3.x OWUI backward compat): X-OpenWebUI-User-Email.
+            #   OWUI (3.x) sets this to the user's email; the gateway derives a slug.
+            #   Preserved so existing 3.x deployments are unaffected.
             #
-            # SPOOFING DEFENSE: because we are inside the proven-internal-bearer
-            # branch, an external caller without the bearer never reaches this
-            # code, so it can never set X-OpenWebUI-User-* to impersonate a user.
+            # ORDERING: runs AFTER orchestration-principal check. Brain/in-mesh agent
+            # self-calls carry NEITHER header; they fall through to `internal`.
+            # SPOOFING DEFENSE: only inside the proven-internal-bearer branch; an
+            # external caller without the bearer never reaches this code.
+            yashigani_identity = _resolve_yashigani_identity_id_header(request)
+            if yashigani_identity is not None:
+                return yashigani_identity
             owui_identity = _resolve_owui_forwarded_user(request)
             if owui_identity is not None:
                 return owui_identity

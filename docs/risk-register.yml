@@ -2444,3 +2444,50 @@ risks:
       step10_bind_policies allows 409 (idempotent re-run after scope normalisation).
   fix_in_version: v4.0
   last_threat_model_review: '2026-07-02'
+
+- id: YSG-RISK-107
+  description: >-
+    Email-in-header residual on 4.0 native chat path (FIND-4.0-CHAT-001 / LAURA-4.0-S1-001).
+    The 4.0 backoffice chat proxy (user_ui.py /user/chat/completions) forwarded
+    X-OpenWebUI-User-Email: session.account_id to the gateway, but session.account_id
+    is a UUID (not an email). The gateway's _resolve_owui_forwarded_user then attempted
+    email_to_slug(UUID), producing an invalid slug that never matched any identity.
+    Per-user OPA/RBAC bindings were therefore silently bypassed on the 4.0 native chat
+    path: all requests resolved to the owui-users baseline instead of the caller's
+    identity. Same bypass class as YSG-RISK-106 (LAURA-4.0-S1-001). (CWE-284, CWE-287)
+  severity: high
+  controls_impacted:
+  - CWE-284 (Improper Access Control)
+  - CWE-287 (Improper Authentication)
+  - ASVS V1.4.1 (Access Control Policy)
+  - ASVS V4.1.1 (General Access Control)
+  compensating_controls:
+  - OPA org-ceiling deny-by-default applies at the policy layer even on baseline identity.
+  - Caddy session gate ensures only authenticated users reach the proxy endpoint.
+  - Internal-bearer path means no public spoofing of the forwarded header is possible.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-03'
+  closed_at: '2026-07-03'
+  closure_evidence:
+  - rationale: >-
+      user_ui.py /user/chat/completions now resolves caller identity_id via
+      identity_registry.get_by_account_id(session.account_id) (Redis key
+      identity:account:{account_id} → idnt_ PK) and forwards it as
+      X-Yashigani-Identity-Id: <idnt_...>. Fail-closed: if the registry is
+      unavailable → 503; if no account→identity mapping exists → 403; if the
+      record has no valid idnt_ PK → 503. X-OpenWebUI-User-Email is no longer
+      forwarded on the 4.0 chat path.
+      Gateway openai_router.py _resolve_yashigani_identity_id_header() reads
+      X-Yashigani-Identity-Id on the trusted path (p2_forwarder / _INTERNAL_BEARER)
+      and does a direct registry.get(identity_id) lookup (no slug derivation).
+      Fail-closed: header present + not found → 403; header present + registry
+      unavailable → 503; malformed (non-idnt_ prefix) → 403. Header absent →
+      None (falls through to OWUI email / API-key path for backward compat).
+      P1 agent branch now strips X-Yashigani-Identity-Id and emits
+      AGENT_HEADER_STRIPPED (same treatment as X-OpenWebUI-User-Email).
+      Caddy edge-strip of X-Yashigani-Identity-Id deferred to Su's Caddyfile
+      task (header is only trusted on the internal-bearer path — defense in depth).
+      12 regression tests in tests/regression/v4.0/test_identity_id_header_forwarding.py.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-03'
