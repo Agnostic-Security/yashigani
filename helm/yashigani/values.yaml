@@ -364,6 +364,12 @@ gateway:
     agentTokenMinLength: "64"
     # v0.5.0
     deploymentStream: "opensource"
+    # YSG-RISK-076 / DP-Y-003 §3.4: semantic-intent import classifier sidecar.
+    # Default "true" — every MCP tool import is screened by the Ollama-backed
+    # semantic-intent classifier before operator approval (day-one-poison close).
+    # Set to "false" to disable (e.g. air-gapped deployments without Ollama).
+    # Backend: ollamaUrl (http://yashigani-ollama:11434 above). No extra service.
+    semanticIntentSidecar: "true"
     # --- Orchestration caps (build-sheet §9 — operator-tunable; MF3 helm parity) ---
     # Mirrors docker-compose.yml x-gateway env exactly so Docker and K8s gateways
     # are config-equivalent. Read by src/yashigani/gateway/orchestrator.py via
@@ -451,6 +457,11 @@ backoffice:
   # install.sh path: install.sh generates DB_AES_KEY and sets this value
   # in _write_helm_values (removing the pre-seeding workaround).
   dbAesKey: ""
+  # YSG-RISK-076 / DP-Y-003 §3.4: semantic-intent import classifier sidecar (backoffice).
+  # Backoffice MCP import screen uses the same Ollama-backed classifier as the gateway.
+  # Default "true". Set to "false" to disable across both gateway and backoffice.
+  # Mirrors docker-compose.yml YASHIGANI_SEMANTIC_INTENT_SIDECAR on the backoffice service.
+  semanticIntentSidecar: "true"
   # v2.23.3 (#59): the backoffice K8s Secret (existingSecretName / default
   # "yashigani-backoffice-secrets") must contain the following keys:
   #   db_aes_key  — 64-char hex (32 bytes) or 44-char base64; used by

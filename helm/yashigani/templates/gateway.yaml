@@ -185,6 +185,13 @@ spec:
             {{- end }}
             - name: SKLEARN_MODEL_PATH
               value: {{ $gwEnv.sklearnModelPath | quote }}
+            # YSG-RISK-076 / DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
+            # Default ON: every MCP tool import is screened by the Ollama-backed
+            # semantic-intent classifier before operator approval (tool-poisoning /
+            # day-one-poison close). Uses same OLLAMA_BASE_URL backend as PII classifier.
+            # Set to "false" in values.yaml or via --set to disable.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.gateway.semanticIntentSidecar | default "true" | quote }}
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: POSTGRES_PASSWORD

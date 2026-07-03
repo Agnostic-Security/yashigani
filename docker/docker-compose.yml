@@ -413,6 +413,12 @@ services:
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       # Opt-in flag; production deployments default false.  Set true in .env for demo.
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
+      # Default ON: every MCP tool import is screened by the LLM semantic-intent
+      # classifier before approval (tool-poisoning / day-one-poison close).
+      # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
+      # Backend: same OLLAMA_BASE_URL (http://ollama:11434) as the PII classifier.
+      YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
       # Extractor sandbox: gateway does NOT spawn containers — only backoffice does.
       # These knobs are kept here only for completeness (MAX_OUTPUT_BYTES is read by
       # the proxy_modeb pipeline in the gateway). The sandbox runtime vars live in backoffice.
@@ -690,6 +696,16 @@ services:
       YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
+      # Backoffice MCP import screening uses the same Ollama-backed semantic-intent
+      # classifier as the gateway. Backoffice is on the `data` network and reaches
+      # ollama:11434 directly (same OLLAMA_BASE_URL default). Default ON.
+      # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
+      YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
+      # Ollama base URL for the semantic-intent sidecar (YSG-RISK-076).
+      # Explicit here so Tom's backoffice startup code has a reliable env var.
+      # Default matches the gateway OLLAMA_BASE_URL (same service on data network).
+      OLLAMA_BASE_URL: http://ollama:11434
       # Extractor sandbox — Design A (LAURA-30-001 / YSG-RISK-080 fix, 2026-06-16).
       # Backoffice calls the pre-spawned extractor-svc container over plain HTTP.
       # NO docker socket, NO socket-proxy, NO container API access in backoffice.

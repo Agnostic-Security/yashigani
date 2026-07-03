@@ -256,6 +256,12 @@ spec:
                   name: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
                   key: caddy_internal_hmac
             {{- end }}
+            # YSG-RISK-076 / DP-Y-003 §3.4 — semantic-intent import classifier sidecar
+            # (backoffice MCP import screen). Same Ollama backend as the gateway
+            # (OLLAMA_BASE_URL). Backoffice is on the data network and reaches
+            # ollama:11434 directly. Default ON; set "false" to disable.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
             # YSG-COMPOSE-ENV-001 Helm parity: backoffice reads YASHIGANI_INTERNAL_BEARER
             # from env (os.environ.get) — must be injected via secretKeyRef, not only
             # present in yashigani-agent-bearer for agent-bundle shims.
