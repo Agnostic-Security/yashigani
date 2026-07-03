@@ -449,6 +449,40 @@ class CorrespondenceTable:
     #: minted without a requester context (legacy / non-gated call shapes).
     owner_identity: str = ""
     tenant: str = ""
+    #: DP-Y-004 §3.1 — plaintext TTL.  The monotonic timestamp at which this
+    #: table was minted and the TTL in seconds, matching the companion
+    #: ``ReplacerMap`` so the plaintext and the encrypted vault expire together.
+    #: Default ``0.0`` / ``0`` means "no TTL metadata" — ``_expired()`` treats
+    #: this as expired (fail-closed) so old tables without metadata cannot be
+    #: retrieved indefinitely.
+    created_at: float = field(default=0.0, repr=False, compare=False)
+    ttl_s: int = field(default=0, repr=False, compare=False)
+    #: DP-Y-004 — single-use consumption flag.
+    #: Set to True by the reveal surface (``_detokenize_gate``) after the first
+    #: successful authorised retrieval.  Subsequent attempts find this True and are
+    #: rejected with a distinct 409 ``handle_already_consumed`` error that is also
+    #: audited.  Thread-safe in asyncio: the gate sets this to True in a
+    #: synchronous block (no ``await`` between the check and the set), so two
+    #: concurrent coroutines cannot both observe it as False — the first wins and
+    #: the second is rejected.  ``init=False`` keeps it out of ``__init__`` so
+    #: every call to :meth:`from_assigner` starts unconsumed by construction.
+    consumed: bool = field(default=False, repr=False, compare=False, init=False)
+
+    def _expired(self, now: Optional[float] = None) -> bool:
+        """True when this plaintext table is past its TTL — fail-closed.
+
+        Fail-closed: if ``created_at`` is zero/missing OR ``ttl_s`` is
+        zero/non-positive, treat the table as expired rather than as fresh.
+        A table minted without TTL metadata (e.g. created by old code or
+        constructed without the ``ttl_s`` / ``created_at`` parameters) must
+        not be retrievable indefinitely — it fails closed immediately.
+
+        Restores YSG-RISK-077 protection dropped in 4.0 port."""
+        if not self.created_at or self.ttl_s <= 0:
+            # Missing or invalid TTL metadata → fail-closed: expired.
+            return True
+        t = now if now is not None else time.monotonic()
+        return (t - self.created_at) >= self.ttl_s
 
     @classmethod
     def from_assigner(
@@ -458,13 +492,24 @@ class CorrespondenceTable:
         detokenize_rbac_role: str,
         owner_identity: str = "",
         tenant: str = "",
+        ttl_s: int = DEFAULT_MAP_TTL_S,
+        now: Optional[float] = None,
     ) -> "CorrespondenceTable":
+        """Mint a CorrespondenceTable from a token assigner.
+
+        Pass ``ttl_s`` from the companion :class:`ReplacerMap` so the
+        plaintext and the encrypted vault expire at the same wall-clock time
+        (DP-Y-004 §3.1 — the plaintext TTL matches the operator-facing vault
+        TTL).  YSG-RISK-077: ttl_s and created_at are required for the
+        plaintext-TTL + consumed gate in ``_detokenize_gate``."""
         return cls(
             rows=assigner.reverse_map,
             detokenize_rbac_role=detokenize_rbac_role,
             doc_hash=assigner.doc_hash,
             owner_identity=owner_identity,
             tenant=tenant,
+            created_at=now if now is not None else time.monotonic(),
+            ttl_s=ttl_s,
         )
 
     def to_csv(self) -> str:

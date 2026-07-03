@@ -65,6 +65,12 @@ class BackofficeState:
     dp_weaken_store: Optional[Any] = None                 # DpWeakenPendingStore (4.0 dual-admin data-protection maker-checker)
     capability_policy_store: Optional[Any] = None         # CapabilityPolicyStore (3.0 browser Permissions-Policy)
     user_plane_durable: Optional[Any] = None              # UserPlaneDurableStore (4.0 user-plane durability)
+    # YSG-RISK-076 (DP-Y-003 §3.4) — semantic-intent classifier sidecar for
+    # MCP import screening (day-one-poison screen).  Wired at startup when
+    # YASHIGANI_SEMANTIC_INTENT_SIDECAR=true and a classifier backend is
+    # available.  None when not configured — the import route degrades safely
+    # (records "not_configured" in the envelope scan verdict).
+    semantic_intent_sidecar: Optional[Any] = None    # SemanticIntentSidecar | None
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None

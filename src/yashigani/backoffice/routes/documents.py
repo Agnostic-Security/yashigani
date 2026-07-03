@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -144,6 +145,18 @@ def _push_document_policies() -> None:
 # read it back.  Demo-grade in-memory (request-scoped maps are TTL'd inside the
 # ReplacerMap itself; this index is the gateway's hold for the demo).
 _results: dict[str, object] = {}
+
+# DP-Y-004 §3.1 GAP-2 — sequential-replay tracking: the set of request_ids
+# whose correspondence table has been burned (first reveal consumed and
+# ``_burn_correspondence_table`` called by the route).  When a caller hits the
+# ``correspondence_table is None`` branch AND its request_id is in this set,
+# the request is a sequential replay — ``_audit_handle_replay`` fires before
+# the 404 so the audit log can distinguish "never had a table" from "burned
+# after first reveal and then replayed."  Growth is bounded by ``_results``
+# (same demo-grade in-memory lifecycle; a production deployment that migrates
+# ``_results`` to Redis must migrate ``_burned`` to a shared atomic store too).
+# Restored by YSG-RISK-077 — dropped in 4.0 port.
+_burned: set[str] = set()
 
 
 # ── Request / Response models ─────────────────────────────────────────────
@@ -739,15 +752,55 @@ async def _detokenize_gate(result, request_id: str, session, *, surface: str):
     """Shared fail-closed gate for the mode-A table surfaces (G-NEW-2 / R5).
 
     Returns the (table, role) on success.  Raises the appropriate HTTPException
-    (404 / 403) on any failure, NEVER leaking the table contents.  Enforces:
-    role membership AND identity+tenant binding (BOLA close).  Step-up is
-    enforced by the ``StepUpAdminSession`` dependency on the calling route.
+    (404 / 403 / 409) on any failure, NEVER leaking the table contents.
+    Enforces (in order): table present, TTL not expired, role membership,
+    identity+tenant binding (BOLA close), and single-use consumption.
+    Step-up is enforced by the ``StepUpAdminSession`` dependency on the
+    calling route.
 
-    LAURA-30-003: now async so ``_admin_in_detokenize_role`` can await the
+    YSG-RISK-077: restored the burned-handle flag, TTL expiry check, consumed
+    single-use gate, and replay-audit-before-404 that were dropped in the 4.0
+    port.  Mirrors 3.1.1 DP-Y-004 §3.1 GAP-1 + GAP-2 protections.
+
+    LAURA-30-003: async so ``_admin_in_detokenize_role`` can await the
     ``auth_service.get_account_by_id`` call needed to resolve UUID → email.
     """
     table = getattr(result, "correspondence_table", None)
     if table is None:
+        # GAP-2 (DP-Y-004 §3.1) — sequential-replay detection: if this
+        # request_id was previously burned (a first successful reveal already
+        # consumed and burned the table), this is a sequential replay.  Emit
+        # the replay audit event so the audit log can distinguish a replay from
+        # a request that never had a table.  The response is still 404 — we
+        # never leak that the table once existed beyond what the message says.
+        if request_id in _burned:
+            logger.warning(
+                "detokenize SEQUENTIAL REPLAY (%s): account=%s document=%s "
+                "— table previously burned; sequential replay detected (DP-Y-004 §3.1)",
+                surface, session.account_id, request_id,
+            )
+            _audit_handle_replay(session, request_id)
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "no_correspondence_table",
+                    "message": "Not a mode-A PSEUDONYMIZE result (or already retrieved — single-use)."},
+        )
+
+    # GAP-1 (DP-Y-004 §3.1) — plaintext TTL: the CorrespondenceTable carries
+    # its own TTL (minted from the same ``map_ttl_s`` as the companion
+    # ReplacerMap so the plaintext and the encrypted vault expire together).
+    # After expiry the plaintext is invalid; proactively drop it from the
+    # result so no subsequent call can retrieve it.
+    # Fail-closed: ``table._expired()`` returns True when TTL metadata is
+    # missing or zero (a table constructed without TTL is treated as expired,
+    # never as fresh).
+    if table._expired():
+        result.correspondence_table = None  # proactive drop — do not retain
+        logger.warning(
+            "detokenize TTL EXPIRED (%s): account=%s document=%s "
+            "— CorrespondenceTable past TTL; proactive drop (DP-Y-004 §3.1)",
+            surface, session.account_id, request_id,
+        )
         raise HTTPException(
             status_code=404,
             detail={"error": "no_correspondence_table",
@@ -770,10 +823,17 @@ async def _detokenize_gate(result, request_id: str, session, *, surface: str):
     # bound to the requester who minted it + this install's tenant; another
     # principal's handle or a cross-tenant request fails closed.  An UNBOUND
     # table (empty owner) is treated as not-retrievable through this surface.
+    # DP-Y-004: constant-time compares (secrets.compare_digest) prevent a timing
+    # oracle on the owner / tenant strings — matching the CT pattern already used
+    # for the ReplacerMap handle and the mode-B replacer-map path.
     owner = getattr(table, "owner_identity", "") or ""
     bound_tenant = getattr(table, "tenant", "") or ""
     this_tenant = _install_tenant()
-    if not owner or owner != session.account_id or bound_tenant != this_tenant:
+    if (
+        not owner
+        or not secrets.compare_digest(owner, session.account_id)
+        or not secrets.compare_digest(bound_tenant, this_tenant)
+    ):
         logger.warning(
             "detokenize IDENTITY/TENANT DENIED (%s): account=%s document=%s "
             "(bound owner present=%s tenant_match=%s) — BOLA close",
@@ -785,7 +845,62 @@ async def _detokenize_gate(result, request_id: str, session, *, surface: str):
             detail={"error": "detokenize_forbidden",
                     "reason": "identity_or_tenant_mismatch"},
         )
+
+    # DP-Y-004 — single-use capability-handle gate (atomic consumption).
+    #
+    # The correspondence table is the re-identification key (GDPR Art. 4(5)); per
+    # DP-Y-004 §3.1 a capability handle authorises EXACTLY ONE reveal.  A handle
+    # replayed within its TTL by the same authenticated principal must be rejected
+    # with a distinct 409 error and audited.
+    #
+    # Atomicity (asyncio): there is NO ``await`` between the ``if table.consumed``
+    # check and the ``table.consumed = True`` assignment below.  In a single-
+    # threaded asyncio event loop, a synchronous block is non-preemptible — no
+    # other coroutine can observe ``consumed=False`` and set it True in the same
+    # window.  The first concurrent caller wins; the second is rejected.
+    if table.consumed:
+        logger.warning(
+            "detokenize REPLAY REJECTED (%s): account=%s document=%s "
+            "— handle already consumed (DP-Y-004 single-use gate)",
+            surface, session.account_id, request_id,
+        )
+        _audit_handle_replay(session, request_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "handle_already_consumed",
+                "message": (
+                    "This correspondence table has already been retrieved (single-use). "
+                    "A capability handle authorises one reveal and is then consumed "
+                    "(DP-Y-004 §3.1). No further access is possible."
+                ),
+            },
+        )
+    # Atomically mark consumed (no await above → non-preemptible in asyncio).
+    table.consumed = True
+
     return table, role
+
+
+def _audit_handle_replay(session, request_id: str) -> None:
+    """Emit an audit event for a replayed (already-consumed) capability handle.
+
+    DP-Y-004 §3.1: every replay attempt is audited — the fact of the replay,
+    the acting identity, and the document reference.  The handle itself is
+    NOT written to the audit record (never-logged invariant).
+    Restored by YSG-RISK-077 — dropped in 4.0 port."""
+    if backoffice_state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import ConfigChangedEvent
+        backoffice_state.audit_writer.write(ConfigChangedEvent(
+            admin_account=session.account_id,
+            setting="document_correspondence_table_replay_rejected",
+            previous_value="(consumed)",
+            new_value=f"document={request_id} replay=rejected single_use=enforced dp_y004=active",
+        ))
+    except Exception:  # pragma: no cover - audit best-effort; never break the rejection path
+        logger.exception("handle-replay audit write failed for document=%s", request_id)
 
 
 def _audit_table_delivery(session, request_id: str, role: str, row_count: int) -> None:
@@ -804,13 +919,18 @@ def _audit_table_delivery(session, request_id: str, role: str, row_count: int) -
 
 
 def _burn_correspondence_table(result, request_id: str) -> None:
-    """Single-use / burn-after-read (G-NEW-2 / R5).
+    """Single-use / burn-after-read (G-NEW-2 / R5 / DP-Y-004 §3.1).
 
     Destroy the correspondence table AND the underlying encrypted ReplacerMap on
     the result so a leaked handle (or a replay of this retrieval) cannot
-    re-retrieve the crown jewel within the TTL.  Idempotent."""
+    re-retrieve the crown jewel within the TTL.  Records ``request_id`` in
+    ``_burned`` for sequential-replay detection (GAP-2 fix): a subsequent caller
+    who hits ``correspondence_table is None`` for this request_id will be
+    audited as a replay rather than silently returning an unrelated-miss 404.
+    Idempotent.  YSG-RISK-077: restored _burned.add — dropped in 4.0 port."""
     try:
         result.correspondence_table = None
+        _burned.add(request_id)  # GAP-2: mark burned for sequential-replay audit
         rmap = getattr(result, "replacer_map", None)
         if rmap is not None:
             rmap.destroy()

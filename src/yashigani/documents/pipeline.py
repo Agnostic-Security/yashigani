@@ -935,6 +935,7 @@ class DocumentInspectionPipeline:
                 detokenize_rbac_role=detokenize_rbac_role,
                 owner_identity=requester_identity,
                 tenant=tenant,
+                ttl_s=map_ttl_s,  # YSG-RISK-077: plaintext TTL matches companion ReplacerMap
             )
         else:
             replacer_map = ReplacerMap.create(

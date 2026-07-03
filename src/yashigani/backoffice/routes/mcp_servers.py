@@ -38,6 +38,7 @@ Last updated: 2026-06-30T00:00:00+00:00
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -105,6 +106,184 @@ def _tool_summary(rec) -> dict:
         "approved_by": rec.approved_by_operator_identity,
         "approved_at": rec.approved_at.isoformat() if rec.approved_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Day-one-poison screen (YSG-RISK-076 / DP-Y-003 §3.4)
+# ---------------------------------------------------------------------------
+
+def _screen_tools(server_id: str, raw_tools: list[dict]) -> dict:
+    """Run the M4 content filter + semantic-intent sidecar over the raw
+    tools/list surface (DP-Y-003 §3.4 import-time screening).
+
+    Returns ``sidecar_scan_verdict`` — the JSON blob recorded on the envelope
+    row.  It captures the filter results (tool count, schema count, any
+    rejections, any truncations, classifier verdict) so the audit chain holds
+    a complete record of what the operator reviewed.
+
+    YSG-RISK-076: wired the day-one-poison screen into the 4.0 import path
+    (POST /admin/mcp/servers/import).  In 3.1.1 this was ``envelope_import.py``
+    which was rewritten into ``mcp_servers.py`` without carrying the screen.
+
+    CT-1 (honesty invariant, DP-Y-003 §3.4): ``sidecar_used``,
+    ``classifier_status``, and ``filter_version`` are derived from whether the
+    classifier ACTUALLY evaluated each screened item — not from whether the
+    sidecar object exists.  Status values:
+      * ``"ran"``               — classifier ran on all items eligible for evaluation.
+      * ``"disabled_by_flag"``  — YASHIGANI_SEMANTIC_INTENT_SIDECAR flag was OFF.
+      * ``"unavailable_error"`` — sidecar object present + flag ON, but evaluate()
+                                  errored for ≥1 eligible item (partial ≠ success).
+      * ``"not_configured"``    — no sidecar object wired at startup (safe degrade).
+
+    CT-3 (§3.4 scope): tool descriptions AND canonicalised parameter schemas
+    (``inputSchema``) are screened via the same filter_description_v2 pipeline.
+
+    Human-in-the-loop (EU AI Act Art.14, DP-Y-003 §3.4): the classifier never
+    holds authority alone — a sidecar flag does NOT auto-reject the surface.
+    The operator review and approval step remains mandatory.
+    """
+    from yashigani.mcp._content_filter import build_catalogue
+    from yashigani.inspection.semantic_intent import sidecar_enabled
+
+    tenant_id = _install_tenant()
+    sidecar = backoffice_state.semantic_intent_sidecar  # SemanticIntentSidecar | None
+
+    # CT-3 (§3.4 scope): canonicalise and screen the inputSchema of each tool.
+    # Schemas are passed as additional screening items keyed "schema:<tool_name>".
+    schema_items: list[dict] = []
+    for raw in raw_tools:
+        name = str(raw.get("name") or "")
+        schema = raw.get("inputSchema")
+        if schema and isinstance(schema, dict):
+            schema_items.append({
+                "name": f"schema:{name}",
+                "content": json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            })
+
+    catalogue = build_catalogue(
+        tenant_id=tenant_id,
+        server_id=server_id,
+        raw_tools=raw_tools,
+        raw_prompts=schema_items,   # CT-3: includes per-tool schemas
+        sidecar=sidecar,
+    )
+
+    # Collect rejection / truncation / sidecar-escalation stats.
+    rejected_tools: list[str] = []
+    truncated_tools: list[str] = []
+    passed_tools: list[str] = []
+    sidecar_escalated: list[str] = []
+
+    for td in catalogue.tools:
+        if getattr(td.filter_result, "rejected", False):
+            rejected_tools.append(td.tool_name)
+            reject_reason = getattr(td.filter_result, "reject_reason", "") or ""
+            if reject_reason.startswith("semantic_intent"):
+                sidecar_escalated.append(td.tool_name)
+        elif len(td.safe_description) < len(str(
+            next(
+                (r.get("description", "") for r in raw_tools if r.get("name") == td.tool_name),
+                "",
+            )
+        )):
+            truncated_tools.append(td.tool_name)
+        else:
+            passed_tools.append(td.tool_name)
+
+    # CT-3: collect schema rejection stats.
+    schema_rejected: list[str] = []
+    for pd in catalogue.prompts:
+        if pd.filter_result.rejected:
+            schema_rejected.append(pd.prompt_name)
+
+    # CT-1 (honesty invariant): derive classifier attestation from FilterResult
+    # evaluation markers, NOT from sidecar object existence.
+    def _heuristic_only_rejected(fr) -> bool:
+        return bool(fr.rejected) and (fr.reject_reason or "") != "semantic_intent"
+
+    def _sidecar_annotated(fr) -> bool:
+        return fr.semantic_intent_score is not None
+
+    if sidecar is None:
+        classifier_status = "not_configured"
+        sidecar_used = False
+        filter_ver = "v2_heuristic"
+    elif not sidecar_enabled():
+        classifier_status = "disabled_by_flag"
+        sidecar_used = False
+        filter_ver = "v2_heuristic"
+    else:
+        all_results = (
+            [td.filter_result for td in catalogue.tools]
+            + [pd.filter_result for pd in catalogue.prompts]
+        )
+        eligible = [fr for fr in all_results if not _heuristic_only_rejected(fr)]
+        evaluated = [fr for fr in eligible if _sidecar_annotated(fr)]
+
+        if len(eligible) == 0:
+            classifier_status = "ran"
+            sidecar_used = False
+            filter_ver = "v2_heuristic"
+        elif len(evaluated) == len(eligible):
+            classifier_status = "ran"
+            sidecar_used = True
+            filter_ver = "v2_semantic"
+        else:
+            classifier_status = "unavailable_error"
+            sidecar_used = False
+            filter_ver = "v2_heuristic"
+
+    verdict: dict = {
+        "sidecar_used": sidecar_used,
+        "classifier_status": classifier_status,
+        "filter_version": filter_ver,
+        "tool_count": len(raw_tools),
+        "schema_count": len(schema_items),
+        "passed": len(passed_tools),
+        "rejected": len(rejected_tools),
+        "truncated": len(truncated_tools),
+    }
+    if rejected_tools:
+        verdict["rejected_tools"] = rejected_tools
+    if truncated_tools:
+        verdict["truncated_tools"] = truncated_tools
+    if sidecar_escalated:
+        verdict["sidecar_escalations"] = sidecar_escalated
+    if schema_rejected:
+        verdict["schema_rejected"] = schema_rejected
+
+    # Suspicious-content flag: surface to the operator at import time.
+    # Human still decides — this flag does NOT auto-block.
+    verdict["suspicious_content_flagged"] = bool(
+        rejected_tools or sidecar_escalated or schema_rejected
+    )
+
+    if classifier_status in ("disabled_by_flag", "not_configured"):
+        logger.info(
+            "mcp-import: semantic-intent classifier %s for server=%r "
+            "— heuristic-only screening applied (DP-Y-003 §3.4 degraded mode)",
+            classifier_status, server_id,
+        )
+    elif classifier_status == "unavailable_error":
+        logger.warning(
+            "mcp-import: sidecar enabled+present but evaluate() errored for "
+            "≥1 eligible item — recording unavailable_error in verdict (server=%r)",
+            server_id,
+        )
+
+    if rejected_tools:
+        logger.warning(
+            "mcp-import: M4 filter rejected %d tool description(s) for server=%r: %s "
+            "— operator is importing with sanitised surface",
+            len(rejected_tools), server_id, rejected_tools,
+        )
+    if schema_rejected:
+        logger.warning(
+            "mcp-import: M4 filter rejected %d schema item(s) for server=%r: %s",
+            len(schema_rejected), server_id, schema_rejected,
+        )
+
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +455,16 @@ async def import_mcp_server(
             },
         )
 
-    # 2. Project the raw surface into a typed capability envelope.
+    # 2. Day-one-poison screen (YSG-RISK-076 / DP-Y-003 §3.4).
+    #    Run BEFORE minting so the verdict is recorded on the envelope and
+    #    visible to the operator at import time.  Human still decides — a flag
+    #    does NOT auto-reject (EU AI Act Art.14 / DP-Y-003 §3.4).
+    #    Degrades safely: when YASHIGANI_SEMANTIC_INTENT_SIDECAR is not
+    #    configured, classifier_status="not_configured" is recorded — the import
+    #    is NOT silently passed as clean.
+    scan_verdict = _screen_tools(body.server_id, raw_tools)
+
+    # 3. Project the raw surface into a typed capability envelope.
     tenant = _install_tenant()
     provenance_id = f"{tenant}:{body.server_id}"
     env = project_surface(
@@ -286,7 +474,7 @@ async def import_mcp_server(
         egress_posture=body.egress_posture,
     )
 
-    # 3. Mint the initial approved envelope (v1 / import ceremony).
+    # 4. Mint the initial approved envelope (v1 / import ceremony).
     svc = _envelope_service()
     try:
         new_id = await svc.mint_envelope(
@@ -294,17 +482,26 @@ async def import_mcp_server(
             server_id=body.server_id,
             operator_identity=session.account_id,
             topology=body.topology,
+            sidecar_scan_verdict=scan_verdict,  # YSG-RISK-076: persist screen verdict
         )
     except Exception as exc:
         envelope, _ = safe_error_envelope(exc, public_message="envelope mint failed")
         raise HTTPException(status_code=500, detail=envelope)
 
     tool_names = sorted(env.tools.keys())
+    suspicious = scan_verdict.get("suspicious_content_flagged", False)
     logger.info(
         "mcp-servers: imported server_id=%r provenance=%r tools=%d envelope_id=%d "
-        "by admin=%s",
+        "by admin=%s screen=%s suspicious=%s",
         body.server_id, provenance_id, len(tool_names), new_id, session.account_id,
+        scan_verdict.get("classifier_status"), suspicious,
     )
+    if suspicious:
+        logger.warning(
+            "mcp-servers: day-one-poison screen FLAGGED suspicious content on "
+            "server=%r — operator review required before trusting this surface",
+            body.server_id,
+        )
 
     return {
         "server_id": body.server_id,
@@ -315,4 +512,6 @@ async def import_mcp_server(
         "topology": body.topology,
         "egress_posture": body.egress_posture,
         "approved_by": session.account_id,
+        "sidecar_scan_verdict": scan_verdict,            # YSG-RISK-076: surface for operator
+        "suspicious_content_flagged": suspicious,         # day-one-poison screen result
     }
