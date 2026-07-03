@@ -149,6 +149,13 @@ class EventType(str, Enum):
     # recorded here; only the 403/substitute ACTION was relaxed.  A would-have-
     # blocked reasoning turn is greppable via this event (relaxation_applied=true).
     ORCHESTRATION_BRAIN_REASONING_RELAXED = "ORCHESTRATION_BRAIN_REASONING_RELAXED"
+    # v4.0 — external_api connection enforcement (Item A — deferred from 3.1).
+    # Emitted when an orchestrator api__ tool hop is DENIED by the runtime
+    # external_api grant check (org grant absent/revoked → blocked before HTTP call).
+    EXTERNAL_API_BLOCKED = "EXTERNAL_API_BLOCKED"
+    # v4.0 — mcp_id lifecycle events (Item B — mcp_id minting + backfill reconcile)
+    MCP_ID_MINTED = "MCP_ID_MINTED"
+    MCP_ID_GRANT_RECONCILED = "MCP_ID_GRANT_RECONCILED"
     # v0.9.0 — Break-glass (S-04)
     BREAK_GLASS_ACTIVATED = "BREAK_GLASS_ACTIVATED"
     BREAK_GLASS_EXPIRED = "BREAK_GLASS_EXPIRED"
@@ -1642,6 +1649,86 @@ class OrchestrationBrainReasoningRelaxedEvent(AuditEvent):
     opa_reason: str = ""             # the response-OPA deny reason that was relaxed
     sensitivity: str = ""            # prompt sensitivity at relaxation time
     relaxation_applied: bool = True  # always True for this event (greppable flag)
+
+
+# ---------------------------------------------------------------------------
+# v4.0 — external_api enforcement (Item A) + mcp_id lifecycle (Item B)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExternalApiBlockedEvent(AuditEvent):
+    """Emitted when an orchestrator api__ tool hop is DENIED by the external_api
+    runtime grant check.
+
+    The org-level external_api grant for the target host was absent or revoked,
+    so the outbound HTTP call was never made.  Only the SHA-256 hash of the
+    attempted URL path is stored; the raw path (which may contain query params
+    with sensitive values) is never stored.
+
+    Security invariants:
+    - Raw URL path/query is never stored — only SHA-256 hash.
+    - host is the grant key (stable DNS name, not the display connection name).
+    - deny_reason distinguishes org_grant_absent (no grant seeded/approved)
+      from org_grant_denied (grant explicitly deny=True).
+
+    v4.0 / external_api connection enforcement.
+    """
+
+    event_type: str = EventType.EXTERNAL_API_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""         # = identity_id (queryable principal)
+    agent_id: str = "orchestrator"
+    connection_name: str = ""    # display name of the api__ connection (not the grant key)
+    host: str = ""               # grant key (stable DNS name)
+    method: str = ""             # HTTP method attempted
+    path_hash: str = ""          # SHA-256 of path (raw path never stored)
+    depth: int = 0
+    deny_reason: str = ""        # org_grant_absent | org_grant_denied
+
+
+@dataclass
+class McpIdMintedEvent(AuditEvent):
+    """Emitted when a new stable mcp_id is minted for an MCP server on startup.
+
+    On first startup after 4.0 upgrade, or when a new server_name is seen,
+    a UUID is minted and stored persistently.  This event records the minting
+    so the audit trail tracks every server identity lifecycle event.
+
+    v4.0 / mcp_id stability (Item B).
+    """
+
+    event_type: str = EventType.MCP_ID_MINTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""         # human-readable display name (mutable)
+    mcp_id: str = ""             # stable UUID (immutable after mint)
+    is_backfill: bool = False    # True when minted during reconcile (existing server)
+
+
+@dataclass
+class McpIdGrantReconciledEvent(AuditEvent):
+    """Emitted when startup reconcile copies a name-keyed MCP grant to mcp_id key.
+
+    Backfill: on first startup after 4.0 upgrade, grants stored at
+    perm:grant:mcp_server:org:{org_id}:{agent_name} are copied to
+    perm:grant:mcp_server:org:{org_id}:{mcp_id} so the broker's
+    _check_connection_permit() can switch to mcp_id keys.
+
+    v4.0 / mcp_id stability (Item B).
+    """
+
+    event_type: str = EventType.MCP_ID_GRANT_RECONCILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""         # the old name key that was backfilled
+    mcp_id: str = ""             # the new stable key
+    org_id: str = ""
+    grants_copied: int = 0       # number of grant scopes copied
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,12 @@ class McpBrokerServerConfig:
     tenant_id: str
     agent_name: str
     is_git_agent: bool = False
+    # v4.0 Item B — stable UUID minted once at first registration.
+    # Keyed in: perm:grant:mcp_server:org:{org_id}:{mcp_id}
+    # When present, McpBroker._check_connection_permit() uses mcp_id as the
+    # grant key instead of agent_name so renaming a server does NOT orphan grants.
+    # Populated by build_registry_from_env() via McpIdStore.get_or_mint().
+    mcp_id: str = ""
 
 
 class McpBrokerRegistry:
@@ -118,6 +124,7 @@ def build_registry_from_env(
     envelope_service: Optional[object] = None,
     permission_store: Optional[object] = None,  # PermissionStore — 3.1 Phase 4
     org_id: str = "default",                    # 3.1 Phase 4 — org ceiling
+    mcp_id_store: Optional[object] = None,      # McpIdStore — 4.0 Item B
 ) -> tuple[McpBrokerRegistry, object]:  # (registry, jwks_store | None)
     """
     Parse YASHIGANI_MCP_SERVERS and build a McpBrokerRegistry.
@@ -253,6 +260,32 @@ def build_registry_from_env(
         is_filesystem_agent = bool(entry.get("is_filesystem_agent", False))
         is_git_agent = bool(entry.get("is_git_agent", False))
 
+        # v4.0 Item B — mint (or restore) a stable mcp_id for this server.
+        # Precedence:
+        #   1. Explicit "mcp_id" field in the YASHIGANI_MCP_SERVERS entry (operator-pinned).
+        #   2. Existing entry in McpIdStore Redis (persisted from prior startup).
+        #   3. Freshly minted UUID (first-time registration).
+        # When no mcp_id_store is supplied (dev/test without Redis), fall back to
+        # agent_name as the grant key (backward-compatible — grants work as before).
+        _entry_mcp_id: str = str(entry.get("mcp_id", "")).strip()
+        _resolved_mcp_id: str = ""
+        if mcp_id_store is not None:
+            try:
+                _resolved_mcp_id = mcp_id_store.get_or_mint(  # type: ignore[union-attr]
+                    agent_name,
+                    override_mcp_id=_entry_mcp_id or None,
+                )
+            except Exception as _id_exc:
+                logger.warning(
+                    "mcp-registry: mcp_id mint/lookup failed for agent=%r: %s — "
+                    "falling back to agent_name as grant key",
+                    agent_name, _id_exc,
+                )
+        elif _entry_mcp_id:
+            # No store but operator pinned an id — honour it.
+            _resolved_mcp_id = _entry_mcp_id
+        # Else: empty → broker falls back to agent_name (legacy path, no-op).
+
         broker_cfg = McpBrokerConfig(
             opa_url=opa_url,
             tenant_id=tenant_id,
@@ -279,6 +312,7 @@ def build_registry_from_env(
             is_git_agent=is_git_agent,
             tenant_id=tenant_id,
             agent_name=agent_name,
+            mcp_id=_resolved_mcp_id,   # v4.0 Item B — stable grant key
         )
 
         registry.register(agent_name, broker, server_cfg)

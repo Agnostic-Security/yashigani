@@ -612,6 +612,240 @@ def _extract_mcp_text(upstream: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _execute_api_call — external_api connection enforcement (v4.0 Item A)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _path_hash(path: str) -> str:
+    """SHA-256 of a URL path for audit.  Raw path never stored in audit log."""
+    return hashlib.sha256((path or "").encode("utf-8")).hexdigest()[:32]
+
+
+async def _execute_api_call(
+    *,
+    connection_name: str,
+    api_host: str,
+    api_url: str,
+    args: dict,
+    identity,
+    depth: int,
+    root_rid: str,
+    request_id: str,
+) -> ToolResult:
+    """Execute one external API hop end-to-end with runtime grant enforcement.
+
+    Enforcement order (Item A — external_api connection enforcement):
+
+    1. GRANT CHECK — resolve_boolean_grant(EXTERNAL_API, api_host, org_id, ...)
+       BEFORE the HTTP call.  Deny-by-default: hosts without an org-level grant
+       are blocked here.  Deny → ExternalApiBlockedEvent audit, blocked notice.
+       The grant is keyed by HOST (stable DNS name), not by connection display
+       name.  Revoking the grant immediately blocks all subsequent calls.
+
+    2. Static Caddy egress_allow (C1 guard) — defense-in-depth at the network
+       layer.  Both must pass; this function enforces the runtime grant layer.
+
+    3. OUTBOUND HTTP via net.HttpClient with SSRF guardrails (scheme allowlist,
+       private-IP rejection, timeout ceiling).
+
+    4. ResponseInspection on the result (before it can re-enter model context).
+
+    5. OPA EGRESS decision on the result (sensitivity ceiling).
+
+    Effective permission model:
+        allowed = org_external_api_grant(host)
+                  AND NOT any_group_deny(host)
+                  AND NOT user_deny(host)
+        (org-ceiling resolution via resolve_boolean_grant — mirrors MCP broker
+        _check_connection_permit pattern)
+
+    Fail-closed on any exception from the grant check (resolve_boolean_grant
+    already catches all errors and returns False).
+    """
+    from yashigani.audit.schema import ExternalApiBlockedEvent, OrchestrationBlockedStepEvent
+    from yashigani.permissions import ResourceType, resolve_boolean_grant, DEFAULT_ORG_ID
+    from yashigani.gateway.openai_router import _state
+
+    pid = _principal_id(identity)
+    path = str(args.get("path", "/")).strip() or "/"
+    method = str(args.get("method", "GET")).strip().upper() or "GET"
+    body = args.get("body") if isinstance(args.get("body"), dict) else None
+    extra_headers = args.get("headers") if isinstance(args.get("headers"), dict) else {}
+
+    # ── 1. Runtime grant check — external_api BEFORE any outbound call ────────
+    #
+    # This is the enforcement point deferred from 3.1 (seeder.py:68).
+    # org_id: YASHIGANI_ORG_ID env (DEFAULT_ORG_ID fallback = "default").
+    # The caller's group and user context applies for narrowing (org is ceiling).
+    perm_store = _state.permission_store
+    _org_id = DEFAULT_ORG_ID
+
+    # Extract caller context for group/user narrowing.
+    _identity_dict = identity or {}
+    _user_email: Optional[str] = (
+        _identity_dict.get("email") or _identity_dict.get("identity_id") or None
+    )
+    _group_ids: list[str] = [
+        str(g) for g in (_identity_dict.get("groups") or []) if g
+    ]
+
+    if perm_store is None:
+        # No permission store configured — fail-closed in production.
+        # Allow in dev (YASHIGANI_ENV != production) for backward compat.
+        import os as _os
+        _env = _os.environ.get("YASHIGANI_ENV", "").strip().lower()
+        if _env in {"production", "staging"}:
+            notice = (
+                f"[BLOCKED BY YASHIGANI POLICY] External API call to '{api_host}' "
+                "was denied: permission store not configured (fail-closed in production). "
+                "Set REDIS_URL and ensure the permission store initialises at startup."
+            )
+            _audit(ExternalApiBlockedEvent(
+                root_request_id=root_rid, request_id=request_id,
+                identity_id=pid, session_id=pid,
+                connection_name=connection_name, host=api_host,
+                method=method, path_hash=_path_hash(path), depth=depth,
+                deny_reason="permission_store_not_configured",
+            ))
+            return ToolResult(notice, blocked=True, ingress_opa="deny:no_perm_store",
+                              http_status=403, block_source="external_api_grant")
+        # Dev/test without permission store — allow (non-prod only).
+        logger.debug(
+            "orchestration: external_api grant check skipped "
+            "(no perm store, non-prod) host=%s connection=%s",
+            api_host, connection_name,
+        )
+    else:
+        _grant_allowed = resolve_boolean_grant(
+            ResourceType.EXTERNAL_API,
+            api_host,
+            org_id=_org_id,
+            group_ids=_group_ids,
+            user_email=_user_email,
+            store=perm_store,
+        )
+        if not _grant_allowed:
+            deny_reason = "org_grant_absent"
+            notice = (
+                f"[BLOCKED BY YASHIGANI POLICY] External API connection to "
+                f"'{connection_name}' (host={api_host}) is not permitted by the "
+                "organisation's external_api grant policy. An admin must approve "
+                f"this connection via POST /admin/permissions/declarations/"
+                f"external_api/{api_host}/approve."
+            )
+            _audit(ExternalApiBlockedEvent(
+                root_request_id=root_rid, request_id=request_id,
+                identity_id=pid, session_id=pid,
+                connection_name=connection_name, host=api_host,
+                method=method, path_hash=_path_hash(path), depth=depth,
+                deny_reason=deny_reason,
+            ))
+            logger.warning(
+                "orchestration: external_api DENIED connection=%s host=%s "
+                "identity=%s reason=%s",
+                connection_name, api_host, pid, deny_reason,
+            )
+            return ToolResult(notice, blocked=True, ingress_opa=f"deny:{deny_reason}",
+                              http_status=403, block_source="external_api_grant")
+
+    # ── 2+3. Make the outbound HTTP call via HttpClient (SSRF guard) ──────────
+    from yashigani.net import HttpClient, BlockedByPolicy
+
+    full_url = api_url.rstrip("/") + "/" + path.lstrip("/")
+    # Safety: do NOT let args-supplied headers override Authorization or Host.
+    _safe_headers: dict[str, str] = {
+        k: str(v)
+        for k, v in (extra_headers or {}).items()
+        if k.lower() not in ("authorization", "host", "cookie", "x-api-key")
+    }
+
+    result_text: str
+    upstream_status: int
+    try:
+        http = HttpClient()
+        # Dispatch to the method-specific async helper (HttpClient exposes
+        # get/post/put/patch/delete rather than a generic request() method).
+        _method_map = {
+            "GET": http.get, "POST": http.post, "PUT": http.put,
+            "PATCH": http.patch, "DELETE": http.delete,
+        }
+        _caller = _method_map.get(method, http.get)
+        _kwargs: dict = {"headers": _safe_headers}
+        if body is not None and method in ("POST", "PUT", "PATCH"):
+            _kwargs["json"] = body
+        resp = await _caller(full_url, **_kwargs)
+        upstream_status = resp.status_code
+        try:
+            result_text = resp.text[:8000]   # cap response size entering model context
+        except Exception:
+            result_text = f"[API response: status={resp.status_code}]"
+    except BlockedByPolicy as bpe:
+        # SSRF guard fired — the URL resolved to a blocked host/range.
+        notice = (
+            f"[BLOCKED BY YASHIGANI SSRF GUARD] The external API call to "
+            f"'{connection_name}' ({full_url}) was blocked by the network policy: {bpe}"
+        )
+        _audit(ExternalApiBlockedEvent(
+            root_request_id=root_rid, request_id=request_id,
+            identity_id=pid, session_id=pid,
+            connection_name=connection_name, host=api_host,
+            method=method, path_hash=_path_hash(path), depth=depth,
+            deny_reason="ssrf_guard_blocked",
+        ))
+        return ToolResult(notice, blocked=True, ingress_opa="deny:ssrf_guard",
+                          http_status=403, block_source="ssrf_guard")
+    except Exception as exc:
+        logger.warning(
+            "orchestration: external_api HTTP error connection=%s host=%s: %s",
+            connection_name, api_host, exc,
+        )
+        return ToolResult(
+            f"[API ERROR] Connection '{connection_name}' to {api_host} failed: {exc}",
+            blocked=False, ingress_opa="allow", egress_opa="not_applicable",
+            inspection_verdict="skipped", http_status=502,
+        )
+
+    # ── 4. ResponseInspection on the result ───────────────────────────────────
+    verdict, confidence, _ = _inspect_result(result_text, identity, request_id)
+
+    # ── 5. Classify result sensitivity + OPA EGRESS ──────────────────────────
+    result_sensitivity = _classify_sensitivity(result_text)
+    egress = await _opa_egress_for_mcp_result(
+        identity, connection_name, f"api_call:{method}:{path}",
+        verdict, response_sensitivity=result_sensitivity,
+    )
+    egress_allow = egress.get("allow", False)
+    egress_reason = egress.get("reason", "ok")
+
+    if verdict == "BLOCKED" or not egress_allow:
+        block_source = (
+            "both" if (verdict == "BLOCKED" and not egress_allow)
+            else "response_inspection" if verdict == "BLOCKED"
+            else "opa_egress"
+        )
+        notice = _BLOCK_NOTICE.format(conf=confidence, rid=request_id)
+        from yashigani.gateway.tool_catalog import sanitise_tool_token as _sanitise
+        _audit(OrchestrationBlockedStepEvent(
+            root_request_id=root_rid, request_id=request_id, identity_id=pid,
+            session_id=pid, agent_id="orchestrator",
+            tool_name=f"api__{_sanitise(connection_name)}", tool_kind="api",
+            depth=depth, block_source=block_source,
+            egress_opa_decision=("deny:" + egress_reason) if not egress_allow else "allow",
+            inspection_verdict=verdict, inspection_confidence=confidence,
+            response_content_hash=_content_hash(result_text),
+        ))
+        return ToolResult(notice, blocked=True, ingress_opa="allow",
+                          egress_opa=("deny:" + egress_reason) if not egress_allow else "allow",
+                          inspection_verdict=verdict, inspection_confidence=confidence,
+                          http_status=502, block_source=block_source,
+                          content_hash=_content_hash(result_text))
+
+    return ToolResult(result_text, blocked=False, ingress_opa="allow", egress_opa="allow",
+                      inspection_verdict=verdict, inspection_confidence=confidence,
+                      http_status=upstream_status)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # execute_tool_call — routing per tool kind (build sheet §3.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -699,6 +933,21 @@ async def _execute_tool_call(*, tool_name: str, args: dict, catalog, identity,
         return await _execute_mcp_tool(
             server=entry.target, upstream_url=entry.mcp_url or "", tool=entry.mcp_tool or "",
             args=args, identity=identity, depth=depth, root_rid=root_rid, request_id=request_id,
+        )
+
+    if entry.kind == "api":
+        # v4.0 Item A — external_api connection enforcement.
+        if not isinstance(args, dict):
+            args = {}
+        return await _execute_api_call(
+            connection_name=entry.target,
+            api_host=entry.api_host or "",
+            api_url=entry.api_url or "",
+            args=args,
+            identity=identity,
+            depth=depth,
+            root_rid=root_rid,
+            request_id=request_id,
         )
 
     return ToolResult(f"[UNSUPPORTED TOOL KIND] {entry.kind}", blocked=True,

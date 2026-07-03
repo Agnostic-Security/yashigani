@@ -854,6 +854,23 @@ def _build_app(mesh_mode: bool = False):
         # Reuse the same YASHIGANI_ORG_ID that the capability policy store uses.
         _perm_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
 
+        # v4.0 Item B — mint stable mcp_id per MCP server using db/3 Redis.
+        # Uses the same redis_client_rbac (db 3) as PermissionStore — the
+        # id_store keys live under a separate mcp: prefix.  When Redis is
+        # unavailable (permission_store=None), fall back gracefully.
+        _mcp_id_store = None
+        if redis_client_rbac is not None:
+            try:
+                from yashigani.mcp._id_store import McpIdStore
+                _mcp_id_store = McpIdStore(redis_client_rbac)
+                logger.info("mcp-id-store: McpIdStore initialised (Redis db/3)")
+            except Exception as _id_store_exc:
+                logger.warning(
+                    "mcp-id-store: McpIdStore init failed — mcp_id minting "
+                    "unavailable, grants keyed by agent_name (fallback): %s",
+                    _id_store_exc,
+                )
+
         _mcp_registry, _mcp_jwks_store = build_registry_from_env(
             opa_url=opa_url,
             audit_writer=audit_writer,
@@ -861,6 +878,8 @@ def _build_app(mesh_mode: bool = False):
             # When permission_store is None (Redis unavailable), the check no-ops.
             permission_store=permission_store,
             org_id=_perm_org_id,
+            # v4.0 Item B — pass the id store so each server gets a stable mcp_id.
+            mcp_id_store=_mcp_id_store,
         )
         _extra_routers: list = [openai_router]
 
@@ -881,9 +900,13 @@ def _build_app(mesh_mode: bool = False):
                 len(_mcp_registry),
             )
 
-            # 3.1 Phase 4 — seed org-level MCP server grants (B1 / auto-seed).
+            # 3.1 Phase 4 / 4.0 Item A — seed org-level grants (B1 / auto-seed).
+            # Seeds both MCP server grants AND external API host grants.
             # Idempotent; runs at every startup so grants stay in sync with
-            # YASHIGANI_MCP_SERVERS.  Only runs when permission_store is available.
+            # YASHIGANI_MCP_SERVERS + YASHIGANI_EXTERNAL_APIS.
+            # NOTE (4.0 Item A): external_api grants are now ENFORCED at
+            # runtime by orchestrator._execute_api_call().  Absent seed =
+            # deny-by-default for all api__ tool calls.
             if permission_store is not None:
                 try:
                     from yashigani.permissions import seed_mcp_grants
@@ -899,21 +922,68 @@ def _build_app(mesh_mode: bool = False):
                             ]
                         except Exception:
                             pass
+                    # 4.0 Item A — parse YASHIGANI_EXTERNAL_APIS to collect
+                    # approved external API hosts for org-level grant seeding.
+                    _ext_api_raw = os.environ.get("YASHIGANI_EXTERNAL_APIS", "").strip()
+                    _ext_api_hosts: list = []
+                    if _ext_api_raw:
+                        try:
+                            _ext_api_entries = _json.loads(_ext_api_raw)
+                            _ext_api_hosts = [
+                                str(e.get("host", "")).strip()
+                                for e in _ext_api_entries
+                                if isinstance(e, dict) and e.get("host", "").strip()
+                            ]
+                        except Exception as _parse_exc:
+                            logger.warning(
+                                "YASHIGANI_EXTERNAL_APIS invalid JSON — "
+                                "external_api grants not seeded: %s",
+                                _parse_exc,
+                            )
                     seed_mcp_grants(
                         perm_store=permission_store,
                         server_ids=_server_ids,
                         org_id=_perm_org_id,
+                        external_api_hosts=_ext_api_hosts or None,
                     )
                     logger.info(
-                        "MCP permission seeder: seeded %d server grant(s) for org=%s",
-                        len(_server_ids), _perm_org_id,
+                        "Permission seeder: seeded %d MCP server grant(s) + "
+                        "%d external_api grant(s) for org=%s",
+                        len(_server_ids), len(_ext_api_hosts), _perm_org_id,
                     )
+
+                    # v4.0 Item B — reconcile name-keyed grants to mcp_id-keyed grants.
+                    # On first startup after upgrade, existing grants may be stored at
+                    # agent_name keys; copy them to mcp_id keys so the new broker path
+                    # (which uses mcp_id as grant key) passes correctly.
+                    if _mcp_id_store is not None:
+                        _reconcile_total = 0
+                        try:
+                            for _sn in _server_ids:
+                                if not _sn:
+                                    continue
+                                _mid = _mcp_id_store.get_mcp_id_for_name(_sn)
+                                if _mid:
+                                    _reconcile_total += _mcp_id_store.reconcile_grants(
+                                        permission_store, _perm_org_id, _sn, _mid,
+                                    )
+                            logger.info(
+                                "mcp-id-store: reconciled %d name→id grant(s) for org=%s",
+                                _reconcile_total, _perm_org_id,
+                            )
+                        except Exception as _rec_exc:
+                            logger.warning(
+                                "mcp-id-store: grant reconcile failed (non-fatal): %s",
+                                _rec_exc,
+                            )
+
                 except Exception as _seed_exc:
                     # Seeding failure is non-fatal at startup but deny-by-default
-                    # will apply to ALL MCP servers until next restart seeds them.
+                    # will apply to ALL MCP servers + external API hosts until
+                    # the next restart seeds them.
                     logger.warning(
-                        "MCP permission seeder FAILED (%s) — deny-by-default "
-                        "applies to all MCP servers until next restart",
+                        "Permission seeder FAILED (%s) — deny-by-default "
+                        "applies to all MCP servers + external API hosts until next restart",
                         _seed_exc,
                     )
         else:

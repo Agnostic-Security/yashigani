@@ -16,13 +16,21 @@ Sources:
   • MCP tools    — tools/list from each onboarded MCP server (broker registry)
                    OR, in the Phase-1 demo wiring, the configured demo upstream:
                    ``mcp__<server>__<tool>`` with the server-declared schema.
+  • external APIs — org-approved outbound HTTP connections from
+                   YASHIGANI_EXTERNAL_APIS env var (v4.0, Item A):
+                   ``api__<sanitised-name>`` with ``{path, method?, body?}`` schema.
+                   Grant check ``resolve_boolean_grant(external_api, host, ...)``
+                   is enforced at EXECUTION time by _execute_api_call() in
+                   orchestrator.py — deny-by-default if no org grant exists.
+                   The connection identity (grant key) is the HOST, not the name,
+                   so renaming a connection does NOT orphan its grant.
 
 The catalog returns BOTH the OpenAI tool-def list (offered to the model) and a
 ``name_map`` resolving each synthetic tool name back to its concrete target
-(agent slug / model id / mcp server+tool+schema).  A name not in the map is
-rejected by the executor (no SSRF surface — assertion / §7.4).
+(agent slug / model id / mcp server+tool+schema / api host+url).  A name not in
+the map is rejected by the executor (no SSRF surface — assertion / §7.4).
 
-# Last updated: 2026-06-10T00:00:00+00:00
+# Last updated: 2026-07-03T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -39,6 +47,7 @@ logger = logging.getLogger(__name__)
 _AGENT_PREFIX = "agent__"
 _MODEL_PREFIX = "model__"
 _MCP_PREFIX = "mcp__"
+_API_PREFIX = "api__"    # v4.0 — external API connections (Item A)
 
 # Sanitise a model id (dots/colons/slashes) into a tool-name-safe token.
 _SANITISE_RE = re.compile(r"[^a-z0-9_]+")
@@ -61,12 +70,20 @@ def sanitise_tool_token(raw: str) -> str:
 class CatalogEntry:
     """Resolution target for one catalog tool name."""
 
-    kind: str          # "agent" | "model" | "mcp"
+    kind: str          # "agent" | "model" | "mcp" | "api"
     # agent: the @slug to self-call.  model: the real model id.  mcp: server name.
+    # api: the connection display name (NOT the grant key — see api_host for that).
     target: str
     # mcp only: the upstream tool name + the upstream JSON-RPC URL.
     mcp_tool: Optional[str] = None
     mcp_url: Optional[str] = None
+    # api (external_api, v4.0 Item A):
+    #   api_host — the hostname used as the grant key in resolve_boolean_grant().
+    #              Stable across connection renames.  This is what the org grant
+    #              is keyed on: perm:grant:external_api:org:{org_id}:{api_host}.
+    #   api_url  — the full base URL for outbound HTTP calls (e.g. "https://api.github.com").
+    api_host: Optional[str] = None
+    api_url: Optional[str] = None
     # The JSON-Schema offered to the model for this tool (for arg validation hints).
     parameters: dict = field(default_factory=dict)
 
@@ -267,12 +284,108 @@ def build_tool_catalog(
     for server_name, upstream_url in mcp_servers.items():
         tools.extend(_mcp_tools_from_upstream(server_name, upstream_url, name_map))
 
+    # 4) External API connections (v4.0, Item A).
+    #    Projected from YASHIGANI_EXTERNAL_APIS; each connection appears as
+    #    api__<name>.  Enforcement (resolve_boolean_grant) fires at execution
+    #    time in _execute_api_call() — deny-by-default if no org grant.
+    tools.extend(_external_api_tools(name_map))
+
     logger.info(
         "tool_catalog: built %d tool(s) for identity=%s (agents+models+mcp): %s",
         len(tools), identity.get("identity_id", "?") if identity else "anonymous",
         sorted(name_map.keys()),
     )
     return ToolCatalog(tools=tools, name_map=name_map)
+
+
+def _external_api_tools(name_map: dict[str, CatalogEntry]) -> list[dict]:
+    """Project external API connections into the tool catalog (v4.0, Item A).
+
+    Source: YASHIGANI_EXTERNAL_APIS — JSON array of:
+        [{"name": str, "host": str, "base_url": str, "description": str?}, ...]
+
+    Each entry becomes ``api__<sanitised-name>`` with a ``{path, method?, body?}``
+    schema.  The grant key is ``host`` (stable DNS name, not the mutable ``name``).
+
+    Connection identity invariant: the org-level grant is keyed by HOST, not by
+    the display name.  Renaming a connection entry does NOT orphan its grant.
+
+    Enforcement: resolve_boolean_grant(EXTERNAL_API, host, ...) is called at
+    EXECUTION time in orchestrator._execute_api_call(), not here.  The catalog
+    is a projection of *configured* connections; actual enforcement is deny-by-
+    default at call time.
+    """
+    raw = os.environ.get("YASHIGANI_EXTERNAL_APIS", "").strip()
+    if not raw:
+        return []
+
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("tool_catalog: YASHIGANI_EXTERNAL_APIS invalid JSON: %s", exc)
+        return []
+
+    if not isinstance(entries, list):
+        logger.warning("tool_catalog: YASHIGANI_EXTERNAL_APIS must be a JSON array")
+        return []
+
+    _api_schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "API endpoint path (e.g. '/v1/repos/owner/repo/issues').",
+            },
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                "description": "HTTP method (default: GET).",
+            },
+            "body": {
+                "type": "object",
+                "description": "Request body (for POST/PUT/PATCH — must be JSON-serialisable).",
+            },
+            "headers": {
+                "type": "object",
+                "description": "Additional request headers (non-auth; no Authorization override).",
+            },
+        },
+        "required": ["path"],
+    }
+
+    out: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        host = str(entry.get("host", "")).strip()
+        base_url = str(entry.get("base_url", "")).strip()
+        if not name or not host or not base_url:
+            logger.warning(
+                "tool_catalog: YASHIGANI_EXTERNAL_APIS entry missing name/host/base_url — skipped"
+            )
+            continue
+        description = str(entry.get("description", "")) or f"Call the {name} external API."
+        tool_name = f"{_API_PREFIX}{sanitise_tool_token(name)}"
+        out.append({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": (
+                    f"{description} "
+                    f"(host={host}; runtime grant check enforced; deny-by-default)"
+                ),
+                "parameters": _api_schema,
+            },
+        })
+        name_map[tool_name] = CatalogEntry(
+            kind="api",
+            target=name,
+            api_host=host,
+            api_url=base_url,
+            parameters=_api_schema,
+        )
+    return out
 
 
 def _resolve_mcp_servers() -> dict[str, str]:

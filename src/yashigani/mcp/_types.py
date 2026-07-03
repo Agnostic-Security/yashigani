@@ -111,6 +111,12 @@ class McpCallContext:
 
     # Transport metadata (for OPA input enrichment)
     server_id: str = ""     # upstream MCP server identifier
+    # v4.0 Item B — stable mcp_id for this server (minted once, keyed in grants).
+    # When populated (from McpBrokerServerConfig.mcp_id via the transport layer),
+    # McpBroker._check_connection_permit() uses mcp_id as the grant key instead
+    # of agent_name.  If absent (legacy / pre-4.0 path), falls back to server_id
+    # or agent_name.  Populated by the runtime MCP router from the server config.
+    mcp_id: str = ""
 
     # FIX-C (Iris FIND-001): sensitivity labels for resource and prompt calls.
     # OPA policy (mcp.rego:380-391) escalates audit_capture for CONFIDENTIAL/RESTRICTED

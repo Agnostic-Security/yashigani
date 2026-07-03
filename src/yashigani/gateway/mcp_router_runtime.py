@@ -387,6 +387,10 @@ async def _handle_mcp_call_inner(
             call_id=call_id,
             request_id=request_id,
             server_id=agent_name,
+            # v4.0 Item B — stable mcp_id from server config (keyed in grants).
+            # Empty string when mcp_id not yet minted (pre-4.0 or no Redis);
+            # _check_connection_permit() falls back to server_id / agent_name.
+            mcp_id=server_cfg.mcp_id,
             # G-ORCH-OPA-1 / Option A: populate from identity registry lookup.
             # None when registry absent or user not found → fail-closed at egress.
             caller_sensitivity_ceiling=caller_sensitivity_ceiling,
@@ -586,6 +590,8 @@ async def _handle_mcp_call_inner(
             call_id=call_id,
             request_id=request_id,
             server_id=agent_name,
+            # v4.0 Item B — stable mcp_id for session context (informational).
+            mcp_id=server_cfg.mcp_id,
             # 3.1 Phase 1 — caller identity for session context (informational).
             caller_agent_id=_caller_agent_id,
         )
