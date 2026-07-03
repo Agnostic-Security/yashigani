@@ -67,6 +67,7 @@ from yashigani.mcp._upstream_pin import (
     CERT_PIN_MISMATCH_LABEL,
 )
 # 3.0 / YSG-RISK-058 — external-upstream revocation-watch
+# 4.0: CRL active channel (L3) + per-tenant cache + CRL_REVOKED_LABEL / CRL_STALE_LABEL
 from yashigani.mcp._upstream_revocation import (
     RevocationConfig,
     RevocationResult,
@@ -76,8 +77,16 @@ from yashigani.mcp._upstream_revocation import (
     REVOCATION_STALE_LABEL,
     REVOCATION_NO_CHANNEL_LABEL,
     REVOCATION_PIN_EXPIRED_LABEL,
+    CRL_REVOKED_LABEL,
+    CRL_STALE_LABEL,
 )
 from yashigani.mcp._pool import TenantPoolManager
+# 4.0 / P8 stdio-binary-pin — closes TODO[P8] in _transport_stdio
+from yashigani.mcp._transport_stdio import (
+    StdioPinConfig,
+    StdioPinMismatchError,
+    STDIO_PIN_MISMATCH_LABEL,
+)
 
 # 3.0 / YSG-RISK-060 — capability-envelope tool-surface pin
 from yashigani.mcp._envelope import (
@@ -154,6 +163,7 @@ __all__ = [
     "require_pin_mode_for_servers",
     "CERT_PIN_MISMATCH_LABEL",
     # 3.0: external-upstream revocation-watch (YSG-RISK-058)
+    # 4.0: CRL active channel (L3) + per-tenant cache
     "RevocationConfig",
     "RevocationResult",
     "RevocationStatus",
@@ -162,8 +172,14 @@ __all__ = [
     "REVOCATION_STALE_LABEL",
     "REVOCATION_NO_CHANNEL_LABEL",
     "REVOCATION_PIN_EXPIRED_LABEL",
+    "CRL_REVOKED_LABEL",
+    "CRL_STALE_LABEL",
     # Phase-2: P1-pool
     "TenantPoolManager",
+    # 4.0: P8 stdio binary pin
+    "StdioPinConfig",
+    "StdioPinMismatchError",
+    "STDIO_PIN_MISMATCH_LABEL",
     # 3.0: capability-envelope tool-surface pin (YSG-RISK-060)
     "EffectClass",
     "ArgShape",

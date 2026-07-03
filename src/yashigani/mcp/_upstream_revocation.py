@@ -14,16 +14,21 @@ Per Laura's threat model (PR #35) + Tiago's "only approved MCPs added" posture:
 the approved set is curated, but a revoked cert *inside* the approved set must
 still be caught.  This module is the revocation channel.
 
-Layers (Laura L1 / L2)
-----------------------
-* **L1 — revocation-watch + short pin-TTL.**  From the live leaf we extract the
-  AIA OCSP responder URL and the CRL distribution points.  We query OCSP (and
-  fall back to CRL) and BLOCK on a ``REVOKED`` verdict.  A pin older than
-  ``max_pin_age`` is treated as stale and must be re-validated before use.
-* **L2 — OCSP freshness (synchronous, highest leverage).**  An OCSP verdict is
-  only honoured if it is *fresh*: ``this_update`` is in the past and
-  ``next_update`` is in the future, within ``ocsp_max_age``.  A stale OCSP
-  response (replayed "good" past its validity) is rejected.
+Layers (Laura L1 / L2 / L3)
+-----------------------------
+* **L1 — OCSP (primary).**  From the live leaf we extract the AIA OCSP
+  responder URL.  We query it directly (or use a stapled response when
+  available) and BLOCK on a ``REVOKED`` verdict.
+* **L2 — OCSP freshness.**  An OCSP verdict is only honoured if it is *fresh*:
+  ``this_update`` is in the past and ``next_update`` is in the future, within
+  ``ocsp_max_age``.  A stale OCSP response (replayed "good" past its validity)
+  is rejected.
+* **L3 — CRL fallback (active, enabled in 4.0).**  When OCSP is unavailable or
+  returns ERROR/UNKNOWN, we fall back to the CRL distribution point(s) in the
+  leaf.  The fetched CRL is cached per ``(tenant_id, crl_url)`` and freshness-
+  checked against ``thisUpdate / nextUpdate``.  A serial found in the CRL
+  revoked list blocks the connection.  CRL data is public CA metadata; the per-
+  tenant cache key prevents hypothetical cross-tenant cache pollution.
 
   stdlib note (ground-truthed 2026-06-10): Python's ``ssl`` module exposes NO
   API to read a *stapled* OCSP response from the live handshake, and pyOpenSSL
@@ -48,14 +53,15 @@ re-onboarded.  The exposure is therefore **bounded by ``max_pin_age``**.
 strict_mode removes this residual entirely by refusing such upstreams.
 
 YSG-RISK-058 / Laura external-upstream-revocation threat model (PR #35) /
-release 3.0.
+release 3.0 + 4.0 (CRL L3 activation).
 
-Last updated: 2026-06-10T00:00:00+00:00
+Last updated: 2026-07-03T00:00:00+00:00
 """
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -83,6 +89,8 @@ REVOKED_LABEL = "MCP_UPSTREAM_CERT_REVOKED"
 REVOCATION_STALE_LABEL = "MCP_UPSTREAM_REVOCATION_STALE"
 REVOCATION_NO_CHANNEL_LABEL = "MCP_UPSTREAM_NO_REVOCATION_CHANNEL"
 REVOCATION_PIN_EXPIRED_LABEL = "MCP_UPSTREAM_PIN_AGE_EXPIRED"
+CRL_REVOKED_LABEL = "MCP_UPSTREAM_CERT_CRL_REVOKED"
+CRL_STALE_LABEL = "MCP_UPSTREAM_CRL_STALE"
 
 
 class RevocationStatus(str, Enum):
@@ -114,13 +122,24 @@ class RevocationConfig:
         L2 freshness window: an OCSP response whose ``this_update`` is older
         than this is treated as STALE even if ``next_update`` has not passed.
         Default 1h.
+    crl_max_age_seconds:
+        L3 CRL freshness window: a CRL whose ``thisUpdate`` is older than this
+        is treated as STALE even if ``nextUpdate`` has not passed.  Default 24h.
+        CRL issuance cadence varies by CA (hourly to weekly); 24h is a safe
+        conservative bound.
     http_timeout_seconds:
         Timeout for OCSP/CRL fetches.  Default 5s.
+    tenant_id:
+        Tenant identifier. Used to key the per-tenant CRL cache so one tenant's
+        cached CRL data cannot be served to another tenant's check.  Empty string
+        uses a shared default bucket (acceptable for single-tenant deployments).
     """
     strict_mode: bool = False
     max_pin_age_seconds: int = 24 * 3600
     ocsp_max_age_seconds: int = 3600
+    crl_max_age_seconds: int = 24 * 3600
     http_timeout_seconds: float = 5.0
+    tenant_id: str = ""
 
 
 def _config_from_env() -> RevocationConfig:
@@ -142,7 +161,9 @@ def _config_from_env() -> RevocationConfig:
         strict_mode=_b("YASHIGANI_MCP_REVOCATION_STRICT", False),
         max_pin_age_seconds=_i("YASHIGANI_MCP_PIN_MAX_AGE_SECONDS", 24 * 3600),
         ocsp_max_age_seconds=_i("YASHIGANI_MCP_OCSP_MAX_AGE_SECONDS", 3600),
+        crl_max_age_seconds=_i("YASHIGANI_MCP_CRL_MAX_AGE_SECONDS", 24 * 3600),
         http_timeout_seconds=float(_i("YASHIGANI_MCP_REVOCATION_TIMEOUT", 5)),
+        tenant_id=os.environ.get("YASHIGANI_TENANT_ID", ""),
     )
 
 
@@ -208,6 +229,183 @@ def _extract_crl_urls(cert: x509.Certificate) -> list[str]:
 
 def _has_revocation_channel(cert: x509.Certificate) -> bool:
     return bool(_extract_ocsp_urls(cert) or _extract_crl_urls(cert))
+
+
+# ---------------------------------------------------------------------------
+# CRL fetch + cache + freshness (L3 — active CRL channel, 4.0)
+# ---------------------------------------------------------------------------
+#
+# CRL data is public CA metadata published by the issuing CA.  It is the same
+# for all callers hitting the same CA endpoint, so caching by URL is correct.
+# The cache key is (tenant_id, url) rather than url alone: this scopes each
+# tenant's cached CRL view independently, preventing any hypothetical cross-
+# tenant cache pollution (e.g., if a compromised tenant could somehow inject a
+# stale/invalid CRL entry that affects another tenant's check).  CRL data
+# itself is CA-signed and verified; the per-tenant key is defence-in-depth.
+
+
+@dataclass
+class _CrlCacheEntry:
+    """One cached CRL entry: the parsed object + freshness timestamps."""
+    crl: object                           # x509.CertificateRevocationList
+    fetched_at: float                     # time.time() when fetched
+    this_update: datetime                 # CRL's thisUpdate (aware UTC)
+    next_update: Optional[datetime]       # CRL's nextUpdate (aware UTC), or None
+
+
+# Process-global CRL cache: (tenant_id, crl_url) -> _CrlCacheEntry
+# Protected by _CRL_CACHE_LOCK for thread safety.
+_CRL_CACHE: dict[tuple[str, str], _CrlCacheEntry] = {}
+_CRL_CACHE_LOCK = threading.Lock()
+
+
+def _get_crl_from_cache_or_fetch(
+    crl_url: str,
+    cfg: RevocationConfig,
+    *,
+    _http_get: Optional[Callable[[str, float], bytes]] = None,
+) -> "_CrlCacheEntry":
+    """
+    Return a cached CRL entry for ``(cfg.tenant_id, crl_url)``, or fetch and
+    cache a fresh one.
+
+    Freshness: an existing cache entry is reused if:
+      * its ``next_update`` is in the future (or unknown), AND
+      * ``(now - fetched_at)`` < ``crl_max_age_seconds``.
+    Otherwise the CRL is re-fetched.
+
+    Raises OSError / ValueError on network or parse failure.
+    """
+    cache_key = (cfg.tenant_id, crl_url)
+    now_ts = time.time()
+    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+
+    with _CRL_CACHE_LOCK:
+        entry = _CRL_CACHE.get(cache_key)
+
+    if entry is not None:
+        # Re-use if next_update is in the future AND entry is within max_age.
+        age = now_ts - entry.fetched_at
+        next_ok = entry.next_update is None or entry.next_update > now_dt
+        if next_ok and age < cfg.crl_max_age_seconds:
+            return entry
+
+    # Need to fetch. _http_get module-level function is resolved at call time.
+    if _http_get is not None:
+        raw = _http_get(crl_url, cfg.http_timeout_seconds)
+    else:
+        from urllib.request import urlopen as _urlopen  # noqa: PLC0415
+        with _urlopen(crl_url, timeout=cfg.http_timeout_seconds) as resp:  # noqa: S310
+            raw = resp.read()
+    # Try DER first, then PEM.
+    try:
+        crl = x509.load_der_x509_crl(raw)
+    except Exception:  # noqa: BLE001
+        crl = x509.load_pem_x509_crl(raw)
+
+    # Prefer timezone-aware _utc variants (cryptography 42+); fall back to
+    # naive last_update / next_update (cryptography <42) normalised via _aware().
+    tu_raw = getattr(crl, "last_update_utc", None) or crl.last_update
+    tu = _aware(tu_raw)
+    nu_obj = getattr(crl, "next_update_utc", None) or crl.next_update
+    nu: Optional[datetime] = _aware(nu_obj) if nu_obj is not None else None
+
+    new_entry = _CrlCacheEntry(
+        crl=crl,
+        fetched_at=now_ts,
+        this_update=tu,
+        next_update=nu,
+    )
+    with _CRL_CACHE_LOCK:
+        _CRL_CACHE[cache_key] = new_entry
+    return new_entry
+
+
+def _evaluate_crl_channel(
+    leaf: x509.Certificate,
+    cfg: RevocationConfig,
+    now: Optional[float] = None,
+    *,
+    _crl_fetch: Optional[Callable[[str, float], bytes]] = None,
+) -> Optional[RevocationResult]:
+    """
+    Try each CRL distribution point URL for the leaf.  Return a
+    ``RevocationResult`` on the FIRST URL that yields a definitive answer
+    (REVOKED, GOOD, or STALE), or None if no CRL URL is reachable / parseable.
+
+    Freshness contract mirrors OCSP L2:
+      * CRL ``thisUpdate`` must be within ``crl_max_age_seconds`` of now.
+      * CRL ``nextUpdate`` (if present) must be in the future.
+      * A stale CRL blocks (same fail-closed posture as stale OCSP).
+
+    A serial number found in the CRL revoked list → REVOKED (blocks=True).
+    A serial number NOT in the CRL revoked list + fresh CRL → GOOD.
+    """
+    crl_urls = _extract_crl_urls(leaf)
+    if not crl_urls:
+        return None
+
+    now_ts = time.time() if now is None else now
+    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+
+    for url in crl_urls:
+        try:
+            entry = _get_crl_from_cache_or_fetch(url, cfg, _http_get=_crl_fetch)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("revocation-watch/CRL: fetch failed url=%s: %s", url, exc)
+            continue
+
+        tu = entry.this_update
+        nu = entry.next_update
+
+        # Freshness check (mirrors OCSP L2).
+        if tu > now_dt:
+            logger.warning(
+                "revocation-watch/CRL: %s thisUpdate in the future (clock skew?) url=%s",
+                CRL_STALE_LABEL, url,
+            )
+            return RevocationResult(
+                RevocationStatus.STALE, CRL_STALE_LABEL, blocks=True,
+            )
+        if nu is not None and nu <= now_dt:
+            logger.warning(
+                "revocation-watch/CRL: %s nextUpdate expired url=%s nu=%s",
+                CRL_STALE_LABEL, url, nu.isoformat(),
+            )
+            return RevocationResult(
+                RevocationStatus.STALE, CRL_STALE_LABEL, blocks=True,
+            )
+        if (now_dt - tu).total_seconds() > cfg.crl_max_age_seconds:
+            logger.warning(
+                "revocation-watch/CRL: %s thisUpdate too old url=%s tu=%s",
+                CRL_STALE_LABEL, url, tu.isoformat(),
+            )
+            return RevocationResult(
+                RevocationStatus.STALE, CRL_STALE_LABEL, blocks=True,
+            )
+
+        # Revocation check.
+        revoked_entry = entry.crl.get_revoked_certificate_by_serial_number(  # type: ignore[attr-defined]
+            leaf.serial_number
+        )
+        if revoked_entry is not None:
+            logger.warning(
+                "revocation-watch/CRL: %s serial=%s found in CRL url=%s",
+                CRL_REVOKED_LABEL, leaf.serial_number, url,
+            )
+            return RevocationResult(
+                RevocationStatus.REVOKED, CRL_REVOKED_LABEL, blocks=True,
+            )
+
+        # Fresh CRL, serial not revoked.
+        logger.debug(
+            "revocation-watch/CRL: serial=%s NOT in CRL (fresh) url=%s",
+            leaf.serial_number, url,
+        )
+        return RevocationResult(RevocationStatus.GOOD, "ok", blocks=False)
+
+    # All URLs tried, none yielded a result.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -336,9 +534,10 @@ def check_revocation(
     _get_stapled_ocsp: Optional[Callable[[], Optional[bytes]]] = None,
     _ocsp_fetch: Optional[Callable[..., bytes]] = None,
     _fetch_issuer: Optional[Callable[[str, float], bytes]] = None,
+    _crl_fetch: Optional[Callable[[str, float], bytes]] = None,
 ) -> RevocationResult:
     """
-    Check an external upstream leaf for revocation (YSG-RISK-058).
+    Check an external upstream leaf for revocation (YSG-RISK-058 / 4.0 CRL).
 
     Parameters
     ----------
@@ -353,18 +552,27 @@ def check_revocation(
         stale pin cannot mask a revocation that happened after onboard.
     config:
         RevocationConfig (defaults from env / RevocationConfig()).
+    _crl_fetch:
+        Injection hook for CRL HTTP fetch (testing only).  When provided, called
+        as ``_crl_fetch(url, timeout_seconds) -> bytes``.
 
     Returns
     -------
     RevocationResult — ``blocks=True`` means the caller MUST refuse the upstream.
 
     Fail-closed semantics:
-      * REVOKED  -> blocks (always).
-      * STALE    -> blocks (L2: evidence too old to trust).
+      * REVOKED  -> blocks (always; from OCSP or CRL).
+      * STALE    -> blocks (L2/L3: evidence too old to trust).
       * NO_CHANNEL -> blocks ONLY in strict_mode; else warn (curated posture).
       * PIN_EXPIRED -> blocks (pin too old, no fresh GOOD verdict).
       * ERROR / UNKNOWN -> does NOT block on its own (fingerprint pin still holds),
         UNLESS the pin is also expired or strict_mode demands a channel.
+
+    Channel priority:
+      OCSP (L1/L2) is tried first.  If OCSP yields GOOD, REVOKED, or STALE,
+      that result is final.  CRL (L3) is tried only when OCSP is unavailable
+      (ERROR / UNKNOWN / no OCSP URL in the leaf).  This mirrors the RFC 6960
+      recommendation: OCSP is the preferred real-time channel; CRL is fallback.
     """
     cfg = config if config is not None else _config_from_env()
     now_ts = time.time() if now is None else now
@@ -442,9 +650,24 @@ def check_revocation(
     if der is not None:
         result = _evaluate_ocsp_response(der, cfg, now=now_ts)
 
-    # REVOKED / STALE block unconditionally.
+    # REVOKED / STALE block unconditionally (from OCSP).
     if result.status in (RevocationStatus.REVOKED, RevocationStatus.STALE):
         return result
+
+    # GOOD from OCSP — authoritative; no need to check CRL.
+    if result.status == RevocationStatus.GOOD:
+        return result
+
+    # OCSP was unavailable or returned UNKNOWN: try CRL fallback (L3 — 4.0).
+    # A CRL REVOKED or STALE verdict is as hard as OCSP; GOOD from a fresh
+    # CRL overrides an OCSP ERROR/UNKNOWN (net: cert is clean per CA).
+    crl_result = _evaluate_crl_channel(leaf, cfg, now=now_ts, _crl_fetch=_crl_fetch)
+    if crl_result is not None:
+        if crl_result.status in (RevocationStatus.REVOKED, RevocationStatus.STALE):
+            return crl_result
+        if crl_result.status == RevocationStatus.GOOD:
+            # Fresh CRL says not revoked — treat as GOOD verdict.
+            result = crl_result
 
     # Pin-age fail-closed: no fresh GOOD verdict + over-age pin => block.
     if result.status != RevocationStatus.GOOD:

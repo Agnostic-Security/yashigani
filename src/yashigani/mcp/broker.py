@@ -958,7 +958,9 @@ class McpBroker:
 
         Logic:
           - No permission_store configured → no-op (None), backwards-compatible.
-          - Call resolve_boolean_grant(MCP_SERVER, server_id, org_id,
+          - Resolve server key: ctx.mcp_id (v4.0 stable UUID) or ctx.server_id
+              or ctx.agent_name (backward compat fallback).
+          - Call resolve_boolean_grant(MCP_SERVER, server_key, org_id,
               group_ids=[], user_email=None) — org-level check only.
           - Returns "mcp_server_not_permitted" when no org grant or org denies.
 
@@ -970,7 +972,10 @@ class McpBroker:
 
         from yashigani.permissions import ResourceType, resolve_boolean_grant
 
-        server_key = ctx.server_id or ctx.agent_name
+        # v4.0 Item B — prefer stable mcp_id as the grant key.
+        # Falls back to server_id → agent_name for backward compatibility
+        # (pre-4.0 paths where mcp_id has not yet been populated).
+        server_key = ctx.mcp_id or ctx.server_id or ctx.agent_name
         if not server_key:
             # No server identifier — deny (fail-closed on missing context).
             return "mcp_server_not_permitted"
@@ -1549,6 +1554,20 @@ class McpBroker:
             )
             return result
 
+        # Item 3 (4.0 per-tenant key cache): build an explicit RevocationConfig
+        # scoped to this broker's tenant_id so the CRL cache is per-tenant
+        # rather than shared globally across tenants.
+        from yashigani.mcp._upstream_revocation import (  # noqa: PLC0415
+            _config_from_env as _rev_cfg_from_env,
+            RevocationConfig as _RevocationConfig,
+        )
+        import dataclasses as _dataclasses  # noqa: PLC0415
+        _base_rev_cfg = _rev_cfg_from_env()
+        _tenant_rev_cfg = _dataclasses.replace(
+            _base_rev_cfg,
+            tenant_id=self._config.tenant_id,
+        )
+
         result = verify_upstream_pin(
             config=pin_cfg,
             timeout=timeout,
@@ -1556,6 +1575,9 @@ class McpBroker:
             _get_spiffe=_get_spiffe,
             # YSG-RISK-058: revocation-watch runs on a matched pin. A revoked /
             # stale / (strict) no-channel / over-age leaf overrides the match.
+            # 4.0: RevocationConfig carries tenant_id so the CRL cache is
+            # scoped per-tenant (per-tenant key cache item 3).
+            revocation_config=_tenant_rev_cfg,
             pin_age_seconds=pin_age_seconds,
             _get_der=_get_der,
             _check_revocation=_check_revocation,
