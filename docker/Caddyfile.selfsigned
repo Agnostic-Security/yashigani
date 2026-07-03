@@ -173,6 +173,25 @@ import /etc/caddy/Caddyfile.csp
     request_header -X-Yashigani-Orchestration-*
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strip identity-forwarding headers at the public edge (T-1 belt-and-suspenders).
+# X-Yashigani-User-Id and X-Yashigani-Identity-Id are set by the trusted internal
+# backoffice forwarder on the mesh path (gateway:8081). An external client MUST
+# NOT be able to inject either header to spoof an internal identity.
+# The gateway already rejects externally-supplied identity headers at the
+# application layer, but stripping at the edge (T-1) removes the attack surface
+# before it ever reaches the app — zero cost, belt-and-suspenders.
+# Applied at the public-site level so ALL handle blocks are covered with no
+# per-handle drift risk. NOT applied on :8444/:8445 (separate internal-mesh
+# site blocks) where the trusted backoffice forwarder legitimately sets them.
+# X-Yashigani-User-Id     — 3.x identity forward header
+# X-Yashigani-Identity-Id — 4.0 identity forward header (Tom's rename, 4.0 port)
+# ─────────────────────────────────────────────────────────────────────────────
+(strip-identity-headers) {
+    request_header -X-Yashigani-User-Id
+    request_header -X-Yashigani-Identity-Id
+}
+
 (inject-caddy-verified) {
     # Inject the per-install shared secret from the mounted secrets file.
     # {$CADDY_INTERNAL_HMAC} is a parse-time env substitution (NOT a request-time
@@ -256,6 +275,12 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
     # See Caddyfile.csp for full design rationale.
     import csp-policies
+
+    # T-1 edge strip: remove any client-supplied identity-forwarding headers
+    # before they reach any handle block (backoffice or gateway). Site-level
+    # placement covers ALL paths — no per-handle drift. Internal mesh listeners
+    # (:8444/:8445) are separate site blocks and are NOT affected.
+    import strip-identity-headers
 
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {

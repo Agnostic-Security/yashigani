@@ -436,6 +436,22 @@ data:
       # Defence-in-depth catch for any future X-Yashigani-Orchestration-* header.
       request_header -X-Yashigani-Orchestration-*
     }
+    # ────────────────────────────────────────────────────────────────────────
+    # Strip identity-forwarding headers at the public edge (T-1 belt-and-suspenders).
+    # CRITICAL: MUST stay byte-parity with docker/Caddyfile.{selfsigned,ca,acme}.
+    # X-Yashigani-User-Id and X-Yashigani-Identity-Id are set by the trusted
+    # internal backoffice forwarder on the mesh path (gateway:8081). An external
+    # client MUST NOT be able to inject either header to spoof an internal identity.
+    # Applied at the public-site level inside :443 — no per-handle drift.
+    # NOT applied on :8444/:8445 (internal-mesh listeners) where the trusted
+    # forwarder legitimately sets these headers.
+    # X-Yashigani-User-Id     — 3.x identity forward header
+    # X-Yashigani-Identity-Id — 4.0 identity forward header (Tom's rename, 4.0 port)
+    # ────────────────────────────────────────────────────────────────────────
+    (strip-identity-headers) {
+      request_header -X-Yashigani-User-Id
+      request_header -X-Yashigani-Identity-Id
+    }
     # Bind on :443 (any Host) so port-forward / NodePort / IP-based tests
     # work regardless of how the cluster operator routes the public domain.
     # Internal K8s integration finding: use explicit PKI cert (caddy_client.crt/key)
@@ -512,6 +528,11 @@ data:
       # iframed from the admin shell). 'none' blocked the embed — fixed here.
       header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'self'; object-src 'none'; base-uri 'none'"
       header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+      # T-1 edge strip: remove any client-supplied identity-forwarding headers
+      # before they reach any handle block (backoffice or gateway). Site-level
+      # placement covers ALL paths — no per-handle drift. Internal mesh listeners
+      # (:8444/:8445) are separate site blocks and are NOT affected.
+      import strip-identity-headers
       handle /healthz {
         import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
