@@ -210,39 +210,66 @@ class McpJwtIssuer:
 
     def _load_or_generate_key(self) -> tuple[EllipticCurvePrivateKey, Optional[int]]:
         """
-        Load the signing key from env, secrets file, or generate ephemeral.
+        Load the install-wide root key and derive a per-tenant ES384 key.
 
-        Returns (key, stable_generated_at) where stable_generated_at is:
-          - None  for path #1 (env-var PEM; caller uses int(time.time()) fallback)
-          - int   derived from the file's mtime for path #2 — ensures all replicas
-                  holding the SAME file produce the SAME kid (Nico kid-stability fix)
-          - None  for path #3 (ephemeral; kid will differ per process — dev only)
+        Returns (derived_tenant_key, stable_generated_at) where:
+          - derived_tenant_key: P-384 key derived from the root via HKDF-SHA384,
+            scoped to self._tenant_id (see yashigani.auth._jwt.derive_tenant_ec_key).
+            The root key is used ONLY as HKDF input key material — it is never
+            stored in self._key.  Each distinct tenant_id yields a
+            cryptographically independent signing key (YSG-RISK-109).
+          - stable_generated_at: file mtime for kid stability (path #2), else None.
 
-        WARNING: ephemeral key generation means the JWKS changes on restart —
-        downstream verifiers caching the JWKS will reject tokens after restart.
+        Key loading order (root key source):
+          1. YASHIGANI_MCP_SIGNING_KEY_PEM env var (base64-encoded PEM, for testing)
+          2. PEM file at YASHIGANI_MCP_SIGNING_KEY_PATH
+             (default /run/secrets/mcp_identity_signing_key)
+          3. Generated ephemeral key — dev/test only; REFUSED in production/staging.
+
+        After loading the root key via any of the above paths, the per-tenant
+        derived key is computed:
+          tenant_key = HKDF-SHA384(IKM=root_private_scalar, info="tenant:<tenant_id>")
+
+        WARNING: ephemeral key generation means the JWKS changes on restart.
         Only acceptable for unit tests.
 
         Laura SB-1: YASHIGANI_MCP_SIGNING_KEY_PATH is read HERE (at call time),
         not at module import, so monkeypatching the env var takes effect without
         importlib.reload().
+
+        YSG-RISK-109: per-tenant key isolation via HKDF derivation.
         """
+        from yashigani.auth._jwt import derive_tenant_ec_key as _derive_tenant_key
+
+        def _apply_tenant_derivation(
+            root: EllipticCurvePrivateKey,
+        ) -> EllipticCurvePrivateKey:
+            """Derive the per-tenant key from *root* and log the isolation event."""
+            derived = _derive_tenant_key(root, self._tenant_id)
+            logger.debug(
+                "mcp-broker: derived per-tenant signing key for tenant_id=%r "
+                "(YSG-RISK-109: install-wide root → per-tenant HKDF-SHA384)",
+                self._tenant_id,
+            )
+            return derived
+
         # 1. Env var (base64-encoded PEM — for test injection)
         pem_b64 = os.environ.get("YASHIGANI_MCP_SIGNING_KEY_PEM", "")
         if pem_b64:
             try:
                 pem = base64.b64decode(pem_b64)
-                key = serialization.load_pem_private_key(pem, password=None)
-                if not isinstance(key, EllipticCurvePrivateKey):
+                root_key = serialization.load_pem_private_key(pem, password=None)
+                if not isinstance(root_key, EllipticCurvePrivateKey):
                     raise ValueError("MCP signing key must be an EC private key")
-                if not isinstance(key.curve, SECP384R1):
+                if not isinstance(root_key.curve, SECP384R1):
                     raise ValueError(
-                        f"MCP signing key must use P-384 curve; got {type(key.curve).__name__}. "
+                        f"MCP signing key must use P-384 curve; got {type(root_key.curve).__name__}. "
                         "Nico spec §1: ES384 only."
                     )
-                logger.info("mcp-broker: loaded MCP signing key from env var")
+                logger.info("mcp-broker: loaded MCP root signing key from env var")
                 # Path #1: no stable file mtime — return None so __init__ uses its
                 # key_generated_at parameter (or falls back to int(time.time())).
-                return key, None
+                return _apply_tenant_derivation(root_key), None
             except Exception as exc:
                 raise RuntimeError(
                     f"YASHIGANI_MCP_SIGNING_KEY_PEM is set but invalid: {exc}"
@@ -254,23 +281,23 @@ class McpJwtIssuer:
         if signing_key_path.exists():
             try:
                 pem = signing_key_path.read_bytes()
-                key = serialization.load_pem_private_key(pem, password=None)
-                if not isinstance(key, EllipticCurvePrivateKey):
+                root_key = serialization.load_pem_private_key(pem, password=None)
+                if not isinstance(root_key, EllipticCurvePrivateKey):
                     raise ValueError("MCP signing key must be an EC private key")
-                if not isinstance(key.curve, SECP384R1):
+                if not isinstance(root_key.curve, SECP384R1):
                     raise ValueError(
-                        f"MCP signing key must use P-384 curve; got {type(key.curve).__name__}. "
+                        f"MCP signing key must use P-384 curve; got {type(root_key.curve).__name__}. "
                         "Nico spec §1: ES384 only."
                     )
                 logger.info(
-                    "mcp-broker: loaded MCP signing key from %s (DEV MODE — not KMS-backed)",
+                    "mcp-broker: loaded MCP root signing key from %s (DEV MODE — not KMS-backed)",
                     signing_key_path,
                 )
                 # Path #2 (Nico kid-stability fix): derive stable_generated_at from
                 # the file's mtime so that all replicas mounting the SAME file produce
                 # the SAME kid, regardless of when they start.
                 file_mtime = int(signing_key_path.stat().st_mtime)
-                return key, file_mtime
+                return _apply_tenant_derivation(root_key), file_mtime
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to load MCP signing key from {signing_key_path}: {exc}"
@@ -302,14 +329,16 @@ class McpJwtIssuer:
             )
 
         logger.warning(
-            "mcp-broker: generating EPHEMERAL MCP signing key "
+            "mcp-broker: generating EPHEMERAL MCP root key "
             "(NOT PERSISTED — dev/test mode only). "
             "Set YASHIGANI_MCP_SIGNING_KEY_PEM or provide %s for persistent key. "
             "Nico spec §2: KMS-backed key required in production.",
             signing_key_path_str,
         )
-        # Path #3: ephemeral — no stable generated_at; kid will differ per process.
-        return ec.generate_private_key(SECP384R1()), None
+        # Path #3: ephemeral root key — derive per-tenant key from it.
+        # kid will differ per process (ephemeral root changes on each start).
+        ephemeral_root = ec.generate_private_key(SECP384R1())
+        return _apply_tenant_derivation(ephemeral_root), None
 
     def _startup_self_test(self) -> None:
         """

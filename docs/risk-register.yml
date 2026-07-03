@@ -2491,3 +2491,119 @@ risks:
       12 regression tests in tests/regression/v4.0/test_identity_id_header_forwarding.py.
   fix_in_version: v4.0
   last_threat_model_review: '2026-07-03'
+
+- id: YSG-RISK-108
+  description: >-
+    Mesh-port (:8081) identity-header authn bypass (LAURA-4.0 T-3 / T-4).
+    The gateway MCP mesh port accepted unauthenticated POST requests and
+    (T-3) promoted X-Forwarded-User to the OPA user_id without verifying the
+    internal bearer; (T-4) promoted X-Yashigani-Orchestration-Depth to the
+    reserved "gateway:orchestrator" caller_agent_id without verifying the
+    internal bearer. An attacker with network access to port 8081 could forge
+    a higher-privilege identity context on inbound MCP calls.
+    (LAURA-4.0 findings T-3/T-4, CWE-284, CWE-287)
+  severity: high
+  controls_impacted:
+  - CWE-284 (Improper Access Control)
+  - CWE-287 (Improper Authentication)
+  - ASVS V4.1.1 (General Access Control — mesh-port identity binding)
+  compensating_controls:
+  - Mesh port :8081 is inside the mTLS mesh (not exposed at the Caddy edge).
+  - OPA deny-by-default applies even on forged identities at the policy layer.
+  status: partially_closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-03'
+  review_by: '2026-09-30'
+  closure_evidence:
+  - rationale: >-
+      Negative cases (T-3/T-4) hardened in mcp_router_runtime.py:
+      unauthenticated caller without YASHIGANI_INTERNAL_BEARER or Caddy secret
+      is NOT promoted to gateway:orchestrator (T-4) and X-Forwarded-User is
+      NOT trusted (T-3). Regression tests in
+      tests/regression/v4.0/test_ysg_risk_108_mesh_port_authn_bypass.py.
+      Positive cases (internal bearer + depth header → promotion) pending
+      full test wiring for the T-4 positive path (test_v31_mcp_caller_identity
+      test_orch_depth_header_sets_gateway_orchestrator_caller is the open
+      regression — requires bearer injection in the test helper).
+  residuals:
+  - >-
+      T-4 POSITIVE PATH: test_v31_mcp_caller_identity::test_orch_depth_header_sets_gateway_orchestrator_caller
+      is a known pre-existing failure on this branch — the positive promotion
+      path (internal bearer + depth header) is wired in mcp_router_runtime.py
+      but the test helper does not inject the bearer. Fix in a disjoint commit
+      touching the test helper only.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-03'
+
+- id: YSG-RISK-109
+  description: >-
+    MCP identity JWT signing key is install-wide, not per-tenant.
+    src/yashigani/mcp/_jwt.py McpJwtIssuer loads ONE install-wide P-384 key
+    (from /run/secrets/mcp_identity_signing_key). The tenant_id argument only
+    labels the kid claim (f"mcp-{tenant_id}-{mtime}") — it does NOT select a
+    different key. In a multi-tenant deployment all tenants share the same
+    physical signing key: a token minted for tenant A can in principle be
+    verified using tenant B's key material (same key), and any entity that
+    obtains the single root key can forge tokens for every tenant.
+    Additionally, registry.py build_registry_from_env() explicitly uses one
+    shared McpJwtIssuer for all brokers ("one key per installation, not per
+    server" — Iris F-1 comment). The operator-token and step-up JWTs in
+    backoffice/routes/auth.py and auth/stepup.py also use the install-wide
+    caddy_internal_hmac (HS256) with no per-tenant scoping.
+    (ASVS V2.1, CWE-320, CWE-321)
+  severity: medium
+  controls_impacted:
+  - ASVS V2.1 (Cryptographic key management)
+  - CWE-320 (Key Management Errors)
+  - CWE-321 (Hard-coded Cryptographic Key)
+  compensating_controls:
+  - ES384 MCP JWTs carry an explicit "tenant" claim; OPA policies verify
+    tenant-scoping at every hop.
+  - The install-wide key file is mounted 0600 inside the gateway container;
+    container hardening (cap_drop ALL, read_only rootfs, seccomp) limits
+    exposure.
+  - jti nonce dedup (RedisNonceStore) prevents replay even if key is leaked.
+  status: partially_closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-03'
+  review_by: '2026-12-31'
+  closure_evidence:
+  - rationale: >-
+      PARTIAL CLOSURE (JWT per-tenant key isolation):
+      auth/_jwt.py introduces derive_tenant_ec_key() using HKDF-SHA384:
+        IKM  = 48-byte big-endian root key private scalar
+        salt = b"yashigani-tenant-jwt-v1"
+        info = b"tenant:" + tenant_id
+        out  = 64 bytes → reduced mod secp384r1 order n
+      McpJwtIssuer._load_or_generate_key() now derives a per-tenant P-384 key
+      from the install-wide root before returning it. Two McpJwtIssuer instances
+      with the same root but different tenant_ids produce cryptographically
+      independent keys; McpJwtVerifier.from_issuer() captures the derived
+      public key, so cross-tenant verification fails at the signature check.
+      Tests: tests/unit/test_ysg_risk_078_per_tenant_jwt_isolation.py — F1/F2
+      prove cross-tenant forgery is rejected; B2/C2 prove determinism.
+      Committed: feat(security): per-tenant MCP JWT key isolation (YSG-RISK-109).
+  residuals:
+  - >-
+      ROOT KEY COMPROMISE: derivation is deterministic; if the install-wide
+      root key is exfiltrated, all tenant keys can be re-derived. Mitigated
+      by KMS-backed root key with HSM binding in production (Nico §2).
+  - >-
+      REGISTRY ONE-ISSUER DESIGN: registry.py currently builds ONE shared
+      McpJwtIssuer (Iris F-1) labeled with first_tenant. After this change
+      that issuer uses the first_tenant's derived key, but all brokers still
+      sign JWTs with that single derived key. Full per-tenant isolation
+      requires registry.py to instantiate separate issuers per tenant_id.
+      Deferred: requires editing registry.py (currently disjoint-locked).
+  - >-
+      INTERNAL BEARER (YASHIGANI_INTERNAL_BEARER): install-wide shared token
+      used by agent bundles (letta, langflow, open-webui) as OPENAI_API_KEY
+      shim. Per-tenant scoping requires per-tenant shim tokens and changes to
+      Caddyfile routing. Deferred to a future hardening sprint.
+  - >-
+      CADDY_INTERNAL_HMAC (step-up JWTs, operator tokens): auth/stepup.py and
+      backoffice/routes/auth.py sign HS256 JWTs with the install-wide
+      caddy_internal_hmac. Per-tenant scoping deferred — step-up is admin-plane
+      and already protected by AdminSession + mTLS + SPIFFE. Deferred.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-03'

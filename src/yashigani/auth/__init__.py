@@ -1,5 +1,5 @@
 """Yashigani Auth — local auth, TOTP, session management, SPIFFE gate, step-up."""
-# Last updated: 2026-05-07T01:00:00+01:00
+# Last updated: 2026-07-03T00:00:00+01:00
 from yashigani.auth.password import (
     hash_password, verify_password, generate_password,
     PasswordBreachedError, PasswordContextError,
@@ -34,6 +34,8 @@ from yashigani.auth.hibp_config import (
     mask_hibp_key, validate_hibp_key_format,
     resolve_hibp_api_key, get_hibp_key_status,
 )
+# YSG-RISK-108: per-tenant JWT signing key isolation
+from yashigani.auth._jwt import derive_tenant_ec_key, TenantJwtKeyStore
 
 __all__ = [
     "hash_password", "verify_password", "generate_password",
@@ -60,4 +62,6 @@ __all__ = [
     "AuthSettingsStore",
     "mask_hibp_key", "validate_hibp_key_format",
     "resolve_hibp_api_key", "get_hibp_key_status",
+    # YSG-RISK-108: per-tenant JWT signing key isolation
+    "derive_tenant_ec_key", "TenantJwtKeyStore",
 ]
