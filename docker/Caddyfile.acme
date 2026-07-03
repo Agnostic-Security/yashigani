@@ -131,13 +131,22 @@ import /etc/caddy/Caddyfile.csp
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strip identity-forwarding headers at the public edge (T-1 belt-and-suspenders).
-# X-Yashigani-User-Id and X-Yashigani-Identity-Id are set by the trusted internal
-# backoffice forwarder on the mesh path (gateway:8081). An external client MUST
-# NOT be able to inject either header to spoof an internal identity.
-# The gateway already rejects externally-supplied identity headers at the
-# application layer, but stripping at the edge (T-1) removes the attack surface
-# before it ever reaches the app — zero cost, belt-and-suspenders.
+# Strip internal-trust headers at the public edge (T-1 belt-and-suspenders).
+# Three classes of header MUST NOT arrive from external clients unchallenged:
+#
+#   X-Yashigani-User-Id / X-Yashigani-Identity-Id — set by the trusted internal
+#     backoffice forwarder on the mesh path (gateway:8081). An external client MUST
+#     NOT be able to inject either to spoof an internal identity.
+#
+#   X-Caddy-Verified-Secret — set ONLY by Caddy (inject-caddy-verified snippet) on
+#     every reverse_proxy upstream call. The gateway/backoffice middleware verifies
+#     this header to confirm the request was forwarded by the trusted Caddy edge
+#     (YSG-RISK-108 / EX-231-10 Layer B). Stripping inbound prevents an attacker
+#     on the public network from presenting a forged value before Caddy overwrites
+#     it — belt-and-suspenders on top of the `header_up set` overwrite in
+#     inject-caddy-verified (the overwrite is the primary control; this strip is T-1
+#     depth). NOT applied on :8444/:8445 (internal-mesh listeners).
+#
 # Applied at the public-site level so ALL handle blocks are covered with no
 # per-handle drift risk. NOT applied on :8444/:8445 (separate internal-mesh
 # site blocks) where the trusted backoffice forwarder legitimately sets them.
@@ -147,6 +156,11 @@ import /etc/caddy/Caddyfile.csp
 (strip-identity-headers) {
     request_header -X-Yashigani-User-Id
     request_header -X-Yashigani-Identity-Id
+    # YSG-RISK-108 / EX-231-10 Layer B — strip any client-supplied Caddy secret.
+    # inject-caddy-verified (header_up set) overwrites it on the upstream call,
+    # but stripping here prevents the raw header from persisting in forward_auth
+    # sub-requests where no inject-caddy-verified is called.
+    request_header -X-Caddy-Verified-Secret
 }
 
 (inject-caddy-verified) {

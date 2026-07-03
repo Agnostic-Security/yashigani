@@ -437,11 +437,15 @@ data:
       request_header -X-Yashigani-Orchestration-*
     }
     # ────────────────────────────────────────────────────────────────────────
-    # Strip identity-forwarding headers at the public edge (T-1 belt-and-suspenders).
+    # Strip internal-trust headers at the public edge (T-1 belt-and-suspenders).
     # CRITICAL: MUST stay byte-parity with docker/Caddyfile.{selfsigned,ca,acme}.
-    # X-Yashigani-User-Id and X-Yashigani-Identity-Id are set by the trusted
-    # internal backoffice forwarder on the mesh path (gateway:8081). An external
-    # client MUST NOT be able to inject either header to spoof an internal identity.
+    # Three classes of header MUST NOT arrive from external clients unchallenged:
+    #   X-Yashigani-User-Id / X-Yashigani-Identity-Id — set by the trusted internal
+    #     backoffice forwarder on the mesh path (gateway:8081).
+    #   X-Caddy-Verified-Secret — set ONLY by Caddy (inject-caddy-verified) on every
+    #     reverse_proxy upstream call (YSG-RISK-108 / EX-231-10 Layer B). Stripping
+    #     here prevents an external client from forging the value before Caddy's
+    #     `header_up set` overwrites it on the upstream call.
     # Applied at the public-site level inside :443 — no per-handle drift.
     # NOT applied on :8444/:8445 (internal-mesh listeners) where the trusted
     # forwarder legitimately sets these headers.
@@ -451,6 +455,8 @@ data:
     (strip-identity-headers) {
       request_header -X-Yashigani-User-Id
       request_header -X-Yashigani-Identity-Id
+      # YSG-RISK-108 / EX-231-10 Layer B — strip any client-supplied Caddy secret.
+      request_header -X-Caddy-Verified-Secret
     }
     # Bind on :443 (any Host) so port-forward / NodePort / IP-based tests
     # work regardless of how the cluster operator routes the public domain.
