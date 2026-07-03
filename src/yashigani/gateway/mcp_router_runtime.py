@@ -67,6 +67,7 @@ v3.1 / G-ORCH-OPA-1 egress hardening.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -80,6 +81,39 @@ from yashigani.mcp._types import McpCallContext, McpPosture, PostureBinding
 from yashigani.mcp._transport_http import McpHttpTransport, HttpTransportError
 
 logger = logging.getLogger(__name__)
+
+
+def _mesh_caller_is_internal(request: Request) -> bool:
+    """Return True iff the request proves internal mesh identity.
+
+    YSG-RISK-108 / T-3 + T-4 trust gate.
+
+    The per-install YASHIGANI_INTERNAL_BEARER is present on ALL legitimate
+    mesh callers (orchestrator self-calls, OWUI, 4.0 native chat path).
+    Only when this token is verified should identity-forwarding headers
+    (X-Forwarded-User, X-Yashigani-Orchestration-Depth/Principal,
+    X-Yashigani-Identity-Id) be trusted.
+
+    An anonymous caller on port :8081 cannot know the per-install bearer —
+    so any identity header without it is a header-spoof attempt.
+
+    Fail-closed: if the bearer import fails (e.g. circular-import guard at
+    test time), returns False — no identity promoted, no escalation.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
+    key = auth[7:]
+    if not key:
+        return False
+    try:
+        from yashigani.gateway.openai_router import _INTERNAL_BEARER  # noqa: PLC0415
+        return hmac.compare_digest(
+            key.encode("ascii"),
+            _INTERNAL_BEARER.encode("ascii"),
+        )
+    except Exception:
+        return False
 
 # Fix-3 (Laura ship-blocker): body size cap — defense in depth at the router layer.
 # The bridge enforces the same cap independently (see _bridge.py _BRIDGE_BODY_LIMIT).
@@ -130,6 +164,7 @@ async def dispatch_mcp_call(
     response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
     identity_registry: Optional[object] = None,  # IdentityRegistry | None — for ceiling lookup
     agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3 tool permit
+    audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-108 mesh audit
 ) -> Response:
     """
     Core MCP call handler.  Called DIRECTLY from the proxy catch-all AFTER the
@@ -173,6 +208,10 @@ async def dispatch_mcp_call(
         by caller_agent_id slug) and set on McpCallContext.caller_allowed_tools
         before broker.enforce().  When absent or caller not found, no per-caller
         tool restriction applies.  3.1 Phase 3 — tool allow-list enforcement.
+    audit_writer:
+        Optional AuditLogWriter instance.  When provided, mesh identity-header
+        rejection events (YSG-RISK-108 T-3/T-4) are emitted to the tamper-
+        evident audit chain.  When absent, rejections are logged only (WARNING).
     """
     return await _handle_mcp_call_inner(
         agent_name=agent_name,
@@ -181,6 +220,7 @@ async def dispatch_mcp_call(
         response_inspection_pipeline=response_inspection_pipeline,
         identity_registry=identity_registry,
         agent_registry=agent_registry,
+        audit_writer=audit_writer,
     )
 
 
@@ -191,6 +231,7 @@ async def _handle_mcp_call_inner(
     response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
     identity_registry: Optional[object] = None,  # IdentityRegistry | None
     agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3
+    audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-108
 ) -> Response:
     """
     Core MCP call processing logic — shared by dispatch_mcp_call (catch-all path)
@@ -198,6 +239,85 @@ async def _handle_mcp_call_inner(
 
     agent_name is the path component — NEVER read from the request body.
     """
+    # ── YSG-RISK-108 / T-3 + T-4 — Mesh port identity-header trust gate ─────
+    #
+    # Runs BEFORE any resource lookup so that spoof attempts against any path
+    # (including non-existent agents that would 404) are caught and audited.
+    #
+    # Identity-forwarding headers (X-Forwarded-User, X-Yashigani-Orchestration-*)
+    # are ONLY trusted if the caller proves internal mesh identity via:
+    #   (a) YASHIGANI_INTERNAL_BEARER — present on ALL legitimate mesh callers
+    #       (orchestrator self-calls, OWUI, 4.0 native chat path), OR
+    #   (b) X-Caddy-Verified-Secret — present on requests proxied through Caddy
+    #       (SSO/API path via port 8080; Caddy strips inbound copies at the edge).
+    #
+    # An anonymous caller on port :8081 presenting identity headers without
+    # proving either (a) or (b) is a header-spoof attempt (T-3 / T-4).
+    # The header is stripped and the caller is treated as anonymous ("unknown").
+    # A HIGH-severity audit event is emitted to the tamper-evident chain.
+    from yashigani.auth.caddy_verified import validate_caddy_secret as _validate_caddy
+    _caller_is_internal = _mesh_caller_is_internal(request)
+    _caller_is_caddy = _validate_caddy(
+        request.headers.get("x-caddy-verified-secret", "")
+    )
+    _caller_is_trusted = _caller_is_internal or _caller_is_caddy
+
+    # T-3: X-Forwarded-User trust gate
+    _fwd_user_raw = request.headers.get("x-forwarded-user", "").strip()
+    if _fwd_user_raw and not _caller_is_trusted:
+        logger.warning(
+            "mcp-runtime: YSG-RISK-108/T-3: unauthenticated caller on mesh port "
+            "presented X-Forwarded-User=%r without internal bearer or Caddy secret — "
+            "stripped; caller treated as anonymous. path=%r",
+            _fwd_user_raw[:64],
+            str(request.url.path)[:128],
+        )
+        if audit_writer is not None:
+            try:
+                from yashigani.audit.schema import MeshIdentityHeaderRejectedEvent
+                audit_writer.write(MeshIdentityHeaderRejectedEvent(
+                    path=str(request.url.path)[:256],
+                    method=request.method,
+                    rejected_header="x-forwarded-user",
+                    claimed_value_truncated=_fwd_user_raw[:64],
+                ))
+            except Exception as _ae:
+                logger.error(
+                    "mcp-runtime: failed to write MESH_IDENTITY_HEADER_REJECTED event: %s", _ae
+                )
+        _fwd_user_raw = ""  # strip — caller is anonymous
+
+    # T-4: Orchestration-depth promotion gate
+    # Priority 1: AgentAuthMiddleware sets agent_id on request.state for /agents/ paths.
+    # Priority 2: X-Yashigani-Orchestration-Depth marks a gateway orchestrator self-call,
+    #   BUT only when the caller has proven internal mesh identity.
+    _caller_agent_id: Optional[str] = getattr(request.state, "agent_id", None)
+    if not _caller_agent_id:
+        _depth_hdr = request.headers.get("x-yashigani-orchestration-depth")
+        if _depth_hdr is not None:
+            if _caller_is_trusted:
+                _caller_agent_id = "gateway:orchestrator"
+            else:
+                logger.warning(
+                    "mcp-runtime: YSG-RISK-108/T-4: unauthenticated caller on mesh port "
+                    "presented X-Yashigani-Orchestration-Depth=%r without internal bearer "
+                    "or Caddy secret — NOT promoted to gateway:orchestrator. path=%r",
+                    str(_depth_hdr)[:16],
+                    str(request.url.path)[:128],
+                )
+                if audit_writer is not None:
+                    try:
+                        from yashigani.audit.schema import MeshOrchDepthForgedEvent
+                        audit_writer.write(MeshOrchDepthForgedEvent(
+                            path=str(request.url.path)[:256],
+                            method=request.method,
+                            depth_value_truncated=str(_depth_hdr)[:16],
+                        ))
+                    except Exception as _ae:
+                        logger.error(
+                            "mcp-runtime: failed to write MESH_ORCH_DEPTH_FORGED event: %s", _ae
+                        )
+
     # ── 1. Registry lookup ────────────────────────────────────────────────
     entry = registry.get(agent_name)  # type: ignore[attr-defined]
     if entry is None:
@@ -274,29 +394,12 @@ async def _handle_mcp_call_inner(
     msg_id = msg.get("id")  # None for notifications
     is_notification = msg_id is None
 
-    # Resolve identity from the gateway-injected header (Caddy forward_auth)
-    # X-Forwarded-User is stripped from downstream but available in inbound headers.
-    user_id = _raw_headers.get("x-forwarded-user", "").strip() or "unknown"
+    # ── Identity settled above (top-of-function gate, YSG-RISK-108) ──────────
+    # _fwd_user_raw and _caller_agent_id were computed and trust-gated before
+    # the registry lookup; use them here to build call IDs and pass to OPA.
+    user_id = _fwd_user_raw or "unknown"
     call_id = str(uuid.uuid4())
     request_id = str(uuid.uuid4())
-
-    # 3.1 Phase 1 — resolve the calling agent's identity for the OPA input.
-    #
-    # Priority 1: AgentAuthMiddleware sets request.state.agent_id for requests
-    #   authenticated via the agent PSK pathway (X-Yashigani-Caller-Agent-Id +
-    #   Authorization: Bearer <PSK>).  This is the normal agent→MCP path.
-    #
-    # Priority 2: X-Yashigani-Orchestration-Depth header marks a gateway
-    #   orchestrator self-call (see orchestrator._self_call_headers).  The
-    #   reserved identity "gateway:orchestrator" is used so OPA policies can
-    #   distinguish internal-gateway MCP hops from external agent hops.
-    #
-    # Priority 3: None — caller is unauthenticated or not yet identified.
-    #   Phase 1 is additive: unbound policies treat an absent caller as no-op.
-    _caller_agent_id: Optional[str] = getattr(request.state, "agent_id", None)
-    if not _caller_agent_id:
-        if _raw_headers.get("x-yashigani-orchestration-depth") is not None:
-            _caller_agent_id = "gateway:orchestrator"
 
     # G-ORCH-OPA-1 / Option A: look up the caller's sensitivity_ceiling from
     # the identity registry (keyed by the X-Forwarded-User slug).  This is the

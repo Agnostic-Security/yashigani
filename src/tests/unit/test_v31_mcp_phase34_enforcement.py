@@ -632,8 +632,14 @@ class TestMcpRuntimeCallerAllowedToolsResolution:
 
         req = MagicMock()
         req.state = MagicMock(spec=[])  # no agent_id
-        req.headers = {"x-yashigani-orchestration-depth": "1",
-                       "x-forwarded-user": "alice"}
+        # YSG-RISK-108: legitimate orchestrator self-call carries internal bearer
+        # AND depth header.  Depth header alone is no longer sufficient (T-4 fix).
+        from yashigani.gateway.openai_router import _INTERNAL_BEARER as _bearer
+        req.headers = {
+            "authorization": f"Bearer {_bearer}",
+            "x-yashigani-orchestration-depth": "1",
+            "x-forwarded-user": "alice",
+        }
         req.body = AsyncMock(return_value=self._make_jsonrpc())
 
         fake_upstream = json.dumps({

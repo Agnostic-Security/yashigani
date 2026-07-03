@@ -2510,7 +2510,7 @@ risks:
   compensating_controls:
   - Mesh port :8081 is inside the mTLS mesh (not exposed at the Caddy edge).
   - OPA deny-by-default applies even on forged identities at the policy layer.
-  status: partially_closed
+  status: closed
   accepted_by: tiago@agnosticsec.com
   accepted_at: '2026-07-03'
   review_by: '2026-09-30'
@@ -2520,18 +2520,13 @@ risks:
       unauthenticated caller without YASHIGANI_INTERNAL_BEARER or Caddy secret
       is NOT promoted to gateway:orchestrator (T-4) and X-Forwarded-User is
       NOT trusted (T-3). Regression tests in
-      tests/regression/v4.0/test_ysg_risk_108_mesh_port_authn_bypass.py.
-      Positive cases (internal bearer + depth header → promotion) pending
-      full test wiring for the T-4 positive path (test_v31_mcp_caller_identity
-      test_orch_depth_header_sets_gateway_orchestrator_caller is the open
-      regression — requires bearer injection in the test helper).
-  residuals:
-  - >-
-      T-4 POSITIVE PATH: test_v31_mcp_caller_identity::test_orch_depth_header_sets_gateway_orchestrator_caller
-      is a known pre-existing failure on this branch — the positive promotion
-      path (internal bearer + depth header) is wired in mcp_router_runtime.py
-      but the test helper does not inject the bearer. Fix in a disjoint commit
-      touching the test helper only.
+      tests/regression/v4.0/test_ysg_risk_108_mesh_port_authn_bypass.py
+      (10/10 PASS).
+      Positive cases (internal bearer + depth header → promotion) verified in
+      test_v31_mcp_caller_identity::test_orch_depth_header_sets_gateway_orchestrator_caller
+      and test_v31_mcp_phase34_enforcement::test_e3_gateway_orchestrator_skips_identity_lookup
+      (both updated to carry bearer, now PASS). All MCP tests 42/42 PASS.
+  residuals: []
   fix_in_version: v4.0
   last_threat_model_review: '2026-07-03'
 

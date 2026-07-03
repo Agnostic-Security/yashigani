@@ -989,6 +989,9 @@ async def _proxy_request_body(
                 # 3.1 Phase 3 — pass agent_registry so caller allowed_tools
                 # can be resolved from the identity registry at call time.
                 agent_registry=state.get("agent_registry"),
+                # YSG-RISK-108 — pass audit_writer so mesh identity-header
+                # rejection events (T-3/T-4) reach the tamper-evident chain.
+                audit_writer=state.get("audit_writer"),
             )
         # Multi-segment or empty suffix falls through to generic upstream forwarding
 
