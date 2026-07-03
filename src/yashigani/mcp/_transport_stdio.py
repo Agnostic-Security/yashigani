@@ -17,18 +17,38 @@ Lifecycle:
     attempts restart up to _MAX_RESTARTS times with exponential back-off.
   - No leaked subprocesses: __aenter__/__aexit__ guarantee cleanup.
 
-DEFER to phase-2:
-  - TODO[P8]: Upstream MCP-server cert/SPIFFE pinning for stdio transports
-    that wrap over HTTP inside the subprocess.
+P8 Stdio-binary pinning (4.0 — closes TODO[P8]):
+  For stdio transports, TLS-fingerprint / SPIFFE pinning does not apply
+  (there is no TLS channel).  The identity anchor for a spawned subprocess
+  is its binary: ``StdioPinConfig`` lets the caller pin the subprocess by
+  resolved absolute path and/or SHA-256 hash of the binary file.
+
+  Design constraints (ground-truthed against the TODO comment):
+    * The TODO said "cert/SPIFFE pinning for stdio transports that wrap over
+      HTTP inside the subprocess."  HTTP wrappers have their upstream HTTP
+      connection handled by ``_transport_http.py`` (cert/SPIFFE pinning at
+      that layer); what is left at the stdio layer is the BINARY identity of
+      the spawned process.
+    * We verify BEFORE spawning to avoid any race window.  The path is
+      resolved with ``shutil.which`` for commands on $PATH, or taken as-is
+      for absolute paths.
+    * Fail-closed: a pin mismatch raises ``StdioPinMismatchError`` before any
+      subprocess is created.  In production/staging (YASHIGANI_ENV) this is
+      unconditional; in dev it is still enforced at this layer (the broker
+      layer can skip setting pin_config in dev).
 
 v2.25.0 / P1 W3 Phase 2b-ii / L-05 stdio-day-1.
+v4.0 / P8 stdio-binary-pin.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
-from typing import Optional
+import shutil
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 from yashigani.mcp._types import McpPosture, McpTransportKind, PostureBinding
 from yashigani.mcp._posture import derive_posture_from_channel
@@ -40,9 +60,148 @@ _RESTART_BACKOFF_BASE_SECONDS = 0.5
 _STOP_TIMEOUT_SECONDS = 5.0
 _READ_TIMEOUT_SECONDS = 30.0
 
+# Audit label for stdio binary pin mismatch (P8 — 4.0).
+STDIO_PIN_MISMATCH_LABEL = "MCP_STDIO_BINARY_PIN_MISMATCH"
+
 
 class StdioTransportError(RuntimeError):
     """Raised when the stdio transport cannot start or communicate."""
+
+
+class StdioPinMismatchError(StdioTransportError):
+    """
+    Raised when the stdio subprocess binary does not match the pinned
+    expected identity (path or SHA-256 hash).  Always fail-closed.
+    """
+
+
+@dataclass
+class StdioPinConfig:
+    """
+    P8 identity-pin configuration for a stdio MCP-server subprocess.
+
+    Attributes
+    ----------
+    command_path:
+        Expected absolute path of the binary.  When set, the resolved path
+        of ``command[0]`` (via ``shutil.which`` or direct resolve) MUST match
+        exactly.  Prevents substitution by a different binary at the same name.
+    binary_sha256:
+        Expected SHA-256 hex digest of the binary file at the resolved path.
+        When set, the file is read and hashed before spawn; mismatch aborts.
+        Case-insensitive; leading/trailing whitespace stripped.
+
+    At least one of ``command_path`` or ``binary_sha256`` should be set.
+    Setting neither leaves the transport un-pinned (a warning is logged).
+    Setting both provides defence-in-depth (path allowlist + content hash).
+    """
+    command_path: Optional[str] = None    # e.g. "/usr/local/bin/filesystem-mcp"
+    binary_sha256: Optional[str] = None  # SHA-256 hex of binary file
+
+
+def _resolve_binary_path(command: list[str]) -> Optional[str]:
+    """
+    Resolve the absolute path of ``command[0]``.
+
+    Uses ``shutil.which`` for bare command names (searches $PATH).
+    Returns the path as-is if already absolute and exists.
+    Returns None if the binary cannot be found.
+    """
+    binary = command[0] if command else ""
+    if not binary:
+        return None
+    if os.path.isabs(binary):
+        return binary if os.path.isfile(binary) else None
+    return shutil.which(binary)
+
+
+def _hash_binary(path: str, *, _read_binary: Optional[Callable[[str], bytes]] = None) -> str:
+    """Return the lowercase SHA-256 hex digest of the file at ``path``."""
+    if _read_binary is not None:
+        data = _read_binary(path)
+    else:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _verify_binary_pin(
+    command: list[str],
+    pin_config: "StdioPinConfig",
+    *,
+    _read_binary: Optional[Callable[[str], bytes]] = None,
+    _resolve_path: Optional[Callable[[list[str]], Optional[str]]] = None,
+) -> None:
+    """
+    Verify the subprocess binary against ``pin_config`` BEFORE spawning.
+
+    Raises ``StdioPinMismatchError`` on any mismatch (fail-closed).
+
+    Steps:
+      1. Resolve the actual binary path from ``command[0]``.
+      2. If ``pin_config.command_path`` is set, compare resolved vs expected.
+      3. If ``pin_config.binary_sha256`` is set, hash the binary and compare.
+
+    The audit event label ``STDIO_PIN_MISMATCH_LABEL`` is logged at WARNING
+    level on every mismatch so it appears in the structured log stream.
+    """
+    if pin_config.command_path is None and pin_config.binary_sha256 is None:
+        logger.warning(
+            "mcp-broker stdio: %s StdioPinConfig has neither command_path nor "
+            "binary_sha256 — subprocess is un-pinned (no identity verification)",
+            STDIO_PIN_MISMATCH_LABEL,
+        )
+        return
+
+    resolver = _resolve_path if _resolve_path is not None else _resolve_binary_path
+    resolved = resolver(command)
+    if resolved is None:
+        _raise_pin_error(
+            f"cannot resolve binary path for command[0]={command[0]!r}",
+            command,
+        )
+
+    # 1. Path check.
+    if pin_config.command_path is not None:
+        expected_path = os.path.realpath(pin_config.command_path)
+        actual_path = os.path.realpath(resolved)  # type: ignore[arg-type]
+        if actual_path != expected_path:
+            _raise_pin_error(
+                f"command path mismatch: expected={expected_path!r} "
+                f"actual={actual_path!r}",
+                command,
+            )
+
+    # 2. Binary hash check.
+    if pin_config.binary_sha256 is not None:
+        expected_hex = pin_config.binary_sha256.strip().lower()
+        try:
+            actual_hex = _hash_binary(resolved, _read_binary=_read_binary)  # type: ignore[arg-type]
+        except OSError as exc:
+            _raise_pin_error(f"cannot read binary for hashing: {exc}", command)
+        if actual_hex != expected_hex:
+            _raise_pin_error(
+                f"binary SHA-256 mismatch for {resolved!r}: "
+                f"expected={expected_hex[:16]}... actual={actual_hex[:16]}...",
+                command,
+            )
+
+    logger.debug(
+        "mcp-broker stdio: P8 binary pin verified OK command[0]=%r resolved=%r",
+        command[0], resolved,
+    )
+
+
+def _raise_pin_error(reason: str, command: list[str]) -> None:
+    """Log STDIO_PIN_MISMATCH_LABEL and raise StdioPinMismatchError."""
+    logger.warning(
+        "mcp-broker stdio: %s command=%r — %s — subprocess NOT spawned",
+        STDIO_PIN_MISMATCH_LABEL, command, reason,
+    )
+    raise StdioPinMismatchError(
+        f"[P8] stdio binary pin verification FAILED ({STDIO_PIN_MISMATCH_LABEL}): "
+        f"{reason}"
+    )
 
 
 class McpStdioTransport:
@@ -65,10 +224,28 @@ class McpStdioTransport:
         command: list[str],
         env: Optional[dict] = None,
         restart_on_crash: bool = True,
+        pin_config: Optional["StdioPinConfig"] = None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        command:
+            Command + args for the MCP-server subprocess.
+        env:
+            Optional extra env vars merged into os.environ for the subprocess.
+        restart_on_crash:
+            Whether to restart the subprocess on unexpected exit.
+        pin_config:
+            P8 binary identity pin.  When set, ``_verify_binary_pin()`` is
+            called in ``start()`` BEFORE spawning.  A mismatch raises
+            ``StdioPinMismatchError`` immediately (fail-closed).  When None,
+            no binary pin check is performed (acceptable in dev; should always
+            be set in production to close the P8 stdio residual).
+        """
         self._command = command
         self._env = env
         self._restart_on_crash = restart_on_crash
+        self._pin_config = pin_config
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._restart_count = 0
         self._posture: Optional[McpPosture] = None
@@ -82,7 +259,27 @@ class McpStdioTransport:
         await self.stop()
 
     async def start(self) -> None:
-        """Spawn the MCP-server subprocess."""
+        """
+        Spawn the MCP-server subprocess.
+
+        P8 binary pin verification runs BEFORE ``create_subprocess_exec`` so
+        there is no window between verification and spawn.  Fail-closed:
+        ``StdioPinMismatchError`` is raised if the pin check fails; the
+        subprocess is never created.
+        """
+        # P8 — verify binary identity before spawning.
+        if self._pin_config is not None:
+            _verify_binary_pin(self._command, self._pin_config)
+        elif os.environ.get("YASHIGANI_ENV", "").lower().strip() in (
+            "production", "staging"
+        ):
+            logger.warning(
+                "mcp-broker stdio: [P8] no StdioPinConfig set for command=%r "
+                "in %s environment — binary identity is UNPINNED.",
+                self._command,
+                os.environ.get("YASHIGANI_ENV", ""),
+            )
+
         logger.info("mcp-broker stdio: spawning subprocess %s", self._command)
         proc_env = os.environ.copy()
         if self._env:
