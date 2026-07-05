@@ -133,13 +133,27 @@ class IssuerPaths:
         """
         return self.secrets_dir / "var" / "runtime" / "service_identities.yaml"
 
-    def agent_cert(self, tenant_id: str, agent_name: str) -> Path:
-        """Leaf cert path for a dynamically-issued agent identity."""
-        return self.secrets_dir / f"agent_{tenant_id}_{agent_name}_client.crt"
+    @staticmethod
+    def agent_entry_name(tenant_id: str, agent_name: str, instance_id: str = "") -> str:
+        """Canonical file/manifest stem for a dynamically-issued agent identity.
 
-    def agent_key(self, tenant_id: str, agent_name: str) -> Path:
+        Legacy (no instance): ``agent_<tenant>_<name>``.
+        Per-instance (v4.1 Phase 1a, GAP-1): ``agent_<tenant>_<name>_<nhi_id>``
+        — two same-named instances get DISTINCT cert/key files instead of
+        silently overwriting each other.
+        """
+        stem = f"agent_{tenant_id}_{agent_name}"
+        if instance_id:
+            stem = f"{stem}_{instance_id}"
+        return stem
+
+    def agent_cert(self, tenant_id: str, agent_name: str, instance_id: str = "") -> Path:
+        """Leaf cert path for a dynamically-issued agent identity."""
+        return self.secrets_dir / f"{self.agent_entry_name(tenant_id, agent_name, instance_id)}_client.crt"
+
+    def agent_key(self, tenant_id: str, agent_name: str, instance_id: str = "") -> Path:
         """Leaf key path for a dynamically-issued agent identity."""
-        return self.secrets_dir / f"agent_{tenant_id}_{agent_name}_client.key"
+        return self.secrets_dir / f"{self.agent_entry_name(tenant_id, agent_name, instance_id)}_client.key"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,6 +554,8 @@ def build_leaf(
     *,
     extra_dns_sans: Optional[list[str]] = None,
     extra_ip_sans: Optional[list[str]] = None,
+    include_service_name_dns_san: bool = True,
+    binding_extension_value: Optional[bytes] = None,
 ) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
     """Build a leaf cert. Leaf keys are always EC P-256; the intermediate signing
     key may be EC or RSA (v2.24.1+ BYO RSA broadening)."""
@@ -551,13 +567,27 @@ def build_leaf(
     the gateway without a separate CA / Let's Encrypt deployment.
 
     Ignored for non-caddy services (passed as None from rotate_leaves for those).
+
+    include_service_name_dns_san — v4.1 Phase 1a DNS-SAN hygiene: agent/MCP
+    instance leaves are SPIFFE-URI-identified; their synthetic service names
+    (``agent_<tenant>_<name>_<nhi_id>``) are not valid hostnames and must not
+    widen the DNS SAN surface. mint_agent_leaf passes False → the
+    ``DNSName(service.name)`` fallback is skipped. ``localhost`` +
+    127.0.0.1/::1 are KEPT on every leaf: the Phase 2 Caddy-front binds the
+    instance shim on loopback and in-container healthchecks dial
+    ``https://localhost`` — that is the only DNS/IP surface an instance leaf
+    needs.
+
+    binding_extension_value — v4.1 Phase 1a GAP-2: when set, embedded as a
+    CRITICAL custom extension (pki/binding.py BINDING_EXTENSION_OID) carrying
+    the sha384(image_digest ‖ scope_hash) change-prevention digest.
     """
     lifetime_days = policy.clamp_leaf(lifetime_days or policy.leaf_lifetime_days_default)
     key = _gen_keypair()
     now = _utcnow()
 
     sans: list[x509.GeneralName] = [x509.DNSName(n) for n in service.dns_sans]
-    if not sans:
+    if not sans and include_service_name_dns_san:
         sans = [x509.DNSName(service.name)]
     # Always include localhost + loopback so in-container healthchecks and
     # self-connecting clients can verify the cert against their own hostname.
@@ -656,9 +686,17 @@ def build_leaf(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(intermediate_cert.public_key()),  # type: ignore[arg-type]
             critical=False,
         )
-        .sign(intermediate_key, hashes.SHA256())
     )
-    return cert, key
+    if binding_extension_value is not None:
+        # v4.1 Phase 1a GAP-2 — change-prevention binding digest, CRITICAL.
+        # Encoding contract lives in pki/binding.py (fixed handoff contract).
+        from yashigani.pki.binding import BINDING_EXTENSION_OID
+        cert = cert.add_extension(
+            x509.UnrecognizedExtension(BINDING_EXTENSION_OID, binding_extension_value),
+            critical=True,
+        )
+    signed = cert.sign(intermediate_key, hashes.SHA256())
+    return signed, key
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1035,8 +1073,7 @@ def rotate_root(
 
 def _append_agent_identity_to_runtime_manifest(
     paths: IssuerPaths,
-    tenant_id: str,
-    agent_name: str,
+    entry_name: str,
     spiffe_id: str,
     cert_not_after_iso: str,
 ) -> None:
@@ -1046,9 +1083,10 @@ def _append_agent_identity_to_runtime_manifest(
     committed IaC manifest at paths.manifest_path). It is created empty by
     install.sh and never committed to git.
 
-    Format appended:
-        - name: agent_<tenant_id>_<agent_name>
-          spiffe_id: spiffe://…/agents/<tenant_id>/<agent_name>
+    Format appended (entry_name = IssuerPaths.agent_entry_name(...) — includes
+    the ``_<nhi_id>`` instance suffix for per-instance identities, GAP-1):
+        - name: agent_<tenant_id>_<agent_name>[_<nhi_id>]
+          spiffe_id: spiffe://…/agents/<tenant_id>/<agent_name>[/<nhi_id>]
           dns_sans: []
           purpose: agent-identity
           mtls_capable: true
@@ -1060,8 +1098,6 @@ def _append_agent_identity_to_runtime_manifest(
     """
     runtime_path = paths.runtime_manifest
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
-
-    entry_name = f"agent_{tenant_id}_{agent_name}"
 
     # Load existing runtime manifest content (may be empty on first call).
     existing_text = runtime_path.read_text() if runtime_path.exists() else "agent_identities: []\n"
@@ -1105,11 +1141,70 @@ def _append_agent_identity_to_runtime_manifest(
     )
 
 
+
+def revoke_agent_identity(
+    paths: IssuerPaths,
+    tenant_id: str,
+    agent_name: str,
+    instance_id: str = "",
+) -> bool:
+    """Mark an agent identity ``revoked: true`` in the runtime manifest (GAP-4).
+
+    Called on NHI deactivate.  The leaf cert file is left on disk (deletion
+    requires explicit operator action per repo deletion rules); the manifest
+    ``revoked`` flag is the signal the manifest loader / OPA baseline push /
+    sidecar binding check consume — a revoked entry must fail the instance
+    immediately, without waiting for ``not_after``.
+
+    Returns True when an entry was flipped, False when no matching
+    non-revoked entry exists (absent manifest, unknown entry, or already
+    revoked).  Never raises on missing files — deactivate must stay usable
+    even if PKI state is gone.
+    """
+    entry_name = IssuerPaths.agent_entry_name(tenant_id, agent_name, instance_id)
+    runtime_path = paths.runtime_manifest
+    if not runtime_path.exists():
+        logger.warning(
+            "internal-pki: revoke requested for %r but runtime manifest %s does not exist",
+            entry_name, runtime_path,
+        )
+        return False
+
+    lines = runtime_path.read_text().splitlines(keepends=True)
+    in_entry = False
+    flipped = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("- name: "):
+            in_entry = stripped == f"- name: {entry_name}"
+            continue
+        if in_entry and stripped == "revoked: false":
+            lines[i] = line.replace("revoked: false", "revoked: true")
+            flipped = True
+            break
+
+    if not flipped:
+        logger.warning(
+            "internal-pki: revoke found no non-revoked entry %r in runtime manifest",
+            entry_name,
+        )
+        return False
+
+    _write_secret(runtime_path, "".join(lines).encode("utf-8"), 0o640)
+    logger.info(
+        "internal-pki: agent identity %r marked revoked in runtime manifest", entry_name
+    )
+    return True
+
+
 def mint_agent_leaf(
     paths: IssuerPaths,
     tenant_id: str,
     agent_name: str,
     *,
+    instance_id: str = "",
+    scope_hash: str = "",
+    image_digest: str = "",
     leaf_lifetime_days: Optional[int] = None,
     approved_by: str = "",
     approval_audit_jti: str = "",
@@ -1117,9 +1212,13 @@ def mint_agent_leaf(
 ) -> str:
     """Issue a per-agent leaf cert and append the identity to the runtime manifest.
 
-    4.0 Phase 0 / §2 of svid-mesh-container-spec.md (RECONCILIATION-20260627.md R10):
-    Each agent gets a 2-component SPIFFE ID:
-        spiffe://<trust_domain>/agents/<tenant_id>/<agent_name>
+    4.0 Phase 0 / §2 of svid-mesh-container-spec.md (RECONCILIATION-20260627.md R10),
+    extended by v4.1 Phase 1a (GAP-1/GAP-2):
+    Each agent instance gets a SPIFFE ID:
+        spiffe://<trust_domain>/agents/<tenant_id>/<agent_name>[/<instance_id>]
+    When ``instance_id`` (the registry ``nhi_id``) is supplied, the identity is
+    PER-INSTANCE: distinct SPIFFE URI + distinct cert/key files even for two
+    same-named agents (GAP-1 — no more collide/overwrite).
 
     This function:
       1. Generates a new EC P-256 key pair.
@@ -1138,6 +1237,14 @@ def mint_agent_leaf(
         paths:               IssuerPaths pointing at the live secrets dir.
         tenant_id:           Tenant/user ID slug (used in SPIFFE URI + file name).
         agent_name:          Agent name slug (e.g. "letta", "langflow").
+        instance_id:         Registry nhi_id (``nhi_<12 hex>``) — per-instance
+                             identity segment (GAP-1). Empty = legacy shared
+                             (tenant, name) identity, unchanged byte-for-byte.
+        scope_hash:          Tool-surface hash ``sha384:<hex>`` (binding.py
+                             tool_surface_hash). With image_digest, forms the
+                             change-prevention binding extension (GAP-2).
+        image_digest:        OCI image digest pinned at approve time (may be
+                             "" when not yet pinned — recorded as such).
         leaf_lifetime_days:  Override default leaf lifetime from cert policy.
         approved_by:         Admin identity who approved this issuance (for audit).
         approval_audit_jti:  JTI of the admin's approval audit event (for audit chain).
@@ -1145,6 +1252,7 @@ def mint_agent_leaf(
                              CLI callers pass None. Admin API callers pass the live writer.
     """
     from yashigani.identity.trust_domain import agent_spiffe_uri
+    from yashigani.pki.binding import binding_digest, encode_binding_extension_value
 
     manifest = load_manifest(str(paths.manifest_path))
     policy = manifest.cert_policy
@@ -1156,9 +1264,10 @@ def mint_agent_leaf(
 
     # Build a synthetic ServiceIdentity for this agent.  We do NOT add it to the
     # committed manifest — it goes into the runtime manifest only.
-    spiffe_id = agent_spiffe_uri(tenant_id, agent_name)
+    spiffe_id = agent_spiffe_uri(tenant_id, agent_name, instance_id)
+    entry_name = IssuerPaths.agent_entry_name(tenant_id, agent_name, instance_id)
     synthetic_identity = ServiceIdentity(
-        name=f"agent_{tenant_id}_{agent_name}",
+        name=entry_name,
         dns_sans=(),
         purpose="agent-identity",
         mtls_capable=True,
@@ -1169,27 +1278,40 @@ def mint_agent_leaf(
 
     # BUG-A (v4.1 Phase 0): args must match build_leaf(service, intermediate_cert,
     # intermediate_key, policy, lifetime_days=...) — see build_leaf def above.
+    # GAP-2 change-prevention binding: sha384(image_digest ‖ 0x00 ‖ scope_hash)
+    # embedded as a CRITICAL extension (contract in pki/binding.py). Only
+    # embedded when a tool-surface baseline exists — a binding over two empty
+    # inputs would be a false "nothing was approved" attestation.
+    binding_ext = (
+        encode_binding_extension_value(image_digest, scope_hash)
+        if scope_hash else None
+    )
+
     leaf_cert, leaf_key = build_leaf(
         synthetic_identity,
         intermediate_cert,
         intermediate_key,
         policy,
         lifetime_days=lifetime,
+        # DNS-SAN hygiene (Phase 1a): SPIFFE-URI-identified — no synthetic
+        # service-name DNS SAN; localhost + loopback retained (see build_leaf).
+        include_service_name_dns_san=False,
+        binding_extension_value=binding_ext,
     )
 
     # Write cert+key.  Use agent_cert/agent_key path helpers (separate namespace from
     # regular service leaves to avoid collisions with service names like "gateway").
-    cert_path = paths.agent_cert(tenant_id, agent_name)
-    key_path = paths.agent_key(tenant_id, agent_name)
+    cert_path = paths.agent_cert(tenant_id, agent_name, instance_id)
+    key_path = paths.agent_key(tenant_id, agent_name, instance_id)
     bundle = _pem_cert(leaf_cert) + _pem_cert(intermediate_cert)
     _write_secret(cert_path, bundle, _FILE_MODE_CERT)
     _write_secret(key_path, _pem_key(leaf_key), _FILE_MODE_KEY)
 
     cert_not_after = leaf_cert.not_valid_after_utc.isoformat()
 
-    # Append to runtime manifest.
+    # Append to runtime manifest (entry keyed per-instance — GAP-1).
     _append_agent_identity_to_runtime_manifest(
-        paths, tenant_id, agent_name, spiffe_id, cert_not_after,
+        paths, entry_name, spiffe_id, cert_not_after,
     )
 
     logger.info(
@@ -1214,6 +1336,11 @@ def mint_agent_leaf(
                 cert_not_after=cert_not_after,
                 approved_by=approved_by,
                 approval_audit_jti=approval_audit_jti,
+                # v4.1 Phase 1a GAP-2 — baseline on the tamper-evident chain.
+                instance_id=instance_id,
+                scope_hash=scope_hash,
+                image_digest=image_digest,
+                binding_sha384=(binding_digest(image_digest, scope_hash) if scope_hash else ""),
             )
             audit_writer.write(event)
         except Exception as exc:

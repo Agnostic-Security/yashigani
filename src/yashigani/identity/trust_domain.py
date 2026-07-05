@@ -59,15 +59,46 @@ def spiffe_agents_prefix() -> str:
     return "spiffe://%s/agents" % trust_domain()
 
 
-def agent_spiffe_uri(tenant_id: str, agent_name: str) -> str:
+def agent_spiffe_uri(tenant_id: str, agent_name: str, instance_id: str = "") -> str:
     """Canonical agent SPIFFE URI for this instance's trust domain.
 
-    ``spiffe://<trust_domain>/agents/{tenant_id}/{agent_name}``.
+    Legacy (2-segment, no instance): ``spiffe://<td>/agents/{tenant_id}/{agent_name}``.
+
+    Per-instance (v4.1 Phase 1a, GAP-1): when ``instance_id`` is supplied (the
+    registry ``nhi_id``, shape ``nhi_<12 hex>``) a third path segment is added:
+
+        spiffe://<td>/agents/{tenant_id}/{agent_name}/{instance_id}
+
+    Two same-named instances therefore carry DISTINCT SPIFFE identities.  The
+    instance segment always matches ``nhi_[0-9a-f]{12}`` so validators can
+    distinguish instanced from legacy URIs (see ``parse_agent_spiffe_uri``).
 
     This is the single construction used by pool/manager, gateway/principal_token,
     mcp/broker and mcp/_jwt so the minted identity and every validator agree.
     """
-    return "spiffe://%s/agents/%s/%s" % (trust_domain(), tenant_id, agent_name)
+    base = "spiffe://%s/agents/%s/%s" % (trust_domain(), tenant_id, agent_name)
+    if instance_id:
+        return "%s/%s" % (base, instance_id)
+    return base
+
+
+def parse_agent_spiffe_uri(uri: str) -> "tuple[str, str, str] | None":
+    """Round-trip an agent SPIFFE URI → ``(tenant_id, agent_name, instance_id)``.
+
+    ``instance_id`` is ``""`` for legacy 2-segment URIs.  Returns ``None`` when
+    the URI is not under THIS instance's ``spiffe://<td>/agents/`` namespace
+    (reject-foreign stays exact — see module docstring isolation note).
+    """
+    prefix = spiffe_agents_prefix() + "/"
+    if not uri.startswith(prefix):
+        return None
+    rest = uri[len(prefix):]
+    parts = rest.split("/")
+    if len(parts) == 2 and all(parts):
+        return parts[0], parts[1], ""
+    if len(parts) == 3 and all(parts):
+        return parts[0], parts[1], parts[2]
+    return None
 
 
 def gateway_issuer_prefix() -> str:

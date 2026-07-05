@@ -21,6 +21,7 @@ from yashigani.identity.trust_domain import (
     trust_domain,
     spiffe_agents_prefix,
     agent_spiffe_uri,
+    parse_agent_spiffe_uri,
     gateway_issuer_prefix,
     audit_signer_spiffe_id,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "trust_domain",
     "spiffe_agents_prefix",
     "agent_spiffe_uri",
+    "parse_agent_spiffe_uri",
     "gateway_issuer_prefix",
     "audit_signer_spiffe_id",
     "email_to_slug",

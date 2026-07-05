@@ -345,10 +345,16 @@ return 1
                     )
 
     def deactivate(self, agent_id: str) -> None:
-        """Set status=inactive and remove from active index."""
+        """Set status=inactive and remove from active indexes.
+
+        v4.1 Phase 1a (GAP-4 adjacency): NHIs must ALSO leave
+        ``nhi:index:active`` — ``get_nhi_token_map()`` reads that index, so a
+        deactivated NHI whose id lingered there kept a live gateway token.
+        """
         reg_key = f"agent:reg:{agent_id}"
         self._r.hset(reg_key, b"status", b"inactive")
         self._r.srem("agent:index:active", agent_id.encode("utf-8"))
+        self._r.srem("nhi:index:active", agent_id.encode("utf-8"))
         logger.info("AgentRegistry: deactivated %s", agent_id)
         # ISSUE-AGENT-REG-DURABILITY: mirror the status change into Postgres.
         if self._durable is not None:
@@ -506,6 +512,7 @@ return 1
         pids_limit: int = 64,
         memory_mb: int = 512,
         spiffe_id: str = "",
+        scope_hash: str = "",
     ) -> tuple[str, str]:
         """Register a new Non-Human Identity (NHI) entry.
 
@@ -548,6 +555,7 @@ return 1
             "pids_limit":              str(pids_limit),
             "memory_mb":               str(memory_mb),
             "spiffe_id":               spiffe_id,
+            "scope_hash":              scope_hash,
             "svid_issued":             "0",
             "created_at":              now,
             "last_seen_at":            "",
@@ -730,6 +738,8 @@ return 1
                 "sensitivity_ceiling": _b(b"sensitivity_ceiling") or "PUBLIC",
                 "budget_cap":          _j(b"budget_cap") or {},
                 "svid_issued":         _b(b"svid_issued") == "1",
+                "scope_hash":          _b(b"scope_hash"),
+                "image_digest":        _b(b"image_digest"),
                 "pids_limit":          int(_b(b"pids_limit") or "64"),
                 "memory_mb":           int(_b(b"memory_mb") or "512"),
                 "spiffe_id":           _b(b"spiffe_id"),

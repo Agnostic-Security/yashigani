@@ -794,6 +794,35 @@ async def deactivate_agent(
     reason = (body.reason if body else "") or ""
     registry.deactivate(agent_id)
 
+    # v4.1 Phase 1a GAP-4 — NHI deactivate revokes the runtime-manifest
+    # identity entry so the OPA baseline push / sidecar binding check fails
+    # the instance immediately (not at cert expiry). Best-effort: a missing
+    # manifest/entry is logged by the issuer, never blocks deactivation.
+    if existing.get("kind") == "nhi":
+        try:
+            from pathlib import Path as _Path
+            from yashigani.pki.issuer import IssuerPaths, revoke_agent_identity
+
+            _pki_paths = IssuerPaths(
+                secrets_dir=_Path(os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")),
+                manifest_path=_Path(os.getenv(
+                    "YASHIGANI_SERVICE_MANIFEST_PATH",
+                    "/etc/yashigani/service_identities.yaml",
+                )),
+            )
+            revoke_agent_identity(
+                _pki_paths,
+                tenant_id=existing.get("owner_identity_id", "tenant"),
+                agent_name=existing.get("name", agent_id),
+                instance_id=agent_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "NHI deactivate: runtime-manifest revocation failed for %s "
+                "(deactivation itself succeeded — registry indexes cleared): %s",
+                agent_id, exc,
+            )
+
     # Audit
     if audit is not None:
         try:
@@ -1009,10 +1038,27 @@ async def approve_nhi_svid(
         )
         tenant_id = nhi.get("owner_identity_id", "tenant")
         agent_name = nhi.get("name", nhi_id)
+        # v4.1 Phase 1a GAP-2 — change-prevention baseline. scope_hash is
+        # stored at register_nhi time (instantiate path); for entries
+        # registered before that field existed, recompute from the SAME
+        # canonical encoding over the registry's allowed_tools.
+        from yashigani.pki.binding import tool_surface_hash
+        scope_hash = nhi.get("scope_hash") or tool_surface_hash(
+            nhi.get("allowed_tools") or []
+        )
+        # OCI image digest pinned at approve time. Populated by PoolManager
+        # once the pool pins digests; "" (unpinned) is recorded honestly —
+        # the binding then covers the tool surface only (see pki/binding.py).
+        image_digest = nhi.get("image_digest") or ""
         spiffe_id = mint_agent_leaf(
             pki_paths,
             tenant_id=tenant_id,
             agent_name=agent_name,
+            # GAP-1 — per-instance identity: nhi_id becomes the instance
+            # segment in BOTH the SPIFFE URI and the cert/key file names.
+            instance_id=nhi_id,
+            scope_hash=scope_hash,
+            image_digest=image_digest,
             approved_by=session.account_id,
             audit_writer=backoffice_state.audit_writer,
         )

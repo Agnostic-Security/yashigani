@@ -1230,6 +1230,12 @@ class AgentSvidIssuedEvent(AuditEvent):
     cert_not_after: str = ""        # ISO 8601 UTC
     approved_by: str = ""           # admin identity_id
     approval_audit_jti: str = ""    # links to approval event in hash chain
+    # v4.1 Phase 1a (GAP-1/GAP-2) — per-instance identity + change-prevention
+    # baseline, recorded on the tamper-evident chain at issuance time.
+    instance_id: str = ""           # registry nhi_id (per-instance segment)
+    scope_hash: str = ""            # sha384:<hex> tool-surface hash (binding.py)
+    image_digest: str = ""          # OCI image digest pinned at approve ("" = unpinned)
+    binding_sha384: str = ""        # sha384:<hex> = binding_digest(image_digest, scope_hash)
 
 
 @dataclass

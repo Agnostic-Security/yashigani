@@ -1741,11 +1741,11 @@ async def run_user_agent(ua_id: str, session: UserSession):
         )
 
     agent_name = meta.get("name", ua_id)
-    # Compute scope hash for audit (R3)
-    scope_obj = {"allowed_tools": sorted(effective_tools)}
-    scope_hash = "sha384:" + hashlib.sha384(
-        json.dumps(scope_obj, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    # Compute scope hash for audit (R3) + the leaf change-prevention binding
+    # (v4.1 Phase 1a GAP-2). Single source: pki/binding.tool_surface_hash —
+    # byte-identical to the previous inline sha384-over-canonical-JSON.
+    from yashigani.pki.binding import tool_surface_hash
+    scope_hash = tool_surface_hash(effective_tools)
 
     # Emit NHI_INSTANTIATION_REQUESTED
     aw = getattr(backoffice_state, "audit_writer", None)
@@ -1777,6 +1777,9 @@ async def run_user_agent(ua_id: str, session: UserSession):
             budget_cap=budget_cap,
             pids_limit=64,
             memory_mb=512,
+            # v4.1 Phase 1a GAP-2 — persist the tool-surface baseline so the
+            # approve path can bind it into the leaf without recomputation.
+            scope_hash=scope_hash,
         )
     except Exception as exc:
         logger.error("NHI registration failed for ua_id=%s: %s", ua_id, exc)
