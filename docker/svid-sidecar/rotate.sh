@@ -83,11 +83,17 @@ mkdir -p "${SVID_DIR}"
 [ -f "${INIT_DIR}/client.key" ] || die "Init key missing: ${INIT_DIR}/client.key"
 [ -f "${INIT_DIR}/ca.crt" ]     || die "Init CA cert missing: ${INIT_DIR}/ca.crt"
 
-# Copy with explicit permissions: cert 0444 (world-readable for the agent), key 0400.
+# Copy with explicit permissions:
+#   cert/ca 0444 — world-readable for the agent container.
+#   key     0440 + chown :2003 — group-readable for the shared svid GID (_MCP_SVID_GID=2003).
+#   Caddy joins group 2003 (group_add: ["2003"] in the codegen-emitted compose snippet).
+#   NOT 0400 (blocks Caddy) — NOT 0444 (world-readable, over-permissive for a private key).
+#   Least-privilege: only owner (UID 1002 sidecar) and group 2003 (Caddy) can read the key.
 cp "${INIT_DIR}/client.crt" "${CERT_PATH}"
 chmod 0444 "${CERT_PATH}"
 cp "${INIT_DIR}/client.key" "${KEY_PATH}"
-chmod 0400 "${KEY_PATH}"
+chmod 0440 "${KEY_PATH}"
+chown :2003 "${KEY_PATH}"
 cp "${INIT_DIR}/ca.crt" "${CA_PATH}"
 chmod 0444 "${CA_PATH}"
 
@@ -201,7 +207,10 @@ while true; do
         printf '%s\n' "${NEW_CERT}" > "${NEW_CERT_TMP}"
         printf '%s\n' "${NEW_KEY}"  > "${NEW_KEY_TMP}"
         chmod 0444 "${NEW_CERT_TMP}"
-        chmod 0400 "${NEW_KEY_TMP}"
+        # v4.1 Phase 1b-ii: 0440 + :2003 mirrors init-phase perms (see comment above).
+        # mv(1) preserves mode+ownership atomically — KEY_PATH inherits 0440/:2003.
+        chmod 0440 "${NEW_KEY_TMP}"
+        chown :2003 "${NEW_KEY_TMP}"
 
         if ! openssl x509 -in "${NEW_CERT_TMP}" -noout -checkend 0 2>/dev/null; then
             rm -f "${NEW_CERT_TMP}" "${NEW_KEY_TMP}"
