@@ -388,6 +388,13 @@ class EventType(str, Enum):
     # NHI invocation (per-hop OPA decisions)
     NHI_INVOCATION_ALLOWED = "NHI_INVOCATION_ALLOWED"
     NHI_INVOCATION_DENIED = "NHI_INVOCATION_DENIED"
+    # v4.1 Phase 1c — MCP Caddy-front ingress gate (/auth/verify-mcp).
+    # A mesh caller was DENIED at the per-MCP wrap's forward_auth leg.
+    # Allows are high-volume data-plane traffic → app log only, never chained.
+    MCP_INGRESS_DENIED = "MCP_INGRESS_DENIED"
+    # v4.1 Phase 1c — MCP approve transaction (mint leaf → codegen → reload →
+    # durable envelope) aborted + rolled back; nothing was onboarded.
+    MCP_ONBOARD_TRANSACTION_FAILED = "MCP_ONBOARD_TRANSACTION_FAILED"
     # P1/P2 header isolation — SECURITY event (HIGH severity)
     # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
     # The header is silently stripped; this event is the regression canary.
@@ -3523,6 +3530,58 @@ class NhiSvidIssuanceFailedEvent(AuditEvent):
     approver_account: str = ""
     nhi_id: str = ""
     spiffe_id: str = ""
+    error_type: str = ""
+
+
+@dataclass
+class McpIngressDeniedEvent(AuditEvent):
+    """A mesh caller was DENIED at a per-MCP Caddy-front ingress gate.
+
+    v4.1 Phase 1c — emitted by /auth/verify-mcp (the forward_auth leg of the
+    per-MCP wrap, codegen `_gen_caddy_snippet_mcp`).  The subject SPIFFE is
+    the mTLS-VERIFIED peer identity Caddy injected (X-SPIFFE-ID
+    strip-before-set from the verified peer cert URI SAN) — never a
+    client-supplied header (SpiffePeerCertMiddleware Option C guarantees).
+
+    reason: machine-readable deny reason (no_spiffe_id / foreign_identity /
+            legacy_identity / cross_tenant / nhi_not_found / nhi_not_approved /
+            spiffe_mismatch / server_not_onboarded / invalid_target /
+            registry_unavailable / envelope_store_unavailable).
+    """
+
+    event_type: str = EventType.MCP_INGRESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # SPIFFE URIs + slugs only — no PII
+    subject_spiffe_id: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    reason: str = ""
+
+
+@dataclass
+class McpOnboardTransactionFailedEvent(AuditEvent):
+    """The MCP approve transaction ABORTED and was rolled back (fail-closed).
+
+    v4.1 Phase 1c — emitted by the import/approve ceremony when any step of
+    mint-leaf → codegen → artifact-write → caddy-reload → durable-envelope
+    fails.  Nothing was onboarded: minted cert/key files and written
+    artifacts are removed; `svid_issued` is never persisted without a real
+    cert on disk (the BUG-A fail-open pattern must not reappear).
+
+    failed_step: which transaction step raised (mint_leaf / codegen /
+                 artifact_write / caddy_reload / envelope_mint).
+    error_type:  exception class name only (paths/messages stay in app logs).
+    """
+
+    event_type: str = EventType.MCP_ONBOARD_TRANSACTION_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    failed_step: str = ""
     error_type: str = ""
 
 

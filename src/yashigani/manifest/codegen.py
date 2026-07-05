@@ -1685,10 +1685,23 @@ def _gen_caddy_snippet_mcp(
                 # the VERIFIED peer cert's SPIFFE URI SAN. Only Caddy sets this header.
                 request_header -X-SPIFFE-ID
                 request_header X-SPIFFE-ID {{http.request.tls.client.san.uris.0}}
+                # Strip any client-supplied Layer-B marker before we set our own
+                # on the forward_auth hop below (EX-231-10 hygiene).
+                request_header -X-Caddy-Verified-Secret
 
                 # App-layer ingress gate (Caddy IS the auth perimeter).
                 forward_auth https://backoffice:8443 {{
                     uri /auth/verify-mcp?tenant={tenant_id}&server={server_id}
+                    # Layer B (EX-231-10): per-install HMAC marker. Without it the
+                    # backoffice CaddyVerifiedMiddleware 401s this hop AND
+                    # SpiffePeerCertMiddleware (Option C) strips x-spiffe-id —
+                    # the verified subject would never reach /auth/verify-mcp.
+                    # {{$CADDY_INTERNAL_HMAC}} is parse-time env substitution
+                    # (same rationale as the monolith's inject-caddy-verified
+                    # snippet — inlined here because generated snippets are
+                    # C10-validated standalone, where named snippets from the
+                    # monolith are not defined).
+                    header_up X-Caddy-Verified-Secret {{$CADDY_INTERNAL_HMAC}}
                     transport http {{
                         tls
                         tls_trust_pool file /run/secrets/ca_intermediate.crt

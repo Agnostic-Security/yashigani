@@ -1018,6 +1018,201 @@ async def verify_user_session(request: Request):
     return resp
 
 
+# ---------------------------------------------------------------------------
+# v4.1 Phase 1c — /auth/verify-mcp: forward_auth gate for the per-MCP wrap
+# ---------------------------------------------------------------------------
+
+# server_id / tenant_id slugs (mirrors mcp_servers._SAFE_SERVER_ID_RE — 1–63
+# chars, alphanumeric start, [-_] allowed). Anything else is denied outright.
+_VERIFY_MCP_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}$")
+
+
+def _verify_mcp_envelope_service():
+    """Live CapabilityEnvelopeService over the asyncpg pool (patchable in tests)."""
+    from yashigani.db import get_pool
+    from yashigani.mcp.envelope_service import CapabilityEnvelopeService
+    return CapabilityEnvelopeService(get_pool())
+
+
+def _verify_mcp_audit_deny(
+    reason: str, subject: str, tenant: str, server: str,
+) -> None:
+    """Best-effort MCP_INGRESS_DENIED audit write (never raises)."""
+    aw = backoffice_state.audit_writer
+    if aw is None:
+        return
+    try:
+        from yashigani.audit.schema import McpIngressDeniedEvent
+        aw.write(McpIngressDeniedEvent(
+            subject_spiffe_id=subject,
+            tenant_id=tenant,
+            server_id=server,
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001 — audit must never mask the deny
+        _log.error("verify-mcp: MCP_INGRESS_DENIED audit write failed: %s", exc)
+
+
+def _verify_mcp_deny(
+    status_code: int, reason: str, subject: str, tenant: str, server: str,
+) -> HTTPException:
+    """Audit + build the deny response (Caddy treats any non-2xx as DENY)."""
+    _verify_mcp_audit_deny(reason, subject, tenant, server)
+    _log.warning(
+        "verify-mcp: DENY reason=%s subject=%r tenant=%r server=%r",
+        reason, subject, tenant, server,
+    )
+    return HTTPException(
+        status_code=status_code,
+        detail={"error": reason},
+        headers={"X-Authz-Reason": reason},
+    )
+
+
+@router.get("/verify-mcp")
+async def verify_mcp_ingress(request: Request, tenant: str = "", server: str = ""):
+    """
+    Caddy forward_auth gate for the per-MCP Caddy-front wrap (v4.1 Phase 1c,
+    SYNTHESIS.md Issue-1 step 3/6; snippet contract in codegen
+    ``_gen_caddy_snippet_mcp`` / tests/contracts/test_codegen_mcp_caddy_front.py).
+
+    Trust model — the subject identity is NEVER a spoofable client header:
+      * The per-MCP mesh listener terminates mTLS ``require_and_verify``
+        against the internal intermediate CA, then STRIP-BEFORE-SETS
+        ``X-SPIFFE-ID`` from the VERIFIED peer cert URI SAN.
+      * The forward_auth hop to this endpoint presents caddy_client.crt
+        (backoffice mTLS, ``--ssl-cert-reqs 2``) and carries
+        ``X-Caddy-Verified-Secret`` (Layer B HMAC).  ``CaddyVerifiedMiddleware``
+        401s any request without the valid secret, and
+        ``SpiffePeerCertMiddleware`` (Option C) strips ``x-spiffe-id`` unless
+        the secret validated — so an ``x-spiffe-id`` value observed here is
+        Caddy-set-from-verified-peer by construction.
+
+    Authorisation (fail-closed at every step):
+      * Subject == ``spiffe://<td>/gateway`` → ALLOW (the broker's mesh
+        transport identity; per-tool authz stays with the broker's OPA leg —
+        SYNTHESIS Issue-2 role split; per-instance grant objects land in
+        Phase 2 with Lu's rego).
+      * Subject matching Nico's per-instance contract
+        ``spiffe://<td>/agents/<tenant>/<name>/<nhi_id>`` → ALLOW only when
+        the instance segment is present, the URI tenant equals the route
+        ``tenant``, the NHI exists in the registry with ``svid_issued`` set,
+        and the registered SPIFFE matches the presented one exactly.
+      * The target ``(tenant, server)`` must have an ACTIVE capability
+        envelope (durable registry) — un-onboarded servers deny.
+      * Registry / envelope store unavailable → 503 (deny, fail-closed).
+
+    Denies are audited (``MCP_INGRESS_DENIED``); allows are data-plane volume
+    and stay in app logs at DEBUG.
+    """
+    # 0. Route params must be sane slugs (they come from the generated snippet,
+    #    but validate anyway — zero-trust on our own config surface).
+    if not _VERIFY_MCP_SLUG_RE.match(tenant) or not _VERIFY_MCP_SLUG_RE.match(server):
+        raise _verify_mcp_deny(
+            status.HTTP_403_FORBIDDEN, "invalid_target", "", tenant, server,
+        )
+
+    # 1. Subject identity — Caddy-set from the VERIFIED peer cert (see above).
+    #    x-spiffe-id-peer-cert (this hop's own TLS peer = Caddy) is not the
+    #    subject; the wrap's verified client rides in x-spiffe-id.
+    subject = request.headers.get("x-spiffe-id", "").strip()
+    if not subject:
+        raise _verify_mcp_deny(
+            status.HTTP_401_UNAUTHORIZED, "no_spiffe_id", "", tenant, server,
+        )
+
+    from yashigani.identity.trust_domain import (
+        parse_agent_spiffe_uri,
+        trust_domain,
+    )
+
+    # 2a. Broker transport identity (gateway mesh leaf) — allowed.
+    if subject == f"spiffe://{trust_domain()}/gateway":
+        _log.debug(
+            "verify-mcp: ALLOW gateway transport tenant=%r server=%r",
+            tenant, server,
+        )
+    else:
+        # 2b. Per-instance agent identity (Nico's contract, GAP-1).
+        parsed_subject = parse_agent_spiffe_uri(subject)
+        if parsed_subject is None:
+            # Foreign trust domain or not under /agents/ — reject-foreign exact.
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "foreign_identity",
+                subject, tenant, server,
+            )
+        subj_tenant, _subj_name, subj_instance = parsed_subject
+        if not subj_instance:
+            # Legacy 2-segment URI — per-instance identity is REQUIRED at the
+            # wrap (two same-named agents must not share an ingress identity).
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "legacy_identity",
+                subject, tenant, server,
+            )
+        if subj_tenant != tenant:
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "cross_tenant",
+                subject, tenant, server,
+            )
+
+        registry = backoffice_state.agent_registry
+        if registry is None:
+            # Fail-closed: cannot corroborate the identity → deny, not allow.
+            raise _verify_mcp_deny(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "registry_unavailable",
+                subject, tenant, server,
+            )
+        nhi = registry.get(subj_instance)
+        if nhi is None or nhi.get("kind") != "nhi":
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "nhi_not_found",
+                subject, tenant, server,
+            )
+        if not nhi.get("svid_issued"):
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "nhi_not_approved",
+                subject, tenant, server,
+            )
+        registered_spiffe = (nhi.get("spiffe_id") or "").strip()
+        if registered_spiffe != subject:
+            # The presented (cert-verified) URI must match the registered
+            # identity byte-for-byte — a valid mesh cert for a DIFFERENT
+            # instance must not authorise this one.
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "spiffe_mismatch",
+                subject, tenant, server,
+            )
+
+    # 3. Target must be onboarded: ACTIVE capability envelope for
+    #    (tenant, server) in the durable registry.
+    try:
+        svc = _verify_mcp_envelope_service()
+        rec = await svc.get_active_envelope(f"{tenant}:{server}")
+    except Exception as exc:  # noqa: BLE001 — store down ⇒ deny, never allow
+        _log.error("verify-mcp: envelope store unavailable: %s", exc)
+        raise _verify_mcp_deny(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "envelope_store_unavailable",
+            subject, tenant, server,
+        )
+    if rec is None or rec.tenant_id != tenant:
+        raise _verify_mcp_deny(
+            status.HTTP_403_FORBIDDEN, "server_not_onboarded",
+            subject, tenant, server,
+        )
+
+    _log.debug(
+        "verify-mcp: ALLOW subject=%r tenant=%r server=%r envelope_id=%d",
+        subject, tenant, server, rec.id,
+    )
+    from starlette.responses import Response as StarletteResponse
+    resp = StarletteResponse(status_code=200)
+    # Copied upstream by Caddy's forward_auth copy_headers if configured;
+    # also useful in access logs.
+    resp.headers["X-Yashigani-Mcp-Caller"] = subject
+    resp.headers["X-Yashigani-Mcp-Envelope"] = str(rec.id)
+    return resp
+
+
 @router.post("/password/change")
 async def change_password(
     body: PasswordChangeRequest,
