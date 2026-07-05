@@ -498,12 +498,28 @@ def test_sc_artifact_keys_inventory():
 # ---------------------------------------------------------------------------
 
 def test_sc_helm_networkpolicy_no_caddy_egress():
-    """SC-EGRESS-NONE: Helm NetworkPolicy must not allow egress to Caddy."""
+    """SC-EGRESS-NONE: Helm NetworkPolicy must not allow egress to Caddy.
+
+    v4.1 Phase 1b-i update: the INGRESS section now allows the Caddy pod
+    (the wrap — sole path to the shim), so the no-caddy assertion is scoped
+    to the egress section instead of the whole document.  The old
+    gateway-direct ingress (Laura SB-2) must be GONE — it was an L3 path
+    around the Caddy front (Laura I1-02 class).
+    """
     engine = CodegenEngineShapeC(_base_manifest(), runtime="docker")
     artifacts = engine.render(dry_run=True)
     netpol = artifacts["helm/yashigani/values-filesystem-networkpolicy.yaml"]
-    # No Caddy pod selector rule
-    assert "app.kubernetes.io/name: caddy" not in netpol
+
+    ingress_section = netpol.split("    egress:", 1)[0]
+    egress_section = netpol.split("    egress:", 1)[1]
+
+    # Phase 1b-i wrap: ingress from the Caddy pod ONLY.
+    assert "app.kubernetes.io/name: caddy" in ingress_section
+    # The gateway-direct shim allow is an around-the-wrap bypass — must be gone.
+    assert "yashigani-gateway" not in netpol
+    # SC-EGRESS-NONE unchanged: no Caddy (or any pod) egress allow — kube-dns only.
+    assert "app.kubernetes.io/name: caddy" not in egress_section
+    assert "kube-dns" in egress_section
     # The SC-EGRESS-NONE comment must be present
     assert "SC-EGRESS-NONE" in netpol
 

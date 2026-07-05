@@ -54,9 +54,16 @@ Artifact set (Shape A):
   tests/contracts/test_<agent>_compose.py stub
   tests/contracts/test_<agent>_helm.py stub
 
-Artifact set (Shape C) — same as Shape A MINUS the Caddy snippet:
-  docker-compose.override.yml stanza  (volume mount, tmpfs, L9 runAsUser 10001)
-  values-<agent>.yaml + -networkpolicy overlay (Helm)
+Artifact set (Shape C) — same as Shape A MINUS the Caddy EGRESS route, PLUS
+the v4.1 Phase 1b-i Caddy-front INGRESS wrap:
+  docker-compose.override.yml stanza  (volume mount, tmpfs, L9 runAsUser 10001;
+                                       Caddy joins the ringfence bridge)
+  docker/caddy/agents/<agent>-mcp.caddy  (dedicated mesh listener: Caddy
+                                       presents the per-instance leaf,
+                                       require_and_verify-gates callers,
+                                       forward_auth, proxies to the shim)
+  values-<agent>.yaml + -networkpolicy overlay (Helm; shim ingress from the
+                                       Caddy pod ONLY — K8s wrap parity)
   templates/agents/<agent>-policy-exception.yaml (Kyverno)
   service_identities.yaml append entry
   pki_ownership.sh tuple fragment (shell)
@@ -215,8 +222,10 @@ def _assert_unique_agent_pair(tenant_id: str, agent_id: str) -> None:
 
 
 def reset_codegen_registry() -> None:
-    """Reset the C3 duplicate-pair registry. Call between independent onboard sessions."""
+    """Reset the C3 duplicate-pair + Phase 1b-i mesh-port registries.
+    Call between independent onboard sessions."""
     _SEEN_PAIRS.clear()
+    _SEEN_MESH_PORTS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +329,150 @@ def _validate_caddy_snippet(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _ephemeral_validation_pki(tmpdir: str) -> tuple[str, str]:
+    """Generate a throwaway self-signed EC cert + key pair for C10 validation.
+
+    `caddy validate` PROVISIONS the config — it opens every `tls` cert/key and
+    trust_pool file.  The real paths in an MCP-front snippet exist only inside
+    the Caddy container, so validation substitutes them with this ephemeral
+    pair (validation checks config semantics, not production key material).
+    """
+    import datetime as _dt
+
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives import serialization as _ser
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+    key = _ec.generate_private_key(_ec.SECP256R1())
+    now = _dt.datetime.now(_dt.timezone.utc)
+    name = _x509.Name([
+        _x509.NameAttribute(_x509.NameOID.COMMON_NAME, "ysg-c10-validate"),
+    ])
+    cert = (
+        _x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(_x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=5))
+        .not_valid_after(now + _dt.timedelta(hours=1))
+        .add_extension(
+            _x509.SubjectAlternativeName([_x509.DNSName("localhost")]),
+            critical=False,
+        )
+        .sign(key, _hashes.SHA256())
+    )
+    crt_path = os.path.join(tmpdir, "c10-validate.crt")
+    key_path = os.path.join(tmpdir, "c10-validate.key")
+    with open(crt_path, "wb") as fh:
+        fh.write(cert.public_bytes(_ser.Encoding.PEM))
+    with open(key_path, "wb") as fh:
+        fh.write(key.private_bytes(
+            _ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption(),
+        ))
+    return crt_path, key_path
+
+
+def _validate_caddy_snippet_mcp(
+    snippet: str,
+    cert_paths: list[str],
+    key_paths: list[str],
+    *,
+    _validator: Optional[Callable[[str], int]] = None,
+) -> None:
+    """
+    C10 for MCP Caddy-front snippets (v4.1 Phase 1b-i).
+
+    MCP-front snippets carry `tls <cert> <key>` + trust_pool/tls_client_auth
+    file references that exist only INSIDE the Caddy container, so the plain
+    `_validate_caddy_snippet` path (`caddy validate`) would fail on the host
+    with "loading certificates: no such file".  Two-stage gate instead:
+
+      1. `caddy adapt` on the raw snippet — full Caddyfile syntax + directive
+         structure check; does NOT open referenced files (empirically
+         verified, Caddy v2.11.3).  Hard fail on error.
+      2. `caddy validate` on a copy with every cert/key/trust-pool path
+         substituted by an ephemeral self-signed pair — full provisioning
+         semantics (TLS/client_auth/transport wiring).  Hard fail on error.
+
+    Absent caddy binary follows the same LAURA-005 enforcement gate as
+    `_validate_caddy_snippet`.  An injected ``_validator`` receives the raw
+    wrapped snippet (test hook, mirrors the Shape-A signature).
+    """
+    if _validator is not None:
+        caddyfile = "{\n    admin off\n}\n\n" + snippet
+        rc = _validator(caddyfile)
+        if rc != 0:
+            raise CodegenError(
+                "C10_caddy_validate_failed",
+                "caddy validate returned exit code %d for MCP-front snippet. "
+                "Codegen aborted (C10). Fix the Caddy configuration fragment." % rc,
+            )
+        return
+
+    caddy_bin = shutil.which("caddy")
+    if caddy_bin is None:
+        if _c10_require_caddy_validate():
+            raise CodegenError(
+                "C10_caddy_binary_absent",
+                "caddy binary not found and YSG_REQUIRE_CADDY_VALIDATE / YASHIGANI_ENV "
+                "mandates validation. Install caddy on PATH before running "
+                "`yashigani onboard` in production/staging (LAURA-005 / C10).",
+            )
+        _log.warning(
+            "C10: caddy binary not found — MCP Caddy-front snippet validation "
+            "SKIPPED. Install caddy and re-run `yashigani onboard` to enforce "
+            "C10 (LAURA-005 gate applies)."
+        )
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix="ysg-c10-mcp-")
+    try:
+        # Stage 1 — caddy adapt on the raw snippet (no file provisioning).
+        raw_path = os.path.join(tmpdir, "raw.Caddyfile")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            fh.write("{\n    admin off\n}\n\n" + snippet)
+        result = subprocess.run(  # noqa: S603 — caddy binary is system-installed
+            [caddy_bin, "adapt", "--config", raw_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")[:512]
+            raise CodegenError(
+                "C10_caddy_adapt_failed",
+                "caddy adapt failed (exit %d) for MCP-front snippet: %s\n"
+                "Codegen aborted (C10)." % (result.returncode, stderr),
+            )
+
+        # Stage 2 — caddy validate with ephemeral cert substitution.
+        eph_crt, eph_key = _ephemeral_validation_pki(tmpdir)
+        substituted = snippet
+        for p in cert_paths:
+            substituted = substituted.replace(p, eph_crt)
+        for p in key_paths:
+            substituted = substituted.replace(p, eph_key)
+        sub_path = os.path.join(tmpdir, "substituted.Caddyfile")
+        with open(sub_path, "w", encoding="utf-8") as fh:
+            fh.write("{\n    admin off\n}\n\n" + substituted)
+        result2 = subprocess.run(  # noqa: S603
+            [caddy_bin, "validate", "--config", sub_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if result2.returncode != 0:
+            stderr2 = result2.stderr.decode("utf-8", errors="replace")[:512]
+            raise CodegenError(
+                "C10_caddy_validate_failed",
+                "caddy validate failed (exit %d) for MCP-front snippet "
+                "(ephemeral-cert substitution): %s\nCodegen aborted (C10)." % (
+                    result2.returncode, stderr2),
+            )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1331,6 +1484,218 @@ _SC_MEM_REQUEST: str = "64Mi"
 # shim's HTTP listener, declared separately as spec.mcp.exposes.shim_port.
 _SC_BRIDGE_PORT: int = 8000
 
+# ---------------------------------------------------------------------------
+# v4.1 Phase 1b-i — MCP Caddy-front (the wrap)
+# ---------------------------------------------------------------------------
+# Every onboarded MCP server is fronted by Caddy: Caddy terminates mesh mTLS
+# on a dedicated per-MCP listener, PRESENTING the per-instance leaf (minted by
+# mint_agent_leaf, rotated by the svid-sidecar into a shared tmpfs) and
+# VERIFYING mesh client certs (require_and_verify against the internal
+# intermediate CA).  The MCP container joins ONLY its ringfence bridge
+# (internal:true); Caddy joins that bridge to reach the shim; nothing else
+# can.  Sole path in: mesh client → caddy:<mesh_port> (mTLS) → forward_auth →
+# ringfence bridge → shim.
+
+# Per-MCP mesh listener port allocation.  Deterministic default derived from
+# (tenant_id, server_id) so re-runs are stable; operators may pin an explicit
+# port via spec.mcp.exposes.mesh_port.  Collisions within a codegen session
+# abort with MCP_mesh_port_collision (set mesh_port explicitly to resolve).
+_MCP_MESH_PORT_BASE: int = 9500
+_MCP_MESH_PORT_RANGE: int = 400
+
+# Ports already claimed by base listeners (Caddyfile monolith + mesh
+# services) — a generated MCP front must never collide with these.
+_MCP_RESERVED_PORTS: frozenset[int] = frozenset({
+    80, 443, 2019, _SC_BRIDGE_PORT, 8080, 8443, 8444, 8445,
+})
+
+# In-container path (inside the Caddy container) where the per-MCP
+# svid-sidecar tmpfs is projected.  The sidecar's rotate.sh contract writes
+# ${SVID_DIR}/client.{crt,key}; Su (Phase 1b-ii) mounts each instance's svid
+# volume into Caddy at <_MCP_SVID_MOUNT_ROOT>/<tenant_id>/<server_id>/.
+_MCP_SVID_MOUNT_ROOT: str = "/run/secrets/svid"
+
+# Session-level mesh-port registry (mirrors the C3 _SEEN_PAIRS pattern).
+_SEEN_MESH_PORTS: dict[int, tuple[str, str]] = {}
+
+
+def _mcp_svid_paths(tenant_id: str, server_id: str) -> tuple[str, str]:
+    """In-Caddy-container paths of the per-instance leaf cert + key.
+
+    Contract (Phase 1b-i, consumed by Su's compose/helm wiring):
+      <_MCP_SVID_MOUNT_ROOT>/<tenant_id>/<server_id>/client.crt
+      <_MCP_SVID_MOUNT_ROOT>/<tenant_id>/<server_id>/client.key
+    File BASENAMES match the svid-sidecar rotate.sh contract (client.{crt,key});
+    the per-instance nhi_id is NOT in the path — it lives in the cert content
+    (SPIFFE URI SAN + binding extension), so re-approve/rotate never requires
+    a codegen re-run or Caddy config change.
+    """
+    base = "%s/%s/%s" % (_MCP_SVID_MOUNT_ROOT, tenant_id, server_id)
+    return base + "/client.crt", base + "/client.key"
+
+
+def _mcp_mesh_port(parsed: dict) -> int:
+    """Resolve the per-MCP Caddy mesh-listener port.
+
+    Explicit spec.mcp.exposes.mesh_port wins; otherwise a deterministic
+    default is derived from sha256(tenant_id/server_id) in
+    [_MCP_MESH_PORT_BASE, _MCP_MESH_PORT_BASE + _MCP_MESH_PORT_RANGE).
+
+    Raises:
+        CodegenError: MCP_mesh_port_invalid, MCP_mesh_port_collision.
+    """
+    meta = parsed.get("metadata") or {}
+    mcp_exposes = ((parsed.get("spec") or {}).get("mcp") or {}).get("exposes") or {}
+    tenant_id = meta.get("tenant_id", "")
+    server_id = meta.get("name", "")
+
+    explicit = mcp_exposes.get("mesh_port")
+    if explicit is not None:
+        if not isinstance(explicit, int) or isinstance(explicit, bool) or \
+                not (1024 <= explicit <= 65535) or explicit in _MCP_RESERVED_PORTS:
+            raise CodegenError(
+                "MCP_mesh_port_invalid",
+                "spec.mcp.exposes.mesh_port=%r for MCP %r is invalid: must be an "
+                "integer in 1024-65535 and not one of the reserved base-listener "
+                "ports %s." % (explicit, server_id, sorted(_MCP_RESERVED_PORTS)),
+            )
+        port = explicit
+    else:
+        digest = hashlib.sha256(
+            ("%s/%s" % (tenant_id, server_id)).encode("utf-8")
+        ).digest()
+        port = _MCP_MESH_PORT_BASE + int.from_bytes(digest[:4], "big") % _MCP_MESH_PORT_RANGE
+
+    prior = _SEEN_MESH_PORTS.get(port)
+    if prior is not None and prior != (tenant_id, server_id):
+        raise CodegenError(
+            "MCP_mesh_port_collision",
+            "MCP mesh port %d for (tenant=%r, server=%r) collides with "
+            "(tenant=%r, server=%r) in this codegen session. Pin a distinct "
+            "spec.mcp.exposes.mesh_port on one of them." % (
+                port, tenant_id, server_id, prior[0], prior[1]),
+        )
+    _SEEN_MESH_PORTS[port] = (tenant_id, server_id)
+    return port
+
+
+def _gen_caddy_snippet_mcp(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """
+    Generate docker/caddy/agents/<server_id>-mcp.caddy — the Phase 1b-i wrap.
+
+    A dedicated per-MCP mesh listener (mirrors the proven :8444/:8445 pattern
+    in the Caddyfile monolith) auto-imported by the existing
+    `import /etc/caddy/agents/*.caddy` sentinel — NO monolith edit:
+
+      - tls <per-instance leaf> + client_auth require_and_verify: Caddy
+        PRESENTS the instance leaf (server side of the MCP's mTLS front) and
+        VERIFIES mesh clients against the internal intermediate CA.  The leaf
+        is Go-parseable ONLY with the non-critical, int32-arc binding
+        extension (pki/binding.py Phase 1b-i — empirically proven).
+      - handle_path /mcp/<tenant_id>/<server_id>/*: route namespace (C3
+        analogue); the prefix is stripped so the shim sees its own paths
+        (McpHttpTransport appends /mcp to the base URL).
+      - X-SPIFFE-ID strip-before-set from the VERIFIED peer cert URI SAN
+        (zero-trust header discipline, EX-231-08).
+      - forward_auth backoffice /auth/verify-mcp: app-layer ingress gate
+        (endpoint lands with Tom's Phase 1b/2 work; the gate fails closed —
+        Caddy 502s the route until the endpoint exists).
+      - reverse_proxy http://<server_id>:<shim_port> over the MCP's ringfence
+        bridge.  Plain HTTP on the isolated bridge is intentional (T2): the
+        per-instance identity travels via the leaf Caddy presents/verifies +
+        the OPA input subject, not shim-level TLS.  C8 conn-pool cap applied.
+      - default handle → 404 (nothing else is served on this listener).
+
+    NOTE: unlike Shape-A snippets this is NOT a `:443` site block — TLS
+    config (which leaf Caddy presents) is per-server in Caddy, and the wrap
+    must present the PER-INSTANCE leaf, so each MCP gets its own port-matched
+    listener.  Server-cert SANs on instance leaves are localhost/127.0.0.1
+    (Phase 1a DNS-SAN hygiene): mesh clients dialling https://caddy:<mesh_port>
+    must verify by SPIFFE URI SAN / pinned trust, not hostname (broker client
+    change — Tom, Issue 2).
+    """
+    meta = parsed.get("metadata") or {}
+    spec = parsed.get("spec") or {}
+    mcp_exposes = (spec.get("mcp") or {}).get("exposes") or {}
+
+    server_id = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    shim_port = mcp_exposes.get("shim_port") or _SC_BRIDGE_PORT
+    mesh_port = _mcp_mesh_port(parsed)
+    leaf_crt, leaf_key = _mcp_svid_paths(tenant_id, server_id)
+    route_prefix = "/mcp/%s/%s" % (tenant_id, server_id)
+
+    rootless_note = ""
+    if runtime == "podman-rootless":
+        rootless_note = "    # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
+
+    content = textwrap.dedent("""\
+        {header}
+        # v4.1 Phase 1b-i MCP Caddy-front (the wrap) for MCP server: {server_id} (tenant: {tenant_id})
+        # Dedicated mesh listener — mirrors the :8444/:8445 monolith pattern.
+        # Caddy PRESENTS the per-instance leaf + VERIFIES mesh clients (require_and_verify).
+        # Sole reachable path to the MCP shim: this listener -> ringfence bridge.
+        :{mesh_port} {{
+            tls {leaf_crt} {leaf_key} {{
+                client_auth {{
+                    mode require_and_verify
+                    trust_pool file /run/secrets/ca_intermediate.crt
+                }}
+                protocols tls1.3
+            }}
+
+            handle_path {route_prefix}/* {{
+        {rootless_note}        # Zero-trust header discipline (EX-231-08): strip inbound, set from
+                # the VERIFIED peer cert's SPIFFE URI SAN. Only Caddy sets this header.
+                request_header -X-SPIFFE-ID
+                request_header X-SPIFFE-ID {{http.request.tls.client.san.uris.0}}
+
+                # App-layer ingress gate (Caddy IS the auth perimeter).
+                forward_auth https://backoffice:8443 {{
+                    uri /auth/verify-mcp?tenant={tenant_id}&server={server_id}
+                    transport http {{
+                        tls
+                        tls_trust_pool file /run/secrets/ca_intermediate.crt
+                        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+                        versions 1.1
+                    }}
+                }}
+
+                # Upstream: first-party shim on the MCP's ringfence bridge
+                # (internal:true; Caddy is the only other member). Plain HTTP by
+                # design (T2) — identity is the leaf above + the OPA input subject.
+                # C8: connection-pool cap — DoS resistance.
+                reverse_proxy http://{server_id}:{shim_port} {{
+                    transport http {{
+                        max_conns_per_host {max_conns}
+                    }}
+                }}
+            }}
+
+            # Default-deny: nothing else is served on this listener.
+            handle {{
+                respond "Not Found" 404
+            }}
+        }}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        server_id=server_id,
+        tenant_id=tenant_id,
+        mesh_port=mesh_port,
+        leaf_crt=leaf_crt,
+        leaf_key=leaf_key,
+        route_prefix=route_prefix,
+        shim_port=shim_port,
+        max_conns=_C8_MAX_CONNS_PER_HOST_DEFAULT,
+        rootless_note=rootless_note,
+    )
+    return content
+
 
 def _is_shape_c(parsed: dict) -> bool:
     """
@@ -1538,26 +1903,28 @@ def _gen_compose_override_shape_c(
         if _subprocess_env_val else ""
     )
 
+    # v4.1 Phase 1b-i (the wrap): the broker reaches the MCP ONLY via the
+    # Caddy front. mesh_port is deterministic per (tenant, server) unless
+    # pinned via spec.mcp.exposes.mesh_port.
+    mesh_port = _mcp_mesh_port(parsed)
+
     lines = [
         _header_comment(manifest_hash, runtime),
         "# Shape C compose override for MCP-server agent: %s (tenant: %s)" % (agent_name, tenant_id),
         "# SC-EGRESS-NONE: no caddy_internal bridge — this server makes no outbound calls",
         "# SC-NO-SECRETS: spec.secrets=[] confirmed — group_add 2002 NOT emitted",
         "#",
-        "# OPERATOR ACTION REQUIRED (Captain restart-on-onboard):",
-        "# Before onboarding this agent, add '%s' to the gateway service's" % ringfence_bridge,
-        "# networks list in docker-compose.yml so the gateway can reach the bridge on",
-        "# TCP/%d.  Example patch:" % _SC_BRIDGE_PORT,
-        "#   services:",
-        "#     gateway:",
-        "#       networks:",
-        "#         - %s   # ADD THIS" % ringfence_bridge,
-        "# Then restart the gateway: docker compose up -d gateway",
+        "# v4.1 Phase 1b-i — THE WRAP: this MCP is reachable ONLY through its",
+        "# Caddy front. Caddy joins '%s' below (no manual monolith edit);" % ringfence_bridge,
+        "# the gateway must NOT join the ringfence bridge and must NOT dial the",
+        "# shim directly. Broker route: https://caddy:%d%s" % (
+            mesh_port, "/mcp/%s/%s" % (tenant_id, agent_name)),
+        "# (mesh mTLS, require_and_verify — see docker/caddy/agents/%s-mcp.caddy)." % agent_name,
         "# YASHIGANI_MCP_SERVERS entry for gateway (add to gateway environment):",
         # FIX-UPSTREAM-URL-DOUBLE-MCP (2026-05-30): upstream_url is the BASE URL only.
         # McpHttpTransport.forward() appends path="/mcp" — do NOT include /mcp here.
-        '#   - {"agent_name": "%s", "upstream_url": "http://%s:%d",' % (
-            agent_name, agent_name, _SC_BRIDGE_PORT,
+        '#   - {"agent_name": "%s", "upstream_url": "https://caddy:%d/mcp/%s/%s",' % (
+            agent_name, mesh_port, tenant_id, agent_name,
         ),
         '#     "tenant_id": "%s", "is_filesystem_agent": true}' % tenant_id,
         "services:",
@@ -1566,8 +1933,8 @@ def _gen_compose_override_shape_c(
         _bridge_command_line,
         _subprocess_env_line if _subprocess_env_line else "",
         "    # Laura SB-5: bridge HTTP port exposed on the ringfence bridge (internal:true)",
-        "    # Not externally routable — only the gateway container on the same bridge",
-        "    # can reach TCP/%d." % _SC_BRIDGE_PORT,
+        "    # Not externally routable — Phase 1b-i wrap: only the Caddy front on the",
+        "    # same bridge can reach TCP/%d." % _SC_BRIDGE_PORT,
         "    expose:",
         '      - "%d"' % _SC_BRIDGE_PORT,
         "    networks:",
@@ -1606,6 +1973,15 @@ def _gen_compose_override_shape_c(
     ) + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
+        "  # v4.1 Phase 1b-i (the wrap): Caddy joins the MCP's ringfence bridge —",
+        "  # it is the ONLY other member, so the sole path to the shim is",
+        "  # caddy:%d (mTLS, per-instance leaf) -> %s:%d." % (
+            mesh_port, agent_name, _SC_BRIDGE_PORT),
+        "  # Compose merges this list with the base caddy networks (additive).",
+        "  caddy:",
+        "    networks:",
+        "      - %s" % ringfence_bridge,
+        "",
         "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
         "volumes:",
         "  %s:" % vol_name,
@@ -1613,7 +1989,7 @@ def _gen_compose_override_shape_c(
         "",
         "# W3-F1: isolated ringfence bridge — L2 default-deny containment",
         "# SC-EGRESS-NONE: internal:true + no caddy_internal = no outbound path",
-        "# TCP/%d reachable from gateway only (after OPERATOR ACTION above)" % _SC_BRIDGE_PORT,
+        "# TCP/%d reachable from the Caddy front ONLY (Phase 1b-i wrap)" % _SC_BRIDGE_PORT,
         "networks:",
         "  %s:" % ringfence_bridge,
         "    driver: bridge",
@@ -1778,16 +2154,18 @@ def _gen_networkpolicy_shape_c(
         "              port: 53"
     )
 
-    # Laura SB-2: allow gateway→bridge ingress on TCP/_SC_BRIDGE_PORT.
-    # Previously ingress: [] (deny-all) blocked the gateway from reaching the shim.
-    # Under T2 the gateway Pod must reach port _SC_BRIDGE_PORT on the MCP-server Pod
-    # over HTTP.  Only the gateway Pod is permitted as source.
-    gateway_ingress = (
-        "        # Laura SB-2: gateway Pod may reach bridge on TCP/%d\n"
+    # v4.1 Phase 1b-i (the wrap — supersedes Laura SB-2 gateway-direct):
+    # ONLY the Caddy pod may reach the shim on TCP/_SC_BRIDGE_PORT.  The
+    # gateway/broker reaches the MCP exclusively through the Caddy front
+    # (mesh mTLS listener presenting the per-instance leaf); a gateway→shim
+    # allow would leave an L3 path AROUND the wrap (Laura I1-02 class).
+    caddy_ingress = (
+        "        # Phase 1b-i wrap: ONLY the Caddy front may reach the shim on TCP/%d\n"
+        "        # (K8s parity with the compose ringfence bridge: caddy is the sole peer)\n"
         "        - from:\n"
         "            - podSelector:\n"
         "                matchLabels:\n"
-        "                  app.kubernetes.io/name: yashigani-gateway\n"
+        "                  app.kubernetes.io/name: caddy\n"
         "          ports:\n"
         "            - protocol: TCP\n"
         "              port: %d"
@@ -1796,13 +2174,13 @@ def _gen_networkpolicy_shape_c(
     content = textwrap.dedent("""\
         {header}
         # Shape C NetworkPolicy overlay for MCP-server agent: {agent_name} (tenant: {tenant_id})
-        # SC-EGRESS-NONE: no external egress, no Caddy route
-        # Laura SB-2: ingress from gateway only on TCP/{bridge_port} (T2 first-party bridge)
+        # SC-EGRESS-NONE: no external egress, no Caddy EGRESS route
+        # Phase 1b-i wrap: ingress from the Caddy front ONLY on TCP/{bridge_port}
         networkPolicy:
           enabled: true
           agent{agent_name_camel}:
             ingress:
-        {gateway_ingress}
+        {caddy_ingress}
             egress:
         {dns_egress}
     """).format(
@@ -1811,7 +2189,7 @@ def _gen_networkpolicy_shape_c(
         agent_name_camel=_to_camel(agent_name),
         tenant_id=tenant_id,
         bridge_port=_SC_BRIDGE_PORT,
-        gateway_ingress=gateway_ingress,
+        caddy_ingress=caddy_ingress,
         dns_egress=dns_egress,
     )
     return content
@@ -2411,7 +2789,11 @@ class CodegenEngineShapeC:
     subprocesses. They have no network listener, no LLM egress, and no secrets.
 
     Key differences from Shape-A (CodegenEngine):
-    - No Caddy snippet generated (SC-EGRESS-NONE — caddy validate NOT called)
+    - No Caddy EGRESS route generated (SC-EGRESS-NONE still holds: the MCP
+      makes no outbound calls).  v4.1 Phase 1b-i: a Caddy INGRESS front
+      snippet IS generated — docker/caddy/agents/<agent>-mcp.caddy — a
+      dedicated mesh listener where Caddy presents the per-instance leaf and
+      require_and_verify-gates every caller (the wrap).
     - Named-volume workspace mount (tenant-namespaced — LAURA-FS-TM-008)
     - tmpfs /tmp overlay (64Mi — keeps readOnlyRootFilesystem with Node.js)
     - runAsUser 10001 (Laura §4.6)
@@ -2421,6 +2803,7 @@ class CodegenEngineShapeC:
 
     Artifact set:
       docker/<agent>-compose.override.yml
+      docker/caddy/agents/<agent>-mcp.caddy   (Phase 1b-i Caddy-front wrap)
       helm/yashigani/values-<agent>.yaml
       helm/yashigani/values-<agent>-networkpolicy.yaml
       helm/yashigani/templates/agents/<agent>-policy-exception.yaml (Kyverno)
@@ -2429,7 +2812,7 @@ class CodegenEngineShapeC:
       opa/<agent>.rego  (full per-tool policy — NOT a stub)
       tests/contracts/test_<agent>_shape_c_compose.py
 
-    No Caddy snippet is generated. Callers can assert this via:
+    No Caddy EGRESS route is generated. Callers can assert this via:
         "docker/caddy/agents/<agent>.caddy" not in artifacts
 
     Usage::
@@ -2437,17 +2820,22 @@ class CodegenEngineShapeC:
         engine = CodegenEngineShapeC(parsed_manifest, runtime="docker")
         artifacts = engine.render(dry_run=True)
         assert "docker/caddy/agents/filesystem.caddy" not in artifacts
+        assert "docker/caddy/agents/filesystem-mcp.caddy" in artifacts
 
     Args:
         parsed: validated parsed manifest (output of parse_manifest + validate_manifest).
         runtime: 4-way runtime string — one of "docker", "podman-rootful",
                  "podman-rootless", "k8s".
+        caddy_validator: optional injectable callable for C10 validation of
+                         the MCP-front snippet (test hook, mirrors Shape-A).
     """
 
     def __init__(
         self,
         parsed: dict,
         runtime: str,
+        *,
+        caddy_validator: Optional[Callable[[str], int]] = None,
     ) -> None:
         if runtime not in VALID_RUNTIMES:
             raise CodegenError(
@@ -2464,6 +2852,7 @@ class CodegenEngineShapeC:
             )
         self._parsed = parsed
         self._runtime = runtime
+        self._caddy_validator = caddy_validator
 
         meta = parsed.get("metadata") or {}
         self._tenant_id = meta.get("tenant_id", "")
@@ -2577,18 +2966,33 @@ class CodegenEngineShapeC:
             opa_content = _gen_opa_filesystem_bundle(self._parsed, **kwargs)
         test_compose_content = _gen_contract_test_compose_shape_c(self._parsed, **kwargs)
 
+        # v4.1 Phase 1b-i — the wrap: per-MCP Caddy-front snippet.
+        # This is an INGRESS front (Caddy presents the per-instance leaf +
+        # require_and_verify-gates callers), NOT an egress route —
+        # SC-EGRESS-NONE still holds.
+        mcp_caddy_content = _gen_caddy_snippet_mcp(self._parsed, **kwargs)
+        leaf_crt, leaf_key = _mcp_svid_paths(self._tenant_id, agent_name)
+        _validate_caddy_snippet_mcp(
+            mcp_caddy_content,
+            [leaf_crt, "/run/secrets/ca_intermediate.crt",
+             "/run/secrets/caddy_client.crt"],
+            [leaf_key, "/run/secrets/caddy_client.key"],
+            _validator=self._caddy_validator,
+        )
+
         # S6 — validate shell fragment
         _validate_shell_fragment(pki_content, "pki_ownership-%s.sh" % agent_name)
 
-        # NOTE: No Caddy snippet generated (SC-EGRESS-NONE).
-        # No _validate_caddy_snippet call for Shape-C.
+        # NOTE: No Caddy EGRESS route generated (SC-EGRESS-NONE).
         _log.info(
-            "codegen: Shape-C agent %r — no Caddy snippet generated (SC-EGRESS-NONE)",
+            "codegen: Shape-C agent %r — Caddy-front (ingress wrap) snippet "
+            "generated; no egress route (SC-EGRESS-NONE)",
             agent_name,
         )
 
         artifacts: dict[str, str] = {
             "docker/%s-compose.override.yml" % agent_name: compose_content,
+            "docker/caddy/agents/%s-mcp.caddy" % agent_name: mcp_caddy_content,
             "helm/yashigani/values-%s.yaml" % agent_name: values_content,
             "helm/yashigani/values-%s-networkpolicy.yaml" % agent_name: netpol_content,
             "helm/yashigani/templates/agents/%s-policy-exception.yaml" % agent_name: kyverno_content,
@@ -2598,11 +3002,17 @@ class CodegenEngineShapeC:
             "tests/contracts/test_%s_shape_c_compose.py" % agent_name: test_compose_content,
         }
 
-        # SC-EGRESS-NONE assertion: no caddy file in artifact map
+        # SC-EGRESS-NONE assertion: no Shape-A-style EGRESS caddy route in the
+        # artifact map ("<agent>.caddy" — LLM egress). The "<agent>-mcp.caddy"
+        # INGRESS front is required to be present (Phase 1b-i wrap).
         caddy_key = "docker/caddy/agents/%s.caddy" % agent_name
         assert caddy_key not in artifacts, (
-            "BUG: Caddy snippet unexpectedly in Shape-C artifact map for %r. "
+            "BUG: Caddy egress snippet unexpectedly in Shape-C artifact map for %r. "
             "SC-EGRESS-NONE violated." % agent_name
+        )
+        assert "docker/caddy/agents/%s-mcp.caddy" % agent_name in artifacts, (
+            "BUG: Phase 1b-i MCP Caddy-front snippet missing for %r — the MCP "
+            "would be onboarded UNWRAPPED." % agent_name
         )
 
         if not dry_run:
