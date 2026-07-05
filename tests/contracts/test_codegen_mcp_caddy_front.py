@@ -1,4 +1,4 @@
-# Last updated: 2026-07-05T00:00:00+00:00 (v4.1 Phase 1b-i — MCP Caddy-front wrap)
+# Last updated: 2026-07-06T00:00:00+00:00 (v4.1 Phase 1b-ii — SVID-GID model + demo-mcp + approve-hook)
 """
 v4.1 Phase 1b-i contract tests — the MCP Caddy-front ("the wrap").
 
@@ -34,7 +34,10 @@ from yashigani.manifest.codegen import (
     CodegenError,
     _MCP_MESH_PORT_BASE,
     _MCP_MESH_PORT_RANGE,
+    _MCP_SVID_GID,
     _mcp_mesh_port,
+    _mcp_svid_volume_name,
+    approve_mcp_onboard,
     reset_codegen_registry,
 )
 
@@ -266,3 +269,214 @@ def test_wrap_snippet_passes_real_caddy_if_present():
     engine = CodegenEngineShapeC(_base_manifest(), runtime="docker")
     artifacts = engine.render(dry_run=True)  # raises CodegenError on C10 failure
     assert "docker/caddy/agents/filesystem-mcp.caddy" in artifacts
+
+
+# ---------------------------------------------------------------------------
+# 6. SVID volume + GID model (Phase 1b-ii seam)
+# ---------------------------------------------------------------------------
+
+
+def test_svid_volume_declared_in_compose_override():
+    """Phase 1b-ii: compose override declares ysg_svid_<tenant>_<server> volume."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    vol_name = _mcp_svid_volume_name("acme-corp", "filesystem")
+    # Named volume declared in the volumes: section.
+    assert ("%s:" % vol_name) in compose
+    assert "driver: local" in compose
+
+
+def test_caddy_mounts_svid_volume_at_correct_path():
+    """Phase 1b-ii: the Caddy stanza mounts the SVID volume at the expected path."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    vol_name = _mcp_svid_volume_name("acme-corp", "filesystem")
+    expected_mount = "%s:/run/secrets/svid/acme-corp/filesystem" % vol_name
+    # Mount is under the caddy: stanza (appears after the caddy: key).
+    caddy_stanza = compose.split("  caddy:", 1)[1]
+    assert expected_mount in caddy_stanza
+
+
+def test_caddy_has_svid_gid_group_add():
+    """Phase 1b-ii: Caddy gets group_add _MCP_SVID_GID so it can read 0440 keys."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    caddy_stanza = compose.split("  caddy:", 1)[1]
+    # group_add must be present in the caddy stanza.
+    assert "group_add:" in caddy_stanza
+    assert ('"%d"' % _MCP_SVID_GID) in caddy_stanza
+
+
+def test_svid_gid_is_distinct_from_kms_gid():
+    """_MCP_SVID_GID must not equal 2002 (KMS GID S7) — the two access classes
+    must never be conflated."""
+    assert _MCP_SVID_GID != 2002, (
+        "SVID GID must not be 2002 (KMS GID). Two distinct GIDs enforce"
+        " least-privilege separation between SVID and KMS secret access."
+    )
+
+
+def test_perm_model_documented_in_compose():
+    """Compose override comment must document the 0440 key-perm requirement so
+    Su knows rotate.sh must be updated (chmod 0440, not 0400)."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    # The '0440' comment drives Su's rotate.sh perm-bump — MUST be present.
+    assert "0440" in compose
+
+
+# ---------------------------------------------------------------------------
+# 7. demo-mcp via codegen onboarding flow (no hand-wired leaf source)
+# ---------------------------------------------------------------------------
+
+_DEMO_MCP_DIGEST = "sha256:" + "b" * 64
+
+
+def _demo_mcp_manifest() -> dict[str, Any]:
+    """Minimal Shape-C manifest for the demo-mcp server.
+
+    demo-mcp is onboarded through the codegen approve flow just like any other
+    Shape-C server.  It gets a proper per-instance leaf (minted by
+    mint_agent_leaf) and a Caddy front — no second hand-wired leaf source.
+
+    Tenant 'yashigani-demo' is the internal demo tenant; operators never
+    interact with this tenant's servers directly.
+    """
+    return {
+        "apiVersion": "yashigani.io/v1alpha1",
+        "kind": "AgentIntegration",
+        "metadata": {
+            "name": "demo-mcp",
+            "tenant_id": "yashigani-demo",
+            "category": "mcp_server",
+            "description": "Purpose-built demo MCP server (cloud-9 rogue-tool demo)",
+            "vendor": "Agnostic Security",
+            "licence": "proprietary",
+        },
+        "spec": {
+            "image": {
+                "repository": "yashigani/demo-mcp",
+                "tag": "3.0.0",
+                "digest": _DEMO_MCP_DIGEST,
+            },
+            "write_posture": "readonly",
+            "subprocess": {
+                "command": ["python3", "server.py"],
+                "args": [],
+            },
+            "network": {"egress_allow": []},
+            "mcp": {
+                "posture": "mcp-b",
+                "transport": "stdio",
+                "session_mode": "persistent",
+                "identity_propagation": "gateway-enforced-only",
+                "exposes": {
+                    "listen_port": None,
+                    "shim_port": 8000,
+                    "tools": [
+                        {"name": "echo", "allowed": True, "sensitivity_class": "PUBLIC"},
+                        {"name": "add", "allowed": True, "sensitivity_class": "PUBLIC"},
+                        {"name": "uppercase", "allowed": True, "sensitivity_class": "PUBLIC"},
+                        {"name": "word_count", "allowed": True, "sensitivity_class": "PUBLIC"},
+                        {"name": "current_time", "allowed": True, "sensitivity_class": "PUBLIC"},
+                    ],
+                },
+            },
+            "storage": {
+                "mounts": [],
+                "tmpfs": [{"path": "/tmp", "size_limit": "16m"}],
+            },
+            "secrets": [],
+            "lifecycle": {"mode": "persistent"},
+        },
+    }
+
+
+def test_demo_mcp_gets_caddy_front_via_codegen():
+    """demo-mcp must receive a Caddy-front snippet through the codegen flow,
+    not a hand-wired leaf.  Verifies the snippet is present, route-namespaced,
+    and the SVID paths use the correct tenant."""
+    reset_codegen_registry()
+    artifacts = CodegenEngineShapeC(
+        _demo_mcp_manifest(), runtime="docker", caddy_validator=lambda _: 0,
+    ).render(dry_run=True)
+
+    # Wrap snippet is present and correctly named.
+    assert "docker/caddy/agents/demo-mcp-mcp.caddy" in artifacts
+    # No egress route.
+    assert "docker/caddy/agents/demo-mcp.caddy" not in artifacts
+
+    snip = artifacts["docker/caddy/agents/demo-mcp-mcp.caddy"]
+    # Route namespace uses the demo tenant.
+    assert "handle_path /mcp/yashigani-demo/demo-mcp/*" in snip
+    # SVID paths use the demo tenant — no cross-tenant path confusion.
+    assert "tls /run/secrets/svid/yashigani-demo/demo-mcp/client.crt" in snip
+
+
+def test_demo_mcp_compose_has_svid_volume_and_gid():
+    """demo-mcp compose override must carry the SVID volume + Caddy group_add."""
+    reset_codegen_registry()
+    artifacts = CodegenEngineShapeC(
+        _demo_mcp_manifest(), runtime="docker", caddy_validator=lambda _: 0,
+    ).render(dry_run=True)
+
+    compose = artifacts["docker/demo-mcp-compose.override.yml"]
+    vol_name = _mcp_svid_volume_name("yashigani-demo", "demo-mcp")
+    # SVID volume declared.
+    assert ("%s:" % vol_name) in compose
+    # Caddy mount.
+    caddy_stanza = compose.split("  caddy:", 1)[1]
+    assert "/run/secrets/svid/yashigani-demo/demo-mcp" in caddy_stanza
+    assert ('"%d"' % _MCP_SVID_GID) in caddy_stanza
+
+
+# ---------------------------------------------------------------------------
+# 8. approve_mcp_onboard() — Phase 1c approve-hook interface
+# ---------------------------------------------------------------------------
+
+
+def test_approve_hook_returns_artifact_map():
+    """approve_mcp_onboard() is the single entry point Tom calls from the
+    approve transaction.  Smoke-test: it returns the same artifact map as
+    CodegenEngineShapeC.render()."""
+    reset_codegen_registry()
+    artifacts = approve_mcp_onboard(
+        _base_manifest(),
+        runtime="docker",
+        dry_run=True,
+        caddy_validator=lambda _: 0,
+    )
+    # Load-bearing Phase 1c artifacts must be present.
+    assert "docker/caddy/agents/filesystem-mcp.caddy" in artifacts
+    assert "docker/filesystem-compose.override.yml" in artifacts
+    assert "helm/yashigani/values-filesystem-networkpolicy.yaml" in artifacts
+
+
+def test_approve_hook_error_propagates():
+    """C10 failure inside approve_mcp_onboard propagates as CodegenError."""
+    reset_codegen_registry()
+    with pytest.raises(CodegenError) as exc:
+        approve_mcp_onboard(
+            _base_manifest(),
+            runtime="docker",
+            dry_run=True,
+            caddy_validator=lambda _: 1,  # simulate caddy validate failure
+        )
+    assert exc.value.code == "C10_caddy_validate_failed"
+
+
+def test_approve_hook_svid_volume_in_output():
+    """approve_mcp_onboard() compose override carries SVID volume + GID — the
+    approve transaction can rely on this without inspecting engine internals."""
+    reset_codegen_registry()
+    artifacts = approve_mcp_onboard(
+        _base_manifest(),
+        runtime="docker",
+        dry_run=True,
+        caddy_validator=lambda _: 0,
+    )
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    vol_name = _mcp_svid_volume_name("acme-corp", "filesystem")
+    assert ("%s:" % vol_name) in compose
+    caddy_stanza = compose.split("  caddy:", 1)[1]
+    assert ('"%d"' % _MCP_SVID_GID) in caddy_stanza

@@ -1518,6 +1518,37 @@ _MCP_SVID_MOUNT_ROOT: str = "/run/secrets/svid"
 # Session-level mesh-port registry (mirrors the C3 _SEEN_PAIRS pattern).
 _SEEN_MESH_PORTS: dict[int, tuple[str, str]] = {}
 
+# GID shared between the svid-sidecar (primary group) and Caddy (supplemental
+# group).  The sidecar writes keys at mode 0440 (owner-read + group-read, no
+# world-read — least-privilege, never 0444).  Caddy joins this GID so it can
+# read the key without running as the sidecar's UID.
+#
+# Coordination contract with rotate.sh (Su domain):
+#   - Sidecar Dockerfile must set its GID to _MCP_SVID_GID (addgroup --gid 2003 svid)
+#     and chown/chmod the key: 0440 group=2003 (replace the current chmod 0400).
+#   - The codegen-emitted volume (ysg_svid_<tenant>_<server>) is backed by
+#     the local driver; the tmpfs overlay at /run/secrets/svid/<tenant>/<server>
+#     inside the sidecar makes rotation atomic (POSIX rename on tmpfs).
+#   - The Caddy container image must have GID 2003 available (addgroup in
+#     Dockerfile.caddy or a USER instruction with the numeric GID).
+#
+# Distinct from GID 2002 (_MCP_KMS_GID / S7): KMS secrets access — never mixed.
+_MCP_SVID_GID: int = 2003
+
+
+def _mcp_svid_volume_name(tenant_id: str, server_id: str) -> str:
+    """Named volume that bridges the svid-sidecar and Caddy.
+
+    Both the svid-sidecar (write path, rotate.sh) and Caddy (read path,
+    present leaf) mount this volume at
+      /run/secrets/svid/<tenant_id>/<server_id>/
+    The sidecar writes client.{crt,key} with mode 0440, GID _MCP_SVID_GID.
+    Caddy reads via supp-group _MCP_SVID_GID.
+    """
+    tenant_slug = tenant_id.replace("-", "_").replace(".", "_")
+    server_slug = server_id.replace("-", "_").replace(".", "_")
+    return "ysg_svid_%s_%s" % (tenant_slug, server_slug)
+
 
 def _mcp_svid_paths(tenant_id: str, server_id: str) -> tuple[str, str]:
     """In-Caddy-container paths of the per-instance leaf cert + key.
@@ -1978,13 +2009,31 @@ def _gen_compose_override_shape_c(
         "  # caddy:%d (mTLS, per-instance leaf) -> %s:%d." % (
             mesh_port, agent_name, _SC_BRIDGE_PORT),
         "  # Compose merges this list with the base caddy networks (additive).",
+        "  #",
+        "  # Phase 1b-ii SVID-GID model: Caddy reads the per-instance key via",
+        "  # supp-group %d (shared with the svid-sidecar, _MCP_SVID_GID)." % _MCP_SVID_GID,
+        "  # Key mode: 0440 (owner-read + group-read). NOT 0400, NOT 0444.",
+        "  # Su: rotate.sh must chmod 0440 + chown :%d the key after each write." % _MCP_SVID_GID,
         "  caddy:",
         "    networks:",
         "      - %s" % ringfence_bridge,
+        "    # SVID volume: per-instance leaf+key written by the svid-sidecar.",
+        "    # Sidecar mounts this same volume at the same path with SVID_DIR set.",
+        "    # Key perm: 0440 GID %d — Caddy reads via group_add below." % _MCP_SVID_GID,
+        "    volumes:",
+        "      - %s:/run/secrets/svid/%s/%s" % (
+            _mcp_svid_volume_name(tenant_id, agent_name), tenant_id, agent_name),
+        "    group_add:",
+        '      - "%d"' % _MCP_SVID_GID,
         "",
         "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
+        "# Phase 1b-ii SVID volume: sidecar + Caddy share this; key mode 0440 GID %d." % _MCP_SVID_GID,
+        "# Su wires the svid-sidecar service to mount %s at" % _mcp_svid_volume_name(tenant_id, agent_name),
+        "#   /run/secrets/svid/%s/%s with SVID_DIR set to that path." % (tenant_id, agent_name),
         "volumes:",
         "  %s:" % vol_name,
+        "    driver: local",
+        "  %s:" % _mcp_svid_volume_name(tenant_id, agent_name),
         "    driver: local",
         "",
         "# W3-F1: isolated ringfence bridge — L2 default-deny containment",
@@ -3177,3 +3226,83 @@ class CodegenEngine:
                 _log.info("codegen: wrote %s", rel_path)
 
         return artifacts
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 1c approve-hook — public entry point for the approve transaction
+# ---------------------------------------------------------------------------
+
+
+def approve_mcp_onboard(
+    manifest: dict,
+    runtime: str,
+    *,
+    output_root: Optional[Path] = None,
+    dry_run: bool = True,
+    caddy_validator: Optional[Callable[[str], int]] = None,
+) -> dict[str, str]:
+    """
+    Approve-hook entry point for Phase 1c (Tom wires this from the approve
+    transaction).  Render all Shape-C artifacts for an MCP server and
+    (optionally) write them to disk.
+
+    Called by the approve transaction AFTER:
+      1. ``mint_agent_leaf()`` has been called and the per-instance leaf is
+         written to the svid-sidecar volume (INIT_DIR = source for rotate.sh).
+      2. The manifest has been validated (parse_manifest + validate_manifest).
+
+    On ``dry_run=False`` (production approve path):
+      - Writes all artifacts to ``output_root``.
+      - Caddy picks up ``docker/caddy/agents/<server>-mcp.caddy`` on the next
+        ``caddy reload`` (or SIGUSR1) — the approve transaction is responsible
+        for issuing the reload signal after this function returns.
+
+    Args:
+        manifest:        Validated parsed manifest dict (Shape-C / mcp_server).
+        runtime:         One of "docker", "podman-rootful", "podman-rootless",
+                         "k8s".
+        output_root:     Root directory for file writes; required when
+                         ``dry_run=False``.
+        dry_run:         If True (default), return rendered content without
+                         writing files.
+        caddy_validator: Optional injectable C10 validator (signature:
+                         ``(caddyfile_text: str) -> int``).  None uses the
+                         real caddy binary.
+
+    Returns:
+        Artifact map ``{relative_path: content}`` — same shape as
+        ``CodegenEngineShapeC.render()``.  Load-bearing keys for Phase 1c:
+
+        ``docker/caddy/agents/<server_id>-mcp.caddy``
+            Caddy-front snippet — write to the caddy agents/ directory, then
+            ``caddy reload``.
+
+        ``docker/<server_id>-compose.override.yml``
+            Compose override — write and run ``docker compose up -d``
+            (or equivalent Podman / Helm apply path).
+
+        ``helm/yashigani/values-<server_id>-networkpolicy.yaml``
+            K8s NetworkPolicy overlay — ``kubectl apply`` after Helm render.
+
+    Raises:
+        CodegenError: on any security violation (SC-EGRESS-NONE, SC-NO-SECRETS,
+                      C10 Caddy validate failure, port collision, M9 path
+                      safety).
+
+    SVID volume + GID contract (Phase 1b-ii seam, Su owns sidecar wiring):
+        - Volume name:  ``ysg_svid_<tenant_slug>_<server_slug>``
+          (from ``_mcp_svid_volume_name(tenant_id, server_id)``).
+        - Sidecar mounts this volume at
+          ``/run/secrets/svid/<tenant_id>/<server_id>/`` with
+          ``SVID_DIR=/run/secrets/svid/<tenant_id>/<server_id>``.
+        - rotate.sh writes ``client.{crt,key}``; key MUST be ``chmod 0440``
+          with ``chown :<_MCP_SVID_GID>`` (GID %d) — NOT 0400.
+        - Caddy mounts the same volume at the same path; reads via
+          ``group_add: ["%d"]`` (supp-group %d) emitted in the compose override.
+    """ % (_MCP_SVID_GID, _MCP_SVID_GID, _MCP_SVID_GID)
+    engine = CodegenEngineShapeC(
+        manifest,
+        runtime,
+        caddy_validator=caddy_validator,
+    )
+    return engine.render(output_root=output_root, dry_run=dry_run)

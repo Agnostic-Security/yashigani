@@ -215,21 +215,36 @@ def test_sc_egress_not_empty_raises():
 # ---------------------------------------------------------------------------
 
 def test_sc_no_group_add_2002_in_compose():
-    """SC-NO-SECRETS: group_add 2002 must NOT appear as a YAML directive in compose output."""
+    """SC-NO-SECRETS: GID 2002 (KMS secrets group, S7) must NOT appear in
+    the MCP container stanza of the compose output.
+
+    NOTE: GID 2003 (_MCP_SVID_GID) IS legitimately emitted in the caddy stanza
+    for the SVID key-read permission model (Phase 1b-ii). The assertion below is
+    scoped to GID 2002 only, and to the MCP service stanza only — not the whole
+    compose file."""
     engine = CodegenEngineShapeC(_base_manifest(), runtime="docker")
     artifacts = engine.render(dry_run=True)
     compose = artifacts["docker/filesystem-compose.override.yml"]
-    # group_add must not appear as a YAML key (not in a comment)
     non_comment_lines = [
         line for line in compose.splitlines()
         if not line.strip().startswith("#")
     ]
     non_comment_text = "\n".join(non_comment_lines)
-    assert "group_add" not in non_comment_text, (
-        "group_add directive must not appear in Shape-C compose (SC-NO-SECRETS)"
+    # GID 2002 (KMS) must never appear in ANY Shape-C compose output.
+    assert "\"2002\"" not in non_comment_text, (
+        "GID 2002 (KMS group_add S7) must not appear in Shape-C compose — "
+        "SC-NO-SECRETS: MCP servers have no KMS secret access."
     )
-    assert "  - \"2002\"" not in non_comment_text, (
-        "GID 2002 must not appear as YAML list entry in Shape-C compose (SC-NO-SECRETS)"
+    # GID 2002 must not appear as a group_add entry for the MCP container;
+    # check the MCP service stanza only (stops before caddy:).
+    mcp_stanza = compose.split("  caddy:", 1)[0]
+    mcp_non_comment = "\n".join(
+        line for line in mcp_stanza.splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "group_add" not in mcp_non_comment, (
+        "group_add must not appear in the MCP container stanza (SC-NO-SECRETS). "
+        "group_add for the SVID GID belongs in the caddy stanza only."
     )
 
 
