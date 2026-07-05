@@ -417,7 +417,11 @@ class SensitivityClassifier:
         A clean PUBLIC response (ollama reachable, text classified as non-sensitive)
         returns SensitivityLevel.PUBLIC without raising.
         """
-        import httpx  # noqa: PLC0415 — intentional lazy import
+        # v4.1 Phase 1c (LAURA-I1-01 seam): mesh-aware transport — presents the
+        # gateway leaf to the Caddy :11435 Ollama front on https URLs.
+        from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+            ollama_sync_client,
+        )
         prompt = (
             "Classify the sensitivity of the following text. "
             "Reply with ONLY one word: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED, or SENSITIVE.\n"
@@ -433,11 +437,11 @@ class SensitivityClassifier:
             f"Text: {text[:2000]}\n\n"  # Truncate to avoid overwhelming small models
             "Classification:"
         )
-        resp = httpx.post(
-            f"{self._ollama_url}/api/generate",
-            json={"model": self._ollama_model, "prompt": prompt, "stream": False},
-            timeout=10.0,
-        )
+        with ollama_sync_client(self._ollama_url, timeout=10.0) as _client:
+            resp = _client.post(
+                f"{self._ollama_url}/api/generate",
+                json={"model": self._ollama_model, "prompt": prompt, "stream": False},
+            )
         if resp.status_code == 200:
             body = resp.json()
             answer = body.get("response", "").strip().upper()

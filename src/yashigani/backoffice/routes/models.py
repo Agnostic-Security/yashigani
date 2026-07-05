@@ -150,12 +150,14 @@ async def list_available_models(session: AdminSession):
     if pipeline is None:
         return {"models": []}
     try:
-        import httpx
+        # v4.1 Phase 1c (LAURA-I1-01 seam): mesh-aware transport for the
+        # Caddy :11435 Ollama front (presents the backoffice leaf on https).
+        from yashigani.inspection._ollama_transport import ollama_async_client
         ollama_url = getattr(pipeline, '_classifier', None)
-        base_url = "http://ollama:11434"
+        base_url = _ollama_base()
         if ollama_url and hasattr(ollama_url, '_ollama_base_url'):
             base_url = ollama_url._ollama_base_url
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with ollama_async_client(base_url, timeout=10.0) as client:
             resp = await client.get(f"{base_url}/api/tags")
             if resp.status_code == 200:
                 data = resp.json()
@@ -212,11 +214,16 @@ async def pull_model(body: PullModelRequest, session: StepUpAdminSession):
     """
     import httpx
     import json as _json
+    # v4.1 Phase 1c (LAURA-I1-01 seam): mesh-aware transport — presents the
+    # backoffice leaf to the Caddy :11435 Ollama front on https URLs.
+    from yashigani.inspection._ollama_transport import ollama_async_client
     name = body.name.strip()
     base = _ollama_base()
     last: dict = {}
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+        async with ollama_async_client(
+            base, timeout=httpx.Timeout(600.0, connect=10.0),
+        ) as client:
             async with client.stream("POST", base + "/api/pull",
                                      json={"name": name, "stream": True}) as resp:
                 if resp.status_code != 200:
