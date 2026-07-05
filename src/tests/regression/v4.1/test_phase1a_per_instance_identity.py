@@ -9,8 +9,18 @@ GAP-1  Two same-named instances previously COLLIDED: identical SPIFFE URI
        registry ``nhi_id`` becomes an instance segment in BOTH.
 
 GAP-2  The leaf carried no cryptographic binding to WHAT was approved.  Fixed:
-       a CRITICAL custom extension (pki/binding.BINDING_EXTENSION_OID) carries
-       sha384(image_digest ‖ 0x00 ‖ scope_hash).
+       a NON-critical custom extension (pki/binding.BINDING_EXTENSION_OID)
+       carries sha384(image_digest ‖ 0x00 ‖ scope_hash).
+
+       Phase 1b-i amendment (Captain, 2026-07-05): the extension was flipped
+       CRITICAL → NON-critical.  Go crypto/x509 (Caddy ``require_and_verify``)
+       rejects any leaf carrying an unrecognised CRITICAL extension (RFC 5280
+       §4.2), which would make every Go-based mesh verifier refuse the
+       per-instance leaf.  Change-prevention is enforced at the OPA input
+       layer, not TLS path validation — Nico's Phase 1a handoff note called
+       out exactly this consumer constraint.  The criticality assertion below
+       is updated accordingly and is load-bearing in the OPPOSITE direction:
+       a regression back to critical=True bricks the Caddy front.
 
 GAP-4  Deactivate left the runtime-manifest entry ``revoked: false`` and the
        NHI in ``nhi:index:active`` (token stayed in the gateway token map).
@@ -165,9 +175,14 @@ def test_legacy_mint_without_instance_unchanged(paths: IssuerPaths) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_binding_extension_present_critical_and_correct(paths: IssuerPaths) -> None:
-    """Verify criterion (b): extension present, CRITICAL, value equal to
-    sha384(image_digest ‖ 0x00 ‖ scope_hash) in the documented encoding."""
+def test_binding_extension_present_noncritical_and_correct(paths: IssuerPaths) -> None:
+    """Verify criterion (b): extension present, NON-critical, value equal to
+    sha384(image_digest ‖ 0x00 ‖ scope_hash) in the documented encoding.
+
+    Phase 1b-i: non-criticality is LOAD-BEARING — Go crypto/x509 (Caddy
+    require_and_verify) rejects leaves with unrecognised CRITICAL extensions;
+    a critical binding extension bricks the entire Caddy-front architecture.
+    """
     mint_agent_leaf(
         paths, "tenant1", "cloud9",
         instance_id="nhi_cccccccccccc", scope_hash=_SCOPE, image_digest=_IMAGE,
@@ -175,7 +190,11 @@ def test_binding_extension_present_critical_and_correct(paths: IssuerPaths) -> N
     leaf = _leaf(paths, "tenant1", "cloud9", "nhi_cccccccccccc")
 
     ext = leaf.extensions.get_extension_for_oid(BINDING_EXTENSION_OID)
-    assert ext.critical is True, "change-prevention extension MUST be critical"
+    assert ext.critical is False, (
+        "change-prevention extension MUST be NON-critical — Go crypto/x509 "
+        "(Caddy require_and_verify) rejects unrecognised critical extensions "
+        "(RFC 5280 §4.2); enforcement is at the OPA input layer"
+    )
 
     # Independent recomputation — do not trust binding.py's own digest helper.
     expected = "sha384:" + hashlib.sha384(
@@ -200,6 +219,36 @@ def test_binding_unpinned_image_recorded_honestly(paths: IssuerPaths) -> None:
     leaf = _leaf(paths, "tenant1", "cloud9", "nhi_dddddddddddd")
     expected = "sha384:" + hashlib.sha384(b"\x00" + _SCOPE.encode()).hexdigest()
     assert parse_binding_extension(leaf) == expected
+
+
+def test_oid_arcs_go_parseable_and_uuid_derived() -> None:
+    """Phase 1b-i: every arc of the binding-extension OID MUST fit in an
+    int32.  Go crypto/x509 (Caddy require_and_verify, gateway mesh listeners)
+    rejects the ENTIRE certificate when any extension OID arc exceeds 2^31-1
+    — empirically proven (arc 2^31-1 accepted, 2^32-1 → decode_error abort;
+    the original X.667 single-UUID arc ~2^127 → same abort).  Also pins the
+    derivation: eight 16-bit chunks of the provenance UUID."""
+    import uuid as _uuid
+
+    from yashigani.pki.binding import (
+        YASHIGANI_ARC_PROVENANCE_UUID,
+        YASHIGANI_PRIVATE_ARC,
+        BINDING_EXTENSION_OID_DOTTED,
+    )
+
+    arcs = [int(a) for a in BINDING_EXTENSION_OID_DOTTED.split(".")]
+    assert all(a <= 2**31 - 1 for a in arcs), (
+        "binding-extension OID arc exceeds int32 — Go crypto/x509 will "
+        "reject every per-instance leaf at TLS handshake (Phase 1b-i proof)"
+    )
+    # Derivation pin: last eight arcs of the private arc are the provenance
+    # UUID split into big-endian 16-bit chunks.
+    u = _uuid.UUID(YASHIGANI_ARC_PROVENANCE_UUID).bytes
+    expected_chunks = [
+        int.from_bytes(u[i:i + 2], "big") for i in range(0, 16, 2)
+    ]
+    assert YASHIGANI_PRIVATE_ARC.split(".")[-8:] == [str(c) for c in expected_chunks]
+    assert BINDING_EXTENSION_OID_DOTTED == YASHIGANI_PRIVATE_ARC + ".1"
 
 
 def test_tool_surface_hash_matches_r3_inline_encoding() -> None:
@@ -227,7 +276,7 @@ def test_encode_parse_rejects_garbage() -> None:
         .not_valid_before(now).not_valid_after(now + _dt.timedelta(days=1))
         .add_extension(
             x509.UnrecognizedExtension(BINDING_EXTENSION_OID, b"sha384:nothex"),
-            critical=True,
+            critical=False,  # matches the shipping contract (non-critical)
         )
         .sign(k, _h.SHA256())
     )

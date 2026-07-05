@@ -8,19 +8,45 @@ binding — the running instance can no longer present a leaf whose binding dige
 matches what the verifier (sidecar / OPA Phase 2) recomputes, and is denied
 ``IDENTITY_BINDING_BROKEN``.
 
-X.509 extension contract (FIXED — consumers build against this):
+X.509 extension contract (FIXED — consumers build against this; import the
+``BINDING_EXTENSION_OID`` / ``BINDING_EXTENSION_OID_DOTTED`` constants, never
+inline the dotted literal):
 
-  OID:       2.25.245749903045077406250620676131142091552.1
-             (X.667 UUID-derived arc from b8e1b5af-95fa-4a3b-844d-12ef9bb1c320;
-             self-assigned per ITU-T X.667 — globally unique without an IANA
-             PEN, and makes no false registration claim.  Sub-arc .1 =
-             change-prevention binding digest.)
-  Critical:  True (per v4.1 Phase 1a brief).  NOTE for consumers: RFC 5280
-             path validators that do not recognise the OID MUST reject the
-             cert — Go crypto/x509 ``Verify`` (Caddy ``require_and_verify``)
-             and strict OpenSSL both do.  The mesh verifier must therefore
-             either recognise/strip this OID before chain validation or use
-             a verification mode that tolerates it (see Phase 1a handoff).
+  OID:       1.2.840.113556.1.8000.2554.47329.46511.38394.19003.33869.4847.39857.49952.1
+             Derived from the SAME provenance UUID
+             b8e1b5af-95fa-4a3b-844d-12ef9bb1c320 as the original Phase 1a
+             arc, split into eight 16-bit arcs under Microsoft's public
+             self-assignment arc 1.2.840.113556.1.8000.2554 (the arc owner
+             explicitly delegates this space for GUID-derived self-generated
+             OIDs — no false registration claim; uniqueness inherited from
+             the UUID).  Sub-arc .1 = change-prevention binding digest.
+
+             Phase 1b-i AMENDMENT (Captain, 2026-07-05 — Nico to ratify):
+             the original X.667 form 2.25.245749903045077406250620676131142091552.1
+             encodes the UUID as ONE ~2^127 arc.  Go's crypto/x509 stores OID
+             arcs as machine ints and REJECTS any certificate whose extension
+             OID has an arc > 2^31-1 — empirically proven against Caddy
+             ``require_and_verify``: arc 2^31-1 → accepted, arc 2^32-1 →
+             ``decode_error`` handshake abort, X.667 UUID arc → same abort,
+             with criticality irrelevant.  Every X.667 single-UUID arc is
+             therefore unusable in any cert a Go TLS stack must parse
+             (Caddy, gateway mesh listeners, OPA).  PROPER long-term fix:
+             register an Agnostic Security IANA PEN (free) and move to
+             1.3.6.1.4.1.<PEN>.1.1 in a coordinated rotation.
+
+  Critical:  False (v4.1 Phase 1b-i decision — supersedes the Phase 1a brief).
+             RATIONALE: RFC 5280 path validators that do not recognise a
+             CRITICAL OID MUST reject the cert — Go crypto/x509 ``Verify``
+             (Caddy ``require_and_verify``) and strict OpenSSL both do.  The
+             architecture enforces change-prevention at the OPA layer (the
+             binding digest is an OPA *input*, recomputed from registry
+             state), NOT at TLS path validation — so the extension is
+             informational to TLS stacks and MUST be non-critical or every
+             Go-based mesh verifier (Caddy fronting gateway/backoffice/OPA)
+             would refuse the per-instance leaf outright.  Verified
+             empirically against Caddy ``client_auth require_and_verify``
+             (Phase 1b-i handshake proof: critical → TLS alert
+             ``bad certificate``; non-critical → accepted).
   extnValue: the raw ASCII bytes ``sha384:<96 lowercase hex chars>``
              (no inner DER wrapping — cryptography's UnrecognizedExtension
              emits the bytes directly as the extension's OCTET STRING body).
@@ -49,10 +75,20 @@ import json
 
 from cryptography import x509
 
-#: UUID-derived private arc (ITU-T X.667). See module docstring for provenance.
-YASHIGANI_PRIVATE_ARC = "2.25.245749903045077406250620676131142091552"
+#: Provenance UUID for the Yashigani private arc (same as Phase 1a).
+YASHIGANI_ARC_PROVENANCE_UUID = "b8e1b5af-95fa-4a3b-844d-12ef9bb1c320"
 
-#: Change-prevention binding digest extension (critical).
+#: UUID-derived private arc — the provenance UUID split into eight 16-bit
+#: arcs under Microsoft's public GUID-self-assignment arc (see module
+#: docstring).  Phase 1b-i: every arc MUST stay <= 2^31-1 or Go crypto/x509
+#: (Caddy require_and_verify, gateway mesh listeners) rejects the whole
+#: certificate at parse time — test_oid_arcs_go_parseable guards this.
+YASHIGANI_PRIVATE_ARC = (
+    "1.2.840.113556.1.8000.2554."
+    "47329.46511.38394.19003.33869.4847.39857.49952"
+)
+
+#: Change-prevention binding digest extension (NON-critical — see docstring).
 BINDING_EXTENSION_OID = x509.ObjectIdentifier(YASHIGANI_PRIVATE_ARC + ".1")
 
 #: Dotted-string form for consumers that match on strings (OPA input, openssl).

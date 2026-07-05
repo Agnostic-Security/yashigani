@@ -579,8 +579,11 @@ def build_leaf(
     needs.
 
     binding_extension_value — v4.1 Phase 1a GAP-2: when set, embedded as a
-    CRITICAL custom extension (pki/binding.py BINDING_EXTENSION_OID) carrying
-    the sha384(image_digest ‖ scope_hash) change-prevention digest.
+    NON-critical custom extension (pki/binding.py BINDING_EXTENSION_OID)
+    carrying the sha384(image_digest ‖ scope_hash) change-prevention digest.
+    Non-critical because Go crypto/x509 (Caddy ``require_and_verify``) rejects
+    leaves with unrecognised CRITICAL extensions; enforcement lives at the OPA
+    input layer, not TLS path validation (Phase 1b-i decision — binding.py).
     """
     lifetime_days = policy.clamp_leaf(lifetime_days or policy.leaf_lifetime_days_default)
     key = _gen_keypair()
@@ -688,12 +691,17 @@ def build_leaf(
         )
     )
     if binding_extension_value is not None:
-        # v4.1 Phase 1a GAP-2 — change-prevention binding digest, CRITICAL.
+        # v4.1 Phase 1a GAP-2 — change-prevention binding digest, NON-critical.
         # Encoding contract lives in pki/binding.py (fixed handoff contract).
+        # Phase 1b-i: critical=False is LOAD-BEARING — Go crypto/x509 (Caddy
+        # require_and_verify) rejects any leaf carrying an unrecognised
+        # CRITICAL extension (RFC 5280 §4.2). Change-prevention is enforced
+        # at the OPA input layer, not TLS path validation. Empirically proven
+        # against Caddy client_auth (see binding.py module docstring).
         from yashigani.pki.binding import BINDING_EXTENSION_OID
         cert = cert.add_extension(
             x509.UnrecognizedExtension(BINDING_EXTENSION_OID, binding_extension_value),
-            critical=True,
+            critical=False,
         )
     signed = cert.sign(intermediate_key, hashes.SHA256())
     return signed, key
@@ -1279,9 +1287,11 @@ def mint_agent_leaf(
     # BUG-A (v4.1 Phase 0): args must match build_leaf(service, intermediate_cert,
     # intermediate_key, policy, lifetime_days=...) — see build_leaf def above.
     # GAP-2 change-prevention binding: sha384(image_digest ‖ 0x00 ‖ scope_hash)
-    # embedded as a CRITICAL extension (contract in pki/binding.py). Only
-    # embedded when a tool-surface baseline exists — a binding over two empty
-    # inputs would be a false "nothing was approved" attestation.
+    # embedded as a NON-critical extension (contract in pki/binding.py —
+    # non-critical so Go crypto/x509 / Caddy require_and_verify accept the
+    # leaf; enforcement is at the OPA input layer). Only embedded when a
+    # tool-surface baseline exists — a binding over two empty inputs would
+    # be a false "nothing was approved" attestation.
     binding_ext = (
         encode_binding_extension_value(image_digest, scope_hash)
         if scope_hash else None
