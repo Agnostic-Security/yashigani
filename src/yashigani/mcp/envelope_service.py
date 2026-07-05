@@ -67,6 +67,12 @@ class EnvelopeRecord:
     approved_by_operator_identity: str
     approved_at: datetime
     envelope: ServerEnvelope
+    # v4.1 Phase 1c (migration 0026) — per-instance SVID identity minted by
+    # the approve transaction.  Empty/False on legacy DB-row-only imports and
+    # external_relay topologies (no wrap → no leaf) — honest record.
+    svid_instance_id: str = ""
+    svid_spiffe_id: str = ""
+    svid_issued: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +204,19 @@ class CapabilityEnvelopeService:
         operator_identity: str,
         topology: str = TOPOLOGY_RING_FENCED,
         sidecar_scan_verdict: Optional[dict] = None,
+        svid_instance_id: str = "",
+        svid_spiffe_id: str = "",
+        svid_issued: bool = False,
     ) -> int:
         """
         Mint the FIRST envelope (version 1) at the import ceremony, OR a new
         chained version on re-approval.  Supersedes any existing active row for
         the provenance_id in the same transaction (the single-active invariant).
+
+        v4.1 Phase 1c: ``svid_*`` record the per-instance leaf minted by the
+        approve transaction BEFORE this INSERT.  ``svid_issued=True`` MUST only
+        ever be passed when a real cert exists on disk (fail-closed contract —
+        the caller mints first, records last; BUG-A guard).
 
         Returns the new row id.
         """
@@ -210,6 +224,12 @@ class CapabilityEnvelopeService:
             raise ValueError(f"invalid topology: {topology!r}")
         if not operator_identity:
             raise ValueError("operator_identity is required to mint an envelope")
+        if svid_issued and not (svid_instance_id and svid_spiffe_id):
+            # An "issued" claim without the identity it was issued FOR is
+            # exactly the false-evidence shape BUG-A produced. Refuse.
+            raise ValueError(
+                "svid_issued=True requires svid_instance_id and svid_spiffe_id"
+            )
 
         payload = serialise_envelope(env)
         verdict_json = (
@@ -250,12 +270,14 @@ class CapabilityEnvelopeService:
                         tool_set, effect_classes, arg_shape_signatures,
                         data_scope, egress_posture, surface_set_hash,
                         current_surface_hash, topology, sidecar_scan_verdict,
-                        approved_by_operator_identity
+                        approved_by_operator_identity,
+                        svid_instance_id, svid_spiffe_id, svid_issued
                     ) VALUES (
                         $1, $2, $3, $4, $5, 'active',
                         $6::jsonb, $7::jsonb, $8::jsonb,
                         $9::jsonb, $10, $11,
-                        $12, $13, $14::jsonb, $15
+                        $12, $13, $14::jsonb, $15,
+                        $16, $17, $18
                     )
                     RETURNING id
                     """,
@@ -274,6 +296,9 @@ class CapabilityEnvelopeService:
                     topology,
                     verdict_json,
                     operator_identity,
+                    svid_instance_id,
+                    svid_spiffe_id,
+                    svid_issued,
                 )
         new_id: int = row["id"]
         _log.info(
@@ -467,7 +492,22 @@ class CapabilityEnvelopeService:
             approved_by_operator_identity=row["approved_by_operator_identity"],
             approved_at=row["approved_at"],
             envelope=env,
+            # v4.1 Phase 1c (migration 0026). .get()-style tolerance is NOT
+            # used: asyncpg Records raise KeyError on unknown columns, and
+            # tests use dict-shaped rows — support both via a guarded lookup.
+            svid_instance_id=_row_get(row, "svid_instance_id", ""),
+            svid_spiffe_id=_row_get(row, "svid_spiffe_id", ""),
+            svid_issued=bool(_row_get(row, "svid_issued", False)),
         )
+
+
+def _row_get(row: Any, key: str, default: Any) -> Any:
+    """Column lookup tolerant of pre-0026 rows/mocks lacking the svid columns."""
+    try:
+        value = row[key]
+    except (KeyError, IndexError):
+        return default
+    return default if value is None else value
 
 
 def _as_dict(value: Any) -> dict:

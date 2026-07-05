@@ -317,6 +317,16 @@ class ImportMcpServerRequest(BaseModel):
     display_name: Optional[str] = None
     """Optional human-readable display name (for UI labels)."""
 
+    manifest_yaml: Optional[str] = None
+    """v4.1 Phase 1c — Shape-C manifest (YAML text) for the approve
+    transaction.  REQUIRED for ring_fenced topology: the import ceremony now
+    provisions the wrap atomically (per-instance leaf + Caddy front + reload
+    + durable registry) — 'DB row only' onboarding no longer exists for
+    ring-fenced servers.  metadata.name must equal server_id and
+    metadata.tenant_id must equal this install's tenant.  external_relay
+    (remote/cloud endpoint — no local container, nothing to wrap) does not
+    take a manifest."""
+
     @field_validator("server_id")
     @classmethod
     def validate_server_id(cls, v: str) -> str:
@@ -474,27 +484,83 @@ async def import_mcp_server(
         egress_posture=body.egress_posture,
     )
 
-    # 4. Mint the initial approved envelope (v1 / import ceremony).
+    # 4. Approve.
+    #
+    # v4.1 Phase 1c (SYNTHESIS.md Issue-1 step 6 — "approve = transaction"):
+    # ring_fenced servers are onboarded through the ATOMIC transaction —
+    # mint per-instance leaf → codegen the Caddy-front wrap → write artifacts
+    # → caddy reload → durable envelope INSERT (the commit point, carrying
+    # svid_issued=True only because a real cert now exists).  Any step
+    # failure rolls back everything (fail-closed; no partial onboarding, no
+    # BUG-A false svid evidence).  'DB row only' no longer exists for
+    # ring-fenced topology.
+    #
+    # external_relay (remote/cloud endpoint) has no local container: there is
+    # no ringfence bridge, no shim and nothing to wrap — the envelope row
+    # (with svid_issued=False, honestly) remains the whole ceremony.
     svc = _envelope_service()
-    try:
-        new_id = await svc.mint_envelope(
-            env,
-            server_id=body.server_id,
-            operator_identity=session.account_id,
-            topology=body.topology,
-            sidecar_scan_verdict=scan_verdict,  # YSG-RISK-076: persist screen verdict
+    onboard_result = None
+    if body.topology == TOPOLOGY_RING_FENCED:
+        if not body.manifest_yaml:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "manifest_required",
+                    "message": (
+                        "ring_fenced imports require manifest_yaml: the approve "
+                        "ceremony provisions the per-instance leaf and Caddy-front "
+                        "wrap atomically (v4.1 Phase 1c). Supply the Shape-C "
+                        "manifest for this server."
+                    ),
+                },
+            )
+        from yashigani.backoffice.mcp_onboard import (
+            McpOnboardError,
+            run_approve_transaction,
         )
-    except Exception as exc:
-        envelope, _ = safe_error_envelope(exc, public_message="envelope mint failed")
-        raise HTTPException(status_code=500, detail=envelope)
+        try:
+            onboard_result = await run_approve_transaction(
+                manifest_yaml=body.manifest_yaml,
+                server_id=body.server_id,
+                tenant_id=tenant,
+                env=env,
+                topology=body.topology,
+                sidecar_scan_verdict=scan_verdict,
+                operator_identity=session.account_id,
+                envelope_service=svc,
+                audit_writer=backoffice_state.audit_writer,
+            )
+        except McpOnboardError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={
+                    "error": "onboard_transaction_failed",
+                    "failed_step": exc.step,
+                    "message": str(exc),
+                },
+            )
+        new_id = onboard_result.envelope_id
+    else:
+        try:
+            new_id = await svc.mint_envelope(
+                env,
+                server_id=body.server_id,
+                operator_identity=session.account_id,
+                topology=body.topology,
+                sidecar_scan_verdict=scan_verdict,  # YSG-RISK-076: persist screen verdict
+            )
+        except Exception as exc:
+            envelope, _ = safe_error_envelope(exc, public_message="envelope mint failed")
+            raise HTTPException(status_code=500, detail=envelope)
 
     tool_names = sorted(env.tools.keys())
     suspicious = scan_verdict.get("suspicious_content_flagged", False)
     logger.info(
         "mcp-servers: imported server_id=%r provenance=%r tools=%d envelope_id=%d "
-        "by admin=%s screen=%s suspicious=%s",
+        "by admin=%s screen=%s suspicious=%s wrap=%s",
         body.server_id, provenance_id, len(tool_names), new_id, session.account_id,
         scan_verdict.get("classifier_status"), suspicious,
+        (onboard_result.spiffe_id if onboard_result else "n/a"),
     )
     if suspicious:
         logger.warning(
@@ -503,7 +569,7 @@ async def import_mcp_server(
             body.server_id,
         )
 
-    return {
+    response = {
         "server_id": body.server_id,
         "provenance_id": provenance_id,
         "envelope_id": new_id,
@@ -515,3 +581,13 @@ async def import_mcp_server(
         "sidecar_scan_verdict": scan_verdict,            # YSG-RISK-076: surface for operator
         "suspicious_content_flagged": suspicious,         # day-one-poison screen result
     }
+    if onboard_result is not None:
+        # v4.1 Phase 1c — wrap provisioning evidence (per-instance identity +
+        # written artifacts). svid_issued=True is backed by the cert on disk.
+        response["svid"] = {
+            "instance_id": onboard_result.instance_id,
+            "spiffe_id": onboard_result.spiffe_id,
+            "svid_issued": True,
+        }
+        response["artifacts"] = onboard_result.artifact_paths
+    return response

@@ -1687,6 +1687,89 @@ print('GATEWAY-REDIS-OK', wf_id)
 
     return wf_id
 
+def _demo_mcp_image_digest() -> str:
+    """Resolve a sha256 digest for the demo-mcp image (M6 lint requirement).
+
+    Order: YASHIGANI_DEMO_MCP_DIGEST env override → RepoDigests (pushed
+    images) → image Id (locally-built images have no RepoDigests; the config
+    Id is still a real sha256 content-address of THIS image and honestly pins
+    it for the GAP-2 change-prevention binding).  Returns "" on failure.
+    """
+    import subprocess
+    env_digest = os.environ.get("YASHIGANI_DEMO_MCP_DIGEST", "").strip()
+    if env_digest:
+        return env_digest
+    for runtime in ("docker", "podman"):
+        try:
+            r = subprocess.run(
+                [runtime, "image", "inspect", "yashigani/demo-mcp:3.0.0",
+                 "--format", "{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            value = r.stdout.strip()
+            # RepoDigests form: repo@sha256:<hex>; Id form: sha256:<hex>.
+            return value.split("@", 1)[1] if "@" in value else value
+    return ""
+
+
+def _demo_mcp_manifest_yaml(tenant_id: str, image_digest: str) -> str:
+    """Shape-C manifest for the cloud-9 demo MCP (v4.1 Phase 1c onboarding).
+
+    The import ceremony now provisions the wrap atomically (per-instance leaf
+    + Caddy front + reload + durable registry) — the manifest is the codegen
+    input.  metadata.name MUST equal the import server_id and tenant_id MUST
+    equal the install tenant (transaction consistency rule).
+    """
+    return f"""\
+apiVersion: yashigani.io/v1alpha1
+kind: AgentIntegration
+metadata:
+  name: cloud9-demo
+  tenant_id: {tenant_id}
+  category: mcp_server
+  description: Purpose-built demo MCP server (cloud-9 rogue-tool demo)
+  vendor: Agnostic Security
+  licence: proprietary
+spec:
+  image:
+    repository: yashigani/demo-mcp
+    tag: "3.0.0"
+    digest: {image_digest}
+  write_posture: readonly
+  subprocess:
+    command: ["python3", "server.py"]
+    args: []
+  network:
+    egress_allow: []
+  mcp:
+    posture: mcp-b
+    transport: stdio
+    session_mode: persistent
+    identity_propagation: gateway-enforced-only
+    exposes:
+      listen_port: null
+      shim_port: 8000
+      tools:
+        - {{name: echo, allowed: true, sensitivity_class: PUBLIC}}
+        - {{name: add, allowed: true, sensitivity_class: PUBLIC}}
+        - {{name: uppercase, allowed: true, sensitivity_class: PUBLIC}}
+        - {{name: word_count, allowed: true, sensitivity_class: PUBLIC}}
+        - {{name: current_time, allowed: true, sensitivity_class: PUBLIC}}
+  audit:
+    sensitivity_ceiling: PUBLIC
+  storage:
+    mounts: []
+    tmpfs:
+      - {{path: /tmp, size_limit: 16m}}
+  secrets: []
+  lifecycle:
+    mode: persistent
+"""
+
+
 def step13c_mcp_import_ceremony() -> None:
     """
     4.0 — Seed the cloud-9 demo MCP's initial capability envelope via the governed
@@ -1711,6 +1794,15 @@ def step13c_mcp_import_ceremony() -> None:
     # Ensure step-up is fresh before the import (StepUpAdminSession required).
     _do_stepup_inline()
 
+    # v4.1 Phase 1c — ring_fenced imports run the atomic approve transaction
+    # (mint per-instance leaf → codegen the Caddy-front wrap → write artifacts
+    # → caddy reload → durable envelope).  The Shape-C manifest is required.
+    _tenant = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+    _digest = _demo_mcp_image_digest()
+    if not _digest:
+        print("  WARN: could not resolve yashigani/demo-mcp:3.0.0 digest — the")
+        print("        approve transaction will 422 on M6. Set YASHIGANI_DEMO_MCP_DIGEST.")
+
     r = S.post(
         f"{BASE_URL}/admin/mcp/servers/import",
         json={
@@ -1719,6 +1811,7 @@ def step13c_mcp_import_ceremony() -> None:
             "topology": "ring_fenced",
             "egress_posture": "NONE",
             "display_name": "Cloud-9 Demo MCP",
+            "manifest_yaml": _demo_mcp_manifest_yaml(_tenant, _digest),
         },
     )
 
@@ -1738,6 +1831,14 @@ def step13c_mcp_import_ceremony() -> None:
     elif r.status_code == 403 and "step_up_required" in r.text:
         print("  FAIL: step-up TOTP expired before import — retry the script.")
         print(f"        {r.text[:200]}")
+    elif r.status_code in (502, 503) and "onboard_transaction_failed" in r.text:
+        # v4.1 Phase 1c: transaction rolled back fail-closed. On stacks built
+        # before the Phase-3 rebuild the artifact-root / caddy-admin-socket
+        # wiring is absent — expected until Su/Captain land the mounts.
+        print("  PENDING: approve transaction failed CLOSED and rolled back")
+        print("           (Phase-3 stack wiring required: YASHIGANI_MCP_ARTIFACT_ROOT")
+        print("            + shared caddy admin socket + Caddyfile mount).")
+        print(f"           Detail: {r.text[:300]}")
     else:
         print(f"  FAIL: import ceremony returned HTTP {r.status_code}: {r.text[:400]}")
 

@@ -186,6 +186,18 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
+                "shim_port": {
+                  "type": "integer",
+                  "minimum": 1024,
+                  "maximum": 49151,
+                  "description": "v4.1 Phase 1b-i: port of the first-party Streamable-HTTP shim on the MCP's ringfence bridge (the wrap's reverse_proxy upstream). Bridge-local only - never published."
+                },
+                "mesh_port": {
+                  "type": "integer",
+                  "minimum": 9500,
+                  "maximum": 9899,
+                  "description": "v4.1 Phase 1b-i: pinned Caddy mesh-listener port for this MCP's per-instance front. Optional - defaults to the deterministic 9500 + sha256(tenant/name) % 400 assignment (codegen _mcp_mesh_port)."
+                },
                 "listen_port": {
                   "description": "Port the agent exposes for MCP (mcp-b/mcp-c HTTP only). null for stdio shape (Shape-C has no network listener).",
                   "oneOf": [
