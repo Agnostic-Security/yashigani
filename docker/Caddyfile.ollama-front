@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ollama inference-plane Caddy front — v4.1 Phase 1b-ii (LAURA-I1-01 close)
+# Last updated: 2026-07-05
+#
+# SINGLE SOURCE. This file is imported (top-level) by every Caddyfile variant
+#   docker/Caddyfile.{selfsigned,ca,acme}   via  import /etc/caddy/Caddyfile.ollama-front
+# and rendered byte-identically into the Helm caddy ConfigMap
+#   helm/yashigani/templates/caddy-ollama-front-configmap.yaml
+# — no compose/helm drift (Iris parity rule).
+#
+# WHY (LAURA-I1-01, High/Bypass, proven live): the Ollama inference plane bound
+# :11434 unauthenticated on the shared `data` bridge — any peer drove the LLM
+# directly with zero gateway budget/OPA/PII/audit. Fix: Ollama leaves `data`,
+# joins a dedicated ringfence bridge (internal:true) whose ONLY other member is
+# Caddy. Ollama has no non-loopback listener reachable except through this
+# Caddy front (Caddy IS the auth perimeter — we front Ollama, we do NOT enable
+# Ollama's own auth). Mesh clients (gateway, backoffice) dial
+#   https://caddy:11435/ollama/...   presenting their per-service mesh leaf.
+# Caddy require_and_verify-gates the caller against the internal intermediate
+# CA, forwards the verified SPIFFE identity, and reverse-proxies to Ollama on
+# the ringfence bridge. A caller with no valid mesh cert is refused at the TLS
+# handshake — the L3 side-door Laura proved is closed.
+#
+# Mirrors the proven :8444/:8445 mesh-listener pattern (Caddyfile.selfsigned).
+# Port 11435 (front) is distinct from Ollama's own 11434 and from the codegen
+# MCP mesh-port range 9500-9900; never host-mapped (no compose `ports:` entry).
+# ─────────────────────────────────────────────────────────────────────────────
+:11435 {
+    tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+            mode require_and_verify
+            trust_pool file /run/secrets/ca_intermediate.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+    }
+
+    handle_path /ollama/* {
+        # Zero-trust header discipline (EX-231-08): strip any inbound value,
+        # then set X-SPIFFE-ID from the VERIFIED peer cert's first URI SAN.
+        # Only Caddy sets this header; a co-located bridge peer cannot forge it.
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+
+        # Upstream: Ollama on the ringfence bridge (internal:true; Caddy is the
+        # only other member). Plain HTTP by design — Ollama has no TLS
+        # (mtls_capable:false); the identity boundary is the mesh mTLS Caddy
+        # verifies above, not Ollama-level TLS. Long write timeout: model
+        # cold-load / generate can exceed the default (WARMUP-001 rationale).
+        reverse_proxy http://ollama:11434 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            transport http {
+                read_timeout 300s
+                write_timeout 300s
+            }
+        }
+    }
+
+    # Default-deny: nothing else is served on this listener.
+    handle {
+        respond "Not Found" 404
+    }
+}

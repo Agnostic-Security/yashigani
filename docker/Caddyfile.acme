@@ -780,4 +780,8 @@ http://{$YASHIGANI_TLS_DOMAIN} {
 #
 # NEVER regenerate the Caddyfile monolith — agent routes live in snippets only.
 # ─────────────────────────────────────────────────────────────────────────────
+# v4.1 Phase 1b-ii (LAURA-I1-01): Ollama inference-plane mesh front (:11435).
+# Single-source snippet, byte-identical to the Helm caddy ConfigMap render.
+import /etc/caddy/Caddyfile.ollama-front
+
 import /etc/caddy/agents/*.caddy

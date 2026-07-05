@@ -181,13 +181,16 @@ spec:
       ports:
         - protocol: TCP
           port: {{ if .Values.mtls.enabled }}6380{{ else }}6379{{ end }}
+    # v4.1 Phase 1b-ii (LAURA-I1-01): gateway no longer reaches Ollama directly.
+    # It dials the Caddy :11435 mesh front (mesh mTLS) which proxies to Ollama on
+    # the ringfence. Egress target flipped ollama:11434 -> caddy:11435.
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: yashigani-ollama
+              app.kubernetes.io/name: yashigani-caddy
       ports:
         - protocol: TCP
-          port: 11434
+          port: 11435
     - to:
         - podSelector:
             matchLabels:
@@ -384,13 +387,15 @@ spec:
       ports:
         - protocol: TCP
           port: {{ if .Values.mtls.enabled }}6380{{ else }}6379{{ end }}
+    # v4.1 Phase 1b-ii (LAURA-I1-01): backoffice reaches Ollama via the Caddy
+    # :11435 mesh front (mesh mTLS), not ollama:11434 directly.
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: yashigani-ollama
+              app.kubernetes.io/name: yashigani-caddy
       ports:
         - protocol: TCP
-          port: 11434
+          port: 11435
     - to:
         - podSelector:
             matchLabels:
@@ -511,7 +516,10 @@ spec:
           port: {{ if .Values.mtls.enabled }}6380{{ else }}6379{{ end }}
 
 ---
-# Ollama — accept ingress from gateway, backoffice, and ollama-init Job pod
+# Ollama — v4.1 Phase 1b-ii (LAURA-I1-01): accept ingress ONLY from the Caddy
+# pod (the :11435 mesh front) and the ollama-init Job pod. The gateway/backoffice
+# gateway->ollama:11434 direct paths are REMOVED — they were the L3 side-door
+# Laura proved. All runtime inference now traverses the Caddy mesh front.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -526,13 +534,12 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # Only the Caddy front may reach Ollama's :11434 (K8s parity with the
+    # compose ollama_ringfence bridge — Caddy is the sole peer).
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: yashigani-gateway
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: yashigani-backoffice
+              app.kubernetes.io/name: yashigani-caddy
       ports:
         - protocol: TCP
           port: 11434
@@ -1492,6 +1499,21 @@ spec:
         - protocol: TCP
           port: {{ .Values.caddy.internalMetricsListenerBackoffice.port }}
     {{- end }}
+    {{- if .Values.ollama.enabled }}
+    # v4.1 Phase 1b-ii (LAURA-I1-01): gateway + backoffice dial the Ollama mesh
+    # front (:11435). This is the ONLY ingress path to Ollama; the direct
+    # gateway/backoffice -> ollama:11434 rules were removed (allow-ollama-ingress).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-backoffice
+      ports:
+        - protocol: TCP
+          port: 11435
+    {{- end }}
 
 ---
 # Caddy egress — Caddy is the K8s public TLS edge (Option B parity with
@@ -1565,6 +1587,17 @@ spec:
       ports:
         - protocol: TCP
           port: 9090
+    {{- end }}
+    {{- if .Values.ollama.enabled }}
+    # v4.1 Phase 1b-ii (LAURA-I1-01): Caddy :11435 mesh front proxies to Ollama.
+    # Caddy is the sole pod permitted to reach Ollama's :11434 (allow-ollama-ingress).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-ollama
+      ports:
+        - protocol: TCP
+          port: 11434
     {{- end }}
 
 {{- if .Values.mtls.enabled }}

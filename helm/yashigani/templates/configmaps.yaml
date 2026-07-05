@@ -880,6 +880,48 @@ data:
       }
     }
     {{- end }}
+    {{- if .Values.ollama.enabled }}
+    # ─────────────────────────────────────────────────────────────────────────
+    # v4.1 Phase 1b-ii (LAURA-I1-01) — Ollama inference-plane mesh front (:11435)
+    # K8s parity for docker/Caddyfile.ollama-front. Per retro #81-b this Helm
+    # ConfigMap Caddyfile is a hand-coded K8s variant (yashigani-ollama service
+    # name, ca_bundle.crt trust anchor) — the compose snippet is the design
+    # single-source; this block is the K8s render of the same front.
+    #
+    # WHY: Ollama's :11434 must be reachable ONLY through a mesh-mTLS Caddy front.
+    # The K8s NetworkPolicy (allow-ollama-ingress) is flipped to admit ONLY the
+    # Caddy pod on :11434 — the gateway/backoffice reach Ollama exclusively via
+    # this listener presenting their mesh leaf. Closes the LAURA-I1-01 L3 bypass.
+    # ─────────────────────────────────────────────────────────────────────────
+    :11435 {
+      tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+          mode require_and_verify
+          trust_pool file /run/secrets/ca_bundle.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+      }
+      handle_path /ollama/* {
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        # Ollama has no TLS (mtls_capable:false) — plain HTTP upstream. The
+        # identity boundary is the mesh mTLS Caddy verifies above.
+        reverse_proxy http://yashigani-ollama:11434 {
+          header_up X-Forwarded-Proto https
+          header_up X-Real-IP {remote_host}
+          transport http {
+            read_timeout 300s
+            write_timeout 300s
+          }
+        }
+      }
+      handle {
+        respond "Not Found" 404
+      }
+    }
+    {{- end }}
     # ─────────────────────────────────────────────────────────────────────────
     # S4 — Agent import sentinel (P1 W3 Phase 2a)
     # Last updated: 2026-05-29T00:00:00+00:00

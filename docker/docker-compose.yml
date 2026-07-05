@@ -233,6 +233,10 @@ services:
       # and used inside the site block with:
       #   import csp-policies
       - ./Caddyfile.csp:/etc/caddy/Caddyfile.csp:ro
+      # v4.1 Phase 1b-ii (LAURA-I1-01): Ollama inference-plane mesh front (:11435).
+      # Single-source snippet imported (top-level) by every Caddyfile variant and
+      # rendered byte-identically into the Helm caddy ConfigMap. Read-only.
+      - ./Caddyfile.ollama-front:/etc/caddy/Caddyfile.ollama-front:ro
       - caddy_data:/data
       - caddy_config:/config
       - ./tls:/etc/caddy/tls:ro    # only used in ca mode
@@ -306,6 +310,10 @@ services:
       - edge
       - caddy_internal
       - obs
+      # v4.1 Phase 1b-ii (LAURA-I1-01): Caddy is the ONLY other member of the
+      # Ollama ringfence bridge. Sole path to Ollama's :11434 is the :11435
+      # mesh front above → ringfence → ollama. No shared-bridge L3 side-door.
+      - ollama_ringfence
 
   # ---------------------------------------------------------------------------
   # Gateway — MCP reverse proxy (data plane)
@@ -341,7 +349,14 @@ services:
       # Without this, _opa.py AsyncClient → [SSL: CERTIFICATE_VERIFY_FAILED] →
       # opa_unreachable → tools/call fail-closed deny.
       YASHIGANI_CA_CERT: /run/secrets/ca_root.crt
-      OLLAMA_BASE_URL: http://ollama:11434  # Ollama has no TLS; internal bridge-only + bearer token (honest gap, tracked in manifest as mtls_capable: false)
+      # v4.1 Phase 1b-ii (LAURA-I1-01): Ollama is now reachable ONLY via the Caddy
+      # :11435 mesh front (require_and_verify). The gateway dials the front over
+      # mesh mTLS presenting its per-service leaf.
+      # SEAM (Tom, Issue-1): the Ollama httpx client must switch from a plain
+      # AsyncClient to internal_httpx_client() (mesh identity) so it presents
+      # gateway_client.crt/key to Caddy — same client the OPA path already uses.
+      # Until that lands the front 401s at the TLS handshake (fail-closed, correct).
+      OLLAMA_BASE_URL: https://caddy:11435/ollama
       REDIS_HOST: redis
       REDIS_PORT: "6380"                     # TLS-only port
       REDIS_USE_TLS: "true"
@@ -698,14 +713,16 @@ services:
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
       # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
       # Backoffice MCP import screening uses the same Ollama-backed semantic-intent
-      # classifier as the gateway. Backoffice is on the `data` network and reaches
-      # ollama:11434 directly (same OLLAMA_BASE_URL default). Default ON.
+      # classifier as the gateway. Default ON.
       # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
       YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
-      # Ollama base URL for the semantic-intent sidecar (YSG-RISK-076).
-      # Explicit here so Tom's backoffice startup code has a reliable env var.
-      # Default matches the gateway OLLAMA_BASE_URL (same service on data network).
-      OLLAMA_BASE_URL: http://ollama:11434
+      # v4.1 Phase 1b-ii (LAURA-I1-01): Ollama reachable ONLY via the Caddy :11435
+      # mesh front. Backoffice reaches it through Caddy on caddy_internal (already a
+      # member); it no longer dials ollama:11434 directly on `data`.
+      # SEAM (Tom, Issue-1): backoffice semantic-intent client must present its mesh
+      # leaf (internal_httpx_client / backoffice_client.crt) to the front — same as
+      # the gateway change above. Front fails closed at the handshake until it does.
+      OLLAMA_BASE_URL: https://caddy:11435/ollama
       # Extractor sandbox — Design A (LAURA-30-001 / YSG-RISK-080 fix, 2026-06-16).
       # Backoffice calls the pre-spawned extractor-svc container over plain HTTP.
       # NO docker socket, NO socket-proxy, NO container API access in backoffice.
@@ -1152,8 +1169,12 @@ services:
     # self-contained `ollama serve` in its own edge-attached container, writes
     # models to the shared ollama_data volume, and exits before this service starts.
     # Long-running ollama has zero internet egress post-install. cap_drop:[ALL]
-    # and no NET_ADMIN (L2 posture unchanged). EX-231-10: gateway/backoffice reach
-    # ollama on `data`; no edge attachment needed at runtime.
+    # and no NET_ADMIN (L2 posture unchanged).
+    # v4.1 Phase 1b-ii (LAURA-I1-01, High/Bypass close): Ollama leaves the shared
+    # `data` bridge and joins ONLY `ollama_ringfence` (internal:true; Caddy is the
+    # sole other member). Its :11434 listener is no longer L3-reachable by any
+    # `data`-net peer. Mesh clients (gateway/backoffice) reach Ollama exclusively
+    # via the Caddy :11435 mesh front (require_and_verify), never directly.
     depends_on:
       ollama-init:
         # required:false — ollama-init is profile-gated [openwebui,langflow,letta,
@@ -1165,7 +1186,9 @@ services:
         condition: service_completed_successfully
         required: false
     networks:
-      - data
+      # v4.1 Phase 1b-ii (LAURA-I1-01): ringfence bridge ONLY — Caddy is the sole
+      # peer. Ollama is unreachable except through the Caddy :11435 mesh front.
+      - ollama_ringfence
     # Uncomment for NVIDIA GPU:
     # deploy:
     #   resources:
@@ -3022,6 +3045,16 @@ networks:
   # on top of the extractor service's own egress=none design: no outbound at all).
   # IPv6 disabled consistent with all other internal bridges (Tiago 2026-05-26).
   extractor_svc:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  # v4.1 Phase 1b-ii (LAURA-I1-01): Ollama inference-plane ringfence.
+  # Members: ollama + caddy ONLY. internal:true — no host-external egress and
+  # (crucially) no shared-bridge L3 path to Ollama's :11434. The sole ingress to
+  # Ollama is the Caddy :11435 mesh front (require_and_verify). This is the
+  # "no component on a shared bridge with a non-loopback listener except behind
+  # Caddy" invariant applied to the LLM plane.
+  ollama_ringfence:
     driver: bridge
     enable_ipv6: false
     internal: true
