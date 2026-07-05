@@ -1159,7 +1159,7 @@ def mint_agent_leaf(
     spiffe_id = agent_spiffe_uri(tenant_id, agent_name)
     synthetic_identity = ServiceIdentity(
         name=f"agent_{tenant_id}_{agent_name}",
-        dns_sans=[],
+        dns_sans=(),
         purpose="agent-identity",
         mtls_capable=True,
         bootstrap_token_sha256="",
@@ -1167,12 +1167,14 @@ def mint_agent_leaf(
         spiffe_id=spiffe_id,
     )
 
+    # BUG-A (v4.1 Phase 0): args must match build_leaf(service, intermediate_cert,
+    # intermediate_key, policy, lifetime_days=...) — see build_leaf def above.
     leaf_cert, leaf_key = build_leaf(
+        synthetic_identity,
         intermediate_cert,
         intermediate_key,
-        synthetic_identity,
         policy,
-        leaf_lifetime_days=lifetime,
+        lifetime_days=lifetime,
     )
 
     # Write cert+key.  Use agent_cert/agent_key path helpers (separate namespace from

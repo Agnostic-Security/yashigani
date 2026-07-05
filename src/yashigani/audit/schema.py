@@ -381,6 +381,10 @@ class EventType(str, Enum):
     NHI_SCOPE_INTERSECTED = "NHI_SCOPE_INTERSECTED"
     NHI_INSTANTIATION_DENIED = "NHI_INSTANTIATION_DENIED"
     NHI_SVID_APPROVED = "NHI_SVID_APPROVED"
+    # BUG-A (v4.1 Phase 0) — approval endpoint fail-closed path: PKI leaf mint
+    # failed, svid_issued was NOT set, admin got a 502. Governance-relevant
+    # (an approval attempt that did NOT result in an issued identity).
+    NHI_SVID_ISSUANCE_FAILED = "NHI_SVID_ISSUANCE_FAILED"
     # NHI invocation (per-hop OPA decisions)
     NHI_INVOCATION_ALLOWED = "NHI_INVOCATION_ALLOWED"
     NHI_INVOCATION_DENIED = "NHI_INVOCATION_DENIED"
@@ -3492,6 +3496,28 @@ class NhiSvidApprovedEvent(AuditEvent):
     nhi_id: str = ""
     spiffe_id: str = ""
     step_up_verified: bool = True
+
+
+@dataclass
+class NhiSvidIssuanceFailedEvent(AuditEvent):
+    """PKI leaf mint FAILED during NHI SVID approval (fail-closed path, BUG-A v4.1).
+
+    Emitted by the approval endpoint when mint_agent_leaf() raises. The registry
+    flag ``svid_issued`` is NOT set (approval is aborted with a 502) — a registry
+    entry must never claim an issued SVID with no cert on disk.
+
+    error_type: exception class name from the mint failure (no message payload —
+                paths/errors may leak filesystem layout; the full error goes to
+                app logs only).
+    """
+
+    event_type: str = EventType.NHI_SVID_ISSUANCE_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    nhi_id: str = ""
+    spiffe_id: str = ""
+    error_type: str = ""
 
 
 @dataclass

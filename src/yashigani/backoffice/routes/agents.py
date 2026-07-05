@@ -937,16 +937,16 @@ async def list_identities(
 #
 # Requires StepUpAdminSession (ASVS V6.8.4 — step-up TOTP for high-value ops).
 #
-# Flow:
+# Flow (BUG-A v4.1 Phase 0 — mint BEFORE approve, fail-closed):
 #   1. Validate nhi_id refers to a registered NHI (kind="nhi").
-#   2. Call registry.approve_svid(nhi_id) — sets svid_issued=1, adds to active index.
-#   3. Call mint_agent_leaf() to issue the PKI leaf cert (internal-CA mode).
-#      Best-effort: PKI issuance failure logs loudly but does NOT roll back the
-#      registry approval — the operator can re-trigger PKI via pki_v1 rotate.
+#   2. Call mint_agent_leaf() to issue the PKI leaf cert (internal-CA mode).
+#      Fail-closed: mint failure → NhiSvidIssuanceFailedEvent audit + 502;
+#      svid_issued is NOT set and the NHI stays NHI_PENDING_APPROVAL.
+#   3. Call registry.approve_svid(nhi_id) — sets svid_issued=1, adds to active index.
 #   4. Emit NhiSvidApprovedEvent to the tamper-evident audit hash-chain.
 #   5. Return {nhi_id, spiffe_id, approved: True}.
 #
-# Fail-closed: unknown nhi_id or non-NHI kind → 404.
+# Fail-closed: unknown nhi_id or non-NHI kind → 404; PKI mint failure → 502.
 # ---------------------------------------------------------------------------
 
 
@@ -957,9 +957,12 @@ async def approve_nhi_svid(
 ):
     """Admin-approve an NHI SVID (step-up required, RISK-097).
 
-    Transitions svid_issued=False → True in the agent registry so the NHI
+    Issues a PKI leaf cert for the NHI's SPIFFE identity FIRST, then
+    transitions svid_issued=False → True in the agent registry so the NHI
     can be resolved by the gateway (``_resolve_nhi_identity`` checks this flag).
-    Also issues a PKI leaf cert for the NHI's SPIFFE identity (best-effort).
+    Fail-closed: if the mint fails, svid_issued is NOT set, a
+    ``NhiSvidIssuanceFailedEvent`` is written to the audit chain, and the
+    request fails with 502 (BUG-A, v4.1 Phase 0).
 
     Without approval, the NHI cannot run — the gateway returns 403
     ``NHI_PENDING_APPROVAL`` on every invocation (fail-closed).
@@ -985,16 +988,11 @@ async def approve_nhi_svid(
             },
         )
 
-    # 2. Approve: set svid_issued=1 + add to active index
-    try:
-        registry.approve_svid(nhi_id)
-    except KeyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "nhi_not_found", "message": str(exc)},
-        )
-
-    # 3. PKI: mint agent leaf cert (best-effort — best_effort avoids rollback on PKI blip)
+    # 2. PKI: mint agent leaf cert FIRST (fail-closed — BUG-A, v4.1 Phase 0).
+    #    svid_issued is only ever set AFTER a real leaf cert exists on disk.
+    #    (registry.approve_svid docstring: "Called ... after the PKI leaf cert
+    #    is issued" — the previous best-effort order violated that contract and
+    #    left registries claiming issued SVIDs with no cert on disk.)
     spiffe_id: str = nhi.get("spiffe_id", "")
     try:
         from pathlib import Path
@@ -1025,13 +1023,49 @@ async def approve_nhi_svid(
             nhi_id, spiffe_id,
         )
     except Exception as exc:
-        # PKI issuance is best-effort at MVP: log loudly, don't roll back approval.
-        # The operator can re-issue via POST /admin/pki/rotate/<agent_name>.
+        # Fail-closed: the approval is ABORTED — svid_issued stays 0, the NHI
+        # remains NHI_PENDING_APPROVAL at the gateway. A registry that claims
+        # issued with no cert on disk is unacceptable (BUG-A, v4.1 Phase 0).
         logger.error(
-            "NHI approve: mint_agent_leaf FAILED for nhi_id=%s — registry is approved "
-            "but PKI leaf cert was NOT issued. Re-trigger via PKI rotate endpoint. "
+            "NHI approve: mint_agent_leaf FAILED for nhi_id=%s — approval aborted, "
+            "svid_issued NOT set (fail-closed). Fix the PKI issuer and re-approve. "
             "Error: %s",
             nhi_id, exc,
+        )
+        aw_fail = backoffice_state.audit_writer
+        if aw_fail is not None:
+            try:
+                from yashigani.audit.schema import NhiSvidIssuanceFailedEvent
+                aw_fail.write(NhiSvidIssuanceFailedEvent(
+                    approver_account=session.account_id,
+                    nhi_id=nhi_id,
+                    spiffe_id=spiffe_id,
+                    error_type=type(exc).__name__,
+                ))
+            except Exception as audit_exc:
+                logger.error(
+                    "NhiSvidIssuanceFailedEvent audit write failed (nhi_id=%s): %s",
+                    nhi_id, audit_exc,
+                )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "svid_issuance_failed",
+                "message": (
+                    "PKI leaf cert issuance failed — approval aborted (fail-closed). "
+                    "svid_issued was NOT set; the NHI remains pending. "
+                    "Check backoffice logs and re-approve once the PKI issuer is healthy."
+                ),
+            },
+        )
+
+    # 3. Approve: set svid_issued=1 + add to active index (mint succeeded above)
+    try:
+        registry.approve_svid(nhi_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "nhi_not_found", "message": str(exc)},
         )
 
     # 4. Audit: emit NhiSvidApprovedEvent to the tamper-evident hash-chain
