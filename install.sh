@@ -9530,6 +9530,31 @@ generate_secrets() {
       echo "OPENCLAW_GATEWAY_TOKEN=${openclaw_token}" >> "$env_file"
     fi
 
+    # v4.1 Phase 1c (LAURA-I1-03): openclaw egress-gateway flag.
+    # When the openclaw profile is enabled, caddy-entrypoint.sh must allowlist
+    # the three fixed egress upstreams (slack.com / hooks.slack.com /
+    # api.telegram.org — see docker/Caddyfile.openclaw-egress) in its iptables
+    # OUTPUT layer. Probe BOTH COMPOSE_PROFILES and AGENT_BUNDLES — the
+    # non-interactive --agent-bundles value is only pushed into
+    # COMPOSE_PROFILES at step 8, which can be after this function runs (same
+    # dual-probe as the optional-services summary panel). Default stays "0"
+    # (fail-closed: Slack/Telegram hosts NOT allowlisted).
+    # Idempotent: sed-replace on re-run so a profile change is reflected.
+    local _openclaw_egress="0"
+    local _oc_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
+      _openclaw_egress="1"
+    elif [[ "$_oc_ab" == *",openclaw,"* || "$_oc_ab" == *",all,"* ]]; then
+      _openclaw_egress="1"
+    fi
+    if grep -q "^YASHIGANI_OPENCLAW_EGRESS=" "$env_file" 2>/dev/null; then
+      local tmp_env_oc; tmp_env_oc="$(mktemp)"
+      sed "s|^YASHIGANI_OPENCLAW_EGRESS=.*|YASHIGANI_OPENCLAW_EGRESS=${_openclaw_egress}|" "$env_file" > "$tmp_env_oc"
+      mv "$tmp_env_oc" "$env_file"
+    else
+      echo "YASHIGANI_OPENCLAW_EGRESS=${_openclaw_egress}" >> "$env_file"
+    fi
+
     # Generate credentials for NEW services added since last install
     # This handles upgrades where new components (e.g., Wazuh) need passwords
     local _new_creds_generated=false

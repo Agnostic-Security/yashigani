@@ -50,6 +50,15 @@
 #      Encrypt OCSP; only in acme mode). Caddy auto-staples OCSP.
 #   6. ESTABLISHED/RELATED — return traffic for inbound client connections on
 #      :80/:443 (these are response packets, not new connections)
+#   7. openclaw egress-gateway upstreams (v4.1 Phase 1c, LAURA-I1-03) —
+#      slack.com:443, hooks.slack.com:443, api.telegram.org:443 — ONLY when
+#      YASHIGANI_OPENCLAW_EGRESS=1 (install.sh sets it iff the openclaw
+#      profile is enabled). These mirror the fixed reverse_proxy upstreams in
+#      Caddyfile.openclaw-egress (the PRIMARY control; this iptables layer is
+#      defence in depth). Known limitation, same class as the ACME hosts:
+#      IPs are resolved once at container start — if the provider rotates
+#      DNS, blocked egress logs under CADDY_EGRESS_BLOCKED_V4 and a container
+#      restart refreshes the rules.
 #   Operators may extend the ACME list via YASHIGANI_CADDY_EGRESS_ALLOWLIST env.
 #
 # DESIGN NOTES
@@ -242,6 +251,26 @@ apply_egress_rules() {
         else
             full_allowlist="${full_allowlist} ${extra_space}"
         fi
+    fi
+
+    # ── Step 6b: openclaw egress-gateway upstreams (v4.1 Phase 1c) ─────────
+    # LAURA-I1-03: the :18790 fixed-upstream egress gateway
+    # (Caddyfile.openclaw-egress) reverse_proxies to exactly these three
+    # FQDNs. Mirror them here so the iptables OUTPUT layer and the Caddyfile
+    # allowlist agree (defence in depth — the Caddyfile literals are the
+    # primary, destination-shaped control). Gated on the flag install.sh
+    # writes iff the openclaw profile is enabled; any value other than the
+    # literal "1" keeps these hosts BLOCKED (fail-closed default).
+    OPENCLAW_EGRESS_HOSTS="slack.com:443 hooks.slack.com:443 api.telegram.org:443"
+    if [ "${YASHIGANI_OPENCLAW_EGRESS:-0}" = "1" ]; then
+        if [ -z "$full_allowlist" ]; then
+            full_allowlist="${OPENCLAW_EGRESS_HOSTS}"
+        else
+            full_allowlist="${full_allowlist} ${OPENCLAW_EGRESS_HOSTS}"
+        fi
+        log "openclaw egress gateway enabled — allowlisting: ${OPENCLAW_EGRESS_HOSTS}"
+    else
+        log "openclaw egress gateway disabled (YASHIGANI_OPENCLAW_EGRESS != 1) — Slack/Telegram hosts NOT allowlisted."
     fi
     # If nothing to allowlist (non-acme + no operator extras), skip the loop —
     # iptables policy DROP is already in effect (LOG + DROP appended below).

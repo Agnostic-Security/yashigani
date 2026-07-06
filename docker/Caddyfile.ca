@@ -61,6 +61,11 @@
 # Defines (csp-policies) named snippet; used via `import csp-policies` in site block.
 import /etc/caddy/Caddyfile.csp
 
+# openclaw inbound-webhook snippet — defines (openclaw-webhooks); pulled into
+# the :443 site block below via `import openclaw-webhooks`. Single source:
+# docker/Caddyfile.openclaw-webhooks (v4.1 Phase 1c, LAURA-I1-03 / FP-05).
+import /etc/caddy/Caddyfile.openclaw-webhooks
+
 # ─── Internal mTLS snippet (imported by every upstream block that targets a
 #     service terminating mTLS: gateway:8080, backoffice:8443). ─────────────
 (internal-mtls) {
@@ -231,6 +236,12 @@ import /etc/caddy/Caddyfile.csp
     request_body {
         max_size 10MB
     }
+
+    # ── openclaw inbound webhooks — /webhooks/{slack,telegram} (FP-05) ─────
+    # Exact POST paths only; forward_auth signature verify (fail-closed);
+    # replay/rate enforcement in the verifier; 1MB body cap; /webhooks/* 404
+    # default-deny. Single source: docker/Caddyfile.openclaw-webhooks.
+    import openclaw-webhooks
 
     # ── RFC 9116 security.txt — vulnerability disclosure ──────────────────
     handle /.well-known/security.txt {
@@ -749,5 +760,10 @@ http://{$YASHIGANI_TLS_DOMAIN} {
 # v4.1 Phase 1b-ii (LAURA-I1-01): Ollama inference-plane mesh front (:11435).
 # Single-source snippet, byte-identical to the Helm caddy ConfigMap render.
 import /etc/caddy/Caddyfile.ollama-front
+
+# v4.1 Phase 1c (LAURA-I1-03): openclaw egress gateway (:18790) — fixed-upstream
+# reverse_proxy allowlist (slack.com / hooks.slack.com / api.telegram.org),
+# mTLS-bound to openclaw's leaf SAN on the openclaw_ringfence bridge.
+import /etc/caddy/Caddyfile.openclaw-egress
 
 import /etc/caddy/agents/*.caddy

@@ -779,6 +779,60 @@ data:
           import inject-caddy-verified
         }
       }
+      {{- if .Values.agentBundles.openclaw.enabled }}
+      # ── openclaw inbound webhooks — /webhooks/{slack,telegram} ─────────────
+      # v4.1 Phase 1c (LAURA-I1-03 / FP-05). K8s render of the single-source
+      # docker/Caddyfile.openclaw-webhooks (yashigani-* service names; see the
+      # compose snippet for the full design rationale AND the
+      # /auth/verify-webhook contract). Exact POST paths only; forward_auth
+      # signature verify fails closed (any non-2xx from the verifier = deny);
+      # replay dedupe + rate-limit live in the verifier; 1MB body cap;
+      # /webhooks/* falls through to 404 — openclaw's wider :18789 surface is
+      # never published.
+      handle /webhooks/slack {
+        route {
+          @not_post not method POST
+          respond @not_post "Method Not Allowed" 405
+          request_body {
+            max_size 1MB
+          }
+          forward_auth https://yashigani-backoffice:8443 {
+            {{- if .Values.mtls.enabled }}
+            import internal-mtls-backoffice
+            {{- end }}
+            import inject-caddy-verified
+            uri /auth/verify-webhook?provider=slack
+          }
+          reverse_proxy http://yashigani-openclaw:18789 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+          }
+        }
+      }
+      handle /webhooks/telegram {
+        route {
+          @not_post not method POST
+          respond @not_post "Method Not Allowed" 405
+          request_body {
+            max_size 1MB
+          }
+          forward_auth https://yashigani-backoffice:8443 {
+            {{- if .Values.mtls.enabled }}
+            import internal-mtls-backoffice
+            {{- end }}
+            import inject-caddy-verified
+            uri /auth/verify-webhook?provider=telegram
+          }
+          reverse_proxy http://yashigani-openclaw:18789 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+          }
+        }
+      }
+      handle /webhooks/* {
+        respond "Not Found" 404
+      }
+      {{- end }}
       # ── 4.0 catch-all — ui4 portal redirect + backoffice proxy ─────────────
       # OWUI removed in 4.0. / → /chat; unmatched paths → backoffice (ui4).
       # Backoffice owns its own session auth — no forward_auth needed here.
@@ -919,6 +973,90 @@ data:
       }
       handle {
         respond "Not Found" 404
+      }
+    }
+    {{- end }}
+    {{- if .Values.agentBundles.openclaw.enabled }}
+    # ─────────────────────────────────────────────────────────────────────────
+    # v4.1 Phase 1c (LAURA-I1-03) — openclaw egress gateway (:18790)
+    # K8s render of the single-source docker/Caddyfile.openclaw-egress (see the
+    # compose snippet for the full Laura threat-model rationale, FP-01..FP-07).
+    # Hand-coded K8s variant per retro #81-b: ca_bundle.crt trust anchor and a
+    # Helm-templated SPIFFE trust domain instead of the compose parse-time env.
+    #
+    # FIXED-UPSTREAM reverse_proxy — NOT a CONNECT/open proxy. The destination
+    # set is the three literals below; openclaw never supplies a host. Caller
+    # auth = require_and_verify against the internal CA PLUS an exact URI-SAN
+    # match on openclaw's leaf. Reachability to :18790 is additionally scoped
+    # to openclaw pods by allow-caddy-ingress (networkpolicy.yaml) — the K8s
+    # equivalent of the compose openclaw_ringfence 2-member bridge.
+    #
+    # HONEST ASYMMETRY vs compose: K8s NetworkPolicy cannot FQDN-pin Caddy's
+    # own outbound (yashigani-caddy-acme-egress already grants public :443);
+    # compose adds a per-IP iptables mirror in caddy-entrypoint.sh. On K8s the
+    # fixed upstreams in THIS block are the destination control.
+    # ─────────────────────────────────────────────────────────────────────────
+    (openclaw-egress-caller-gate) {
+      @caller_not_openclaw expression {http.request.tls.client.san.uris.0} != "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/openclaw"
+      respond @caller_not_openclaw "Forbidden" 403
+    }
+    :18790 {
+      tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+          mode require_and_verify
+          trust_pool file /run/secrets/ca_bundle.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+      }
+      request_body {
+        max_size 10MB
+      }
+      handle_path /slack/* {
+        route {
+          import openclaw-egress-caller-gate
+          reverse_proxy https://slack.com {
+            header_up Host slack.com
+            header_up -X-SPIFFE-ID
+            header_up -X-Caddy-Verified-Secret
+            transport http {
+              tls
+              tls_server_name slack.com
+            }
+          }
+        }
+      }
+      handle_path /slack-hooks/* {
+        route {
+          import openclaw-egress-caller-gate
+          reverse_proxy https://hooks.slack.com {
+            header_up Host hooks.slack.com
+            header_up -X-SPIFFE-ID
+            header_up -X-Caddy-Verified-Secret
+            transport http {
+              tls
+              tls_server_name hooks.slack.com
+            }
+          }
+        }
+      }
+      handle_path /telegram/* {
+        route {
+          import openclaw-egress-caller-gate
+          reverse_proxy https://api.telegram.org {
+            header_up Host api.telegram.org
+            header_up -X-SPIFFE-ID
+            header_up -X-Caddy-Verified-Secret
+            transport http {
+              tls
+              tls_server_name api.telegram.org
+            }
+          }
+        }
+      }
+      handle {
+        respond "Forbidden" 403
       }
     }
     {{- end }}

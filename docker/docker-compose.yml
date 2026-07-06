@@ -225,6 +225,19 @@ services:
       # install.sh derives YASHIGANI_SPIFFE_TRUST_DOMAIN per instance and writes it
       # to docker/.env; this composes the caddy id from it.
       YASHIGANI_CADDY_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/caddy
+      # v4.1 Phase 1c (LAURA-I1-03 / FP-03): the ONLY SPIFFE identity admitted
+      # by the :18790 openclaw egress gateway (Caddyfile.openclaw-egress
+      # caller-gate; parse-time env substitution). Composed from the
+      # per-instance trust domain — matches the URI SAN install.sh bakes into
+      # openclaw_client.crt (service_identities.yaml `openclaw` entry).
+      YASHIGANI_OPENCLAW_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/openclaw
+      # v4.1 Phase 1c (LAURA-I1-03): when "1" (install.sh sets it iff the
+      # openclaw profile is enabled), caddy-entrypoint.sh appends
+      # slack.com:443 hooks.slack.com:443 api.telegram.org:443 to the iptables
+      # OUTPUT allowlist — the container-level mirror of the fixed upstreams in
+      # Caddyfile.openclaw-egress (defence in depth; the Caddyfile literals are
+      # the primary control).
+      YASHIGANI_OPENCLAW_EGRESS: ${YASHIGANI_OPENCLAW_EGRESS:-0}
     volumes:
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
       # 4.0-phase1: shared CSP snippet (defines (csp-policies) named snippet).
@@ -237,6 +250,14 @@ services:
       # Single-source snippet imported (top-level) by every Caddyfile variant and
       # rendered byte-identically into the Helm caddy ConfigMap. Read-only.
       - ./Caddyfile.ollama-front:/etc/caddy/Caddyfile.ollama-front:ro
+      # v4.1 Phase 1c (LAURA-I1-03): openclaw egress gateway (:18790, fixed
+      # upstreams slack.com/hooks.slack.com/api.telegram.org, SAN-bound to the
+      # openclaw leaf) + inbound webhook routes (/webhooks/{slack,telegram},
+      # forward_auth signature verify). Single-source snippets imported
+      # (top-level) by every Caddyfile variant; Helm carries the hand-coded
+      # K8s render in configmaps.yaml. Read-only.
+      - ./Caddyfile.openclaw-egress:/etc/caddy/Caddyfile.openclaw-egress:ro
+      - ./Caddyfile.openclaw-webhooks:/etc/caddy/Caddyfile.openclaw-webhooks:ro
       - caddy_data:/data
       - caddy_config:/config
       - ./tls:/etc/caddy/tls:ro    # only used in ca mode
@@ -314,6 +335,11 @@ services:
       # Ollama ringfence bridge. Sole path to Ollama's :11434 is the :11435
       # mesh front above → ringfence → ollama. No shared-bridge L3 side-door.
       - ollama_ringfence
+      # v4.1 Phase 1c (LAURA-I1-03 / FP-03): dedicated 2-member bridge
+      # {caddy, openclaw}. Carries BOTH openclaw directions: outbound
+      # openclaw → caddy:18790 (egress gateway) and inbound webhook delivery
+      # caddy → openclaw:18789. No other container joins this bridge.
+      - openclaw_ringfence
 
   # ---------------------------------------------------------------------------
   # Gateway — MCP reverse proxy (data plane)
@@ -2487,14 +2513,14 @@ services:
     restart: unless-stopped
     mem_limit: ${YASHIGANI_OPENCLAW_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_OPENCLAW_CPU_LIMIT:-1.0}
-    ports:
-      # YSG-RISK-006 #3aw: loopback-bind only. OpenClaw is behind the gateway;
-      # external clients must never bypass the gateway to reach OpenClaw directly.
-      # Messaging channel webhooks reach OpenClaw via the host loopback (or a
-      # local nginx/Caddy reverse proxy) — not directly from the public internet.
-      # Gateway-to-OpenClaw traffic stays on the internal Docker bridge (no ports:
-      # entry needed for that path). CWE-668 — design decision: option A.
-      - "127.0.0.1:18789:18789"
+    # v4.1 Phase 1c (LAURA-I1-03 / FP-05): the 127.0.0.1:18789 host publish
+    # (YSG-RISK-006 option A) is REMOVED. All of openclaw's bridges are now
+    # internal:true — Docker cannot DNAT a host publish into internal-only
+    # networks, and inbound must arrive EXCLUSIVELY via the Caddy webhook
+    # routes (/webhooks/{slack,telegram} → signature verify → openclaw:18789
+    # over openclaw_ringfence). openclaw's :18789 stays bridge-local.
+    expose:
+      - "18789"
     # Captain Bucket-C NOTE: openclaw.json contains __YASHIGANI_INTERNAL_BEARER__
     # as a placeholder. Su's install.sh must substitute it with the real per-install
     # token from docker/secrets/yashigani_internal_bearer before starting this service.
@@ -2507,19 +2533,35 @@ services:
       OPENCLAW_DISABLE_CAMERA: "true"
       OPENCLAW_DISABLE_LOCATION: "true"
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
+      # v4.1 Phase 1c (LAURA-I1-03): trust anchor for the :18790 egress
+      # gateway's server cert (internal PKI). Standard Node.js extra-CA hook —
+      # applies to all of openclaw's outbound TLS.
+      NODE_EXTRA_CA_CERTS: /etc/openclaw/tls/ca.crt
     volumes:
       - openclaw_data:/home/node/.openclaw
       # YSG-BUG-2255-002: mount the runtime copy (bearer substituted by install.sh step 8f),
       # NOT the git-tracked placeholder. openclaw.runtime.json is written to WORK_DIR at
       # install time and is gitignored so the real token never enters VCS.
       - ./openclaw/openclaw.runtime.json:/etc/openclaw/openclaw.json:ro
+      # v4.1 Phase 1c (LAURA-I1-03 / FP-03): openclaw's OWN mesh leaf + public
+      # internal-CA cert, and NOTHING else — per-file binds, deliberately NOT
+      # the flat ./secrets dir (PROBE-AG1 blast-radius rule holds). The leaf
+      # (URI SAN spiffe://<td>/openclaw, minted by install.sh from
+      # service_identities.yaml; key 0600 uid 1000 per lib/pki_ownership.sh)
+      # is what openclaw presents to the :18790 egress gateway. If the
+      # openclaw build cannot present a client cert, egress fails CLOSED at
+      # the TLS handshake (correct posture — never bearer fallback).
+      - ./secrets/openclaw_client.crt:/etc/openclaw/tls/client.crt:ro
+      - ./secrets/openclaw_client.key:/etc/openclaw/tls/client.key:ro
+      - ./secrets/ca_root.crt:/etc/openclaw/tls/ca.crt:ro
     # PROBE-AG1 fix: NO /run/secrets mount at all for openclaw.
     # openclaw reads yashigani_internal_bearer via openclaw.runtime.json (install.sh
     # step 8f substitutes __YASHIGANI_INTERNAL_BEARER__ at install time — bearer is
     # baked into the runtime config). No runtime secret file reads required.
-    # caddy_internal_hmac and ALL PKI material are NOT accessible to openclaw containers.
-    # openclaw also joins `edge` (internet-facing for Slack/Telegram webhooks) — the
-    # absence of /run/secrets mount is the critical blast-radius reduction for PROBE-AG1.
+    # caddy_internal_hmac and ALL OTHER PKI material are NOT accessible to openclaw
+    # containers — only its own leaf + the public CA cert via the per-file binds
+    # above. (v4.1 Phase 1c: openclaw no longer joins `edge`; the PROBE-AG1
+    # blast-radius rule — no flat /run/secrets mount — still holds.)
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:18789/healthz 2>/dev/null || wget -qO- http://localhost:18789/healthz 2>/dev/null || exit 1"]
       interval: 15s
@@ -2542,13 +2584,26 @@ services:
     # YSG-RISK-055 UA-10 (v2.24.1): openclaw moves from `data` to
     # `openclaw_isolated`. Gateway joins openclaw_isolated for dispatch.
     # openclaw CANNOT resolve langflow or letta — they are on separate bridges.
-    # `edge` retained: openclaw needs internet egress for messaging channel
-    # webhooks (Slack, Telegram inbound POST to :18789). This was the original
-    # EX-231-10 rationale. openclaw_isolated is internal:true (no host-external
-    # DNS from that bridge); edge provides the internet path.
+    #
+    # v4.1 Phase 1c (LAURA-I1-03, High/Bypass, proven live): `edge` REMOVED.
+    # The old rationale ("openclaw needs internet egress for messaging
+    # channels", EX-231-10) built the exfil path Laura proved: internal:false
+    # bridge membership is bidirectional at L3, so "edge for webhooks" was
+    # arbitrary-internet egress for a container holding
+    # YASHIGANI_INTERNAL_BEARER. Now:
+    #   inbound  — internet → caddy:443 /webhooks/{slack,telegram}
+    #              (signature-verified, Caddyfile.openclaw-webhooks)
+    #              → openclaw:18789 over openclaw_ringfence.
+    #   outbound — openclaw → caddy:18790 egress gateway
+    #              (Caddyfile.openclaw-egress; fixed upstreams slack.com /
+    #              hooks.slack.com / api.telegram.org; SAN-bound to the
+    #              openclaw leaf) over openclaw_ringfence.
+    # Both bridges are internal:true — openclaw has NO internal:false NIC and
+    # no L3 route to the internet (enforced by
+    # tests/invariants/test_openclaw_egress_gateway.py).
     networks:
       - openclaw_isolated
-      - edge      # Port 18789 must be reachable by messaging channel webhooks
+      - openclaw_ringfence
     profiles:
       - openclaw
 
@@ -2885,15 +2940,17 @@ volumes:
 # the service(s) that actually need it. caddy_internal_hmac is NOT listed here because
 # no agent container needs it — it is passed to gateway/backoffice/caddy via .env only.
 #
-# openclaw has NO entry in this block — it needs zero secret file reads at runtime.
-# The bearer token is pre-substituted into openclaw.json by install.sh.
+# openclaw has NO entry in this block — the bearer token is pre-substituted into
+# openclaw.json by install.sh, and its mesh leaf (openclaw_client.{crt,key} +
+# ca_root.crt, v4.1 Phase 1c) arrives via narrow per-file bind-mounts on the
+# service, not named secrets and never the flat ./secrets dir.
 #
 # Most core services (gateway, backoffice, caddy, redis, postgres, pgbouncer, etc.)
 # continue to use the ./secrets:/run/secrets:ro bind-mount directly — those services
 # are first-party Python/Go workloads with constrained blast radius. The bind-mount
 # pattern is intentionally preserved for them; the named-secrets pattern is applied
-# to third-party agent containers that join the `edge` network (openclaw) or that
-# have broader blast-radius exposure.
+# to third-party agent containers with broader blast-radius exposure. (openclaw
+# left the `edge` network in v4.1 Phase 1c — LAURA-I1-03.)
 #
 # Secret files are generated by install.sh and stored in docker/secrets/.
 # To upgrade to a paid tier, replace docker/secrets/license_key with your .ysg content.
@@ -3055,6 +3112,17 @@ networks:
   # "no component on a shared bridge with a non-loopback listener except behind
   # Caddy" invariant applied to the LLM plane.
   ollama_ringfence:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  # v4.1 Phase 1c (LAURA-I1-03 / FP-03): openclaw ringfence.
+  # Members: openclaw + caddy ONLY. internal:true — no host-external routing.
+  # Carries both openclaw directions: openclaw → caddy:18790 (egress gateway,
+  # fixed-upstream allowlist, mTLS SAN-bound) and caddy → openclaw:18789
+  # (signature-verified webhook delivery). A dedicated 2-member bridge so the
+  # egress gateway can never become a shared relay (FP-03: a bridge-open
+  # egress proxy would be the I1-04 root cause reintroduced).
+  openclaw_ringfence:
     driver: bridge
     enable_ipv6: false
     internal: true

@@ -1405,30 +1405,26 @@ spec:
 # (High/Bypass). The namespace default-deny-egress policy (top of this file)
 # now covers openclaw with no exceptions on the K8s side.
 #
-# Docker/Podman vs K8s egress-enforcement asymmetry (documented per brief):
+# v4.1 Phase 1c RESOLUTION (Laura threat model GO-WITH-FIXES, no plugin):
+# the egress path is now the Caddy :18790 FIXED-UPSTREAM gateway
+# (configmaps.yaml; design source docker/Caddyfile.openclaw-egress) —
+# reverse_proxy to literal slack.com / hooks.slack.com / api.telegram.org,
+# mTLS-bound to openclaw's leaf SAN. NOT caddyserver/forwardproxy, NOT a
+# CONNECT proxy (FP-01 NO-GO condition). Compose parity landed in the same
+# change: openclaw left `edge` (docker-compose.yml); inbound is the
+# signature-verified /webhooks/* Caddy route; the parity gap below is CLOSED.
 #
-#   Docker/Podman:
-#     openclaw_isolated bridge is internal:true — no outbound route from that
-#     bridge alone. However, openclaw currently also joins `edge` (internal:false)
-#     in docker-compose.yml, which preserves internet egress on the compose side.
-#     Removing openclaw from `edge` is a customer-facing design fork: it breaks
-#     Slack/Telegram inbound webhooks (POST :18789) and outbound replies. That
-#     change is ON HOLD pending Tiago decision on the Caddy forward-proxy path
-#     (new Caddy plugin required; Laura threat model required before it ships).
-#     Compose enforcement is therefore PARTIAL until that decision lands.
+#   K8s enforcement notes (unchanged): NetworkPolicy is CNI-dependent
+#   (Calico/Cilium enforce; flannel silently no-ops). allow-openclaw-egress
+#   permits gateway dispatch :8080/:8081 + caddy :18790 (egress gateway) only.
 #
-#   K8s (this file):
-#     NetworkPolicy enforcement is CNI-dependent (Calico/Cilium enforce;
-#     flannel silently no-ops). With an enforcing CNI, removing this policy
-#     unconditionally closes the blanket internet egress. Only allow-openclaw-egress
-#     (below) permits egress: gateway dispatch :8080/:8081 only.
-#     openclaw's outbound messaging capability is intentionally degraded until the
-#     forward-proxy design decision resolves. Fail-closed.
-#
-#   Runtime parity gap: Docker openclaw still has `edge`; K8s openclaw does not.
-#   Resolution is the Tiago forward-proxy decision (Caddy plugin + Laura TM).
-#
-# PENDING: Tiago decision on Caddy egress-proxy + allowlist for Slack/Telegram.
+#   Residual honest asymmetry: compose mirrors the three egress FQDNs as
+#   per-IP iptables rules in caddy-entrypoint.sh; K8s NetworkPolicy cannot
+#   FQDN-pin Caddy's own outbound (yashigani-caddy-acme-egress already grants
+#   public :443), so on K8s the Caddyfile fixed upstreams are the destination
+#   control. FP-06 residual (exfil to an attacker-OWNED Slack workspace /
+#   Telegram bot passes ANY host allowlist) is registered with Lu — Phase 2:
+#   token/workspace pinning + egress DLP + outbound rate/audit.
 
 ---
 # Caddy ingress — accept external client connections on :443 and :80.
@@ -1505,6 +1501,20 @@ spec:
       ports:
         - protocol: TCP
           port: 11435
+    {{- end }}
+    {{- if .Values.agentBundles.openclaw.enabled }}
+    # v4.1 Phase 1c (LAURA-I1-03 / FP-03): ONLY openclaw pods may dial the
+    # :18790 egress gateway — K8s equivalent of the compose openclaw_ringfence
+    # 2-member bridge. A bridge/namespace-open egress proxy would be a shared
+    # relay (I1-04 root cause reintroduced); this scoping plus the SAN match
+    # in the :18790 Caddyfile block prevents that.
+    - from:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "openclaw"
+      ports:
+        - protocol: TCP
+          port: 18790
     {{- end }}
 
 ---
@@ -1590,6 +1600,18 @@ spec:
       ports:
         - protocol: TCP
           port: 11434
+    {{- end }}
+    {{- if .Values.agentBundles.openclaw.enabled }}
+    # v4.1 Phase 1c (LAURA-I1-03 / FP-05): Caddy delivers signature-verified
+    # /webhooks/{slack,telegram} POSTs to openclaw:18789. Caddy joins gateway
+    # as a permitted ingress source on allow-openclaw-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: "openclaw"
+      ports:
+        - protocol: TCP
+          port: 18789
     {{- end }}
 
 {{- if .Values.mtls.enabled }}
@@ -1789,6 +1811,17 @@ spec:
       ports:
         - protocol: TCP
           port: 18789
+    # v4.1 Phase 1c (LAURA-I1-03 / FP-05): Caddy delivers the
+    # signature-verified /webhooks/{slack,telegram} POSTs. Exact-path routes
+    # only (configmaps.yaml) — openclaw's wider :18789 surface is never
+    # published even though the port is admitted here.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: 18789
 
 ---
 # v4.1 Phase 1b-ii (LAURA-I1-03): openclaw egress — gateway dispatch ONLY.
@@ -1800,9 +1833,10 @@ spec:
 # so :8081 is required. Without it, all openclaw LLM calls are dropped under
 # default-deny-egress. Council finding A4.
 #
-# Legitimate outbound (Slack/Telegram webhook replies) is PENDING Tiago decision
-# on the Caddy forward-proxy path. Until resolved, openclaw cannot send outbound
-# channel messages in K8s. Fail-closed is the correct posture.
+# v4.1 Phase 1c: outbound Slack/Telegram messaging restored THROUGH the Caddy
+# :18790 fixed-upstream egress gateway (LAURA GO-WITH-FIXES design; see the
+# tombstone comment above and configmaps.yaml). openclaw still has NO direct
+# internet egress — default-deny-egress covers everything not listed here.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -1827,6 +1861,16 @@ spec:
         # A4: mesh port for LLM dispatch
         - protocol: TCP
           port: 8081
+    # v4.1 Phase 1c (LAURA-I1-03 / FP-03): the ONLY outbound-messaging path —
+    # Caddy's :18790 egress gateway (fixed upstreams slack.com /
+    # hooks.slack.com / api.telegram.org; mTLS SAN-bound to openclaw's leaf).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: 18790
 {{- end }}
 
 

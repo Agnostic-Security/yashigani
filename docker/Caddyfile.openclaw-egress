@@ -1,0 +1,162 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# openclaw EGRESS GATEWAY — v4.1 Phase 1c (LAURA-I1-03 close, compose side)
+# Last updated: 2026-07-06
+#
+# SINGLE SOURCE. This file is imported (top-level) by every Caddyfile variant
+#   docker/Caddyfile.{selfsigned,ca,acme}   via  import /etc/caddy/Caddyfile.openclaw-egress
+# and rendered as a hand-coded K8s variant into the Helm caddy ConfigMap
+#   helm/yashigani/templates/configmaps.yaml (:18790 block, gated on
+#   .Values.agentBundles.openclaw.enabled) — no compose/helm drift (Iris parity
+#   rule; retro #81-b: helm render substitutes yashigani-* service names +
+#   ca_bundle.crt trust anchor; THIS file is the design source of truth).
+#
+# WHY (LAURA-I1-03, High/Bypass, proven live): openclaw was dual-homed on the
+# `edge` bridge (internal:false) with arbitrary internet egress while holding
+# YASHIGANI_INTERNAL_BEARER — a one-hop exfiltration path. Fix: openclaw leaves
+# `edge` entirely; its ONLY outbound path to the internet is THIS gateway.
+#
+# DESIGN (Laura threat model laura-forwardproxy-threatmodel.md, GO-WITH-FIXES):
+#   FP-01 — this is a FIXED-UPSTREAM reverse_proxy gateway, NOT a CONNECT/open
+#           forward proxy. The destination set is the three literal upstreams
+#           below. openclaw never supplies a destination host — the entire
+#           open-relay / SSRF / DNS-rebind / IP-literal / domain-fronting class
+#           has no input field to attack. caddyserver/forwardproxy is
+#           deliberately NOT used (NO-GO condition).
+#   FP-02 — the allowlist IS this file (perimeter-owned, single-source render).
+#           No destination host exists in openclaw.json / openclaw env — a
+#           compromised openclaw cannot rewrite its own destination set.
+#           Enforced by tests/invariants/test_openclaw_egress_gateway.py.
+#   FP-03 — caller auth = openclaw's per-instance mesh leaf. The listener
+#           requires_and_verifies a leaf from the internal intermediate CA AND
+#           each route hard-matches the URI SAN against openclaw's SPIFFE ID
+#           (parse-time env {$YASHIGANI_OPENCLAW_SPIFFE_ID}; compose composes it
+#           from the per-instance trust domain). Any other mesh peer — even one
+#           holding a valid leaf (e.g. gateway) — is refused 403. The listener
+#           additionally rides a dedicated 2-member bridge (openclaw_ringfence:
+#           openclaw + caddy ONLY, internal:true) so no other container can even
+#           dial :18790. NOT bearer-auth (FP-08: the baked bearer is exactly
+#           what an openclaw attacker holds).
+#   FP-04 — moot by construction: Caddy resolves the fixed hosts itself, dials
+#           :443 only, verifies the upstream cert against the system (public)
+#           CA pool [transport tls default], and pins SNI via tls_server_name.
+#   FP-07 — hooks.slack.com (Slack response_url callbacks) and api.telegram.org
+#           (bot API + /file/bot<token>/... downloads) are IN the allowlist as
+#           exact FQDNs (no wildcards), so those legitimate callbacks flow
+#           through THIS gateway — no second unfiltered egress path exists
+#           (openclaw has no other route to the internet at L3).
+#   FP-06 — RESIDUAL (registered with Lu, Phase 2): a host allowlist cannot
+#           stop exfil to an ATTACKER-OWNED Slack workspace / Telegram bot —
+#           both are legitimate slack.com / api.telegram.org destinations.
+#           Compensating controls owed in Phase 2: bot-token workspace/chat
+#           pinning, M4/DLP content filter on egress bodies, outbound
+#           rate-limiting, per-request audit. Do NOT treat this gateway as a
+#           data-loss control; it is a DESTINATION control.
+#
+# Defence in depth: caddy-entrypoint.sh mirrors these three FQDNs in the
+# container-level iptables OUTPUT allowlist (YASHIGANI_OPENCLAW_EGRESS=1,
+# set by install.sh when the openclaw profile is enabled). The Caddyfile
+# literals are the PRIMARY control; iptables is belt-and-suspenders.
+#
+# openclaw-side wiring (operator config, NOT the allowlist): openclaw's
+# Slack/Telegram channel API base URLs point at
+#   https://caddy:18790/slack        (Slack Web API  → slack.com)
+#   https://caddy:18790/slack-hooks  (response_url    → hooks.slack.com)
+#   https://caddy:18790/telegram     (Bot API + files → api.telegram.org)
+# presenting /etc/openclaw/tls/client.{crt,key} (its minted mesh leaf,
+# service_identities.yaml `openclaw`) and trusting /etc/openclaw/tls/ca.crt
+# (NODE_EXTRA_CA_CERTS). If openclaw cannot present a client certificate,
+# this gateway fails CLOSED (TLS handshake refused) — which is the correct
+# posture, never bearer-fallback.
+#
+# Port 18790 (front) is distinct from openclaw's own 18789, the Ollama front
+# 11435, the mesh listeners 8444/8445, and the codegen MCP mesh-port range
+# 9500-9900; never host-mapped (no compose `ports:` entry).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Caller gate — exact SPIFFE SAN match on the VERIFIED peer certificate.
+# require_and_verify (below) already guarantees the cert chains to the internal
+# intermediate CA; this snippet narrows "any mesh member" to "openclaw only".
+# Parse-time env substitution: if YASHIGANI_OPENCLAW_SPIFFE_ID is unset the
+# default literal applies; an empty substitution would fail CLOSED (no leaf
+# carries an empty URI SAN, so the != matcher fires and 403s everything).
+(openclaw-egress-caller-gate) {
+    @caller_not_openclaw expression {http.request.tls.client.san.uris.0} != "{$YASHIGANI_OPENCLAW_SPIFFE_ID:spiffe://yashigani.internal/openclaw}"
+    respond @caller_not_openclaw "Forbidden" 403
+}
+
+:18790 {
+    tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+            mode require_and_verify
+            trust_pool file /run/secrets/ca_intermediate.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+    }
+
+    # Outbound body cap — light exfil-volume brake (primary volume/DLP control
+    # is FP-06 Phase 2). Matches the public edge cap (OWASP ASVS 4.1.7).
+    request_body {
+        max_size 10MB
+    }
+
+    # ── Slack Web API — https://slack.com/api/... ────────────────────────────
+    # openclaw dials /slack/api/chat.postMessage → upstream /api/chat.postMessage
+    handle_path /slack/* {
+        route {
+            import openclaw-egress-caller-gate
+            reverse_proxy https://slack.com {
+                # Pin Host + SNI to the allowlisted FQDN (anti domain-fronting,
+                # FP-04e). Upstream cert verified against the public CA pool
+                # (Caddy transport tls default — no tls_trust_pool override).
+                header_up Host slack.com
+                # Never leak mesh identity material upstream.
+                header_up -X-SPIFFE-ID
+                header_up -X-Caddy-Verified-Secret
+                transport http {
+                    tls
+                    tls_server_name slack.com
+                }
+            }
+        }
+    }
+
+    # ── Slack response_url callbacks — https://hooks.slack.com/... (FP-07) ──
+    handle_path /slack-hooks/* {
+        route {
+            import openclaw-egress-caller-gate
+            reverse_proxy https://hooks.slack.com {
+                header_up Host hooks.slack.com
+                header_up -X-SPIFFE-ID
+                header_up -X-Caddy-Verified-Secret
+                transport http {
+                    tls
+                    tls_server_name hooks.slack.com
+                }
+            }
+        }
+    }
+
+    # ── Telegram Bot API + file downloads — https://api.telegram.org/... ────
+    # Covers both /bot<token>/<method> and /file/bot<token>/<path> (FP-07).
+    handle_path /telegram/* {
+        route {
+            import openclaw-egress-caller-gate
+            reverse_proxy https://api.telegram.org {
+                header_up Host api.telegram.org
+                header_up -X-SPIFFE-ID
+                header_up -X-Caddy-Verified-Secret
+                transport http {
+                    tls
+                    tls_server_name api.telegram.org
+                }
+            }
+        }
+    }
+
+    # Default-deny: no other destination exists on this listener.
+    handle {
+        respond "Forbidden" 403
+    }
+}
