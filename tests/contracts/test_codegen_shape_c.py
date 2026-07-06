@@ -539,11 +539,16 @@ def test_sc_helm_networkpolicy_no_caddy_egress():
     egress_section = netpol.split("    egress:", 1)[1]
 
     # Phase 1b-i wrap: ingress from the Caddy pod ONLY.
-    assert "app.kubernetes.io/name: caddy" in ingress_section
+    # Real Caddy pod label is yashigani-caddy (caddy.yaml pod template) — a
+    # bare "caddy" selector matches nothing (Phase-2a deploy-breaker #2).
+    assert "app.kubernetes.io/name: yashigani-caddy" in ingress_section
+    assert "app.kubernetes.io/name: caddy\n" not in ingress_section, (
+        "bare 'caddy' selector matches no pod — must be yashigani-caddy"
+    )
     # The gateway-direct shim allow is an around-the-wrap bypass — must be gone.
     assert "yashigani-gateway" not in netpol
     # SC-EGRESS-NONE unchanged: no Caddy (or any pod) egress allow — kube-dns only.
-    assert "app.kubernetes.io/name: caddy" not in egress_section
+    assert "yashigani-caddy" not in egress_section
     assert "kube-dns" in egress_section
     # The SC-EGRESS-NONE comment must be present
     assert "SC-EGRESS-NONE" in netpol
