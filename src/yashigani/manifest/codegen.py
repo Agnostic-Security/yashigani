@@ -91,7 +91,8 @@ import subprocess
 import tempfile
 import textwrap
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
+from urllib.parse import urlsplit
 
 from yashigani.manifest.linter import _is_private_address
 
@@ -1503,10 +1504,28 @@ _SC_BRIDGE_PORT: int = 8000
 _MCP_MESH_PORT_BASE: int = 9500
 _MCP_MESH_PORT_RANGE: int = 400
 
+# ── v4.1 unified-sidecar (Captain C2) — egress FORWARDER listener port ───────
+# The per-system egress forwarder (unified-sidecar design, gateway→deliver
+# hop) listens on ONE fixed, well-known port — NOT a per-system hashed port.
+# It is deliberately OUTSIDE the ingress mesh-port range
+# [_MCP_MESH_PORT_BASE, _MCP_MESH_PORT_BASE + _MCP_MESH_PORT_RANGE) == [9500, 9900):
+# that range stays INGRESS-ONLY (per-MCP Caddy mesh fronts).  Descriptor
+# override: spec.mcp.exposes.forwarder_port — validated by
+# resolve_egress_forwarder_port() below (must also stay outside the ingress
+# range and off the reserved base listeners).
+MCP_EGRESS_FORWARDER_PORT: int = 9400
+
 # Ports already claimed by base listeners (Caddyfile monolith + mesh
 # services) — a generated MCP front must never collide with these.
+#   80/443       public edge          2019    caddy admin relay (K8s)
+#   8000         ringfence shim       8080    gateway mTLS
+#   8443         backoffice mTLS      8444/8445 mesh listeners
+#   9400         egress forwarder (C2, above)
+#   11435        Ollama mesh front    18789   openclaw app port
+#   18790        openclaw egress gateway
 _MCP_RESERVED_PORTS: frozenset[int] = frozenset({
     80, 443, 2019, _SC_BRIDGE_PORT, 8080, 8443, 8444, 8445,
+    MCP_EGRESS_FORWARDER_PORT, 11435, 18789, 18790,
 })
 
 # In-container path (inside the Caddy container) where the per-MCP
@@ -1640,6 +1659,132 @@ def _mcp_mesh_port(parsed: dict) -> int:
         )
     _SEEN_MESH_PORTS[port] = (tenant_id, server_id)
     return port
+
+
+# ---------------------------------------------------------------------------
+# C1 (unified-sidecar must-fix #10) — mesh-port registry persistence seed
+# ---------------------------------------------------------------------------
+
+def _mesh_port_from_upstream_url(upstream_url: str) -> Optional[int]:
+    """Extract the mesh-listener port from a broker-descriptor upstream_url.
+
+    Descriptor contract (mcp/_durable_registry.py):
+        upstream_url == "https://caddy:<mesh_port>/mcp/<tenant>/<server>"
+    Returns None (never raises) on anything unparseable — seeding must
+    tolerate legacy/corrupt descriptors.
+    """
+    if not upstream_url or not isinstance(upstream_url, str):
+        return None
+    try:
+        port = urlsplit(upstream_url).port
+    except ValueError:
+        return None
+    return port
+
+
+def seed_mesh_ports_from_descriptors(descriptors: Iterable[dict]) -> int:
+    """Seed _SEEN_MESH_PORTS from PERSISTED broker-registry descriptors.
+
+    Captain C1 (unified-sidecar must-fix #10): the mesh-port registry is
+    in-process only and cleared by reset_codegen_registry() / process
+    restart.  Without reconciling against durable state, a backoffice
+    restart forgets every claimed port and the next onboard can hash (or be
+    pinned) onto an occupied port — surfacing as an opaque C10 validator
+    failure mid-transaction instead of the explicit
+    MCP_mesh_port_collision abort.
+
+    Call at engine init — the approve transaction
+    (backoffice/mcp_onboard.py) seeds from
+    DurableMcpRegistryStore.list_all() BEFORE codegen runs.
+
+    Semantics:
+      * idempotent — re-seeding the same (tenant, server) on the same port
+        is a no-op, and _mcp_mesh_port() re-resolution for the SAME pair
+        never collides (re-approve stays safe);
+      * tolerant — descriptors without a parsable
+        ``upstream_url``/``tenant_id``/``agent_name`` are skipped with a
+        warning (legacy or corrupt entries must not brick onboarding);
+      * first-claim-wins on seed conflict — two persisted descriptors
+        claiming one port for different pairs cannot happen via the approve
+        transaction (it would have aborted); if seen, the first claim is
+        kept and an error is logged.  The losing pair's next re-approve
+        then aborts fail-closed with MCP_mesh_port_collision, surfacing
+        the corrupt state at the right moment.
+
+    Returns the number of ports newly registered.
+    """
+    seeded = 0
+    for desc in descriptors:
+        if not isinstance(desc, dict):
+            _log.warning("mesh-port seed: skipping non-dict descriptor %r", type(desc))
+            continue
+        tenant_id = str(desc.get("tenant_id") or "")
+        server_id = str(desc.get("agent_name") or "")
+        port = _mesh_port_from_upstream_url(desc.get("upstream_url") or "")
+        if not tenant_id or not server_id or port is None or not (1024 <= port <= 65535):
+            _log.warning(
+                "mesh-port seed: skipping descriptor with unusable "
+                "tenant_id=%r agent_name=%r upstream_url=%r",
+                tenant_id, server_id, desc.get("upstream_url"),
+            )
+            continue
+        prior = _SEEN_MESH_PORTS.get(port)
+        if prior is not None:
+            if prior != (tenant_id, server_id):
+                _log.error(
+                    "mesh-port seed: persisted port %d claimed by BOTH "
+                    "(tenant=%r, server=%r) and (tenant=%r, server=%r) — "
+                    "keeping the first claim; re-approving the second will "
+                    "abort with MCP_mesh_port_collision (corrupt durable "
+                    "state — investigate)",
+                    port, prior[0], prior[1], tenant_id, server_id,
+                )
+            continue
+        _SEEN_MESH_PORTS[port] = (tenant_id, server_id)
+        seeded += 1
+    return seeded
+
+
+# ---------------------------------------------------------------------------
+# C2 (unified-sidecar must-fix #10) — egress forwarder port resolution
+# ---------------------------------------------------------------------------
+
+def resolve_egress_forwarder_port(parsed: Optional[dict] = None) -> int:
+    """Resolve the egress FORWARDER listener port (Captain C2).
+
+    Default: the fixed, well-known MCP_EGRESS_FORWARDER_PORT (9400).
+    Override: spec.mcp.exposes.forwarder_port in the system descriptor.
+
+    The forwarder port MUST stay OUTSIDE the ingress mesh-port range
+    [9500, 9900) — that range is ingress-only (per-MCP Caddy mesh fronts,
+    hashed or pinned) — and off every reserved base-listener port.
+
+    Raises:
+        CodegenError: MCP_forwarder_port_invalid.
+    """
+    mcp_exposes = (((parsed or {}).get("spec") or {}).get("mcp") or {}).get("exposes") or {}
+    override = mcp_exposes.get("forwarder_port")
+    if override is None:
+        return MCP_EGRESS_FORWARDER_PORT
+
+    ingress_lo = _MCP_MESH_PORT_BASE
+    ingress_hi = _MCP_MESH_PORT_BASE + _MCP_MESH_PORT_RANGE
+    if (
+        not isinstance(override, int)
+        or isinstance(override, bool)
+        or not (1024 <= override <= 65535)
+        or (ingress_lo <= override < ingress_hi)
+        or (override in _MCP_RESERVED_PORTS and override != MCP_EGRESS_FORWARDER_PORT)
+    ):
+        raise CodegenError(
+            "MCP_forwarder_port_invalid",
+            "spec.mcp.exposes.forwarder_port=%r is invalid: must be an "
+            "integer in 1024-65535, OUTSIDE the ingress-only mesh-port range "
+            "%d-%d, and not one of the reserved base-listener ports %s." % (
+                override, ingress_lo, ingress_hi - 1,
+                sorted(_MCP_RESERVED_PORTS)),
+        )
+    return override
 
 
 def _gen_caddy_snippet_mcp(

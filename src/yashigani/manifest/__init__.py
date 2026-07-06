@@ -21,19 +21,25 @@ Entry points:
   CodegenEngineShapeC(parsed, runtime) — P3 Shape C (stdio MCP-server) artifact generator
   CodegenError                         — codegen failure type
   reset_codegen_registry()             — C3 duplicate-pair registry reset
+  seed_mesh_ports_from_descriptors(d)  — C1 mesh-port registry seed from durable state
+  resolve_egress_forwarder_port(p)     — C2 fixed egress-forwarder port (9400, overridable)
+  MCP_EGRESS_FORWARDER_PORT            — C2 forwarder port constant (outside 9500-9899)
   is_shape_c(parsed)                   — detect if manifest is Shape-C
 
-Last updated: 2026-05-29T00:00:00+00:00
+Last updated: 2026-07-06T00:00:00+00:00
 """
 from yashigani.manifest.parser import parse_manifest, ManifestParseError
 from yashigani.manifest.schema import validate_schema, assert_schema_valid, ManifestSchemaError
 from yashigani.manifest.linter import validate_manifest, LintResult, LintError, resolve_spiffe_uri
 from yashigani.manifest.signatures import verify_manifest_signature, ManifestSignatureError
 from yashigani.manifest.codegen import (
+    MCP_EGRESS_FORWARDER_PORT,
     CodegenEngine,
     CodegenEngineShapeC,
     CodegenError,
     reset_codegen_registry,
+    resolve_egress_forwarder_port,
+    seed_mesh_ports_from_descriptors,
     _is_shape_c as is_shape_c,
 )
 
@@ -53,5 +59,8 @@ __all__ = [
     "CodegenEngineShapeC",
     "CodegenError",
     "reset_codegen_registry",
+    "seed_mesh_ports_from_descriptors",
+    "resolve_egress_forwarder_port",
+    "MCP_EGRESS_FORWARDER_PORT",
     "is_shape_c",
 ]

@@ -447,6 +447,31 @@ async def run_approve_transaction(
             http_status=503,
         )
 
+    # ── C1 (unified-sidecar must-fix #10): reconcile the codegen mesh-port
+    # registry with PERSISTED state before codegen runs.  _SEEN_MESH_PORTS is
+    # in-process only and cleared on backoffice restart; without this seed a
+    # restart forgets every claimed port and this onboard can hash (or be
+    # pinned) onto an occupied one — an opaque C10 validator failure
+    # mid-transaction instead of the explicit MCP_mesh_port_collision abort.
+    # Idempotent (same-pair re-claims are no-ops; re-approve stays safe).
+    # Non-fatal on seed failure: the degradation is availability-shaped only —
+    # a genuine collision still aborts fail-closed at codegen time.
+    if registry_store is not None:
+        try:
+            from yashigani.manifest.codegen import seed_mesh_ports_from_descriptors
+            _seeded = seed_mesh_ports_from_descriptors(registry_store.list_all())
+            if _seeded:
+                logger.info(
+                    "mcp-onboard: seeded %d persisted mesh-port claim(s) into "
+                    "the codegen registry (C1)", _seeded,
+                )
+        except Exception as exc:  # noqa: BLE001 — availability-only degradation
+            logger.warning(
+                "mcp-onboard: mesh-port seed from the durable registry failed "
+                "(%s) — collision guard degraded to session-only; a real "
+                "collision still aborts fail-closed at codegen (C10)", exc,
+            )
+
     # ── Step 1: manifest ────────────────────────────────────────────────────
     parsed = _validate_manifest_or_raise(
         manifest_yaml, server_id=server_id, tenant_id=tenant_id,
@@ -648,6 +673,11 @@ async def run_approve_transaction(
                 "cert_fingerprint": _leaf_fp,
                 "spiffe_id": spiffe_id,
                 "svid_instance_id": instance_id,
+                # v4.1 Phase 1 (Nico Q1 — cert/rotate): persist the pinned OCI
+                # digest so the rotation endpoint can re-mint with the SAME
+                # binding inputs (image_digest ‖ scope_hash).  "" when the
+                # manifest pinned no digest — recorded honestly (binding.py).
+                "image_digest": image_digest,
             }
             registry_store.put(tenant_id, server_id, descriptor)
 
