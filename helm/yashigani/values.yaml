@@ -1031,6 +1031,21 @@ agentBundles:
     # to restrict the :18790 egress gateway to one specific Telegram bot account.
     # Empty string (default) = inert; enforcement begins when non-empty.
     telegramBotId: ""
+    # FP-06 Phase 2: Slack channel pins (operator-supplied; inert-until-set).
+    # Stored in K8s Secret yashigani-openclaw-slack-secrets; injected as env vars
+    # into the Caddy pod (YASHIGANI_OPENCLAW_SLACK_{WEBHOOK_PATH,BOT_TOKEN}).
+    # Caddy reads them at parse time via {$YASHIGANI_OPENCLAW_SLACK_*:} in the
+    # :18790 egress Caddyfile block.
+    slack:
+      # CHANNEL 1: incoming-webhook path pin (/services/T.../B.../<secret>).
+      # Set to the path component of the operator's Slack incoming-webhook URL.
+      # Empty (default) = feature OFF (no enforcement).
+      webhookPath: ""
+      # CHANNEL 2: Web API bot-token pin (xoxb-..., scoped to one workspace).
+      # Set to the operator's Slack bot token. Empty (default) = feature OFF.
+      # WARNING: this value is stored in the Helm release secret. Use a K8s
+      # ExternalSecret / SealedSecret for production hardening.
+      botToken: ""
     image:
       # Pinned to 2026.5.6 to match docker-compose.yml. INDEX digest verified
       # 2026-05-07 via crane digest — multi-arch (linux/amd64 + linux/arm64).

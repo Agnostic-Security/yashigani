@@ -324,26 +324,203 @@ def test_telegram_bot_id_pin_in_helm_render() -> None:
     )
 
 
-def test_slack_token_pin_hook_is_inert_comment_only() -> None:
-    """FP-06/Phase-2: The Slack workspace token hook must exist as a comment
-    placeholder only — no live `header_up Authorization` directive must be
-    present in any egress config (an empty token would break all Slack egress)."""
+def test_slack_bot_token_dual_handle_in_egress_snippet() -> None:
+    """FP-06/Phase-2 CHANNEL 2: Slack Web API bot-token workspace pin must use
+    the dual-handle inert-until-set pattern in the /slack/* route."""
     text = EGRESS_SNIPPET.read_text()
-    # Commented hook must be present (shows where to activate when provisioned).
-    assert "header_up Authorization" in text, (
-        "INERT Slack token hook comment missing from egress snippet"
+    # Named matcher for the pin-on branch.
+    assert "@slack_pin_on" in text, (
+        "Caddyfile.openclaw-egress missing @slack_pin_on matcher "
+        "(FP-06 Phase 2 CHANNEL 2 Slack bot-token pin)"
     )
-    # But it must not be an active (un-commented) directive.
-    # Every occurrence of `header_up Authorization` must be in a comment line.
-    for lineno, line in enumerate(text.splitlines(), 1):
-        stripped = line.lstrip()
-        if "header_up Authorization" in stripped:
-            assert stripped.startswith("#"), (
-                f"Caddyfile.openclaw-egress line {lineno}: `header_up Authorization` "
-                f"is NOT commented out — live Slack token inject would break egress "
-                f"if the secret is empty. Must remain commented until Tiago greenlit "
-                f"provisioning."
-            )
+    # Expression guard: token non-empty → pin active.
+    assert '"{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""' in text, (
+        "Slack bot-token expression guard missing "
+        '("{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != "") '
+        "— must short-circuit inert when var is unset"
+    )
+    # Pin-on branch must strip caller's Authorization and inject operator's token.
+    assert "header_up -Authorization" in text, (
+        "Slack bot-token pin missing `header_up -Authorization` (strip caller token)"
+    )
+    assert 'header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}"' in text, (
+        "Slack bot-token pin missing bearer inject directive"
+    )
+    # Fallback handle (pass-through, inert) must also be present.
+    assert "handle {" in text, (
+        "Fallback handle block missing (required for dual-handle inert-when-empty)"
+    )
+
+
+def test_slack_bot_token_pin_inert_when_empty() -> None:
+    """FP-06/Phase-2 CHANNEL 2: The bot-token pin MUST NOT fire when the env var
+    is empty or unset. The guard expression must short-circuit on empty."""
+    text = EGRESS_SNIPPET.read_text()
+    # The && short-circuit guard must be present.
+    assert (
+        '"{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""' in text
+        and "handle @slack_pin_on" in text
+    ), (
+        "Slack bot-token pin is missing the inert-when-empty guard: "
+        '"{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != "" must gate @slack_pin_on'
+    )
+
+
+def test_slack_webhook_path_pin_in_egress_snippet() -> None:
+    """FP-06/Phase-2 CHANNEL 1: Slack incoming-webhook path pin must be present
+    in the /slack-hooks/* route with the correct startsWith expression."""
+    text = EGRESS_SNIPPET.read_text()
+    assert "@wrong_slack_hook" in text, (
+        "Caddyfile.openclaw-egress missing @wrong_slack_hook matcher "
+        "(FP-06 Phase 2 CHANNEL 1 Slack webhook-path pin)"
+    )
+    assert '"{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != ""' in text, (
+        "Slack webhook-path expression guard missing — must be inert when empty"
+    )
+    assert 'startsWith("{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}")' in text, (
+        "Slack webhook-path pin missing startsWith expression "
+        "(must pin to the operator's /services/T.../B.../<secret> path)"
+    )
+    assert 'respond @wrong_slack_hook "Forbidden" 403' in text, (
+        "403 response for @wrong_slack_hook missing from egress snippet"
+    )
+
+
+def test_slack_webhook_path_pin_inert_when_empty() -> None:
+    """FP-06/Phase-2 CHANNEL 1: The webhook-path pin must not fire when the env
+    var is empty. The && guard must short-circuit on empty."""
+    text = EGRESS_SNIPPET.read_text()
+    assert (
+        '"{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != ""' in text
+        and "&&" in text
+    ), (
+        "Slack webhook-path pin missing && short-circuit guard: "
+        '"{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != "" && !...startsWith(...)'
+    )
+
+
+def test_slack_secrets_exported_in_entrypoint() -> None:
+    """FP-06/Phase-2: caddy-entrypoint.sh must read both Slack secret files and
+    export them as parse-time env vars before exec caddy (single-source; not in
+    compose env)."""
+    text = CADDY_ENTRYPOINT.read_text()
+    assert "openclaw_slack_webhook_path" in text, (
+        "caddy-entrypoint.sh must read /run/secrets/openclaw_slack_webhook_path "
+        "(CHANNEL 1 webhook-path pin secret file)"
+    )
+    assert "openclaw_slack_bot_token" in text, (
+        "caddy-entrypoint.sh must read /run/secrets/openclaw_slack_bot_token "
+        "(CHANNEL 2 bot-token pin secret file)"
+    )
+    assert "YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH" in text, (
+        "caddy-entrypoint.sh must export YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH "
+        "so Caddy can substitute {$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:} at parse time"
+    )
+    assert "YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN" in text, (
+        "caddy-entrypoint.sh must export YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN "
+        "so Caddy can substitute {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:} at parse time"
+    )
+    assert "export YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH" in text, (
+        "caddy-entrypoint.sh must `export YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH` "
+        "(not just set — Caddy must inherit from the process env)"
+    )
+    assert "export YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN" in text, (
+        "caddy-entrypoint.sh must `export YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN`"
+    )
+
+
+def test_slack_secret_files_accessible_to_caddy_in_compose(compose: dict) -> None:
+    """FP-06/Phase-2: Both Slack secret files must be accessible to the Caddy
+    container via the flat ./secrets bind-mount (no per-file bind needed since
+    the flat mount already covers docker/secrets/)."""
+    svc = compose["services"]["caddy"]
+    vols = [v for v in svc["volumes"] if isinstance(v, str)]
+    # The flat bind-mount covers openclaw_slack_{webhook_path,bot_token}
+    assert any(
+        v.startswith("./secrets:/run/secrets") for v in vols
+    ), (
+        "Caddy service missing ./secrets:/run/secrets bind-mount — "
+        "openclaw_slack_{webhook_path,bot_token} would not be accessible"
+    )
+    # The Slack env vars must NOT be declared in compose environment: — they
+    # must come ONLY from the secret files via caddy-entrypoint.sh export.
+    env = svc.get("environment", {})
+    assert "YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH" not in env, (
+        "YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH must NOT be in compose environment: "
+        "(must come from /run/secrets/openclaw_slack_webhook_path via entrypoint)"
+    )
+    assert "YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN" not in env, (
+        "YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN must NOT be in compose environment: "
+        "(must come from /run/secrets/openclaw_slack_bot_token via entrypoint)"
+    )
+
+
+def test_install_provisions_slack_secret_files() -> None:
+    """FP-06/Phase-2: install.sh must provision both Slack operator-config secret
+    files (empty on default install = inert; operator supplies values to enable)."""
+    install_sh = (REPO_ROOT / "install.sh").read_text()
+    assert "openclaw_slack_webhook_path" in install_sh, (
+        "install.sh must provision openclaw_slack_webhook_path secret file "
+        "(CHANNEL 1 incoming-webhook path pin)"
+    )
+    assert "openclaw_slack_bot_token" in install_sh, (
+        "install.sh must provision openclaw_slack_bot_token secret file "
+        "(CHANNEL 2 bot-token pin)"
+    )
+    assert "YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH" in install_sh, (
+        "install.sh must read YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH env var "
+        "for operator-supplied webhook path"
+    )
+    assert "YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN" in install_sh, (
+        "install.sh must read YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN env var "
+        "for operator-supplied bot token"
+    )
+
+
+def test_slack_enforcement_in_helm_render() -> None:
+    """FP-06/Phase-2 compose↔Helm parity: both Slack enforcement blocks must be
+    present in the Helm :18790 render (configmaps.yaml)."""
+    text = HELM_CONFIGMAPS.read_text()
+    # CHANNEL 1: webhook-path pin
+    assert "@wrong_slack_hook" in text, (
+        "Helm :18790 block missing @wrong_slack_hook matcher (CHANNEL 1 parity)"
+    )
+    assert '"{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != ""' in text, (
+        "Helm :18790 block missing CHANNEL 1 inert-when-empty guard"
+    )
+    assert 'startsWith("{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}")' in text, (
+        "Helm :18790 block missing CHANNEL 1 startsWith expression"
+    )
+    assert 'respond @wrong_slack_hook "Forbidden" 403' in text, (
+        "Helm :18790 block missing CHANNEL 1 403 respond"
+    )
+    # CHANNEL 2: bot-token dual-handle
+    assert "@slack_pin_on" in text, (
+        "Helm :18790 block missing @slack_pin_on matcher (CHANNEL 2 parity)"
+    )
+    assert '"{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""' in text, (
+        "Helm :18790 block missing CHANNEL 2 inert-when-empty guard"
+    )
+    assert 'header_up -Authorization' in text, (
+        "Helm :18790 block missing `header_up -Authorization` (CHANNEL 2 strip)"
+    )
+    assert 'header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}"' in text, (
+        "Helm :18790 block missing CHANNEL 2 bearer inject"
+    )
+
+
+def test_slack_not_in_openclaw_config() -> None:
+    """FP-02 extension: Slack bot token and webhook path must NOT appear in
+    openclaw.json — a compromised openclaw must not be able to rewrite its own
+    destination account."""
+    text = OPENCLAW_JSON.read_text()
+    assert "SLACK_BOT_TOKEN" not in text, (
+        "Slack bot token reference found in openclaw.json — single-source violation "
+        "(FP-02 extension: destination account must be perimeter-owned)"
+    )
+    assert "SLACK_WEBHOOK_PATH" not in text, (
+        "Slack webhook path reference found in openclaw.json — single-source violation"
+    )
 
 
 def test_iptables_hashlimit_in_entrypoint() -> None:

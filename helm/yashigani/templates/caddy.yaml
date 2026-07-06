@@ -116,6 +116,28 @@ spec:
             - name: FIPS_MODE
               value: "1"
             {{- end }}
+            {{- if .Values.agentBundles.openclaw.enabled }}
+            # FP-06 Phase 2: Slack operator-config secrets → Caddy parse-time env.
+            # CHANNEL 1 (incoming-webhook path pin) and CHANNEL 2 (bot-token pin).
+            # Sourced from K8s Secret yashigani-openclaw-slack-secrets (secrets.yaml).
+            # optional: true → if Secret/key absent, env var not set → Caddy default
+            # "" → enforcement expression short-circuits false (inert-until-set).
+            # Byte-parity with compose: compose reads from /run/secrets/ files via
+            # caddy-entrypoint.sh; K8s injects the same vars directly from the Secret.
+            # Caddyfile uses {$YASHIGANI_OPENCLAW_SLACK_*:} in both runtimes.
+            - name: YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+              valueFrom:
+                secretKeyRef:
+                  name: yashigani-openclaw-slack-secrets
+                  key: webhook_path
+                  optional: true
+            - name: YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: yashigani-openclaw-slack-secrets
+                  key: bot_token
+                  optional: true
+            {{- end }}
           # Retro #3al — probe the public :80 listener instead of the admin
           # endpoint at :2019. Caddy's admin API is bound to localhost only;
           # exposing it on 0.0.0.0 to satisfy the kubelet would expose the

@@ -242,6 +242,16 @@ services:
       # restrict the egress gateway to one specific Telegram bot account.
       # Empty (default) = inert; enforcement begins when the value is non-empty.
       YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID: ${YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:-}
+      # FP-06 Phase 2: Slack channel pins (CHANNEL 1 + CHANNEL 2).
+      # NOT declared as compose env vars — exported by caddy-entrypoint.sh from
+      # operator-config secret files before exec caddy (single-source-of-truth;
+      # avoids docker inspect env-audit exposure of secret values):
+      #   /run/secrets/openclaw_slack_webhook_path → YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+      #   /run/secrets/openclaw_slack_bot_token    → YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+      # Both files are under docker/secrets/ and accessible via the flat
+      # ./secrets:/run/secrets:ro mount. Provisioned empty by install.sh on
+      # default install; set YASHIGANI_OPENCLAW_SLACK_{WEBHOOK_PATH,BOT_TOKEN}
+      # at install time to enable pinning.
     volumes:
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
       # 4.0-phase1: shared CSP snippet (defines (csp-policies) named snippet).
@@ -273,15 +283,21 @@ services:
       # Empty at base install (no agents onboarded); Caddy continues normally.
       - ./caddy/agents:/etc/caddy/agents:ro
       # Internal mesh CA — Caddy calls backoffice /auth/verify via forward_auth
-      # (mTLS client). Its own client cert lives in ./secrets; the runtime manifest
-      # (with per-install bootstrap_token_sha256 values) is mounted read-only.
+      # (mTLS client). The runtime manifest (with per-install
+      # bootstrap_token_sha256 values) is mounted read-only.
       # Source is docker/var/runtime/ (gitignored, populated by install.sh).
-      # LAURA-001 (MED, RISK-REGISTERED): flat ./secrets mount exposes
-      # caddy_client.key to ~18 services sharing this bind-mount. Pre-existing
-      # compose architecture constraint; per-service secret-split is tracked as
-      # a risk item (not in scope for this branch). K8s uses pki-certs Secret
-      # (caddy.yaml) which is already correctly isolated to the caddy pod only.
+      # YSG-RISK-053 (closes LAURA-001): the Caddy mesh leaf (caddy_client.crt/
+      # .key) and the forward_auth HMAC (caddy_internal_hmac) are relocated by
+      # install.sh into docker/secrets-caddy/ so the flat ./secrets bind-mount
+      # shared by ~18 services no longer contains them (a compromised
+      # co-resident could read the leaf key + HMAC and forge
+      # X-Caddy-Verified-Secret / X-SPIFFE-ID). They are re-mounted below as
+      # single-file binds at the SAME in-container paths, so every Caddyfile
+      # keeps reading /run/secrets/caddy_client.{crt,key} unchanged.
       - ./secrets:/run/secrets:ro
+      - ./secrets-caddy/caddy_client.crt:/run/secrets/caddy_client.crt:ro
+      - ./secrets-caddy/caddy_client.key:/run/secrets/caddy_client.key:ro
+      - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
       # v4.1 Phase 1d (SEAM Phase-3 wiring): Caddy admin unix socket shared
       # with backoffice for caddy /load (MCP approve). Socket mode 0666 per
@@ -527,6 +543,11 @@ services:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
       - ./secrets:/run/secrets:ro
+      # YSG-RISK-053: caddy_internal_hmac is scoped out of the flat ./secrets
+      # dir (see caddy service). The gateway verifies X-Caddy-Verified-Secret
+      # (auth/caddy_verified.py Layer B) — CADDY_INTERNAL_HMAC env var first,
+      # file fallback at this unchanged in-container path.
+      - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro
       # Demo/free: writable cloud-keys volume for runtime-set cloud LLM API keys.
       # DockerSecretsProvider reads this dir first (before /run/secrets) when
       # resolving cloud keys set via the admin UI.  Mode 0600 per-file (set by
@@ -811,6 +832,11 @@ services:
       # for v2.24.0. K8s is already protected: backoffice.yaml initContainer runs
       # chmod 0400 on all /secrets-rw/* files including license_key.
       - ./secrets:/run/secrets
+      # YSG-RISK-053: caddy_internal_hmac is scoped out of the flat ./secrets
+      # dir (see caddy service). Single-file remount (ro) at the unchanged
+      # in-container path for Layer-B verify + the step-up signer
+      # (auth/caddy_verified.py, auth/stepup.py).
+      - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro
       # Demo/free: writable cloud-keys volume for runtime-set cloud LLM API keys.
       # Backoffice calls DockerSecretsProvider.set_secret (atomic write, 0600)
       # here when an admin stores a key via the UI.  Gateway reads back from this
@@ -3029,7 +3055,9 @@ volumes:
 # Per-key Docker named-secrets replace wholesale ./secrets:/run/secrets:ro mounts on
 # agent containers (langflow, letta, letta-pgbouncer). Each secret is exposed ONLY to
 # the service(s) that actually need it. caddy_internal_hmac is NOT listed here because
-# no agent container needs it — it is passed to gateway/backoffice/caddy via .env only.
+# no agent container needs it — Caddy consumes it via .env (CADDY_INTERNAL_HMAC);
+# gateway + backoffice additionally receive the FILE via a scoped single-file
+# bind from docker/secrets-caddy/ (YSG-RISK-053, see below).
 #
 # openclaw has NO entry in this block — the bearer token is pre-substituted into
 # openclaw.json by install.sh, and its mesh leaf (openclaw_client.{crt,key} +
@@ -3042,6 +3070,11 @@ volumes:
 # pattern is intentionally preserved for them; the named-secrets pattern is applied
 # to third-party agent containers with broader blast-radius exposure. (openclaw
 # left the `edge` network in v4.1 Phase 1c — LAURA-I1-03.)
+#
+# YSG-RISK-053 exception: caddy_client.{crt,key} + caddy_internal_hmac live in
+# docker/secrets-caddy/ (NOT docker/secrets/) and are single-file bind-mounted
+# ONLY on caddy (all three) and gateway/backoffice (hmac only). Do NOT move them
+# back into docker/secrets/ — the flat dir is readable by every service above.
 #
 # Secret files are generated by install.sh and stored in docker/secrets/.
 # To upgrade to a paid tier, replace docker/secrets/license_key with your .ysg content.

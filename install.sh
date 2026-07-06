@@ -3701,6 +3701,31 @@ _backup_existing_data() {
     fi
   fi
 
+  # YSG-RISK-053: back up the Caddy-scoped secrets dir (caddy_client.{key,crt}
+  # + caddy_internal_hmac) alongside docker/secrets — same ownership-preserving
+  # strategy per runtime. restore.sh restores it into docker/secrets-caddy/.
+  if [[ -d "${WORK_DIR}/docker/secrets-caddy" ]]; then
+    local _caddy_src="${WORK_DIR}/docker/secrets-caddy"
+    local _caddy_dest="${backup_dir}/secrets-caddy"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" && "$(id -u)" != "0" ]]; then
+      mkdir -p "$_caddy_dest"
+      if podman unshare bash -c "tar -cf - -C '${_caddy_src}' ." \
+           | tar -xpf - -C "$_caddy_dest" 2>/dev/null; then
+        log_info "  secrets-caddy/ backed up via podman unshare tar (YSG-RISK-053)"
+      else
+        log_warn "  secrets-caddy/ backup via podman unshare failed — skipping (non-fatal; install.sh regenerates/relocates on next run)"
+        rm -rf "$_caddy_dest"
+      fi
+    else
+      mkdir -p "$_caddy_dest"
+      if cp -rp "$_caddy_src"/. "$_caddy_dest"/ 2>/dev/null; then
+        log_info "  secrets-caddy/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets-caddy/ partial copy — some files owned by container UIDs are unreadable as $(id -un); non-fatal."
+      fi
+    fi
+  fi
+
   # Backup .env (contains passwords as env vars)
   if [[ -f "${WORK_DIR}/docker/.env" ]]; then
     cp "${WORK_DIR}/docker/.env" "${backup_dir}/.env"
@@ -6018,6 +6043,7 @@ _fix_config_perms() {
   # and the DB dump were all 0604/0644. Prune the whole backups/ tree.
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
+    -not \( -path "${work_dir}/docker/secrets-caddy" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
@@ -6033,25 +6059,29 @@ _fix_config_perms() {
   # Note: *.crt files are intentionally 0644 (public material — CA and client certs
   # must be readable by all container UIDs for mTLS peer verification). Only private
   # keys and password/token files are checked here.
-  local _secrets_dir="${work_dir}/docker/secrets"
-  if [[ -d "$_secrets_dir" ]]; then
-    # A1 (Iris BLOCKING / iris-install-umask-design-review.md):
-    # Check only WORLD-readable (-perm -004), NOT group-readable (-perm -040).
-    # caddy_internal_hmac is intentionally 0640 (group-readable for caddy<->backoffice
-    # HMAC handoff); checking -perm -040 caused a false-positive abort on every install.
-    # Group-readable is a legitimate design choice for specific files in docker/secrets/;
-    # world-readable (o+r) on ANY secret file there is always wrong.
-    # Self-heal THEN assert: tighten any world-readable non-cert secret (e.g. a password
-    # file left 0644 by an earlier step or a prior install) by removing world access, then
-    # fail only if any remain. Tightening rather than aborting keeps upgrades moving without
-    # weakening posture — group bits (e.g. caddy_internal_hmac 0640) are preserved (o-rwx only).
-    find "${_secrets_dir}" -type f ! -name "*.crt" -perm -004 -exec chmod o-rwx {} + 2>/dev/null || true
-    if find "${_secrets_dir}" -type f ! -name "*.crt" -perm -004 2>/dev/null | grep -q .; then
-      log_error "CWE-732: world-readable non-cert file(s) STILL present under ${_secrets_dir} after self-heal" >&2
-      log_error "Could not tighten (ownership/filesystem issue) — investigate." >&2
-      exit 1
+  # YSG-RISK-053: sweep BOTH secret dirs — the flat docker/secrets/ and the
+  # Caddy-scoped docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  local _sweep_dir
+  for _sweep_dir in "${work_dir}/docker/secrets" "${work_dir}/docker/secrets-caddy"; do
+    if [[ -d "$_sweep_dir" ]]; then
+      # A1 (Iris BLOCKING / iris-install-umask-design-review.md):
+      # Check only WORLD-readable (-perm -004), NOT group-readable (-perm -040).
+      # caddy_internal_hmac is intentionally 0640 (group-readable for caddy<->backoffice
+      # HMAC handoff); checking -perm -040 caused a false-positive abort on every install.
+      # Group-readable is a legitimate design choice for specific files in docker/secrets/;
+      # world-readable (o+r) on ANY secret file there is always wrong.
+      # Self-heal THEN assert: tighten any world-readable non-cert secret (e.g. a password
+      # file left 0644 by an earlier step or a prior install) by removing world access, then
+      # fail only if any remain. Tightening rather than aborting keeps upgrades moving without
+      # weakening posture — group bits (e.g. caddy_internal_hmac 0640) are preserved (o-rwx only).
+      find "${_sweep_dir}" -type f ! -name "*.crt" -perm -004 -exec chmod o-rwx {} + 2>/dev/null || true
+      if find "${_sweep_dir}" -type f ! -name "*.crt" -perm -004 2>/dev/null | grep -q .; then
+        log_error "CWE-732: world-readable non-cert file(s) STILL present under ${_sweep_dir} after self-heal" >&2
+        log_error "Could not tighten (ownership/filesystem issue) — investigate." >&2
+        exit 1
+      fi
     fi
-  fi
+  done
 
   log_success "Bind-mounted config permissions verified"
 }
@@ -9591,7 +9621,16 @@ generate_secrets() {
     # .env but omits caddy_internal_hmac, so the gateway cannot start.
     # Fix: check + generate each new secret independently, regardless of whether
     # core secrets (postgres/redis) already exist.
-    local hmac_file="${secrets_dir}/caddy_internal_hmac"
+    #
+    # YSG-RISK-053: the HMAC lives in the Caddy-scoped dir (docker/secrets-caddy/),
+    # never the flat docker/secrets/ shared by ~18 services. Migrate a
+    # legacy-layout file first so upgrades PRESERVE the existing value
+    # (relocation is a rename — no rotation, .env stays consistent).
+    _ensure_caddy_secrets_dir || return 1
+    if [[ -e "${secrets_dir}/caddy_internal_hmac" ]]; then
+      _relocate_caddy_scoped_secrets || return 1
+    fi
+    local hmac_file="${WORK_DIR}/docker/secrets-caddy/caddy_internal_hmac"
     # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
     if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
       local _hmac_secret
@@ -9844,6 +9883,45 @@ generate_secrets() {
     echo "OPENCLAW_GATEWAY_TOKEN=${openclaw_token}" >> "$env_file"
   fi
 
+  # --- OpenClaw Slack operator-config secrets (FP-06 Phase 2) ---
+  # CHANNEL 1: incoming-webhook path pin (/services/T.../B.../<secret>)
+  # CHANNEL 2: Web API bot-token pin (xoxb-... scoped to one workspace)
+  #
+  # Both are INERT by default (empty secret file → feature off). The operator
+  # supplies values at install time via env vars; on re-run (upgrade) existing
+  # non-empty files are preserved unless the operator supplies a new value.
+  # Single-source: stored ONLY in the secret file — NOT in openclaw.json or
+  # docker/.env — so a compromised openclaw cannot rewrite its own destination.
+  # caddy-entrypoint.sh exports YASHIGANI_OPENCLAW_SLACK_{WEBHOOK_PATH,BOT_TOKEN}
+  # from these files before exec caddy (Caddy parse-time substitution).
+  local _oc_slack_webhook_path="${YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:-}"
+  local _oc_slack_bot_token="${YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:-}"
+  local _oc_wh_file="${secrets_dir}/openclaw_slack_webhook_path"
+  local _oc_bt_file="${secrets_dir}/openclaw_slack_bot_token"
+  # Write if: file does not exist (fresh install), OR operator supplies a new value.
+  if [[ ! -f "$_oc_wh_file" ]] || [[ -n "$_oc_slack_webhook_path" ]]; then
+    printf "%s" "$_oc_slack_webhook_path" > "$_oc_wh_file"
+    chmod 600 "$_oc_wh_file"
+    if [[ -n "$_oc_slack_webhook_path" ]]; then
+      log_info "openclaw Slack webhook-path pin provisioned (CHANNEL 1 enforcement ON)."
+    else
+      log_info "openclaw Slack webhook-path pin: empty secret file created (CHANNEL 1 inert — supply YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH to enable)."
+    fi
+  else
+    log_info "openclaw Slack webhook-path pin: existing secret file preserved (re-run; supply YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH to update)."
+  fi
+  if [[ ! -f "$_oc_bt_file" ]] || [[ -n "$_oc_slack_bot_token" ]]; then
+    printf "%s" "$_oc_slack_bot_token" > "$_oc_bt_file"
+    chmod 600 "$_oc_bt_file"
+    if [[ -n "$_oc_slack_bot_token" ]]; then
+      log_info "openclaw Slack bot-token pin provisioned (CHANNEL 2 enforcement ON)."
+    else
+      log_info "openclaw Slack bot-token pin: empty secret file created (CHANNEL 2 inert — supply YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN to enable)."
+    fi
+  else
+    log_info "openclaw Slack bot-token pin: existing secret file preserved (re-run; supply YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN to update)."
+  fi
+
   # --- Grafana ---
   GEN_GRAFANA_PASSWORD="$(_gen_password)"
   printf "%s" "$GEN_GRAFANA_PASSWORD" > "${secrets_dir}/grafana_admin_password"
@@ -9883,7 +9961,15 @@ generate_secrets() {
   # never world-readable.
   # On --upgrade this block regenerates the secret. All three containers must
   # be restarted to pick it up (install.sh --upgrade restarts them).
-  local hmac_file="${secrets_dir}/caddy_internal_hmac"
+  #
+  # YSG-RISK-053: the HMAC lives in the Caddy-scoped dir (docker/secrets-caddy/),
+  # never the flat docker/secrets/ shared by ~18 services. Migrate a
+  # legacy-layout file first so re-runs PRESERVE the existing value.
+  _ensure_caddy_secrets_dir || return 1
+  if [[ -e "${secrets_dir}/caddy_internal_hmac" ]]; then
+    _relocate_caddy_scoped_secrets || return 1
+  fi
+  local hmac_file="${WORK_DIR}/docker/secrets-caddy/caddy_internal_hmac"
   # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
   if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
     local _hmac_secret
@@ -10946,6 +11032,81 @@ _pki_runtime_cmd() {
   echo "podman"
 }
 
+# ---------------------------------------------------------------------------
+# YSG-RISK-053 — per-service secret scoping (Caddy-scoped secrets).
+#
+# The flat ./secrets:/run/secrets bind-mount is shared by ~18 compose services.
+# Any compromised co-resident (redis, prometheus, ...) could read the Caddy
+# mesh leaf key + the forward_auth HMAC and forge X-Caddy-Verified-Secret /
+# X-SPIFFE-ID (forward_auth bypass). Fix: caddy_client.{key,crt} and
+# caddy_internal_hmac live in docker/secrets-caddy/ and are re-mounted as
+# single-file binds ONLY on caddy (all three) and gateway/backoffice (hmac) —
+# at the SAME in-container paths, so no Caddyfile/Python change is needed.
+#
+# The PKI issuer (yashigani.pki.issuer) still mints caddy_client.* into
+# docker/secrets/ (its only mounted output dir); _relocate_caddy_scoped_secrets
+# sweeps them into docker/secrets-caddy/ after every mutating issuer action.
+# ---------------------------------------------------------------------------
+_YSG_CADDY_SCOPED_SECRETS=(caddy_client.key caddy_client.crt caddy_internal_hmac)
+
+_ensure_caddy_secrets_dir() {
+  local _dir="${WORK_DIR}/docker/secrets-caddy"
+  if [[ ! -d "$_dir" ]]; then
+    mkdir -p "$_dir" || { log_error "YSG-RISK-053: cannot create ${_dir}"; return 1; }
+  fi
+  # 0700 — owner-only. Bind-mount source resolution is performed by the
+  # container runtime (root dockerd, or rootless podman running as the owner),
+  # so no other host UID needs traversal. In-container access control is the
+  # per-file mode/owner (key 0600 UID 0, hmac 0640 UID 1001), same as before.
+  # Best-effort: on re-runs the dir may be owned by a prior installer user.
+  chmod 0700 "$_dir" 2>/dev/null || true
+  return 0
+}
+
+# _relocate_caddy_scoped_secrets — move the three Caddy-scoped files out of the
+# flat docker/secrets/ dir. Idempotent (no-op when already relocated /
+# never minted). Preserves mode+ownership (rename, not copy). FAIL-CLOSED: if a
+# file cannot be moved it would remain exposed to every flat-mount service, so
+# the install aborts rather than shipping the known-bypassable layout.
+_relocate_caddy_scoped_secrets() {
+  local _src="${WORK_DIR}/docker/secrets"
+  local _dst="${WORK_DIR}/docker/secrets-caddy"
+  _ensure_caddy_secrets_dir || return 1
+  local _f _moved=0
+  for _f in "${_YSG_CADDY_SCOPED_SECRETS[@]}"; do
+    [[ -e "${_src}/${_f}" ]] || continue
+    # (1) plain rename — needs write+search on both parent dirs only; file
+    #     ownership (container/subuid UIDs) is irrelevant for rename(2).
+    if mv -f "${_src}/${_f}" "${_dst}/${_f}" 2>/dev/null; then
+      _moved=$((_moved + 1)); continue
+    fi
+    # (2) rootless Podman: docker/secrets/ itself may be owned by a subuid-range
+    #     UID (set by _prepare_secrets_dir_for_pki) — rename inside the userns.
+    if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+       && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]] \
+       && podman unshare mv -f "${_src}/${_f}" "${_dst}/${_f}" 2>/dev/null; then
+      _moved=$((_moved + 1)); continue
+    fi
+    # (3) last resort: ephemeral container with both dirs mounted (same pinned
+    #     alpine digest as _pki_chown_client_keys — supply-chain pin).
+    local _rt; _rt="$(_pki_runtime_cmd)"
+    "$_rt" run --rm --network=none \
+      --volume "${_src}:/a:rw" --volume "${_dst}:/b:rw" \
+      "alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11" \
+      mv -f "/a/${_f}" "/b/${_f}" 2>/dev/null || true
+    if [[ -e "${_src}/${_f}" ]]; then
+      log_error "YSG-RISK-053: could not relocate ${_f} out of ${_src} — it would remain readable by every service on the flat /run/secrets mount. Aborting fail-closed."
+      log_error "  Manual fix: mv '${_src}/${_f}' '${_dst}/${_f}' (as root or via podman unshare), then re-run."
+      return 1
+    fi
+    _moved=$((_moved + 1))
+  done
+  if [[ "$_moved" -gt 0 ]]; then
+    log_info "YSG-RISK-053: relocated ${_moved} Caddy-scoped secret(s) → docker/secrets-caddy/"
+  fi
+  return 0
+}
+
 _pki_validate_lifetimes() {
   # Clamp to manifest bounds: root 5-20 yr, intermediate 90-365 d, leaf 30-90 d.
   if ! [[ "$YASHIGANI_ROOT_CA_LIFETIME_YEARS" =~ ^[0-9]+$ ]] \
@@ -11624,6 +11785,14 @@ PYHASH
     fi
     log_success "_pki_run_issuer: runtime manifest bootstrap tokens populated (${_pop} service(s))"
   fi
+
+  # YSG-RISK-053: after any mutating issuer action (bootstrap / rotate-*), sweep
+  # freshly minted Caddy-scoped material out of the flat secrets dir before any
+  # container can mount it. Idempotent no-op when nothing was (re)minted for
+  # caddy (e.g. rotate-leaves --only <agent>). `status` never writes — skip.
+  if [[ "$_issuer_rc" -eq 0 && "$subcmd" != "status" ]]; then
+    _relocate_caddy_scoped_secrets || return 1
+  fi
   return "$_issuer_rc"
 }
 
@@ -11809,16 +11978,26 @@ _pki_chown_client_keys() {
   # pki_service_uid + pki_key_mode replace the inline array and the prometheus
   # special-case. Adding a new service updates lib/pki_ownership.sh only.
   # GATE5-BUG-01 / maintainer directive 2026-05-10.
-  local _svc _uid _mode _keyfile
+  local _svc _uid _mode _keyfile _keybase
+  local _caddy_scoped_dir="${WORK_DIR}/docker/secrets-caddy"
   while IFS= read -r _svc; do
     _uid="$(pki_service_uid "$_svc")"
     _mode="$(pki_key_mode "$_svc")"
     _keyfile="${_secrets_dir}/${_svc}_client.key"
+    _keybase="$_secrets_dir"
+    # YSG-RISK-053: the caddy leaf key lives in the Caddy-scoped dir (relocated
+    # by _relocate_caddy_scoped_secrets after every mint/rotation). Pass the
+    # scoped dir as _do_chown's mount base (5th arg) so the container-dispatch
+    # modes bind the correct root.
+    if [[ "$_svc" == "caddy" ]]; then
+      _keyfile="${_caddy_scoped_dir}/${_svc}_client.key"
+      _keybase="$_caddy_scoped_dir"
+    fi
     if [[ -f "$_keyfile" ]]; then
       # #3d-fix: mode from shared map (0600 default, 0640 for prometheus).
       # chmod runs inside the container alongside chown so a non-root installer
       # (e.g. uid 1003) doesn't get EPERM trying to chmod a file it no longer owns.
-      _do_chown "${_uid}" "$_keyfile" "${_svc}_client.key" "${_mode}" || return 1
+      _do_chown "${_uid}" "$_keyfile" "${_svc}_client.key" "${_mode}" "$_keybase" || return 1
     fi
   done < <(pki_services_all)
 
@@ -11831,6 +12010,11 @@ _pki_chown_client_keys() {
   find "${_secrets_dir}" -maxdepth 1 -type f \
     \( -name '*_client.crt' -o -name 'ca_*.crt' \) \
     -exec chmod 0644 {} \; 2>/dev/null || true
+  # YSG-RISK-053: caddy leaf cert lives in the Caddy-scoped dir — same 0644
+  # public-material posture (best-effort, mirrors the find above).
+  if [[ -f "${_caddy_scoped_dir}/caddy_client.crt" ]]; then
+    chmod 0644 "${_caddy_scoped_dir}/caddy_client.crt" 2>/dev/null || true
+  fi
 
   # gate #ROOTLESS-11: password files, bootstrap tokens, and HMAC secret are
   # written by generate_secrets() as the installer user (e.g. UID 1005 on Podman
@@ -11873,6 +12057,10 @@ _pki_chown_client_keys() {
     grafana_admin_password
     caddy_internal_hmac
     openclaw_gateway_token
+    # FP-06 Phase 2 operator-config secrets: caddy (uid 1001) reads them via
+    # caddy-entrypoint.sh before exec caddy. Empty = inert-until-set.
+    openclaw_slack_webhook_path
+    openclaw_slack_bot_token
     # wazuh passwords are read by the wazuh containers (run as root inside docker),
     # not by the UID 1001 services. Chowning them to 1001 is harmless: root (UID 0)
     # inside the wazuh containers can still read them; the mode stays 0600.
@@ -11882,8 +12070,16 @@ _pki_chown_client_keys() {
   )
   for _sf in "${_uid1001_secrets[@]}"; do
     local _sfpath="${_secrets_dir}/${_sf}"
+    local _sfbase="$_secrets_dir"
+    # YSG-RISK-053: caddy_internal_hmac lives in the Caddy-scoped dir; keep it
+    # in this array (ownership contract unchanged: 1001, mode 0640 set at
+    # generation) but chown it at its scoped path with the matching mount base.
+    if [[ "$_sf" == "caddy_internal_hmac" ]]; then
+      _sfpath="${_caddy_scoped_dir}/${_sf}"
+      _sfbase="$_caddy_scoped_dir"
+    fi
     if [[ -f "$_sfpath" ]]; then
-      _do_chown "1001" "$_sfpath" "$_sf" || return 1
+      _do_chown "1001" "$_sfpath" "$_sf" "" "$_sfbase" || return 1
     fi
   done
 
@@ -12188,6 +12384,9 @@ _pki_detect_uri_san_drift() {
   while IFS='|' read -r svc expected; do
     [[ -z "$svc" || -z "$expected" ]] && continue
     crt="${secrets_dir}/${svc}_client.crt"
+    # YSG-RISK-053: the caddy leaf lives in the Caddy-scoped dir, not the flat
+    # secrets dir (relocated by _relocate_caddy_scoped_secrets).
+    [[ "$svc" == "caddy" ]] && crt="${WORK_DIR}/docker/secrets-caddy/${svc}_client.crt"
     if [[ ! -f "$crt" ]]; then
       log_warn "  ${svc}: leaf cert missing (${crt}) — treating as drift"
       drift=1
@@ -12392,6 +12591,11 @@ bootstrap_internal_pki() {
   local ca_root="${WORK_DIR}/docker/secrets/ca_root.crt"
   if [[ -f "$ca_root" ]]; then
     log_info "Root CA already present — checking renewal status"
+    # YSG-RISK-053: legacy-layout upgrades (pre-v4.1) still hold the Caddy leaf
+    # + HMAC in docker/secrets/. Relocate BEFORE the drift check so the caddy
+    # leaf is found at its scoped path and no spurious "leaf missing → forced
+    # rotation" fires on every upgrade.
+    _relocate_caddy_scoped_secrets || return 1
     local needs_rotation=false
     # Platform Review Finding: no /tmp — keep scratch inside WORK_DIR.
     # Podman rootless: status_file written by container (UID 363144) cannot

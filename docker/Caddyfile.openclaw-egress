@@ -44,13 +44,23 @@
 #           exact FQDNs (no wildcards), so those legitimate callbacks flow
 #           through THIS gateway — no second unfiltered egress path exists
 #           (openclaw has no other route to the internet at L3).
-#   FP-06 — RESIDUAL (registered with Lu, Phase 2): a host allowlist cannot
-#           stop exfil to an ATTACKER-OWNED Slack workspace / Telegram bot —
-#           both are legitimate slack.com / api.telegram.org destinations.
-#           Compensating controls owed in Phase 2: bot-token workspace/chat
-#           pinning, M4/DLP content filter on egress bodies, outbound
-#           rate-limiting, per-request audit. Do NOT treat this gateway as a
-#           data-loss control; it is a DESTINATION control.
+#   FP-06 — Phase 2 CLOSED (this commit): a host allowlist alone cannot stop
+#           exfil to an ATTACKER-OWNED Slack workspace / Telegram bot (both are
+#           legitimate slack.com / api.telegram.org FQDNs). Controls landed:
+#           (a) Telegram bot-ID path pin (env YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID,
+#               inert-until-set) — 516caa66.
+#           (b) Slack Web API bot-token pin (env YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN,
+#               dual-handle inert-until-set): strips openclaw's Authorization +
+#               injects operator's token → forces one workspace.
+#           (c) Slack incoming-webhook path pin (env YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH,
+#               inert-until-set): path encodes workspace+channel+secret → a
+#               different attacker-owned webhook has a different path → 403.
+#           (d) Egress audit log on every request (including 403 denies) with
+#               Authorization header redaction.
+#           (e) iptables hashlimit rate-brake on the three egress hosts.
+#           Outstanding: M4/DLP content filter on egress bodies (registered with Lu).
+#           Do NOT treat this gateway as a data-loss control; it is a DESTINATION
+#           + ACCOUNT control. Token/path operator-supplied; never shipped.
 #
 # Defence in depth: caddy-entrypoint.sh mirrors these three FQDNs in the
 # container-level iptables OUTPUT allowlist (YASHIGANI_OPENCLAW_EGRESS=1,
@@ -146,29 +156,53 @@
     handle_path /slack/* {
         route {
             import openclaw-egress-caller-gate
-            # FP-06 Phase 2 — INERT Slack workspace-pin hook.
-            # The robust form (workspace pinning via token injection) requires a
-            # per-install YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN secret provisioned by
-            # install.sh. No such secret exists today (not in openclaw.json, compose,
-            # or install.sh). Provisioning is gated by the suggest-yes-create-never
-            # invariant and needs an explicit Tiago greenlight.
-            # When provisioned, activate by uncommenting these two lines:
-            #   header_up -Authorization
-            #   header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN}"
-            # DO NOT wire live with an empty token: an empty inject breaks all Slack
-            # egress. Install path: install.sh → /run/secrets/openclaw_slack_bot_token
-            # → {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN} parse-time env substitution.
-            reverse_proxy https://slack.com {
-                # Pin Host + SNI to the allowlisted FQDN (anti domain-fronting,
-                # FP-04e). Upstream cert verified against the public CA pool
-                # (Caddy transport tls default — no tls_trust_pool override).
-                header_up Host slack.com
-                # Never leak mesh identity material upstream.
-                header_up -X-SPIFFE-ID
-                header_up -X-Caddy-Verified-Secret
-                transport http {
-                    tls
-                    tls_server_name slack.com
+            # FP-06 Phase 2 — Slack bot-token workspace pin (destination-account
+            # control; CHANNEL 2).
+            # Operator config: /run/secrets/openclaw_slack_bot_token (0600, provisioned
+            #   by install.sh from operator-supplied YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN;
+            #   empty on default install — inert-until-set).
+            # Mechanism: caddy-entrypoint.sh reads the secret file before exec caddy
+            #   and exports YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN to the process env;
+            #   Caddy substitutes {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:} at parse time.
+            # Security model: a Slack bot token (xoxb-...) is scoped to one workspace.
+            #   This handle strips openclaw's Authorization and injects the operator's
+            #   token → forces the operator's workspace regardless of what a compromised
+            #   openclaw sends. Attacker-controlled workspace → different token → rejected.
+            # Dual-handle inert-when-empty:
+            #   @slack_pin_on fires ONLY when the token env var is non-empty.
+            #   "" != "" is false → @slack_pin_on never matches → only the fallback
+            #   `handle` runs (pass-through, unchanged from prior state). An empty-bearer
+            #   injection is therefore structurally impossible.
+            # Single-source: NOT in openclaw.json — a compromised openclaw cannot
+            #   rewrite its own destination token. Enforced by test_openclaw_egress_gateway.py.
+            @slack_pin_on expression "{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""
+            handle @slack_pin_on {
+                reverse_proxy https://slack.com {
+                    # Strip openclaw's caller Authorization; inject operator's token.
+                    header_up -Authorization
+                    header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}"
+                    # Pin Host + SNI (anti domain-fronting, FP-04e).
+                    header_up Host slack.com
+                    # Never leak mesh identity material upstream.
+                    header_up -X-SPIFFE-ID
+                    header_up -X-Caddy-Verified-Secret
+                    transport http {
+                        tls
+                        tls_server_name slack.com
+                    }
+                }
+            }
+            handle {
+                # Fallback: pass-through (inert when YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+                # is empty — default install unchanged).
+                reverse_proxy https://slack.com {
+                    header_up Host slack.com
+                    header_up -X-SPIFFE-ID
+                    header_up -X-Caddy-Verified-Secret
+                    transport http {
+                        tls
+                        tls_server_name slack.com
+                    }
                 }
             }
         }
@@ -178,10 +212,25 @@
     handle_path /slack-hooks/* {
         route {
             import openclaw-egress-caller-gate
-            # FP-06 Phase 2 — INERT Slack workspace-pin hook (same as /slack/*).
-            # Awaits Tiago-greenlit provisioning of YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN.
-            #   header_up -Authorization
-            #   header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN}"
+            # FP-06 Phase 2 — Slack incoming-webhook path pin (destination control;
+            # CHANNEL 1).
+            # Operator config: /run/secrets/openclaw_slack_webhook_path (0600, provisioned
+            #   by install.sh from operator-supplied YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH;
+            #   empty on default install — inert-until-set).
+            # Mechanism: caddy-entrypoint.sh exports YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+            #   from the secret file before exec caddy (Caddy parse-time substitution).
+            # Security model: incoming-webhook URLs contain workspace+channel+secret in
+            #   the path: /services/T<workspace>/B<app>/<signing-secret>
+            #   After handle_path strips /slack-hooks, the rewritten URI path IS the
+            #   /services/... component. An attacker-owned hooks.slack.com webhook has a
+            #   DIFFERENT /services path → 403. The operator's workspace+channel+secret
+            #   are all embedded in the pin — a partial match (different channel or
+            #   signing-secret) is also rejected.
+            # Inert-when-empty: "{$..._WEBHOOK_PATH:}" == "" → "" != "" is false →
+            #   short-circuit → @wrong_slack_hook never fires → no enforcement on a
+            #   default install.
+            @wrong_slack_hook expression "{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != "" && !{http.request.uri.path}.startsWith("{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}")
+            respond @wrong_slack_hook "Forbidden" 403
             reverse_proxy https://hooks.slack.com {
                 header_up Host hooks.slack.com
                 header_up -X-SPIFFE-ID

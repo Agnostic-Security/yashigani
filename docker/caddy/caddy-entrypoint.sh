@@ -464,5 +464,32 @@ fi
 
 apply_egress_rules
 
+
+# ── FP-06 Phase 2: Slack operator-config secrets → Caddy parse-time env ───
+# Secret files (0600, created by install.sh from operator-supplied values):
+#   /run/secrets/openclaw_slack_webhook_path  (CHANNEL 1: incoming-webhook path pin)
+#   /run/secrets/openclaw_slack_bot_token     (CHANNEL 2: Web API bot-token pin)
+# These are NOT declared in compose environment: — the secret file is the single
+# source of truth; this avoids the value appearing in `docker inspect` env dumps.
+# caddy-entrypoint.sh reads the files HERE (before exec caddy) and exports them
+# so Caddy inherits the vars at parse time ({$YASHIGANI_OPENCLAW_SLACK_*:} in
+# the Caddyfile substitutes to the actual value).
+# Empty/absent file → var stays unset → Caddy default "" → enforcement expression
+# short-circuits false (inert-until-set; default install unbroken).
+if [ -s /run/secrets/openclaw_slack_webhook_path ]; then
+    YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH="$(cat /run/secrets/openclaw_slack_webhook_path)"
+    export YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+    log "Slack webhook-path pin loaded (YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH set)."
+else
+    log "Slack webhook-path pin: secret file absent or empty — CHANNEL 1 enforcement OFF (inert)."
+fi
+if [ -s /run/secrets/openclaw_slack_bot_token ]; then
+    YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN="$(cat /run/secrets/openclaw_slack_bot_token)"
+    export YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+    log "Slack bot-token pin loaded (YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN set; value redacted from log)."
+else
+    log "Slack bot-token pin: secret file absent or empty — CHANNEL 2 enforcement OFF (inert)."
+fi
+
 log "Starting Caddy..."
 exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

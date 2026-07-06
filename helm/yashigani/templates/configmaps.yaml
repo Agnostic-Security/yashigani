@@ -1113,18 +1113,36 @@ data:
       handle_path /slack/* {
         route {
           import openclaw-egress-caller-gate
-          # FP-06 Phase 2 — INERT Slack workspace-pin hook (awaits Tiago greenlit
-          # secret provisioning — suggest-yes-create-never invariant).
-          # Activate by uncommenting when YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN is provisioned:
-          #   header_up -Authorization
-          #   header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN}"
-          reverse_proxy https://slack.com {
-            header_up Host slack.com
-            header_up -X-SPIFFE-ID
-            header_up -X-Caddy-Verified-Secret
-            transport http {
-              tls
-              tls_server_name slack.com
+          # FP-06 Phase 2 — Slack bot-token workspace pin (CHANNEL 2).
+          # Compose parity: docker/Caddyfile.openclaw-egress (@slack_pin_on block).
+          # Env YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN sourced from K8s Secret
+          # yashigani-openclaw-slack-secrets (key: bot_token); injected via
+          # caddy.yaml secretKeyRef (optional: true → empty if not provisioned).
+          # Inert-when-empty: "{$...:}" == "" → expression false → @slack_pin_on
+          # never matches → fallback handle runs (pass-through, unchanged).
+          @slack_pin_on expression "{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""
+          handle @slack_pin_on {
+            reverse_proxy https://slack.com {
+              header_up -Authorization
+              header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}"
+              header_up Host slack.com
+              header_up -X-SPIFFE-ID
+              header_up -X-Caddy-Verified-Secret
+              transport http {
+                tls
+                tls_server_name slack.com
+              }
+            }
+          }
+          handle {
+            reverse_proxy https://slack.com {
+              header_up Host slack.com
+              header_up -X-SPIFFE-ID
+              header_up -X-Caddy-Verified-Secret
+              transport http {
+                tls
+                tls_server_name slack.com
+              }
             }
           }
         }
@@ -1132,9 +1150,15 @@ data:
       handle_path /slack-hooks/* {
         route {
           import openclaw-egress-caller-gate
-          # FP-06 Phase 2 — INERT Slack workspace-pin hook (same as /slack/*).
-          #   header_up -Authorization
-          #   header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN}"
+          # FP-06 Phase 2 — Slack incoming-webhook path pin (CHANNEL 1).
+          # Compose parity: docker/Caddyfile.openclaw-egress (@wrong_slack_hook block).
+          # Env YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH sourced from K8s Secret
+          # yashigani-openclaw-slack-secrets (key: webhook_path); injected via
+          # caddy.yaml secretKeyRef (optional: true → empty if not provisioned).
+          # Inert-when-empty: "{$...:}" == "" → "" != "" is false → short-circuit
+          # → @wrong_slack_hook never fires → no enforcement on a default install.
+          @wrong_slack_hook expression "{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != "" && !{http.request.uri.path}.startsWith("{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}")
+          respond @wrong_slack_hook "Forbidden" 403
           reverse_proxy https://hooks.slack.com {
             header_up Host hooks.slack.com
             header_up -X-SPIFFE-ID
