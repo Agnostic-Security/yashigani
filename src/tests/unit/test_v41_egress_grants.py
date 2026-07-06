@@ -391,11 +391,14 @@ def _manifest_yaml(egress_block: str = "") -> str:
     return doc.replace("@EGRESS@\n", "")
 
 
+# Phase 2a: internet-facing needs MUST declare account pins — the
+# egress-forwarder template FAILS render without them (Laura L-US-3,
+# codegen._assert_egress_pins). The grant write itself consumes only prefix.
 _EGRESS_BLOCK = """\
   egress:
     needs:
-      - {prefix: slack, deliver_to: "slack.com:443"}
-      - {prefix: telegram, deliver_to: "api.telegram.org:443"}
+      - {prefix: slack, deliver_to: "slack.com:443", pins: {bot_token_env: TEST_SLACK_BOT_TOKEN}}
+      - {prefix: telegram, deliver_to: "api.telegram.org:443", pins: {bot_id_env: TEST_TG_BOT_ID}}
 """
 
 

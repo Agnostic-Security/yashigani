@@ -272,6 +272,25 @@
           }
         },
 
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "v4.1 unified-sidecar (design §2.1) — what the system SERVES. Phase 2a consumes shim_port (the intra-zone-deny tuple for the egress-forwarder split-ringfence topology); surface classes generalise in the descriptor-unification phase. For Shape-C MCPs, spec.mcp.exposes.shim_port remains authoritative when both are absent/present per codegen._resolve_shim_port precedence (ingress.shim_port wins).",
+          "properties": {
+            "surface": {
+              "type": "string",
+              "enum": ["mcp", "openai-api", "http-api", "none"],
+              "description": "Served-surface class (design §2.1). Informational in Phase 2a."
+            },
+            "shim_port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "The system's serve/shim port. Pins the intra-zone deny: forwarder → system:<shim_port> is DENIED on the egress ringfence (design §2.3)."
+            }
+          }
+        },
+
         "egress": {
           "type": "object",
           "additionalProperties": false,
@@ -297,8 +316,36 @@
                   "pins": {
                     "type": "object",
                     "additionalProperties": true,
-                    "description": "Destination/account pins (bot-token workspace pin, webhook path pin, bot-ID pin, …). Consumed by the sidecar template codegen; the template MUST fail render for internet-facing/webhook prefixes without their pin (Laura L-US-3 — enforced at codegen, later phase)."
+                    "description": "Destination/account pins (bot-token workspace pin, webhook path pin, bot-ID pin, …). Consumed by the sidecar template codegen; the template FAILS render for internet-facing/webhook prefixes without their pin (Laura L-US-3 — enforced by codegen._assert_egress_pins, Phase 2a)."
                   }
+                }
+              }
+            },
+            "svid_files": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["cert", "key", "ca", "owner_uid"],
+              "description": "TRANSITIONAL (v4.1 Phase 2a — retires at the system's per-instance /agents/ identity migration, design §3.1 step 1). Pre-migration bundled systems (openclaw) hold a hand-minted service leaf as per-file host binds instead of the standard SVID named volume. Declaring this block makes the egress-forwarder mount these files READ-ONLY at the standard SVID container paths, so the generated forwarder config is identical across modes. Declarative capability config — codegen has NO name-keyed branch.",
+              "properties": {
+                "cert": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Host path (compose-relative) of the service leaf certificate, e.g. ./secrets/openclaw_client.crt."
+                },
+                "key": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Host path of the service leaf private key. The forwarder container runs as owner_uid so it can read the 0600 key."
+                },
+                "ca": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Host path of the trust anchor used to verify the caddy:18790 egress-gateway server certificate (e.g. ./secrets/ca_root.crt — the same anchor the system itself uses today)."
+                },
+                "owner_uid": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Owning UID of the key file; the forwarder container user is set to this UID (transitional-mode replacement for the GID-2003 volume contract)."
                 }
               }
             }

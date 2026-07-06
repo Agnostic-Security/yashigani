@@ -79,7 +79,19 @@ dict of {relative_path: content} without writing any files.
 
 Shape B (off-process HTTP) and offboard are out of scope (later phases).
 
-Last updated: 2026-05-29T00:00:00+00:00
+v4.1 unified-sidecar Phase 2a — egress-forwarder template (design §2.2(c/d),
+§2.3, §2.6): systems declaring spec.egress.needs != [] additionally get
+  docker/<system>-egress-forwarder.override.yml   (split ringfences —
+      ringfence_<s>_in EXACTLY {system, caddy}, ringfence_<s>_eg EXACTLY
+      {system, egress-<s>} — + forwarder sidecar + intra-zone deny)
+  docker/caddy/egress/<system>-forwarder.caddy    (forwarder Caddy config)
+  helm/yashigani/values-<system>-egress.yaml      (K8s parity — separate
+      forwarder pod + NetworkPolicies via templates/egress-forwarders.yaml)
+The §2.6 topology invariant is enforced STRUCTURALLY by
+validate_ringfence_topology() — any 3rd member on the ingress ringfence is a
+CodegenError (I1-02 gate), never a warning.
+
+Last updated: 2026-07-06T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -1787,6 +1799,915 @@ def resolve_egress_forwarder_port(parsed: Optional[dict] = None) -> int:
     return override
 
 
+# ---------------------------------------------------------------------------
+# v4.1 unified-sidecar Phase 2a — egress-forwarder template
+# (design §2.2(c/d), §2.3, §2.6 — I1-02 gate; synthesis must-fixes #2 and #3)
+# ---------------------------------------------------------------------------
+# Every system whose descriptor declares spec.egress.needs != [] gets ONE
+# per-system egress-forwarder sidecar (`egress-<system>`), rendered from this
+# template with no per-agent special-casing:
+#
+#   - The forwarder holds the system's SVID mount (per-instance leaf,
+#     GID-scoped, forwarder-container-only) and PRESENTS that leaf to the
+#     caddy:18790 egress gateway (mTLS client).  The wrapped system itself
+#     never needs mTLS capability — it dials the forwarder over plain HTTP
+#     on the isolated egress ringfence (T2 rationale, same as the shim-side
+#     argument in _gen_caddy_snippet_mcp).
+#   - The forwarder listens on the FIXED port MCP_EGRESS_FORWARDER_PORT
+#     (9400, Captain C2) and proxies /{prefix}/* → caddy:18790/{prefix}/*,
+#     which rewrites into the gateway /egress/eval/{prefix}/* content gate
+#     (Tom's published interface, egress_proxy.py — reused unchanged).
+#   - Split ringfence topology (§2.6, BINDING — I1-02 preservation):
+#       ringfence_<s>_in  = EXACTLY {system, ingress-Caddy}   (2-member)
+#       ringfence_<s>_eg  = EXACTLY {system, egress-<s>}      (2-member)
+#     The forwarder is NEVER a member of the ingress ringfence — a
+#     compromised forwarder must have no L3 path to the shim's plaintext
+#     port.  validate_ringfence_topology() enforces this STRUCTURALLY on the
+#     rendered artifact and errors on any violation (contract tests 3a-3d).
+#   - Intra-zone deny (§2.2(d)/§2.6 belt-and-suspenders): the system binds
+#     0.0.0.0:<shim_port>, so its egress-bridge IP is reachable from the
+#     forwarder at L3.  Compose: a ringfence-init sidecar in the FORWARDER's
+#     network namespace applies default-deny OUTPUT permitting ONLY
+#     caddy:18790 (+ DNS + ESTABLISHED responses) — this denies
+#     forwarder→system:<shim_port> and also implements the synthesis #2
+#     requirement that the forwarder cannot reach gateway:8080 /
+#     backoffice:8443 despite caddy_internal membership.
+#     NOTE (Captain): the design text says "iptables FORWARD DROP on the
+#     egress bridge"; containers cannot program the host bridge FORWARD
+#     chain, so the deployable netns-equivalent is the established
+#     ringfence-init OUTPUT default-deny pattern — identical effect
+#     (forwarder cannot INITIATE to system:<shim_port>), same L1 mechanism
+#     every ring-fenced agent already uses.  K8s: the deny is achieved by
+#     ABSENCE of an egress allow (standard K8s NetworkPolicy is default-deny;
+#     there is no deny verb) — the generated forwarder egress policy allows
+#     ONLY caddy:18790 + kube-dns and carries an explicit INTRA-ZONE-DENY
+#     marker naming the denied tuple for auditability.
+#   - Forwarder hardening (synthesis #2): carries NO CADDY_INTERNAL_HMAC;
+#     pins its declared prefix allowlist locally (only declared prefixes get
+#     handles, default 403); L9 container hardening; strips identity headers
+#     from wrapped-system requests before proxying (caddy:18790 re-stamps
+#     from the VERIFIED peer cert — forge-proof either way).
+#   - Account-pins mandatory (Laura L-US-3, synthesis #3): render FAILS for
+#     any internet-facing need declared without a non-empty pins object.
+#
+# Shape-C (SC-EGRESS-NONE) systems declare no egress needs → NO forwarder,
+# NO egress ringfence; their existing 2-member ingress ringfence is
+# unchanged (contract test 3d).
+
+# Reserved deliver_to class names that denote INTERNAL delivery targets
+# (no account pin required — L-US-3 applies to internet-facing needs only).
+# "gateway-inference" is the LLM class (design §2.4 — cutover is a later,
+# separately-gated phase; declaring it renders a forwarder handle but the
+# :18790 eval/deliver wiring for the llm prefix lands with §2.4).
+_EGRESS_INTERNAL_DELIVER_CLASSES: frozenset[str] = frozenset({"gateway-inference"})
+
+# Egress-prefix slug constraint — mirrors the manifest schema pattern so a
+# prefix can never carry path metacharacters into deliver_path construction
+# (L-US-4 adjacent).  Re-validated here defensively: codegen must hold the
+# invariant even for callers that bypass schema validation.
+_EGRESS_PREFIX_RE = r"^[a-z0-9][a-z0-9-]{0,63}$"
+
+# Forwarder resource limits (Captain C3 hygiene — a static reverse proxy
+# needs far less than an agent container).
+# NOTE compose vs K8s units: docker compose deploy.resources.*.memory
+# REJECTS the K8s "Mi" suffix ("invalid suffix: 'mi'" — proven live via
+# `docker compose config`, compose v5.1.3). Compose artifacts use M; the
+# Helm template carries its own Mi defaults. (The Shape-C generator's
+# _SC_MEM_LIMIT="256Mi" in compose deploy has the same latent defect —
+# surfaced separately, not silently absorbed here.)
+_EGRESS_FWD_CPU_LIMIT: str = "0.25"
+_EGRESS_FWD_MEM_LIMIT: str = "128M"
+_EGRESS_FWD_CPU_REQUEST: str = "0.05"
+_EGRESS_FWD_MEM_REQUEST: str = "32M"
+
+# Forwarder container image — the hardened Yashigani caddy build (entrypoint
+# overridden to plain `caddy run`, so caddy-entrypoint.sh's iptables logic —
+# which needs NET_ADMIN we drop — never executes).
+_EGRESS_FWD_IMAGE: str = "yashigani/caddy"
+
+# ringfence-init image (docker/ringfence-init/) — reused for the forwarder's
+# intra-zone deny with RINGFENCE_CADDY_PORT=18790.
+_RINGFENCE_INIT_IMAGE: str = "ghcr.io/agnosticsec/ringfence-init"
+
+# The egress gateway listener (docker/Caddyfile.openclaw-egress — canonical,
+# single-sourced per must-fix #9).  Member of _MCP_RESERVED_PORTS above.
+_EGRESS_GATEWAY_PORT: int = 18790
+
+
+def _egress_needs(parsed: dict) -> list[dict]:
+    """Return the normalised, validated spec.egress.needs list.
+
+    Raises:
+        CodegenError: EGRESS_need_invalid, EGRESS_prefix_invalid,
+                      EGRESS_prefix_duplicate.
+    """
+    import re as _re
+
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    needs = ((parsed.get("spec") or {}).get("egress") or {}).get("needs") or []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for n in needs:
+        if not isinstance(n, dict):
+            raise CodegenError(
+                "EGRESS_need_invalid",
+                "spec.egress.needs entry %r for system %r is not a mapping." % (n, system),
+            )
+        prefix = n.get("prefix")
+        if not isinstance(prefix, str) or not _re.match(_EGRESS_PREFIX_RE, prefix):
+            raise CodegenError(
+                "EGRESS_prefix_invalid",
+                "spec.egress.needs prefix %r for system %r is invalid: must match "
+                "%s (lowercase alnum + hyphen, max 64 — L-US-4)." % (
+                    prefix, system, _EGRESS_PREFIX_RE),
+            )
+        if prefix in seen:
+            raise CodegenError(
+                "EGRESS_prefix_duplicate",
+                "spec.egress.needs declares prefix %r twice for system %r." % (prefix, system),
+            )
+        seen.add(prefix)
+        out.append(n)
+    return out
+
+
+def _resolve_shim_port(parsed: dict) -> int:
+    """Resolve the wrapped system's serve/shim port for the intra-zone deny.
+
+    Order: spec.ingress.shim_port (unified descriptor, design §2.1) →
+    spec.mcp.exposes.shim_port (existing Shape-C field) → _SC_BRIDGE_PORT
+    default.  The generator ERRORS on an invalid explicit value — the
+    intra-zone deny must pin a real port (§2.3).
+    """
+    spec = parsed.get("spec") or {}
+    ingress = spec.get("ingress") or {}
+    mcp_exposes = (spec.get("mcp") or {}).get("exposes") or {}
+    port = ingress.get("shim_port")
+    if port is None:
+        port = mcp_exposes.get("shim_port")
+    if port is None:
+        port = _SC_BRIDGE_PORT
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+        raise CodegenError(
+            "EGRESS_shim_port_invalid",
+            "cannot derive a valid shim/serve port for system %r "
+            "(spec.ingress.shim_port / spec.mcp.exposes.shim_port = %r). The "
+            "intra-zone deny (design §2.3) must pin a real port — declare it." % (
+                (parsed.get("metadata") or {}).get("name", ""), port),
+        )
+    return port
+
+
+def _assert_egress_pins(needs: list[dict], system: str) -> None:
+    """Laura L-US-3 (synthesis must-fix #3): account pins are MANDATORY.
+
+    Any need whose deliver_to is internet-facing (i.e. not a reserved
+    internal class) — or which omits deliver_to entirely (fail closed) —
+    must declare a non-empty pins object.
+
+    Raises:
+        CodegenError: EGRESS_pin_required.
+    """
+    for n in needs:
+        deliver_to = n.get("deliver_to") or ""
+        if deliver_to in _EGRESS_INTERNAL_DELIVER_CLASSES:
+            continue
+        pins = n.get("pins")
+        if not isinstance(pins, dict) or not pins:
+            raise CodegenError(
+                "EGRESS_pin_required",
+                "spec.egress.needs prefix %r for system %r is internet-facing "
+                "(deliver_to=%r) but declares no account pins. The template "
+                "FAILS render for internet-facing/webhook prefixes without "
+                "their pin (Laura L-US-3 — no default-off pinning for shared "
+                "systems)." % (n.get("prefix"), system, deliver_to),
+            )
+
+
+def _egress_svid_cfg(parsed: dict) -> dict:
+    """Resolve how the forwarder obtains the system's SVID material.
+
+    Default mode "volume": the standard per-instance SVID named volume
+    (ysg_svid_<t>_<s>, written by the svid-sidecar; key 0440 GID 2003 —
+    forwarder reads via group_add 2003, same contract as Caddy).
+
+    TRANSITIONAL mode "files" (spec.egress.svid_files — declarative, no
+    name-based code branch): pre-migration bundled systems (openclaw) still
+    hold a hand-minted service leaf as per-file binds.  The files are bound
+    into the forwarder AT THE STANDARD SVID PATHS, so the generated
+    forwarder Caddyfile is byte-identical across modes.  owner_uid must
+    match the key file's owner (e.g. 1000 for the openclaw leaf, key mode
+    0600 uid 1000 per lib/pki_ownership.sh).  RETIRES when the system
+    migrates to a per-instance /agents/ identity (design §3.1 step 1).
+
+    Raises:
+        CodegenError: EGRESS_svid_files_invalid.
+    """
+    egress = ((parsed.get("spec") or {}).get("egress") or {})
+    svid_files = egress.get("svid_files")
+    if svid_files is None:
+        return {"mode": "volume"}
+    system = (parsed.get("metadata") or {}).get("name", "")
+    if not isinstance(svid_files, dict):
+        raise CodegenError(
+            "EGRESS_svid_files_invalid",
+            "spec.egress.svid_files for system %r must be a mapping." % system,
+        )
+    cert = svid_files.get("cert")
+    key = svid_files.get("key")
+    ca = svid_files.get("ca")
+    owner_uid = svid_files.get("owner_uid")
+    if not (isinstance(cert, str) and cert and isinstance(key, str) and key
+            and isinstance(ca, str) and ca):
+        raise CodegenError(
+            "EGRESS_svid_files_invalid",
+            "spec.egress.svid_files for system %r must declare non-empty "
+            "cert, key and ca host paths (got cert=%r key=%r ca=%r)." % (
+                system, cert, key, ca),
+        )
+    if not isinstance(owner_uid, int) or isinstance(owner_uid, bool) or owner_uid < 1:
+        raise CodegenError(
+            "EGRESS_svid_files_invalid",
+            "spec.egress.svid_files.owner_uid for system %r must be a positive "
+            "integer matching the key file's owning UID (got %r) — the "
+            "forwarder container runs as this UID so it can read the 0600 "
+            "key." % (system, owner_uid),
+        )
+    return {"mode": "files", "cert": cert, "key": key, "ca": ca, "owner_uid": owner_uid}
+
+
+def _gen_egress_forwarder_caddyfile(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """Generate the forwarder's COMPLETE Caddy config (not a snippet).
+
+    docker/caddy/egress/<system>-forwarder.caddy — mounted as the sole
+    config of the egress-<system> container.
+
+      - admin off (no admin socket in the agent trust zone), auto_https off.
+      - :<forwarder_port> plain-HTTP listener — reachable ONLY on
+        ringfence_<s>_eg (2-member: system + forwarder).  Plain HTTP on the
+        isolated bridge is intentional (T2): the per-instance identity
+        travels via the leaf the forwarder PRESENTS on the next hop, not
+        via listener TLS.
+      - one handle per DECLARED prefix (local prefix allowlist,
+        synthesis #2 defence-in-depth); everything else → 403.
+      - each handle strips identity/marker headers the wrapped system may
+        try to smuggle, then reverse-proxies to https://caddy:18790/{prefix}
+        presenting the system's SVID leaf (tls_client_auth from the SVID
+        mount).  caddy:18790 verifies the leaf, stamps X-SPIFFE-ID from the
+        VERIFIED URI SAN, and forwards into gateway /egress/eval — Tom's
+        interface untouched.
+      - NO CADDY_INTERNAL_HMAC anywhere in this config (synthesis #2): the
+        Layer-B marker is attached by the :18790 gateway hop, never by a
+        component inside the agent trust zone.
+      - C8 conn-pool cap on the upstream transport.
+    """
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    needs = _egress_needs(parsed)
+    fwd_port = resolve_egress_forwarder_port(parsed)
+    leaf_crt, leaf_key = _mcp_svid_paths(tenant_id, system)
+    svid_ca = "%s/%s/%s/ca.crt" % (_MCP_SVID_MOUNT_ROOT, tenant_id, system)
+
+    handles: list[str] = []
+    for n in needs:
+        prefix = n["prefix"]
+        deliver_to = n.get("deliver_to") or "(static :18790 handles)"
+        handles.append(textwrap.dedent("""\
+            # ── {prefix} — {system} /{prefix}/* → caddy:{gw_port}/{prefix}/* → /egress/eval ──
+            # Final delivery target (enforced at the :{gw_port} deliver handles): {deliver_to}
+            handle /{prefix}/* {{
+                # Header hygiene: the wrapped system must not smuggle identity or
+                # Layer-B markers — caddy:{gw_port} re-stamps from the VERIFIED peer
+                # cert anyway (forge-proof); this strip is belt-and-suspenders.
+                request_header -X-SPIFFE-ID
+                request_header -X-Caddy-Verified-Secret
+                request_header -X-Yashigani-Verified-Spiffe
+                reverse_proxy https://caddy:{gw_port} {{
+                    transport http {{
+                        tls
+                        tls_trust_pool file {svid_ca}
+                        tls_client_auth {leaf_crt} {leaf_key}
+                        tls_server_name caddy
+                        max_conns_per_host {max_conns}
+                    }}
+                }}
+            }}""").format(
+            prefix=prefix, system=system, gw_port=_EGRESS_GATEWAY_PORT,
+            deliver_to=deliver_to, svid_ca=svid_ca, leaf_crt=leaf_crt,
+            leaf_key=leaf_key, max_conns=_C8_MAX_CONNS_PER_HOST_DEFAULT,
+        ))
+
+    handles_block = textwrap.indent("\n\n".join(handles), "    ")
+
+    content = textwrap.dedent("""\
+        {header}
+        # v4.1 unified-sidecar Phase 2a — egress-forwarder config for system: {system} (tenant: {tenant_id})
+        # Container: egress-{system} — the ONLY holder of this system's SVID mount.
+        # Listener is plain HTTP by design (T2) and reachable ONLY on the 2-member
+        # egress ringfence ringfence_{system}_eg (system + forwarder — §2.6).
+        # NO CADDY_INTERNAL_HMAC in this config (synthesis must-fix #2).
+        {{
+            admin off
+            auto_https off
+            log {{
+                output stderr
+                format json
+            }}
+        }}
+
+        :{fwd_port} {{
+            # Outbound body cap — matches the :18790 gateway cap (ASVS 4.1.7).
+            request_body {{
+                max_size 10MB
+            }}
+
+            # Liveness only (config loaded + listener up). Serviceability of the
+            # full egress path (leaf → :18790 → /egress/eval) is proven by the
+            # Phase-2b live acceptance gate (design §8 item 4, Laura co-sign).
+            handle /healthz {{
+                respond "ok" 200
+            }}
+
+        {handles_block}
+
+            # Local prefix allowlist (synthesis #2): ONLY the prefixes declared in
+            # spec.egress.needs exist on this listener. Default-deny everything else.
+            handle {{
+                respond "Forbidden" 403
+            }}
+        }}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        system=system,
+        tenant_id=tenant_id,
+        fwd_port=fwd_port,
+        handles_block=handles_block,
+    )
+    return content
+
+
+def _gen_egress_forwarder_compose(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """Generate docker/<system>-egress-forwarder.override.yml.
+
+    The authoritative SPLIT-RINGFENCE topology statement for the system
+    (design §2.2(d)/§2.6) — self-contained and additive (compose merges
+    service `networks:` lists across -f files):
+
+      services:
+        <system>     — joins ringfence_<s>_in + ringfence_<s>_eg
+        caddy        — joins ringfence_<s>_in (ingress front; NEVER _eg)
+        egress-<s>   — joins ringfence_<s>_eg + caddy_internal (to reach
+                       caddy:18790; L1 default-deny below prevents any other
+                       caddy_internal destination — synthesis #2)
+        ringfence-init-egress-<s> — intra-zone deny in the forwarder netns
+      networks: both bridges, internal:true, IPv6 off.
+
+    validate_ringfence_topology() is run on this artifact by the renderer —
+    the 2-member invariants are enforced structurally, not advisorily.
+    """
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    needs = _egress_needs(parsed)
+    fwd_port = resolve_egress_forwarder_port(parsed)
+    shim_port = _resolve_shim_port(parsed)
+    svid_cfg = _egress_svid_cfg(parsed)
+    fwd_svc = "egress-%s" % system
+    init_svc = "ringfence-init-egress-%s" % system
+    rf_in = "ringfence_%s_in" % system
+    rf_eg = "ringfence_%s_eg" % system
+    svid_dir = "%s/%s/%s" % (_MCP_SVID_MOUNT_ROOT, tenant_id, system)
+    prefixes = ", ".join(n["prefix"] for n in needs)
+    emit_init = runtime != "podman-rootless"
+
+    # SVID delivery into the forwarder — volume (standard) or per-file binds
+    # (transitional, declarative via spec.egress.svid_files).  Both mount at
+    # the SAME in-container paths so the forwarder Caddyfile is mode-agnostic.
+    if svid_cfg["mode"] == "volume":
+        svid_volume_lines = [
+            "      # Per-instance SVID (leaf+key, 0440 GID %d) — svid-sidecar writes," % _MCP_SVID_GID,
+            "      # forwarder reads via group_add %d. FORWARDER-ONLY mount (synthesis #2):" % _MCP_SVID_GID,
+            "      # the wrapped system has NO volume access to this material.",
+            "      - %s:%s:ro" % (_mcp_svid_volume_name(tenant_id, system), svid_dir),
+        ]
+        user_line = '    user: "65534:65534"'
+        group_add_lines = [
+            "    group_add:",
+            '      - "%d"' % _MCP_SVID_GID,
+        ]
+        top_volume_lines = [
+            "",
+            "# Per-instance SVID volume (shared with the svid-sidecar writer; identical",
+            "# definition merges cleanly with the system's own override).",
+            "volumes:",
+            "  %s:" % _mcp_svid_volume_name(tenant_id, system),
+            "    driver: local",
+        ]
+    else:
+        svid_volume_lines = [
+            "      # TRANSITIONAL (spec.egress.svid_files — retires at per-instance",
+            "      # migration, design §3.1 step 1): hand-minted service leaf bound at",
+            "      # the STANDARD SVID paths so the forwarder config is mode-agnostic.",
+            "      # FORWARDER-ONLY mount of this material (synthesis #2).",
+            "      - %s:%s/client.crt:ro" % (svid_cfg["cert"], svid_dir),
+            "      - %s:%s/client.key:ro" % (svid_cfg["key"], svid_dir),
+            "      - %s:%s/ca.crt:ro" % (svid_cfg["ca"], svid_dir),
+        ]
+        user_line = '    user: "%d:%d"  # matches the transitional key file owner (0600)' % (
+            svid_cfg["owner_uid"], svid_cfg["owner_uid"])
+        group_add_lines = []
+        top_volume_lines = []
+
+    rootless_lines: list[str] = []
+    if runtime == "podman-rootless":
+        rootless_lines = [
+            "  # %s" % _ROOTLESS_L1_GAP_WARNING.lstrip("# "),
+            "  # Applies to the intra-zone deny too: ringfence-init-egress-%s is NOT" % system,
+            "  # emitted rootless. The 2-member bridge topology (L2) and OPA grants (L3)",
+            "  # remain the active controls for forwarder→system:%d containment." % shim_port,
+        ]
+
+    lines = [
+        _header_comment(manifest_hash, runtime),
+        "# v4.1 unified-sidecar Phase 2a — egress-forwarder override for system: %s (tenant: %s)" % (
+            system, tenant_id),
+        "# Declared egress prefixes: %s" % prefixes,
+        "#",
+        "# SPLIT RINGFENCE TOPOLOGY (design §2.6 — BINDING, I1-02 preservation):",
+        "#   %s = EXACTLY {%s, caddy}       — ingress zone, 2-member" % (rf_in, system),
+        "#   %s = EXACTLY {%s, egress-%s} — egress zone, 2-member" % (rf_eg, system, system),
+        "# The forwarder is NEVER on the ingress ringfence: a compromised forwarder",
+        "# must have no L3 path to the shim's plaintext port. Enforced structurally",
+        "# by codegen.validate_ringfence_topology() — 3rd member = CodegenError.",
+        "#",
+        "# INTRA-ZONE-DENY (§2.2(d)): %s → %s:%d REFUSED." % (fwd_svc, system, shim_port),
+        "# Mechanism: ringfence-init in the FORWARDER netns applies default-deny",
+        "# OUTPUT permitting ONLY caddy:%d (+DNS +ESTABLISHED). Netns-equivalent" % _EGRESS_GATEWAY_PORT,
+        "# of the design's bridge FORWARD DROP (containers cannot program the host",
+        "# bridge FORWARD chain). Also enforces synthesis #2: no forwarder path to",
+        "# gateway:8080 / backoffice:8443 despite caddy_internal membership.",
+        "# Live REFUSED probe = Phase-2b acceptance gate (§8 item 4, Laura co-sign).",
+        "services:",
+        "  %s:" % system,
+        "    networks:",
+        "      - %s" % rf_in,
+        "      - %s" % rf_eg,
+        "",
+        "  # Ingress front: caddy joins the INGRESS ringfence only (sole co-member).",
+        "  # Compose merges this list with the base caddy networks (additive).",
+        "  caddy:",
+        "    networks:",
+        "      - %s" % rf_in,
+        "",
+        "  # The egress-forwarder sidecar (§2.3) — sole holder of the SVID mount;",
+        "  # presents the leaf to caddy:%d; listens plain-HTTP :%d on the" % (
+            _EGRESS_GATEWAY_PORT, fwd_port),
+        "  # egress ringfence. NO CADDY_INTERNAL_HMAC is mounted or injected here.",
+        "  %s:" % fwd_svc,
+        "    image: ${YASHIGANI_EGRESS_FORWARDER_IMAGE:-%s}:${YASHIGANI_VERSION:-3.0.0}" % _EGRESS_FWD_IMAGE,
+        "    restart: unless-stopped",
+        "    # Plain `caddy run` — caddy-entrypoint.sh (iptables logic, needs",
+        "    # NET_ADMIN) deliberately bypassed; every capability is dropped.",
+        '    entrypoint: ["caddy"]',
+        '    command: ["run", "--config", "/etc/caddy/egress-forwarder.caddy", "--adapter", "caddyfile"]',
+        "    environment:",
+        "      # Caddy writable state on tmpfs (read_only rootfs).",
+        "      XDG_CONFIG_HOME: /tmp/caddy/config",
+        "      XDG_DATA_HOME: /tmp/caddy/data",
+        "    expose:",
+        '      - "%d"' % fwd_port,
+        "    volumes:",
+        "      - ./caddy/egress/%s-forwarder.caddy:/etc/caddy/egress-forwarder.caddy:ro" % system,
+    ] + svid_volume_lines + [
+        "    tmpfs:",
+        "      - /tmp:size=16m,mode=0700",
+        "    networks:",
+        "      # Egress ringfence (2-member: %s + this forwarder) + caddy_internal" % system,
+        "      # to reach caddy:%d. L1 default-deny (init below) pins caddy:%d as" % (
+            _EGRESS_GATEWAY_PORT, _EGRESS_GATEWAY_PORT),
+        "      # the ONLY initiable destination.",
+        "      - %s" % rf_eg,
+        "      - caddy_internal",
+        user_line,
+    ] + group_add_lines + [
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    cap_drop:",
+        "      - ALL",
+        "    read_only: true",
+        "    # L3 — IPv6 default-deny",
+        "    sysctls:",
+        "      net.ipv6.conf.all.disable_ipv6: 1",
+        "      net.ipv6.conf.default.disable_ipv6: 1",
+        "    healthcheck:",
+        '      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:%d/healthz >/dev/null 2>&1 || exit 1"]' % fwd_port,
+        "      interval: 15s",
+        "      timeout: 5s",
+        "      retries: 3",
+        "      start_period: 10s",
+        "    deploy:",
+        "      resources:",
+        "        limits:",
+        "          cpus: '%s'" % _EGRESS_FWD_CPU_LIMIT,
+        "          memory: %s" % _EGRESS_FWD_MEM_LIMIT,
+        "        reservations:",
+        "          cpus: '%s'" % _EGRESS_FWD_CPU_REQUEST,
+        "          memory: %s" % _EGRESS_FWD_MEM_REQUEST,
+    ] + (
+        [
+            "",
+            "  # INTRA-ZONE-DENY enforcer: runs in the FORWARDER's netns (network_mode",
+            "  # service:), applies default-deny OUTPUT + ACCEPT caddy:%d + DNS +" % _EGRESS_GATEWAY_PORT,
+            "  # ESTABLISHED (inbound %s→forwarder:%d responses still flow)." % (system, fwd_port),
+            "  # DENIES: %s → %s:%d (and every other destination)." % (fwd_svc, system, shim_port),
+            "  #",
+            "  # ORDERING (Captain): network_mode service:<forwarder> already implies",
+            "  # init-after-forwarder; the reverse depends_on (forwarder waits for",
+            "  # init completion, the classic L7 pattern) is a dependency CYCLE that",
+            "  # compose v5 rejects outright. The rules therefore land moments after",
+            "  # the forwarder process starts. Accepted: the deny is belt-and-",
+            "  # suspenders against a COMPROMISED forwarder (a post-boot event); the",
+            "  # forwarder never legitimately initiates to the system; and the",
+            "  # Phase-2b live acceptance gate (§8 item 4) probes the APPLIED state.",
+            "  %s:" % init_svc,
+            "    image: ${YASHIGANI_RINGFENCE_INIT_IMAGE:-%s}:${YASHIGANI_RINGFENCE_INIT_VERSION:-0.1.0}" % _RINGFENCE_INIT_IMAGE,
+            '    network_mode: "service:%s"' % fwd_svc,
+            "    depends_on:",
+            "      %s:" % fwd_svc,
+            "        condition: service_started",
+            "    cap_drop:",
+            "      - ALL",
+            "    cap_add:",
+            "      - NET_ADMIN",
+            "    security_opt:",
+            "      - no-new-privileges:true",
+            "    environment:",
+            "      RINGFENCE_CADDY_HOST: caddy",
+            '      RINGFENCE_CADDY_PORT: "%d"' % _EGRESS_GATEWAY_PORT,
+            '      RINGFENCE_DNS_SERVER: "127.0.0.11"',
+            '      RINGFENCE_RUNTIME: "%s"' % runtime,
+            '      RINGFENCE_AGENT_NAME: "%s"' % fwd_svc,
+            "    tmpfs:",
+            "      - /run/ringfence:size=1m,mode=1777",
+        ] if emit_init else rootless_lines
+    ) + top_volume_lines + [
+        "",
+        "# SPLIT RINGFENCES (§2.6): both internal:true, IPv6 off. Membership is the",
+        "# invariant — validate_ringfence_topology() errors on any 3rd member.",
+        "networks:",
+        "  %s:" % rf_in,
+        "    driver: bridge",
+        "    enable_ipv6: false",
+        "    internal: true",
+        "  %s:" % rf_eg,
+        "    driver: bridge",
+        "    enable_ipv6: false",
+        "    internal: true",
+    ]
+
+    return "\n".join(line for line in lines if line != "") + "\n"
+
+
+def validate_ringfence_topology(compose_text: str, system: str) -> None:
+    """§2.6 generator enforcement — the I1-02 gate (contract tests 3a/3b).
+
+    Parses a rendered compose override and STRUCTURALLY asserts the split
+    ringfence invariants for ``system``:
+
+      * ``ringfence_<s>_in`` members == EXACTLY {system, caddy} — any 3rd
+        member (or a missing/wrong member) is a hard CodegenError, never a
+        warning.  The forwarder must NEVER appear here.
+      * ``ringfence_<s>_eg`` members == EXACTLY {system, egress-<s>} —
+        the ingress Caddy must NEVER appear here.
+      * Cross-bridge contamination: no service other than the system itself
+        may be a member of BOTH bridges (bridge membership strictly
+        disjoint apart from the wrapped system — Laura §6.1).
+      * Both bridges must be internal:true with enable_ipv6:false.
+
+    Raises:
+        CodegenError: RINGFENCE_IN_MEMBERSHIP_VIOLATION,
+                      RINGFENCE_EG_MEMBERSHIP_VIOLATION,
+                      RINGFENCE_CROSS_BRIDGE_CONTAMINATION,
+                      RINGFENCE_BRIDGE_NOT_INTERNAL,
+                      RINGFENCE_TOPOLOGY_UNPARSEABLE.
+    """
+    import yaml as _yaml
+
+    rf_in = "ringfence_%s_in" % system
+    rf_eg = "ringfence_%s_eg" % system
+    fwd_svc = "egress-%s" % system
+
+    try:
+        doc = _yaml.safe_load(compose_text)
+    except _yaml.YAMLError as exc:
+        raise CodegenError(
+            "RINGFENCE_TOPOLOGY_UNPARSEABLE",
+            "rendered egress override for system %r is not valid YAML: %s" % (system, exc),
+        )
+    if not isinstance(doc, dict):
+        raise CodegenError(
+            "RINGFENCE_TOPOLOGY_UNPARSEABLE",
+            "rendered egress override for system %r did not parse to a mapping." % system,
+        )
+
+    services = doc.get("services") or {}
+    members: dict[str, set[str]] = {rf_in: set(), rf_eg: set()}
+    for svc_name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        nets = svc.get("networks") or []
+        net_names = list(nets.keys()) if isinstance(nets, dict) else list(nets)
+        for bridge in (rf_in, rf_eg):
+            if bridge in net_names:
+                members[bridge].add(str(svc_name))
+
+    expected_in = {system, "caddy"}
+    if members[rf_in] != expected_in:
+        extra = sorted(members[rf_in] - expected_in)
+        missing = sorted(expected_in - members[rf_in])
+        raise CodegenError(
+            "RINGFENCE_IN_MEMBERSHIP_VIOLATION",
+            "INGRESS ringfence %r must contain EXACTLY {%s, caddy} (2-member "
+            "invariant, design §2.6 / I1-02). Violation: extra members %s, "
+            "missing members %s. The generator refuses to emit this topology "
+            "— a 3rd member on the ingress bridge is an L3 path around the "
+            "wrap." % (rf_in, system, extra, missing),
+        )
+
+    expected_eg = {system, fwd_svc}
+    if members[rf_eg] != expected_eg:
+        extra = sorted(members[rf_eg] - expected_eg)
+        missing = sorted(expected_eg - members[rf_eg])
+        raise CodegenError(
+            "RINGFENCE_EG_MEMBERSHIP_VIOLATION",
+            "EGRESS ringfence %r must contain EXACTLY {%s, %s} (2-member "
+            "invariant, design §2.6). Violation: extra members %s, missing "
+            "members %s." % (rf_eg, system, fwd_svc, extra, missing),
+        )
+
+    contaminated = (members[rf_in] & members[rf_eg]) - {system}
+    if contaminated:
+        raise CodegenError(
+            "RINGFENCE_CROSS_BRIDGE_CONTAMINATION",
+            "service(s) %s are members of BOTH %r and %r — bridge membership "
+            "must be strictly disjoint apart from the wrapped system "
+            "(design §2.6 error conditions; Laura §6.1 pivot check)." % (
+                sorted(contaminated), rf_in, rf_eg),
+        )
+
+    networks = doc.get("networks") or {}
+    for bridge in (rf_in, rf_eg):
+        net = networks.get(bridge)
+        if not isinstance(net, dict) or net.get("internal") is not True \
+                or net.get("enable_ipv6") is not False:
+            raise CodegenError(
+                "RINGFENCE_BRIDGE_NOT_INTERNAL",
+                "bridge %r must be declared with internal: true and "
+                "enable_ipv6: false (got %r)." % (bridge, net),
+            )
+
+
+def _validate_caddy_config_full(
+    content: str,
+    cert_paths: list[str],
+    key_paths: list[str],
+    *,
+    _validator: Optional[Callable[[str], int]] = None,
+) -> None:
+    """C10 for COMPLETE Caddy configs (the forwarder file has its own global
+    options block, so the snippet validators' ``{ admin off }`` wrapper would
+    produce two global blocks — a parse error).  Same two-stage gate as
+    ``_validate_caddy_snippet_mcp`` (adapt on raw; validate with ephemeral
+    cert substitution), same LAURA-005 absent-binary enforcement gate.
+    """
+    if _validator is not None:
+        rc = _validator(content)
+        if rc != 0:
+            raise CodegenError(
+                "C10_caddy_validate_failed",
+                "caddy validate returned exit code %d for egress-forwarder "
+                "config. Codegen aborted (C10)." % rc,
+            )
+        return
+
+    caddy_bin = shutil.which("caddy")
+    if caddy_bin is None:
+        if _c10_require_caddy_validate():
+            raise CodegenError(
+                "C10_caddy_binary_absent",
+                "caddy binary not found and YSG_REQUIRE_CADDY_VALIDATE / "
+                "YASHIGANI_ENV mandates validation (LAURA-005 / C10).",
+            )
+        _log.warning(
+            "C10: caddy binary not found — egress-forwarder config validation "
+            "SKIPPED (LAURA-005 gate applies).")
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix="ysg-c10-egress-")
+    try:
+        raw_path = os.path.join(tmpdir, "raw.Caddyfile")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        result = subprocess.run(  # noqa: S603 — caddy binary is system-installed
+            [caddy_bin, "adapt", "--adapter", "caddyfile", "--config", raw_path],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")[:512]
+            raise CodegenError(
+                "C10_caddy_adapt_failed",
+                "caddy adapt failed (exit %d) for egress-forwarder config: %s" % (
+                    result.returncode, stderr),
+            )
+        eph_crt, eph_key = _ephemeral_validation_pki(tmpdir)
+        substituted = content
+        for p in cert_paths:
+            substituted = substituted.replace(p, eph_crt)
+        for p in key_paths:
+            substituted = substituted.replace(p, eph_key)
+        sub_path = os.path.join(tmpdir, "substituted.Caddyfile")
+        with open(sub_path, "w", encoding="utf-8") as fh:
+            fh.write(substituted)
+        result2 = subprocess.run(  # noqa: S603
+            [caddy_bin, "validate", "--adapter", "caddyfile", "--config", sub_path],
+            capture_output=True, timeout=30,
+        )
+        if result2.returncode != 0:
+            stderr2 = result2.stderr.decode("utf-8", errors="replace")[:512]
+            raise CodegenError(
+                "C10_caddy_validate_failed",
+                "caddy validate failed (exit %d) for egress-forwarder config "
+                "(ephemeral-cert substitution): %s" % (result2.returncode, stderr2),
+            )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _gen_values_egress_forwarder(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """Generate helm/yashigani/values-<system>-egress.yaml.
+
+    Additive-map values (same merge rationale as mcpSvid): each system gets
+    a unique camelCase key under ``egressForwarders``; the chart template
+    ``templates/egress-forwarders.yaml`` renders a SEPARATE forwarder pod
+    (Deployment + Service + NetworkPolicies) per enabled entry.
+
+    K8s topology decision (Captain): the forwarder is a SEPARATE pod, NOT an
+    in-pod sidecar — an in-pod sidecar shares the pod network namespace, so
+    forwarder→system:<shim_port> would be loopback traffic that NetworkPolicy
+    CANNOT filter, silently voiding the §2.6 intra-zone deny.  §2.6 (the
+    authoritative resolution) specifies forwarder-pod-scoped NetworkPolicies,
+    which require a separate pod.
+
+    K8s intra-zone deny: standard NetworkPolicy has no deny verb — the deny
+    is achieved by ABSENCE of an egress allow (the forwarder egress policy
+    allows ONLY caddy:18790 + kube-dns).  The rendered policy carries an
+    explicit INTRA-ZONE-DENY marker naming the denied tuple.
+    """
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    needs = _egress_needs(parsed)
+    fwd_port = resolve_egress_forwarder_port(parsed)
+    shim_port = _resolve_shim_port(parsed)
+    svid_cfg = _egress_svid_cfg(parsed)
+    helm_key = _mcp_svid_helm_key(tenant_id, system)
+    prefixes_yaml = "\n".join("      - %s" % n["prefix"] for n in needs)
+
+    if svid_cfg["mode"] == "volume":
+        identity_block = (
+            "    # Per-instance SVID Secret (approve transaction creates it;\n"
+            "    # keys client.crt / client.key / ca.crt — SEAM-1d-04 pattern).\n"
+            "    svidSecretName: %s" % _mcp_svid_secret_name(tenant_id, system)
+        )
+    else:
+        # TRANSITIONAL: pre-migration bundled system — project ONLY the three
+        # needed items from the monolithic PKI Secret (YSG-RISK-053 items:
+        # pattern, 52738f13). Retires at per-instance migration (§3.1 step 1).
+        identity_block = (
+            "    # TRANSITIONAL identity (pre per-instance migration — §3.1 step 1):\n"
+            "    # items: projection of the service leaf from the PKI Secret\n"
+            "    # (YSG-RISK-053 scoped-projection pattern). Forwarder-pod-only.\n"
+            "    existingSecret:\n"
+            "      name: yashigani-pki-certs\n"
+            "      certKey: %s_client.crt\n"
+            "      keyKey: %s_client.key\n"
+            "      caKey: ca_bundle.crt" % (system, system)
+        )
+
+    content = textwrap.dedent("""\
+        {header}
+        # v4.1 unified-sidecar Phase 2a — egress-forwarder Helm values for
+        # system: {system} (tenant: {tenant_id})
+        # Rendered by templates/egress-forwarders.yaml as a SEPARATE forwarder pod
+        # (Deployment + Service + NetworkPolicies). Map key is unique per
+        # (system, tenant) so multiple -f overlays merge additively (mcpSvid pattern).
+        egressForwarders:
+          {helm_key}:
+            enabled: true
+            systemName: {system}
+            tenantId: {tenant_id}
+            # Wrapped system's serve/shim port — the INTRA-ZONE-DENY tuple is
+            # egress-{system} -> {system}:{shim_port} (denied by ABSENCE of any
+            # egress allow to the system pod; standard K8s NP is default-deny).
+            shimPort: {shim_port}
+            forwarderPort: {fwd_port}
+            # Local prefix allowlist — ONLY these handles exist on the listener.
+            prefixes:
+        {prefixes_yaml}
+        {identity_block}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        system=system,
+        tenant_id=tenant_id,
+        helm_key=helm_key,
+        shim_port=shim_port,
+        fwd_port=fwd_port,
+        prefixes_yaml=prefixes_yaml,
+        identity_block=identity_block,
+    )
+    return content
+
+
+def render_egress_forwarder_artifacts(
+    parsed: dict,
+    runtime: str,
+    *,
+    caddy_validator: Optional[Callable[[str], int]] = None,
+) -> dict[str, str]:
+    """Render the per-system egress-forwarder artifact set (Phase 2a public API).
+
+    Capability-keyed, never name-keyed: any system descriptor with
+    ``spec.egress.needs != []`` gets the full set; a system with no declared
+    egress needs gets ``{}`` (Shape-C / SC-EGRESS-NONE unchanged — test 3d).
+
+    Artifact set:
+      docker/<system>-egress-forwarder.override.yml   (split ringfences +
+          forwarder + intra-zone deny — topology validated structurally)
+      docker/caddy/egress/<system>-forwarder.caddy    (C10-validated)
+      helm/yashigani/values-<system>-egress.yaml      (K8s parity)
+
+    Raises:
+        CodegenError: INVALID_RUNTIME, EGRESS_*, RINGFENCE_*, C10_*.
+    """
+    if runtime not in VALID_RUNTIMES:
+        raise CodegenError(
+            "INVALID_RUNTIME",
+            "runtime %r is not one of %s" % (runtime, sorted(VALID_RUNTIMES)),
+        )
+    needs = _egress_needs(parsed)
+    if not needs:
+        return {}
+
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    _assert_egress_pins(needs, system)
+    # Validates any descriptor override of the forwarder port (Captain C2).
+    resolve_egress_forwarder_port(parsed)
+
+    mhash = _manifest_hash(parsed)
+    kwargs: dict[str, Any] = {"manifest_hash": mhash, "runtime": runtime}
+
+    caddy_content = _gen_egress_forwarder_caddyfile(parsed, **kwargs)
+    compose_content = _gen_egress_forwarder_compose(parsed, **kwargs)
+    values_content = _gen_values_egress_forwarder(parsed, **kwargs)
+
+    # §2.6 structural gate — the generator can never emit a 3rd member by
+    # construction, but the invariant is ENFORCED, not assumed (I1-02).
+    validate_ringfence_topology(compose_content, system)
+
+    # C10 on the forwarder config (complete-file variant).
+    leaf_crt, leaf_key = _mcp_svid_paths(tenant_id, system)
+    svid_ca = "%s/%s/%s/ca.crt" % (_MCP_SVID_MOUNT_ROOT, tenant_id, system)
+    _validate_caddy_config_full(
+        caddy_content, [leaf_crt, svid_ca], [leaf_key],
+        _validator=caddy_validator,
+    )
+
+    return {
+        "docker/%s-egress-forwarder.override.yml" % system: compose_content,
+        "docker/caddy/egress/%s-forwarder.caddy" % system: caddy_content,
+        "helm/yashigani/values-%s-egress.yaml" % system: values_content,
+    }
+
+
 def _gen_caddy_snippet_mcp(
     parsed: dict,
     *,
@@ -3256,6 +4177,16 @@ class CodegenEngineShapeC:
                 "Remove all entries from spec.secrets." % self._agent_id,
             )
 
+        # v4.1 unified-sidecar note: spec.egress.needs is NOT constrained here.
+        # SC-EGRESS-NONE governs spec.network.egress_allow (DIRECT network
+        # egress — always forbidden for Shape-C, asserted above). Declared
+        # egress needs are a different, GOVERNED class: they route through
+        # the egress-forwarder → caddy:18790 → gateway /egress/eval → OPA
+        # (caller, prefix) grant — the landed Phase-1 grant contract writes
+        # the grant from EXACTLY this list at approve (mcp_onboard step
+        # 4b-iii). Capability-keyed: needs != [] → forwarder artifact set;
+        # needs == [] → none (contract test 3d).
+
         # SC: no MCP-protocol network listener on stdio shape (Laura SB-4).
         # listen_port describes the MCP *protocol* listener — stdio has none.
         # The first-party bridge HTTP port is declared separately as shim_port
@@ -3378,6 +4309,34 @@ class CodegenEngineShapeC:
             "BUG: Phase 1b-i MCP Caddy-front snippet missing for %r — the MCP "
             "would be onboarded UNWRAPPED." % agent_name
         )
+
+        # v4.1 unified-sidecar Phase 2a — capability-keyed, NEVER name- or
+        # shape-keyed: a Shape-C system declaring spec.egress.needs != []
+        # (governed /egress/eval class; grant written from this exact list at
+        # approve) gets the forwarder set; one with no declared needs gets
+        # nothing extra.
+        forwarder_artifacts = render_egress_forwarder_artifacts(
+            self._parsed, runtime, caddy_validator=self._caddy_validator,
+        )
+        artifacts.update(forwarder_artifacts)
+
+        # Contract test 3d (design §8): Shape-C with NO declared egress needs
+        # (SC-EGRESS-NONE unchanged) — the egress ringfence and forwarder
+        # artifacts must NOT appear, and no rendered artifact may reference
+        # ringfence_<s>_eg.
+        if not forwarder_artifacts:
+            assert "docker/%s-egress-forwarder.override.yml" % agent_name not in artifacts, (
+                "BUG: egress-forwarder override unexpectedly in Shape-C artifact "
+                "map for %r (SC-EGRESS-NONE violated)." % agent_name
+            )
+            assert not any(
+                ("ringfence_%s_eg" % agent_name) in content
+                for content in artifacts.values()
+            ), (
+                "BUG: ringfence_%s_eg referenced by a Shape-C artifact with no "
+                "declared egress needs — the egress ringfence must not exist "
+                "for SC-EGRESS-NONE systems (test 3d)." % agent_name
+            )
 
         if not dry_run:
             assert output_root is not None
@@ -3532,6 +4491,16 @@ class CodegenEngine:
             "tests/contracts/test_%s_compose.py" % agent_name: test_compose_content,
             "tests/contracts/test_%s_helm.py" % agent_name: test_helm_content,
         }
+
+        # v4.1 unified-sidecar Phase 2a — capability-keyed, NEVER name-keyed:
+        # any system declaring spec.egress.needs != [] gets the per-system
+        # egress-forwarder set (forwarder + split ringfences + intra-zone
+        # deny). Systems without declared needs get nothing extra.
+        artifacts.update(
+            render_egress_forwarder_artifacts(
+                self._parsed, runtime, caddy_validator=self._caddy_validator,
+            )
+        )
 
         if not dry_run:
             assert output_root is not None  # already checked above

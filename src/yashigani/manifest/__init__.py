@@ -25,6 +25,11 @@ Entry points:
   resolve_egress_forwarder_port(p)     — C2 fixed egress-forwarder port (9400, overridable)
   MCP_EGRESS_FORWARDER_PORT            — C2 forwarder port constant (outside 9500-9899)
   is_shape_c(parsed)                   — detect if manifest is Shape-C
+  render_egress_forwarder_artifacts(p, runtime)
+                                       — v4.1 Phase 2a: per-system egress-forwarder
+                                         artifact set (spec.egress.needs != [])
+  validate_ringfence_topology(text, s) — §2.6 I1-02 gate: 2-member ringfence
+                                         invariant (errors on any 3rd member)
 
 Last updated: 2026-07-06T00:00:00+00:00
 """
@@ -37,9 +42,11 @@ from yashigani.manifest.codegen import (
     CodegenEngine,
     CodegenEngineShapeC,
     CodegenError,
+    render_egress_forwarder_artifacts,
     reset_codegen_registry,
     resolve_egress_forwarder_port,
     seed_mesh_ports_from_descriptors,
+    validate_ringfence_topology,
     _is_shape_c as is_shape_c,
 )
 
@@ -63,4 +70,6 @@ __all__ = [
     "resolve_egress_forwarder_port",
     "MCP_EGRESS_FORWARDER_PORT",
     "is_shape_c",
+    "render_egress_forwarder_artifacts",
+    "validate_ringfence_topology",
 ]
