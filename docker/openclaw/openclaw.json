@@ -33,5 +33,18 @@
     "defaults": {
       "model": "yashigani/qwen2.5:3b"
     }
+  },
+  "egress": {
+    "slack": {
+      "apiBaseUrl": "https://caddy:18790/slack",
+      "hooksBaseUrl": "https://caddy:18790/slack-hooks"
+    },
+    "telegram": {
+      "apiBaseUrl": "https://caddy:18790/telegram"
+    },
+    "tls": {
+      "certFile": "/etc/openclaw/tls/client.crt",
+      "keyFile": "/etc/openclaw/tls/client.key"
+    }
   }
 }

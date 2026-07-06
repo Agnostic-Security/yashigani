@@ -48,7 +48,9 @@
     # TCP :2019 removed. Filesystem permissions are the auth gate.
     # In-container tooling (healthcheck, reload) uses the socket directly.
     # No other service on any network can reach this surface.
-    admin unix//run/caddy/admin.sock
+    # |0666: socket lives on caddy_admin_sock (named volume, caddy + backoffice
+    # only). No third container can reach the path — 0666 is contained.
+    admin unix//run/caddy/admin.sock|0666
 
     # ── Connection timeouts (DoS/slow-loris mitigation) ─────────────────────
     servers {

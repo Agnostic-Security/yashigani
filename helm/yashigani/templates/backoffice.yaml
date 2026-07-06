@@ -262,6 +262,22 @@ spec:
             # ollama:11434 directly. Default ON; set "false" to disable.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
+            # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
+            # MCP approve-transaction env vars. The unix-socket admin path
+            # (YASHIGANI_CADDY_ADMIN_SOCKET) cannot be shared between caddy
+            # and backoffice on K8s (separate pods; emptyDir is pod-local).
+            # K8s asymmetry documented: default_caddy_reloader() will fail
+            # on K8s until a PVC-backed shared volume or sidecar pattern
+            # replaces the emptyDir on caddy (SEAM-1d-04 scope, Phase-2).
+            # The remaining three env vars are K8s-compatible today.
+            - name: YASHIGANI_MCP_ARTIFACT_ROOT
+              value: {{ .Values.backoffice.mcpArtifactRoot | default "/mnt/install" | quote }}
+            - name: YASHIGANI_CONTAINER_RUNTIME
+              value: {{ .Values.containerRuntime | default "k8s" | quote }}
+            - name: YASHIGANI_CADDY_ADMIN_SOCKET
+              value: "/run/caddy/admin.sock"
+            - name: YASHIGANI_CADDY_CADDYFILE
+              value: "/etc/caddy/Caddyfile"
             # YSG-COMPOSE-ENV-001 Helm parity: backoffice reads YASHIGANI_INTERNAL_BEARER
             # from env (os.environ.get) — must be injected via secretKeyRef, not only
             # present in yashigani-agent-bearer for agent-bundle shims.

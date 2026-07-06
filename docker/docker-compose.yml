@@ -279,6 +279,10 @@ services:
       # (caddy.yaml) which is already correctly isolated to the caddy pod only.
       - ./secrets:/run/secrets:ro
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+      # v4.1 Phase 1d (SEAM Phase-3 wiring): Caddy admin unix socket shared
+      # with backoffice for caddy /load (MCP approve). Socket mode 0666 per
+      # Caddyfile admin |0666 — contained to caddy + backoffice mounts only.
+      - caddy_admin_sock:/run/caddy
     healthcheck:
       # MUST-4 / v2.24.1: admin TCP :2019 removed; unix socket is the only
       # admin path. curl --unix-socket targets the socket from inside the
@@ -292,9 +296,8 @@ services:
       # YSG-RISK-008 (v2.23.4): caddy_data + caddy_config are named volumes
       # (writable). /tmp needed for ACME challenge staging + TLS cert staging.
       - /tmp:size=64m,mode=1777
-      # MUST-4 / v2.24.1: /run/caddy holds the admin unix socket.
-      # read_only rootfs requires tmpfs here — caddy creates admin.sock at startup.
-      - /run/caddy:size=1m,mode=0700
+      # NOTE: /run/caddy was here as a tmpfs (MUST-4 / v2.24.1). Promoted to
+      # named volume caddy_admin_sock (v4.1 Phase 1d) — see volumes above.
     # C6 (P1 W3 Phase 2a): seccomp profile + no-new-privileges hardening.
     # Parity with gateway/backoffice — both use the same yashigani.json profile.
     # yashigani.json extends Docker's default seccomp allowlist by explicitly
@@ -759,6 +762,31 @@ services:
       YASHIGANI_EXTRACTOR_RUNTIME: "http"
       YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
       YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
+      # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
+      # MCP approve-transaction env vars. _artifact_root(), _runtime(), and
+      # default_caddy_reloader() all raise McpOnboardError (503) if unset.
+      # The transaction fails CLOSED without these — no partial onboarding.
+      #
+      # YASHIGANI_MCP_ARTIFACT_ROOT: output_root for codegen; artifacts written
+      #   as  output_root / "docker/caddy/agents/<s>-mcp.caddy". The mount
+      #   ./:/mnt/install/docker (below) places the docker/ tree at
+      #   /mnt/install/docker inside backoffice, so output_root=/mnt/install
+      #   resolves to the correct host path ${INSTALL_DIR}/docker/caddy/agents/.
+      #   Caddy reads the same host path via ./caddy/agents:/etc/caddy/agents:ro.
+      YASHIGANI_MCP_ARTIFACT_ROOT: /mnt/install
+      # YASHIGANI_CONTAINER_RUNTIME: selects the correct codegen render path.
+      #   install.sh writes this to docker/.env at bootstrap time. The ?:-docker
+      #   default covers pre-3.0 .env files that predate this variable.
+      YASHIGANI_CONTAINER_RUNTIME: ${YASHIGANI_CONTAINER_RUNTIME:-docker}
+      # YASHIGANI_CADDY_ADMIN_SOCKET: default_caddy_reloader() POSTs the
+      #   Caddyfile to the caddy admin unix socket via httpx AsyncHTTPTransport.
+      #   Promoted from caddy-local tmpfs to caddy_admin_sock named volume so
+      #   backoffice can reach it (see volumes: caddy_admin_sock:/run/caddy).
+      YASHIGANI_CADDY_ADMIN_SOCKET: /run/caddy/admin.sock
+      # YASHIGANI_CADDY_CADDYFILE: default_caddy_reloader() reads the active
+      #   Caddyfile and POSTs it to /load; Caddy adapts server-side (env subs +
+      #   import /etc/caddy/agents/*.caddy sentinel). Mount: see volumes below.
+      YASHIGANI_CADDY_CADDYFILE: /etc/caddy/Caddyfile
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -793,6 +821,26 @@ services:
       # LAURA-30-001 / YSG-RISK-080 fix (Design A): NO docker socket mounted here.
       # Backoffice reaches the extractor via HTTP (extractor-svc:8090 on extractor_svc
       # internal bridge). The host-escape primitive is fully eliminated.
+      #
+      # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-B):
+      # Three mounts required for the MCP approve transaction.
+      #
+      # (a) Artifact root — docker/ tree (writable). Codegen writes
+      #     docker/caddy/agents/<s>-mcp.caddy relative to YASHIGANI_MCP_ARTIFACT_ROOT
+      #     (/mnt/install). Mounting ./  at /mnt/install/docker exposes ONLY the
+      #     docker/ directory subtree (same blast radius as ./secrets:/run/secrets
+      #     which already exists). codegen._safe_write() rejects traversals outside
+      #     output_root. Caddy reads the same host path via ./caddy/agents:ro (above).
+      - ./:/mnt/install/docker:rw
+      # (b) Caddy admin socket — shared named volume caddy_admin_sock. Caddy creates
+      #     admin.sock with mode 0666 (Caddyfile |0666, compose variant). backoffice
+      #     UID 1001 connects via httpx AsyncHTTPTransport(uds=...) to POST /load.
+      #     No network exposure — the socket is inside this named volume only.
+      - caddy_admin_sock:/run/caddy
+      # (c) Active Caddyfile (ro) — default_caddy_reloader() reads it to POST to
+      #     /load. YASHIGANI_CADDY_CADDYFILE=/etc/caddy/Caddyfile maps here.
+      #     Same source file as caddy's own mount (host path ./Caddyfile.<mode>).
+      - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
     read_only: true
     tmpfs:
       - /tmp:size=100M
@@ -2537,6 +2585,18 @@ services:
       # gateway's server cert (internal PKI). Standard Node.js extra-CA hook —
       # applies to all of openclaw's outbound TLS.
       NODE_EXTRA_CA_CERTS: /etc/openclaw/tls/ca.crt
+      # v4.1 Phase 1d: route openclaw's Slack/Telegram SDK calls through the
+      # egress gateway at :18790. openclaw presents client.{crt,key} (its minted
+      # mesh leaf, service_identities.yaml `openclaw`) to the gateway. If the
+      # openclaw build does not honour OPENCLAW_EGRESS_TLS_* the TLS handshake
+      # is refused at :18790 (fail CLOSED — the correct posture). Var names per
+      # openclaw 2026.5.x SDK convention. Laura Phase-3 test (c) confirms cert
+      # IS presented; if not, Tom wire-up via openclaw.runtime.json egress block.
+      OPENCLAW_SLACK_API_BASE_URL: "https://caddy:18790/slack"
+      OPENCLAW_SLACK_HOOKS_BASE_URL: "https://caddy:18790/slack-hooks"
+      OPENCLAW_TELEGRAM_API_BASE_URL: "https://caddy:18790/telegram"
+      OPENCLAW_EGRESS_TLS_CERT_FILE: /etc/openclaw/tls/client.crt
+      OPENCLAW_EGRESS_TLS_KEY_FILE: /etc/openclaw/tls/client.key
     volumes:
       - openclaw_data:/home/node/.openclaw
       # YSG-BUG-2255-002: mount the runtime copy (bearer substituted by install.sh step 8f),
@@ -2870,6 +2930,13 @@ volumes:
   caddy_data:
     driver: local
   caddy_config:
+    driver: local
+  # v4.1 Phase 1d (SEAM Phase-3 wiring): Caddy admin unix socket shared
+  # between caddy and backoffice so default_caddy_reloader() can POST /load.
+  # Promoted from caddy-local tmpfs (MUST-4 / v2.24.1). Socket mode 0666
+  # (Caddyfile admin |0666) — volume is mounted ONLY in caddy + backoffice,
+  # no external access to the path.
+  caddy_admin_sock:
     driver: local
   postgres_data:
     driver: local

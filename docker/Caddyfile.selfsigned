@@ -39,7 +39,12 @@
     # TCP :2019 removed. Filesystem permissions are the auth gate.
     # In-container tooling (healthcheck, reload) uses the socket directly.
     # No other service on any network can reach this surface.
-    admin unix//run/caddy/admin.sock
+    # |0666: socket lives on a named volume mounted ONLY in caddy + backoffice
+    # (caddy_admin_sock). No third container can reach this path, so world-write
+    # on the socket is equivalent to 0660 with a shared group — no external
+    # process can access it. Allows backoffice UID 1001 to POST /load via
+    # default_caddy_reloader() (mcp_onboard.py:135) without requiring group_add.
+    admin unix//run/caddy/admin.sock|0666
 
     # ── Connection timeouts (DoS/slow-loris mitigation) ─────────────────────
     servers {

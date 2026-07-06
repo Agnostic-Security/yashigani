@@ -316,7 +316,10 @@ data:
       # probe via caddy CLI or curl --unix-socket; kubelet pod-IP probes use
       # the :80 /healthz listener below (unchanged). No TCP admin surface
       # exposed to any pod network or host port.
-      admin unix//run/caddy/admin.sock
+      # |0666: K8s emptyDir /run/caddy is caddy-pod-local (no backoffice unix-
+      # socket sharing on K8s — separate pods; see SEAM-1d-04 / Phase-3 K8s
+      # asymmetry). 0666 matches compose parity; contained to caddy pod only.
+      admin unix//run/caddy/admin.sock|0666
       servers {
         timeouts {
           read_body   10s

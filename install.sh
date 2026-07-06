@@ -3262,7 +3262,9 @@ _write_aes_key_to_env() {
     # 4.0 — Register the cloud-9 demo MCP in YASHIGANI_MCP_SERVERS so the broker
     # registry picks it up at gateway startup and @-handles appear in the user surface.
     # Only set if not already present (upgrade-safe: preserve operator-configured servers).
-    local _demo_mcp_entry='[{"agent_name":"cloud9-demo","upstream_url":"http://demo-mcp:8000","tenant_id":"default","is_filesystem_agent":false,"is_git_agent":false,"display_name":"Cloud-9 Demo MCP"}]'
+    # SEAM-1d-01: derive tenant_id from YASHIGANI_TENANT_ID (default "default") so the
+    # broker entry stays consistent with the envelope tenant on non-default deployments.
+    local _demo_mcp_entry='[{"agent_name":"cloud9-demo","upstream_url":"http://demo-mcp:8000","tenant_id":"'"${YASHIGANI_TENANT_ID:-default}"'","is_filesystem_agent":false,"is_git_agent":false,"display_name":"Cloud-9 Demo MCP"}]'
     local _existing_mcp_servers
     _existing_mcp_servers="$(grep -m1 '^YASHIGANI_MCP_SERVERS=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)"
     if [[ -z "$_existing_mcp_servers" || "$_existing_mcp_servers" == "[]" || "$_existing_mcp_servers" == "" ]]; then
