@@ -188,17 +188,27 @@ def test_sc_no_caddy_snippet_in_artifacts():
 
 
 def test_sc_no_caddy_internal_in_compose():
-    """SC-EGRESS-NONE: compose override must not list caddy_internal as a network entry."""
+    """SC-EGRESS-NONE: the MCP container must not join caddy_internal.
+
+    NOTE: the SVID sidecar service (<server>-svid-sidecar) legitimately joins
+    caddy_internal so it can reach backoffice:8443 for cert rotation. The
+    SC-EGRESS-NONE rule applies to the MCP container (the bridge/shim), not
+    the sidecar. This test scopes the check to the MCP service stanza only.
+    """
     engine = CodegenEngineShapeC(_base_manifest(), runtime="docker")
     artifacts = engine.render(dry_run=True)
     compose = artifacts["docker/filesystem-compose.override.yml"]
-    # Check that caddy_internal does not appear as a YAML network entry
-    # (lines starting with optional spaces + "- caddy_internal")
+    # Scope to the MCP container stanza (before the sidecar or caddy: stanza).
+    sidecar_pos = compose.find("  filesystem-svid-sidecar:")
+    caddy_pos = compose.find("  caddy:")
+    end_pos = min(p for p in [sidecar_pos, caddy_pos] if p >= 0)
+    mcp_stanza = compose[:end_pos]
+    # caddy_internal must not appear as a YAML network entry in the MCP stanza.
     assert not any(
         line.strip() in ("- caddy_internal", "caddy_internal:") or
         (line.strip().startswith("- ") and "caddy_internal" in line and not line.strip().startswith("# "))
-        for line in compose.splitlines()
-    ), "caddy_internal must not be a network entry in Shape-C compose (SC-EGRESS-NONE)"
+        for line in mcp_stanza.splitlines()
+    ), "MCP container must not join caddy_internal (SC-EGRESS-NONE); SVID sidecar may"
 
 
 def test_sc_egress_not_empty_raises():

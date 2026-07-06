@@ -1535,6 +1535,11 @@ _SEEN_MESH_PORTS: dict[int, tuple[str, str]] = {}
 # Distinct from GID 2002 (_MCP_KMS_GID / S7): KMS secrets access — never mixed.
 _MCP_SVID_GID: int = 2003
 
+# svid-sidecar image (Phase 1b-ii / SEAM-1d-06).  Overridable at runtime via
+# YASHIGANI_SVID_SIDECAR_IMAGE so install.sh can pin the digest; version tracks
+# YASHIGANI_VERSION.
+_MCP_SVID_SIDECAR_IMAGE: str = "ghcr.io/agnosticsec/svid-sidecar"
+
 
 def _mcp_svid_volume_name(tenant_id: str, server_id: str) -> str:
     """Named volume that bridges the svid-sidecar and Caddy.
@@ -1548,6 +1553,33 @@ def _mcp_svid_volume_name(tenant_id: str, server_id: str) -> str:
     tenant_slug = tenant_id.replace("-", "_").replace(".", "_")
     server_slug = server_id.replace("-", "_").replace(".", "_")
     return "ysg_svid_%s_%s" % (tenant_slug, server_slug)
+
+
+def _mcp_svid_secret_name(tenant_id: str, server_id: str) -> str:
+    """K8s Secret name for the per-instance SVID material (SEAM-1d-04).
+
+    The approve transaction creates this Secret with data keys
+    ``client.crt``, ``client.key``, ``ca.crt``.  caddy.yaml projects it
+    into the Caddy Pod at ``_MCP_SVID_MOUNT_ROOT/<tenant_id>/<server_id>/``.
+    """
+    tenant_slug = tenant_id.replace("-", "_").replace(".", "-")
+    server_slug = server_id.replace("_", "-").replace(".", "-")
+    # Kubernetes name: lower-case, hyphens (max 253 chars — slugs are short)
+    return "mcp-svid-%s-%s" % (tenant_id.lower().replace("_", "-"), server_id.lower().replace("_", "-"))
+
+
+def _mcp_svid_helm_key(tenant_id: str, server_id: str) -> str:
+    """Camel-case map key used in the Helm values mcpSvid block.
+
+    Multiple Shape-C agents emit separate values files; Helm merges map keys
+    additively (unlike lists which are overwritten).  Using a unique camelCase
+    key per (tenant, server) pair lets an operator pass -f values-a.yaml
+    -f values-b.yaml and get BOTH SVID volumes in the Caddy Pod.
+    """
+    def _camel(s: str) -> str:
+        return "".join(p.capitalize() for p in s.replace("-", "_").split("_"))
+
+    return "%s%s" % (_camel(server_id), _camel(tenant_id))
 
 
 def _mcp_svid_paths(tenant_id: str, server_id: str) -> tuple[str, str]:
@@ -1791,6 +1823,106 @@ def _sc_volume_name(tenant_id: str, agent_name: str) -> str:
     safe_tid = tenant_id.replace("-", "_")
     safe_name = agent_name.replace("-", "_")
     return "ysg_fs_%s_%s_workspace" % (safe_tid, safe_name)
+
+
+def _gen_svid_sidecar_service(
+    parsed: dict,
+    *,
+    runtime: str,
+) -> str:
+    """
+    Generate the svid-sidecar compose service stanza (SEAM-1d-06 fix).
+
+    The svid-sidecar:
+      1. Init phase (rotate.sh):  copies ``INIT_DIR/client.{crt,key,ca.crt}``
+         → ``SVID_DIR/client.{crt,key,ca.crt}``, sets mode 0440 GID 2003 on
+         the key, writes the ready flag.
+      2. Rotation loop: polls cert expiry; POSTs to
+         ``backoffice:8443/admin/agents/<server>/cert/rotate`` over mTLS.
+         Atomically replaces certs on success.
+
+    The approve transaction (Phase 1c, ``mcp_onboard.py``) MUST:
+      a. Create ``secrets/svid-init/<tenant>/<server>/`` on the host.
+      b. Copy the minted leaf (``agent_<t>_<s>_<nhi>_client.*``) into that dir
+         with the correct basenames: ``client.crt``, ``client.key``, ``ca.crt``.
+      c. Start this sidecar service BEFORE issuing ``caddy_reload``, so the cert
+         is available in the SVID volume when Caddy loads the snippet.
+
+    Security:
+      - ``user: "1002:2003"`` — UID 1002 (svid-sidecar), PRIMARY GID 2003
+        (svid GID).  Files written inherit GID 2003 → Caddy reads via
+        ``group_add: ["2003"]`` (emitted in the caddy stanza).
+      - ``read_only: true`` — root FS read-only; writable paths are the SVID
+        named volume + the ringfence-ready tmpfs.
+      - ``caddy_internal`` network ONLY — no ringfence bridge access; no
+        ability to reach the MCP container or its shim directly.
+    """
+    meta = parsed.get("metadata") or {}
+    server_id = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    svid_vol = _mcp_svid_volume_name(tenant_id, server_id)
+    svid_dir = "%s/%s/%s" % (_MCP_SVID_MOUNT_ROOT, tenant_id, server_id)
+    init_dir_host = "secrets/svid-init/%s/%s" % (tenant_id, server_id)
+    svc_name = "%s-svid-sidecar" % server_id
+
+    rootless_note = ""
+    if runtime == "podman-rootless":
+        rootless_note = "    # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
+
+    lines = [
+        "  # SEAM-1d-06: per-MCP svid-sidecar — projects + rotates the minted leaf",
+        "  # into the shared SVID volume for Caddy to present at the wrap.",
+        "  # Started by the approve transaction BEFORE caddy_reload.",
+        "  %s:" % svc_name,
+        "    image: ${YASHIGANI_SVID_SIDECAR_IMAGE:-%s}:${YASHIGANI_VERSION:-4.1.0}" % _MCP_SVID_SIDECAR_IMAGE,
+        "    restart: unless-stopped",
+        "    environment:",
+        "      AGENT_ID: %s" % server_id,
+        "      SVID_DIR: %s" % svid_dir,
+        "      INIT_DIR: /init",
+        "      BACKOFFICE_URL: https://backoffice:8443",
+        "    volumes:",
+        "      # INIT_DIR (ro bind): approve transaction populates with client.{crt,key,ca.crt}.",
+        "      # Basenames MUST match rotate.sh contract (not the minted agent_<t>_<s>_<nhi>_ prefix).",
+        "      - type: bind",
+        "        source: %s" % init_dir_host,
+        "        target: /init",
+        "        read_only: true",
+        "      # SVID named volume (rw): sidecar writes; Caddy reads via group_add 2003.",
+        "      - %s:%s" % (svid_vol, svid_dir),
+    ]
+    if runtime == "podman-rootless":
+        lines.append(rootless_note.rstrip("\n"))
+    lines += [
+        "    tmpfs:",
+        "      # /run/ringfence: ready-flag (rotate.sh healthcheck; agent depends_on).",
+        "      - /run/ringfence:size=1m,mode=0700",
+        "    networks:",
+        "      # caddy_internal: reaches backoffice:8443 for cert rotation POST.",
+        "      # NOT joined to ringfence_<server>: sidecar never dials the MCP shim.",
+        "      - caddy_internal",
+        "    # UID 1002 (svid-sidecar image USER), primary GID 2003 (svid GID).",
+        "    # Files written by rotate.sh inherit GID 2003 (belt+suspenders: rotate.sh",
+        "    # also does chown :2003 explicitly).  Caddy reads via group_add: [\"2003\"].",
+        '    user: "1002:%d"' % _MCP_SVID_GID,
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    cap_drop:",
+        "      - ALL",
+        "    read_only: true",
+        "    # Healthy once rotate.sh writes /run/ringfence/ready (post-init, pre-loop).",
+        "    healthcheck:",
+        '      test: ["CMD", "test", "-f", "/run/ringfence/ready"]',
+        "      interval: 10s",
+        "      timeout: 5s",
+        "      retries: 3",
+        "      start_period: 10s",
+        "    # L3 — IPv6 default-deny",
+        "    sysctls:",
+        "      net.ipv6.conf.all.disable_ipv6: 1",
+        "      net.ipv6.conf.default.disable_ipv6: 1",
+    ]
+    return "\n".join(lines)
 
 
 def _gen_compose_override_shape_c(
@@ -2059,8 +2191,16 @@ def _gen_compose_override_shape_c(
         "    internal: true",
     ]
 
-    content = "\n".join(line for line in lines if line != "")
-    return content + "\n"
+    # SEAM-1d-06: emit the per-MCP svid-sidecar service that projects the
+    # minted leaf into the shared SVID volume for Caddy to present.
+    sidecar_lines = _gen_svid_sidecar_service(parsed, runtime=runtime)
+    # Insert after the caddy: stanza and before the volumes: section.
+    # We split on the "# Shape-C tenant-namespaced workspace volume" comment
+    # and re-join with the sidecar block interposed.
+    marker = "# Shape-C tenant-namespaced workspace volume"
+    body = "\n".join(line for line in lines if line != "")
+    body = body.replace(marker, sidecar_lines + "\n\n" + marker, 1)
+    return body + "\n"
 
 
 def _gen_values_yaml_shape_c(
@@ -2160,6 +2300,20 @@ def _gen_values_yaml_shape_c(
           # L10 — runtime tag embedded for drift detection
           runtimeTag: "{runtime}"
         {rootless_note}
+        # SEAM-1d-04 K8s SVID projection — Caddy Pod must mount this Secret to
+        # present the per-instance leaf at the wrap listener.
+        # The approve transaction creates Secret <secret_name> with keys:
+        #   client.crt, client.key (0440), ca.crt (0444) — rotate.sh basenames.
+        # caddy.yaml iterates .Values.mcpSvid and mounts each entry as a Secret
+        # volume at mountPath (mode 0440; fsGroup=1000 makes it Caddy-readable).
+        # GID model: K8s uses fsGroup=1000 + defaultMode=0440 (Caddy's GID).
+        #   No supplementalGroups[2003] needed on K8s (unlike compose group_add).
+        mcpSvid:
+          {helm_key}:
+            tenantId: {tenant_id}
+            serverId: {agent_name}
+            secretName: {secret_name}
+            mountPath: {svid_mount_path}
     """).format(
         header=_header_comment(manifest_hash, runtime),
         agent_name=agent_name,
@@ -2178,6 +2332,9 @@ def _gen_values_yaml_shape_c(
         bridge_port=_SC_BRIDGE_PORT,
         runtime=runtime,
         rootless_note=rootless_note,
+        helm_key=_mcp_svid_helm_key(tenant_id, agent_name),
+        secret_name=_mcp_svid_secret_name(tenant_id, agent_name),
+        svid_mount_path="%s/%s/%s" % (_MCP_SVID_MOUNT_ROOT, tenant_id, agent_name),
     )
     return content
 

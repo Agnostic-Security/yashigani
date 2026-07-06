@@ -162,6 +162,20 @@ spec:
               mountPath: /run/secrets
               readOnly: true
             {{- end }}
+            {{- /* SEAM-1d-04: per-MCP SVID Secret volumes.
+                 Each Shape-C agent emits a mcpSvid.<key> entry in its values
+                 file (codegen _gen_values_yaml_shape_c).  Helm merges map
+                 keys addtively across -f values files, so multiple agents each
+                 get their own Secret projected into the Caddy Pod at their
+                 own mountPath.  GID model: fsGroup=1000 (pod security context
+                 above) + defaultMode=0440 → Caddy (UID/GID 1000) can read the
+                 key. No supplementalGroups[2003] needed in K8s (unlike compose
+                 group_add — K8s uses fsGroup instead). */ -}}
+            {{- range $key, $svid := .Values.mcpSvid }}
+            - name: mcp-svid-{{ $key }}
+              mountPath: {{ $svid.mountPath }}
+              readOnly: true
+            {{- end }}
       {{- if .Values.mtls.enabled }}
       # /run/secrets PKI mount collides with SA-token at
       # /var/run/secrets/kubernetes.io/serviceaccount (since /var/run→/run).
@@ -197,6 +211,15 @@ spec:
         - name: pki-certs
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
+            defaultMode: 0440
+        {{- end }}
+        {{- /* SEAM-1d-04: per-MCP SVID Secret volumes (parity with compose group_add model).
+             Created by the approve transaction (mcp_onboard.py Phase 1c).
+             defaultMode: 0440 + fsGroup: 1000 → Caddy reads key without world-readable (0444). */ -}}
+        {{- range $key, $svid := .Values.mcpSvid }}
+        - name: mcp-svid-{{ $key }}
+          secret:
+            secretName: {{ $svid.secretName }}
             defaultMode: 0440
         {{- end }}
 ---

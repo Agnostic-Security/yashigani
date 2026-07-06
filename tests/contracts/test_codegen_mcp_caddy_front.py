@@ -35,7 +35,10 @@ from yashigani.manifest.codegen import (
     _MCP_MESH_PORT_BASE,
     _MCP_MESH_PORT_RANGE,
     _MCP_SVID_GID,
+    _MCP_SVID_SIDECAR_IMAGE,
     _mcp_mesh_port,
+    _mcp_svid_helm_key,
+    _mcp_svid_secret_name,
     _mcp_svid_volume_name,
     approve_mcp_onboard,
     reset_codegen_registry,
@@ -229,12 +232,18 @@ def test_compose_caddy_joins_ringfence_and_mcp_stays_isolated():
     # Caddy joins the MCP's ringfence bridge (generated override — no monolith edit).
     caddy_stanza = compose.split("  caddy:", 1)[1]
     assert "- ringfence_filesystem" in caddy_stanza
-    # The MCP itself joins ONLY the ringfence bridge — never caddy_internal.
-    # (Line-based: comments legitimately mention caddy_internal.)
+    # The MCP container itself must NOT join caddy_internal (ingress bypass).
+    # The SVID sidecar legitimately joins caddy_internal to reach backoffice:8443
+    # for cert rotation — that join is in the sidecar stanza, not the MCP stanza.
+    # Scope the check to the MCP service stanza only (stop at sidecar or caddy:).
+    mcp_stanza_end = compose.find("  filesystem-svid-sidecar:")
+    if mcp_stanza_end == -1:
+        mcp_stanza_end = compose.find("  caddy:")
+    mcp_container_stanza = compose[:mcp_stanza_end]
     assert not any(
         line.strip() in ("- caddy_internal", "caddy_internal:")
-        for line in compose.splitlines()
-    )
+        for line in mcp_container_stanza.splitlines()
+    ), "MCP container must not join caddy_internal; only the SVID sidecar may"
     # The old around-the-wrap guidance (gateway joins the bridge) is GONE.
     assert "gateway:" not in compose
     assert "docker compose up -d gateway" not in compose
@@ -480,3 +489,174 @@ def test_approve_hook_svid_volume_in_output():
     assert ("%s:" % vol_name) in compose
     caddy_stanza = compose.split("  caddy:", 1)[1]
     assert ('"%d"' % _MCP_SVID_GID) in caddy_stanza
+
+
+# ---------------------------------------------------------------------------
+# 9. SEAM-1d-06 — svid-sidecar service emitted in compose override
+# ---------------------------------------------------------------------------
+
+
+def test_svid_sidecar_service_present_in_compose():
+    """SEAM-1d-06: the svid-sidecar service MUST be emitted in the compose
+    override.  Without it the minted leaf is never projected to the SVID
+    volume and Caddy has no cert to present at the wrap listener."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    assert "filesystem-svid-sidecar:" in compose, (
+        "SEAM-1d-06: svid-sidecar service missing — Caddy wrap will have no "
+        "leaf to present at runtime"
+    )
+
+
+def test_svid_sidecar_image_env_interpolated():
+    """Sidecar image MUST use ${YASHIGANI_SVID_SIDECAR_IMAGE} env interpolation
+    so install.sh can pin the exact digest; version uses ${YASHIGANI_VERSION}."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1]
+    assert "${YASHIGANI_SVID_SIDECAR_IMAGE" in sidecar_stanza
+    assert _MCP_SVID_SIDECAR_IMAGE in sidecar_stanza  # fallback image present
+    assert "${YASHIGANI_VERSION" in sidecar_stanza
+
+
+def test_svid_sidecar_svid_dir_and_init_dir():
+    """Sidecar must carry SVID_DIR and INIT_DIR env vars with the correct paths."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1]
+    # SVID_DIR = the per-instance mount path
+    assert "SVID_DIR: /run/secrets/svid/acme-corp/filesystem" in sidecar_stanza
+    assert "INIT_DIR: /init" in sidecar_stanza
+    assert "AGENT_ID: filesystem" in sidecar_stanza
+    assert "BACKOFFICE_URL: https://backoffice:8443" in sidecar_stanza
+
+
+def test_svid_sidecar_init_dir_bind_mount():
+    """INIT_DIR bind-mount must reference the per-instance init path that the
+    approve transaction populates (client.{crt,key,ca.crt} with rotate.sh basenames)."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1]
+    # Source path: approve transaction places files here before starting the sidecar.
+    assert "source: secrets/svid-init/acme-corp/filesystem" in sidecar_stanza
+    assert "target: /init" in sidecar_stanza
+    assert "read_only: true" in sidecar_stanza
+
+
+def test_svid_sidecar_svid_volume_mount():
+    """Sidecar must mount the same SVID named volume as Caddy (the shared bridge)."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    vol_name = _mcp_svid_volume_name("acme-corp", "filesystem")
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1]
+    assert ("%s:/run/secrets/svid/acme-corp/filesystem" % vol_name) in sidecar_stanza
+
+
+def test_svid_sidecar_gid_user():
+    """Sidecar must run as user 1002:2003 — UID 1002 (svid-sidecar), primary GID 2003
+    (svid GID).  Files written inherit GID 2003 so Caddy can read them via group_add."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1]
+    assert 'user: "1002:%d"' % _MCP_SVID_GID in sidecar_stanza
+
+
+def test_svid_sidecar_joins_caddy_internal_not_ringfence():
+    """Sidecar must join caddy_internal (to reach backoffice for cert rotation)
+    and NOT the MCP's ringfence bridge (no direct shim access).
+
+    Scoped to the sidecar's networks: list only (the top-level networks: section
+    that defines ringfence_filesystem appears later in the file and is irrelevant).
+    """
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1].split("  caddy:", 1)[0]
+    # caddy_internal: reaches backoffice for rotation
+    assert "- caddy_internal" in sidecar_stanza
+    # The sidecar's networks: list must not include the ringfence bridge.
+    # Extract only the 'networks:' block within the sidecar stanza (before 'volumes:' etc).
+    nets_block = ""
+    in_networks = False
+    for line in sidecar_stanza.splitlines():
+        stripped = line.strip()
+        if stripped == "networks:":
+            in_networks = True
+            continue
+        if in_networks:
+            if stripped.startswith("- "):
+                nets_block += line + "\n"
+            elif stripped and not stripped.startswith("#"):
+                break  # end of networks: list
+    assert "ringfence_filesystem" not in nets_block, (
+        "sidecar must not join the MCP's ringfence bridge — no direct shim access"
+    )
+
+
+def test_svid_sidecar_security_context():
+    """Sidecar must be hardened: read_only, cap_drop ALL, no-new-privileges."""
+    artifacts = _render()
+    compose = artifacts["docker/filesystem-compose.override.yml"]
+    sidecar_stanza = compose.split("filesystem-svid-sidecar:", 1)[1]
+    assert "read_only: true" in sidecar_stanza
+    assert "no-new-privileges:true" in sidecar_stanza
+    assert "- ALL" in sidecar_stanza
+    # Healthcheck: ready flag driven by rotate.sh init phase
+    assert "/run/ringfence/ready" in sidecar_stanza
+
+
+# ---------------------------------------------------------------------------
+# 10. SEAM-1d-04 — Helm K8s SVID projection (compose↔helm parity)
+# ---------------------------------------------------------------------------
+
+
+def test_helm_values_mcpsvid_section_present():
+    """SEAM-1d-04: helm values must carry mcpSvid.<key> so caddy.yaml projects
+    the per-instance Secret into the Caddy Pod (K8s wrap parity)."""
+    artifacts = _render()
+    vals = artifacts["helm/yashigani/values-filesystem.yaml"]
+    assert "mcpSvid:" in vals, (
+        "SEAM-1d-04: mcpSvid missing from Helm values — K8s Caddy wrap has no leaf"
+    )
+
+
+def test_helm_values_mcpsvid_key_and_fields():
+    """mcpSvid entry must have tenantId, serverId, secretName, mountPath."""
+    artifacts = _render()
+    vals = artifacts["helm/yashigani/values-filesystem.yaml"]
+    helm_key = _mcp_svid_helm_key("acme-corp", "filesystem")
+    secret_name = _mcp_svid_secret_name("acme-corp", "filesystem")
+    # Map key is camelCase (unique per instance — Helm merges maps additively)
+    assert ("%s:" % helm_key) in vals
+    # Secret name: approve transaction creates this K8s Secret
+    assert ("secretName: %s" % secret_name) in vals
+    # Mount path: mirrors _mcp_svid_paths compose contract
+    assert "mountPath: /run/secrets/svid/acme-corp/filesystem" in vals
+    assert "tenantId: acme-corp" in vals
+    assert "serverId: filesystem" in vals
+
+
+def test_helm_values_mcpsvid_keys_are_unique_per_instance():
+    """Two different MCP servers must produce different mcpSvid keys — ensures
+    Helm map merging works correctly (each agent file adds its own key)."""
+    key_a = _mcp_svid_helm_key("acme-corp", "filesystem")
+    key_b = _mcp_svid_helm_key("acme-corp", "git")
+    key_c = _mcp_svid_helm_key("other-tenant", "filesystem")
+    assert key_a != key_b
+    assert key_a != key_c
+    assert key_b != key_c
+
+
+def test_caddy_yaml_has_mcpsvid_volumemount_loop():
+    """SEAM-1d-04: caddy.yaml must contain the {{- range .Values.mcpSvid }}
+    loop so the template renders per-MCP SVID volumeMounts."""
+    import pathlib
+    caddy_tmpl = pathlib.Path(
+        "/Users/max/Documents/Claude/YSG/yashigani-v4.1/helm/yashigani/templates/caddy.yaml"
+    ).read_text()
+    # The range loop over mcpSvid for volumeMounts
+    assert "range $key, $svid := .Values.mcpSvid" in caddy_tmpl
+    assert "mcp-svid-{{ $key }}" in caddy_tmpl
+    assert "$svid.mountPath" in caddy_tmpl
+    # The range loop for volumes (Secret projection)
+    assert "$svid.secretName" in caddy_tmpl
+    assert "defaultMode: 0440" in caddy_tmpl
