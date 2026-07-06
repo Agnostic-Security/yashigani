@@ -58,9 +58,12 @@
 #           (d) Egress audit log on every request (including 403 denies) with
 #               Authorization header redaction.
 #           (e) iptables hashlimit rate-brake on the three egress hosts.
-#           Outstanding: M4/DLP content filter on egress bodies (registered with Lu).
-#           Do NOT treat this gateway as a data-loss control; it is a DESTINATION
-#           + ACCOUNT control. Token/path operator-supplied; never shipped.
+#           CLOSED (v4.1 egress-eval): M4 + secret_detector run on every egress
+#           body at gateway /egress/eval/{prefix}/{path} before the deliver hop.
+#           OPA mcp_response_decision gates the result; bodies classified RESTRICTED
+#           (secrets or injection patterns) are withheld and audited.  Caddy :18790
+#           remains the DESTINATION + ACCOUNT control; content control is at gateway.
+#           Token/path operator-supplied; never shipped.
 #
 # Defence in depth: caddy-entrypoint.sh mirrors these three FQDNs in the
 # container-level iptables OUTPUT allowlist (YASHIGANI_OPENCLAW_EGRESS=1,
@@ -151,41 +154,97 @@
         max_size 10MB
     }
 
-    # ── Slack Web API — https://slack.com/api/... ────────────────────────────
-    # openclaw dials /slack/api/chat.postMessage → upstream /api/chat.postMessage
-    handle_path /slack/* {
+    # ── Phase 1: openclaw → gateway egress evaluation ────────────────────────
+    # openclaw dials these paths unchanged (SDK URLs in docker-compose.yml and
+    # openclaw.json remain https://caddy:18790/{prefix}/*).  Caddy now:
+    #   1. Validates the peer cert (require_and_verify, openclaw SPIFFE stamp).
+    #   2. Rewrites the path:  /{prefix}/{...} → /egress/eval/{prefix}/{...}
+    #   3. Reverse-proxies the FULL request body to gateway:8080.
+    #   4. Sets X-SPIFFE-ID (stamped from verified peer cert URI SAN) and
+    #      X-Caddy-Verified-Secret (Layer B HMAC) so the gateway trusts the
+    #      caller identity without a second mTLS client-auth handshake.
+    # Gateway inspects the body (secret_detector + M4 injection check → OPA)
+    # and on ALLOW calls caddy:18790/deliver/{prefix}/{...} (Phase 2 below).
+    #
+    # Why the stamp is forge-proof: request_header bare SET runs after TLS,
+    # before any route handler, overwriting any client-supplied value.
+    # X-Caddy-Verified-Secret is read from {$CADDY_INTERNAL_HMAC} at parse
+    # time — openclaw has no access to this env var.
+    #
+    # Transport: (internal-mtls) snippet wires caddy's own client cert +
+    # ca_intermediate.crt trust pool for the Caddy → gateway:8080 hop.
+    # versions 1.1 matches the min-TLS policy on the gateway listener.
+
+    # ── Slack Web API — openclaw /slack/* → gateway /egress/eval/slack/* ───
+    handle /slack/* {
         route {
             import openclaw-egress-caller-gate
-            # FP-06 Phase 2 — Slack bot-token workspace pin (destination-account
-            # control; CHANNEL 2).
-            # Operator config: /run/secrets/openclaw_slack_bot_token (0600, provisioned
-            #   by install.sh from operator-supplied YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN;
-            #   empty on default install — inert-until-set).
-            # Mechanism: caddy-entrypoint.sh reads the secret file before exec caddy
-            #   and exports YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN to the process env;
-            #   Caddy substitutes {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:} at parse time.
-            # Security model: a Slack bot token (xoxb-...) is scoped to one workspace.
-            #   This handle strips openclaw's Authorization and injects the operator's
-            #   token → forces the operator's workspace regardless of what a compromised
-            #   openclaw sends. Attacker-controlled workspace → different token → rejected.
-            # Dual-handle inert-when-empty:
-            #   @slack_pin_on fires ONLY when the token env var is non-empty.
-            #   "" != "" is false → @slack_pin_on never matches → only the fallback
-            #   `handle` runs (pass-through, unchanged from prior state). An empty-bearer
-            #   injection is therefore structurally impossible.
-            # Single-source: NOT in openclaw.json — a compromised openclaw cannot
-            #   rewrite its own destination token. Enforced by test_openclaw_egress_gateway.py.
+            rewrite * /egress/eval{uri}
+            reverse_proxy https://gateway:8080 {
+                import internal-mtls
+                # Stamp caller SPIFFE (from verified peer cert, already set by
+                # openclaw-egress-caller-gate above) onto the gateway-bound request.
+                header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+                # Layer B HMAC — enables SpiffePeerCertMiddleware Option C to
+                # trust the X-SPIFFE-ID without a second mTLS auth handshake.
+                header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+            }
+        }
+    }
+
+    # ── Slack hooks — openclaw /slack-hooks/* → gateway /egress/eval/slack-hooks/* ──
+    handle /slack-hooks/* {
+        route {
+            import openclaw-egress-caller-gate
+            rewrite * /egress/eval{uri}
+            reverse_proxy https://gateway:8080 {
+                import internal-mtls
+                header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+                header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+            }
+        }
+    }
+
+    # ── Telegram — openclaw /telegram/* → gateway /egress/eval/telegram/* ──
+    handle /telegram/* {
+        route {
+            import openclaw-egress-caller-gate
+            rewrite * /egress/eval{uri}
+            reverse_proxy https://gateway:8080 {
+                import internal-mtls
+                header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+                header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+            }
+        }
+    }
+
+    # ── Phase 2: gateway → final delivery ───────────────────────────────────
+    # These routes are ONLY reachable by the Yashigani gateway mesh peer.
+    # The gateway calls them after egress inspection + OPA ALLOW.
+    # All FP-06 Phase 2 destination/account controls (bot-token workspace pin,
+    # webhook path pin, bot-ID pin) live here — they are enforced AFTER the
+    # content gate, in the same Caddy block as before.
+    #
+    # Caller gate: gateway-egress-deliver-gate (snippet defined below) stamps
+    # X-Yashigani-Verified-Spiffe from the peer cert and checks against
+    # YASHIGANI_GATEWAY_SPIFFE_ID.  Only the gateway cert satisfies this check.
+    # openclaw cannot call these routes — its SPIFFE ≠ gateway SPIFFE.
+
+    # ── Deliver: Slack Web API — https://slack.com/api/... ──────────────────
+    handle_path /deliver/slack/* {
+        route {
+            import gateway-egress-deliver-gate
+            # FP-06 Phase 2 — Slack bot-token workspace pin.
+            # Inert-when-empty: same semantics as the original /slack/* block.
             @slack_pin_on expression "{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""
             handle @slack_pin_on {
                 reverse_proxy https://slack.com {
-                    # Strip openclaw's caller Authorization; inject operator's token.
                     header_up -Authorization
                     header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}"
-                    # Pin Host + SNI (anti domain-fronting, FP-04e).
                     header_up Host slack.com
-                    # Never leak mesh identity material upstream.
                     header_up -X-SPIFFE-ID
                     header_up -X-Caddy-Verified-Secret
+                    header_up -X-Yashigani-Verified-Spiffe
                     transport http {
                         tls
                         tls_server_name slack.com
@@ -193,12 +252,11 @@
                 }
             }
             handle {
-                # Fallback: pass-through (inert when YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
-                # is empty — default install unchanged).
                 reverse_proxy https://slack.com {
                     header_up Host slack.com
                     header_up -X-SPIFFE-ID
                     header_up -X-Caddy-Verified-Secret
+                    header_up -X-Yashigani-Verified-Spiffe
                     transport http {
                         tls
                         tls_server_name slack.com
@@ -208,33 +266,19 @@
         }
     }
 
-    # ── Slack response_url callbacks — https://hooks.slack.com/... (FP-07) ──
-    handle_path /slack-hooks/* {
+    # ── Deliver: Slack hooks — https://hooks.slack.com/... ──────────────────
+    handle_path /deliver/slack-hooks/* {
         route {
-            import openclaw-egress-caller-gate
-            # FP-06 Phase 2 — Slack incoming-webhook path pin (destination control;
-            # CHANNEL 1).
-            # Operator config: /run/secrets/openclaw_slack_webhook_path (0600, provisioned
-            #   by install.sh from operator-supplied YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH;
-            #   empty on default install — inert-until-set).
-            # Mechanism: caddy-entrypoint.sh exports YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
-            #   from the secret file before exec caddy (Caddy parse-time substitution).
-            # Security model: incoming-webhook URLs contain workspace+channel+secret in
-            #   the path: /services/T<workspace>/B<app>/<signing-secret>
-            #   After handle_path strips /slack-hooks, the rewritten URI path IS the
-            #   /services/... component. An attacker-owned hooks.slack.com webhook has a
-            #   DIFFERENT /services path → 403. The operator's workspace+channel+secret
-            #   are all embedded in the pin — a partial match (different channel or
-            #   signing-secret) is also rejected.
-            # Inert-when-empty: "{$..._WEBHOOK_PATH:}" == "" → "" != "" is false →
-            #   short-circuit → @wrong_slack_hook never fires → no enforcement on a
-            #   default install.
+            import gateway-egress-deliver-gate
+            # FP-06 Phase 2 — Slack incoming-webhook path pin.
+            # Inert-when-empty: same semantics as the original /slack-hooks/* block.
             @wrong_slack_hook expression "{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != "" && !{http.request.uri.path}.startsWith("{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}")
             respond @wrong_slack_hook "Forbidden" 403
             reverse_proxy https://hooks.slack.com {
                 header_up Host hooks.slack.com
                 header_up -X-SPIFFE-ID
                 header_up -X-Caddy-Verified-Secret
+                header_up -X-Yashigani-Verified-Spiffe
                 transport http {
                     tls
                     tls_server_name hooks.slack.com
@@ -243,29 +287,19 @@
         }
     }
 
-    # ── Telegram Bot API + file downloads — https://api.telegram.org/... ────
-    # Covers both /bot<token>/<method> and /file/bot<token>/<path> (FP-07).
-    handle_path /telegram/* {
+    # ── Deliver: Telegram Bot API — https://api.telegram.org/... ────────────
+    handle_path /deliver/telegram/* {
         route {
-            import openclaw-egress-caller-gate
-            # FP-06 Phase 2 — Telegram bot-ID pin (destination-account control).
-            # Env: YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID (parse-time, default empty string).
-            # After handle_path strips /telegram, Telegram API paths take the form:
-            #   /bot<botid>:<token>/<method>
-            # Enforcement: when the pin is NON-EMPTY, only paths whose prefix matches
-            # /bot{pin}: pass; all others → 403. This pins the egress to one specific
-            # Telegram bot account — an attacker-controlled bot on the same api.telegram.org
-            # origin is rejected at the path-level even though the host allowlist passes it.
-            # Inert-when-empty: the first clause ("<pin>" != "") is false when the env var
-            # is unset, so the entire expression short-circuits to false → matcher never fires
-            # → current behaviour (no enforcement) is preserved on a default install.
-            # Verified: caddy adapt compiles cleanly with pin unset (empty string).
+            import gateway-egress-deliver-gate
+            # FP-06 Phase 2 — Telegram bot-ID pin.
+            # Inert-when-empty: same semantics as the original /telegram/* block.
             @wrong_bot_id expression "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" != "" && !{http.request.uri.path}.startsWith("/bot{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}:")
             respond @wrong_bot_id "Forbidden" 403
             reverse_proxy https://api.telegram.org {
                 header_up Host api.telegram.org
                 header_up -X-SPIFFE-ID
                 header_up -X-Caddy-Verified-Secret
+                header_up -X-Yashigani-Verified-Spiffe
                 transport http {
                     tls
                     tls_server_name api.telegram.org
@@ -278,4 +312,16 @@
     handle {
         respond "Forbidden" 403
     }
+}
+
+# Deliver caller gate — only the Yashigani gateway mesh peer may call /deliver/*.
+# Identical pattern to openclaw-egress-caller-gate (stamped-header, no CEL).
+# YASHIGANI_GATEWAY_SPIFFE_ID defaults to spiffe://yashigani.internal/gateway.
+# An empty env var fails CLOSED (empty string ≠ any real URI SAN → 403 all).
+(gateway-egress-deliver-gate) {
+    request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
+    @caller_not_gateway {
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_GATEWAY_SPIFFE_ID:spiffe://yashigani.internal/gateway}"
+    }
+    respond @caller_not_gateway "Forbidden" 403
 }

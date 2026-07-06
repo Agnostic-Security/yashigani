@@ -29,6 +29,7 @@ from yashigani.metrics.middleware import PrometheusMiddleware
 from yashigani.gateway.proxy import GatewayConfig, create_gateway_app
 from yashigani.gateway.agent_auth import AgentAuthMiddleware
 from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router
+from yashigani.gateway.egress_proxy import router as egress_proxy_router, configure as configure_egress_proxy
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
 from yashigani.gateway.ddos import DDoSProtector, ENV_PER_IP_LIMIT, ENV_WINDOW_SECONDS, ENV_EXEMPT_PATHS, _EXEMPT_PATHS, _ddos_default_per_ip_limit
@@ -839,6 +840,15 @@ def _build_app(mesh_mode: bool = False):
         permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
     )
 
+    # ── Egress evaluation proxy (v4.1 — general egress content gate) ─────────
+    # Mounts /egress/eval/{prefix}/{path:path}: every sidecar-wrapped system's
+    # outbound body traverses this endpoint for secret_detector + M4 injection
+    # inspection + OPA mcp_response_decision before Caddy forwards to destination.
+    configure_egress_proxy(
+        opa_url=opa_url,
+        audit_writer=audit_writer,
+    )
+
     # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────
     # Build a McpBrokerRegistry + JwksStore from YASHIGANI_MCP_SERVERS env var.
     # Guard: if env var is unset/empty, both return values are empty/None and
@@ -903,7 +913,7 @@ def _build_app(mesh_mode: bool = False):
             # v4.1 Phase 2a — lazy durable-registry fallback (SEAM-1d-07).
             durable_store=_mcp_durable_store,
         )
-        _extra_routers: list = [openai_router]
+        _extra_routers: list = [openai_router, egress_proxy_router]
 
         if len(_mcp_registry) > 0 and _mcp_jwks_store is not None:
             # Pick any broker for the /mcp/health OPA probe (they all share opa_url)
@@ -915,7 +925,7 @@ def _build_app(mesh_mode: bool = False):
             # dispatch path (after rate-limit + DDoS + JWT + OPA) and calls
             # dispatch_mcp_call() directly.  The _mcp_info_router (JWKS + health)
             # IS mounted as extra_router — those endpoints are intentionally public.
-            _extra_routers = [openai_router, _mcp_info_router]
+            _extra_routers = [openai_router, egress_proxy_router, _mcp_info_router]
             logger.info(
                 "MCP broker wiring: %d server(s) registered, JWKS info routes mounted "
                 "(call routes wired through catch-all — Fix-1)",
