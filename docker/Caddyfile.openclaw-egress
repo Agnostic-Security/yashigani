@@ -71,7 +71,8 @@
 # Static proof (cert chain → SAN gate):
 #   /etc/openclaw/tls/client.crt (./secrets/openclaw_client.crt)
 #   URI SAN: spiffe://yashigani.internal/openclaw (service_identities.yaml:248)
-#   :18790 CEL gate: {san.uris.0} != spiffe://yashigani.internal/openclaw → 403
+#   :18790 stamped-header gate: X-Yashigani-Verified-Spiffe != openclaw SPIFFE → 403
+#   (v4.1 LAURA-I1-CEL: CEL URI-SAN expression replaced — caddy 2.11.x *url.URL bug)
 #   Match: cert SAN satisfies the gate → require_and_verify accepts it.
 # Nothing deferred. Laura Phase-3 test (c) is live confirmation of this chain.
 #
@@ -83,11 +84,26 @@
 # Caller gate — exact SPIFFE SAN match on the VERIFIED peer certificate.
 # require_and_verify (below) already guarantees the cert chains to the internal
 # intermediate CA; this snippet narrows "any mesh member" to "openclaw only".
+#
+# v4.1 LAURA-I1-CEL FIX: Caddy 2.11.x cannot evaluate URI SANs in CEL expressions
+# (unsupported conversion to ref.Val: (*url.URL)spiffe://...) — the original
+# `expression {san.uris.0} != "..."` returned 500 on every request, making the
+# gate permanently broken (fail-closed, but openclaw egress completely non-functional).
+# Replaced with the proven stamped-header pattern (validated for admin relay):
+#   1. request_header bare SET: forge-proof — runs after TLS, overwrites any
+#      client-supplied header value before any matcher sees it.
+#   2. header matcher (string comparison only) — no CEL, no *url.URL conversion.
+#
 # Parse-time env substitution: if YASHIGANI_OPENCLAW_SPIFFE_ID is unset the
-# default literal applies; an empty substitution would fail CLOSED (no leaf
-# carries an empty URI SAN, so the != matcher fires and 403s everything).
+# default literal applies; an empty string would fail CLOSED (no leaf carries an
+# empty URI SAN, so the not-header matcher fires and 403s everything).
 (openclaw-egress-caller-gate) {
-    @caller_not_openclaw expression {http.request.tls.client.san.uris.0} != "{$YASHIGANI_OPENCLAW_SPIFFE_ID:spiffe://yashigani.internal/openclaw}"
+    # Stamp the verified client-cert URI SAN. Bare SET (no + prefix) overwrites
+    # any client-supplied value — a caller cannot forge this past the stamp.
+    request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
+    @caller_not_openclaw {
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_OPENCLAW_SPIFFE_ID:spiffe://yashigani.internal/openclaw}"
+    }
     respond @caller_not_openclaw "Forbidden" 403
 }
 

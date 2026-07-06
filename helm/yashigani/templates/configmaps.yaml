@@ -1075,7 +1075,15 @@ data:
     # fixed upstreams in THIS block are the destination control.
     # ─────────────────────────────────────────────────────────────────────────
     (openclaw-egress-caller-gate) {
-      @caller_not_openclaw expression {http.request.tls.client.san.uris.0} != "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/openclaw"
+      # v4.1 LAURA-I1-CEL FIX: stamped-header pattern replaces broken CEL matcher.
+      # Caddy 2.11.x cannot evaluate URI SANs in CEL (unsupported conversion to
+      # ref.Val: (*url.URL)). See docker/Caddyfile.openclaw-egress for full rationale.
+      # Bare SET stamp overwrites any client-supplied header; header matcher is
+      # pure string comparison — no CEL, no *url.URL conversion.
+      request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
+      @caller_not_openclaw {
+        not header X-Yashigani-Verified-Spiffe "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/openclaw"
+      }
       respond @caller_not_openclaw "Forbidden" 403
     }
     :18790 {
