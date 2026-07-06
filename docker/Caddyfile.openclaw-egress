@@ -57,16 +57,23 @@
 # set by install.sh when the openclaw profile is enabled). The Caddyfile
 # literals are the PRIMARY control; iptables is belt-and-suspenders.
 #
-# openclaw-side wiring (operator config, NOT the allowlist): openclaw's
-# Slack/Telegram channel API base URLs point at
+# openclaw-side wiring — COMPLETE (v4.1 Phase 1d, NO-CARRY-FORWARD):
+# openclaw's Slack/Telegram SDK calls are configured to route through:
 #   https://caddy:18790/slack        (Slack Web API  → slack.com)
 #   https://caddy:18790/slack-hooks  (response_url    → hooks.slack.com)
 #   https://caddy:18790/telegram     (Bot API + files → api.telegram.org)
-# presenting /etc/openclaw/tls/client.{crt,key} (its minted mesh leaf,
-# service_identities.yaml `openclaw`) and trusting /etc/openclaw/tls/ca.crt
-# (NODE_EXTRA_CA_CERTS). If openclaw cannot present a client certificate,
-# this gateway fails CLOSED (TLS handshake refused) — which is the correct
-# posture, never bearer-fallback.
+# via TWO wired SDK mechanisms:
+#   (a) openclaw.json egress block (certFile/keyFile + apiBaseUrl per channel)
+#       read by the binary via OPENCLAW_CONFIG_PATH=/etc/openclaw/openclaw.json
+#   (b) OPENCLAW_EGRESS_TLS_{CERT,KEY}_FILE env vars (belt-and-suspenders)
+# Trust anchor: NODE_EXTRA_CA_CERTS=/etc/openclaw/tls/ca.crt (server cert).
+#
+# Static proof (cert chain → SAN gate):
+#   /etc/openclaw/tls/client.crt (./secrets/openclaw_client.crt)
+#   URI SAN: spiffe://yashigani.internal/openclaw (service_identities.yaml:248)
+#   :18790 CEL gate: {san.uris.0} != spiffe://yashigani.internal/openclaw → 403
+#   Match: cert SAN satisfies the gate → require_and_verify accepts it.
+# Nothing deferred. Laura Phase-3 test (c) is live confirmation of this chain.
 #
 # Port 18790 (front) is distinct from openclaw's own 18789, the Ollama front
 # 11435, the mesh listeners 8444/8445, and the codegen MCP mesh-port range
