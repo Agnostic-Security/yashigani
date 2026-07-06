@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -391,6 +392,56 @@ async def run_approve_transaction(
 
     rollback.append(_undo_mint)
 
+    # ── Step 2b: svid-init directory population (Captain d2931113 / SEAM-1d-06) ─
+    #
+    # Captain's svid-sidecar reads INIT_DIR (bind: secrets/svid-init/<t>/<s>/)
+    # expecting the basenames rotate.sh projects into the shared SVID volume:
+    #   client.crt  — the per-instance leaf cert (minted above)
+    #   client.key  — the corresponding private key
+    #   ca.crt      — the intermediate CA cert (Caddy's trust anchor)
+    # Without these files the sidecar has nothing to project and Caddy cannot
+    # present a leaf at the wrap's mTLS listener — requests to /mcp/<server>
+    # would fail with a TLS handshake error rather than an authz deny.
+    #
+    # Ordering invariant: step 2b runs BEFORE step 3 (codegen) and BEFORE step 4
+    # (caddy reload).  The sidecar service is started by the compose
+    # _gen_svid_sidecar_service stanza; it copies INIT_DIR → SVID_DIR during its
+    # init phase.  Caddy mounts the SVID volume read-only, so the cert must be
+    # in place before the caddy reload at step 4 loads the new snippet.
+    _svid_init_dir = Path(secrets_dir) / "svid-init" / tenant_id / server_id
+    try:
+        _svid_init_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cert_path, _svid_init_dir / "client.crt")
+        shutil.copy2(key_path, _svid_init_dir / "client.key")
+        shutil.copy2(pki_paths.intermediate_cert, _svid_init_dir / "ca.crt")
+        logger.info(
+            "mcp-onboard: svid-init populated for %s/%s at %s",
+            tenant_id, server_id, _svid_init_dir,
+        )
+    except Exception as exc:
+        _run_rollback()
+        _audit_failure("svid_init", exc, instance_id, spiffe_id)
+        raise McpOnboardError(
+            "svid_init",
+            f"svid-init directory population failed — onboarding aborted and "
+            "rolled back (fail-closed; Captain SEAM-1d-06): {exc}",
+        ) from exc
+
+    def _undo_svid_init() -> None:
+        for _fname in ("client.crt", "client.key", "ca.crt"):
+            try:
+                (_svid_init_dir / _fname).unlink(missing_ok=True)
+            except OSError as _unlink_exc:
+                logger.error(
+                    "mcp-onboard: rollback svid-init unlink %s failed: %s",
+                    _fname, _unlink_exc,
+                )
+        logger.warning(
+            "mcp-onboard: rolled back svid-init dir for %s/%s", tenant_id, server_id,
+        )
+
+    rollback.append(_undo_svid_init)
+
     # ── Step 3: codegen + artifact write (Captain's approve-hook) ───────────
     try:
         artifacts = approve_mcp_onboard(
@@ -483,6 +534,38 @@ async def run_approve_transaction(
                 "svid_instance_id": instance_id,
             }
             registry_store.put(tenant_id, server_id, descriptor)
+
+            # ── Step 4b-ii: store OPA grant + baseline (Seam-3 / SEAM-1d-07) ──
+            #
+            # Write the per-instance OPA grant and capability-envelope baseline
+            # into Redis so the gateway's startup push (and any subsequent
+            # re-push on OPA reconnect) can rebuild data.yashigani.mcp without
+            # querying the envelope DB.  Both writes use the same registry_store
+            # client (Redis db/3) as the descriptor above.
+            #
+            # grant:    caller is always the gateway mesh identity (the only
+            #           caller that reaches OPA via the broker transport path).
+            #           tools = the envelope's declared tool surface.
+            # baseline: surface_hash = scope_hash (sha384:...) — stored as-is;
+            #           normalised to the same format the broker sends in the OPA
+            #           input target.surface_hash at push time via list_all().
+            from yashigani.identity.trust_domain import trust_domain as _trust_domain
+            _gateway_spiffe = "spiffe://%s/gateway" % _trust_domain()
+            _sorted_tools = sorted(env.tools.keys())
+            registry_store.put_grant(tenant_id, server_id, {
+                "tools": _sorted_tools,
+                "actions": ["tools/call"],
+                "caller_spiffe": _gateway_spiffe,
+            })
+            registry_store.put_baseline(tenant_id, server_id, {
+                "surface_hash": scope_hash,   # sha384:<hex> — normalised at push time
+                "tools": _sorted_tools,
+            })
+            logger.info(
+                "mcp-onboard: stored OPA grant+baseline for %s/%s "
+                "tools=%d surface=%s",
+                tenant_id, server_id, len(_sorted_tools), scope_hash[:24],
+            )
         except Exception as exc:
             _run_rollback()
             if reload_applied:
@@ -508,6 +591,8 @@ async def run_approve_transaction(
                     "mcp-onboard: rollback broker-registry delete failed: %s",
                     del_exc,
                 )
+            registry_store.delete_grant(tenant_id, server_id)
+            registry_store.delete_baseline(tenant_id, server_id)
 
         rollback.append(_undo_registry)
     else:

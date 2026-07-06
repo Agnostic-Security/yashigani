@@ -1213,6 +1213,199 @@ async def verify_mcp_ingress(request: Request, tenant: str = "", server: str = "
     return resp
 
 
+# ---------------------------------------------------------------------------
+# v4.1 Phase 2b — /auth/verify-webhook: forward_auth gate for openclaw webhook
+# ingress (Caddyfile.openclaw-webhooks / LAURA-I1-03 / FP-05).
+# ---------------------------------------------------------------------------
+
+_SLACK_SIG_RE = re.compile(r"^v0=[0-9a-f]{64}$")
+_WEBHOOK_RATE_IP_LIMIT = 60        # per-IP per 60s
+_WEBHOOK_RATE_GLOBAL_LIMIT = 300   # global per 60s
+_WEBHOOK_RATE_WINDOW = 60          # seconds
+_WEBHOOK_REPLAY_TTL = 600          # Slack sig replay-dedup window (seconds)
+_TELEGRAM_SECRET_PATH = "/run/secrets/openclaw_telegram_webhook_secret"
+
+
+def _webhook_audit_deny(provider: str, reason: str, client_ip: str) -> None:
+    """Best-effort WEBHOOK_INGRESS_DENIED audit write (never raises)."""
+    aw = backoffice_state.audit_writer
+    if aw is None:
+        return
+    try:
+        from yashigani.audit.schema import WebhookIngressDeniedEvent
+        aw.write(WebhookIngressDeniedEvent(
+            provider=provider,
+            reason=reason,
+            client_ip=client_ip,
+        ))
+    except Exception as exc:  # noqa: BLE001 — audit must never mask the deny
+        _log.error("verify-webhook: WEBHOOK_INGRESS_DENIED audit write failed: %s", exc)
+
+
+def _webhook_deny(status_code: int, reason: str, provider: str, client_ip: str):
+    """Audit + build deny response for verify-webhook."""
+    _webhook_audit_deny(provider, reason, client_ip)
+    _log.warning(
+        "verify-webhook: DENY reason=%s provider=%r ip=%s",
+        reason, provider, client_ip,
+    )
+    from fastapi import HTTPException as _HTTPException
+    raise _HTTPException(
+        status_code=status_code,
+        detail={"error": reason},
+        headers={"X-Authz-Reason": reason},
+    )
+
+
+def _webhook_rate_check(client_ip: str, provider: str) -> None:
+    """Per-IP + global rate-limit via Redis (fail-closed: 429 on Redis error)."""
+    try:
+        r = _get_throttle_redis()
+        import time as _time
+        _now = int(_time.time())
+        _window = _now // _WEBHOOK_RATE_WINDOW
+        ip_key = f"webhook:rate:ip:{client_ip}:{_window}"
+        global_key = f"webhook:rate:global:{_window}"
+        pipe = r.pipeline()
+        pipe.incr(ip_key)
+        pipe.expire(ip_key, _WEBHOOK_RATE_WINDOW + 5)
+        pipe.incr(global_key)
+        pipe.expire(global_key, _WEBHOOK_RATE_WINDOW + 5)
+        results = pipe.execute()
+        ip_count = int(results[0])
+        global_count = int(results[2])
+        if ip_count > _WEBHOOK_RATE_IP_LIMIT:
+            _webhook_deny(429, "rate_limit_ip", provider, client_ip)
+        if global_count > _WEBHOOK_RATE_GLOBAL_LIMIT:
+            _webhook_deny(429, "rate_limit_global", provider, client_ip)
+    except Exception as exc:  # noqa: BLE001 — Redis down → fail-closed
+        _log.error("verify-webhook: rate-limit Redis unavailable — denying: %s", exc)
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "rate_limit_store_unavailable"},
+        )
+
+
+def _slack_replay_dedup(sig: str, provider: str, client_ip: str) -> None:
+    """SETNX sha256(X-Slack-Signature) with TTL=600s; duplicate → 401."""
+    from fastapi import HTTPException as _HTTPException
+    import hashlib as _hashlib
+    sig_hash = _hashlib.sha256(sig.encode("utf-8")).hexdigest()
+    try:
+        r = _get_throttle_redis()
+        replay_key = f"webhook:slack:replay:{sig_hash}"
+        inserted = r.setnx(replay_key, "1")
+        if inserted:
+            r.expire(replay_key, _WEBHOOK_REPLAY_TTL)
+        else:
+            _webhook_deny(401, "slack_replay_detected", provider, client_ip)
+    except _HTTPException:
+        raise  # deny decisions must propagate, not be masked as 503
+    except Exception as exc:  # noqa: BLE001 — Redis down → fail-closed
+        _log.error("verify-webhook: replay-dedup Redis unavailable — denying: %s", exc)
+        raise _HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "replay_store_unavailable"},
+        )
+
+
+@router.get("/verify-webhook")
+async def verify_webhook_ingress(request: Request, provider: str = ""):
+    """
+    Caddy forward_auth gate for openclaw inbound webhooks (v4.1 Phase 2b,
+    LAURA-I1-03 / FP-05; contract in Caddyfile.openclaw-webhooks header).
+
+    Fail-closed at every step — any missing or malformed header is 401; any
+    store unavailability is 503.  Caddy treats any non-2xx as DENY.
+
+    Layer-B HMAC (X-Caddy-Verified-Secret):
+      CaddyVerifiedMiddleware already enforces this globally for ALL backoffice
+      routes — a direct public call to this endpoint without the per-install
+      secret is 401 before reaching this handler.
+
+    Step 0: X-Forwarded-Method must be POST (Caddy sets this on the subrequest).
+    Step 1: provider must be "slack" or "telegram".
+    Step 2 (slack): timestamp freshness (±300s) + signature shape + replay dedupe.
+    Step 2 (telegram): constant-time compare of X-Telegram-Bot-Api-Secret-Token
+                       against /run/secrets/openclaw_telegram_webhook_secret.
+    Step 3: per-IP + global rate-limit buckets in Redis.
+    Step 4: audit every deny (WEBHOOK_INGRESS_DENIED).
+
+    Body-MAC split (Caddyfile.openclaw-webhooks §76-85):
+      Caddy's forward_auth strips the body → full Slack HMAC (v0:ts:body) lives
+      with openclaw's Slack SDK channel integration.  This gate enforces:
+        * freshness (timestamp window guards replay without the body), and
+        * exact-replay dedupe (deterministic MAC over v0:ts:body makes the sig
+          a unique per-request token within the freshness window).
+      Telegram token verification is COMPLETE here (no body dependency).
+    """
+    import hmac as _hmac
+    import time as _time
+
+    client_ip = _real_client_ip(request)
+
+    # Step 0 — method check (forward_auth sets X-Forwarded-Method)
+    fwd_method = request.headers.get("x-forwarded-method", "").strip().upper()
+    if fwd_method != "POST":
+        _webhook_deny(401, "method_not_post", provider, client_ip)
+
+    # Step 1 — provider validation
+    if provider not in ("slack", "telegram"):
+        _webhook_deny(401, "unknown_provider", provider or "", client_ip)
+
+    # Step 3 — rate-limit (early, before doing crypto work on attacker input)
+    _webhook_rate_check(client_ip, provider)
+
+    if provider == "slack":
+        # Step 2a — Slack: timestamp freshness
+        ts_raw = request.headers.get("x-slack-request-timestamp", "").strip()
+        if not ts_raw:
+            _webhook_deny(401, "slack_timestamp_missing", provider, client_ip)
+        try:
+            ts = int(ts_raw)
+        except ValueError:
+            _webhook_deny(401, "slack_timestamp_invalid", provider, client_ip)
+        now = int(_time.time())
+        if abs(now - ts) > 300:
+            _webhook_deny(401, "slack_timestamp_stale", provider, client_ip)
+
+        # Step 2b — Slack: signature shape (v0=<64 hex>)
+        sig = request.headers.get("x-slack-signature", "").strip()
+        if not sig:
+            _webhook_deny(401, "slack_signature_missing", provider, client_ip)
+        if not _SLACK_SIG_RE.match(sig):
+            _webhook_deny(401, "slack_signature_malformed", provider, client_ip)
+
+        # Step 2c — Slack: replay dedup (SETNX sha256(sig) TTL 600s)
+        _slack_replay_dedup(sig, provider, client_ip)
+
+    else:  # telegram
+        # Step 2 — Telegram: constant-time token compare
+        presented = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not presented:
+            _webhook_deny(401, "telegram_token_missing", provider, client_ip)
+        try:
+            expected = open(_TELEGRAM_SECRET_PATH).read().strip()  # noqa: WPS515
+        except OSError as exc:
+            _log.error(
+                "verify-webhook: cannot read Telegram webhook secret at %r: %s — "
+                "denying (fail-closed; mount the secret in install.sh)",
+                _TELEGRAM_SECRET_PATH, exc,
+            )
+            from fastapi import HTTPException as _HTTPException
+            raise _HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "telegram_secret_unavailable"},
+            )
+        if not _hmac.compare_digest(presented, expected):
+            _webhook_deny(401, "telegram_token_mismatch", provider, client_ip)
+
+    _log.debug("verify-webhook: ALLOW provider=%r ip=%s", provider, client_ip)
+    from starlette.responses import Response as StarletteResponse
+    return StarletteResponse(status_code=200)
+
+
 @router.post("/password/change")
 async def change_password(
     body: PasswordChangeRequest,

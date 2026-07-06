@@ -392,6 +392,9 @@ class EventType(str, Enum):
     # A mesh caller was DENIED at the per-MCP wrap's forward_auth leg.
     # Allows are high-volume data-plane traffic → app log only, never chained.
     MCP_INGRESS_DENIED = "MCP_INGRESS_DENIED"
+    # v4.1 Phase 2b — webhook ingress gate (/auth/verify-webhook forward_auth).
+    # Slack freshness / replay / Telegram token check failed or provider unknown.
+    WEBHOOK_INGRESS_DENIED = "WEBHOOK_INGRESS_DENIED"
     # v4.1 Phase 1c — MCP approve transaction (mint leaf → codegen → reload →
     # durable envelope) aborted + rolled back; nothing was onboarded.
     MCP_ONBOARD_TRANSACTION_FAILED = "MCP_ONBOARD_TRANSACTION_FAILED"
@@ -3556,6 +3559,28 @@ class McpIngressDeniedEvent(AuditEvent):
     tenant_id: str = ""
     server_id: str = ""
     reason: str = ""
+
+
+@dataclass
+class WebhookIngressDeniedEvent(AuditEvent):
+    """An inbound webhook was DENIED at the /auth/verify-webhook forward_auth gate.
+
+    v4.1 Phase 2b — emitted by the backoffice verify_webhook_ingress route on
+    every deny.  Covers: Layer-B HMAC absent (caught before this event), bad
+    method, unknown provider, Slack timestamp-freshness fail, Slack replay, Telegram
+    token mismatch, and rate-limit exceeded.
+
+    provider: "slack" | "telegram" | "" (unknown/missing)
+    reason: machine-readable deny string
+    client_ip: X-Real-IP from Caddy (never a client-spoofable header)
+    """
+
+    event_type: str = EventType.WEBHOOK_INGRESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # no PII in provider / reason
+    provider: str = ""
+    reason: str = ""
+    client_ip: str = ""
 
 
 @dataclass

@@ -1008,6 +1008,33 @@ def _build_app(mesh_mode: bool = False):
                         "applies to all MCP servers + external API hosts until next restart",
                         _seed_exc,
                     )
+
+            # v4.1 Phase 2b (Seam-3 — OPA grants/baselines re-push on start):
+            # Push data.yashigani.mcp.{grants, baselines} to OPA so that OPA
+            # restarts (which wipe in-memory data) do NOT permanently deny all
+            # MCP invocations.  Non-fatal: OPA may not yet be reachable at
+            # gateway startup (they start concurrently); invocations will deny
+            # fail-closed until a subsequent push succeeds.  A Phase-3 broker
+            # health task will re-push on OPA reconnect.
+            if _mcp_durable_store is not None and _mcp_id_store is not None:
+                try:
+                    from yashigani.mcp._opa_push import push_mcp_opa_data
+                    _mcp_opa_doc = _mcp_durable_store.build_mcp_opa_data(
+                        _mcp_id_store, _perm_org_id,
+                    )
+                    push_mcp_opa_data(opa_url, _mcp_opa_doc)
+                    logger.info(
+                        "MCP OPA startup push: %d grant(s) + %d baseline(s) "
+                        "pushed to OPA (Seam-3)",
+                        len(_mcp_opa_doc.get("grants", {})),
+                        len(_mcp_opa_doc.get("baselines", {})),
+                    )
+                except Exception as _opa_push_exc:
+                    logger.warning(
+                        "MCP OPA startup push FAILED (non-fatal) — invocations "
+                        "will deny until OPA is reachable and data re-pushed "
+                        "(Seam-3): %s", _opa_push_exc,
+                    )
         else:
             _mcp_registry = None
             _mcp_jwks_store = None

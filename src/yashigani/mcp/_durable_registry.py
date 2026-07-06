@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 
 _KEY_SERVER = "mcp:broker:server:{tenant}:{server}"
 _KEY_INDEX = "mcp:broker:server_index"
+# Grant + baseline keys — written at approve time, read at OPA startup push.
+# grant:   {tools: [...], actions: [...], caller_spiffe: "spiffe://..."}
+# baseline: {surface_hash: "sha384:<hex>", tools: [...]}
+_KEY_GRANT = "mcp:broker:grant:{tenant}:{server}"
+_KEY_BASELINE = "mcp:broker:baseline:{tenant}:{server}"
 
 
 def canonical_server_key(tenant_id: str, server_id: str) -> str:
@@ -112,6 +117,144 @@ class DurableMcpRegistryStore:
             logger.info("mcp-durable-registry: deleted %s", key)
         except Exception as exc:  # noqa: BLE001 — rollback path is best-effort
             logger.error("mcp-durable-registry: delete %s failed: %s", key, exc)
+
+    def put_grant(self, tenant_id: str, server_id: str, grant_data: dict) -> None:
+        """Store the per-instance OPA grant for ``<tenant>:<server>``.
+
+        Raises on Redis failure — the approve transaction treats this as a step
+        failure and rolls back (fail-closed, same as put()).
+        grant_data shape: {tools: [...], actions: [...], caller_spiffe: "..."}.
+        """
+        if not tenant_id or not server_id:
+            raise ValueError("tenant_id and server_id must be non-empty")
+        self._redis.set(
+            _KEY_GRANT.format(tenant=tenant_id, server=server_id),
+            json.dumps(grant_data),
+        )
+        logger.debug(
+            "mcp-durable-registry: stored grant for %s:%s tools=%d",
+            tenant_id, server_id, len(grant_data.get("tools", [])),
+        )
+
+    def put_baseline(self, tenant_id: str, server_id: str, baseline_data: dict) -> None:
+        """Store the capability-envelope OPA baseline for ``<tenant>:<server>``.
+
+        baseline_data shape: {surface_hash: "sha384:<hex>", tools: [...]}.
+        Raises on Redis failure.
+        """
+        if not tenant_id or not server_id:
+            raise ValueError("tenant_id and server_id must be non-empty")
+        self._redis.set(
+            _KEY_BASELINE.format(tenant=tenant_id, server=server_id),
+            json.dumps(baseline_data),
+        )
+        logger.debug(
+            "mcp-durable-registry: stored baseline for %s:%s hash=%s",
+            tenant_id, server_id, baseline_data.get("surface_hash", "?")[:20],
+        )
+
+    def delete_grant(self, tenant_id: str, server_id: str) -> None:
+        """Remove a grant entry (rollback path — best-effort)."""
+        try:
+            self._redis.delete(_KEY_GRANT.format(tenant=tenant_id, server=server_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mcp-durable-registry: delete_grant %s:%s failed: %s", tenant_id, server_id, exc)
+
+    def delete_baseline(self, tenant_id: str, server_id: str) -> None:
+        """Remove a baseline entry (rollback path — best-effort)."""
+        try:
+            self._redis.delete(_KEY_BASELINE.format(tenant=tenant_id, server=server_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mcp-durable-registry: delete_baseline %s:%s failed: %s", tenant_id, server_id, exc)
+
+    def get_grant(self, tenant_id: str, server_id: str) -> Optional[dict]:
+        """Return the stored grant for ``<tenant>:<server>``, or None."""
+        try:
+            raw = self._redis.get(_KEY_GRANT.format(tenant=tenant_id, server=server_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mcp-durable-registry: get_grant %s:%s failed: %s", tenant_id, server_id, exc)
+            return None
+        return self._decode(raw)
+
+    def get_baseline(self, tenant_id: str, server_id: str) -> Optional[dict]:
+        """Return the stored baseline for ``<tenant>:<server>``, or None."""
+        try:
+            raw = self._redis.get(_KEY_BASELINE.format(tenant=tenant_id, server=server_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mcp-durable-registry: get_baseline %s:%s failed: %s", tenant_id, server_id, exc)
+            return None
+        return self._decode(raw)
+
+    def build_mcp_opa_data(self, mcp_id_store: Any, org_id: str) -> dict:
+        """Build the OPA MCP data document for startup push (Seam-3 / SEAM-1d-07).
+
+        Returns::
+
+            {
+              "grants":    {mcp_id: {caller_spiffe: {tools: [...], actions: [...]}}},
+              "baselines": {mcp_id: {surface_hash: "sha384:<hex>", tools: [...]}},
+            }
+
+        The ``mcp_id`` is resolved via ``mcp_id_store.get_or_mint(server_id)``
+        (same key the broker uses at call time).  Entries whose grant OR baseline
+        is missing in Redis are skipped with a warning (they were onboarded before
+        Seam-3 wiring — the OPA will fail-closed for those instances until they
+        are re-approved or until the data is back-filled).
+        """
+        grants: dict = {}
+        baselines: dict = {}
+        descriptors = self.list_all()
+        for desc in descriptors:
+            server_id = desc.get("agent_name", "")
+            tenant_id = desc.get("tenant_id", "")
+            if not server_id or not tenant_id:
+                continue
+            # Resolve stable mcp_id (same UUID the broker uses in ctx.mcp_id).
+            try:
+                mcp_id: str = mcp_id_store.get_or_mint(server_id)
+            except Exception as exc:
+                logger.warning(
+                    "mcp-durable-registry: build_mcp_opa_data mcp_id lookup "
+                    "failed for %s:%s — skipping: %s", tenant_id, server_id, exc,
+                )
+                continue
+
+            # Grant
+            grant = self.get_grant(tenant_id, server_id)
+            if grant is not None:
+                caller_spiffe = grant.get("caller_spiffe", "")
+                if caller_spiffe:
+                    grants.setdefault(mcp_id, {})[caller_spiffe] = {
+                        "tools": grant.get("tools", []),
+                        "actions": grant.get("actions", ["tools/call"]),
+                    }
+
+            # Baseline — normalise surface_hash to the same format the broker
+            # sends in the OPA input (sha384:<hex> as stored; _sha256_label not
+            # applied here — the broker normalises at send time using the same
+            # raw value from the live catalogue; the baseline must match that).
+            baseline = self.get_baseline(tenant_id, server_id)
+            if baseline is not None:
+                baselines[mcp_id] = {
+                    "surface_hash": baseline.get("surface_hash", ""),
+                    "tools": baseline.get("tools", []),
+                }
+
+            if grant is None or baseline is None:
+                logger.warning(
+                    "mcp-durable-registry: build_mcp_opa_data: %s:%s has no %s in "
+                    "Redis — OPA will fail-closed for this instance until re-approved "
+                    "(pre-Seam-3 onboard or data evicted)",
+                    tenant_id, server_id,
+                    "grant" if grant is None else "baseline",
+                )
+
+        logger.info(
+            "mcp-durable-registry: build_mcp_opa_data: %d grant(s) + %d baseline(s) "
+            "from %d descriptor(s)",
+            len(grants), len(baselines), len(descriptors),
+        )
+        return {"grants": grants, "baselines": baselines}
 
     # ── read side (gateway lazy load) ─────────────────────────────────────
 
@@ -199,4 +342,7 @@ class DurableMcpRegistryStore:
         return data if isinstance(data, dict) else None
 
 
-__all__ = ["DurableMcpRegistryStore", "canonical_server_key"]
+__all__ = [
+    "DurableMcpRegistryStore",
+    "canonical_server_key",
+]
