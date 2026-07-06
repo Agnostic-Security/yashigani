@@ -118,6 +118,23 @@ class McpCallContext:
     # or agent_name.  Populated by the runtime MCP router from the server config.
     mcp_id: str = ""
 
+    # v4.1 Phase 2a (LU-MCP-A1 — lu.md §3a): identity.verified for the OPA
+    # input.  True ONLY when the transport layer verified the caller's
+    # per-instance leaf certificate (Caddy require_and_verify strip-and-set
+    # SPIFFE URI SAN, AND-coupled with X-Caddy-Verified-Secret — Option C).
+    # NEVER derived from hostname (instance-leaf SANs are loopback-only) and
+    # NEVER from a client-settable header alone.  Default False = fail-closed:
+    # a broker-asserted identity does not claim verification.
+    identity_verified: bool = False
+
+    # v4.1 Phase 2a (LU-MCP-A2 — lu.md §3a): SHA-256 fingerprint of the TARGET
+    # MCP instance's leaf certificate ("sha256:<hex>" or bare hex; normalised
+    # by the broker before the OPA input is built).  Populated by the runtime
+    # router from McpBrokerServerConfig.cert_fingerprint (durable registry /
+    # onboard transaction).  Empty when unknown — the broker falls back to the
+    # P8 upstream-pin material for the server, else omits it.
+    target_cert_fingerprint: str = ""
+
     # FIX-C (Iris FIND-001): sensitivity labels for resource and prompt calls.
     # OPA policy (mcp.rego:380-391) escalates audit_capture for CONFIDENTIAL/RESTRICTED
     # access but the escalation was structurally unreachable because McpCallContext had

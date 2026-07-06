@@ -3,13 +3,15 @@ MCP Broker — OPA enforcement with fail-closed 500ms timeout.
 
 Queries /v1/data/yashigani/mcp/mcp_decision per the locked policy contract.
 
-Input shape (must exactly match mcp.rego):
+Input shape (must exactly match mcp.rego / policy/mcp-input.schema.json):
   {
     "input": {
       "posture":   "mcp-a" | "mcp-b" | "mcp-c",
       "action":    "mcp.tools.call" | ...,
-      "identity":  {"spiffe": "<uri>", "chain": ["<uri>", ...]},
+      "identity":  {"spiffe": "<uri>", "chain": ["<uri>", ...], "verified": bool},
       "tool":      {"name": "<name>", "args_redacted": {<k>: <v>, ...}},  // or prompt/resource
+      "target":    {"mcp_id": "<uuid>", "cert_fingerprint": "sha256:<hex>",
+                    "surface_hash": "sha256:<hex>"},   // v4.1 Phase 2a, when known
     }
   }
 
@@ -82,22 +84,54 @@ OPA_TIMEOUT_SECONDS = 0.5   # 500ms — C9 requirement
 
 def _make_opa_http_client(timeout: float = OPA_TIMEOUT_SECONDS) -> httpx.AsyncClient:
     """
-    FIX-OPA-SSL (2026-05-30): OPA is exposed only via HTTPS with the internal
-    Yashigani PKI CA.  httpx's default trust store does NOT include the internal
-    CA → [SSL: CERTIFICATE_VERIFY_FAILED] → opa_unreachable → tools/call denied.
+    FIX-MCP-001 (v4.1 Phase 2a, 2026-07-06): OPA sits behind the service mesh
+    and REQUIRES a client leaf at the TLS handshake (require_and_verify).  The
+    previous CA-only client (verify=ca_cert, no cert=) was identity-less —
+    OPA rejected it with TLSV13_ALERT_CERTIFICATE_REQUIRED before any HTTP
+    exchange → every broker OPA query fail-closed as ``opa_unreachable``
+    (empirically proven in mcp001_ab_proof.txt: the identity-less client is
+    refused; ``internal_httpx_client()`` with the gateway ServiceIdentity
+    returns OPA 200).
 
-    Read YASHIGANI_CA_CERT env var (= /run/secrets/ca_root.crt in the gateway
-    container) and pass it as the CA bundle to httpx.AsyncClient.
+    Primary path: ``yashigani.pki.client.internal_httpx_client()`` — the
+    gateway mesh identity (ServiceIdentity leaf + internal CA trust).  This is
+    the SAME client every other internal mesh call uses.  ``authz.rego``
+    already admits the gateway service identity; per-MCP instance leaves are
+    NOT used as transport (OPA 401s agent certs by design).
 
-    If the env var is unset or the file does not exist, fall back to the default
-    trust store so that dev/test environments with a public-CA OPA still work.
-    The fallback is intentional: local/unit-test OPA may run over plain HTTP or
-    with a public cert; we only hard-require the CA for the production stack.
+    Fallback (dev/test only): when the ServiceIdentity secrets are absent
+    (unit tests, plain-HTTP OPA, no /run/secrets mount), fall back to the
+    pre-4.1 behaviour — YASHIGANI_CA_CERT trust, then system trust store.
+    The fallback stays fail-closed against a mesh-mTLS OPA: an identity-less
+    client is refused at the handshake → deny (C9).
+
+    FIX-OPA-SSL (2026-05-30) retained inside the fallback: YASHIGANI_CA_CERT
+    (= /run/secrets/ca_root.crt) is used as the CA bundle when present.
 
     This function is the SINGLE place AsyncClient is created for OPA queries —
-    both query_mcp_decision and query_filesystem_tool_allowed use it.
+    query_mcp_decision, query_filesystem_tool_allowed, query_git_tool_allowed
+    and query_mcp_response_decision all use it.
     """
     import os
+
+    # MCP-001 primary path: full mesh mTLS identity (gateway leaf + CA).
+    try:
+        from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
+        client = internal_httpx_client(timeout=timeout)
+        logger.debug("mcp-broker: OPA client using mesh ServiceIdentity (mTLS)")
+        return client
+    except Exception as exc:
+        # ServiceIdentity unavailable (dev/test without /run/secrets, or
+        # misconfigured identity).  Fall back to the identity-less client —
+        # a mesh-mTLS OPA will refuse it at the handshake, which the callers
+        # translate into a fail-closed deny (C9).
+        logger.warning(
+            "mcp-broker: mesh ServiceIdentity unavailable for OPA client (%s) — "
+            "falling back to CA-only client (dev/test path; a mesh-mTLS OPA "
+            "will refuse this client → fail-closed deny)",
+            exc,
+        )
+
     ca_cert = os.environ.get("YASHIGANI_CA_CERT", "").strip()
     if ca_cert and os.path.isfile(ca_cert):
         logger.debug("mcp-broker: OPA client using CA cert %s", ca_cert)
@@ -214,6 +248,22 @@ def _build_opa_input(
     # Purely additive: existing OPA policies that do not reference input.caller
     # are no-ops; the field is ignored.  Passed from McpCallContext.caller_agent_id.
     caller: Optional[dict] = None,
+    # v4.1 Phase 2a (LU-MCP-A1 — lu.md §3a): identity.verified.
+    # True ONLY when the front/broker verified the caller's per-instance leaf
+    # (SPIFFE URI/trust — NOT hostname; instance-leaf SANs are loopback-only).
+    # Default False = fail-closed: an unverified/asserted identity never claims
+    # verification.  Lu's rego gates allow on input.identity.verified == true.
+    identity_verified: bool = False,
+    # v4.1 Phase 2a (LU-MCP-A2/A3 — lu.md §3a): per-instance target object.
+    # mcp_id           — the stable per-instance UUID (ctx.mcp_id, _types.py:119).
+    # cert_fingerprint — "sha256:<hex>" fingerprint of the instance's leaf cert.
+    # surface_hash     — "sha256:<hex>" of the current advertised tool surface.
+    # target is emitted only when mcp_id is non-empty (a target without an
+    # instance id is meaningless; Lu's rego denies instance_unidentified when
+    # target.mcp_id is absent/empty).
+    mcp_id: Optional[str] = None,
+    cert_fingerprint: Optional[str] = None,
+    surface_hash: Optional[str] = None,
 ) -> dict:
     """
     Build the OPA input document.
@@ -226,6 +276,12 @@ def _build_opa_input(
     percent-decoded before being embedded in the input document.  This
     prevents encoded traversal strings (..%2f, %252e%252e, etc.) from
     bypassing OPA's literal ../ check.
+
+    v4.1 Phase 2a (lu.md §3 — the broker is the deterministic PRODUCER,
+    OPA the invoke-time ENFORCER): the document additionally carries
+    ``identity.verified`` (bool, always present, default false) and, when
+    ``mcp_id`` is known, ``target = {mcp_id, cert_fingerprint, surface_hash}``.
+    Existing input fields are unchanged.
     """
     if not isinstance(chain, list):
         raise ValueError(
@@ -239,7 +295,14 @@ def _build_opa_input(
                 "OPA guard will deny. Rejecting before OPA call."
             )
 
-    identity: dict = {"spiffe": spiffe_uri, "chain": chain}
+    identity: dict = {
+        "spiffe": spiffe_uri,
+        "chain": chain,
+        # v4.1 Phase 2a (LU-MCP-A1): ALWAYS present, explicit bool.
+        # False = broker-asserted identity only; True = the transport layer
+        # verified the caller's per-instance leaf (SPIFFE URI/trust).
+        "verified": bool(identity_verified),
+    }
     doc: dict = {
         "posture": posture,
         "action": action,
@@ -249,6 +312,18 @@ def _build_opa_input(
     # 3.1 Phase 1 — caller identity: purely additive, no-op for unbound policies.
     if caller is not None:
         doc["caller"] = caller
+
+    # v4.1 Phase 2a (LU-MCP-A2/A3): per-instance target.  Emitted only when
+    # the stable per-instance mcp_id is known.  cert_fingerprint/surface_hash
+    # keys are included only when non-empty (schema: mcp_id required within
+    # target; the other two optional).
+    if mcp_id:
+        target: dict = {"mcp_id": str(mcp_id)}
+        if cert_fingerprint:
+            target["cert_fingerprint"] = str(cert_fingerprint)
+        if surface_hash:
+            target["surface_hash"] = str(surface_hash)
+        doc["target"] = target
 
     # FIX-P3-ENFORCE / Iris F2: embed agent.name so per-agent rego packages
     # can inspect it (e.g. package yashigani.agents.filesystem allow rule).
@@ -329,6 +404,12 @@ async def query_mcp_decision(
     # Purely additive: absent callers leave the field undefined in OPA input;
     # unbound policies are no-ops.
     caller: Optional[dict] = None,
+    # v4.1 Phase 2a (lu.md §3a) — identity.verified + target{mcp_id,
+    # cert_fingerprint, surface_hash}.  See _build_opa_input for semantics.
+    identity_verified: bool = False,
+    mcp_id: Optional[str] = None,
+    cert_fingerprint: Optional[str] = None,
+    surface_hash: Optional[str] = None,
 ) -> OpaDecisionResult:
     """
     Query OPA for an MCP call decision. Fail-closed on any failure.
@@ -358,6 +439,10 @@ async def query_mcp_decision(
             prompt_sensitivity=prompt_sensitivity,
             agent_name=agent_name,
             caller=caller,
+            identity_verified=identity_verified,
+            mcp_id=mcp_id,
+            cert_fingerprint=cert_fingerprint,
+            surface_hash=surface_hash,
         )
     except ValueError as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)

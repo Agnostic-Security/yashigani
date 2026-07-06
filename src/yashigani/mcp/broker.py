@@ -77,6 +77,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _sha256_label(value: str) -> Optional[str]:
+    """Normalise a SHA-256 digest to the ``sha256:<lowercase hex>`` label form
+    used in the OPA input target object (lu.md §3a).
+
+    Accepts bare hex, colon-separated hex, or an already-prefixed label.
+    Returns None for empty input (the target key is then omitted).
+    """
+    if not value:
+        return None
+    v = value.strip()
+    if v.lower().startswith("sha256:"):
+        v = v[len("sha256:"):]
+    v = v.replace(":", "").replace(" ", "").lower()
+    if not v:
+        return None
+    return f"sha256:{v}"
+
+
 @dataclass
 class McpBrokerConfig:
     """
@@ -414,6 +432,28 @@ class McpBroker:
         spiffe_uri = agent_spiffe_uri(ctx.tenant_id, ctx.agent_name)
         chain_for_opa = list(upstream_chain)
 
+        # v4.1 Phase 2a (LU-MCP-A2/A3 — lu.md §3a): assemble the per-instance
+        # target for the OPA input.  The broker is the deterministic PRODUCER;
+        # OPA (Lu's rego) is the invoke-time ENFORCER.
+        #   cert_fingerprint — the target instance's leaf fp: prefer the value
+        #     the transport layer threaded from the server config (durable
+        #     registry / onboard transaction); fall back to the P8 upstream-pin
+        #     material for this server_id.
+        #   surface_hash — the CURRENT advertised tool surface at call time,
+        #     from the live per-tenant catalogue (same source as the
+        #     capability-envelope gate below).  Empty when no catalogue has
+        #     been fetched yet — Lu's rego fail-closes on baseline mismatch.
+        _target_cert_fp = ctx.target_cert_fingerprint or ""
+        if not _target_cert_fp and ctx.server_id:
+            _pin_cfg = self._upstream_pin_map.get(ctx.server_id)
+            if _pin_cfg is not None and _pin_cfg.cert_fingerprint_sha256:
+                _target_cert_fp = _pin_cfg.cert_fingerprint_sha256
+        _target_surface_hash = ""
+        if ctx.server_id:
+            _live_cat = self._catalogue_store.get(ctx.tenant_id, ctx.server_id)
+            if _live_cat is not None:
+                _target_surface_hash = getattr(_live_cat, "surface_set_hash", "") or ""
+
         # FIX-C (Iris FIND-001): pass sensitivity fields so OPA audit_capture
         # escalation for CONFIDENTIAL/RESTRICTED resources/prompts is reachable.
         # FIX-P3-001: pass tool_args (full args) for path normalisation; also
@@ -435,6 +475,12 @@ class McpBroker:
             # 3.1 Phase 1 — caller identity: additive, no-op for unbound policies.
             # Mirrors the agent_router.py:326 caller+target pattern for MCP.
             caller={"agent_id": ctx.caller_agent_id or "", "user_id": ctx.user_id or ""},
+            # v4.1 Phase 2a (lu.md §3a) — identity.verified (transport-derived,
+            # fail-closed default False) + per-instance target.
+            identity_verified=ctx.identity_verified,
+            mcp_id=ctx.mcp_id or None,
+            cert_fingerprint=_sha256_label(_target_cert_fp),
+            surface_hash=_sha256_label(_target_surface_hash),
         )
 
         elapsed = int((time.monotonic() - t0) * 1000)

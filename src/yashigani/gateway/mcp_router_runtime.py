@@ -318,6 +318,21 @@ async def _handle_mcp_call_inner(
                             "mcp-runtime: failed to write MESH_ORCH_DEPTH_FORGED event: %s", _ae
                         )
 
+    # ── v4.1 Phase 2a (LU-MCP-A1) — identity.verified derivation ───────────
+    #
+    # True ONLY when BOTH hold:
+    #   (a) the caller proved the per-install Caddy HMAC (X-Caddy-Verified-
+    #       Secret validated — Option C AND-coupling), AND
+    #   (b) an x-spiffe-id header is present — Caddy sets it strip-then-set
+    #       from the VERIFIED peer leaf's SPIFFE URI SAN (require_and_verify),
+    #       and SpiffePeerCertMiddleware strips it when (a) fails.
+    # Never derived from hostname (instance-leaf SANs are loopback-only) and
+    # never from a client header alone: without the HMAC the header is treated
+    # as a forge attempt.  Fail-closed default: False.
+    _identity_verified = _caller_is_caddy and bool(
+        request.headers.get("x-spiffe-id", "").strip()
+    )
+
     # ── 1. Registry lookup ────────────────────────────────────────────────
     entry = registry.get(agent_name)  # type: ignore[attr-defined]
     if entry is None:
@@ -494,6 +509,12 @@ async def _handle_mcp_call_inner(
             # Empty string when mcp_id not yet minted (pre-4.0 or no Redis);
             # _check_connection_permit() falls back to server_id / agent_name.
             mcp_id=server_cfg.mcp_id,
+            # v4.1 Phase 2a (LU-MCP-A1/A2): transport-derived verification flag
+            # + the target instance's leaf fingerprint (durable registry /
+            # onboard transaction).  Both flow into the OPA input
+            # (identity.verified + target.cert_fingerprint).
+            identity_verified=_identity_verified,
+            target_cert_fingerprint=getattr(server_cfg, "cert_fingerprint", "") or "",
             # G-ORCH-OPA-1 / Option A: populate from identity registry lookup.
             # None when registry absent or user not found → fail-closed at egress.
             caller_sensitivity_ceiling=caller_sensitivity_ceiling,
@@ -695,6 +716,10 @@ async def _handle_mcp_call_inner(
             server_id=agent_name,
             # v4.0 Item B — stable mcp_id for session context (informational).
             mcp_id=server_cfg.mcp_id,
+            # v4.1 Phase 2a — informational on session messages (no enforce()),
+            # kept consistent with the gated ctx above.
+            identity_verified=_identity_verified,
+            target_cert_fingerprint=getattr(server_cfg, "cert_fingerprint", "") or "",
             # 3.1 Phase 1 — caller identity for session context (informational).
             caller_agent_id=_caller_agent_id,
         )
