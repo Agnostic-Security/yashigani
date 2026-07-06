@@ -208,6 +208,17 @@ spec:
         - name: pki-certs
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + Pattern-A trust anchor only (OPA serves mTLS, verifies
+            # clients against ca_root.crt); no other leaf keys / bootstrap
+            # tokens / caddy_internal_hmac.
+            items:
+              - key: policy_client.crt
+                path: policy_client.crt
+              - key: policy_client.key
+                path: policy_client.key
+              - key: ca_root.crt
+                path: ca_root.crt
         {{- end }}
 ---
 apiVersion: v1

@@ -107,6 +107,16 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + Pattern-B trust anchor only; no other leaf keys /
+            # bootstrap tokens / caddy_internal_hmac.
+            items:
+              - key: loki_client.crt
+                path: loki_client.crt
+              - key: loki_client.key
+                path: loki_client.key
+              - key: ca_intermediate.crt
+                path: ca_intermediate.crt
         {{- end }}
         - name: tmp
           emptyDir:

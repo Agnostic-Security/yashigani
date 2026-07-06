@@ -243,6 +243,22 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # caddy gets its own mesh leaf + the two trust anchors the Caddyfile
+            # references (ca_bundle for upstream verify, ca_intermediate for
+            # client_auth). caddy_internal_hmac is consumed via the
+            # CADDY_INTERNAL_HMAC env secretKeyRef (parse-time {$VAR} in the
+            # Caddyfile), never the file. No other service's leaf key and no
+            # bootstrap tokens are projected.
+            items:
+              - key: caddy_client.crt
+                path: caddy_client.crt
+              - key: caddy_client.key
+                path: caddy_client.key
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
+              - key: ca_intermediate.crt
+                path: ca_intermediate.crt
         {{- end }}
         {{- /* SEAM-1d-04: per-MCP SVID Secret volumes (parity with compose group_add model).
              Created by the approve transaction (mcp_onboard.py Phase 1c).

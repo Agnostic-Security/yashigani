@@ -225,6 +225,12 @@ spec:
               emptyDir:
                 medium: Memory
                 sizeLimit: 10Mi
+            # YSG-RISK-053 DOCUMENTED EXEMPTION: this CronJob is the PKI
+            # rotator — it runs under the yashigani-pki ServiceAccount which
+            # already holds kubectl get/apply rights on the whole Secret
+            # (mtls-rbac.yaml) and must carry every leaf, token and the HMAC
+            # forward across rotations. items: scoping here would be theatre.
+            # No workload pod shares this SA.
             - name: existing-secrets
               secret:
                 secretName: {{ .Values.mtls.secretName }}

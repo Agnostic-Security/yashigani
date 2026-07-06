@@ -446,6 +446,25 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # only these keys are projected into /pki-ro, so the initContainer's
+            # `cp -L /pki-ro/*` copies exactly this set into the /run/secrets
+            # emptyDir: own leaf + own bootstrap token + the two trust anchors
+            # (ca_root for Python ssl / probes / OTLP, ca_bundle for libpq DSN
+            # chain verify). caddy_internal_hmac comes via the
+            # CADDY_INTERNAL_HMAC env secretKeyRef, never the file. No other
+            # service's leaf key or bootstrap token is projected.
+            items:
+              - key: backoffice_client.crt
+                path: backoffice_client.crt
+              - key: backoffice_client.key
+                path: backoffice_client.key
+              - key: backoffice_bootstrap_token
+                path: backoffice_bootstrap_token
+              - key: ca_root.crt
+                path: ca_root.crt
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
         {{- if .Values.adminBootstrap.enabled }}
         - name: admin-bootstrap-ro
           secret:

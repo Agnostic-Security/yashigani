@@ -127,4 +127,17 @@ spec:
               secret:
                 secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
                 defaultMode: 0440
+                # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items:
+                # scoping. DOCUMENTED CROSS-IDENTITY EXCEPTION: this Job runs
+                # the gateway image and connects with the gateway leaf (see
+                # DATABASE_URL above) — it presents gateway_client.{crt,key}
+                # legitimately. ca_bundle for libpq chain verify. No other leaf
+                # keys / bootstrap tokens / caddy_internal_hmac.
+                items:
+                  - key: gateway_client.crt
+                    path: gateway_client.crt
+                  - key: gateway_client.key
+                    path: gateway_client.key
+                  - key: ca_bundle.crt
+                    path: ca_bundle.crt
           {{- end }}

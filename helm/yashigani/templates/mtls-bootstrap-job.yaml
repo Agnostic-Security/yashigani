@@ -219,9 +219,13 @@ spec:
                 exit 1
               fi
               # Retro #3aj — split materials into two Secrets:
-              #   * leaves Secret (.Values.mtls.secretName, mounted by every
-              #     workload pod): all *_client.{crt,key} + ca_root.crt +
-              #     ca_intermediate.crt. NO ca_*.key.
+              #   * leaves Secret (.Values.mtls.secretName): all
+              #     *_client.{crt,key} + ca_root.crt + ca_intermediate.crt.
+              #     NO ca_*.key. YSG-RISK-053: workload pods mount this Secret
+              #     with per-pod `items:` projections (each pod sees ONLY its
+              #     own leaf/token + trust anchors — never another service's
+              #     key, never caddy_internal_hmac). The Secret object itself
+              #     stays monolithic; the projection is the boundary.
               #   * CA-keys Secret (.Values.mtls.caKeysSecretName, mounted
               #     only by the bootstrap Job + rotation CronJob): the two
               #     CA private keys ca_root.key and ca_intermediate.key.

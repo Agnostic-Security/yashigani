@@ -390,6 +390,23 @@ spec:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             # 0440 + fsGroup: pod (1001) can read, others blocked.
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # gateway gets its own leaf + own bootstrap token + the two trust
+            # anchors it uses (ca_root for Python ssl / OTLP / redis / OPA,
+            # ca_bundle for libpq DSN chain verify). caddy_internal_hmac comes
+            # via the CADDY_INTERNAL_HMAC env secretKeyRef, never the file.
+            # No other service's leaf key or bootstrap token is projected.
+            items:
+              - key: gateway_client.crt
+                path: gateway_client.crt
+              - key: gateway_client.key
+                path: gateway_client.key
+              - key: gateway_bootstrap_token
+                path: gateway_bootstrap_token
+              - key: ca_root.crt
+                path: ca_root.crt
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
           {{- else }}
           emptyDir:
             sizeLimit: 10Mi

@@ -160,6 +160,16 @@ spec:
           secret:
             secretName: {{ .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + Pattern-B trust anchor only ($__file{} datasource refs);
+            # no other leaf keys / bootstrap tokens / caddy_internal_hmac.
+            items:
+              - key: grafana_client.crt
+                path: grafana_client.crt
+              - key: grafana_client.key
+                path: grafana_client.key
+              - key: ca_intermediate.crt
+                path: ca_intermediate.crt
         - name: grafana-provisioning
           configMap:
             name: yashigani-grafana-provisioning

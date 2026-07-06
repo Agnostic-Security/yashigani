@@ -119,4 +119,20 @@ spec:
       secret:
         secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
         defaultMode: 0440
+        # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping.
+        # DOCUMENTED CROSS-IDENTITY EXCEPTION: this helm-test pod borrows the
+        # redis + budget-redis leaves as its client identity (see command
+        # comment above — nearest-match, dedicated test identity is overkill).
+        # No other leaf keys / bootstrap tokens / caddy_internal_hmac.
+        items:
+          - key: redis_client.crt
+            path: redis_client.crt
+          - key: redis_client.key
+            path: redis_client.key
+          - key: budget-redis_client.crt
+            path: budget-redis_client.crt
+          - key: budget-redis_client.key
+            path: budget-redis_client.key
+          - key: ca_bundle.crt
+            path: ca_bundle.crt
   {{- end }}

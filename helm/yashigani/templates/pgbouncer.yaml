@@ -136,6 +136,24 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + pgbouncer-auth leaf + libssl trust anchor only.
+            # DOCUMENTED CROSS-IDENTITY EXCEPTION: pgbouncer legitimately
+            # PRESENTS pgbouncer-auth_client.{crt,key} — cert-auth as auth_user
+            # to postgres (YSG-RISK-073 cycle 7 / YSG-RISK-077), referenced by
+            # files/pgbouncer.ini. No other leaf keys / bootstrap tokens /
+            # caddy_internal_hmac.
+            items:
+              - key: pgbouncer_client.crt
+                path: pgbouncer_client.crt
+              - key: pgbouncer_client.key
+                path: pgbouncer_client.key
+              - key: pgbouncer-auth_client.crt
+                path: pgbouncer-auth_client.crt
+              - key: pgbouncer-auth_client.key
+                path: pgbouncer-auth_client.key
+              - key: ca_root.crt
+                path: ca_root.crt
         - name: pgbouncer-config
           configMap:
             name: yashigani-pgbouncer-config
