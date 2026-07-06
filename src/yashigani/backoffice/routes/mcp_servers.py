@@ -86,6 +86,42 @@ def _envelope_service():
         )
 
 
+def _durable_registry_store():
+    """Return a DurableMcpRegistryStore over Redis db/3, or None (dev/test).
+
+    v4.1 Phase 2a (Iris SEAM-1d-07): the approve transaction writes the broker
+    descriptor here; the gateway McpBrokerRegistry lazily loads it so the
+    onboarded MCP routes without a gateway reboot.  Shares Redis db/3 with the
+    gateway's PermissionStore / McpIdStore (same instance, different prefix).
+
+    Degrades to None when Redis is unreachable — run_approve_transaction then
+    fail-closes in production/staging and warn-skips in dev/test.
+    """
+    try:
+        import redis as _redis  # noqa: PLC0415
+        from yashigani.gateway._redis_url import build_redis_url  # noqa: PLC0415
+        from yashigani.mcp._durable_registry import DurableMcpRegistryStore  # noqa: PLC0415
+
+        _use_tls = os.getenv("REDIS_USE_TLS", "true").lower() == "true"
+        _secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+        url = build_redis_url(
+            3,
+            use_tls=_use_tls,
+            secrets_dir=_secrets_dir,
+            client_cert_name="backoffice_client",
+        )
+        client = _redis.from_url(url, decode_responses=False)
+        client.ping()
+        return DurableMcpRegistryStore(client)
+    except Exception as exc:  # noqa: BLE001 — availability is enforced downstream
+        logger.warning(
+            "mcp-servers: durable broker-registry store unavailable (%s) — "
+            "run_approve_transaction will fail closed in production/staging "
+            "(SEAM-1d-07)", exc,
+        )
+        return None
+
+
 def _tool_summary(rec) -> dict:
     """Compact, JSON-safe view of one active EnvelopeRecord for the registry list."""
     tools = []
@@ -529,6 +565,11 @@ async def import_mcp_server(
                 operator_identity=session.account_id,
                 envelope_service=svc,
                 audit_writer=backoffice_state.audit_writer,
+                # v4.1 Phase 2a (SEAM-1d-07): durable broker registry — the
+                # gateway lazily registers the onboarded MCP; /mcp/<server>
+                # routes without a gateway reboot.  None → the transaction
+                # fail-closes in production/staging, warn-skips in dev/test.
+                registry_store=_durable_registry_store(),
             )
         except McpOnboardError as exc:
             raise HTTPException(

@@ -67,6 +67,13 @@ class McpBrokerServerConfig:
     # grant key instead of agent_name so renaming a server does NOT orphan grants.
     # Populated by build_registry_from_env() via McpIdStore.get_or_mint().
     mcp_id: str = ""
+    # v4.1 Phase 2a (LU-MCP-A2) — SHA-256 fingerprint of this instance's leaf
+    # certificate ("sha256:<hex>").  Populated from the durable registry
+    # descriptor written by the approve transaction (the minted per-instance
+    # leaf), or left empty for boot-env entries without one.  Threaded into
+    # McpCallContext.target_cert_fingerprint by the runtime router so the OPA
+    # input target carries the cert binding.
+    cert_fingerprint: str = ""
 
 
 class McpBrokerRegistry:
@@ -74,11 +81,44 @@ class McpBrokerRegistry:
     Maps agent_name → (McpBroker, McpBrokerServerConfig).
 
     One McpBroker instance per registered MCP server.
-    Registry is built once at startup; no runtime mutations.
+
+    Population sources:
+      1. Boot: YASHIGANI_MCP_SERVERS env var (build_registry_from_env).
+      2. Runtime (v4.1 Phase 2a / SEAM-1d-07): the durable registry store —
+         on a lookup MISS, ``get()`` consults the attached
+         DurableMcpRegistryStore and lazily builds + registers the broker
+         from the persisted descriptor.  This is how an MCP onboarded by the
+         approve transaction becomes routable WITHOUT a gateway reboot.
+
+    Thread-safety: dict reads are atomic in CPython; the lazy-register path
+    is idempotent (rebuilding the same descriptor twice registers an
+    equivalent broker — last write wins, both are valid).
     """
 
     def __init__(self) -> None:
         self._registry: dict[str, tuple[object, McpBrokerServerConfig]] = {}
+        # v4.1 Phase 2a — lazy durable-store fallback (SEAM-1d-07).
+        self._durable_store: Optional[object] = None   # DurableMcpRegistryStore
+        self._broker_factory: Optional[object] = None  # Callable[[dict], tuple]
+
+    def attach_durable_source(
+        self,
+        durable_store: object,
+        broker_factory: object,
+    ) -> None:
+        """Attach the durable store + descriptor→broker factory for lazy load.
+
+        ``broker_factory(descriptor: dict) -> (broker, McpBrokerServerConfig)``
+        must build a broker with the SAME shared issuer / nonce store /
+        permission wiring the boot path uses (build_registry_from_env wires
+        its own per-entry builder here).
+        """
+        self._durable_store = durable_store
+        self._broker_factory = broker_factory
+        logger.info(
+            "mcp-registry: durable registry source attached (SEAM-1d-07 — "
+            "onboarded MCPs route without a gateway reboot)"
+        )
 
     def register(
         self,
@@ -103,7 +143,45 @@ class McpBrokerRegistry:
     ) -> Optional[tuple[object, McpBrokerServerConfig]]:
         """
         Return (broker, server_config) for agent_name, or None if not registered.
+
+        v4.1 Phase 2a (SEAM-1d-07): on a miss, consult the attached durable
+        registry store; when the approve transaction has registered this
+        server, lazily build + cache the broker so ``/mcp/<agent_name>``
+        routes without a gateway reboot.  Every failure in the lazy path
+        degrades to None (the pre-existing 404 behaviour — fail-closed).
         """
+        hit = self._registry.get(agent_name)
+        if hit is not None:
+            return hit
+        if self._durable_store is None or self._broker_factory is None:
+            return None
+        try:
+            descriptor = self._durable_store.get_by_agent_name(  # type: ignore[attr-defined]
+                agent_name
+            )
+        except Exception as exc:  # noqa: BLE001 — read degrades to miss
+            logger.warning(
+                "mcp-registry: durable-store lookup failed for %r: %s",
+                agent_name, exc,
+            )
+            return None
+        if descriptor is None:
+            return None
+        try:
+            broker, server_cfg = self._broker_factory(descriptor)  # type: ignore[operator]
+        except Exception as exc:  # noqa: BLE001 — bad descriptor degrades to miss
+            logger.error(
+                "mcp-registry: lazy broker build failed for %r "
+                "(descriptor rejected — 404): %s",
+                agent_name, exc,
+            )
+            return None
+        self.register(agent_name, broker, server_cfg)
+        logger.info(
+            "mcp-registry: lazily registered onboarded MCP %r from the "
+            "durable registry (SEAM-1d-07 — no reboot required)",
+            agent_name,
+        )
         return self._registry.get(agent_name)
 
     def all_brokers(self) -> list[object]:
@@ -125,6 +203,7 @@ def build_registry_from_env(
     permission_store: Optional[object] = None,  # PermissionStore — 3.1 Phase 4
     org_id: str = "default",                    # 3.1 Phase 4 — org ceiling
     mcp_id_store: Optional[object] = None,      # McpIdStore — 4.0 Item B
+    durable_store: Optional[object] = None,     # DurableMcpRegistryStore — 4.1 Ph2a
 ) -> tuple[McpBrokerRegistry, object]:  # (registry, jwks_store | None)
     """
     Parse YASHIGANI_MCP_SERVERS and build a McpBrokerRegistry.
@@ -152,8 +231,16 @@ def build_registry_from_env(
       ...
     ]
 
-    Returns (registry, jwks_store).  If YASHIGANI_MCP_SERVERS is unset or empty,
-    returns an empty registry and None — callers guard on len(registry) == 0.
+    Returns (registry, jwks_store).  If YASHIGANI_MCP_SERVERS is unset or empty
+    AND no durable_store is supplied, returns an empty registry and None —
+    callers guard on len(registry) == 0.
+
+    ``durable_store`` (v4.1 Phase 2a / SEAM-1d-07): when supplied, the
+    registry is wired with a lazy fallback — a lookup miss consults the
+    durable registry store (written by the backoffice approve transaction)
+    and builds the broker on first use, so an onboarded MCP routes WITHOUT a
+    gateway reboot.  The shared issuer/nonce/jwks machinery is built even when
+    the boot env is empty so lazily-built brokers can sign.
 
     Fail-closed: JSON parse errors or missing required fields raise RuntimeError
     at startup so the gateway surfaces misconfiguration immediately.
@@ -163,25 +250,31 @@ def build_registry_from_env(
     from yashigani.mcp.broker import McpBroker, McpBrokerConfig
 
     raw = os.environ.get("YASHIGANI_MCP_SERVERS", "").strip()
-    if not raw:
-        logger.info("mcp-registry: YASHIGANI_MCP_SERVERS not set — no MCP servers registered")
-        return McpBrokerRegistry(), None
+    entries: list = []
+    if raw:
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"YASHIGANI_MCP_SERVERS is not valid JSON: {exc}"
+            ) from exc
 
-    try:
-        entries = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"YASHIGANI_MCP_SERVERS is not valid JSON: {exc}"
-        ) from exc
+        if not isinstance(entries, list):
+            raise RuntimeError(
+                "YASHIGANI_MCP_SERVERS must be a JSON array of server descriptors"
+            )
 
-    if not isinstance(entries, list):
-        raise RuntimeError(
-            "YASHIGANI_MCP_SERVERS must be a JSON array of server descriptors"
+    if len(entries) == 0 and durable_store is None:
+        logger.info(
+            "mcp-registry: YASHIGANI_MCP_SERVERS unset/empty and no durable "
+            "store — no MCP servers registered"
         )
-
-    if len(entries) == 0:
-        logger.info("mcp-registry: YASHIGANI_MCP_SERVERS is an empty array — no MCP servers")
         return McpBrokerRegistry(), None
+    if len(entries) == 0:
+        logger.info(
+            "mcp-registry: YASHIGANI_MCP_SERVERS unset/empty — registry starts "
+            "empty; durable-store lazy load active (SEAM-1d-07)"
+        )
 
     # Fix-4 (HA-correctness): wire RedisNonceStore when REDIS_URL is configured,
     # fall back to InMemoryNonceStore for dev.
@@ -240,18 +333,27 @@ def build_registry_from_env(
     #
     # The first entry's tenant_id is used to label the shared issuer (JWKS kid
     # and iss prefix).  This is a cosmetic choice — the key itself is shared.
-    first_tenant = entries[0].get("tenant_id", "default")
+    first_tenant = entries[0].get("tenant_id", "default") if entries else "default"
     shared_issuer = McpJwtIssuer(tenant_id=first_tenant)
     jwks_store = JwksStore(primary_issuer=shared_issuer)
 
     registry = McpBrokerRegistry()
 
-    for i, entry in enumerate(entries):
+    def _build_broker_and_config(
+        entry: dict,
+    ) -> tuple[object, McpBrokerServerConfig]:
+        """Build one (McpBroker, McpBrokerServerConfig) from a descriptor.
+
+        Shared by the boot loop (YASHIGANI_MCP_SERVERS entries) AND the
+        durable-registry lazy-load path (v4.1 Phase 2a / SEAM-1d-07) so both
+        populations use the SAME shared issuer, nonce store and permission
+        wiring.  Raises RuntimeError on missing required fields.
+        """
         _required = {"agent_name", "upstream_url", "tenant_id"}
         missing = _required - set(entry.keys())
         if missing:
             raise RuntimeError(
-                f"YASHIGANI_MCP_SERVERS[{i}] is missing required fields: {missing}"
+                f"MCP server descriptor is missing required fields: {missing}"
             )
 
         agent_name = str(entry["agent_name"])
@@ -262,7 +364,7 @@ def build_registry_from_env(
 
         # v4.0 Item B — mint (or restore) a stable mcp_id for this server.
         # Precedence:
-        #   1. Explicit "mcp_id" field in the YASHIGANI_MCP_SERVERS entry (operator-pinned).
+        #   1. Explicit "mcp_id" field in the descriptor (operator-pinned).
         #   2. Existing entry in McpIdStore Redis (persisted from prior startup).
         #   3. Freshly minted UUID (first-time registration).
         # When no mcp_id_store is supplied (dev/test without Redis), fall back to
@@ -271,7 +373,7 @@ def build_registry_from_env(
         _resolved_mcp_id: str = ""
         if mcp_id_store is not None:
             try:
-                _resolved_mcp_id = mcp_id_store.get_or_mint(  # type: ignore[union-attr]
+                _resolved_mcp_id = mcp_id_store.get_or_mint(  # type: ignore[union-attr, attr-defined]
                     agent_name,
                     override_mcp_id=_entry_mcp_id or None,
                 )
@@ -313,19 +415,37 @@ def build_registry_from_env(
             tenant_id=tenant_id,
             agent_name=agent_name,
             mcp_id=_resolved_mcp_id,   # v4.0 Item B — stable grant key
+            # v4.1 Phase 2a (LU-MCP-A2) — per-instance leaf fingerprint from
+            # the onboard transaction's durable descriptor (empty for
+            # boot-env entries without one).
+            cert_fingerprint=str(entry.get("cert_fingerprint", "") or ""),
         )
+        return broker, server_cfg
 
-        registry.register(agent_name, broker, server_cfg)
+    for i, entry in enumerate(entries):
+        try:
+            broker, server_cfg = _build_broker_and_config(entry)
+        except RuntimeError as exc:
+            raise RuntimeError(f"YASHIGANI_MCP_SERVERS[{i}]: {exc}") from exc
+
+        registry.register(server_cfg.agent_name, broker, server_cfg)
         logger.info(
             "mcp-registry: registered agent=%r upstream=%r "
             "is_filesystem=%s is_git=%s tenant=%r",
-            agent_name, upstream_url,
-            is_filesystem_agent, is_git_agent, tenant_id,
+            server_cfg.agent_name, server_cfg.upstream_url,
+            server_cfg.is_filesystem_agent, server_cfg.is_git_agent,
+            server_cfg.tenant_id,
         )
 
+    # v4.1 Phase 2a (SEAM-1d-07) — wire the lazy durable-registry fallback so
+    # MCPs onboarded by the approve transaction route without a gateway reboot.
+    if durable_store is not None:
+        registry.attach_durable_source(durable_store, _build_broker_and_config)
+
     logger.info(
-        "mcp-registry: built registry with %d server(s): %s",
+        "mcp-registry: built registry with %d boot server(s): %s%s",
         len(registry),
         [e.get("agent_name") for e in entries],
+        " (+durable lazy load)" if durable_store is not None else "",
     )
     return registry, jwks_store

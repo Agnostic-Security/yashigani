@@ -871,6 +871,26 @@ def _build_app(mesh_mode: bool = False):
                     _id_store_exc,
                 )
 
+        # v4.1 Phase 2a (Iris SEAM-1d-07) — durable broker registry: the
+        # backoffice approve transaction writes onboarded-MCP descriptors to
+        # Redis db/3; the registry lazily loads them on a lookup miss so an
+        # onboarded MCP routes WITHOUT a gateway reboot.
+        _mcp_durable_store = None
+        if redis_client_rbac is not None:
+            try:
+                from yashigani.mcp._durable_registry import DurableMcpRegistryStore
+                _mcp_durable_store = DurableMcpRegistryStore(redis_client_rbac)
+                logger.info(
+                    "mcp-durable-registry: store initialised (Redis db/3) — "
+                    "onboarded MCPs route without a reboot (SEAM-1d-07)"
+                )
+            except Exception as _dur_exc:
+                logger.warning(
+                    "mcp-durable-registry: init failed — onboarded MCPs will "
+                    "require a gateway recreate to route: %s",
+                    _dur_exc,
+                )
+
         _mcp_registry, _mcp_jwks_store = build_registry_from_env(
             opa_url=opa_url,
             audit_writer=audit_writer,
@@ -880,6 +900,8 @@ def _build_app(mesh_mode: bool = False):
             org_id=_perm_org_id,
             # v4.0 Item B — pass the id store so each server gets a stable mcp_id.
             mcp_id_store=_mcp_id_store,
+            # v4.1 Phase 2a — lazy durable-registry fallback (SEAM-1d-07).
+            durable_store=_mcp_durable_store,
         )
         _extra_routers: list = [openai_router]
 

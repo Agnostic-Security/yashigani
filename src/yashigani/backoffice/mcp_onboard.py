@@ -27,6 +27,14 @@ Sequence (fail-CLOSED, rolled back LIFO on ANY step failure):
                        picks up the new wrap).  Caddy reloads are atomic and
                        zero-downtime; a failed load leaves the old config
                        running.
+  4b. broker_registry — v4.1 Phase 2a (Iris SEAM-1d-07): durably register
+                       the broker descriptor (upstream = the Caddy-front
+                       wrap URL, per-instance leaf fingerprint) into the
+                       DurableMcpRegistryStore, keyed on the canonical
+                       ``<tenant>:<server>``.  The gateway McpBrokerRegistry
+                       lazily loads it on first ``/mcp/<server>`` lookup —
+                       the broker dials the wrap WITHOUT a gateway reboot.
+                       Rolled back (key deleted) on any later failure.
   5. envelope_mint   — durable registry INSERT (mcp_tool_surface_pins) with
                        ``svid_instance_id`` / ``svid_spiffe_id`` /
                        ``svid_issued=True``.  This is the COMMIT POINT: the
@@ -34,6 +42,13 @@ Sequence (fail-CLOSED, rolled back LIFO on ANY step failure):
                        never be persisted without the real cert minted in
                        step 2 (the BUG-A fail-open pattern must not
                        reappear).
+
+INVARIANT (Iris SEAM-1d-03 — do NOT "fix" the ordering): steps 4/4b run
+BEFORE the envelope commit (step 5).  This is safe ONLY because
+/auth/verify-mcp fails CLOSED on a missing envelope (auth.py get_active_envelope
+→ None → 403 server_not_onboarded), so a request racing the window between
+reload/registration and commit is DENIED, never leaked.  Reordering the
+commit before the reload would invert that into a fail-open window.
 
 Rollback on failure: minted cert/key files are removed and written artifacts
 deleted (with a best-effort re-reload to restore Caddy state if step 4 had
@@ -165,6 +180,23 @@ async def default_caddy_reloader() -> None:
     logger.info("mcp-onboard: caddy reload OK (admin socket %s)", socket_path)
 
 
+def _leaf_cert_fingerprint(cert_path: Any) -> str:
+    """SHA-256 fingerprint of the minted per-instance leaf, ``sha256:<hex>``.
+
+    v4.1 Phase 2a (LU-MCP-A2): the fingerprint rides the durable broker
+    descriptor and ends up in the OPA input ``target.cert_fingerprint``.
+    Raises on unreadable/unparsable cert — the caller treats that as a
+    broker_registry step failure (fail-closed; a descriptor without the cert
+    binding must not be registered silently).
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    pem = Path(cert_path).read_bytes()
+    cert = x509.load_pem_x509_certificate(pem)
+    return "sha256:%s" % cert.fingerprint(hashes.SHA256()).hex()
+
+
 def _validate_manifest_or_raise(
     manifest_yaml: str, *, server_id: str, tenant_id: str,
 ) -> dict:
@@ -229,8 +261,18 @@ async def run_approve_transaction(
     envelope_service: Any,       # CapabilityEnvelopeService
     audit_writer: Any = None,
     caddy_reloader: Optional[Callable[[], Awaitable[None]]] = None,
+    registry_store: Any = None,  # DurableMcpRegistryStore — v4.1 Ph2a / SEAM-1d-07
 ) -> McpOnboardResult:
     """Run the atomic approve transaction (see module docstring).
+
+    ``registry_store`` (v4.1 Phase 2a — Iris SEAM-1d-07): the durable broker
+    registry.  When supplied, step 4b writes the broker descriptor keyed on
+    the canonical ``<tenant>:<server>`` so the gateway lazily registers the
+    onboarded MCP WITHOUT a reboot.  When None:
+      * production/staging → the transaction fails CLOSED up-front (503) —
+        a wrap the broker can never dial is a partial onboarding.
+      * dev/test           → step 4b is skipped with a warning
+        (backwards-compatible with unit tests / pre-Phase-3 wiring).
 
     Raises McpOnboardError after rolling back on any step failure.  On
     success returns the committed identifiers + written artifact paths.
@@ -272,6 +314,21 @@ async def run_approve_transaction(
     # Resolve config up-front (fail fast, nothing to roll back yet).
     output_root = _artifact_root()
     runtime = _runtime()
+
+    # v4.1 Phase 2a (SEAM-1d-07) — the durable broker registry is REQUIRED in
+    # production/staging: without it the wrap goes live but the gateway broker
+    # can never dial it (boot-env-only registry).  Fail closed BEFORE minting.
+    _env_name = os.environ.get("YASHIGANI_ENV", "").lower().strip()
+    if registry_store is None and _env_name in {"production", "staging"}:
+        raise McpOnboardError(
+            "config",
+            "durable broker-registry store is not wired (registry_store=None) "
+            f"in a {_env_name} environment — the onboarded MCP would never be "
+            "routable by the gateway broker (SEAM-1d-07). Onboarding fails "
+            "closed. Wire Redis db/3 (DurableMcpRegistryStore) into the "
+            "backoffice.",
+            http_status=503,
+        )
 
     # ── Step 1: manifest ────────────────────────────────────────────────────
     parsed = _validate_manifest_or_raise(
@@ -389,6 +446,78 @@ async def run_approve_transaction(
             "caddy_reload",
             "caddy reload failed — onboarding aborted and rolled back.",
         ) from exc
+
+    # ── Step 4b: durable broker-registry registration (SEAM-1d-07) ──────────
+    #
+    # Register the broker descriptor keyed on the canonical <tenant>:<server>
+    # (== envelope provenance_id == wrap route == verify-mcp key, iris §1).
+    # The gateway McpBrokerRegistry lazily loads this on the first
+    # /mcp/<server> lookup miss — no gateway reboot, no env edit.
+    #
+    # Runs BEFORE the envelope commit: a request racing this window is DENIED
+    # by verify-mcp (no envelope yet → 403 server_not_onboarded, fail-closed —
+    # the SEAM-1d-03 invariant).  Rolled back (key deleted) if step 5 fails.
+    if registry_store is not None:
+        try:
+            from yashigani.manifest.codegen import _mcp_mesh_port
+            _mesh_port = _mcp_mesh_port(parsed)
+            _leaf_fp = _leaf_cert_fingerprint(cert_path)
+            _meta_name = str((parsed.get("metadata") or {}).get("name", ""))
+            descriptor = {
+                "agent_name": server_id,
+                # Base URL only — McpHttpTransport.forward() appends /mcp;
+                # the wrap's handle_path strips the /mcp/<t>/<s> prefix
+                # (FIX-UPSTREAM-URL-DOUBLE-MCP + codegen.py wrap contract).
+                "upstream_url": "https://caddy:%d/mcp/%s/%s" % (
+                    _mesh_port, tenant_id, server_id,
+                ),
+                "tenant_id": tenant_id,
+                # Per registry.py contract: the second OPA tool-gates apply to
+                # the filesystem / git bundles by metadata.name.
+                "is_filesystem_agent": _meta_name in {"filesystem", "filesystem-mcp"},
+                "is_git_agent": _meta_name in {"git", "git-mcp"},
+                # v4.1 Phase 2a (LU-MCP-A2): per-instance leaf fingerprint —
+                # threaded into the OPA input target.cert_fingerprint.
+                "cert_fingerprint": _leaf_fp,
+                "spiffe_id": spiffe_id,
+                "svid_instance_id": instance_id,
+            }
+            registry_store.put(tenant_id, server_id, descriptor)
+        except Exception as exc:
+            _run_rollback()
+            if reload_applied:
+                try:
+                    await reloader()
+                except Exception as re_exc:  # noqa: BLE001 — best-effort restore
+                    logger.error(
+                        "mcp-onboard: post-rollback caddy re-reload failed: %s",
+                        re_exc,
+                    )
+            _audit_failure("broker_registry", exc, instance_id, spiffe_id)
+            raise McpOnboardError(
+                "broker_registry",
+                "durable broker-registry registration failed — onboarding "
+                "aborted and rolled back (fail-closed; SEAM-1d-07).",
+            ) from exc
+
+        def _undo_registry() -> None:
+            try:
+                registry_store.delete(tenant_id, server_id)
+            except Exception as del_exc:  # noqa: BLE001 — rollback best-effort
+                logger.error(
+                    "mcp-onboard: rollback broker-registry delete failed: %s",
+                    del_exc,
+                )
+
+        rollback.append(_undo_registry)
+    else:
+        logger.warning(
+            "mcp-onboard: no durable broker-registry store wired "
+            "(registry_store=None, env=%r) — the gateway broker will NOT "
+            "route /mcp/%s until YASHIGANI_MCP_SERVERS is updated and the "
+            "gateway recreated (SEAM-1d-07; dev/test only).",
+            _env_name, server_id,
+        )
 
     # ── Step 5: durable registry commit (envelope + svid flags) ─────────────
     try:
