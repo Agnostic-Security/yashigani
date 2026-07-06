@@ -39,6 +39,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = REPO_ROOT / "docker" / "docker-compose.yml"
 EGRESS_SNIPPET = REPO_ROOT / "docker" / "Caddyfile.openclaw-egress"
+CADDY_ENTRYPOINT = REPO_ROOT / "docker" / "caddy" / "caddy-entrypoint.sh"
 WEBHOOK_SNIPPET = REPO_ROOT / "docker" / "Caddyfile.openclaw-webhooks"
 CADDY_VARIANTS = [
     REPO_ROOT / "docker" / "Caddyfile.selfsigned",
@@ -235,3 +236,140 @@ def test_helm_openclaw_blanket_egress_stays_dead() -> None:
         "the blanket internet-egress NetworkPolicy is back — LAURA-I1-03 regression"
     )
     assert "port: 18790" in text, "openclaw → caddy:18790 egress rule missing"
+
+
+# ── FP-06 Phase 2: compensating controls ────────────────────────────────────
+
+
+def test_telegram_bot_id_pin_present_in_egress_snippet() -> None:
+    """FP-06/Phase-2: Telegram bot-ID pin matcher must be in the egress snippet,
+    targeting the rewritten URI path (after handle_path strips /telegram)."""
+    text = EGRESS_SNIPPET.read_text()
+    # The pin matcher must reference the env var with the empty-default form.
+    assert "YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" in text, (
+        "Telegram bot-ID pin env var missing from egress snippet "
+        "(must use parse-time default: {$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:})"
+    )
+    # Must use the rewritten path (not orig_uri) and check the bot: prefix form.
+    assert "{http.request.uri.path}" in text, (
+        "Telegram pin must match {http.request.uri.path} (post-handle_path rewrite)"
+    )
+    assert "/bot{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}:" in text, (
+        "Telegram pin expression must check /bot<pinid>: path prefix"
+    )
+    assert '@wrong_bot_id' in text, "named matcher @wrong_bot_id missing from egress snippet"
+    assert 'respond @wrong_bot_id "Forbidden" 403' in text, (
+        "403 respond for @wrong_bot_id missing from egress snippet"
+    )
+
+
+def test_telegram_bot_id_pin_inert_when_empty() -> None:
+    """FP-06/Phase-2: The pin must be inert when the env var is empty.
+    The CEL expression must use the short-circuit pattern:
+      "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" != "" && !...startsWith(...)
+    When env is unset, the first clause ("" != "") is false, so the matcher
+    never fires and no request is blocked on a default install."""
+    text = EGRESS_SNIPPET.read_text()
+    # The expression must start with the empty-default guard.
+    assert '"{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" != ""' in text, (
+        "Telegram pin expression must guard with "
+        '"{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" != "" '
+        "so the matcher is inert when the var is unset"
+    )
+    # There must be a && (AND) to short-circuit on the empty case.
+    assert "&&" in text, "Telegram pin expression must use && to short-circuit inert-when-empty"
+
+
+def test_egress_audit_log_in_compose_snippet() -> None:
+    """FP-06/Phase-2: :18790 site block must have a `log` directive with
+    JSON format and Authorization header redaction."""
+    text = EGRESS_SNIPPET.read_text()
+    assert "log {" in text, "log directive missing from :18790 egress snippet"
+    assert "output stderr" in text, "log output must be stderr (compose convention)"
+    assert "format filter" in text, "log must use filter encoder for header redaction"
+    assert "wrap json" in text, "log filter must wrap json encoder"
+    assert "request>headers>Authorization delete" in text, (
+        "Authorization header must be deleted from egress access log "
+        "(prevents bearer tokens leaking in cleartext)"
+    )
+
+
+def test_egress_audit_log_in_helm_render() -> None:
+    """FP-06/Phase-2: Helm :18790 block must carry the same log directive
+    (compose↔Helm parity, Iris rule)."""
+    text = HELM_CONFIGMAPS.read_text()
+    # The log must be inside the :18790 block — check both are present
+    # in the same file (the :18790 block is gated on openclaw.enabled).
+    assert "log {" in text, "log directive missing from Helm :18790 render"
+    assert "format filter" in text, "Helm :18790 log must use filter encoder"
+    assert "request>headers>Authorization delete" in text, (
+        "Helm :18790 log must redact Authorization header"
+    )
+
+
+def test_telegram_bot_id_pin_in_helm_render() -> None:
+    """FP-06/Phase-2: Helm :18790 block must carry the bot-ID pin expression
+    (compose↔Helm parity)."""
+    text = HELM_CONFIGMAPS.read_text()
+    # Helm renders the bot ID at template time; the pattern to check for is the
+    # Helm template variable and the startsWith expression.
+    assert "wrong_bot_id" in text, (
+        "Helm :18790 block missing @wrong_bot_id Telegram bot-ID pin matcher"
+    )
+    assert "startsWith" in text, (
+        "Helm :18790 Telegram pin must use startsWith expression"
+    )
+    assert 'respond @wrong_bot_id "Forbidden" 403' in text, (
+        "Helm :18790 block missing 403 response for @wrong_bot_id"
+    )
+
+
+def test_slack_token_pin_hook_is_inert_comment_only() -> None:
+    """FP-06/Phase-2: The Slack workspace token hook must exist as a comment
+    placeholder only — no live `header_up Authorization` directive must be
+    present in any egress config (an empty token would break all Slack egress)."""
+    text = EGRESS_SNIPPET.read_text()
+    # Commented hook must be present (shows where to activate when provisioned).
+    assert "header_up Authorization" in text, (
+        "INERT Slack token hook comment missing from egress snippet"
+    )
+    # But it must not be an active (un-commented) directive.
+    # Every occurrence of `header_up Authorization` must be in a comment line.
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.lstrip()
+        if "header_up Authorization" in stripped:
+            assert stripped.startswith("#"), (
+                f"Caddyfile.openclaw-egress line {lineno}: `header_up Authorization` "
+                f"is NOT commented out — live Slack token inject would break egress "
+                f"if the secret is empty. Must remain commented until Tiago greenlit "
+                f"provisioning."
+            )
+
+
+def test_iptables_hashlimit_in_entrypoint() -> None:
+    """FP-06/Phase-2: caddy-entrypoint.sh must contain hashlimit rules for the
+    openclaw egress hosts, with a fail-soft fallback and tunable env vars."""
+    text = CADDY_ENTRYPOINT.read_text()
+    assert "hashlimit" in text, (
+        "iptables hashlimit rule missing from caddy-entrypoint.sh "
+        "(FP-06 Phase 2 egress rate-brake)"
+    )
+    assert "hashlimit-upto" in text, (
+        "hashlimit-upto flag missing — rate is not configured"
+    )
+    assert "YASHIGANI_OPENCLAW_EGRESS_RATE_LIMIT" in text, (
+        "tunable YASHIGANI_OPENCLAW_EGRESS_RATE_LIMIT env var missing"
+    )
+    assert "YASHIGANI_OPENCLAW_EGRESS_RATE_BURST" in text, (
+        "tunable YASHIGANI_OPENCLAW_EGRESS_RATE_BURST env var missing"
+    )
+    # Fail-soft: must fall back to plain ACCEPT if hashlimit module is missing.
+    assert "plain ACCEPT" in text or "fallback" in text.lower(), (
+        "hashlimit block must have a fail-soft fallback to plain ACCEPT "
+        "for kernels without the hashlimit module"
+    )
+    # The rate-brake must be gated on YASHIGANI_OPENCLAW_EGRESS=1.
+    assert "_openclaw_egress_active" in text, (
+        "hashlimit rules must be gated on _openclaw_egress_active "
+        "(only when YASHIGANI_OPENCLAW_EGRESS=1)"
+    )

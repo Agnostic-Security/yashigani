@@ -102,6 +102,23 @@
         curves x25519mlkem768 x25519 secp384r1 secp256r1
     }
 
+    # FP-06 Phase 2 — egress audit log (every outbound request, JSON, stderr).
+    # Fires on ALL requests to :18790 — including 403 denies from the caller gate
+    # and the bot-ID pin below; denied requests are the most audit-relevant events.
+    # Captures: ts, method, URI (upstream-facing after handle_path strip), status,
+    # response bytes, duration, TLS client common name (openclaw leaf). The
+    # Authorization header (openclaw's bearer tokens to Slack/Telegram) is redacted
+    # by the filter encoder — it must NOT appear in cleartext in the log stream.
+    log {
+        output stderr
+        format filter {
+            wrap json
+            fields {
+                request>headers>Authorization delete
+            }
+        }
+    }
+
     # Outbound body cap — light exfil-volume brake (primary volume/DLP control
     # is FP-06 Phase 2). Matches the public edge cap (OWASP ASVS 4.1.7).
     request_body {
@@ -113,6 +130,18 @@
     handle_path /slack/* {
         route {
             import openclaw-egress-caller-gate
+            # FP-06 Phase 2 — INERT Slack workspace-pin hook.
+            # The robust form (workspace pinning via token injection) requires a
+            # per-install YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN secret provisioned by
+            # install.sh. No such secret exists today (not in openclaw.json, compose,
+            # or install.sh). Provisioning is gated by the suggest-yes-create-never
+            # invariant and needs an explicit Tiago greenlight.
+            # When provisioned, activate by uncommenting these two lines:
+            #   header_up -Authorization
+            #   header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN}"
+            # DO NOT wire live with an empty token: an empty inject breaks all Slack
+            # egress. Install path: install.sh → /run/secrets/openclaw_slack_bot_token
+            # → {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN} parse-time env substitution.
             reverse_proxy https://slack.com {
                 # Pin Host + SNI to the allowlisted FQDN (anti domain-fronting,
                 # FP-04e). Upstream cert verified against the public CA pool
@@ -133,6 +162,10 @@
     handle_path /slack-hooks/* {
         route {
             import openclaw-egress-caller-gate
+            # FP-06 Phase 2 — INERT Slack workspace-pin hook (same as /slack/*).
+            # Awaits Tiago-greenlit provisioning of YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN.
+            #   header_up -Authorization
+            #   header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN}"
             reverse_proxy https://hooks.slack.com {
                 header_up Host hooks.slack.com
                 header_up -X-SPIFFE-ID
@@ -150,6 +183,20 @@
     handle_path /telegram/* {
         route {
             import openclaw-egress-caller-gate
+            # FP-06 Phase 2 — Telegram bot-ID pin (destination-account control).
+            # Env: YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID (parse-time, default empty string).
+            # After handle_path strips /telegram, Telegram API paths take the form:
+            #   /bot<botid>:<token>/<method>
+            # Enforcement: when the pin is NON-EMPTY, only paths whose prefix matches
+            # /bot{pin}: pass; all others → 403. This pins the egress to one specific
+            # Telegram bot account — an attacker-controlled bot on the same api.telegram.org
+            # origin is rejected at the path-level even though the host allowlist passes it.
+            # Inert-when-empty: the first clause ("<pin>" != "") is false when the env var
+            # is unset, so the entire expression short-circuits to false → matcher never fires
+            # → current behaviour (no enforcement) is preserved on a default install.
+            # Verified: caddy adapt compiles cleanly with pin unset (empty string).
+            @wrong_bot_id expression "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" != "" && !{http.request.uri.path}.startsWith("/bot{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}:")
+            respond @wrong_bot_id "Forbidden" 403
             reverse_proxy https://api.telegram.org {
                 header_up Host api.telegram.org
                 header_up -X-SPIFFE-ID

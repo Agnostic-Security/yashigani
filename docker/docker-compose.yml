@@ -238,6 +238,10 @@ services:
       # Caddyfile.openclaw-egress (defence in depth; the Caddyfile literals are
       # the primary control).
       YASHIGANI_OPENCLAW_EGRESS: ${YASHIGANI_OPENCLAW_EGRESS:-0}
+      # FP-06 Phase 2: Telegram bot-ID pin. Set to your bot's numeric ID to
+      # restrict the egress gateway to one specific Telegram bot account.
+      # Empty (default) = inert; enforcement begins when the value is non-empty.
+      YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID: ${YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:-}
     volumes:
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
       # 4.0-phase1: shared CSP snippet (defines (csp-policies) named snippet).
@@ -782,6 +786,11 @@ services:
       #   Caddyfile to the caddy admin unix socket via httpx AsyncHTTPTransport.
       #   Promoted from caddy-local tmpfs to caddy_admin_sock named volume so
       #   backoffice can reach it (see volumes: caddy_admin_sock:/run/caddy).
+      #   v4.1 SU-SEAM-1d-04: compose-only transport. On K8s (separate pods —
+      #   no shared unix socket) the reloader branches on
+      #   YASHIGANI_CONTAINER_RUNTIME=k8s and POSTs to Caddy's mesh-mTLS admin
+      #   relay instead (YASHIGANI_CADDY_ADMIN_URL; see helm backoffice.yaml +
+      #   configmaps.yaml :2019 admin-relay site block).
       YASHIGANI_CADDY_ADMIN_SOCKET: /run/caddy/admin.sock
       # YASHIGANI_CADDY_CADDYFILE: default_caddy_reloader() reads the active
       #   Caddyfile and POSTs it to /load; Caddy adapts server-side (env subs +

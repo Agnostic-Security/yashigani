@@ -960,6 +960,16 @@ caddy:
   internalMetricsListenerBackoffice:
     enabled: true
     port: 8445
+  # v4.1 SU-SEAM-1d-04 — mesh-mTLS caddy admin relay for the K8s MCP
+  # approve-transaction reload path (mcp_onboard._reload_via_admin_api).
+  # NOT the raw admin API (that stays unix-socket-only per MUST-4): an mTLS
+  # require_and_verify site block admitting ONLY POST /load from the
+  # backoffice SPIFFE URI, proxied to the caddy-pod-local admin socket.
+  # Requires mtls.enabled=true (templates gate on both). NetworkPolicy
+  # restricts ingress on this port to backoffice pods.
+  adminRelay:
+    enabled: true
+    port: 2019
   # YSG-RISK-061 (v2.24.1): operator ACME / external egress allowlist.
   # Comma-separated list of additional host:port pairs to allow in the
   # caddy-entrypoint.sh iptables OUTPUT rules. Default is empty (only the
@@ -1017,6 +1027,10 @@ agentBundles:
     # Integration: OpenClaw Gateway -> Yashigani Gateway -> LLM providers.
     # License: MIT (github.com/openclaw/openclaw)
     enabled: false
+    # FP-06 Phase 2: Telegram bot-ID pin. Set to the bot's numeric ID (e.g. "123456789")
+    # to restrict the :18790 egress gateway to one specific Telegram bot account.
+    # Empty string (default) = inert; enforcement begins when non-empty.
+    telegramBotId: ""
     image:
       # Pinned to 2026.5.6 to match docker-compose.yml. INDEX digest verified
       # 2026-05-07 via crane digest — multi-arch (linux/amd64 + linux/arm64).
