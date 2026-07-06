@@ -9623,13 +9623,11 @@ generate_secrets() {
     # core secrets (postgres/redis) already exist.
     #
     # YSG-RISK-053: the HMAC lives in the Caddy-scoped dir (docker/secrets-caddy/),
-    # never the flat docker/secrets/ shared by ~18 services. Migrate a
-    # legacy-layout file first so upgrades PRESERVE the existing value
-    # (relocation is a rename — no rotation, .env stays consistent).
-    _ensure_caddy_secrets_dir || return 1
-    if [[ -e "${secrets_dir}/caddy_internal_hmac" ]]; then
-      _relocate_caddy_scoped_secrets || return 1
-    fi
+    # never the flat docker/secrets/ shared by ~18 services. Relocation is
+    # unconditional + idempotent: it migrates a legacy-layout file (rename —
+    # value PRESERVED, .env stays consistent) and guarantees the inert
+    # mountpoint stubs exist at the flat paths for the compose overlay.
+    _relocate_caddy_scoped_secrets || return 1
     local hmac_file="${WORK_DIR}/docker/secrets-caddy/caddy_internal_hmac"
     # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
     if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
@@ -9963,12 +9961,11 @@ generate_secrets() {
   # be restarted to pick it up (install.sh --upgrade restarts them).
   #
   # YSG-RISK-053: the HMAC lives in the Caddy-scoped dir (docker/secrets-caddy/),
-  # never the flat docker/secrets/ shared by ~18 services. Migrate a
-  # legacy-layout file first so re-runs PRESERVE the existing value.
-  _ensure_caddy_secrets_dir || return 1
-  if [[ -e "${secrets_dir}/caddy_internal_hmac" ]]; then
-    _relocate_caddy_scoped_secrets || return 1
-  fi
+  # never the flat docker/secrets/ shared by ~18 services. Relocation is
+  # unconditional + idempotent: it migrates a legacy-layout file (rename —
+  # value PRESERVED) and guarantees the inert mountpoint stubs exist at the
+  # flat paths for the compose overlay.
+  _relocate_caddy_scoped_secrets || return 1
   local hmac_file="${WORK_DIR}/docker/secrets-caddy/caddy_internal_hmac"
   # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
   if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
@@ -11046,8 +11043,60 @@ _pki_runtime_cmd() {
 # The PKI issuer (yashigani.pki.issuer) still mints caddy_client.* into
 # docker/secrets/ (its only mounted output dir); _relocate_caddy_scoped_secrets
 # sweeps them into docker/secrets-caddy/ after every mutating issuer action.
+#
+# MOUNTPOINT STUBS (runtime-verified 2026-07-06, Docker 29.4.1): a single-file
+# bind-mount whose target sits under a READ-ONLY dir mount FAILS at container
+# create when no file exists underneath —
+#   "create mountpoint for /run/secrets/<f> mount: make mountpoint:
+#    read-only file system"
+# — the runtime must materialise the mountpoint inside the ro tree. Fix: after
+# relocating each real secret, an INERT stub (marker line, zero secret
+# material, mode 0600) is left at the flat path. The scoped single-file bind
+# covers the stub inside caddy/gateway/backoffice; every other flat-mount
+# service sees only the stub. The issuer's _write_secret() unlinks+rewrites
+# the stub on the next mint/rotation; the post-issuer sweep then re-relocates
+# and re-stubs.
 # ---------------------------------------------------------------------------
 _YSG_CADDY_SCOPED_SECRETS=(caddy_client.key caddy_client.crt caddy_internal_hmac)
+_YSG_SCOPED_STUB_MARKER="# YSG-RISK-053 mountpoint stub"
+
+# _ysg_is_scoped_stub <file> — true when <file> is an inert mountpoint stub.
+# podman unshare fallback covers subuid-owned files on rootless Podman.
+_ysg_is_scoped_stub() {
+  local _f="$1" _first=""
+  _first="$(head -n 1 -- "$_f" 2>/dev/null || true)"
+  if [[ -z "$_first" && "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+     && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]]; then
+    _first="$(podman unshare head -n 1 -- "$_f" 2>/dev/null || true)"
+  fi
+  [[ "$_first" == "${_YSG_SCOPED_STUB_MARKER}"* ]]
+}
+
+# _ysg_write_scoped_stub <file> — write the inert mountpoint stub (0600, zero
+# secret material). Fail-closed: without a stub the scoped single-file bind
+# cannot overlay the ro flat mount and the container refuses to create.
+_ysg_write_scoped_stub() {
+  local _f="$1"
+  local _stub_line="${_YSG_SCOPED_STUB_MARKER} — real secret lives in docker/secrets-caddy/; single-file bind-mounts cover this inert mountpoint (no secret material here)"
+  if printf '%s\n' "$_stub_line" > "$_f" 2>/dev/null; then
+    chmod 0600 "$_f" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+     && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]] \
+     && podman unshare sh -c "printf '%s\n' \"${_stub_line}\" > '${_f}' && chmod 0600 '${_f}'" 2>/dev/null; then
+    return 0
+  fi
+  local _rt; _rt="$(_pki_runtime_cmd)"
+  local _dirp _basef; _dirp="$(dirname "$_f")"; _basef="$(basename "$_f")"
+  if "$_rt" run --rm --network=none --volume "${_dirp}:/s:rw" \
+       "alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11" \
+       sh -c "printf '%s\n' \"${_stub_line}\" > '/s/${_basef}' && chmod 0600 '/s/${_basef}'" 2>/dev/null; then
+    return 0
+  fi
+  log_error "YSG-RISK-053: cannot write mountpoint stub at ${_f} — the scoped single-file bind-mount would fail at container create (read-only mountpoint). Aborting."
+  return 1
+}
 
 _ensure_caddy_secrets_dir() {
   local _dir="${WORK_DIR}/docker/secrets-caddy"
@@ -11064,45 +11113,59 @@ _ensure_caddy_secrets_dir() {
 }
 
 # _relocate_caddy_scoped_secrets — move the three Caddy-scoped files out of the
-# flat docker/secrets/ dir. Idempotent (no-op when already relocated /
-# never minted). Preserves mode+ownership (rename, not copy). FAIL-CLOSED: if a
-# file cannot be moved it would remain exposed to every flat-mount service, so
-# the install aborts rather than shipping the known-bypassable layout.
+# flat docker/secrets/ dir and leave an inert mountpoint stub in each one's
+# place. Idempotent (stub detected → no-op; absent → stub only). Preserves
+# mode+ownership of the real files (rename, not copy). FAIL-CLOSED both ways:
+# a real file that cannot be moved stays exposed to every flat-mount service;
+# a missing stub breaks the scoped overlay at container create. Either aborts.
 _relocate_caddy_scoped_secrets() {
   local _src="${WORK_DIR}/docker/secrets"
   local _dst="${WORK_DIR}/docker/secrets-caddy"
   _ensure_caddy_secrets_dir || return 1
   local _f _moved=0
   for _f in "${_YSG_CADDY_SCOPED_SECRETS[@]}"; do
-    [[ -e "${_src}/${_f}" ]] || continue
+    if [[ ! -e "${_src}/${_f}" ]]; then
+      # Never minted at the flat path (e.g. fresh install before the issuer
+      # runs) — the mountpoint stub must still exist for the compose overlay.
+      _ysg_write_scoped_stub "${_src}/${_f}" || return 1
+      continue
+    fi
+    if _ysg_is_scoped_stub "${_src}/${_f}"; then
+      # Already relocated on a previous run — never move the stub over the
+      # real scoped secret.
+      continue
+    fi
+    local _relocated=false
     # (1) plain rename — needs write+search on both parent dirs only; file
     #     ownership (container/subuid UIDs) is irrelevant for rename(2).
     if mv -f "${_src}/${_f}" "${_dst}/${_f}" 2>/dev/null; then
-      _moved=$((_moved + 1)); continue
-    fi
+      _relocated=true
     # (2) rootless Podman: docker/secrets/ itself may be owned by a subuid-range
     #     UID (set by _prepare_secrets_dir_for_pki) — rename inside the userns.
-    if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+    elif [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
        && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]] \
        && podman unshare mv -f "${_src}/${_f}" "${_dst}/${_f}" 2>/dev/null; then
-      _moved=$((_moved + 1)); continue
+      _relocated=true
+    else
+      # (3) last resort: ephemeral container with both dirs mounted (same
+      #     pinned alpine digest as _pki_chown_client_keys — supply-chain pin).
+      local _rt; _rt="$(_pki_runtime_cmd)"
+      "$_rt" run --rm --network=none \
+        --volume "${_src}:/a:rw" --volume "${_dst}:/b:rw" \
+        "alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11" \
+        mv -f "/a/${_f}" "/b/${_f}" 2>/dev/null || true
+      [[ ! -e "${_src}/${_f}" ]] && _relocated=true
     fi
-    # (3) last resort: ephemeral container with both dirs mounted (same pinned
-    #     alpine digest as _pki_chown_client_keys — supply-chain pin).
-    local _rt; _rt="$(_pki_runtime_cmd)"
-    "$_rt" run --rm --network=none \
-      --volume "${_src}:/a:rw" --volume "${_dst}:/b:rw" \
-      "alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11" \
-      mv -f "/a/${_f}" "/b/${_f}" 2>/dev/null || true
-    if [[ -e "${_src}/${_f}" ]]; then
+    if [[ "$_relocated" != "true" ]]; then
       log_error "YSG-RISK-053: could not relocate ${_f} out of ${_src} — it would remain readable by every service on the flat /run/secrets mount. Aborting fail-closed."
       log_error "  Manual fix: mv '${_src}/${_f}' '${_dst}/${_f}' (as root or via podman unshare), then re-run."
       return 1
     fi
+    _ysg_write_scoped_stub "${_src}/${_f}" || return 1
     _moved=$((_moved + 1))
   done
   if [[ "$_moved" -gt 0 ]]; then
-    log_info "YSG-RISK-053: relocated ${_moved} Caddy-scoped secret(s) → docker/secrets-caddy/"
+    log_info "YSG-RISK-053: relocated ${_moved} Caddy-scoped secret(s) → docker/secrets-caddy/ (inert stubs left at flat paths)"
   fi
   return 0
 }

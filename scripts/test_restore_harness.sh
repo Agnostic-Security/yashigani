@@ -1094,6 +1094,20 @@ else
           if [[ -f \"\${SECRETS}/ca_intermediate.key\" ]]; then
             chmod 0400 \"\${SECRETS}/ca_intermediate.key\"
           fi
+          # YSG-RISK-053: Caddy-scoped secrets live in docker/secrets-caddy/
+          # (relocated out of the flat dir) — apply the same canonical perms.
+          SC='${VM_CLONE_DIR}/docker/secrets-caddy'
+          if [[ -f \"\${SC}/caddy_client.key\" ]]; then
+            chown 0:0 \"\${SC}/caddy_client.key\" && chmod 0600 \"\${SC}/caddy_client.key\"
+            echo \"Fixed: secrets-caddy/caddy_client.key -> 0:0 0600\"
+          fi
+          if [[ -f \"\${SC}/caddy_client.crt\" ]]; then
+            chmod 0644 \"\${SC}/caddy_client.crt\"
+          fi
+          if [[ -f \"\${SC}/caddy_internal_hmac\" ]]; then
+            chown 1001:1001 \"\${SC}/caddy_internal_hmac\" && chmod 0640 \"\${SC}/caddy_internal_hmac\"
+            echo \"Fixed: secrets-caddy/caddy_internal_hmac -> 1001:1001 0640\"
+          fi
         " 2>&1 | tee -a "${EVIDENCE_FILE}" || true
         _ev "Note: sudo post-restore key fix applied."
         RESTORE_EXIT=0

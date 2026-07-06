@@ -18,6 +18,11 @@ htmlcov/
 
 # Yashigani runtime data
 docker/secrets/
+# YSG-RISK-053: Caddy-scoped secrets (caddy_client.{key,crt} + caddy_internal_hmac).
+# Directory tracked via .gitkeep (same rationale as docker/cloud-keys/ — Podman
+# rootless bind-mount fails on a missing host path); contents never committed.
+docker/secrets-caddy/*
+!docker/secrets-caddy/.gitkeep
 docker/.yashigani-install-state
 # docker/cdi/ — install-generated CDI spec (hardware-specific, task #40)
 docker/cdi/
@@ -91,6 +96,8 @@ backups/*
 
 # Docker secrets (never commit)
 docker/secrets/
+docker/secrets-caddy/*
+!docker/secrets-caddy/.gitkeep
 
 # Any secret files
 *.secret

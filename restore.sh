@@ -931,6 +931,8 @@ restore_backup() {
     # BUG-3 (v2.23.1): preserve ownership/mode in pre-restore snapshot so a
     # rollback restores the original uids the containers expect, not root:root.
     cp -rp "${WORK_DIR}/docker/secrets" "${pre_restore_dir}/secrets" 2>/dev/null || true
+    # YSG-RISK-053: snapshot the Caddy-scoped secrets dir too.
+    cp -rp "${WORK_DIR}/docker/secrets-caddy" "${pre_restore_dir}/secrets-caddy" 2>/dev/null || true
     cp "${WORK_DIR}/docker/.env" "${pre_restore_dir}/.env" 2>/dev/null || true
     log_success "Pre-restore snapshot saved"
   fi
@@ -1031,6 +1033,15 @@ restore_backup() {
   else
     log_warn "No secrets directory in backup — skipping"
   fi
+
+  # 1b. YSG-RISK-053: restore the Caddy-scoped secrets (caddy_client.{key,crt}
+  # + caddy_internal_hmac) into docker/secrets-caddy/. Handles both layouts:
+  # v4.1+ backups carry secrets-caddy/; legacy backups carry the three files in
+  # secrets/ (they were just cp'd into the live flat dir above and MUST be
+  # relocated — otherwise (a) every flat-mount service can read them again and
+  # (b) the restored .env HMAC would disagree with the scoped file the
+  # gateway/backoffice single-file mounts serve → total auth outage).
+  _restore_caddy_scoped_secrets "${backup_dir}" || return 1
 
   # 2. Restore .env
   if [[ -f "${backup_dir}/.env" ]]; then
@@ -1134,6 +1145,134 @@ restore_backup() {
 #   e.g.: _pki_chown_client_keys "gateway_client.key" "pgbouncer_client.key"
 #   With no args: no keys are touched (no backup keys found).
 # ---------------------------------------------------------------------------
+_restore_caddy_scoped_secrets() {
+  # YSG-RISK-053 — see call site (step 1b). Restores/relocates the Caddy-scoped
+  # secrets into docker/secrets-caddy/ and re-applies canonical ownership
+  # (caddy_client.key → 0:0 0600 per lib/pki_ownership.sh "caddy:0:0600";
+  #  caddy_client.crt → 0644 public material;
+  #  caddy_internal_hmac → 1001:1001 0640 per install.sh gate #ROOTLESS-11).
+  #
+  # Mountpoint stubs: install.sh leaves an inert stub (marker line below, no
+  # secret material) at each flat path — the compose single-file binds need an
+  # existing mountpoint under the ro flat mount. v4.1+ backups therefore carry
+  # STUBS in secrets/ — a stub must NEVER be moved over the real scoped file.
+  local _backup_dir="$1"
+  local _live_dir="${WORK_DIR}/docker/secrets-caddy"
+  local _flat_dir="${WORK_DIR}/docker/secrets"
+  local _files=(caddy_client.key caddy_client.crt caddy_internal_hmac)
+  local _stub_marker="# YSG-RISK-053 mountpoint stub"
+  local _f _restored=0
+
+  mkdir -p "$_live_dir" 2>/dev/null || true
+  chmod 0700 "$_live_dir" 2>/dev/null || true
+
+  _caddy_scoped_is_stub() {
+    local _sf="$1" _first=""
+    _first="$(head -n 1 -- "$_sf" 2>/dev/null || true)"
+    if [[ -z "$_first" && "${RUNTIME}" == "podman" ]] && command -v podman >/dev/null 2>&1; then
+      _first="$(podman unshare head -n 1 -- "$_sf" 2>/dev/null || true)"
+    fi
+    [[ "$_first" == "${_stub_marker}"* ]]
+  }
+  _caddy_scoped_write_stub() {
+    local _sf="$1"
+    local _stub_line="${_stub_marker} — real secret lives in docker/secrets-caddy/; single-file bind-mounts cover this inert mountpoint (no secret material here)"
+    if printf '%s\n' "$_stub_line" > "$_sf" 2>/dev/null; then
+      chmod 0600 "$_sf" 2>/dev/null || true
+      return 0
+    fi
+    if [[ "${RUNTIME}" == "podman" ]] && command -v podman >/dev/null 2>&1 \
+       && podman unshare sh -c "printf '%s\n' \"${_stub_line}\" > '${_sf}' && chmod 0600 '${_sf}'" 2>/dev/null; then
+      return 0
+    fi
+    log_error "YSG-RISK-053: cannot write mountpoint stub at ${_sf} — the scoped single-file bind-mount would fail at container create"
+    return 1
+  }
+
+  # v4.1+ layout: secrets-caddy/ present in the backup.
+  if [[ -d "${_backup_dir}/secrets-caddy" ]]; then
+    for _f in "${_files[@]}"; do
+      if [[ -f "${_backup_dir}/secrets-caddy/${_f}" ]]; then
+        # BSD cp cannot overwrite 0400 files even when owned — loosen first
+        # (same rationale as the flat-dir u+w pass above).
+        chmod u+w "${_live_dir}/${_f}" 2>/dev/null || true
+        if cp -p "${_backup_dir}/secrets-caddy/${_f}" "${_live_dir}/${_f}" 2>/dev/null; then
+          _restored=$((_restored + 1))
+        else
+          log_error "YSG-RISK-053: failed to restore secrets-caddy/${_f} from backup"
+          return 1
+        fi
+      fi
+    done
+  fi
+
+  # Legacy layout: REAL files (pre-v4.1 backup) arrived in the flat dir via the
+  # secrets/ copy above — relocate them, fail-closed (see step-1b comment).
+  # v4.1 backups restore STUBS to the flat dir — leave those in place.
+  for _f in "${_files[@]}"; do
+    if [[ -e "${_flat_dir}/${_f}" ]] && ! _caddy_scoped_is_stub "${_flat_dir}/${_f}"; then
+      if mv -f "${_flat_dir}/${_f}" "${_live_dir}/${_f}" 2>/dev/null; then
+        _restored=$((_restored + 1))
+      elif [[ "${RUNTIME}" == "podman" ]] && command -v podman >/dev/null 2>&1 \
+           && podman unshare mv -f "${_flat_dir}/${_f}" "${_live_dir}/${_f}" 2>/dev/null; then
+        _restored=$((_restored + 1))
+      else
+        log_error "YSG-RISK-053: could not relocate restored ${_f} out of docker/secrets/ — it would be readable by every service on the flat /run/secrets mount"
+        log_error "  Manual fix: mv '${_flat_dir}/${_f}' '${_live_dir}/${_f}' (as root or via podman unshare), then re-run."
+        return 1
+      fi
+    fi
+    # Guarantee the inert mountpoint stub exists at the flat path (compose
+    # overlay requirement) regardless of which layout the backup carried.
+    if [[ ! -e "${_flat_dir}/${_f}" ]]; then
+      _caddy_scoped_write_stub "${_flat_dir}/${_f}" || return 1
+    fi
+  done
+
+  if [[ "$_restored" -eq 0 ]]; then
+    log_info "No Caddy-scoped secrets in backup — skipping (install.sh mints/relocates on next run)"
+    return 0
+  fi
+
+  # Re-apply canonical ownership — same direct/unshare/warn strategy as
+  # _pki_chown_client_keys below (restore.sh runs zero sudo — P0-14).
+  local _caddy_chown_mode="direct"
+  if [[ "$(id -u)" != "0" ]]; then
+    if [[ "${RUNTIME}" == "podman" ]]; then
+      _caddy_chown_mode="unshare"
+    else
+      _caddy_chown_mode="warn"
+    fi
+  fi
+  _apply_caddy_scoped_perms() {
+    local _spec="$1" _file="$2" _mode="$3"
+    [[ -f "$_file" ]] || return 0
+    case "$_caddy_chown_mode" in
+      direct)
+        chown "$_spec" "$_file" 2>/dev/null \
+          || log_warn "chown ${_spec} failed on ${_file##*/} — container may fail to start"
+        chmod "$_mode" "$_file" 2>/dev/null || true
+        ;;
+      unshare)
+        podman unshare sh -c "chown ${_spec} '${_file}' && chmod ${_mode} '${_file}'" 2>/dev/null \
+          || log_warn "podman unshare chown/chmod failed on ${_file##*/} — container may fail to start"
+        ;;
+      warn)
+        log_warn "Non-root Docker: cannot chown ${_file##*/} to ${_spec} without sudo."
+        log_warn "  Run manually if the service fails to start:"
+        log_warn "    sudo chown ${_spec} \"${_file}\" && sudo chmod ${_mode} \"${_file}\""
+        ;;
+    esac
+    return 0
+  }
+  _apply_caddy_scoped_perms "0:0"       "${_live_dir}/caddy_client.key"    "0600"
+  chmod 0644 "${_live_dir}/caddy_client.crt" 2>/dev/null || true
+  _apply_caddy_scoped_perms "1001:1001" "${_live_dir}/caddy_internal_hmac" "0640"
+
+  log_success "Caddy-scoped secrets restored (${_restored} file(s)) → docker/secrets-caddy/ (YSG-RISK-053)"
+  return 0
+}
+
 _pki_chown_client_keys() {
   # Positional: list of key basenames that were written from the backup.
   local _written_keys=("$@")

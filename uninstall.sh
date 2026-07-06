@@ -1376,19 +1376,28 @@ fi
 _ALPINE_IMAGE="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
 
 if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
-    _secrets_dir="${SCRIPT_DIR}/docker/secrets"
+    # YSG-RISK-053: docker/secrets-caddy/ holds the Caddy-scoped secrets
+    # (caddy_client.{key,crt} + caddy_internal_hmac, relocated out of the flat
+    # dir by install.sh) — wipe it with the same three-tier strategy.
+    for _secrets_dir in "${SCRIPT_DIR}/docker/secrets" "${SCRIPT_DIR}/docker/secrets-caddy"; do
+    _secrets_rel="${_secrets_dir#"${SCRIPT_DIR}"/}"
     # Path-validation guard: only proceed if the resolved path is exactly canonical.
-    if [ "${_secrets_dir}" != "${SCRIPT_DIR}/docker/secrets" ]; then
-        echo "  [WARN] docker/secrets path resolved unexpectedly (${_secrets_dir}) — skipping PKI wipe for safety" >&2
-    elif [ ! -d "${_secrets_dir}" ]; then
-        echo "  [skip] docker/secrets/ does not exist — nothing to wipe"
+    case "${_secrets_dir}" in
+        "${SCRIPT_DIR}/docker/secrets"|"${SCRIPT_DIR}/docker/secrets-caddy") : ;;
+        *)
+            echo "  [WARN] secrets path resolved unexpectedly (${_secrets_dir}) — skipping PKI wipe for safety" >&2
+            continue
+            ;;
+    esac
+    if [ ! -d "${_secrets_dir}" ]; then
+        echo "  [skip] ${_secrets_rel}/ does not exist — nothing to wipe"
     else
-        echo "Removing PKI secrets — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
+        echo "Removing PKI secrets under ${_secrets_rel}/ — fresh install will regenerate keys + admin credentials (BUG-3-MULTI-USER-INSTALL-PKI)"
         _secrets_wiped=false
 
         # Tier 1: direct rm (same-user / root — common clean-install case)
         if rm -rf "${_secrets_dir:?}/"* "${_secrets_dir:?}"/.[!.]* "${_secrets_dir:?}"/..?* 2>/dev/null; then
-            echo "  [removed] docker/secrets/* — direct rm reported success"
+            echo "  [removed] ${_secrets_rel}/* — direct rm reported success"
             _secrets_wiped=true
         fi
 
@@ -1426,7 +1435,7 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
         if [ "$_secrets_wiped" = "false" ] && [ "$RUNTIME" = "podman" ] && command -v podman >/dev/null 2>&1; then
             if podman unshare sh -c "rm -rf '${_secrets_dir:?}'/* '${_secrets_dir:?}'/.[!.]* '${_secrets_dir:?}'/..?* 2>/dev/null; true" 2>/dev/null; then
                 if _secrets_verify "${_secrets_dir}"; then
-                    echo "  [removed] docker/secrets/* — podman unshare rm succeeded"
+                    echo "  [removed] ${_secrets_rel}/* — podman unshare rm succeeded"
                     _secrets_wiped=true
                 else
                     echo "  [WARN] podman unshare rm exited 0 but files remain — proceeding to container tier" >&2
@@ -1457,7 +1466,7 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
             }
             if _run_container_rm "--pull=never" || _run_container_rm ""; then
                 if _secrets_verify "${_secrets_dir}"; then
-                    echo "  [removed] docker/secrets/* — container-fallback rm succeeded"
+                    echo "  [removed] ${_secrets_rel}/* — container-fallback rm succeeded"
                     _secrets_wiped=true
                 else
                     echo "  [WARN] container-fallback rm exited 0 but ${_secrets_dir} still has files" >&2
@@ -1476,6 +1485,7 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
 
         rmdir "${_secrets_dir}" 2>/dev/null || true
     fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
