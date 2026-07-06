@@ -600,6 +600,11 @@ def txn_env(tmp_path, monkeypatch):
     artifact_root.mkdir()
     secrets_dir = tmp_path / "secrets"
     secrets_dir.mkdir()
+    # Step 2b (svid_init, f8dac097 / SEAM-1d-06) copies
+    # IssuerPaths.intermediate_cert (= secrets_dir / "ca_intermediate.crt")
+    # into secrets/svid-init/<tenant>/<server>/ca.crt. The fixture must
+    # provide it or the transaction fail-closes at svid_init.
+    (secrets_dir / "ca_intermediate.crt").write_text("INTERMEDIATE-CA-PEM")
     monkeypatch.setenv("YASHIGANI_MCP_ARTIFACT_ROOT", str(artifact_root))
     monkeypatch.setenv("YASHIGANI_SECRETS_DIR", str(secrets_dir))
     monkeypatch.setenv(

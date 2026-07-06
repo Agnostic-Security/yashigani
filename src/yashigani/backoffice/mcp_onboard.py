@@ -564,8 +564,8 @@ async def run_approve_transaction(
         _audit_failure("svid_init", exc, instance_id, spiffe_id)
         raise McpOnboardError(
             "svid_init",
-            f"svid-init directory population failed — onboarding aborted and "
-            "rolled back (fail-closed; Captain SEAM-1d-06): {exc}",
+            "svid-init directory population failed — onboarding aborted and "
+            f"rolled back (fail-closed; Captain SEAM-1d-06): {exc}",
         ) from exc
 
     def _undo_svid_init() -> None:
