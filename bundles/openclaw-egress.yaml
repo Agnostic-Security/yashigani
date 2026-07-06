@@ -1,0 +1,90 @@
+# Yashigani v4.1 unified-sidecar Phase 2a — openclaw egress-forwarder descriptor
+#
+# TRANSITIONAL, OVERLAP PHASE (design §3.1; synthesis must-fix #1 ordering):
+# this descriptor wires openclaw onto the unified egress-forwarder TEMPLATE
+# while EVERY existing control stays live —
+#   * the static :18790 caller pin (docker/Caddyfile.openclaw-egress
+#     openclaw-egress-caller-gate, YASHIGANI_OPENCLAW_SPIFFE_ID) STAYS,
+#   * the destination/account pins (Slack bot-token, webhook-path, Telegram
+#     bot-ID) STAY,
+#   * openclaw's own direct env base URLs (https://caddy:18790/{prefix}) and
+#     client-cert env vars STAY,
+#   * the OPA (caller, prefix) grant is Tom's transitional bundled-system
+#     seed (src/yashigani/mcp/_egress_grants.py transitional_egress_seed —
+#     keyed on the SAME SPIFFE the static pin uses; prefixes below mirror it
+#     exactly).
+# Pin deletion is a LATER, Laura-gated step — one full release of
+# pin-AND-grant overlap is required first (synthesis must-fix #1).
+#
+# RETIRES when openclaw migrates to a per-instance /agents/ identity
+# (design §3.1 step 1): svid_files then becomes the standard SVID volume and
+# this descriptor's egress block moves into openclaw's full onboard manifest.
+#
+# Regenerating the committed artifacts (drift-gated by
+# tests/contracts/test_v41_egress_forwarder_template.py):
+#   PYTHONPATH=src python3 -c "
+#     import yaml, pathlib
+#     from yashigani.manifest import render_egress_forwarder_artifacts
+#     parsed = yaml.safe_load(open('bundles/openclaw-egress.yaml'))
+#     for rel, content in render_egress_forwarder_artifacts(parsed, 'docker').items():
+#         pathlib.Path(rel).write_text(content)"
+#
+apiVersion: yashigani.io/v1alpha1
+kind: AgentIntegration
+
+metadata:
+  name: openclaw
+  tenant_id: default
+  category: other
+  description: >-
+    Transitional egress-forwarder wiring for the bundled openclaw agent
+    (pin-AND-grant overlap phase). Not a full onboard manifest.
+  vendor: "OpenClaw"
+  licence: MIT
+  upstream: "https://github.com/openclaw/openclaw"
+
+spec:
+  image:
+    repository: ghcr.io/openclaw/openclaw
+    tag: "2026.5.6"
+    digest: "sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
+
+  ingress:
+    surface: http-api
+    # openclaw's own gateway port — the intra-zone-deny tuple is
+    # egress-openclaw -> openclaw:18789 (REFUSED).
+    shim_port: 18789
+
+  egress:
+    # Mirrors the transitional OPA grant seed EXACTLY
+    # (_egress_grants._OPENCLAW_TRANSITIONAL_PREFIXES) and the static :18790
+    # eval handles. Adding a prefix here without a matching grant + :18790
+    # handle yields fail-closed 403s, never new reach.
+    needs:
+      - prefix: slack
+        deliver_to: slack.com
+        pins:
+          # FP-06 Phase 2 Slack Web API bot-token workspace pin — enforced at
+          # the :18790 deliver handle (inert-until-set, operator-supplied).
+          bot_token_env: YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+      - prefix: slack-hooks
+        deliver_to: hooks.slack.com
+        pins:
+          # FP-06 Phase 2 incoming-webhook path pin.
+          webhook_path_env: YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+      - prefix: telegram
+        deliver_to: api.telegram.org
+        pins:
+          # FP-06 Phase 2 Telegram bot-ID path pin.
+          bot_id_env: YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID
+
+    # TRANSITIONAL identity: openclaw's hand-minted service leaf
+    # (spiffe://<td>/openclaw — the SAME leaf openclaw itself presents on its
+    # direct :18790 path, so the static caller pin accepts the forwarder hop
+    # unchanged). Bound read-only at the standard SVID paths; key is
+    # 0600 uid 1000 (lib/pki_ownership.sh), hence owner_uid.
+    svid_files:
+      cert: ./secrets/openclaw_client.crt
+      key: ./secrets/openclaw_client.key
+      ca: ./secrets/ca_root.crt
+      owner_uid: 1000
