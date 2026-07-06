@@ -805,15 +805,35 @@ def test_caddy_adapt_exits_zero(
         lambda m: stub_env.get(m.group(1), m.group(0)),
         src,
     )
+
+    # Stage the sibling /etc/caddy imports (Caddyfile.csp, .openclaw-webhooks,
+    # .ollama-front, .openclaw-egress) so the monolith's top-level `import
+    # /etc/caddy/...` lines resolve — production bind-mounts docker/Caddyfile.*
+    # at /etc/caddy/.  Without this the adapt gate fails on ANY machine where
+    # caddy is installed ("File to import not found: /etc/caddy/Caddyfile.csp")
+    # and the whole family gate silently never ran outside containers.
+    # The agents/ dir satisfies the `import .../agents/*.caddy` sentinel glob
+    # (empty glob = warning only, by design — see configmaps.yaml S4 note).
+    etc_caddy = tmp_path / "etc-caddy"
+    etc_caddy.mkdir(exist_ok=True)
+    (etc_caddy / "agents").mkdir(exist_ok=True)
+    for sibling in sorted(_DOCKER.glob("Caddyfile.*")):
+        sib_text = sibling.read_text(encoding="utf-8")
+        sib_text = re.sub(
+            r"\{\$([A-Z0-9_]+)\}",
+            lambda m: stub_env.get(m.group(1), m.group(0)),
+            sib_text,
+        )
+        sib_text = sib_text.replace("/etc/caddy/", str(etc_caddy) + "/")
+        (etc_caddy / sibling.name).write_text(sib_text, encoding="utf-8")
+    expanded = expanded.replace("/etc/caddy/", str(etc_caddy) + "/")
+
     # For ca mode: the tls cert/key files must exist (caddy adapt validates paths)
     if name == "ca":
-        (tmp_path / "tls").mkdir(exist_ok=True)
-        (tmp_path / "tls" / "server.crt").write_text("placeholder\n")
-        (tmp_path / "tls" / "server.key").write_text("placeholder\n")
-        # Replace /etc/caddy/tls/ with tmp_path/tls/ in the adapted copy
-        expanded = expanded.replace(
-            "/etc/caddy/tls/", str(tmp_path / "tls") + "/"
-        )
+        tls_dir = etc_caddy / "tls"
+        tls_dir.mkdir(exist_ok=True)
+        (tls_dir / "server.crt").write_text("placeholder\n")
+        (tls_dir / "server.key").write_text("placeholder\n")
 
     caddyfile_copy = tmp_path / f"Caddyfile.{name}"
     caddyfile_copy.write_text(expanded, encoding="utf-8")

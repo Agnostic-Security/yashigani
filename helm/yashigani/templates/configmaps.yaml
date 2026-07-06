@@ -1057,203 +1057,56 @@ data:
     {{- if .Values.agentBundles.openclaw.enabled }}
     # ─────────────────────────────────────────────────────────────────────────
     # v4.1 Phase 1c (LAURA-I1-03) — openclaw egress gateway (:18790)
-    # K8s render of the single-source docker/Caddyfile.openclaw-egress (see the
-    # compose snippet for the full Laura threat-model rationale, FP-01..FP-07).
-    # Hand-coded K8s variant per retro #81-b: ca_bundle.crt trust anchor and a
-    # Helm-templated SPIFFE trust domain instead of the compose parse-time env.
+    # SINGLE-SOURCE RENDER (v4.1 unified-sidecar must-fix #9, Captain C5).
+    # The listener is loaded via .Files.Get from the byte-identical mirror
+    #   helm/yashigani/files/Caddyfile.openclaw-egress
+    # of the CANONICAL docker/Caddyfile.openclaw-egress (full Laura threat-model
+    # rationale FP-01..FP-07 lives there).  Mirror maintained by
+    #   scripts/sync-caddyfile-egress-helm.sh
+    # Drift gate: tests/contracts/test_openclaw_egress_single_source.py
+    # (byte parity + no-reinlined-copy + caddy adapt/validate on THIS rendered
+    # ConfigMap).  DO NOT hand-edit routes here — edit the canonical file.
     #
-    # FIXED-UPSTREAM reverse_proxy — NOT a CONNECT/open proxy. The destination
-    # set is the three literals below; openclaw never supplies a host. Caller
-    # auth = require_and_verify against the internal CA PLUS an exact URI-SAN
-    # match on openclaw's leaf. Reachability to :18790 is additionally scoped
-    # to openclaw pods by allow-caddy-ingress (networkpolicy.yaml) — the K8s
-    # equivalent of the compose openclaw_ringfence 2-member bridge.
+    # The ONLY K8s deltas are the four documented `replace` substitutions below
+    # plus this (internal-mtls) snippet shim: compose defines the snippet in
+    # the Caddyfile.{selfsigned,ca,acme} monoliths with the ca_intermediate.crt
+    # anchor; K8s uses the full-chain ca_bundle.crt.  versions 1.1 matches
+    # compose (R4: Caddy v2.11.x drops header_up-set headers on h2 upstream
+    # connections — the X-SPIFFE-ID stamp would be lost).
     #
     # HONEST ASYMMETRY vs compose: K8s NetworkPolicy cannot FQDN-pin Caddy's
     # own outbound (yashigani-caddy-acme-egress already grants public :443);
     # compose adds a per-IP iptables mirror in caddy-entrypoint.sh. On K8s the
-    # fixed upstreams in THIS block are the destination control.
+    # fixed upstreams in the rendered block are the destination control.
+    # Reachability to :18790 is scoped to openclaw pods by allow-caddy-ingress
+    # (networkpolicy.yaml) — the K8s equivalent of the compose
+    # openclaw_ringfence 2-member bridge.
     # ─────────────────────────────────────────────────────────────────────────
-    (openclaw-egress-caller-gate) {
-      # v4.1 LAURA-I1-CEL FIX: stamped-header pattern replaces broken CEL matcher.
-      # Caddy 2.11.x cannot evaluate URI SANs in CEL (unsupported conversion to
-      # ref.Val: (*url.URL)). See docker/Caddyfile.openclaw-egress for full rationale.
-      # Bare SET stamp overwrites any client-supplied header; header matcher is
-      # pure string comparison — no CEL, no *url.URL conversion.
-      request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
-      @caller_not_openclaw {
-        not header X-Yashigani-Verified-Spiffe "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/openclaw"
-      }
-      respond @caller_not_openclaw "Forbidden" 403
-    }
-    :18790 {
-      tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
-        client_auth {
-          mode require_and_verify
-          trust_pool file /run/secrets/ca_bundle.crt
-        }
-        protocols tls1.3
-        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
-        curves x25519mlkem768 x25519 secp384r1 secp256r1
-      }
-      # FP-06 Phase 2 — egress audit log (compose parity: Caddyfile.openclaw-egress).
-      # JSON format to stderr; Authorization header redacted via filter encoder.
-      log {
-        output stderr
-        format filter {
-          wrap json
-          fields {
-            request>headers>Authorization delete
-          }
-        }
-      }
-      request_body {
-        max_size 10MB
-      }
-      # ── Phase 1: openclaw → gateway egress evaluation ──────────────────────
-      # Compose parity: docker/Caddyfile.openclaw-egress handle /slack|slack-hooks|telegram/*.
-      # K8s variant: yashigani-gateway service name instead of "gateway".
-      # Transport: ca_bundle.crt (K8s full chain) instead of ca_intermediate.crt.
-      # openclaw SDK URLs unchanged — Caddy rewrites and proxies body to gateway.
-
-      handle /slack/* {
-        route {
-          import openclaw-egress-caller-gate
-          rewrite * /egress/eval{uri}
-          reverse_proxy https://yashigani-gateway:8080 {
-            transport http {
-              tls
-              tls_trust_pool file /run/secrets/ca_bundle.crt
-              tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
-              versions 1.1
-            }
-            header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
-            header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
-          }
-        }
-      }
-      handle /slack-hooks/* {
-        route {
-          import openclaw-egress-caller-gate
-          rewrite * /egress/eval{uri}
-          reverse_proxy https://yashigani-gateway:8080 {
-            transport http {
-              tls
-              tls_trust_pool file /run/secrets/ca_bundle.crt
-              tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
-              versions 1.1
-            }
-            header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
-            header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
-          }
-        }
-      }
-      handle /telegram/* {
-        route {
-          import openclaw-egress-caller-gate
-          rewrite * /egress/eval{uri}
-          reverse_proxy https://yashigani-gateway:8080 {
-            transport http {
-              tls
-              tls_trust_pool file /run/secrets/ca_bundle.crt
-              tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
-              versions 1.1
-            }
-            header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
-            header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
-          }
-        }
-      }
-
-      # ── Phase 2: gateway → final delivery ───────────────────────────────────
-      # Compose parity: docker/Caddyfile.openclaw-egress handle_path /deliver/*.
-      # K8s variant: ca_bundle.crt trust anchor, Helm-templated bot ID.
-      # Caller gate: gateway-egress-deliver-gate (snippet below).
-
-      handle_path /deliver/slack/* {
-        route {
-          import gateway-egress-deliver-gate
-          # FP-06 Phase 2 — Slack bot-token workspace pin.
-          @slack_pin_on expression "{$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}" != ""
-          handle @slack_pin_on {
-            reverse_proxy https://slack.com {
-              header_up -Authorization
-              header_up Authorization "Bearer {$YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:}"
-              header_up Host slack.com
-              header_up -X-SPIFFE-ID
-              header_up -X-Caddy-Verified-Secret
-              header_up -X-Yashigani-Verified-Spiffe
-              transport http {
-                tls
-                tls_server_name slack.com
-              }
-            }
-          }
-          handle {
-            reverse_proxy https://slack.com {
-              header_up Host slack.com
-              header_up -X-SPIFFE-ID
-              header_up -X-Caddy-Verified-Secret
-              header_up -X-Yashigani-Verified-Spiffe
-              transport http {
-                tls
-                tls_server_name slack.com
-              }
-            }
-          }
-        }
-      }
-      handle_path /deliver/slack-hooks/* {
-        route {
-          import gateway-egress-deliver-gate
-          # FP-06 Phase 2 — Slack incoming-webhook path pin.
-          @wrong_slack_hook expression "{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}" != "" && !{http.request.uri.path}.startsWith("{$YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:}")
-          respond @wrong_slack_hook "Forbidden" 403
-          reverse_proxy https://hooks.slack.com {
-            header_up Host hooks.slack.com
-            header_up -X-SPIFFE-ID
-            header_up -X-Caddy-Verified-Secret
-            header_up -X-Yashigani-Verified-Spiffe
-            transport http {
-              tls
-              tls_server_name hooks.slack.com
-            }
-          }
-        }
-      }
-      handle_path /deliver/telegram/* {
-        route {
-          import gateway-egress-deliver-gate
-          # FP-06 Phase 2 — Telegram bot-ID pin (K8s variant: Helm-templated value).
-          {{- $tgBotId := .Values.agentBundles.openclaw.telegramBotId | default "" }}
-          @wrong_bot_id expression "{{ $tgBotId }}" != "" && !{http.request.uri.path}.startsWith("/bot{{ $tgBotId }}:")
-          respond @wrong_bot_id "Forbidden" 403
-          reverse_proxy https://api.telegram.org {
-            header_up Host api.telegram.org
-            header_up -X-SPIFFE-ID
-            header_up -X-Caddy-Verified-Secret
-            header_up -X-Yashigani-Verified-Spiffe
-            transport http {
-              tls
-              tls_server_name api.telegram.org
-            }
-          }
-        }
-      }
-
-      handle {
-        respond "Forbidden" 403
+    (internal-mtls) {
+      transport http {
+        tls
+        tls_trust_pool file /run/secrets/ca_bundle.crt
+        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+        versions 1.1
       }
     }
-    # Deliver caller gate — only the Yashigani gateway mesh peer may call /deliver/*.
-    # K8s parity for docker/Caddyfile.openclaw-egress (gateway-egress-deliver-gate snippet).
-    (gateway-egress-deliver-gate) {
-      request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
-      @caller_not_gateway {
-        not header X-Yashigani-Verified-Spiffe "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/gateway"
-      }
-      respond @caller_not_gateway "Forbidden" 403
-    }
+    {{- $egressTd := .Values.global.spiffeTrustDomain | default "yashigani.internal" }}
+    {{- $egressTgBotId := .Values.agentBundles.openclaw.telegramBotId | default "" }}
+    {{- $egress := .Files.Get "files/Caddyfile.openclaw-egress" }}
+    {{- if not $egress }}
+    {{- fail "helm/yashigani/files/Caddyfile.openclaw-egress is missing — run scripts/sync-caddyfile-egress-helm.sh (single-source mirror of docker/Caddyfile.openclaw-egress)" }}
+    {{- end }}
+    {{- /* Delta 1: K8s Service name — compose service `gateway` → `yashigani-gateway`. */}}
+    {{- $egress = $egress | replace "https://gateway:8080" "https://yashigani-gateway:8080" }}
+    {{- /* Delta 2: K8s trust anchor is the full-chain bundle. */}}
+    {{- $egress = $egress | replace "/run/secrets/ca_intermediate.crt" "/run/secrets/ca_bundle.crt" }}
+    {{- /* Delta 3: SPIFFE trust domain — compose composes it via parse-time env; K8s templates it. */}}
+    {{- $egress = $egress | replace "spiffe://yashigani.internal/" (printf "spiffe://%s/" $egressTd) }}
+    {{- /* Delta 4: telegram bot-ID pin default from values (a pod env var still wins if set). */}}
+    {{- if $egressTgBotId }}
+    {{- $egress = $egress | replace "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" (printf "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:%s}" $egressTgBotId) }}
+    {{- end }}
+    {{- $egress | nindent 4 }}
     {{- end }}
     # ─────────────────────────────────────────────────────────────────────────
     # S4 — Agent import sentinel (P1 W3 Phase 2a)
