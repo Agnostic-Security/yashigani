@@ -80,6 +80,15 @@ spec:
               containerPort: {{ .Values.caddy.internalMetricsListenerBackoffice.port }}
               protocol: TCP
             {{- end }}
+            {{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+            # v4.1 SU-SEAM-1d-04: mesh-mTLS admin relay (see configmaps.yaml
+            # :2019 site block). NOT the raw admin API (MUST-4 — that stays on
+            # the pod-local unix socket): mTLS require_and_verify + backoffice
+            # SPIFFE pin + POST /load only. NetworkPolicy admits backoffice only.
+            - name: admin-relay
+              containerPort: {{ .Values.caddy.adminRelay.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: YASHIGANI_TLS_DOMAIN
               value: {{ .Values.global.tlsDomain | quote }}
@@ -246,4 +255,38 @@ spec:
       port: {{ .Values.caddy.service.port }}
       targetPort: 443
       protocol: TCP
+{{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+---
+# v4.1 SU-SEAM-1d-04: dedicated ClusterIP Service for the mesh-mTLS admin
+# relay. DELIBERATELY separate from the yashigani-caddy Service above — that
+# one is type LoadBalancer (public edge); putting :2019 on it would publish
+# the admin relay on the external LB IP. This Service is ClusterIP-only, so
+# the relay is reachable exclusively on the pod network. Defence-in-depth:
+# ClusterIP-only → NetworkPolicy (backoffice pods only) → mTLS
+# require_and_verify → backoffice SPIFFE URI pin → POST /load only.
+# The raw admin API remains unix-socket-only inside the caddy pod (MUST-4).
+# backoffice dials https://yashigani-caddy-admin:2019/load
+# (mcp_onboard._reload_via_admin_api); the caddy leaf carries the
+# yashigani-caddy-admin DNS SAN (service_identities.yaml) so hostname
+# verification passes against the internal CA.
+apiVersion: v1
+kind: Service
+metadata:
+  name: yashigani-caddy-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-caddy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: yashigani-caddy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: admin-relay
+      port: {{ .Values.caddy.adminRelay.port }}
+      targetPort: {{ .Values.caddy.adminRelay.port }}
+      protocol: TCP
+{{- end }}
 {{- end }}

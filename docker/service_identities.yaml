@@ -52,7 +52,7 @@ schema_version: 1
 services:
 
   - name: caddy
-    dns_sans: [caddy, caddy.internal, yashigani-caddy]
+    dns_sans: [caddy, caddy.internal, yashigani-caddy, yashigani-caddy-admin]
     spiffe_id: spiffe://yashigani.internal/caddy
     purpose: "TLS edge + internal CA root"
     mtls_capable: true

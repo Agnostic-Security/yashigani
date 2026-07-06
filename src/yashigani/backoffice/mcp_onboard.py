@@ -20,13 +20,29 @@ Sequence (fail-CLOSED, rolled back LIFO on ANY step failure):
                        wrap snippet, compose override, helm values/netpol,
                        …) under YASHIGANI_MCP_ARTIFACT_ROOT.  Raises
                        CodegenError on any security violation.
-  4. caddy_reload    — POST the monolith Caddyfile to Caddy's admin API over
-                       the shared unix socket (Content-Type: text/caddyfile;
-                       Caddy adapts server-side, resolving the
+  4. caddy_reload    — POST the monolith Caddyfile to Caddy's admin API
+                       (Content-Type: text/caddyfile; Caddy adapts
+                       server-side, resolving the
                        ``import /etc/caddy/agents/*.caddy`` sentinel that
                        picks up the new wrap).  Caddy reloads are atomic and
                        zero-downtime; a failed load leaves the old config
-                       running.
+                       running.  Transport branches on
+                       YASHIGANI_CONTAINER_RUNTIME (SU-SEAM-1d-04 fix):
+                         docker / podman-*  — shared unix admin socket
+                                              (single-host compose; caddy and
+                                              backoffice share /run/caddy).
+                         k8s                — Caddy's mesh-mTLS admin relay
+                                              listener (:2019 site block that
+                                              proxies POST /load to the
+                                              caddy-pod-local unix socket).
+                                              backoffice authenticates with
+                                              its mesh ServiceIdentity leaf;
+                                              the relay requires
+                                              require_and_verify + the
+                                              backoffice SPIFFE URI.  Unix
+                                              sockets cannot span pods —
+                                              caddy and backoffice are
+                                              separate pods on K8s.
   4b. broker_registry — v4.1 Phase 2a (Iris SEAM-1d-07): durably register
                        the broker descriptor (upstream = the Caddy-front
                        wrap URL, per-instance leaf fingerprint) into the
@@ -64,7 +80,14 @@ Deployment wiring (Phase-3 stack rebuild — Su/Captain):
     container reads ``docker/caddy/agents/`` from the same tree).
   * ``YASHIGANI_CADDY_ADMIN_SOCKET`` (default ``/run/caddy/admin.sock``) —
     the caddy admin unix socket volume must be shared with backoffice
-    (today it is a caddy-local tmpfs, mode 0700).
+    (today it is a caddy-local tmpfs, mode 0700).  Compose runtimes only.
+  * ``YASHIGANI_CADDY_ADMIN_URL`` (default
+    ``https://yashigani-caddy-admin:2019``) — K8s runtime only: base URL of
+    Caddy's mesh-mTLS admin relay listener
+    (helm configmaps.yaml ``:2019`` site block).  MUST be https on the mesh;
+    the client is ``yashigani.pki.client.internal_httpx_client()`` (the
+    backoffice ServiceIdentity leaf + internal-CA trust) — there is NO
+    identity-less fallback on this path (fail-closed).
   * ``YASHIGANI_CADDY_CADDYFILE`` (default ``/etc/caddy/Caddyfile``) — the
     active monolith Caddyfile mounted read-only into backoffice.
   * ``YASHIGANI_CONTAINER_RUNTIME`` — one of codegen.VALID_RUNTIMES
@@ -86,6 +109,13 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ADMIN_SOCKET = "/run/caddy/admin.sock"
 _DEFAULT_CADDYFILE = "/etc/caddy/Caddyfile"
+# K8s only — Caddy's mesh-mTLS admin relay (helm configmaps.yaml :2019 site
+# block). https is mandatory: the relay is require_and_verify + SPIFFE-gated.
+# yashigani-caddy-admin is the DEDICATED ClusterIP Service (caddy.yaml) — the
+# public yashigani-caddy Service is type LoadBalancer and must never carry
+# the admin relay port. The caddy leaf carries the yashigani-caddy-admin DNS
+# SAN (service_identities.yaml) so hostname verification passes.
+_DEFAULT_ADMIN_API_URL = "https://yashigani-caddy-admin:2019"
 
 
 class McpOnboardError(Exception):
@@ -133,8 +163,21 @@ def _runtime() -> str:
     return runtime
 
 
-async def default_caddy_reloader() -> None:
-    """Reload Caddy via the admin API over the shared unix socket.
+def _read_caddyfile_text() -> str:
+    """Read the active monolith Caddyfile (shared by both reload transports)."""
+    caddyfile_path = os.getenv("YASHIGANI_CADDY_CADDYFILE", _DEFAULT_CADDYFILE)
+    try:
+        return Path(caddyfile_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise McpOnboardError(
+            "caddy_reload",
+            f"cannot read Caddyfile at {caddyfile_path!r}: {exc} "
+            "(Phase-3 wiring — mount the active Caddyfile into backoffice)",
+        ) from exc
+
+
+async def _reload_via_admin_socket() -> None:
+    """Compose runtimes (docker / podman-*) — shared unix admin socket.
 
     POSTs the active monolith Caddyfile with ``Content-Type: text/caddyfile``;
     Caddy adapts it server-side (parse-time ``{$ENV}`` substitution and the
@@ -145,16 +188,7 @@ async def default_caddy_reloader() -> None:
     import httpx  # noqa: PLC0415 — keep module import light
 
     socket_path = os.getenv("YASHIGANI_CADDY_ADMIN_SOCKET", _DEFAULT_ADMIN_SOCKET)
-    caddyfile_path = os.getenv("YASHIGANI_CADDY_CADDYFILE", _DEFAULT_CADDYFILE)
-
-    try:
-        caddyfile_text = Path(caddyfile_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise McpOnboardError(
-            "caddy_reload",
-            f"cannot read Caddyfile at {caddyfile_path!r}: {exc} "
-            "(Phase-3 wiring — mount the active Caddyfile into backoffice)",
-        ) from exc
+    caddyfile_text = _read_caddyfile_text()
 
     transport = httpx.AsyncHTTPTransport(uds=socket_path)
     try:
@@ -179,6 +213,88 @@ async def default_caddy_reloader() -> None:
             % (resp.status_code, resp.text),
         )
     logger.info("mcp-onboard: caddy reload OK (admin socket %s)", socket_path)
+
+
+async def _reload_via_admin_api() -> None:
+    """K8s runtime — Caddy's mesh-mTLS admin relay listener (SU-SEAM-1d-04).
+
+    On K8s, caddy and backoffice are separate pods: the unix admin socket
+    cannot be shared (emptyDir is pod-local; same-node co-location / RWX PVC
+    is not the architecture).  Instead the helm Caddyfile exposes a ``:2019``
+    site block that:
+
+      * terminates mesh mTLS with ``client_auth require_and_verify`` against
+        the internal CA bundle (identity-less clients are refused at the
+        TLS handshake — the raw admin API is NEVER on the pod network), and
+      * admits ONLY ``POST /load`` from the backoffice SPIFFE URI (CEL
+        expression on the client-cert URI SAN), then proxies to the
+        caddy-pod-local unix admin socket.
+
+    The client here is ``internal_httpx_client()`` — the backoffice
+    ServiceIdentity leaf + internal-CA trust, the SAME factory every other
+    internal mesh call uses (MCP-001 pattern).  There is deliberately NO
+    identity-less fallback: an admin config-mutation surface must fail
+    CLOSED when the mesh identity is unavailable.
+    """
+    import httpx  # noqa: PLC0415 — keep module import light
+
+    admin_url = os.getenv(
+        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_ADMIN_API_URL
+    ).strip().rstrip("/")
+    if not admin_url.startswith("https://"):
+        raise McpOnboardError(
+            "caddy_reload",
+            f"YASHIGANI_CADDY_ADMIN_URL={admin_url!r} must be https:// — the "
+            "K8s admin relay is mesh-mTLS only (fail-closed).",
+        )
+    caddyfile_text = _read_caddyfile_text()
+
+    try:
+        from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
+        client = internal_httpx_client(timeout=15.0)
+    except Exception as exc:
+        raise McpOnboardError(
+            "caddy_reload",
+            f"mesh ServiceIdentity unavailable for the caddy admin relay "
+            f"({exc}) — the K8s reload path has no identity-less fallback "
+            "(fail-closed; check YASHIGANI_SERVICE_NAME + /run/secrets PKI).",
+        ) from exc
+
+    try:
+        async with client:
+            resp = await client.post(
+                f"{admin_url}/load",
+                content=caddyfile_text.encode("utf-8"),
+                headers={"Content-Type": "text/caddyfile"},
+            )
+    except httpx.HTTPError as exc:
+        raise McpOnboardError(
+            "caddy_reload",
+            f"caddy admin relay {admin_url!r} unreachable: {exc} "
+            "(check the helm :2019 admin-relay listener + NetworkPolicy "
+            "backoffice→caddy:2019)",
+        ) from exc
+    if resp.status_code // 100 != 2:
+        raise McpOnboardError(
+            "caddy_reload",
+            "caddy /load (admin relay) rejected the config (HTTP %d): %.300s"
+            % (resp.status_code, resp.text),
+        )
+    logger.info("mcp-onboard: caddy reload OK (mesh admin relay %s)", admin_url)
+
+
+async def default_caddy_reloader() -> None:
+    """Reload Caddy — transport selected by YASHIGANI_CONTAINER_RUNTIME.
+
+    docker / podman-rootful / podman-rootless → shared unix admin socket
+    (single-host compose).  k8s → mesh-mTLS admin relay (separate pods; unix
+    sockets cannot span pods).  Both transports POST the same monolith
+    Caddyfile to Caddy's ``/load`` and fail CLOSED on any error.
+    """
+    if _runtime() == "k8s":
+        await _reload_via_admin_api()
+    else:
+        await _reload_via_admin_socket()
 
 
 def _leaf_cert_fingerprint(cert_path: Any) -> str:

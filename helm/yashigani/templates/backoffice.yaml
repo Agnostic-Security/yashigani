@@ -263,19 +263,24 @@ spec:
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
             # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
-            # MCP approve-transaction env vars. The unix-socket admin path
-            # (YASHIGANI_CADDY_ADMIN_SOCKET) cannot be shared between caddy
-            # and backoffice on K8s (separate pods; emptyDir is pod-local).
-            # K8s asymmetry documented: default_caddy_reloader() will fail
-            # on K8s until a PVC-backed shared volume or sidecar pattern
-            # replaces the emptyDir on caddy (SEAM-1d-04 scope, Phase-2).
-            # The remaining three env vars are K8s-compatible today.
+            # MCP approve-transaction env vars.
+            # v4.1 SU-SEAM-1d-04 RESOLVED: the unix-socket admin path cannot
+            # span pods (emptyDir is pod-local), so on K8s
+            # default_caddy_reloader() branches on
+            # YASHIGANI_CONTAINER_RUNTIME=k8s and POSTs the Caddyfile to
+            # Caddy's mesh-mTLS admin relay (:2019 site block, configmaps.yaml)
+            # via YASHIGANI_CADDY_ADMIN_URL, authenticating with the
+            # backoffice ServiceIdentity leaf (internal_httpx_client — no
+            # identity-less fallback, fail-closed). YASHIGANI_CADDY_ADMIN_SOCKET
+            # is intentionally NOT set here: it is the compose-only transport.
             - name: YASHIGANI_MCP_ARTIFACT_ROOT
               value: {{ .Values.backoffice.mcpArtifactRoot | default "/mnt/install" | quote }}
             - name: YASHIGANI_CONTAINER_RUNTIME
               value: {{ .Values.containerRuntime | default "k8s" | quote }}
-            - name: YASHIGANI_CADDY_ADMIN_SOCKET
-              value: "/run/caddy/admin.sock"
+            {{- if and .Values.caddy.enabled .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+            - name: YASHIGANI_CADDY_ADMIN_URL
+              value: "https://yashigani-caddy-admin:{{ .Values.caddy.adminRelay.port }}"
+            {{- end }}
             - name: YASHIGANI_CADDY_CADDYFILE
               value: "/etc/caddy/Caddyfile"
             # YSG-COMPOSE-ENV-001 Helm parity: backoffice reads YASHIGANI_INTERNAL_BEARER
@@ -402,6 +407,17 @@ spec:
               mountPath: /run/audit-signing
               readOnly: true
             {{- end }}
+            {{- if .Values.caddy.enabled }}
+            # v4.1 SU-SEAM-1d-04: the K8s reload path reads the monolith
+            # Caddyfile (YASHIGANI_CADDY_CADDYFILE) and POSTs it to the caddy
+            # admin relay. Same ConfigMap the caddy pod mounts — one source,
+            # no drift. Read-only: backoffice never renders the monolith
+            # (agent routes live in snippets; see caddy-agents design note).
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -460,6 +476,12 @@ spec:
           secret:
             secretName: yashigani-license
             defaultMode: 0440
+        {{- end }}
+        {{- if .Values.caddy.enabled }}
+        # v4.1 SU-SEAM-1d-04: monolith Caddyfile for the K8s reload path.
+        - name: caddyfile
+          configMap:
+            name: yashigani-caddy-config
         {{- end }}
         {{- if .Values.audit.signingKey.enabled }}
         # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): audit-chain

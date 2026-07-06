@@ -396,6 +396,20 @@ spec:
       ports:
         - protocol: TCP
           port: 11435
+    {{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+    # v4.1 SU-SEAM-1d-04: MCP approve-transaction caddy reload on K8s.
+    # backoffice POSTs the monolith Caddyfile to Caddy's mesh-mTLS admin
+    # relay (yashigani-caddy-admin:2019 → :2019 site block → pod-local admin
+    # unix socket). mTLS require_and_verify + backoffice SPIFFE pin + POST
+    # /load only; see configmaps.yaml admin-relay block.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: {{ .Values.caddy.adminRelay.port }}
+    {{- end }}
     - to:
         - podSelector:
             matchLabels:
@@ -1515,6 +1529,21 @@ spec:
       ports:
         - protocol: TCP
           port: 18790
+    {{- end }}
+    {{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+    # v4.1 SU-SEAM-1d-04: ONLY backoffice pods may dial the mesh-mTLS admin
+    # relay (:2019 — MCP approve-transaction caddy reload). Kernel-layer
+    # counterpart of the in-listener gates (mTLS require_and_verify +
+    # backoffice SPIFFE URI pin + POST /load only). The relay is served by a
+    # dedicated ClusterIP Service (yashigani-caddy-admin) — never the public
+    # LoadBalancer. Raw admin API stays unix-socket-only (MUST-4).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-backoffice
+      ports:
+        - protocol: TCP
+          port: {{ .Values.caddy.adminRelay.port }}
     {{- end }}
 
 ---
