@@ -107,6 +107,12 @@ def txn_env(tmp_path, monkeypatch):
     artifact_root.mkdir()
     secrets_dir = tmp_path / "secrets"
     secrets_dir.mkdir()
+    # Step 2b (svid_init, f8dac097 / SEAM-1d-06) copies
+    # IssuerPaths.intermediate_cert (= secrets_dir / "ca_intermediate.crt")
+    # into secrets/svid-init/<tenant>/<server>/ca.crt. On a real install the
+    # PKI bootstrap provisions it; the fixture must provide it or the
+    # transaction fail-closes at svid_init before any step under test.
+    (secrets_dir / "ca_intermediate.crt").write_text("INTERMEDIATE-CA-PEM")
     monkeypatch.setenv("YASHIGANI_MCP_ARTIFACT_ROOT", str(artifact_root))
     monkeypatch.setenv("YASHIGANI_SECRETS_DIR", str(secrets_dir))
     monkeypatch.setenv(
@@ -175,6 +181,13 @@ class TestApproveTransactionCommit:
         leaves = _leaf_files(secrets_dir)
         assert len(leaves) == 2, leaves
         assert result.instance_id in leaves[0].name
+
+        # Step 2b (svid_init, f8dac097): svid-init dir populated with the
+        # basenames Captain's sidecar projects (client.crt/client.key/ca.crt).
+        svid_init = secrets_dir / "svid-init" / _TENANT / _SERVER
+        assert (svid_init / "client.crt").is_file()
+        assert (svid_init / "client.key").is_file()
+        assert (svid_init / "ca.crt").read_text() == "INTERMEDIATE-CA-PEM"
 
         # Wrap snippet + compose override written under the artifact root.
         snippet = artifact_root / f"docker/caddy/agents/{_SERVER}-mcp.caddy"
@@ -292,6 +305,8 @@ class TestApproveTransactionFailClosed:
         assert not _leaf_files(secrets_dir)
         assert not list(artifact_root.rglob("*.caddy"))
         assert not list(artifact_root.rglob("*compose.override.yml"))
+        # svid-init population (step 2b) rolled back too.
+        assert not list((secrets_dir / "svid-init").rglob("client.*"))
         svc.mint_envelope.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-# Last updated: 2026-05-17T00:00:00+00:00 (v2.23.4: F6 CSP parity tests + Helm CSP align)
+# Last updated: 2026-07-06T00:00:00+00:00 (v4.1: CSP tests retargeted at Caddyfile.csp single-source + live parity gate)
 """
 Caddyfile family contract tests — anti-rot gate.
 
@@ -524,15 +524,22 @@ def test_mutation_listener_parity_is_caught() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F6 / v2.23.4 — CSP header parity: compose variants vs Helm Caddyfile
+# CSP single-sourcing (v4.0-phase1) — Caddyfile.csp is the canonical source
 # ---------------------------------------------------------------------------
+#
+# History: F6 / v2.23.4 required an inline Content-Security-Policy header in
+# each compose Caddyfile, kept in parity with the Helm configmap.  Since
+# v4.0-phase1 the CSP values live ONLY in docker/Caddyfile.csp (matcher-based
+# (csp-policies) named snippet: @strict_legacy / @strict_tt / @lenient_subapp
+# / @redoc_ui) which every compose variant imports; the Helm configmap inlines
+# an equivalent block (ConfigMaps cannot import files at runtime) and
+# scripts/check-caddyfile-csp-parity.sh is the live drift gate (pre-commit +
+# CI).  These tests assert the single-sourcing contract and delegate the
+# Helm-parity check to the live gate so pytest reflects the real gate.
 
-# The canonical CSP directive set shared by all Caddyfile variants.
-# Must stay in sync with:
-#   docker/Caddyfile.acme        (line ~126)
-#   docker/Caddyfile.ca          (line ~110)
-#   docker/Caddyfile.selfsigned  (line ~157)
-#   helm/yashigani/templates/configmaps.yaml  (header block)
+# The canonical directive set every STRICT policy in Caddyfile.csp must carry.
+# (The lenient matchers deliberately relax some of these — see the design
+# rationale header in docker/Caddyfile.csp.)
 _CSP_REQUIRED_DIRECTIVES: frozenset[str] = frozenset({
     "default-src 'self'",
     "script-src 'self'",
@@ -546,24 +553,21 @@ _CSP_REQUIRED_DIRECTIVES: frozenset[str] = frozenset({
     "form-action 'self'",
 })
 
-_HELM_CONFIGMAP = (
-    Path(__file__).parent.parent.parent
-    / "helm" / "yashigani" / "templates" / "configmaps.yaml"
-)
+_CSP_FILE = _DOCKER / "Caddyfile.csp"
+_CSP_STRICT_MATCHERS = ("@strict_legacy", "@strict_tt")
+_CSP_PARITY_GATE = _REPO / "scripts" / "check-caddyfile-csp-parity.sh"
 
 
-def _extract_csp_value(text: str) -> str:
+def _csp_value_for(text: str, matcher: str) -> str:
     """
-    Extract the Content-Security-Policy header value from a Caddyfile or
-    Helm configmap snippet.  Returns the raw directive string (everything
-    after the CSP header name, unquoted).
+    Extract the Content-Security-Policy value bound to ``matcher`` from
+    docker/Caddyfile.csp text.  Returns "" if the matcher header is absent.
     """
-    for line in text.splitlines():
-        # Matches: Content-Security-Policy   "..."
-        m = re.search(r'Content-Security-Policy\s+"([^"]+)"', line)
-        if m:
-            return m.group(1)
-    return ""
+    m = re.search(
+        r"header\s+" + re.escape(matcher) + r'\s+Content-Security-Policy\s+"([^"]+)"',
+        text,
+    )
+    return m.group(1) if m else ""
 
 
 def _csp_directives(csp_value: str) -> frozenset[str]:
@@ -575,22 +579,47 @@ def _csp_directives(csp_value: str) -> frozenset[str]:
 
 
 @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
-def test_csp_directives_present_in_compose_caddyfiles(name: str, path: Path) -> None:
+def test_csp_single_sourced_in_compose_caddyfiles(name: str, path: Path) -> None:
     """
-    Every compose Caddyfile must have a Content-Security-Policy header
-    containing all required directives defined in _CSP_REQUIRED_DIRECTIVES.
-
-    Regression: if a directive is removed, the browser will fall back to
-    default-src which is less specific and may allow unintended sources.
+    Every compose Caddyfile must consume CSP EXCLUSIVELY from the canonical
+    docker/Caddyfile.csp snippet: top-level ``import /etc/caddy/Caddyfile.csp``
+    plus ``import csp-policies`` in the site block, and NO residual inline
+    Content-Security-Policy header (an inline copy would silently shadow the
+    single source and rot — the pre-v4.0 drift class).
     """
     text = _load(path)
-    csp_value = _extract_csp_value(text)
-    assert csp_value, f"Caddyfile.{name}: no Content-Security-Policy header found"
+    assert "import /etc/caddy/Caddyfile.csp" in text, (
+        f"Caddyfile.{name}: missing top-level 'import /etc/caddy/Caddyfile.csp' "
+        "(CSP single-source import)"
+    )
+    assert "import csp-policies" in text, (
+        f"Caddyfile.{name}: missing 'import csp-policies' in the site block"
+    )
+    inline = [
+        ln for ln in text.splitlines()
+        if re.search(r'Content-Security-Policy\s+"', ln)
+        and not ln.lstrip().startswith("#")
+    ]
+    assert not inline, (
+        f"Caddyfile.{name}: residual inline Content-Security-Policy header(s) "
+        f"shadowing docker/Caddyfile.csp:\n" + "\n".join(f"  {ln}" for ln in inline)
+    )
 
-    directives = _csp_directives(csp_value)
-    missing = _CSP_REQUIRED_DIRECTIVES - directives
+
+@pytest.mark.parametrize("matcher", _CSP_STRICT_MATCHERS)
+def test_csp_strict_policies_carry_required_directives(matcher: str) -> None:
+    """
+    The strict policies in docker/Caddyfile.csp must contain every directive
+    in _CSP_REQUIRED_DIRECTIVES.  Regression: if a directive is removed, the
+    browser falls back to default-src, which may allow unintended sources.
+    """
+    text = _load(_CSP_FILE)
+    csp_value = _csp_value_for(text, matcher)
+    assert csp_value, f"Caddyfile.csp: no Content-Security-Policy header for {matcher}"
+
+    missing = _CSP_REQUIRED_DIRECTIVES - _csp_directives(csp_value)
     assert not missing, (
-        f"\nCaddyfile.{name} — CSP missing required directives:\n"
+        f"\nCaddyfile.csp {matcher} — CSP missing required directives:\n"
         + "\n".join(f"  - {d}" for d in sorted(missing))
         + f"\n\nFound CSP value: {csp_value!r}"
     )
@@ -598,71 +627,40 @@ def test_csp_directives_present_in_compose_caddyfiles(name: str, path: Path) -> 
 
 def test_csp_helm_matches_compose() -> None:
     """
-    YSG-RISK-026 F6 parity: the Helm Caddyfile (configmaps.yaml) must have
-    the same Content-Security-Policy directives as the compose Caddyfiles.
-
-    Historical drift: Helm had only ``default-src 'self'; object-src 'none';
-    base-uri 'none'`` — missing script-src, style-src, img-src, font-src,
-    connect-src, frame-ancestors, form-action.  Browser console: "style-src
-    was not explicitly set, so default-src is used as a fallback."
-
-    Root cause: F6 (Ava A5 E2E v2.23.4 Track C — 2026-05-16).
+    Compose↔Helm CSP parity is enforced by the live gate
+    scripts/check-caddyfile-csp-parity.sh (pre-commit + CI).  Run it here so
+    the pytest contract suite reflects the same verdict as the real gate
+    (matcher inventory, TT directives, no @lenient_ui/@strict_ui residue,
+    Helm configmap alignment).
     """
-    assert _HELM_CONFIGMAP.exists(), f"Helm configmaps.yaml not found: {_HELM_CONFIGMAP}"
-    helm_text = _HELM_CONFIGMAP.read_text(encoding="utf-8")
-    helm_csp = _extract_csp_value(helm_text)
-    assert helm_csp, f"Helm configmaps.yaml: no Content-Security-Policy header found"
-
-    helm_directives = _csp_directives(helm_csp)
-    missing_from_helm = _CSP_REQUIRED_DIRECTIVES - helm_directives
-    assert not missing_from_helm, (
-        "\nHelm configmaps.yaml CSP missing required directives "
-        "(diverged from compose Caddyfiles — F6 regression class):\n"
-        + "\n".join(f"  - {d}" for d in sorted(missing_from_helm))
-        + f"\n\nHelm CSP value: {helm_csp!r}\n\n"
-        "Fix: align helm/yashigani/templates/configmaps.yaml header block "
-        "to match docker/Caddyfile.{selfsigned,acme,ca}."
+    assert _CSP_PARITY_GATE.is_file(), f"live gate missing: {_CSP_PARITY_GATE}"
+    proc = subprocess.run(
+        ["bash", str(_CSP_PARITY_GATE)],
+        capture_output=True, text=True, timeout=60,
     )
-
-    # Also verify compose CSP matches Helm (bidirectional parity)
-    for name, path in CADDYFILES.items():
-        compose_csp = _extract_csp_value(_load(path))
-        compose_directives = _csp_directives(compose_csp)
-        in_compose_not_helm = compose_directives - helm_directives
-        # Allow compose to have report-uri/report-to (Helm may omit these)
-        non_report = frozenset(
-            d for d in in_compose_not_helm
-            if not d.startswith("report-uri") and not d.startswith("report-to")
-        )
-        assert not non_report, (
-            f"\nCaddyfile.{name} has CSP directives absent from Helm configmaps.yaml "
-            f"(excluding report-uri/report-to):\n"
-            + "\n".join(f"  - {d}" for d in sorted(non_report))
-            + f"\n\nCompose CSP: {compose_csp!r}\nHelm CSP: {helm_csp!r}"
-        )
+    assert proc.returncode == 0, (
+        "check-caddyfile-csp-parity.sh reported drift:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
 
 
 def test_mutation_csp_drift_is_caught() -> None:
     """
-    Mutation guard for CSP parity tests.
-    Remove 'style-src' from a compose Caddyfile in-memory and verify the
-    CSP directives check fires.
+    Mutation guard for the CSP directive check.
+    Remove 'style-src' from a strict policy in Caddyfile.csp in-memory and
+    verify the directives check fires.
     """
-    name = "selfsigned"
-    path = CADDYFILES[name]
-    original = _load(path)
-    # Mutate: remove style-src 'self' from the CSP value
+    original = _load(_CSP_FILE)
     mutated = original.replace("style-src 'self'; ", "")
-    assert mutated != original, "Mutation failed — style-src not found in CSP"
+    assert mutated != original, "Mutation failed — style-src not found in Caddyfile.csp"
 
-    csp_value = _extract_csp_value(mutated)
-    directives = _csp_directives(csp_value)
-    missing = _CSP_REQUIRED_DIRECTIVES - directives
-
-    assert "style-src 'self'" in missing, (
-        "MUTATION TEST FAILED: removing 'style-src' from CSP was NOT detected "
-        "by the CSP directives check. The contract is broken."
-    )
+    for matcher in _CSP_STRICT_MATCHERS:
+        csp_value = _csp_value_for(mutated, matcher)
+        missing = _CSP_REQUIRED_DIRECTIVES - _csp_directives(csp_value)
+        assert "style-src 'self'" in missing, (
+            f"MUTATION TEST FAILED: removing 'style-src' from {matcher} was NOT "
+            "detected by the CSP directives check. The contract is broken."
+        )
 
 
 # ---------------------------------------------------------------------------
