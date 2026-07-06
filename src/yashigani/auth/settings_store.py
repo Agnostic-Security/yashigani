@@ -12,7 +12,11 @@ Callers outside a tenant transaction (e.g. system-level admin config) should
 use the NO-tenant variant get_setting_system / set_setting_system which sets
 app.aes_key only, not app.tenant_id.
 
-Last updated: 2026-05-07T00:00:00+01:00
+v4.1 (#144): writes pass PGP_SYM_ENCRYPT_OPTIONS so values are AES-256
+encrypted (pgp_sym_encrypt defaults to AES-128 otherwise). Decrypt reads the
+cipher from the PGP packet — no decrypt-side option needed.
+
+Last updated: 2026-07-06T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -20,6 +24,8 @@ import datetime
 import logging
 import os
 from typing import Optional
+
+from yashigani.db.pgcrypto import PGP_SYM_ENCRYPT_OPTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -89,16 +95,16 @@ class AuthSettingsStore:
                     aes_key,
                 )
                 await conn.execute(
-                    """
+                    f"""
                     INSERT INTO auth_settings (key, value_encrypted, updated_at, updated_by)
                     VALUES (
                         $1,
-                        pgp_sym_encrypt($2, current_setting('app.aes_key')),
+                        pgp_sym_encrypt($2, current_setting('app.aes_key'), '{PGP_SYM_ENCRYPT_OPTIONS}'),
                         $3,
                         $4
                     )
                     ON CONFLICT (key) DO UPDATE
-                        SET value_encrypted = pgp_sym_encrypt($2, current_setting('app.aes_key')),
+                        SET value_encrypted = pgp_sym_encrypt($2, current_setting('app.aes_key'), '{PGP_SYM_ENCRYPT_OPTIONS}'),
                             updated_at      = $3,
                             updated_by      = $4
                     """,

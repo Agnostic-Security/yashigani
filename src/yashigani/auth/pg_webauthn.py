@@ -16,7 +16,11 @@ Replay-attack resistance on challenges: each challenge is stored under a
 Redis key that auto-expires after _CHALLENGE_TTL_SECONDS. pop() is atomic
 so a challenge can never be re-used.
 
-Last updated: 2026-05-07T00:00:00+00:00
+v4.1 (#144): public_key writes pass PGP_SYM_ENCRYPT_OPTIONS so the COSE key
+is AES-256 encrypted at rest (pgp_sym_encrypt defaults to AES-128).
+Decrypt reads the cipher from the PGP packet — no decrypt-side option.
+
+Last updated: 2026-07-06T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ from yashigani.auth.webauthn import (
     _map_attestation,
     _to_json_str,
 )
+from yashigani.db.pgcrypto import PGP_SYM_ENCRYPT_OPTIONS
 from yashigani.db.postgres import tenant_transaction
 
 logger = logging.getLogger(__name__)
@@ -103,7 +108,7 @@ class PgWebAuthnCredentialStore:
         """Persist a new credential. Raises IntegrityError on duplicate credential_id."""
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             await conn.execute(
-                """
+                f"""
                 INSERT INTO webauthn_credentials (
                     id, user_id, admin_id,
                     credential_id, public_key,
@@ -113,7 +118,7 @@ class PgWebAuthnCredentialStore:
                     created_at, last_used_at
                 ) VALUES (
                     $1::uuid, $2, $3::uuid,
-                    $4, pgp_sym_encrypt($5::text, current_setting('app.aes_key'))::bytea,
+                    $4, pgp_sym_encrypt($5::text, current_setting('app.aes_key'), '{PGP_SYM_ENCRYPT_OPTIONS}')::bytea,
                     $6, $7,
                     $8, $9,
                     $10,
