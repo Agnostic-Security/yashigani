@@ -14,6 +14,9 @@
 #   8. audit_capture — trigger conditions
 #   9. rate_limit_key — format and null cases
 #  10. mcp_decision compound document shape
+#  11. v4.1 Phase 2b — per-instance FOUR-GATE authz + change-prevention
+#      (LU-MCP-A1..A4: verified identity, target.mcp_id, per-caller grant,
+#      capability-envelope baseline; flipped default-deny exposed_tools)
 #
 package yashigani_mcp_test
 
@@ -48,12 +51,62 @@ _mcp_c_input_ok := {
     "posture": "mcp-c",
     "action": "mcp.tools.call",
     "identity": {
-        "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+        "spiffe": _spiffe_relay,
+        "verified": true,
         "chain": [
             "spiffe://cluster.local/ns/default/sa/origin",
-            "spiffe://cluster.local/ns/default/sa/relay",
+            _spiffe_relay,
         ],
     },
+    "target": _target_ok,
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 2b fixtures — per-instance authz + change-prevention
+# ---------------------------------------------------------------------------
+
+_spiffe_langflow := "spiffe://cluster.local/ns/default/sa/langflow"
+
+_spiffe_relay := "spiffe://cluster.local/ns/default/sa/relay"
+
+_mcp_id_1 := "6a7b1c9e-0001-4000-8000-000000000001"
+
+# A SECOND instance with the SAME name-SPIFFE callers but a distinct mcp_id —
+# per-instance isolation is the whole point (LU-MCP-A2).
+_mcp_id_2 := "6a7b1c9e-0002-4000-8000-000000000002"
+
+_hash_ok := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+_hash_drifted := "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+_grants_ok := {
+    _mcp_id_1: {
+        _spiffe_langflow: {"tools": ["web_search"], "actions": ["mcp.tools.call"]},
+        _spiffe_relay: {"tools": ["web_search"], "actions": ["mcp.tools.call"]},
+    },
+    _mcp_id_2: {
+        _spiffe_relay: {"tools": ["other_tool"], "actions": ["mcp.tools.call"]},
+    },
+}
+
+_baselines_ok := {
+    _mcp_id_1: {"surface_hash": _hash_ok, "tools": ["web_search"]},
+    _mcp_id_2: {"surface_hash": _hash_ok, "tools": ["other_tool"]},
+}
+
+_target_ok := {
+    "mcp_id": _mcp_id_1,
+    "cert_fingerprint": "sha256:leaf-fp-1",
+    "surface_hash": _hash_ok,
+}
+
+# Fully-satisfying mcp-b invocation input (verified identity + target).
+_mcp_b_call_ok := {
+    "posture": "mcp-b",
+    "action": "mcp.tools.call",
+    "identity": {"spiffe": _spiffe_langflow, "verified": true},
+    "target": _target_ok,
     "tool": {"name": "web_search", "args_redacted": {}},
 }
 
@@ -83,12 +136,18 @@ test_allow_mcp_a_resource_read if {
     }
 }
 
+# v4.1 Phase 2b: invocation allow requires the FOUR-GATE (verified identity,
+# per-instance target, per-caller grant, unchanged capability envelope).
 test_allow_mcp_b_tool_call if {
-    data.yashigani.mcp.allow with input as _mcp_b_tool_input
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
 }
 
 test_allow_mcp_c_with_valid_chain if {
     data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
 }
 
 test_allow_mcp_a_ping if {
@@ -109,13 +168,15 @@ test_allow_mcp_a_initialize if {
     }
 }
 
+# v4.1 Phase 2b: remote non-invocation actions require verified identity and —
+# when carrying a tool subject — an explicit exposed_tools listing (flipped gate).
 test_allow_mcp_b_sampling if {
     data.yashigani.mcp.allow with input as {
         "posture": "mcp-b",
         "action": "mcp.sampling.createMessage",
-        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/langflow"},
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
         "tool": {"name": "sample", "args_redacted": {}},
-    }
+    } with data.yashigani.mcp.exposed_tools as {"sample"}
 }
 
 # ---------------------------------------------------------------------------
@@ -314,11 +375,14 @@ test_deny_reason_chain_depth_exceeded if {
 
 test_allow_chain_depth_at_max if {
     # Exactly 9 entries == pinned max (YSG-RISK-056): boundary must ALLOW
+    # (v4.1 Phase 2b: with the four-gate satisfied)
     data.yashigani.mcp.allow with input as {
         "posture": "mcp-c",
         "action": "mcp.tools.call",
+        "target": _target_ok,
         "identity": {
             "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "verified": true,
             "chain": [
                 "spiffe://cluster.local/ns/default/sa/hop1",
                 "spiffe://cluster.local/ns/default/sa/hop2",
@@ -332,11 +396,14 @@ test_allow_chain_depth_at_max if {
             ],
         },
         "tool": {"name": "web_search", "args_redacted": {}},
-    }
+    } with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
 }
 
 test_allow_chain_depth_2_within_default_max if {
     data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
 }
 
 test_deny_chain_depth_operator_override_is_inert if {
@@ -416,21 +483,49 @@ test_allow_mcp_a_with_extra_chain_short if {
 # 5. P9 per-tool authz — exposed_tools allowlist
 # ---------------------------------------------------------------------------
 
-# 5a. No allowlist data loaded → gate open (backward-compat), any tool allowed
-test_p9_allow_any_tool_when_allowlist_absent if {
-    data.yashigani.mcp.allow with input as _mcp_b_tool_input
+# 5a. FLIPPED (v4.1 Phase 2b / LU-MCP-A4): no allowlist data loaded is NO LONGER
+# an open gate. A legacy invocation input (unverified, no target, no grant) is
+# DENIED on a default install.
+test_p9_deny_legacy_tools_call_when_allowlist_absent if {
+    not data.yashigani.mcp.allow with input as _mcp_b_tool_input
 }
 
-# 5b. Empty allowlist → gate open
-test_p9_allow_any_tool_when_allowlist_empty if {
-    data.yashigani.mcp.allow with input as _mcp_b_tool_input
+# 5b. FLIPPED: empty allowlist → still deny (closed world).
+test_p9_deny_legacy_tools_call_when_allowlist_empty if {
+    not data.yashigani.mcp.allow with input as _mcp_b_tool_input
         with data.yashigani.mcp.exposed_tools as set()
 }
 
-# 5c. Tool in allowlist → allow
-test_p9_allow_tool_in_allowlist if {
-    data.yashigani.mcp.allow with input as _mcp_b_tool_input
+# 5c. FLIPPED: allowlist membership ALONE no longer authorizes an invocation —
+# without verified identity + target + grant + baseline it is denied.
+test_p9_deny_tools_call_allowlist_alone_insufficient if {
+    not data.yashigani.mcp.allow with input as _mcp_b_tool_input
         with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# 5c-ii. Narrowing gate: four-gate satisfied + tool in populated allowlist → allow.
+test_p9_allow_tool_in_allowlist_with_four_gate if {
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+        with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# 5c-iii. Narrowing gate: four-gate satisfied but populated allowlist EXCLUDES
+# the tool → deny with the allowlist reason.
+test_p9_deny_granted_tool_excluded_by_narrowing_allowlist if {
+    not data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+        with data.yashigani.mcp.exposed_tools as {"code_review"}
+}
+
+test_p9_deny_reason_granted_tool_excluded_by_narrowing_allowlist if {
+    d := data.yashigani.mcp.deny_reason with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+        with data.yashigani.mcp.exposed_tools as {"code_review"}
+    d == "tool_not_in_exposed_allowlist"
 }
 
 # 5d. Tool NOT in allowlist → deny
@@ -443,14 +538,35 @@ test_p9_deny_tool_not_in_allowlist if {
     } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
 }
 
-# 5e. Deny reason for tool not in allowlist
+# 5e. Deny reason for a NON-invocation action carrying a tool subject not in
+# the (flipped, default-deny) allowlist.
 test_p9_deny_reason_tool_not_in_allowlist if {
     d := data.yashigani.mcp.deny_reason with input as {
         "posture": "mcp-b",
-        "action": "mcp.tools.call",
-        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/langflow"},
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
         "tool": {"name": "dangerous_exec", "args_redacted": {}},
     } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+    d == "tool_not_in_exposed_allowlist"
+}
+
+# 5e-ii. FLIPPED: non-invocation tool subject with ABSENT allowlist → deny.
+test_p9_deny_nontool_action_tool_subject_allowlist_absent if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "tool": {"name": "sample", "args_redacted": {}},
+    }
+}
+
+test_p9_deny_reason_nontool_action_tool_subject_allowlist_absent if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "tool": {"name": "sample", "args_redacted": {}},
+    }
     d == "tool_not_in_exposed_allowlist"
 }
 
@@ -475,12 +591,13 @@ test_p9_deny_tool_not_in_allowlist_mcp_c if {
     } with data.yashigani.mcp.exposed_tools as {"web_search"}
 }
 
-# 5h. Non-tool actions (prompts/resources) are not gated by the tool allowlist
+# 5h. Non-tool subjects (prompts/resources) are not gated by the tool allowlist
+# (v4.1 Phase 2b: remote postures now require verified identity).
 test_p9_prompt_action_not_blocked_by_tool_allowlist if {
     data.yashigani.mcp.allow with input as {
         "posture": "mcp-b",
         "action": "mcp.prompts.list",
-        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/langflow"},
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
         "prompt": {"name": "summarize"},
     } with data.yashigani.mcp.exposed_tools as {"web_search"}
 }
@@ -620,7 +737,13 @@ test_audit_capture_false_for_public_resource if {
 }
 
 test_audit_capture_true_for_multihop_chain if {
+    # Allowed multi-hop call (four-gate satisfied) still forces audit capture.
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
     data.yashigani.mcp.audit_capture == true with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
 }
 
 test_audit_capture_true_for_redactable_args if {
@@ -780,19 +903,23 @@ test_fix1_probe1d_array_of_ints_chain_denies_mcp_c if {
 }
 
 # Positive: valid array of SPIFFE strings at depth 2 still allows on mcp-c
+# (v4.1 Phase 2b: with the four-gate satisfied)
 test_fix1_valid_string_array_chain_allows_mcp_c if {
     data.yashigani.mcp.allow with input as {
         "posture": "mcp-c",
         "action": "mcp.tools.call",
+        "target": _target_ok,
         "identity": {
-            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "spiffe": _spiffe_relay,
+            "verified": true,
             "chain": [
                 "spiffe://cluster.local/ns/default/sa/origin",
-                "spiffe://cluster.local/ns/default/sa/relay",
+                _spiffe_relay,
             ],
         },
         "tool": {"name": "web_search", "args_redacted": {}},
-    }
+    } with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
 }
 
 # --- FIX-2: LAURA-MCP-002 / LU-MCP-02 — secret-redaction gaps ---
@@ -1771,4 +1898,241 @@ test_egress_deny_numeric_result_above_ceiling if {
         },
         "result": {"sensitivity": 4, "pii_detected": false},
     }
+}
+
+# ---------------------------------------------------------------------------
+# 11. v4.1 Phase 2b — per-instance FOUR-GATE authz + change-prevention
+#     (LU-MCP-A1..A4; contract lu.md §3)
+# ---------------------------------------------------------------------------
+
+# 11a. Happy path — all four gates satisfied (mcp-b and mcp-c).
+test_v41_allow_four_gate_mcp_b if {
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_allow_four_gate_mcp_c if {
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11b. GATE 1 — identity must be CERT-VERIFIED, not merely asserted (LU-MCP-A1).
+test_v41_deny_unverified_identity if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": false}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_verified_absent if {
+    not data.yashigani.mcp.allow with input as json.remove(
+        _mcp_b_call_ok, ["/identity/verified"],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# A string "true" (or any non-boolean truthy value) must NOT satisfy the gate.
+test_v41_deny_verified_string_true if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": "true"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_spiffe_not_verified if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": false}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "spiffe_not_verified"
+}
+
+# 11c. GATE 2 — per-instance identification (LU-MCP-A2).
+test_v41_deny_target_absent if {
+    not data.yashigani.mcp.allow with input as json.remove(_mcp_b_call_ok, ["/target"])
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_target_absent_instance_unidentified if {
+    d := data.yashigani.mcp.deny_reason with input as json.remove(_mcp_b_call_ok, ["/target"])
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "instance_unidentified"
+}
+
+test_v41_deny_empty_mcp_id if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": ""}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_nonstring_mcp_id if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": 42}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11d. GATE 3 — per-instance, per-caller grant (closed world; LU-MCP-A2/A5).
+test_v41_deny_no_grant_data_at_all if {
+    # Default install: no grants, no baselines loaded → deny.
+    not data.yashigani.mcp.allow with input as _mcp_b_call_ok
+}
+
+test_v41_deny_reason_no_baseline_is_envelope_not_active if {
+    # Baseline missing entirely → the envelope was never activated.
+    d := data.yashigani.mcp.deny_reason with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as {}
+    d == "capability_envelope_not_active"
+}
+
+test_v41_deny_no_grant_for_caller if {
+    # Baseline exists but the CALLER holds no grant for this instance.
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok,
+        [{"op": "replace", "path": "/identity/spiffe", "value": "spiffe://cluster.local/ns/default/sa/intruder"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_no_per_instance_grant if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok,
+        [{"op": "replace", "path": "/identity/spiffe", "value": "spiffe://cluster.local/ns/default/sa/intruder"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "no_per_instance_grant"
+}
+
+test_v41_deny_tool_outside_grant if {
+    # Caller granted web_search only; asks for exec → deny.
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/tool/name", "value": "exec"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11e. Cross-instance isolation — two same-named MCPs, distinct mcp_id,
+# distinct grants: a grant on instance 1 does NOT authorize instance 2
+# (lu.md §3d verification ask).
+test_v41_deny_cross_instance_grant if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": _mcp_id_2}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_cross_instance_grant if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": _mcp_id_2}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "no_per_instance_grant"
+}
+
+# 11f. GATE 4 — change-prevention: capability-envelope drift (LU-MCP-A3).
+test_v41_deny_surface_hash_drift if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/surface_hash", "value": _hash_drifted}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_capability_envelope_drift if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/surface_hash", "value": _hash_drifted}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "capability_envelope_drift"
+}
+
+test_v41_deny_empty_surface_hash if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/surface_hash", "value": ""}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_surface_hash_absent if {
+    not data.yashigani.mcp.allow with input as json.remove(
+        _mcp_b_call_ok, ["/target/surface_hash"],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_tool_granted_but_outside_baseline if {
+    # Grant claims a tool the approved baseline does not contain (grant/baseline
+    # desync) → envelope gate denies. Baseline is authoritative for the surface.
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/tool/name", "value": "sneaky_tool"}],
+    )
+        with data.yashigani.mcp.grants as {_mcp_id_1: {_spiffe_langflow: {"tools": ["sneaky_tool"], "actions": ["mcp.tools.call"]}}}
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11g. tools.call with a non-tool subject cannot slip through the four-gate.
+test_v41_deny_tools_call_with_prompt_subject if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "target": _target_ok,
+        "prompt": {"name": "summarize"},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_tools_call_with_prompt_subject if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "target": _target_ok,
+        "prompt": {"name": "summarize"},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "tool_subject_required"
+}
+
+# 11h. mcp-c four-gate additionally requires the chain (unchanged invariant).
+test_v41_deny_mcp_c_four_gate_without_chain if {
+    not data.yashigani.mcp.allow with input as json.remove(
+        _mcp_c_input_ok, ["/identity/chain"],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11i. Decision document carries the per-instance deny reason (auditable).
+test_v41_decision_document_carries_four_gate_reason if {
+    d := data.yashigani.mcp.mcp_decision with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": false}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d.allow == false
+    d.deny_reason == "spiffe_not_verified"
+    d.audit_capture == true
 }

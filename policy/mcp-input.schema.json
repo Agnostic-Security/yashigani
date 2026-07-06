@@ -28,6 +28,10 @@
           "description": "SPIFFE URI of the immediate caller, e.g. spiffe://cluster.local/ns/default/sa/langflow. Empty string when SPIFFE is not present (treated as anonymous in policy).",
           "examples": ["spiffe://cluster.local/ns/default/sa/langflow", ""]
         },
+        "verified": {
+          "type": "boolean",
+          "description": "v4.1 Phase 2a/2b (LU-MCP-A1): true ONLY when the transport layer verified the caller's per-instance leaf certificate at TLS (SPIFFE URI SAN + trust chain — never hostname; instance-leaf SANs are loopback-only). MUST be set by the transport layer, never from the request body. false = identity.spiffe is a broker assertion built from context fields. Policy requires verified == true (strict boolean) on all mcp-b/mcp-c allow paths (yashigani.mcp _identity_verified rule); a broker-asserted, name-derived SPIFFE alone no longer authorizes. The producer always emits this field; absence is treated as false (fail-closed)."
+        },
         "chain": {
           "type": "array",
           "description": "Full upstream identity chain for multi-hop MCP-C calls. Each entry is a SPIFFE URI representing a hop in call-order (index 0 = originating caller, last = immediate caller). Populated by the MCP-C JWT (P2/N3 chunk). Absent on mcp-a and mcp-b. Policy enforces max depth via mcp_chain_max_depth.",
@@ -51,6 +55,11 @@
         "name": {
           "type": "string",
           "description": "Tool name as declared in the MCP server manifest's tools list."
+        },
+        "args": {
+          "type": "object",
+          "description": "FIX-P3-001: full (non-redacted) tool-call arguments with path-bearing values NFKC-normalised and iteratively percent-decoded by the broker before OPA evaluation. The policy (and per-agent layers — filesystem/git path guards) applies literal '../' and startswith('/') checks against these already-decoded strings (encoded-traversal prevention). Kept in lock-step with _build_opa_input().",
+          "additionalProperties": true
         },
         "args_redacted": {
           "type": "object",
@@ -93,6 +102,32 @@
         }
       }
     },
+    "target": {
+      "type": "object",
+      "description": "v4.1 Phase 2a/2b (LU-MCP-A2/A3, lu.md §3a): the per-instance MCP target of this request, populated by the gateway/broker from the transport layer and call context. Emitted whenever the stable per-instance mcp_id is known; REQUIRED (by policy) for mcp.tools.call on mcp-b/mcp-c — policy denies invocation without target.mcp_id (instance_unidentified) and without a surface_hash matching the approved baseline (capability_envelope_drift / capability_envelope_not_active). Keys into data.yashigani.mcp.grants[mcp_id] and data.yashigani.mcp.baselines[mcp_id].",
+      "required": ["mcp_id"],
+      "additionalProperties": false,
+      "properties": {
+        "mcp_id": {
+          "type": "string",
+          "description": "Stable per-instance MCP UUID minted once at first registration (ctx.mcp_id / McpIdStore / McpBrokerServerConfig.mcp_id). Two same-named MCPs in one tenant share a name-SPIFFE but never an mcp_id — this field is what lets OPA enforce per-instance grants."
+        },
+        "cert_fingerprint": {
+          "type": "string",
+          "description": "SHA-256 fingerprint of the per-instance leaf certificate presented at TLS, formatted 'sha256:<lowercase hex, no separators>' (broker-normalised). Binds the OPA decision log / audit record to the presenting instance's cert material.",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "surface_hash": {
+          "type": "string",
+          "description": "'sha256:<hex>' hash of the tool surface advertised by the instance at call time (yashigani.mcp._envelope.surface_set_hash — RFC-8785-style canonicalised byte-hash, broker-normalised with the sha256: prefix). Compared by policy against data.yashigani.mcp.baselines[mcp_id].surface_hash for change-prevention."
+        }
+      }
+    },
+    "caller": {
+      "type": "object",
+      "description": "3.1 Phase 1 caller identity context (agent_id / user_id), passed from McpCallContext. Purely additive — policies that do not reference input.caller ignore it. Documented here to keep the schema in lock-step with _build_opa_input().",
+      "additionalProperties": true
+    },
     "agent": {
       "type": "object",
       "description": "Agent context. Present when the caller is a registered Yashigani agent.",
@@ -102,6 +137,10 @@
           "type": "string",
           "description": "Agent runtime identifier, e.g. langflow, n8n, openai-assistant, custom. Used by policy for posture-specific enforcement.",
           "examples": ["langflow", "n8n", "openai-assistant", "custom"]
+        },
+        "name": {
+          "type": "string",
+          "description": "FIX-P3-ENFORCE / Iris F2: agent (MCP server) name, emitted by _build_opa_input() so per-agent rego packages (e.g. yashigani.agents.filesystem) can inspect it. Documented here to keep the schema in lock-step with the producer."
         }
       }
     },
@@ -147,7 +186,7 @@
         },
         "deny_reason": {
           "type": "string",
-          "description": "Human-readable reason for the deny decision. Value is 'ok' when allow is true. Values: ok, missing_spiffe_identity, invalid_posture, chain_depth_exceeded, multiple_subjects_in_request, missing_subject, unrecognised_action, tool_not_in_exposed_allowlist, mcp_c_requires_chain."
+          "description": "Human-readable reason for the deny decision. Value is 'ok' when allow is true. Values: ok, missing_spiffe_identity, invalid_posture, chain_depth_exceeded, multiple_subjects_in_request, missing_subject, unrecognised_action, tool_not_in_exposed_allowlist, mcp_c_requires_chain, spiffe_not_verified, tool_subject_required, instance_unidentified, capability_envelope_not_active, no_per_instance_grant, capability_envelope_drift (the last six added in v4.1 Phase 2b per-instance authz — LU-MCP-A1..A4)."
         },
         "redact_args": {
           "type": "array",

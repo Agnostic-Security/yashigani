@@ -8,6 +8,23 @@
 #   P3  (HIGH)  — MCP input schema + policy (this file)
 #   P9  (MEDIUM) — MCP-B per-tool authz enforced at gateway inbound
 #
+# v4.1 Phase 2b (LU-MCP-A1..A4) — per-instance authz + change-prevention:
+#   mcp.tools.call on mcp-b/mcp-c is authorized ONLY when ALL FOUR hold:
+#     1. _identity_verified   — gateway attests SPIFFE URI == mTLS peer leaf SAN
+#                               (input.identity.verified; broker-asserted name-SPIFFE
+#                               alone no longer authorizes — LU-MCP-A1)
+#     2. _instance_identified — per-instance target.mcp_id present (LU-MCP-A2)
+#     3. _grant_ok            — per-instance/per-caller grant in
+#                               data.yashigani.mcp.grants[mcp_id][spiffe] (closed
+#                               world — LU-MCP-A2/A5)
+#     4. _envelope_unchanged  — target.surface_hash equals the approved baseline in
+#                               data.yashigani.mcp.baselines[mcp_id] AND the tool is
+#                               in the baseline tool set (LU-MCP-A3)
+#   The approve-time deterministic structural diff (broker _envelope.py) PRODUCES
+#   grants + baselines — an LLM NEVER grants. OPA ENFORCES at invoke time.
+#   No baseline for the instance → deny (capability_envelope_not_active).
+#   The exposed_tools gate is FLIPPED to default-DENY (LU-MCP-A4).
+#
 # Input schema: policy/mcp-input.schema.json
 # Query path:   /v1/data/yashigani/mcp/mcp_decision
 #               /v1/data/yashigani/mcp/allow
@@ -57,6 +74,54 @@ default allow := false
 _spiffe_present if {
     is_string(input.identity.spiffe)
     input.identity.spiffe != ""
+}
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 2b — per-instance identity, grant and change-prevention helpers
+# (LU-MCP-A1..A4; contract: lu.md §3, mcp-input.schema.json identity/target)
+# ---------------------------------------------------------------------------
+
+# _identity_verified — the SPIFFE URI was VERIFIED by the gateway against the
+# mTLS peer leaf certificate SAN (input.identity.verified is set by the
+# transport layer, never by the caller body). Strict boolean-true check:
+# a string "true", 1, or any other truthy value does NOT satisfy it.
+_identity_verified if {
+    input.identity.verified == true
+    _spiffe_present
+}
+
+# _instance_identified — the stable per-instance MCP UUID (ctx.mcp_id) is
+# present as a non-empty string. Two same-named MCPs in one tenant share a
+# name-SPIFFE but NEVER an mcp_id.
+_instance_identified if {
+    is_string(input.target.mcp_id)
+    input.target.mcp_id != ""
+}
+
+# _baseline_present — an approved capability-envelope baseline exists for this
+# instance. Produced ONLY by the approve-time deterministic diff; absence means
+# the instance was never approved (or approval was revoked) → fail closed.
+_baseline_present if {
+    data.yashigani.mcp.baselines[input.target.mcp_id]
+}
+
+# _grant_ok — per-instance, per-caller grant (closed world). The calling
+# identity must hold an explicit grant for THIS instance covering THIS tool.
+_grant_ok if {
+    g := data.yashigani.mcp.grants[input.target.mcp_id][input.identity.spiffe]
+    input.tool.name in g.tools
+}
+
+# _envelope_unchanged — change-prevention backstop in POLICY (not only broker
+# code): the tool surface advertised at call time must hash-match the approved
+# baseline, and the requested tool must be inside the approved tool set.
+# Empty/missing surface_hash fails closed.
+_envelope_unchanged if {
+    b := data.yashigani.mcp.baselines[input.target.mcp_id]
+    is_string(input.target.surface_hash)
+    input.target.surface_hash != ""
+    input.target.surface_hash == b.surface_hash
+    input.tool.name in b.tools
 }
 
 # _posture_valid — sanity-check the posture string (not in canonical set → deny)
@@ -154,26 +219,53 @@ allow if {
     _action_recognised
 }
 
-# MCP-B (remote Streamable-HTTP, Shape B):
-#   Same as MCP-A plus per-tool authz gate (_tool_authz_ok).
-#   For non-tool actions, the authz check is a no-op (passes through).
+# MCP-B (remote Streamable-HTTP, Shape B) — NON-invocation actions:
+#   Same as MCP-A plus:
+#     - _identity_verified (LU-MCP-A1): the gateway must attest the SPIFFE↔leaf
+#       binding on every remote-posture request.
+#     - _tool_authz_ok — FLIPPED to default-DENY (LU-MCP-A4): a tool subject on
+#       a non-invocation action requires explicit exposed_tools listing.
+#   mcp.tools.call is governed by the dedicated per-instance rule below.
 allow if {
     input.posture == "mcp-b"
+    input.action != "mcp.tools.call"
     _posture_valid
     _spiffe_present
+    _identity_verified
     _chain_depth_ok
     _exactly_one_subject
     _action_recognised
     _tool_authz_ok
 }
 
-# MCP-C (multi-hop chained, Shape C):
-#   Chain MUST be present and non-empty (chain is the core assertion of MCP-C).
-#   Chain depth must be within limit.
+# MCP-B — mcp.tools.call: per-instance FOUR-GATE (v4.1 Phase 2b).
+# ALL FOUR required: verified identity + identified instance + per-caller grant
+# + unchanged capability envelope. Plus the operator narrowing gate.
 allow if {
-    input.posture == "mcp-c"
+    input.posture == "mcp-b"
+    input.action == "mcp.tools.call"
     _posture_valid
     _spiffe_present
+    _identity_verified
+    _chain_depth_ok
+    _exactly_one_subject
+    _tool_present
+    _action_recognised
+    _instance_identified
+    _grant_ok
+    _envelope_unchanged
+    _exposed_tools_narrowing_ok
+}
+
+# MCP-C (multi-hop chained, Shape C) — NON-invocation actions:
+#   Chain MUST be present and non-empty (chain is the core assertion of MCP-C).
+#   Chain depth must be within limit. Identity must be cert-verified.
+allow if {
+    input.posture == "mcp-c"
+    input.action != "mcp.tools.call"
+    _posture_valid
+    _spiffe_present
+    _identity_verified
     # MCP-C requires an explicit chain
     _chain_depth > 0
     _chain_depth_ok
@@ -182,16 +274,40 @@ allow if {
     _tool_authz_ok
 }
 
+# MCP-C — mcp.tools.call: per-instance FOUR-GATE (v4.1 Phase 2b), chain required.
+allow if {
+    input.posture == "mcp-c"
+    input.action == "mcp.tools.call"
+    _posture_valid
+    _spiffe_present
+    _identity_verified
+    _chain_depth > 0
+    _chain_depth_ok
+    _exactly_one_subject
+    _tool_present
+    _action_recognised
+    _instance_identified
+    _grant_ok
+    _envelope_unchanged
+    _exposed_tools_narrowing_ok
+}
+
 # ---------------------------------------------------------------------------
-# P9 — MCP-B per-tool authz (exposed tool allowlist)
+# P9 — per-tool authz (exposed tool allowlist)
 #
-# When data.yashigani.mcp.exposed_tools is populated (operator data bundle),
-# it acts as the canonical allowlist of tool names exposed at the gateway
-# inbound.  Any tool call for a name NOT in the allowlist → deny.
+# FLIPPED v4.1 Phase 2b (LU-MCP-A4 High/Bypass): the previous behaviour —
+# "allowlist absent or empty (default install) → gate OPEN, all tool names
+# permitted" — contradicted this file's own default-deny claim. It is GONE.
 #
-# When the allowlist is absent or empty (default install), the gate is open —
-# all tool names are permitted. This preserves backward-compat for installs
-# that have not configured a tool allowlist.
+# New semantics:
+#   - _tool_authz_ok (non-invocation actions carrying a tool subject): the tool
+#     name MUST be explicitly listed in data.yashigani.mcp.exposed_tools.
+#     Absent/empty allowlist → DENY.
+#   - mcp.tools.call does NOT use _tool_authz_ok. Invocation is governed by the
+#     per-instance closed world (grants + baselines — default-deny per instance)
+#     plus _exposed_tools_narrowing_ok: when the operator ADDITIONALLY populates
+#     exposed_tools it narrows the invocable set; when empty it defers to the
+#     grant+baseline closed world (which denies unknown tools by construction).
 #
 # Operators populate data.yashigani.mcp.exposed_tools as a set of strings:
 #   PUT /v1/data/yashigani/mcp/exposed_tools ["web_search", "code_exec", ...]
@@ -203,21 +319,22 @@ _tool_authz_ok if {
 }
 
 # Resolve the exposed_tools allowlist — default to empty set when absent in data bundle.
-# This makes the gate open (backward-compat) when operators have not loaded a bundle.
 _exposed_tools := data.yashigani.mcp.exposed_tools if {
     data.yashigani.mcp.exposed_tools
 } else := set()
 
 _tool_authz_ok if {
-    # Tool present: allowlist absent or empty → open gate (backward-compat)
+    # Tool present: name must be explicitly allowlisted (default-DENY).
     _tool_present
+    input.tool.name in _exposed_tools
+}
+
+# Operator narrowing gate for mcp.tools.call (see section comment above).
+_exposed_tools_narrowing_ok if {
     count(_exposed_tools) == 0
 }
 
-_tool_authz_ok if {
-    # Tool present: allowlist populated → tool name must be in it
-    _tool_present
-    count(_exposed_tools) > 0
+_exposed_tools_narrowing_ok if {
     input.tool.name in _exposed_tools
 }
 
@@ -295,16 +412,110 @@ deny_reason := "unrecognised_action" if {
     not _action_recognised
 }
 
-deny_reason := "tool_not_in_exposed_allowlist" if {
-    not allow
+# _bc_structural_ok — all structural gates for the remote postures passed
+# (used to scope the v4.1 Phase 2b deny reasons so exactly one reason fires;
+# mcp-c additionally requires a non-empty chain so mcp_c_requires_chain stays
+# mutually exclusive with the reasons below).
+_bc_structural_ok if {
     _spiffe_present
     _posture_valid
     _chain_depth_ok
     _exactly_one_subject
     _action_recognised
+    input.posture == "mcp-b"
+}
+
+_bc_structural_ok if {
+    _spiffe_present
+    _posture_valid
+    _chain_depth_ok
+    _exactly_one_subject
+    _action_recognised
+    input.posture == "mcp-c"
+    _chain_depth > 0
+}
+
+# v4.1 Phase 2b deny reasons (LU-MCP-A1..A4). Ladder — exactly one fires.
+deny_reason := "spiffe_not_verified" if {
+    not allow
+    _bc_structural_ok
+    not _identity_verified
+}
+
+deny_reason := "tool_subject_required" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action == "mcp.tools.call"
+    not _tool_present
+}
+
+deny_reason := "instance_unidentified" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action == "mcp.tools.call"
     _tool_present
-    count(_exposed_tools) > 0
-    not input.tool.name in _exposed_tools
+    not _instance_identified
+}
+
+deny_reason := "capability_envelope_not_active" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    not _baseline_present
+}
+
+deny_reason := "no_per_instance_grant" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    _baseline_present
+    not _grant_ok
+}
+
+deny_reason := "capability_envelope_drift" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    _baseline_present
+    _grant_ok
+    not _envelope_unchanged
+}
+
+# mcp.tools.call: all four gates passed but the operator narrowing allowlist
+# excludes the tool.
+deny_reason := "tool_not_in_exposed_allowlist" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    _baseline_present
+    _grant_ok
+    _envelope_unchanged
+    not _exposed_tools_narrowing_ok
+}
+
+# Non-invocation action carrying a tool subject not in the (flipped,
+# default-deny) exposed_tools allowlist.
+deny_reason := "tool_not_in_exposed_allowlist" if {
+    not allow
+    _bc_structural_ok
+    _identity_verified
+    input.action != "mcp.tools.call"
+    _tool_present
+    not _tool_authz_ok
 }
 
 deny_reason := "mcp_c_requires_chain" if {

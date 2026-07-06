@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import pytest
 from unittest.mock import MagicMock
 
@@ -557,38 +558,52 @@ class TestMcpP9ToolAuthz:
         assert "_tool_authz_ok" in content
 
     def test_p9_tool_allowlist_gate_only_on_mcp_b_and_mcp_c(self):
-        """P9 tool allowlist documented as mcp-b + mcp-c gate in rego (mcp-a bypasses)."""
-        content = _MCP_REGO.read_text()
-        # mcp-a allow branch should NOT call _tool_authz_ok
-        # mcp-b allow branch MUST call _tool_authz_ok
-        # This is a structural check on the rego source
-        lines = content.splitlines()
-        mcp_a_block_lines = []
-        mcp_b_block_lines = []
-        in_mcp_a = False
-        in_mcp_b = False
-        for i, line in enumerate(lines):
-            if 'input.posture == "mcp-a"' in line:
-                in_mcp_a = True
-                mcp_a_block_lines = []
-            elif 'input.posture == "mcp-b"' in line:
-                in_mcp_a = False
-                in_mcp_b = True
-                mcp_b_block_lines = []
-            elif in_mcp_a and line.strip() == "}":
-                in_mcp_a = False
-            elif in_mcp_b and line.strip() == "}":
-                in_mcp_b = False
-            if in_mcp_a:
-                mcp_a_block_lines.append(line)
-            elif in_mcp_b:
-                mcp_b_block_lines.append(line)
+        """P9/v4.1 structural check on the rego allow blocks.
 
-        # mcp-b allow block must reference _tool_authz_ok
-        mcp_b_text = "\n".join(mcp_b_block_lines)
-        assert "_tool_authz_ok" in mcp_b_text, (
-            "mcp.rego mcp-b allow block must call _tool_authz_ok for P9 per-tool authz"
-        )
+        v4.1 Phase 2b split the remote-posture allow rules:
+          - mcp-a allow block does NOT call _tool_authz_ok (transport-gated);
+          - mcp-b/mcp-c NON-invocation blocks MUST call _tool_authz_ok
+            (flipped default-deny exposed_tools gate — LU-MCP-A4);
+          - mcp-b/mcp-c mcp.tools.call blocks MUST require the per-instance
+            FOUR-GATE (LU-MCP-A1..A3) instead of the allowlist gate.
+        """
+        content = _MCP_REGO.read_text()
+        blocks = re.findall(r"^allow if \{\n(.*?)^\}", content, re.DOTALL | re.MULTILINE)
+        assert blocks, "no allow blocks parsed from mcp.rego"
+
+        mcp_a = [b for b in blocks if 'input.posture == "mcp-a"' in b]
+        nontool = [
+            b for b in blocks
+            if 'input.posture == "mcp-' in b
+            and 'input.posture == "mcp-a"' not in b
+            and 'input.action != "mcp.tools.call"' in b
+        ]
+        calls = [
+            b for b in blocks
+            if 'input.posture == "mcp-' in b
+            and 'input.posture == "mcp-a"' not in b
+            and 'input.action == "mcp.tools.call"' in b
+        ]
+
+        assert mcp_a, "mcp-a allow block missing"
+        for b in mcp_a:
+            assert "_tool_authz_ok" not in b, "mcp-a must not be allowlist-gated"
+
+        assert len(nontool) >= 2, "expected non-invocation allow blocks for mcp-b AND mcp-c"
+        for b in nontool:
+            assert "_tool_authz_ok" in b, (
+                "remote non-invocation allow block must call _tool_authz_ok"
+            )
+
+        assert len(calls) >= 2, "expected tools.call allow blocks for mcp-b AND mcp-c"
+        for b in calls:
+            for gate in (
+                "_identity_verified",
+                "_instance_identified",
+                "_grant_ok",
+                "_envelope_unchanged",
+            ):
+                assert gate in b, f"tools.call allow block missing {gate}"
 
     def test_p9_deny_reason_documents_allowlist_violation(self):
         """deny_reason for allowlist violation must be 'tool_not_in_exposed_allowlist'."""
