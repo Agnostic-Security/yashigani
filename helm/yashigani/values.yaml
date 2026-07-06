@@ -983,6 +983,25 @@ caddy:
   egressAllowlist: ""
 
 # ---------------------------------------------------------------------------
+# v4.1 unified-sidecar Phase 2a — per-system egress forwarders
+# (templates/egress-forwarders.yaml; design §2.2(c/d), §2.3, §2.6)
+#
+# Empty by default. Codegen emits a values-<system>-egress.yaml overlay per
+# onboarded system that declares spec.egress.needs != []; apply it with -f.
+# The map keys are unique camelCase per (system, tenant), so multiple
+# overlays merge additively (same rationale as mcpSvid).
+#
+# openclaw (transitional, pin-AND-grant OVERLAP phase): the codegen-emitted
+# overlay lives at helm/yashigani/values-openclaw-egress.yaml — apply with
+#   helm upgrade yashigani ./helm/yashigani \
+#     -f helm/yashigani/values-openclaw-egress.yaml
+# alongside agentBundles.openclaw.enabled=true. The static :18790 caller/
+# destination pins remain in force; pin deletion is a later, Laura-gated
+# step (unified-sidecar synthesis must-fix #1).
+# ---------------------------------------------------------------------------
+egressForwarders: {}
+
+# ---------------------------------------------------------------------------
 # Optional Agent Bundles (v0.8.0)
 #
 # All four agents are DISABLED by default.  Enable per-agent with:
