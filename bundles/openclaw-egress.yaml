@@ -7,8 +7,9 @@
 #     openclaw-egress-caller-gate, YASHIGANI_OPENCLAW_SPIFFE_ID) STAYS,
 #   * the destination/account pins (Slack bot-token, webhook-path, Telegram
 #     bot-ID) STAY,
-#   * openclaw's own direct env base URLs (https://caddy:18790/{prefix}) and
-#     client-cert env vars STAY,
+#   * openclaw's env base URLs are REPOINTED at the forwarder (Phase 2b:
+#     http://egress-openclaw:9400/{prefix} — compose env + openclaw.json);
+#     the client-cert env vars + TLS mounts STAY,
 #   * the OPA (caller, prefix) grant is Tom's transitional bundled-system
 #     seed (src/yashigani/mcp/_egress_grants.py transitional_egress_seed —
 #     keyed on the SAME SPIFFE the static pin uses; prefixes below mirror it

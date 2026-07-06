@@ -2624,31 +2624,35 @@ services:
       # gateway's server cert (internal PKI). Standard Node.js extra-CA hook —
       # applies to all of openclaw's outbound TLS.
       NODE_EXTRA_CA_CERTS: /etc/openclaw/tls/ca.crt
-      # v4.1 Phase 1d (LAURA-I1-03 egress client-cert, NO-CARRY-FORWARD):
-      # openclaw's Slack/Telegram SDK calls are routed through the fixed-upstream
-      # egress gateway (:18790) and the leaf cert is presented via TWO
-      # complementary SDK-level mechanisms — both wired, no deferred step:
+      # v4.1 Phase 2b (unified-sidecar): openclaw's Slack/Telegram SDK calls
+      # dial the per-system EGRESS FORWARDER (egress-openclaw:9400 — stood up
+      # by docker/openclaw-egress-forwarder.override.yml when the openclaw
+      # bundle is enabled; install.sh compose_up layers it, fail-closed).
+      # The forwarder — SOLE holder of the SVID mount — presents the openclaw
+      # leaf to caddy:18790 → /egress/eval; the hop openclaw→forwarder is
+      # plain HTTP on the 2-member ringfence_openclaw_eg bridge (T2 rationale).
+      #
+      # OVERLAP (synthesis must-fix #1 — pin-AND-grant, one full release):
+      # the :18790 static caller pin + destination/account pins stay in force;
+      # openclaw's own client-cert material stays mounted and configured:
       #
       # (1) openclaw.json egress block (primary): OPENCLAW_CONFIG_PATH points
-      #     the binary at openclaw.json; the `egress.tls.{certFile,keyFile}`
-      #     fields configure the TLS client cert for all egress connections.
-      #     The `egress.slack.apiBaseUrl` / `egress.telegram.apiBaseUrl` fields
-      #     route SDK calls through caddy:18790 instead of directly to the
-      #     internet (already not reachable — openclaw_ringfence is internal:true).
+      #     the binary at openclaw.json; `egress.slack.apiBaseUrl` /
+      #     `egress.telegram.apiBaseUrl` route SDK calls through the forwarder.
+      #     The `egress.tls.{certFile,keyFile}` fields stay (overlap — retire
+      #     with the pins at the Laura-gated per-instance migration, §3.1).
       #
       # (2) OPENCLAW_EGRESS_TLS_* env vars (belt-and-suspenders): cover any
       #     runtime paths that read env directly rather than the JSON config.
       #
       # Static proof: /etc/openclaw/tls/client.crt (mounted from
       # ./secrets/openclaw_client.crt) carries URI SAN
-      # spiffe://yashigani.internal/openclaw (service_identities.yaml:248).
-      # The :18790 CEL gate expects exactly that SAN. Chain is complete:
-      # cert path configured → cert mounted → SAN matches gate → accepted.
-      # Laura Phase-3 test (c) is live confirmation of the configured chain,
-      # not a "check if configured" step.
-      OPENCLAW_SLACK_API_BASE_URL: "https://caddy:18790/slack"
-      OPENCLAW_SLACK_HOOKS_BASE_URL: "https://caddy:18790/slack-hooks"
-      OPENCLAW_TELEGRAM_API_BASE_URL: "https://caddy:18790/telegram"
+      # spiffe://yashigani.internal/openclaw (service_identities.yaml:248) —
+      # the SAME leaf the forwarder presents, so the :18790 CEL caller gate
+      # accepts the forwarder hop unchanged.
+      OPENCLAW_SLACK_API_BASE_URL: "http://egress-openclaw:9400/slack"
+      OPENCLAW_SLACK_HOOKS_BASE_URL: "http://egress-openclaw:9400/slack-hooks"
+      OPENCLAW_TELEGRAM_API_BASE_URL: "http://egress-openclaw:9400/telegram"
       OPENCLAW_EGRESS_TLS_CERT_FILE: /etc/openclaw/tls/client.crt
       OPENCLAW_EGRESS_TLS_KEY_FILE: /etc/openclaw/tls/client.key
     volumes:

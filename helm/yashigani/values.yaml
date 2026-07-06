@@ -1086,6 +1086,19 @@ agentBundles:
       OPENCLAW_DISABLE_CAMERA: "true"
       OPENCLAW_DISABLE_LOCATION: "true"
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
+      # v4.1 Phase 2b (unified-sidecar): outbound Slack/Telegram dials the
+      # per-system egress-forwarder Service (templates/egress-forwarders.yaml,
+      # rendered from the values-openclaw-egress.yaml overlay — install.sh
+      # layers it whenever this bundle is enabled via --agent-bundles). The
+      # forwarder holds the SVID and presents the leaf to
+      # yashigani-caddy:18790 → /egress/eval; the static caller/destination
+      # pins there remain in force (pin-AND-grant OVERLAP — pin deletion is a
+      # later, Laura-gated step). Do NOT point these at yashigani-caddy:18790
+      # directly: the forwarder is openclaw's outbound-messaging path
+      # (allow-openclaw-egress + the forwarder NetworkPolicies enforce it).
+      OPENCLAW_SLACK_API_BASE_URL: "http://yashigani-egress-openclaw:9400/slack"
+      OPENCLAW_SLACK_HOOKS_BASE_URL: "http://yashigani-egress-openclaw:9400/slack-hooks"
+      OPENCLAW_TELEGRAM_API_BASE_URL: "http://yashigani-egress-openclaw:9400/telegram"
     service:
       # Expose OpenClaw's own gateway port for incoming messaging webhooks
       port: 18789

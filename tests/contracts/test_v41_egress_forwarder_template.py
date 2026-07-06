@@ -539,15 +539,33 @@ class TestOpenclawOverlapWiring:
                          "https://api.telegram.org"):
             assert upstream in canonical
 
-    def test_openclaw_direct_egress_path_untouched(self) -> None:
-        """OVERLAP: openclaw's own direct :18790 dial (env base URLs + client
-        cert env) stays in docker-compose.yml — env repointing at the
-        forwarder is a later migration step."""
+    def test_openclaw_env_repointed_at_forwarder_overlap_kept(self) -> None:
+        """Phase 2b: openclaw's egress base URLs (compose env + openclaw.json)
+        dial the FORWARDER (egress-openclaw:9400), not caddy:18790 directly.
+        OVERLAP: the client-cert env vars + TLS mounts STAY (they retire with
+        the static pins at the later, Laura-gated per-instance migration)."""
         compose = (REPO_ROOT / "docker" /
                    "docker-compose.yml").read_text(encoding="utf-8")
-        assert 'OPENCLAW_SLACK_API_BASE_URL: "https://caddy:18790/slack"' in compose
-        assert 'OPENCLAW_TELEGRAM_API_BASE_URL: "https://caddy:18790/telegram"' in compose
+        assert 'OPENCLAW_SLACK_API_BASE_URL: "http://egress-openclaw:9400/slack"' in compose
+        assert ('OPENCLAW_SLACK_HOOKS_BASE_URL: '
+                '"http://egress-openclaw:9400/slack-hooks"') in compose
+        assert ('OPENCLAW_TELEGRAM_API_BASE_URL: '
+                '"http://egress-openclaw:9400/telegram"') in compose
+        # No direct-dial base URL may remain anywhere in the compose file.
+        assert "https://caddy:18790/slack" not in compose
+        assert "https://caddy:18790/telegram" not in compose
+        # OVERLAP: client-cert env vars stay wired (pin-AND-grant phase).
         assert "OPENCLAW_EGRESS_TLS_CERT_FILE: /etc/openclaw/tls/client.crt" in compose
+        assert "OPENCLAW_EGRESS_TLS_KEY_FILE: /etc/openclaw/tls/client.key" in compose
+        # Primary config (openclaw.json template) repointed identically.
+        oc_json = (REPO_ROOT / "docker" / "openclaw" /
+                   "openclaw.json").read_text(encoding="utf-8")
+        assert '"apiBaseUrl": "http://egress-openclaw:9400/slack"' in oc_json
+        assert '"hooksBaseUrl": "http://egress-openclaw:9400/slack-hooks"' in oc_json
+        assert '"apiBaseUrl": "http://egress-openclaw:9400/telegram"' in oc_json
+        assert "caddy:18790" not in oc_json
+        # OVERLAP: openclaw.json keeps its client-cert TLS block.
+        assert '"certFile": "/etc/openclaw/tls/client.crt"' in oc_json
 
     def test_helm_overlay_projects_scoped_items_only(self) -> None:
         values = yaml.safe_load(

@@ -1890,9 +1890,12 @@ spec:
         # A4: mesh port for LLM dispatch
         - protocol: TCP
           port: 8081
-    # v4.1 Phase 1c (LAURA-I1-03 / FP-03): the ONLY outbound-messaging path —
-    # Caddy's :18790 egress gateway (fixed upstreams slack.com /
-    # hooks.slack.com / api.telegram.org; mTLS SAN-bound to openclaw's leaf).
+    # v4.1 Phase 1c (LAURA-I1-03 / FP-03) — RETAINED FOR OVERLAP: the direct
+    # :18790 dial (fixed upstreams slack.com / hooks.slack.com /
+    # api.telegram.org; mTLS SAN-bound to openclaw's leaf). Phase 2b repoints
+    # openclaw's env at the forwarder (rule below); this allow stays for the
+    # pin-AND-grant overlap release and retires WITH the static pins at the
+    # later, Laura-gated step (unified-sidecar synthesis must-fix #1).
     - to:
         - podSelector:
             matchLabels:
@@ -1900,6 +1903,20 @@ spec:
       ports:
         - protocol: TCP
           port: 18790
+    # v4.1 Phase 2b (unified-sidecar): the system-side half of the §2.6
+    # split-zone contract — openclaw → its egress-forwarder pod (:9400,
+    # K8s parity of ringfence_openclaw_eg 2-member membership). The
+    # forwarder-side NetworkPolicy (templates/egress-forwarders.yaml) admits
+    # ingress ONLY from this pod and denies forwarder → openclaw:18789
+    # (intra-zone deny, I1-02). openclaw's OPENCLAW_*_BASE_URL env dials
+    # http://yashigani-egress-openclaw:9400/<prefix>.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: egress-openclaw
+      ports:
+        - protocol: TCP
+          port: 9400
 {{- end }}
 
 

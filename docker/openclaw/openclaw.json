@@ -36,11 +36,11 @@
   },
   "egress": {
     "slack": {
-      "apiBaseUrl": "https://caddy:18790/slack",
-      "hooksBaseUrl": "https://caddy:18790/slack-hooks"
+      "apiBaseUrl": "http://egress-openclaw:9400/slack",
+      "hooksBaseUrl": "http://egress-openclaw:9400/slack-hooks"
     },
     "telegram": {
-      "apiBaseUrl": "https://caddy:18790/telegram"
+      "apiBaseUrl": "http://egress-openclaw:9400/telegram"
     },
     "tls": {
       "certFile": "/etc/openclaw/tls/client.crt",
