@@ -680,6 +680,76 @@ def _header_comment(
 # Shape A artifact generators
 # ---------------------------------------------------------------------------
 
+def _ringfence_init_service_lines(
+    agent_name: str,
+    runtime: str,
+    *,
+    caddy_port: int = 443,
+) -> list[str]:
+    """Emit the ``ringfence-init-<agent>`` service stanza (L1 netns iptables).
+
+    DEPLOY-BREAKER FIX (v4.1 Phase-2a finding #1): Shape-A/C previously
+    emitted ``depends_on: ringfence-init-<agent>`` on the agent but never
+    emitted the init service itself — ``docker compose config`` fails on the
+    unresolvable dependency at stack bring-up.  This helper emits the stanza
+    (shared by Shape-A and Shape-C); the AGENT-side depends_on is REMOVED,
+    because it cannot coexist with the netns join:
+
+    ORDERING (proven live, docker compose v5.1.3): ``network_mode:
+    "service:<agent>"`` implies init-after-agent; adding the reverse
+    depends_on (agent waits for init completion — the original L7 pattern)
+    is rejected outright: ``dependency cycle detected: agent -> init ->
+    agent``.  Compose cannot express init-before-start with a shared netns
+    (K8s initContainers can — on K8s, L1 is carried by the generated
+    NetworkPolicy overlay, active from pod creation).  Same acceptance as
+    the egress-forwarder's init (§2.6 ORDERING note): rules land moments
+    after the agent process starts; every agent bridge is internal:true, so
+    the boot window exposes no internet egress — the residual window is
+    intra-bridge only, closed as soon as the init completes.
+
+    The init applies default-deny OUTPUT in the agent netns — the
+    netns-equivalent of the §2.6 intra-zone bridge FORWARD-DROP (containers
+    cannot program the host bridge FORWARD chain) — with sole ACCEPTs:
+    caddy:<caddy_port>, DNS, ESTABLISHED (see docker/ringfence-init/).
+
+    NOT emitted for podman-rootless (L1 gap — NET_ADMIN unavailable; the
+    generated stanza carries the ROOTLESS-PODMAN-L1-GAP annotation instead).
+    Callers gate on ``runtime != "podman-rootless"``.
+    """
+    init_svc = "ringfence-init-%s" % agent_name
+    return [
+        "",
+        "  # L1 ringfence-init: runs in the AGENT's netns (network_mode service:),",
+        "  # applies default-deny OUTPUT + ACCEPT caddy:%d + DNS + ESTABLISHED —" % caddy_port,
+        "  # the netns-equivalent of the §2.6 intra-zone FORWARD-DROP.",
+        "  # ORDERING: init depends_on the agent (service_started); the reverse",
+        "  # (agent waits for init completion) is a compose dependency cycle —",
+        "  # proven live: 'dependency cycle detected' (docker compose v5.1.3).",
+        "  # Rules land moments after agent start; all agent bridges are",
+        "  # internal:true, so the boot window has no internet egress path.",
+        "  %s:" % init_svc,
+        "    image: ${YASHIGANI_RINGFENCE_INIT_IMAGE:-%s}:${YASHIGANI_RINGFENCE_INIT_VERSION:-0.1.0}" % _RINGFENCE_INIT_IMAGE,
+        '    network_mode: "service:%s"' % agent_name,
+        "    depends_on:",
+        "      %s:" % agent_name,
+        "        condition: service_started",
+        "    cap_drop:",
+        "      - ALL",
+        "    cap_add:",
+        "      - NET_ADMIN",
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    environment:",
+        "      RINGFENCE_CADDY_HOST: caddy",
+        '      RINGFENCE_CADDY_PORT: "%d"' % caddy_port,
+        '      RINGFENCE_DNS_SERVER: "127.0.0.11"',
+        '      RINGFENCE_RUNTIME: "%s"' % runtime,
+        '      RINGFENCE_AGENT_NAME: "%s"' % agent_name,
+        "    tmpfs:",
+        "      - /run/ringfence:size=1m,mode=1777",
+    ]
+
+
 def _gen_compose_override(
     parsed: dict,
     *,
@@ -716,15 +786,15 @@ def _gen_compose_override(
     if runtime == "podman-rootless":
         rootless_note = "      # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
 
-    # L7: depends_on — ringfence-init must complete before agent starts.
-    # NEW-BUG-F FIX (cascade audit 2026-05-30): ringfence-init-<agent> is NOT
-    # generated for podman-rootless (L1 gap — CAP_NET_ADMIN unavailable rootless).
-    # Emitting depends_on for a service that doesn't exist causes podman-compose
-    # to raise KeyError on 'ringfence-init-<agent>' during `compose up`.
-    # Gate: only emit depends_on when the init sidecar is actually generated
-    # (i.e. runtime != "podman-rootless").
-    init_svc = "ringfence-init-%s" % agent_name
-    emit_depends_on = runtime != "podman-rootless"
+    # L1/L7: ringfence-init stanza (DEPLOY-BREAKER FIX, Phase-2a finding #1).
+    # Previously this generator emitted depends_on: ringfence-init-<agent>
+    # WITHOUT ever emitting the init service → `docker compose config` fails
+    # on the missing dependency. Now the stanza itself is emitted (see
+    # _ringfence_init_service_lines — incl. the ORDERING rationale for why
+    # the agent-side depends_on is gone: it is a compose dependency cycle).
+    # NEW-BUG-F gate retained: NOT emitted for podman-rootless (L1 gap —
+    # CAP_NET_ADMIN unavailable rootless).
+    emit_init = runtime != "podman-rootless"
 
     # W3-F1: emit BOTH the isolated ringfence bridge and caddy_internal.
     # Replicates the existing <agent>_isolated pattern at docker-compose.yml:2405-2413
@@ -733,14 +803,9 @@ def _gen_compose_override(
     # containment; caddy_internal is the only bridge that reaches Caddy egress.
     ringfence_bridge = "ringfence_%s" % agent_name
 
-    depends_on_lines: list[str] = []
-    if emit_depends_on:
-        depends_on_lines = [
-            "    # L7 — block on ringfence-init completion",
-            "    depends_on:",
-            "      %s:" % init_svc,
-            "        condition: service_completed_successfully",
-        ]
+    init_stanza_lines: list[str] = []
+    if emit_init:
+        init_stanza_lines = _ringfence_init_service_lines(agent_name, runtime)
 
     lines = [
         _header_comment(manifest_hash, runtime),
@@ -763,7 +828,7 @@ def _gen_compose_override(
         "    sysctls:",
         "      net.ipv6.conf.all.disable_ipv6: 1",
         "      net.ipv6.conf.default.disable_ipv6: 1",
-    ] + depends_on_lines + [
+    ] + init_stanza_lines + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
         "# W3-F1: isolated ringfence bridge — L2 default-deny containment (YSG-RISK-055)",
@@ -883,12 +948,17 @@ def _gen_networkpolicy_overlay(
     # template string, the {egress_section} placeholder is at 8-space indent
     # relative to the YAML root).  We emit our rules at 8-space indent so they
     # nest correctly under egress:.
+    # DEPLOY-BREAKER FIX (Phase-2a finding #2): the real Caddy pod label is
+    # app.kubernetes.io/name: yashigani-caddy (helm/yashigani/templates/
+    # caddy.yaml — selectorLabels prefix the chart name). The previous bare
+    # "caddy" selector matched NOTHING → the egress allow silently never
+    # applied on K8s.
     egress_rules.append(
         "        # W3-F2: allow egress to Caddy (ring-fence egress gateway) — port 443\n"
         "        - to:\n"
         "            - podSelector:\n"
         "                matchLabels:\n"
-        "                  app.kubernetes.io/name: caddy\n"
+        "                  app.kubernetes.io/name: yashigani-caddy\n"
         "          ports:\n"
         "            - protocol: TCP\n"
         "              port: 443"
@@ -1377,8 +1447,10 @@ def _gen_contract_test_compose(
                 \"\"\"STUB: IPv6 disable sysctls must be present (L3).\"\"\"
                 pytest.skip("stub — implement after onboard writes override file")
 
-            def test_l7_depends_on_ringfence_init(self) -> None:
-                \"\"\"STUB: depends_on ringfence-init with service_completed_successfully (L7).\"\"\"
+            def test_l1_ringfence_init_stanza_present(self) -> None:
+                \"\"\"STUB: ringfence-init-<agent> stanza present; init depends_on the
+                agent with service_started (netns join — the reverse depends_on is a
+                compose dependency cycle; see codegen._ringfence_init_service_lines).\"\"\"
                 pytest.skip("stub — implement after onboard writes override file")
 
             def test_c1_no_private_upstream_in_caddy_snippet(self) -> None:
@@ -1484,10 +1556,17 @@ _SC_RUN_AS_USER: int = 10001
 _SC_TMPFS_SIZE_DEFAULT: str = "64m"
 
 # Shape-C CPU/memory resource limits (Laura §4.6).
+# UNIT SPLIT (DEPLOY-BREAKER FIX, Phase-2a finding #3): docker compose
+# deploy.resources.*.memory REJECTS the K8s "Mi" suffix — proven live via
+# `docker compose config` (v5.1.3): "invalid suffix: 'mi'".  Compose
+# artifacts MUST use the "M" forms; the K8s/Helm values keep "Mi".
+# (Same unit contract as _EGRESS_FWD_MEM_* below.)
 _SC_CPU_LIMIT: str = "0.5"
-_SC_MEM_LIMIT: str = "256Mi"
+_SC_MEM_LIMIT: str = "256Mi"            # K8s/Helm values ONLY
+_SC_MEM_LIMIT_COMPOSE: str = "256M"     # compose deploy.resources ONLY
 _SC_CPU_REQUEST: str = "0.1"
-_SC_MEM_REQUEST: str = "64Mi"
+_SC_MEM_REQUEST: str = "64Mi"           # K8s/Helm values ONLY
+_SC_MEM_REQUEST_COMPOSE: str = "64M"    # compose deploy.resources ONLY
 
 # Shape-C first-party bridge HTTP port (Laura SB-5 / Captain T2 design).
 # The first-party shim (src/yashigani/mcp/_bridge.py) listens on this port
@@ -1872,9 +1951,9 @@ _EGRESS_PREFIX_RE = r"^[a-z0-9][a-z0-9-]{0,63}$"
 # NOTE compose vs K8s units: docker compose deploy.resources.*.memory
 # REJECTS the K8s "Mi" suffix ("invalid suffix: 'mi'" — proven live via
 # `docker compose config`, compose v5.1.3). Compose artifacts use M; the
-# Helm template carries its own Mi defaults. (The Shape-C generator's
-# _SC_MEM_LIMIT="256Mi" in compose deploy has the same latent defect —
-# surfaced separately, not silently absorbed here.)
+# Helm template carries its own Mi defaults. (The Shape-C generator had the
+# same defect in its compose deploy block — FIXED via the
+# _SC_MEM_*_COMPOSE unit split, Phase-2a finding #3.)
 _EGRESS_FWD_CPU_LIMIT: str = "0.25"
 _EGRESS_FWD_MEM_LIMIT: str = "128M"
 _EGRESS_FWD_CPU_REQUEST: str = "0.05"
@@ -3108,12 +3187,12 @@ def _gen_compose_override_shape_c(
     volumes_section = "\n".join(volume_mounts_lines)
     tmpfs_section = "\n".join(tmpfs_mounts_lines)
 
-    # L7: depends_on ringfence-init.
-    # NEW-BUG-F FIX (cascade audit 2026-05-30): same gate as Shape A.
-    # ringfence-init-<agent> is NOT generated for podman-rootless (L1 gap).
-    # Emitting depends_on for a non-existent service → KeyError in podman-compose.
-    init_svc = "ringfence-init-%s" % agent_name
-    emit_depends_on = runtime != "podman-rootless"
+    # L1/L7: ringfence-init stanza (DEPLOY-BREAKER FIX, Phase-2a finding #1 —
+    # same as Shape A: the depends_on used to dangle on a never-emitted
+    # service; now the init service itself is emitted and the agent-side
+    # depends_on is gone — see _ringfence_init_service_lines ORDERING note).
+    # NEW-BUG-F gate retained: NOT emitted for podman-rootless (L1 gap).
+    emit_init = runtime != "podman-rootless"
 
     # L1 isolated bridge (internal: true) — no caddy_internal (egress NONE)
     ringfence_bridge = "ringfence_%s" % agent_name
@@ -3201,17 +3280,12 @@ def _gen_compose_override_shape_c(
         "      resources:",
         "        limits:",
         "          cpus: '%s'" % _SC_CPU_LIMIT,
-        "          memory: %s" % _SC_MEM_LIMIT,
+        "          memory: %s" % _SC_MEM_LIMIT_COMPOSE,
         "        reservations:",
         "          cpus: '%s'" % _SC_CPU_REQUEST,
-        "          memory: %s" % _SC_MEM_REQUEST,
+        "          memory: %s" % _SC_MEM_REQUEST_COMPOSE,
     ] + (
-        [
-            "    # L7 — block on ringfence-init completion",
-            "    depends_on:",
-            "      %s:" % init_svc,
-            "        condition: service_completed_successfully",
-        ] if emit_depends_on else []
+        _ringfence_init_service_lines(agent_name, runtime) if emit_init else []
     ) + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
@@ -3444,13 +3518,17 @@ def _gen_networkpolicy_shape_c(
     # gateway/broker reaches the MCP exclusively through the Caddy front
     # (mesh mTLS listener presenting the per-instance leaf); a gateway→shim
     # allow would leave an L3 path AROUND the wrap (Laura I1-02 class).
+    # DEPLOY-BREAKER FIX (Phase-2a finding #2): the real Caddy pod label is
+    # app.kubernetes.io/name: yashigani-caddy (caddy.yaml pod template). The
+    # previous bare "caddy" selector matched NOTHING → under default-deny
+    # ingress the wrap listener could never reach the shim on K8s.
     caddy_ingress = (
         "        # Phase 1b-i wrap: ONLY the Caddy front may reach the shim on TCP/%d\n"
         "        # (K8s parity with the compose ringfence bridge: caddy is the sole peer)\n"
         "        - from:\n"
         "            - podSelector:\n"
         "                matchLabels:\n"
-        "                  app.kubernetes.io/name: caddy\n"
+        "                  app.kubernetes.io/name: yashigani-caddy\n"
         "          ports:\n"
         "            - protocol: TCP\n"
         "              port: %d"
