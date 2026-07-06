@@ -707,10 +707,56 @@ async def run_approve_transaction(
                 "surface_hash": scope_hash,   # sha384:<hex> — normalised at push time
                 "tools": _sorted_tools,
             })
+
+            # ── Step 4b-iii: (caller, prefix) egress grant (v4.1 Phase 1 /
+            #                 Lu M1 — synthesis must-fix #1) ────────────────
+            #
+            # POSITIVE-grant, closed-world: the ONLY prefixes this instance
+            # may egress through /egress/eval are the ones declared in the
+            # manifest's spec.egress.needs[].prefix — keyed on the EXACT
+            # per-instance SPIFFE minted in step 2 (byte-match at decision
+            # time; never name-collapsed).  An empty declaration writes an
+            # explicit empty grant (instance granted NO egress) — closed
+            # world either way.  Written inside this step-up-gated
+            # transaction (StepUpAdminSession on POST /import) and audited
+            # via MCP_EGRESS_GRANT_WRITTEN.  Revocation = grant absence in
+            # the pushed OPA data (the kill switch — Nico Q3); rollback
+            # deletes the record.
+            _egress_needs = (
+                (parsed.get("spec") or {}).get("egress") or {}
+            ).get("needs") or []
+            _egress_prefixes = sorted({
+                str(n.get("prefix")).strip()
+                for n in _egress_needs
+                if isinstance(n, dict) and str(n.get("prefix") or "").strip()
+            })
+            registry_store.put_egress_grant(tenant_id, server_id, {
+                "spiffe": spiffe_id,
+                "tenant": tenant_id,
+                "prefixes": _egress_prefixes,
+            })
+            if audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import McpEgressGrantWrittenEvent  # noqa: PLC0415
+                    audit_writer.write(McpEgressGrantWrittenEvent(
+                        approver_account=operator_identity,
+                        tenant_id=tenant_id,
+                        server_id=server_id,
+                        instance_id=instance_id,
+                        spiffe_id=spiffe_id,
+                        prefixes=list(_egress_prefixes),
+                    ))
+                except Exception as audit_exc:  # noqa: BLE001 — audit never masks the tx
+                    logger.error(
+                        "mcp-onboard: MCP_EGRESS_GRANT_WRITTEN audit write "
+                        "failed: %s", audit_exc,
+                    )
+
             logger.info(
-                "mcp-onboard: stored OPA grant+baseline for %s/%s "
-                "tools=%d surface=%s",
+                "mcp-onboard: stored OPA grant+baseline+egress-grant for %s/%s "
+                "tools=%d surface=%s egress_prefixes=%s",
                 tenant_id, server_id, len(_sorted_tools), scope_hash[:24],
+                _egress_prefixes,
             )
         except Exception as exc:
             _run_rollback()
@@ -739,6 +785,9 @@ async def run_approve_transaction(
                 )
             registry_store.delete_grant(tenant_id, server_id)
             registry_store.delete_baseline(tenant_id, server_id)
+            # v4.1 Phase 1 (Lu M1): a rolled-back onboarding must leave NO
+            # egress grant behind (grant-absence is the kill switch).
+            registry_store.delete_egress_grant(tenant_id, server_id)
 
         rollback.append(_undo_registry)
     else:
@@ -787,6 +836,31 @@ async def run_approve_transaction(
         server_id, tenant_id, envelope_id, instance_id, spiffe_id,
         len(artifact_paths),
     )
+
+    # ── Post-commit: push egress grants to OPA (v4.1 Phase 1 / Lu M1) ───────
+    # Sub-path PUT of the FULL egress_grants document — the new grant goes
+    # live without a gateway restart; the same re-push mechanism is the
+    # revocation path (grant absence in the document = kill switch, Nico Q3).
+    # Best-effort AFTER the commit point: a failed push never unwinds a
+    # committed onboarding — the instance simply DENIES egress (fail-closed)
+    # until the gateway startup push (or a later approve) re-pushes.
+    if registry_store is not None:
+        try:
+            from yashigani.mcp._egress_grants import build_egress_grants_doc  # noqa: PLC0415
+            from yashigani.mcp._opa_push import push_egress_grants  # noqa: PLC0415
+            _opa_url = os.environ.get(
+                "YASHIGANI_OPA_URL", "https://policy:8181",
+            ).strip() or "https://policy:8181"
+            push_egress_grants(_opa_url, build_egress_grants_doc(registry_store))
+        except Exception as push_exc:  # noqa: BLE001 — committed tx; deny-until-pushed
+            logger.error(
+                "mcp-onboard: egress-grant OPA push failed after commit (%s) — "
+                "server=%s will DENY egress (caller_not_granted_prefix, "
+                "fail-closed) until the gateway startup push or the next "
+                "approve re-pushes data.yashigani.mcp.egress_grants",
+                push_exc, server_id,
+            )
+
     return McpOnboardResult(
         envelope_id=envelope_id,
         instance_id=instance_id,

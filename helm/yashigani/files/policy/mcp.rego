@@ -730,6 +730,114 @@ _result_ceiling_rank(level) := 1 if level == "INTERNAL"
 _result_ceiling_rank(level) := 2 if level == "CONFIDENTIAL"
 _result_ceiling_rank(level) := 3 if level == "RESTRICTED"
 
+# ---------------------------------------------------------------------------
+# v4.1 unified-sidecar Phase 1 (Lu M1/M2, Laura L-US-1) — (caller, prefix)
+# egress GRANT model.
+#
+# POSITIVE-grant, CLOSED-world: an egress request (identified by the presence
+# of the ``egress`` key in the input document — the /egress/eval producer
+# ALWAYS emits it; the broker tool-result path never does) is allowed ONLY
+# when the caller's EXACT presented SPIFFE URI holds an explicit grant that
+# lists the EXACT requested prefix.  Absent egress_grants data, absent caller
+# key, absent/empty prefixes list, tenant mismatch → DENY.  There is no
+# deny-list anywhere in this model.
+#
+# Data shape (pushed by the gateway startup push + the backoffice approve
+# transaction — see yashigani/mcp/_egress_grants.py, _opa_push.py)::
+#
+#   data.yashigani.mcp.egress_grants: {
+#     "<EXACT per-instance SPIFFE URI>": {
+#       "tenant":        "<tenant_id>",          # tenant scope conjunct
+#       "prefixes":      ["slack", "telegram"],  # positive grant set
+#       "legacy_system": true,                   # OPTIONAL — transitional only
+#     }
+#   }
+#
+# Keying is BYTE-EXACT on the caller SPIFFE (mirror of the verify-mcp
+# registered_spiffe != subject byte-match, backoffice/routes/auth.py
+# spiffe_mismatch deny).  NEVER name-collapsed: two instances of the same
+# agent hold DIFFERENT per-instance URIs and therefore different grants.
+#
+# Grant-absence is the kill switch (Nico Q3): revoking = removing the key
+# from the pushed data document; there is no CRL.
+#
+# NOTE (migration sequencing — synthesis must-fix #1): the static Caddyfile
+# egress pins (Caddyfile.openclaw-egress caller gate) remain LIVE alongside
+# this model.  Nothing here authorises their removal; that requires one
+# release of pin-AND-grants overlap + a Laura probe.
+# ---------------------------------------------------------------------------
+
+# _egress_request_present — the input document carries the egress context
+# key at all (object.keys: even null/false/{} count as present → fail-closed
+# grant evaluation applies; only genuine absence selects the broker path).
+_egress_request_present if {
+    "egress" in object.keys(input)
+}
+
+# _egress_caller_tenant — tenant segment embedded in a per-instance agent
+# SPIFFE URI: spiffe://<td>/agents/<tenant>/<name>/<instance>
+# split("/") → ["spiffe:", "", "<td>", "agents", "<tenant>", "<name>", "<instance>"]
+# Undefined for every other URI shape, including legacy 2-segment agent URIs
+# (mirror of the verify-mcp legacy_identity deny) — undefined tenant means the
+# strict tenant conjunct below cannot be satisfied.
+_egress_caller_tenant := parts[4] if {
+    is_string(input.caller.spiffe)
+    parts := split(input.caller.spiffe, "/")
+    count(parts) == 7
+    parts[0] == "spiffe:"
+    parts[1] == ""
+    parts[2] != ""
+    parts[3] == "agents"
+    parts[4] != ""
+    parts[5] != ""
+    parts[6] != ""
+}
+
+# _egress_grant — byte-exact grant lookup keyed on the presented caller SPIFFE.
+_egress_grant := data.yashigani.mcp.egress_grants[input.caller.spiffe]
+
+# _egress_grant_tenant_ok — tenant scope conjunct.
+# Per-instance agent URIs: the grant's tenant MUST equal the tenant embedded
+# in the (transport-verified) SPIFFE URI — a grant record mis-written for a
+# different tenant never authorises.
+_egress_grant_tenant_ok if {
+    _egress_grant.tenant == _egress_caller_tenant
+}
+
+# Transitional pre-migration system identities (e.g. spiffe://<td>/openclaw):
+# no tenant segment in the URI; the grant must be EXPLICITLY seeded with
+# legacy_system == true (gateway env seed — same env source as the live
+# static Caddyfile pin; see _egress_grants.py).  Retires when the bundled
+# systems migrate to per-instance /agents/ identities (design §3.1 step 1).
+_egress_grant_tenant_ok if {
+    not _egress_caller_tenant
+    _egress_grant.legacy_system == true
+}
+
+# _egress_prefix_granted — the POSITIVE grant: non-empty prefix string, a
+# tenant-consistent grant for the exact caller SPIFFE, and the exact prefix
+# is a member of the granted set.
+_egress_prefix_granted if {
+    is_string(input.egress.prefix)
+    input.egress.prefix != ""
+    _egress_grant_tenant_ok
+    input.egress.prefix in _egress_grant.prefixes
+}
+
+# _egress_gate_satisfied — conjunct wired into mcp_response_allowed:
+#   * broker tool-result path (no egress key in input) → gate not applicable.
+#   * egress path → the (caller, prefix) grant MUST hold.
+# INDEPENDENT of the ceiling + PII conjuncts below (Lu M3 / Laura L-US-5):
+# holding a grant never neutralises the detection gates, and no ceiling
+# setting neutralises the grant requirement.
+_egress_gate_satisfied if {
+    not _egress_request_present
+}
+
+_egress_gate_satisfied if {
+    _egress_prefix_granted
+}
+
 # Fail-closed default.
 default mcp_response_allowed := false
 
@@ -737,6 +845,11 @@ mcp_response_allowed if {
     # Caller SPIFFE must be a non-empty string.
     is_string(input.caller.spiffe)
     input.caller.spiffe != ""
+
+    # v4.1 unified-sidecar Phase 1: (caller, prefix) egress grant — closed
+    # world, positive grant only.  No-op for the broker tool-result path
+    # (input carries no egress key).
+    _egress_gate_satisfied
 
     # Caller ceiling must be a recognised level (unknown → _ceiling_rank undefined → deny).
     result_rank := _result_sensitivity_rank(input.result.sensitivity)
@@ -751,9 +864,12 @@ mcp_response_allowed if {
 #
 # Priority order (high → low):
 #   1. missing_caller_identity (identity check first)
-#   2. invalid_or_missing_caller_ceiling (ceiling must be parseable)
-#   3. result_sensitivity_exceeds_caller_ceiling (ceiling breach, with or without PII)
-#   4. pii_detected_in_result (PII only when ceiling is satisfied)
+#   2. caller_not_granted_prefix (egress authorisation before content checks —
+#      v4.1 unified-sidecar Phase 1; fires only when the input carries the
+#      egress key and the (caller, prefix) grant does not hold)
+#   3. invalid_or_missing_caller_ceiling (ceiling must be parseable)
+#   4. result_sensitivity_exceeds_caller_ceiling (ceiling breach, with or without PII)
+#   5. pii_detected_in_result (PII only when ceiling is satisfied)
 #
 # Ceiling takes priority over PII: when result exceeds ceiling AND PII is present,
 # the auditor sees the sensitivity-governance reason (ceiling) — that is the
@@ -761,10 +877,24 @@ mcp_response_allowed if {
 # ceiling (the caller has clearance but PII blocks delivery).
 _mcp_response_deny_reason := "ok" if { mcp_response_allowed }
 
+_mcp_response_deny_reason := "caller_not_granted_prefix" if {
+    not mcp_response_allowed
+    is_string(input.caller.spiffe)
+    input.caller.spiffe != ""
+    # Egress request without a satisfying (caller, prefix) grant.  This is
+    # the authorisation reason — it fires BEFORE any content-level reason so
+    # the auditor sees the grant gap, not a downstream content symptom.
+    _egress_request_present
+    not _egress_prefix_granted
+}
+
 _mcp_response_deny_reason := "result_sensitivity_exceeds_caller_ceiling" if {
     not mcp_response_allowed
     is_string(input.caller.spiffe)
     input.caller.spiffe != ""
+    # Grant gate passed (or not applicable) — authorisation reason takes
+    # priority over every content reason (v4.1 Phase 1).
+    _egress_gate_satisfied
     # _ceiling_rank MUST be defined (meaning the ceiling string is valid).
     _result_ceiling_rank(input.caller.sensitivity_ceiling)
     result_rank := _result_sensitivity_rank(input.result.sensitivity)
@@ -778,6 +908,8 @@ _mcp_response_deny_reason := "pii_detected_in_result" if {
     input.result.pii_detected == true
     is_string(input.caller.spiffe)
     input.caller.spiffe != ""
+    # Grant gate passed (or not applicable) — see caller_not_granted_prefix.
+    _egress_gate_satisfied
     # Only fire when ceiling is valid AND result is within ceiling.
     # If ceiling is also exceeded, the ceiling rule above takes priority.
     _result_ceiling_rank(input.caller.sensitivity_ceiling)
@@ -790,6 +922,8 @@ _mcp_response_deny_reason := "invalid_or_missing_caller_ceiling" if {
     not mcp_response_allowed
     is_string(input.caller.spiffe)
     input.caller.spiffe != ""
+    # Grant gate passed (or not applicable) — see caller_not_granted_prefix.
+    _egress_gate_satisfied
     # _ceiling_rank is UNDEFINED for the provided ceiling — that is why we denied.
     # This rule fires regardless of PII status; an unrecognised ceiling is
     # structurally prior to all content-level checks.
@@ -827,6 +961,12 @@ _mcp_response_user_message := msg if {
 
 _mcp_response_user_message := msg if {
     not mcp_response_allowed
+    _mcp_response_deny_reason == "caller_not_granted_prefix"
+    msg := "This system does not hold an egress grant for the requested destination prefix, so the request was blocked. An operator must grant this destination at approval time."
+}
+
+_mcp_response_user_message := msg if {
+    not mcp_response_allowed
     _mcp_response_deny_reason == "invalid_or_missing_caller_ceiling"
     msg := "The tool result could not be returned because your authorisation level is not recognised."
 }
@@ -848,6 +988,10 @@ _mcp_response_code := "MCP_RESULT_SENSITIVITY_EXCEEDED" if {
 _mcp_response_code := "MCP_RESULT_PII_BLOCKED" if {
     not mcp_response_allowed
     _mcp_response_deny_reason == "pii_detected_in_result"
+}
+_mcp_response_code := "MCP_EGRESS_PREFIX_NOT_GRANTED" if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "caller_not_granted_prefix"
 }
 _mcp_response_code := "MCP_RESULT_CEILING_INVALID" if {
     not mcp_response_allowed

@@ -272,6 +272,39 @@
           }
         },
 
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "v4.1 unified-sidecar Phase 1 (design §2.1) — declared egress destination classes. Each needs[] entry declares ONE egress prefix this system may traverse via /egress/eval/{prefix}/*. The approve transaction writes the (caller SPIFFE, prefixes) OPA grant from EXACTLY this list (positive-grant, closed-world — Lu M1): omitting this block (or declaring needs: []) grants NO egress. deliver_to/pins are consumed by the sidecar template codegen (later phase); only prefix is consumed by the grant write.",
+          "properties": {
+            "needs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["prefix"],
+                "additionalProperties": false,
+                "properties": {
+                  "prefix": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+                    "description": "Egress prefix slug (lowercase alnum + hyphen, max 64). Becomes the first-class OPA input.egress.prefix and a member of the caller's grant set. Slug-constrained so it can never carry path metacharacters into deliver_path construction (L-US-4 adjacent)."
+                  },
+                  "deliver_to": {
+                    "type": "string",
+                    "maxLength": 253,
+                    "description": "Final delivery destination (public host[:port], or a reserved class name for internal delivery, e.g. gateway-inference for the llm class). Consumed by the sidecar template codegen — NOT by the grant write."
+                  },
+                  "pins": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Destination/account pins (bot-token workspace pin, webhook path pin, bot-ID pin, …). Consumed by the sidecar template codegen; the template MUST fail render for internet-facing/webhook prefixes without their pin (Laura L-US-3 — enforced at codegen, later phase)."
+                  }
+                }
+              }
+            }
+          }
+        },
+
         "identity": {
           "type": "object",
           "additionalProperties": false,

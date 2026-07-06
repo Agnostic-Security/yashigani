@@ -16,13 +16,17 @@ Routes:
   PUT    /admin/agents/{agent_id}               — update agent fields
   DELETE /admin/agents/{agent_id}               — deactivate (soft delete)
   POST   /admin/agents/{agent_id}/token/rotate  — rotate PSK, return new token once
+  POST   /admin/agents/{agent_id}/cert/rotate   — svid-sidecar self-rotation: re-mint
+                                                  the caller's OWN per-instance leaf
+                                                  (mTLS SPIFFE-gated, NO admin session —
+                                                  v4.1 Phase 1, Nico Q1 must-fix #7)
 
   GET    /admin/identities                      — list HUMAN identities from IdentityRegistry
                                                   (v2.23.4 F4 fix — surfaces local-auth users who
                                                   have logged in at least once and been auto-registered
                                                   via da6de8b; also lists SSO-registered identities)
 
-Last updated: 2026-05-17T00:00:00+01:00
+Last updated: 2026-07-06T00:00:00+00:00 (v4.1 Phase 1 — cert/rotate, Nico Q1)
 """
 
 from __future__ import annotations
@@ -288,6 +292,21 @@ class AgentRotateResponse(BaseModel):
     agent_id: str
     token: str = Field(description="New plaintext PSK token. Store immediately — never shown again.")
     quick_start: dict = Field(default_factory=dict)
+
+
+class AgentCertRotateResponse(BaseModel):
+    """Response for POST /admin/agents/{agent_id}/cert/rotate (v4.1 Phase 1, Nico Q1).
+
+    Field names ``cert_pem`` / ``key_pem`` are the rotate.sh contract
+    (docker/svid-sidecar/rotate.sh — grep-based extraction, do not rename).
+    ``cert_pem`` is the leaf + intermediate bundle, byte-identical in shape to
+    the install-time /init/client.crt.
+    """
+    agent_id: str
+    spiffe_id: str
+    cert_pem: str = Field(description="New leaf cert PEM bundle (leaf + intermediate).")
+    key_pem: str = Field(description="New private key PEM. Delivered once over mTLS.")
+    cert_not_after: str = Field(default="", description="ISO-8601 expiry of the new leaf.")
 
 
 class AgentQuickStartResponse(BaseModel):
@@ -879,6 +898,344 @@ async def rotate_agent_token(
         agent_id=agent_id,
         token=plaintext_token,
         quick_start=_build_quick_start(agent_id, plaintext_token),
+    )
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 1 — POST /admin/agents/{agent_id}/cert/rotate
+# (Nico Q1 — unified-sidecar review must-fix #7, BLOCKER)
+#
+# The svid-sidecar (docker/svid-sidecar/rotate.sh:180) POSTs here over mTLS
+# when < RENEWAL_THRESHOLD_FRAC of the leaf lifetime remains.  The endpoint
+# was ACL'd (service_identities.yaml:398-404) and documented
+# (Dockerfile.svid-sidecar) since 4.0 Phase 0 but never implemented —
+# continuously-running bundled agents hard-failed at leaf expiry (≤90d).
+#
+# Design (per the review synthesis):
+#   * Key off the PRESENTED cert's FULL per-instance SPIFFE — NOT the
+#     {agent_id} path param / sidecar AGENT_ID env, which is the bare server
+#     name (codegen.py) and ambiguous across tenants/instances.  The path
+#     param is only cross-checked by the ACL gate
+#     (verify_spiffe_matches_agent_id).
+#   * Re-mint with the SAME instance_id (nhi_id) + the registry-CURRENT
+#     scope_hash / image_digest from the durable approval record.
+#   * DENY (409) if the tool surface CHANGED since approval — a changed
+#     surface must go through re-approval; silently re-binding it at rotation
+#     would bypass change-prevention (GAP-2).
+#   * No admin session: possession of the CURRENT (unexpired, unrevoked)
+#     agent leaf is the rotation credential, enforced by the mTLS listener +
+#     the SPIFFE ACL gate.  Only the agent's own identity passes the gate for
+#     its own {agent_id}; exact-id callers (caddy/backoffice) never parse as
+#     agent SPIFFEs and are refused below.
+# ---------------------------------------------------------------------------
+
+_CERT_ROTATE_ACL_PATH = "/admin/agents/*/cert/rotate"
+
+
+def _rotate_pki_paths():
+    """IssuerPaths from the live env (same wiring as approve/deactivate)."""
+    from pathlib import Path as _Path
+    from yashigani.pki.issuer import IssuerPaths
+
+    return IssuerPaths(
+        secrets_dir=_Path(os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")),
+        manifest_path=_Path(os.getenv(
+            "YASHIGANI_SERVICE_MANIFEST_PATH",
+            "/etc/yashigani/service_identities.yaml",
+        )),
+    )
+
+
+def _runtime_manifest_agent_entry(pki_paths: Any, entry_name: str) -> Optional[dict]:
+    """Return the runtime-manifest entry for *entry_name*, or None when absent.
+
+    The runtime manifest (mint_agent_leaf appends; revoke_agent_identity flips
+    ``revoked``) is the durable record of EVERY minted agent identity —
+    including install.sh CLI mints that have no registry/envelope row.
+    Fail-closed: an unreadable manifest raises 503 (we cannot prove the
+    identity is still live, so we refuse to re-mint).
+    """
+    import yaml as _yaml
+
+    runtime_path = pki_paths.runtime_manifest
+    if not runtime_path.exists():
+        return None
+    try:
+        doc = _yaml.safe_load(runtime_path.read_text()) or {}
+    except Exception as exc:
+        logger.error("cert-rotate: runtime manifest unreadable at %s: %s", runtime_path, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "runtime_manifest_unreadable",
+                "message": "Agent identity manifest unreadable — rotation refused (fail-closed).",
+            },
+        )
+    for entry in doc.get("agent_identities") or []:
+        if isinstance(entry, dict) and entry.get("name") == entry_name:
+            return entry
+    return None
+
+
+def _deny_surface_changed(spiffe_id: str, approved: str, current: str) -> HTTPException:
+    logger.warning(
+        "cert-rotate: DENIED — tool surface changed since approval for %s "
+        "(approved=%s current=%s). Re-approval required.",
+        spiffe_id, approved[:24], current[:24],
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "surface_changed_reapproval_required",
+            "message": (
+                "The agent's tool surface changed since it was approved. "
+                "Rotation would re-bind an unapproved surface (change-prevention "
+                "bypass). Re-approve the agent (admin approval flow) to mint a "
+                "new identity; the current cert stays valid until its expiry."
+            ),
+        },
+    )
+
+
+@router.post(
+    "/admin/agents/{agent_id}/cert/rotate",
+    response_model=AgentCertRotateResponse,
+)
+async def rotate_agent_cert(
+    agent_id: str,
+    caller_spiffe: str = Depends(require_spiffe_id(_CERT_ROTATE_ACL_PATH)),
+):
+    """Re-mint the CALLING agent's own leaf cert (svid-sidecar rotation).
+
+    Identity is the presented client cert's SPIFFE URI (Caddy/middleware
+    validated) — the ``agent_id`` path param is only the ACL-gate cross-check.
+    """
+    from yashigani.identity.trust_domain import parse_agent_spiffe_uri
+    from yashigani.pki.binding import tool_surface_hash
+    from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
+
+    parsed = parse_agent_spiffe_uri(caller_spiffe)
+    if parsed is None:
+        # caddy/backoffice pass the ACL's exact-id list but carry no agent
+        # identity — there is nothing they could rotate "as themselves".
+        # Admin-initiated re-issuance is the approve flow, not this endpoint.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "cert_rotate_requires_agent_identity",
+                "message": (
+                    "Only an agent's own svid-sidecar identity may rotate its "
+                    "cert. Use the admin approval flow to (re-)issue agent "
+                    "identities."
+                ),
+            },
+        )
+    tenant_id, agent_name, instance_id = parsed
+
+    pki_paths = _rotate_pki_paths()
+    entry_name = IssuerPaths.agent_entry_name(tenant_id, agent_name, instance_id)
+
+    # 1. Durable identity record — runtime manifest (covers CLI-minted bundled
+    #    agents too).  Fail-closed on absent or revoked entries.
+    entry = _runtime_manifest_agent_entry(pki_paths, entry_name)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "identity_not_provisioned",
+                "message": "No minted identity record exists for this SPIFFE ID.",
+            },
+        )
+    if entry.get("revoked"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "identity_revoked",
+                "message": "This agent identity is revoked — rotation refused.",
+            },
+        )
+    entry_spiffe = entry.get("spiffe_id", "")
+    if entry_spiffe and entry_spiffe != caller_spiffe:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "spiffe_identity_mismatch",
+                "message": "Presented SPIFFE ID does not match the minted identity record.",
+            },
+        )
+
+    # 2. Approval record + change-prevention (GAP-2).  Instanced identities
+    #    (3-segment SPIFFE) MUST have a durable approval record; the
+    #    registry-CURRENT scope_hash / image_digest are re-bound at mint.
+    scope_hash = ""
+    image_digest = ""
+    if instance_id:
+        reg = backoffice_state.agent_registry
+        nhi = reg.get(instance_id) if reg is not None else None
+        if nhi is not None:
+            # 2a. Registry NHI (approve_nhi_svid / user_agents instantiate path).
+            if nhi.get("kind") != "nhi" or not nhi.get("svid_issued"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_not_approved",
+                        "message": "Agent has no approved SVID — rotation refused.",
+                    },
+                )
+            if nhi.get("status") != "active":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_not_active",
+                        "message": "Agent is not active — rotation refused.",
+                    },
+                )
+            if nhi.get("spiffe_id", "") != caller_spiffe:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "spiffe_identity_mismatch",
+                        "message": "Presented SPIFFE ID does not match the registry record.",
+                    },
+                )
+            approved_scope = nhi.get("scope_hash") or ""
+            current_scope = tool_surface_hash(nhi.get("allowed_tools") or [])
+            if approved_scope and current_scope != approved_scope:
+                raise _deny_surface_changed(caller_spiffe, approved_scope, current_scope)
+            scope_hash = approved_scope or current_scope
+            image_digest = nhi.get("image_digest") or ""
+        else:
+            # 2b. MCP-onboarded instance (mcp_onboard approve transaction) —
+            #     the ACTIVE capability envelope is the durable approval record.
+            from yashigani.backoffice.routes.mcp_servers import (
+                _durable_registry_store,
+                _envelope_service,
+            )
+
+            svc = _envelope_service()  # raises 503 when the DB pool is down
+            rec = await svc.get_active_envelope(f"{tenant_id}:{agent_name}")
+            if rec is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_record_not_found",
+                        "message": (
+                            "No durable approval record exists for this "
+                            "per-instance identity — rotation refused (fail-closed)."
+                        ),
+                    },
+                )
+            if (
+                not rec.svid_issued
+                or rec.svid_instance_id != instance_id
+                or rec.svid_spiffe_id != caller_spiffe
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_superseded_reapproval_required",
+                        "message": (
+                            "Presented identity does not match the active approval "
+                            "record (server re-onboarded or SVID superseded). "
+                            "Re-approve to mint a fresh identity."
+                        ),
+                    },
+                )
+            # Change-prevention: current_surface_hash advances on triage
+            # re-pins; surface_set_hash is the approved set.  Drift ⇒ deny.
+            if (
+                rec.current_surface_hash
+                and rec.surface_set_hash
+                and rec.current_surface_hash != rec.surface_set_hash
+            ):
+                raise _deny_surface_changed(
+                    caller_spiffe, rec.surface_set_hash, rec.current_surface_hash
+                )
+            # Registry-CURRENT surface — same computation as the approve mint
+            # (mcp_onboard.py: tool_surface_hash(sorted(env.tools.keys()))).
+            scope_hash = tool_surface_hash(sorted(rec.envelope.tools.keys()))
+            store = _durable_registry_store()
+            descriptor = store.get(tenant_id, agent_name) if store is not None else None
+            if descriptor is not None:
+                image_digest = descriptor.get("image_digest", "") or ""
+                baseline = store.get_baseline(tenant_id, agent_name)
+                baseline_hash = (baseline or {}).get("surface_hash", "")
+                if baseline_hash and baseline_hash != scope_hash:
+                    raise _deny_surface_changed(caller_spiffe, baseline_hash, scope_hash)
+            else:
+                logger.warning(
+                    "cert-rotate: durable broker registry unavailable for %s — "
+                    "re-minting with image_digest='' (binding covers the tool "
+                    "surface only; see pki/binding.py).",
+                    caller_spiffe,
+                )
+    # Legacy 2-segment identities (install.sh CLI mints — bundled agents):
+    # no registry/envelope record exists by design; the runtime-manifest check
+    # above is the authorisation record.  scope_hash/image_digest stay "" —
+    # byte-identical re-mint of the legacy identity (no binding extension),
+    # matching the original CLI issuance.
+
+    # 3. Re-mint — same instance_id, registry-current binding inputs.
+    try:
+        new_spiffe = mint_agent_leaf(
+            pki_paths,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            instance_id=instance_id,
+            scope_hash=scope_hash,
+            image_digest=image_digest,
+            approved_by=f"svid-rotation:{caller_spiffe}",
+            audit_writer=backoffice_state.audit_writer,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("cert-rotate: mint_agent_leaf FAILED for %s: %s", caller_spiffe, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "pki_mint_failed",
+                "message": "Leaf re-issuance failed — existing cert remains valid until expiry.",
+            },
+        )
+
+    if new_spiffe != caller_spiffe:
+        # Invariant: same (tenant, name, instance) must reproduce the same
+        # SPIFFE URI.  A mismatch means trust-domain drift — never hand out
+        # a cert for a different identity than the caller presented.
+        logger.error(
+            "cert-rotate: minted SPIFFE %r != presented %r — trust-domain drift? "
+            "Response withheld (fail-closed).", new_spiffe, caller_spiffe,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "identity_mismatch_after_mint"},
+        )
+
+    cert_pem = pki_paths.agent_cert(tenant_id, agent_name, instance_id).read_text()
+    key_pem = pki_paths.agent_key(tenant_id, agent_name, instance_id).read_text()
+
+    cert_not_after = ""
+    try:
+        from cryptography import x509 as _x509
+
+        cert_not_after = _x509.load_pem_x509_certificates(
+            cert_pem.encode()
+        )[0].not_valid_after_utc.isoformat()
+    except Exception as exc:  # pragma: no cover — informational field only
+        logger.warning("cert-rotate: could not parse new cert not_after: %s", exc)
+
+    logger.info(
+        "cert-rotate: re-minted leaf for %s (agent_id path=%r, not_after=%s)",
+        caller_spiffe, agent_id, cert_not_after,
+    )
+
+    return AgentCertRotateResponse(
+        agent_id=agent_id,
+        spiffe_id=new_spiffe,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+        cert_not_after=cert_not_after,
     )
 
 

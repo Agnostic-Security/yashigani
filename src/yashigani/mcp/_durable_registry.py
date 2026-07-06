@@ -60,6 +60,11 @@ _KEY_INDEX = "mcp:broker:server_index"
 # baseline: {surface_hash: "sha384:<hex>", tools: [...]}
 _KEY_GRANT = "mcp:broker:grant:{tenant}:{server}"
 _KEY_BASELINE = "mcp:broker:baseline:{tenant}:{server}"
+# v4.1 unified-sidecar Phase 1 (Lu M1) — (caller SPIFFE, egress prefixes)
+# grant, written inside the approve transaction, read by the OPA data push.
+# egress_grant: {spiffe: "<exact per-instance URI>", tenant: "<tenant_id>",
+#                prefixes: ["slack", ...]}
+_KEY_EGRESS_GRANT = "mcp:broker:egress_grant:{tenant}:{server}"
 
 
 def canonical_server_key(tenant_id: str, server_id: str) -> str:
@@ -153,6 +158,96 @@ class DurableMcpRegistryStore:
             tenant_id, server_id, baseline_data.get("surface_hash", "?")[:20],
         )
 
+    def put_egress_grant(self, tenant_id: str, server_id: str, grant_data: dict) -> None:
+        """Store the (caller SPIFFE, egress prefixes) grant for ``<tenant>:<server>``.
+
+        v4.1 unified-sidecar Phase 1 (Lu M1).  Raises on Redis failure — the
+        approve transaction treats this as a step failure and rolls back
+        (fail-closed, same as put()/put_grant()).
+
+        grant_data shape::
+
+            {"spiffe": "<EXACT per-instance SPIFFE URI>",
+             "tenant": "<tenant_id>",
+             "prefixes": ["slack", ...]}   # positive set; [] = no egress
+
+        The OPA data push keys the grant on the EXACT ``spiffe`` value
+        (byte-match at decision time — never name-collapsed).
+        """
+        if not tenant_id or not server_id:
+            raise ValueError("tenant_id and server_id must be non-empty")
+        if not str(grant_data.get("spiffe", "")).strip():
+            raise ValueError("egress grant requires a non-empty spiffe key")
+        self._redis.set(
+            _KEY_EGRESS_GRANT.format(tenant=tenant_id, server=server_id),
+            json.dumps(grant_data),
+        )
+        logger.info(
+            "mcp-durable-registry: stored egress grant for %s:%s spiffe=%s prefixes=%s",
+            tenant_id, server_id, grant_data.get("spiffe"),
+            sorted(grant_data.get("prefixes", [])),
+        )
+
+    def get_egress_grant(self, tenant_id: str, server_id: str) -> Optional[dict]:
+        """Return the stored egress grant for ``<tenant>:<server>``, or None."""
+        try:
+            raw = self._redis.get(
+                _KEY_EGRESS_GRANT.format(tenant=tenant_id, server=server_id)
+            )
+        except Exception as exc:  # noqa: BLE001 — read degrades to miss (OPA denies)
+            logger.warning(
+                "mcp-durable-registry: get_egress_grant %s:%s failed: %s",
+                tenant_id, server_id, exc,
+            )
+            return None
+        return self._decode(raw)
+
+    def delete_egress_grant(self, tenant_id: str, server_id: str) -> None:
+        """Remove an egress grant (rollback/offboard — best-effort delete;
+        the authoritative revocation is the grant's ABSENCE from the next
+        OPA data push — grant-absence is the kill switch)."""
+        try:
+            self._redis.delete(
+                _KEY_EGRESS_GRANT.format(tenant=tenant_id, server=server_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "mcp-durable-registry: delete_egress_grant %s:%s failed: %s",
+                tenant_id, server_id, exc,
+            )
+
+    def build_egress_grants_data(self) -> dict:
+        """Build the ``egress_grants`` OPA data sub-document from the store.
+
+        Returns ``{"<exact SPIFFE URI>": {"tenant": ..., "prefixes": [...]}}``
+        — the shape policy/mcp.rego keys on at
+        ``data.yashigani.mcp.egress_grants[input.caller.spiffe]``.
+
+        Descriptors without an egress grant record are simply absent from the
+        document → OPA denies their egress fail-closed (closed world).
+        Callers that need the transitional bundled-system seed merged in
+        should use ``yashigani.mcp._egress_grants.build_egress_grants_doc``.
+        """
+        out: dict = {}
+        for desc in self.list_all():
+            server_id = desc.get("agent_name", "")
+            tenant_id = desc.get("tenant_id", "")
+            if not server_id or not tenant_id:
+                continue
+            grant = self.get_egress_grant(tenant_id, server_id)
+            if grant is None:
+                continue
+            spiffe = str(grant.get("spiffe", "")).strip()
+            if not spiffe:
+                continue
+            out[spiffe] = {
+                "tenant": str(grant.get("tenant", tenant_id)),
+                "prefixes": sorted(
+                    str(p) for p in grant.get("prefixes", []) if p
+                ),
+            }
+        return out
+
     def delete_grant(self, tenant_id: str, server_id: str) -> None:
         """Remove a grant entry (rollback path — best-effort)."""
         try:
@@ -193,7 +288,14 @@ class DurableMcpRegistryStore:
             {
               "grants":    {mcp_id: {caller_spiffe: {tools: [...], actions: [...]}}},
               "baselines": {mcp_id: {surface_hash: "sha384:<hex>", tools: [...]}},
+              "egress_grants": {spiffe: {tenant: ..., prefixes: [...]}},
             }
+
+        ``egress_grants`` (v4.1 Phase 1 — Lu M1) rides the SAME document
+        because the Seam-3 startup push PUTs the whole
+        ``data.yashigani.mcp`` subtree — omitting it here would wipe any
+        previously pushed egress grants.  It includes the transitional
+        bundled-system seed (see _egress_grants.py).
 
         The ``mcp_id`` is resolved via ``mcp_id_store.get_or_mint(server_id)``
         (same key the broker uses at call time).  Entries whose grant OR baseline
@@ -249,12 +351,23 @@ class DurableMcpRegistryStore:
                     "grant" if grant is None else "baseline",
                 )
 
+        # v4.1 Phase 1 (Lu M1): egress grants (store + transitional seed) —
+        # must ride the same document; the startup push replaces the whole
+        # data.yashigani.mcp subtree.
+        from yashigani.mcp._egress_grants import build_egress_grants_doc  # noqa: PLC0415
+
+        egress_grants = build_egress_grants_doc(self)
+
         logger.info(
             "mcp-durable-registry: build_mcp_opa_data: %d grant(s) + %d baseline(s) "
-            "from %d descriptor(s)",
-            len(grants), len(baselines), len(descriptors),
+            "+ %d egress grant(s) from %d descriptor(s)",
+            len(grants), len(baselines), len(egress_grants), len(descriptors),
         )
-        return {"grants": grants, "baselines": baselines}
+        return {
+            "grants": grants,
+            "baselines": baselines,
+            "egress_grants": egress_grants,
+        }
 
     # ── read side (gateway lazy load) ─────────────────────────────────────
 

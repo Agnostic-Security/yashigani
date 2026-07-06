@@ -49,6 +49,7 @@ def push_mcp_opa_data(opa_url: str, mcp_doc: dict) -> None:
         {
           "grants":    {mcp_id: {caller_spiffe: {tools: [...], actions: [...]}}},
           "baselines": {mcp_id: {surface_hash: "sha384:<hex>", tools: [...]}},
+          "egress_grants": {spiffe: {tenant: ..., prefixes: [...]}},
         }
 
     Raises:
@@ -68,10 +69,53 @@ def push_mcp_opa_data(opa_url: str, mcp_doc: dict) -> None:
 
     n_grants = sum(len(v) for v in mcp_doc.get("grants", {}).values())
     n_baselines = len(mcp_doc.get("baselines", {}))
+    n_egress = len(mcp_doc.get("egress_grants", {}))
     logger.info(
-        "OPA MCP data pushed: %d instance grant(s) + %d baseline(s)",
-        n_grants, n_baselines,
+        "OPA MCP data pushed: %d instance grant(s) + %d baseline(s) + "
+        "%d egress grant(s)",
+        n_grants, n_baselines, n_egress,
     )
 
 
-__all__ = ["push_mcp_opa_data"]
+def push_egress_grants(opa_url: str, egress_grants_doc: dict) -> None:
+    """PUT ONLY the ``egress_grants`` sub-document to OPA.
+
+    v4.1 unified-sidecar Phase 1 (Lu M1).  Sub-path PUT
+    (``/v1/data/yashigani/mcp/egress_grants``) replaces the egress_grants
+    subtree WITHOUT touching grants/baselines (OPA partial-replace
+    semantics) — used by:
+
+      * the gateway startup path when the durable store is not wired (the
+        full Seam-3 push does not run, but the transitional bundled-system
+        seed must still land or pre-migration openclaw egress denies);
+      * the backoffice approve transaction after commit (new grant live
+        without waiting for a gateway restart) — and by any future
+        offboard/revocation path (grant-absence in the re-pushed document IS
+        the revocation — the kill switch, Nico Q3).
+
+    ``egress_grants_doc`` MUST be the FULL egress_grants document
+    (``yashigani.mcp._egress_grants.build_egress_grants_doc``) — pushing a
+    partial dict would silently revoke every grant not included.
+
+    Raises (caller decides fatal vs warn — deny-until-pushed is fail-closed):
+        httpx.HTTPStatusError  — OPA returned a non-2xx status.
+        httpx.RequestError     — Network or connection error.
+    """
+    from yashigani.pki.client import internal_httpx_sync_client
+
+    url = opa_url.rstrip("/") + _OPA_MCP_DATA_PATH + "/egress_grants"
+    with internal_httpx_sync_client(timeout=10.0) as client:
+        resp = client.put(
+            url,
+            json=egress_grants_doc,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+
+    logger.info(
+        "OPA egress_grants pushed: %d grant(s) keyed on exact SPIFFE",
+        len(egress_grants_doc),
+    )
+
+
+__all__ = ["push_egress_grants", "push_mcp_opa_data"]

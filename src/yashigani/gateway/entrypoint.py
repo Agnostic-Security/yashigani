@@ -1058,6 +1058,34 @@ def _build_app(mesh_mode: bool = False):
             f"MCP broker wiring failed — gateway cannot start safely: {exc}"
         ) from exc
 
+    # ── v4.1 unified-sidecar Phase 1 (Lu M1) — egress_grants startup push ───
+    # Push data.yashigani.mcp.egress_grants (durable-store grants + the
+    # transitional bundled-system seed) UNCONDITIONALLY — the Seam-3 full push
+    # above only runs when YASHIGANI_MCP_SERVERS is configured AND the durable
+    # store is wired, but the (caller, prefix) grant model applies to EVERY
+    # /egress/eval request (closed world: no data in OPA = deny ALL egress,
+    # including pre-migration openclaw traffic that the static Caddy pins
+    # admit at the transport layer).  Sub-path PUT — never touches
+    # grants/baselines.  Deliberately non-fatal (matches the Seam-3 posture:
+    # OPA starts concurrently; egress denies fail-closed until a push lands).
+    try:
+        from yashigani.mcp._egress_grants import build_egress_grants_doc
+        from yashigani.mcp._opa_push import push_egress_grants
+        _egress_grants_doc = build_egress_grants_doc(_mcp_durable_store)
+        push_egress_grants(opa_url, _egress_grants_doc)
+        logger.info(
+            "egress-grants startup push: %d (caller, prefix) grant(s) pushed "
+            "to OPA (v4.1 Phase 1 / Lu M1)",
+            len(_egress_grants_doc),
+        )
+    except Exception as _egress_push_exc:  # noqa: BLE001 — deny-until-pushed is fail-closed
+        logger.warning(
+            "egress-grants startup push FAILED (non-fatal) — ALL /egress/eval "
+            "requests deny with caller_not_granted_prefix until OPA is "
+            "reachable and the data re-pushed (fail-closed, v4.1 Phase 1): %s",
+            _egress_push_exc,
+        )
+
     # ── Signed orchestration-principal machinery (#47 / G-NEW-5 / R3) ─────────
     # The gateway SIGNS the orchestration principal (ES384, the SAME signing key
     # the MCP broker uses) bound to the caller's SPIFFE identity, and VERIFIES it

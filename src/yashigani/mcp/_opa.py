@@ -775,6 +775,7 @@ async def query_mcp_response_decision(
     tool_name: Optional[str] = None,
     agent_name: Optional[str] = None,
     http_client: Optional[httpx.AsyncClient] = None,
+    egress_prefix: Optional[str] = None,
 ) -> OpaResponseDecisionResult:
     """
     G-ORCH-OPA-1 — Query OPA for an MCP tool-result egress decision.
@@ -817,6 +818,18 @@ async def query_mcp_response_decision(
     http_client:
         Optional pre-constructed httpx.AsyncClient.  When None, a new client
         is created using _make_opa_http_client() and closed after the call.
+    egress_prefix:
+        v4.1 unified-sidecar Phase 1 (Lu M1 / Laura L-US-1): the egress
+        destination prefix as a FIRST-CLASS input field.  When not None the
+        input document carries ``input.egress = {"prefix": <str>}`` and the
+        policy applies the closed-world (caller, prefix) grant model —
+        ``allow`` requires ``prefix in
+        data.yashigani.mcp.egress_grants[<exact caller SPIFFE>].prefixes``
+        (tenant-scoped; absent/empty grant data denies everything).
+        MUST be passed by the /egress/eval producer for EVERY egress
+        evaluation; None selects the broker tool-result path (no grant model).
+        The prefix is never smuggled inside ``tool_name`` for decisioning —
+        ``tool_name="egress:<prefix>"`` remains audit context only.
 
     Returns OpaResponseDecisionResult.  Never raises.
     """
@@ -839,6 +852,12 @@ async def query_mcp_response_decision(
         input_doc["input"]["tool"] = {"name": tool_name}
     if agent_name is not None:
         input_doc["input"]["agent"] = {"name": agent_name}
+    if egress_prefix is not None:
+        # v4.1 Phase 1 — first-class egress context. The producer (gateway
+        # /egress/eval) always sets this; the rego treats the PRESENCE of the
+        # egress key as "grant model applies" (crafted null/false values are
+        # also treated as present → fail-closed deny).
+        input_doc["input"]["egress"] = {"prefix": str(egress_prefix)}
 
     url = f"{opa_url.rstrip('/')}{MCP_RESPONSE_OPA_PATH}"
     own_client = http_client is None

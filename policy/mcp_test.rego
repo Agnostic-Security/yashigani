@@ -2136,3 +2136,242 @@ test_v41_decision_document_carries_four_gate_reason if {
     d.deny_reason == "spiffe_not_verified"
     d.audit_capture == true
 }
+
+# ---------------------------------------------------------------------------
+# 18. v4.1 unified-sidecar Phase 1 — (caller, prefix) egress GRANT model
+#     (Lu M1/M2, Laura L-US-1 — synthesis must-fix #1)
+#
+# Positive-grant, closed-world: input.egress.prefix is authorised ONLY by an
+# exact-SPIFFE-keyed, tenant-consistent grant in
+# data.yashigani.mcp.egress_grants.  Absent/empty data → deny everything.
+# Detection flags (PII / sensitivity) remain INDEPENDENT conjuncts (Lu M3 /
+# Laura L-US-5) — a grant never neutralises them.
+# ---------------------------------------------------------------------------
+
+# Exact per-instance SPIFFE of the granted caller (tenant "default").
+_g18_spiffe := "spiffe://yashigani.internal/agents/default/notifier/nhi_aaa111bbb222"
+
+# A sibling instance of the SAME agent (different nhi) — must NOT inherit.
+_g18_spiffe_other_instance := "spiffe://yashigani.internal/agents/default/notifier/nhi_ccc333ddd444"
+
+_g18_grants := {
+    _g18_spiffe: {
+        "tenant": "default",
+        "prefixes": ["slack", "telegram"],
+    },
+}
+
+# Clean egress request (PUBLIC body, PUBLIC ceiling, no PII) for prefix p.
+_g18_input(spiffe, p) := {
+    "caller": {
+        "spiffe": spiffe,
+        "sensitivity_ceiling": "PUBLIC",
+        "groups": [],
+    },
+    "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    "tool": {"name": sprintf("egress:%s", [p])},
+    "egress": {"prefix": p},
+}
+
+# --- 18.1 Positive grant — allow path ---
+
+test_v41_egress_grant_allow_granted_prefix if {
+    data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+test_v41_egress_grant_allow_second_granted_prefix if {
+    data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "telegram")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# --- 18.2 Closed world — ungranted prefix / wrong instance / absent data ---
+
+# Ungranted prefix → deny with caller_not_granted_prefix.
+test_v41_egress_grant_deny_ungranted_prefix if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _g18_input(_g18_spiffe, "webhook-exfil")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "caller_not_granted_prefix"
+    d.code == "MCP_EGRESS_PREFIX_NOT_GRANTED"
+    d.user_message != ""
+}
+
+# Wrong-instance SPIFFE (same tenant, same agent name, different nhi) → deny.
+# Byte-exact keying: a grant NEVER collapses across instances.
+test_v41_egress_grant_deny_wrong_instance_spiffe if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _g18_input(_g18_spiffe_other_instance, "slack")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "caller_not_granted_prefix"
+}
+
+# Absent grant data entirely → deny-all (kill switch).
+test_v41_egress_grant_deny_absent_grant_data if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as {}
+}
+
+# Empty prefixes list (grant record exists, nothing granted) → deny.
+test_v41_egress_grant_deny_empty_prefixes if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            _g18_spiffe: {"tenant": "default", "prefixes": []},
+        }
+}
+
+# --- 18.3 Tenant scope ---
+
+# Grant record written for a DIFFERENT tenant than the URI-embedded one → deny.
+test_v41_egress_grant_deny_tenant_mismatch if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            _g18_spiffe: {"tenant": "other-tenant", "prefixes": ["slack"]},
+        }
+}
+
+# Legacy 2-segment agent URI (no instance segment) → tenant undefined → deny
+# even with a byte-matching grant key (mirror of verify-mcp legacy_identity).
+test_v41_egress_grant_deny_legacy_two_segment_agent_uri if {
+    legacy := "spiffe://yashigani.internal/agents/default/notifier"
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(legacy, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            legacy: {"tenant": "default", "prefixes": ["slack"]},
+        }
+}
+
+# --- 18.4 Transitional legacy_system identities (pre-migration seed) ---
+
+# System-form SPIFFE + explicit legacy_system grant → allow (pin-AND-grant
+# overlap for openclaw until it migrates to a per-instance identity).
+test_v41_egress_grant_allow_legacy_system_seed if {
+    sys := "spiffe://yashigani.internal/openclaw"
+    data.yashigani.mcp.mcp_response_allowed with input as _g18_input(sys, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            sys: {"tenant": "default", "prefixes": ["slack", "slack-hooks", "telegram"], "legacy_system": true},
+        }
+}
+
+# System-form SPIFFE WITHOUT the explicit legacy_system flag → deny.
+test_v41_egress_grant_deny_system_uri_without_legacy_flag if {
+    sys := "spiffe://yashigani.internal/openclaw"
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(sys, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            sys: {"tenant": "default", "prefixes": ["slack"]},
+        }
+}
+
+# --- 18.5 Crafted / malformed egress inputs — all fail closed ---
+
+# egress present but prefix missing → deny.
+test_v41_egress_grant_deny_missing_prefix if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.remove(
+        _g18_input(_g18_spiffe, "slack"), ["/egress/prefix"],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# egress present but prefix empty string → deny.
+test_v41_egress_grant_deny_empty_prefix if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# egress key present with null value → still treated as an egress request → deny.
+test_v41_egress_grant_deny_null_egress_value if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/egress", "value": null}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# egress key present with false value (crafted falsy escape attempt) → deny.
+test_v41_egress_grant_deny_false_egress_value if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/egress", "value": false}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# Non-string prefix (number) → deny.
+test_v41_egress_grant_deny_non_string_prefix if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/egress/prefix", "value": 1}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# --- 18.6 Detection independence (Lu M3 / Laura L-US-5) ---
+
+# Granted prefix + PII detected → deny with the PII reason (grant does NOT
+# neutralise the detection gate).
+test_v41_egress_grant_does_not_neutralise_pii_gate if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/result/pii_detected", "value": true}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "pii_detected_in_result"
+    d.code == "MCP_RESULT_PII_BLOCKED"
+}
+
+# Granted prefix + RESTRICTED body over PUBLIC ceiling → deny with the
+# ceiling reason (grant does NOT raise the ceiling).
+test_v41_egress_grant_does_not_neutralise_ceiling_gate if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/result/sensitivity", "value": "RESTRICTED"}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+}
+
+# Grant-denied takes reporting priority over content reasons: ungranted
+# prefix AND PII AND ceiling breach → the auditor sees the authorisation gap.
+test_v41_egress_grant_reason_priority_over_content_reasons if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "webhook-exfil"),
+        [
+            {"op": "replace", "path": "/result/pii_detected", "value": true},
+            {"op": "replace", "path": "/result/sensitivity", "value": "RESTRICTED"},
+        ],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "caller_not_granted_prefix"
+}
+
+# --- 18.7 Broker tool-result path regression (no egress key) ---
+
+# Inputs WITHOUT the egress key are the broker G-ORCH-OPA-1 path — the grant
+# model does not apply and pre-existing behaviour is unchanged (section 17
+# covers it in depth; this is the explicit seam regression).
+test_v41_egress_grant_no_egress_key_broker_path_unchanged if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+        "tool": {"name": "web_search"},
+    }
+        with data.yashigani.mcp.egress_grants as {}
+}
+
+# Missing identity still reports missing_caller_identity (priority 1) even on
+# the egress path.
+test_v41_egress_grant_missing_identity_priority if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/caller/spiffe", "value": ""}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "missing_caller_identity"
+}

@@ -125,8 +125,20 @@
     },
     "caller": {
       "type": "object",
-      "description": "3.1 Phase 1 caller identity context (agent_id / user_id), passed from McpCallContext. Purely additive — policies that do not reference input.caller ignore it. Documented here to keep the schema in lock-step with _build_opa_input().",
+      "description": "3.1 Phase 1 caller identity context (agent_id / user_id), passed from McpCallContext. Purely additive — policies that do not reference input.caller ignore it. Documented here to keep the schema in lock-step with _build_opa_input(). NOTE: the mcp_response_decision input (a DIFFERENT document, built by query_mcp_response_decision) also uses a top-level 'caller' object with {spiffe, sensitivity_ceiling, groups} — see the egress property below and policy/mcp.rego G-ORCH-OPA-1 header.",
       "additionalProperties": true
+    },
+    "egress": {
+      "type": "object",
+      "description": "v4.1 unified-sidecar Phase 1 (Lu M1 / Laura L-US-1) — FIRST-CLASS egress context on the mcp_response_decision input document (NOT on mcp_decision). Emitted by query_mcp_response_decision(egress_prefix=...) for EVERY /egress/eval request; never emitted on the broker tool-result path. Policy semantics key on the PRESENCE of this key: when present, allow additionally requires input.egress.prefix ∈ data.yashigani.mcp.egress_grants[input.caller.spiffe].prefixes with a tenant-scope conjunct (closed world — absent/empty grant data, ungranted prefix, wrong-instance SPIFFE, tenant mismatch all deny with caller_not_granted_prefix / MCP_EGRESS_PREFIX_NOT_GRANTED). Crafted null/false/{} values still count as present (fail-closed). The prefix is never smuggled inside tool.name for decisioning — tool.name 'egress:<prefix>' stays audit context only. Documented here to keep the schema in lock-step with the producer.",
+      "required": ["prefix"],
+      "additionalProperties": false,
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "description": "Egress destination prefix slug from /egress/eval/{prefix}/{path} (e.g. slack, slack-hooks, telegram, llm). Grant-set membership is exact string equality."
+        }
+      }
     },
     "agent": {
       "type": "object",

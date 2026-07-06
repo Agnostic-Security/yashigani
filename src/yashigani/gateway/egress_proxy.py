@@ -202,6 +202,12 @@ async def egress_eval(
     )
 
     # ── 5. OPA decision (fail-closed) ────────────────────────────────────────
+    # v4.1 unified-sidecar Phase 1 (Lu M1 / Laura L-US-1): the prefix rides
+    # FIRST-CLASS as input.egress.prefix — OPA applies the closed-world
+    # (caller, prefix) grant model keyed on the EXACT presented SPIFFE.
+    # tool_name/agent_name are audit context ONLY (agent_name is
+    # name-collapsed by design and never authorises — the grant key is the
+    # full per-instance SPIFFE URI).
     opa_result = await query_mcp_response_decision(
         opa_url=_state.opa_url,
         caller_spiffe=caller_spiffe,
@@ -211,6 +217,7 @@ async def egress_eval(
         pii_detected=pii_detected,
         tool_name=f"egress:{prefix}",
         agent_name=_agent_name_from_spiffe(caller_spiffe),
+        egress_prefix=prefix,
     )
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -342,6 +349,11 @@ def _emit_deny_audit(
 
     Body is NEVER stored — this record contains only classification metadata.
     Synchronous (mirrors broker._audit_writer.write pattern).
+
+    v4.1 Phase 1 (Lu M1): the record carries the FULL caller SPIFFE URI
+    (``caller_spiffe``) so grant denials (deny_reason
+    ``egress:caller_not_granted_prefix``) are attributable to the exact
+    instance — ``agent_name`` is name-collapsed and insufficient alone.
     """
     if _state.audit_writer is None:
         logger.warning(
@@ -357,6 +369,7 @@ def _emit_deny_audit(
         event = OpaDecisionOnMcpEvent(
             account_tier=AccountTier.SYSTEM,
             agent_name=_agent_name_from_spiffe(caller_spiffe),
+            caller_spiffe=caller_spiffe,
             tool_name=f"egress:{prefix}",
             decision="deny",
             deny_reason=f"egress:{deny_reason}",

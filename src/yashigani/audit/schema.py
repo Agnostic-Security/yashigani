@@ -398,6 +398,9 @@ class EventType(str, Enum):
     # v4.1 Phase 1c — MCP approve transaction (mint leaf → codegen → reload →
     # durable envelope) aborted + rolled back; nothing was onboarded.
     MCP_ONBOARD_TRANSACTION_FAILED = "MCP_ONBOARD_TRANSACTION_FAILED"
+    # v4.1 unified-sidecar Phase 1 (Lu M1) — a (caller SPIFFE, egress prefixes)
+    # grant was written inside the step-up-gated approve transaction.
+    MCP_EGRESS_GRANT_WRITTEN = "MCP_EGRESS_GRANT_WRITTEN"
     # P1/P2 header isolation — SECURITY event (HIGH severity)
     # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
     # The header is silently stripped; this event is the regression canary.
@@ -3292,6 +3295,12 @@ class OpaDecisionOnMcpEvent(AuditEvent):
     identity_chain: list = field(default_factory=list)
     chain_depth: int = 0         # JWT identity chain depth (multi-hop) — kept for backward compat
     elapsed_ms: Optional[int] = None
+    # v4.1 unified-sidecar Phase 1 (Lu M1): FULL caller SPIFFE URI of the
+    # denied/allowed caller.  Grant decisions (deny_reason
+    # "egress:caller_not_granted_prefix") key on the EXACT per-instance
+    # SPIFFE — agent_name is name-collapsed and cannot attribute an egress
+    # grant denial to a specific instance.  Empty for pre-4.1 emitters.
+    caller_spiffe: str = ""
 
 
 @dataclass
@@ -3608,6 +3617,37 @@ class McpOnboardTransactionFailedEvent(AuditEvent):
     spiffe_id: str = ""
     failed_step: str = ""
     error_type: str = ""
+
+
+@dataclass
+class McpEgressGrantWrittenEvent(AuditEvent):
+    """A (caller SPIFFE, egress prefixes) grant was written at approve time.
+
+    v4.1 unified-sidecar Phase 1 (Lu M1 — synthesis must-fix #1): the
+    positive-grant, closed-world OPA egress model
+    (``data.yashigani.mcp.egress_grants``) is populated ONLY inside the
+    step-up-gated approve transaction (StepUpAdminSession on POST /import).
+    This event is the audit evidence for every grant write.
+
+    Closed world means an EMPTY ``prefixes`` list is itself meaningful (the
+    instance is explicitly granted NO egress) and is still audited.
+    Revocation is grant ABSENCE in the pushed OPA data document (the kill
+    switch — Nico Q3); the rollback path deletes the grant record.
+
+    spiffe_id:  EXACT per-instance SPIFFE URI the grant is keyed on
+                (byte-match at decision time — never name-collapsed).
+    prefixes:   the granted egress prefix slugs (positive set).
+    """
+
+    event_type: str = EventType.MCP_EGRESS_GRANT_WRITTEN
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    prefixes: list = field(default_factory=list)
 
 
 @dataclass

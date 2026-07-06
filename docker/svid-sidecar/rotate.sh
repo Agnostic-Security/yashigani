@@ -48,6 +48,14 @@
 # Pipe failures in critical sections are checked manually via explicit variable inspection.
 set -eu
 
+# v4.1 Phase 1 (Nico Q4): private-by-default file creation.  The rotation
+# response JSON (curl --output) contains key_pem and previously landed at
+# curl-default mode (umask 022 → group/world-readable) in the SHARED SVID
+# volume.  umask 077 makes every newly-created file 0600; files that must be
+# readable by the agent/Caddy are chmod'd explicitly below (0444 certs,
+# 0440+:2003 key, 0644 ready flag).
+umask 077
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 AGENT_ID="${AGENT_ID:?AGENT_ID env var is required}"
 BACKOFFICE_URL="${BACKOFFICE_URL:-https://backoffice:8443}"
@@ -118,6 +126,9 @@ log "SPIFFE ID: ${SPIFFE_ID}"
 # Must be written AFTER certs are in place and validated.
 mkdir -p "$(dirname "${READY_FLAG}")"
 printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${READY_FLAG}"
+# Under umask 077 the flag would be 0600 — keep it world-readable (it carries
+# only a timestamp) so agent-side existence/read polls keep working.
+chmod 0644 "${READY_FLAG}"
 log "Ready flag written: ${READY_FLAG}"
 
 # ── Phase 2: Rotation loop ────────────────────────────────────────────────────
@@ -164,7 +175,14 @@ while true; do
         # --fail: exit non-zero on HTTP error (4xx/5xx).
         # --silent: suppress progress bar (not log output — we redirect to log).
         # --show-error: still show curl errors even with --silent.
+        # Nico Q4: the response JSON contains key_pem — it must NEVER be
+        # group/world-readable in the shared SVID volume.  umask 077 (above)
+        # makes curl create it 0600; the touch+chmod additionally repairs a
+        # pre-existing file left at older perms by a previous run/image.
         RESPONSE_FILE="${SVID_DIR}/.rotate_response.json"
+        rm -f "${RESPONSE_FILE}"
+        touch "${RESPONSE_FILE}"
+        chmod 0600 "${RESPONSE_FILE}"
         HTTP_CODE="$(curl \
             --silent \
             --show-error \

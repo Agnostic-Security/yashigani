@@ -159,15 +159,37 @@ class CASource:
 
 
 @dataclass(frozen=True)
+class EndpointAcl:
+    """One parsed ``endpoint_acls`` rule (v4.1 Phase 1 — cert/rotate gate).
+
+    ``allowed_spiffe_ids``
+        Exact-match allowlist (the only field parsed before v4.1 Phase 1).
+    ``allowed_spiffe_prefix``
+        Optional prefix grant for agent self-service endpoints (e.g.
+        ``spiffe://<td>/agents/`` lets every live agent identity call its OWN
+        rotation endpoint without listing per-instance URIs in IaC).  Empty
+        string disables prefix matching.
+    ``verify_spiffe_matches_agent_id``
+        When True, a prefix-matched caller is accepted ONLY if its SPIFFE
+        ``agent_name`` or ``instance_id`` segment equals the route's
+        ``{agent_id}`` path parameter — one agent can never rotate/poll
+        another agent's identity.  Requires ``allowed_spiffe_prefix``.
+    """
+    allowed_spiffe_ids: frozenset[str]
+    allowed_spiffe_prefix: str = ""
+    verify_spiffe_matches_agent_id: bool = False
+
+
+@dataclass(frozen=True)
 class Manifest:
     schema_version: int
     services: tuple[ServiceIdentity, ...]
     cert_policy: CertPolicy
     ca_source: CASource
-    # Top-level endpoint_acls: path -> set of allowed SPIFFE URIs.
-    # Empty dict means "no ACLs declared" — yashigani.auth.spiffe defaults
-    # to deny on any gated endpoint.
-    endpoint_acls: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Top-level endpoint_acls: path -> EndpointAcl rule (exact allowlist +
+    # optional agent-prefix grant). Empty dict means "no ACLs declared" —
+    # yashigani.auth.spiffe defaults to deny on any gated endpoint.
+    endpoint_acls: dict[str, EndpointAcl] = field(default_factory=dict)
 
     def get(self, name: str) -> ServiceIdentity:
         for s in self.services:
@@ -274,13 +296,20 @@ def load_manifest(path: Optional[str] = None) -> Manifest:
     )
 
 
-def _parse_endpoint_acls(raw: Any) -> dict[str, frozenset[str]]:
-    """Parse the top-level endpoint_acls block into {path: frozenset(spiffe_ids)}."""
+def _parse_endpoint_acls(raw: Any) -> dict[str, EndpointAcl]:
+    """Parse the top-level endpoint_acls block into {path: EndpointAcl}.
+
+    v4.1 Phase 1 (Nico Q1 — cert/rotate): ``allowed_spiffe_prefix`` and
+    ``verify_spiffe_matches_agent_id`` were declared in service_identities.yaml
+    since 4.0 Phase 0 but silently DROPPED by this parser — the ACL gate could
+    therefore never honour the sidecar self-rotation grant. Now parsed and
+    enforced by yashigani.auth.spiffe.require_spiffe_id.
+    """
     if raw is None or raw == {}:
         return {}
     if not isinstance(raw, dict):
         raise ManifestError("endpoint_acls must be a mapping of path -> rule")
-    out: dict[str, frozenset[str]] = {}
+    out: dict[str, EndpointAcl] = {}
     for path, rule in raw.items():
         if not isinstance(path, str) or not path.startswith("/"):
             raise ManifestError(
@@ -298,7 +327,28 @@ def _parse_endpoint_acls(raw: Any) -> dict[str, frozenset[str]]:
                 raise ManifestError(
                     f"endpoint_acls[{path!r}] contains non-SPIFFE id {sid!r}"
                 )
-        out[path] = frozenset(allowed)
+        prefix = rule.get("allowed_spiffe_prefix", "") or ""
+        if not isinstance(prefix, str):
+            raise ManifestError(
+                f"endpoint_acls[{path!r}].allowed_spiffe_prefix must be a string"
+            )
+        if prefix and not prefix.startswith("spiffe://"):
+            raise ManifestError(
+                f"endpoint_acls[{path!r}].allowed_spiffe_prefix {prefix!r} "
+                "must start with spiffe://"
+            )
+        verify_match = bool(rule.get("verify_spiffe_matches_agent_id", False))
+        if verify_match and not prefix:
+            raise ManifestError(
+                f"endpoint_acls[{path!r}]: verify_spiffe_matches_agent_id "
+                "requires allowed_spiffe_prefix (exact-id callers carry no "
+                "agent segment to match)"
+            )
+        out[path] = EndpointAcl(
+            allowed_spiffe_ids=frozenset(allowed),
+            allowed_spiffe_prefix=prefix,
+            verify_spiffe_matches_agent_id=verify_match,
+        )
     return out
 
 
