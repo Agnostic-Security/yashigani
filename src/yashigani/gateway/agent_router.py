@@ -33,6 +33,7 @@ import types as _types
 
 from yashigani.pki.client import internal_httpx_client
 from yashigani.gateway._client_enforce import evaluate_client_policies
+from yashigani.gateway._dispatch_client import agent_dispatch_client
 
 
 def _agent_cp_deny(audit_writer, caller_agent_id, direction, ce_result):
@@ -392,7 +393,11 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
                     },
                 )
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # v4.1 §2.5 dispatch repoint: registered upstreams are the agents'
+        # Caddy INGRESS fronts (require_and_verify) — present the gateway
+        # mesh leaf via agent_dispatch_client(); a bare client is refused at
+        # the TLS handshake and every dispatch fails closed.
+        async with agent_dispatch_client(timeout=30.0) as client:
             upstream_resp = await client.request(
                 method=request.method,
                 url=upstream_url.rstrip("/") + remainder_path,

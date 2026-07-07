@@ -16,6 +16,8 @@ import uuid
 
 import httpx
 
+from yashigani.gateway._dispatch_client import agent_dispatch_client
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -395,7 +397,10 @@ async def create_flow(
         RuntimeError: If the Langflow API returns a non-2xx status or
                       the response carries no ``id`` field.
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # v4.1 §2.5: base_url is the langflow Caddy ingress front
+    # (https://caddy:9705/agents/default/langflow) — present this process's
+    # mesh leaf (backoffice leaf in the backoffice container).
+    async with agent_dispatch_client(timeout=timeout) as client:
         api_key, _flow_id_unused = await _ensure_initialized(client, base_url)
 
         resp = await client.post(
@@ -448,7 +453,9 @@ async def langflow_chat(
     if not user_message:
         user_message = messages[-1].get("content", "") if messages else ""
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # v4.1 §2.5: base_url is the langflow Caddy ingress front — present the
+    # mesh leaf (gateway leaf in the gateway container).
+    async with agent_dispatch_client(timeout=timeout) as client:
         api_key, flow_id = await _ensure_initialized(client, base_url)
 
         resp = await client.post(

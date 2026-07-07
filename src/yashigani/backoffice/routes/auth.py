@@ -1026,6 +1026,22 @@ async def verify_user_session(request: Request):
 # chars, alphanumeric start, [-_] allowed). Anything else is denied outright.
 _VERIFY_MCP_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}$")
 
+# v4.1 §2.5 — backoffice transport-subject allow (CLOSED allowlist, Lu-review
+# item): the backoffice mesh leaf (spiffe://<td>/backoffice) is a legitimate
+# dispatcher ONLY toward the bundled langflow front (user_agents draft-flow
+# creation + langflow_client.create_flow via YASHIGANI_LANGFLOW_URL).  Every
+# other (subject=backoffice, server) pair keeps the deny — this is a
+# positive, server-scoped grant, not a blanket transport identity.  The
+# tenant conjunct is enforced in the route (must equal the install tenant).
+# No OPA/rego change: this gate is Python-only (mcp.rego governs egress
+# grants + broker tool results, not the §2.5 ingress transport subjects).
+_VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS: frozenset[str] = frozenset({"langflow"})
+
+
+def _verify_mcp_install_tenant() -> str:
+    """This install's tenant id (mirrors mcp_servers._install_tenant)."""
+    return os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+
 
 def _verify_mcp_envelope_service():
     """Live CapabilityEnvelopeService over the asyncpg pool (patchable in tests)."""
@@ -1093,6 +1109,11 @@ async def verify_mcp_ingress(request: Request, tenant: str = "", server: str = "
         transport identity; per-tool authz stays with the broker's OPA leg —
         SYNTHESIS Issue-2 role split; per-instance grant objects land in
         Phase 2 with Lu's rego).
+      * Subject == ``spiffe://<td>/backoffice`` → ALLOW only toward the
+        bundled langflow front in this install's tenant (v4.1 §2.5 closed
+        allowlist — the backoffice dispatches draft-flow creation through
+        langflow's ingress front); every other target denies
+        ``transport_subject_not_allowed``.
       * Subject matching Nico's per-instance contract
         ``spiffe://<td>/agents/<tenant>/<name>/<nhi_id>`` → ALLOW only when
         the instance segment is present, the URI tenant equals the route
@@ -1130,6 +1151,23 @@ async def verify_mcp_ingress(request: Request, tenant: str = "", server: str = "
     if subject == f"spiffe://{trust_domain()}/gateway":
         _log.debug(
             "verify-mcp: ALLOW gateway transport tenant=%r server=%r",
+            tenant, server,
+        )
+    # 2a-ii. Backoffice transport identity (v4.1 §2.5) — allowed ONLY toward
+    # the bundled langflow front in this install's tenant (closed allowlist,
+    # _VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS).  Any other target keeps the
+    # deny (fail-closed).  Step 3's envelope requirement still applies.
+    elif subject == f"spiffe://{trust_domain()}/backoffice":
+        if (
+            server not in _VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS
+            or tenant != _verify_mcp_install_tenant()
+        ):
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "transport_subject_not_allowed",
+                subject, tenant, server,
+            )
+        _log.debug(
+            "verify-mcp: ALLOW backoffice transport tenant=%r server=%r",
             tenant, server,
         )
     else:

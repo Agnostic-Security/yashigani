@@ -470,6 +470,45 @@ async def lifespan(app: FastAPI):
                     _wa_exc,
                     exc_info=True,
                 )
+
+            # v4.1 unified-sidecar §2.5 — bundled-agent ingress envelopes.
+            # The agent INGRESS fronts forward_auth to /auth/verify-mcp, whose
+            # step 3 requires an ACTIVE capability envelope; bundled agents
+            # (openclaw/langflow/letta) never pass the BYO import ceremony, so
+            # without this bootstrap every dispatch through their fronts 403s
+            # server_not_onboarded.  Idempotent; closed allowlist; registry-
+            # derived (only profiles the operator actually installed).
+            # Non-fatal BY DESIGN (documented SOP-1 exception, audit-DB-sink
+            # precedent above): no service-critical attribute is set to None
+            # here and the failure mode is fail-CLOSED (verify-mcp keeps
+            # denying the bundled fronts) — availability-only degradation,
+            # retried on the next boot.
+            try:
+                from yashigani.backoffice.bundled_envelopes import (
+                    bootstrap_bundled_agent_envelopes,
+                )
+                from yashigani.mcp.envelope_service import CapabilityEnvelopeService
+                _minted = await bootstrap_bundled_agent_envelopes(
+                    CapabilityEnvelopeService(get_pool()),
+                    backoffice_state.agent_registry,
+                )
+                if _minted:
+                    _log.info(
+                        "Backoffice: bundled-agent envelopes minted: %s",
+                        ", ".join(_minted),
+                    )
+                else:
+                    _log.info(
+                        "Backoffice: bundled-agent envelopes already present "
+                        "or no bundled agents registered"
+                    )
+            except Exception as _be_exc:  # noqa: BLE001 — see rationale above
+                _log.exception(
+                    "Backoffice: bundled-agent envelope bootstrap FAILED (%s) "
+                    "— bundled agent ingress fronts will DENY "
+                    "server_not_onboarded (fail-closed) until the next boot",
+                    _be_exc,
+                )
         except Exception as exc:
             # Retro #3ar — fail-closed on lifespan init failure (CLAUDE.md §3).
             # The previous behaviour was to log a warning and continue with
