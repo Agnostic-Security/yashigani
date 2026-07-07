@@ -1,4 +1,4 @@
-# Last updated: 2026-07-06T00:00:00+00:00
+# Last updated: 2026-07-08T00:00:00+00:00
 """
 Yashigani MCP — (caller, prefix) egress grant document builder.
 
@@ -120,6 +120,29 @@ def transitional_egress_seed() -> dict:
     return seed
 
 
+def bundled_system_spiffe_set() -> frozenset:
+    """Return the set of bundled-system SPIFFE URIs (env-derived, runtime).
+
+    Used by ``build_egress_grants_data`` to SERVER-DERIVE ``legacy_system``
+    rather than reading it from the store (Lu MF-1, HIGH: a store-suppliable
+    ``legacy_system`` is a tenant-conjunct bypass — any SPIFFE lacking an
+    ``/agents/`` tenant segment could claim the ``legacy_system`` path in the
+    OPA rule and bypass the per-tenant conjunct).
+
+    Returns the same set of SPIFFEs that ``transitional_egress_seed`` keys on.
+    ``frozenset()`` on any failure (fail-closed: no SPIFFE gets the flag).
+    """
+    try:
+        return frozenset(transitional_egress_seed().keys())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "egress-grants: bundled_system_spiffe_set failed (%s) — "
+            "returning empty set (no SPIFFE gets legacy_system=true; "
+            "bundled pre-migration systems deny egress until fixed)", exc,
+        )
+        return frozenset()
+
+
 def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:
     """Build the full ``egress_grants`` OPA data sub-document.
 
@@ -129,17 +152,48 @@ def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:
     seed-only: onboarded instances then deny fail-closed until the store is
     reachable and the document re-pushed.
 
+    Seed suppression (design §4.4 / Lu MF-2 fix-2a): once the store has
+    been asked to ``put_egress_grant`` for a bundled-system SPIFFE (admin
+    applied or has ever been applied), that SPIFFE's seed entry is removed
+    before the merge — grant-absence after a subsequent ``delete_egress_grant``
+    IS the kill switch (the seed can never resurface it).  Suppression is
+    gated on the store's ``get_claimed_egress_seed_spiffes`` call; if the
+    call fails, suppression is skipped with a WARNING (fail-open on the seed
+    only — same as the pre-fix behaviour — rather than silently denying
+    every unclaimed bundled system).
+
     Never raises.
     """
-    doc: dict = {}
+    # Build seed first so we can remove claimed entries before merging.
+    seed: dict = {}
     try:
-        doc.update(transitional_egress_seed())
+        seed = transitional_egress_seed()
     except Exception as exc:  # noqa: BLE001 — seed failure must not kill the push
         logger.error(
             "egress-grants: transitional seed build failed (%s) — bundled "
             "pre-migration systems will DENY egress at OPA until fixed "
             "(fail-closed; static Caddy pins alone cannot allow)", exc,
         )
+
+    if registry_store is not None:
+        # Suppress seed entries for SPIFFEs the store has ever claimed
+        # (admin apply or revoke).  Once claimed, grant-absence = kill switch;
+        # the seed must never override a deliberate revocation (Lu MF-2a).
+        try:
+            claimed = registry_store.get_claimed_egress_seed_spiffes()
+            for spiffe in claimed:
+                seed.pop(spiffe, None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "egress-grants: claimed-seed lookup failed (%s) — seed "
+                "suppression SKIPPED; revoked seed grants may resurface "
+                "(fail-OPEN risk on revoke — restore the store connection "
+                "and re-push to enforce revocations)", exc,
+            )
+
+    doc: dict = {}
+    doc.update(seed)
+
     if registry_store is not None:
         try:
             doc.update(registry_store.build_egress_grants_data())
@@ -154,5 +208,6 @@ def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:
 
 __all__ = [
     "build_egress_grants_doc",
+    "bundled_system_spiffe_set",
     "transitional_egress_seed",
 ]

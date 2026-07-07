@@ -26,12 +26,12 @@ decides whether a push failure is fatal (startup) or best-effort (mutation).
 The gateway startup path treats OPA-unreachable as non-fatal (OPA starts
 concurrently) and will deny invocations until OPA has the data.
 
-Last updated: 2026-07-06T00:00:00+00:00
+Last updated: 2026-07-08T00:00:00+00:00
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -118,4 +118,67 @@ def push_egress_grants(opa_url: str, egress_grants_doc: dict) -> None:
     )
 
 
-__all__ = ["push_egress_grants", "push_mcp_opa_data"]
+def push_and_verify_egress_grants(
+    opa_url: str,
+    egress_grants_doc: dict,
+    must_be_absent: Optional[frozenset] = None,
+) -> None:
+    """Push ``egress_grants`` to OPA and verify the push landed.
+
+    Fail-closed for revoke/narrow operations (Lu MF-2, Nico gaps 2/3, HIGH):
+    after the PUT, reads back the ``egress_grants`` sub-document from OPA and
+    asserts that every SPIFFE in ``must_be_absent`` is genuinely absent.  If
+    the push fails OR the readback still contains a must-be-absent SPIFFE,
+    raises ``RuntimeError`` — better to surface a hard error than to silently
+    leave a stale ``allow`` in OPA.
+
+    For add-only operations (``must_be_absent=None`` or empty), delegates
+    directly to ``push_egress_grants`` (raises on push failure; no readback).
+
+    Raises:
+        httpx.HTTPStatusError  — OPA returned a non-2xx on push or readback.
+        httpx.RequestError     — Network / connection error on push or readback.
+        RuntimeError           — Readback unavailable OR must-be-absent SPIFFE
+                                 still present after push.
+    """
+    push_egress_grants(opa_url, egress_grants_doc)  # raises on push failure
+
+    if not must_be_absent:
+        return  # add-only: no readback needed
+
+    from yashigani.pki.client import internal_httpx_sync_client  # noqa: PLC0415
+
+    readback_url = opa_url.rstrip("/") + _OPA_MCP_DATA_PATH + "/egress_grants"
+    try:
+        with internal_httpx_sync_client(timeout=10.0) as client:
+            resp = client.get(
+                readback_url,
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            result_doc: dict = resp.json().get("result") or {}
+    except Exception as exc:
+        raise RuntimeError(
+            "egress-grants: revoke verification readback failed — cannot "
+            "confirm revocation landed in OPA; refusing to report success "
+            "(fail-closed, Lu MF-2). Restore OPA connectivity and re-push. "
+            "Underlying error: %s" % exc
+        ) from exc
+
+    still_present = [s for s in must_be_absent if s in result_doc]
+    if still_present:
+        raise RuntimeError(
+            "egress-grants: revoke push readback shows %d must-be-absent "
+            "SPIFFE(s) still present in OPA — stale allow; revocation did "
+            "NOT land (fail-closed, Lu MF-2): %s"
+            % (len(still_present), still_present)
+        )
+
+    logger.info(
+        "egress-grants: revoke verification PASS — %d SPIFFE(s) confirmed "
+        "absent from OPA egress_grants after push",
+        len(must_be_absent),
+    )
+
+
+__all__ = ["push_and_verify_egress_grants", "push_egress_grants", "push_mcp_opa_data"]
