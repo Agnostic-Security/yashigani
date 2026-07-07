@@ -391,6 +391,12 @@ class TestForwarderHardening:
         fwd = doc["services"]["egress-notifybot"]
         assert fwd["read_only"] is True
         assert fwd["cap_drop"] == ["ALL"]
+        # Deploy-fix (Phase-3 live rebuild): the upstream caddy binary carries a
+        # cap_net_bind_service FILE capability; under cap_drop:ALL +
+        # no-new-privileges the kernel refuses the execve entirely
+        # ("exec /usr/bin/caddy: operation not permitted"). The template must
+        # re-add exactly that one cap — nothing else — mirroring main caddy.
+        assert fwd["cap_add"] == ["NET_BIND_SERVICE"]
         assert "no-new-privileges:true" in fwd["security_opt"]
         assert fwd["user"].startswith("65534:")
         assert fwd["sysctls"]["net.ipv6.conf.all.disable_ipv6"] == 1
