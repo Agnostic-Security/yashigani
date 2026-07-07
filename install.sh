@@ -5278,6 +5278,94 @@ _build_extractor_image() {
   fi
 }
 
+# v4.1 unified-sidecar (Phase-3 deploy fix): build the ringfence-init and
+# svid-sidecar images as RELEASE ARTIFACTS, next to the gateway/backoffice
+# source build. Referenced tags:
+#   ghcr.io/agnosticsec/ringfence-init:0.1.0  — intra-zone-deny enforcer;
+#     referenced by the codegen forwarder overrides (e.g. the committed
+#     docker/openclaw-egress-forwarder.override.yml) and by every generated
+#     agent override's ringfence-init-<agent> stanza.
+#   ghcr.io/agnosticsec/svid-sidecar:0.1.0    — per-instance SVID writer
+#     (docker/Dockerfile.svid-sidecar). Also alias-tagged with
+#     ${YASHIGANI_VERSION} because the codegen per-MCP sidecar stanza
+#     references ${YASHIGANI_SVID_SIDECAR_IMAGE:-...}:${YASHIGANI_VERSION}
+#     (src/yashigani/manifest/codegen.py — _gen sidecar stanza).
+# NEITHER tag is published on ghcr.io — a clean install with the forwarder /
+# ringfence features active fails at image-pull/up time unless the images
+# exist in the local store. Dockerfiles are in-tree:
+#   docker/ringfence-init/Dockerfile  (self-contained context docker/ringfence-init/)
+#   docker/Dockerfile.svid-sidecar    (context docker/)
+# Idempotent: skips when the exact tag already exists (airgap / re-runs /
+# pre-seeded stores); YASHIGANI_FORCE_REBUILD=1 forces a rebuild. Runs under
+# both runtimes (docker + podman) — plain `build`, no compose service needed
+# (these images are referenced by overlays/generated files, not the base file).
+_build_ringfence_images() {
+  local _rf_img="${YASHIGANI_RINGFENCE_INIT_IMAGE:-ghcr.io/agnosticsec/ringfence-init}:${YASHIGANI_RINGFENCE_INIT_VERSION:-0.1.0}"
+  local _svid_img="${YASHIGANI_SVID_SIDECAR_IMAGE:-ghcr.io/agnosticsec/svid-sidecar}:${YASHIGANI_SVID_SIDECAR_VERSION:-0.1.0}"
+  local _svid_alias="${YASHIGANI_SVID_SIDECAR_IMAGE:-ghcr.io/agnosticsec/svid-sidecar}:${YASHIGANI_VERSION}"
+  local _ctr_cmd="docker"
+  [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _ctr_cmd="podman"
+
+  # Active only when the unified-sidecar forwarder/ringfence features are in
+  # play for THIS install: the openclaw bundle (whose enablement layers the
+  # committed egress-forwarder override at compose up). Probe BOTH
+  # COMPOSE_PROFILES and AGENT_BUNDLES — same defensive pattern as the
+  # overlay gate in compose_up (non-interactive --agent-bundles is only
+  # pushed into COMPOSE_PROFILES at step 8).
+  local _rf_active="false"
+  if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
+    _rf_active="true"
+  else
+    local _rf_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+    if [[ "$_rf_ab" == *",openclaw,"* || "$_rf_ab" == *",all,"* ]]; then
+      _rf_active="true"
+    fi
+  fi
+  if [[ "$_rf_active" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "$_ctr_cmd build -t $_rf_img ${WORK_DIR}/docker/ringfence-init/"
+    dry_print "$_ctr_cmd build -f ${WORK_DIR}/docker/Dockerfile.svid-sidecar -t $_svid_img ${WORK_DIR}/docker"
+    dry_print "$_ctr_cmd tag $_svid_img $_svid_alias"
+    return 0
+  fi
+
+  # ringfence-init — required by the forwarder overlay's intra-zone-deny
+  # stanza. Fail-closed: the overlay WILL be applied at compose up (same
+  # gate), so a missing image is a guaranteed deploy failure later.
+  if "$_ctr_cmd" image inspect "$_rf_img" >/dev/null 2>&1 \
+      && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+    log_info "ringfence-init image already present ($_rf_img) — skipping build"
+  else
+    log_info "Building ringfence-init image ($_rf_img)..."
+    "$_ctr_cmd" build -t "$_rf_img" "${WORK_DIR}/docker/ringfence-init/" || {
+      log_error "ringfence-init image build FAILED — the egress-forwarder overlay"
+      log_error "references $_rf_img and compose up cannot pull it (unpublished). ABORTING."
+      exit 1
+    }
+    log_success "ringfence-init image built ($_rf_img)"
+  fi
+
+  # svid-sidecar — per-instance SVID writer for onboarded systems.
+  if "$_ctr_cmd" image inspect "$_svid_img" >/dev/null 2>&1 \
+      && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+    log_info "svid-sidecar image already present ($_svid_img) — skipping build"
+  else
+    log_info "Building svid-sidecar image ($_svid_img)..."
+    "$_ctr_cmd" build -f "${WORK_DIR}/docker/Dockerfile.svid-sidecar" \
+        -t "$_svid_img" "${WORK_DIR}/docker" || {
+      log_error "svid-sidecar image build FAILED — onboarded-agent SVID stanzas"
+      log_error "reference this unpublished image. ABORTING."
+      exit 1
+    }
+    log_success "svid-sidecar image built ($_svid_img)"
+  fi
+  # Alias tag for the codegen per-MCP stanza reference (:${YASHIGANI_VERSION}).
+  "$_ctr_cmd" tag "$_svid_img" "$_svid_alias" 2>/dev/null || true
+}
+
 # =============================================================================
 # STEP 9 (compose/vm): docker compose pull
 # =============================================================================
@@ -5492,6 +5580,12 @@ except Exception:
   if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
     _build_extractor_image
   fi
+
+  # v4.1 unified-sidecar: build ringfence-init + svid-sidecar (unpublished
+  # ghcr.io tags — must exist locally before the forwarder overlay is applied
+  # at compose up). No-op unless the forwarder/ringfence features are active.
+  # Runs on BOTH runtimes (the helper picks docker vs podman itself).
+  _build_ringfence_images
 
   # letta-pgbouncer uses edoburu/pgbouncer:v1.25.1-p0 (same multi-arch image as the
   # existing pgbouncer service — arm64 + amd64, pinned sha256). No local build required.
