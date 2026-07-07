@@ -1235,7 +1235,12 @@ fi
 # Final assertion exits 1 if any survive.
 # ---------------------------------------------------------------------------
 _PROJECT_PREFIX="${_PROJECT_PREFIX:-docker}"
-_CANONICAL_NETWORKS="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated"
+# v4.1 three-agent wrap (2026-07-07): the *_isolated bridges are still
+# DEFINED in docker-compose.yml (dead — no agent joins them), so keep them
+# here for clean removal. letta_db is the new 2-member letta↔pgbouncer lane.
+# The §2.6 split ringfences (ringfence_<agent>_{in,eg}) are swept by the
+# J12 ringfence_* filter below — no need to list each.
+_CANONICAL_NETWORKS="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated letta_db"
 
 echo "=== Canonical network cleanup ==="
 _net_removed=0

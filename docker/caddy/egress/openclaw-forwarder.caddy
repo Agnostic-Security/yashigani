@@ -31,6 +31,26 @@
         respond "ok" 200
     }
 
+    # ── llm — openclaw /llm/* → caddy:18790/llm/* → /egress/eval ──
+    # Final delivery target (enforced at the :18790 deliver handles): gateway-inference
+    handle /llm/* {
+        # Header hygiene: the wrapped system must not smuggle identity or
+        # Layer-B markers — caddy:18790 re-stamps from the VERIFIED peer
+        # cert anyway (forge-proof); this strip is belt-and-suspenders.
+        request_header -X-SPIFFE-ID
+        request_header -X-Caddy-Verified-Secret
+        request_header -X-Yashigani-Verified-Spiffe
+        reverse_proxy https://caddy:18790 {
+            transport http {
+                tls
+                tls_trust_pool file /run/secrets/svid/default/openclaw/ca.crt
+                tls_client_auth /run/secrets/svid/default/openclaw/client.crt /run/secrets/svid/default/openclaw/client.key
+                tls_server_name caddy
+                max_conns_per_host 64
+            }
+        }
+    }
+
     # ── slack — openclaw /slack/* → caddy:18790/slack/* → /egress/eval ──
     # Final delivery target (enforced at the :18790 deliver handles): slack.com
     handle /slack/* {

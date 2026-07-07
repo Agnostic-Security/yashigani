@@ -346,8 +346,11 @@ class TestGatewayOnlyUpstreamProof:
         )
         assert match is not None, "OPENAI_API_BASE not found in langflow service"
         base_url = match.group(1).strip()
-        assert base_url == "http://gateway:8081/v1", (
-            f"langflow OPENAI_API_BASE must be gateway-only; got: {base_url}"
+        # v4.1 three-agent wrap (2026-07-07): the base URL dials langflow's
+        # egress FORWARDER; the gateway hop moved behind /egress/eval →
+        # /deliver/llm → gateway:8081 (governance in front, same surface).
+        assert base_url == "http://egress-langflow:9400/llm/v1", (
+            f"langflow OPENAI_API_BASE must dial its egress forwarder; got: {base_url}"
         )
 
     def test_langflow_openai_api_base_not_direct_ollama(self):
@@ -418,10 +421,16 @@ class TestNetworkIsolationProof:
     def _langflow_block(self) -> str:
         return _extract_service_block("langflow")
 
-    def test_langflow_joins_langflow_isolated_network(self):
-        block = self._langflow_block()
-        assert "langflow_isolated" in block, (
-            "langflow service must join langflow_isolated network"
+    def test_langflow_joins_split_ringfences_only(self):
+        # v4.1 three-agent wrap (2026-07-07): langflow moved OFF
+        # langflow_isolated onto the §2.6 split ringfences. Parse the real
+        # networks list (string-matching the block would pass on comments).
+        import yaml as _yaml
+
+        compose = _yaml.safe_load(_read_compose())
+        nets = set(compose["services"]["langflow"].get("networks") or [])
+        assert nets == {"ringfence_langflow_in", "ringfence_langflow_eg"}, (
+            f"langflow must join exactly its split ringfences; got {sorted(nets)}"
         )
 
     def test_langflow_does_not_join_internet_egress(self):

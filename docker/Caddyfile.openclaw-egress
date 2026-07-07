@@ -84,24 +84,32 @@
 # set by install.sh when the openclaw profile is enabled). The Caddyfile
 # literals are the PRIMARY control; iptables is belt-and-suspenders.
 #
-# openclaw-side wiring — COMPLETE (v4.1 Phase 1d, NO-CARRY-FORWARD):
-# openclaw's Slack/Telegram SDK calls are configured to route through:
-#   https://caddy:18790/slack        (Slack Web API  → slack.com)
-#   https://caddy:18790/slack-hooks  (response_url    → hooks.slack.com)
-#   https://caddy:18790/telegram     (Bot API + files → api.telegram.org)
-# via TWO wired SDK mechanisms:
-#   (a) openclaw.json egress block (certFile/keyFile + apiBaseUrl per channel)
-#       read by the binary via OPENCLAW_CONFIG_PATH=/etc/openclaw/openclaw.json
-#   (b) OPENCLAW_EGRESS_TLS_{CERT,KEY}_FILE env vars (belt-and-suspenders)
-# Trust anchor: NODE_EXTRA_CA_CERTS=/etc/openclaw/tls/ca.crt (server cert).
+# System-side wiring — unified-sidecar (v4.1 three-agent wrap, 2026-07-07):
+# every caller of this listener is a per-system EGRESS FORWARDER
+# (egress-openclaw / egress-langflow / egress-letta — codegen §2.3), each
+# presenting its system's leaf via tls_client_auth from the SVID mount:
+#   https://caddy:18790/llm          (all three systems → gateway:8081 /v1)
+#   https://caddy:18790/slack        (openclaw — Slack Web API → slack.com)
+#   https://caddy:18790/slack-hooks  (openclaw — response_url → hooks.slack.com)
+#   https://caddy:18790/telegram     (openclaw — Bot API → api.telegram.org)
+# System-side config uses each system's REAL, schema-validated mechanism:
+#   openclaw:  models.providers.yashigani.baseUrl → egress-openclaw:9400/llm/v1
+#              channels.telegram.apiRoot          → egress-openclaw:9400/telegram
+#              (Slack Web API base URL is NOT configurable in openclaw
+#              2026.5.6 — hardcoded slack.com, HTTP CONNECT proxy only; the
+#              /slack handles stay for the future proxy/upstream mechanism.
+#              The former top-level `egress` config block and the
+#              OPENCLAW_*_BASE_URL / OPENCLAW_EGRESS_TLS_* env vars were
+#              INVENTED keys the binary rejects/ignores — removed 2026-07-07.)
+#   langflow:  OPENAI_API_BASE → http://egress-langflow:9400/llm/v1
+#   letta:     OPENAI_API_BASE → http://egress-letta:9400/llm/v1
 #
-# Static proof (cert chain → SAN gate):
-#   /etc/openclaw/tls/client.crt (./secrets/openclaw_client.crt)
-#   URI SAN: spiffe://yashigani.internal/openclaw (service_identities.yaml:248)
-#   :18790 stamped-header gate: X-Yashigani-Verified-Spiffe != openclaw SPIFFE → 403
+# Static proof (cert chain → SAN gate), per system:
+#   ./secrets/<system>_client.crt URI SAN: spiffe://yashigani.internal/<system>
+#   (service_identities.yaml) — held by the FORWARDER (sole SVID holder,
+#   synthesis #2); stamped-header gates below narrow per prefix
 #   (v4.1 LAURA-I1-CEL: CEL URI-SAN expression replaced — caddy 2.11.x *url.URL bug)
-#   Match: cert SAN satisfies the gate → require_and_verify accepts it.
-# Nothing deferred. Laura Phase-3 test (c) is live confirmation of this chain.
+# Laura Phase-3 test (c) is live confirmation of this chain.
 #
 # Port 18790 (front) is distinct from openclaw's own 18789, the Ollama front
 # 11435, the mesh listeners 8444/8445, and the codegen MCP mesh-port range
@@ -132,6 +140,27 @@
         not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_OPENCLAW_SPIFFE_ID:spiffe://yashigani.internal/openclaw}"
     }
     respond @caller_not_openclaw "Forbidden" 403
+}
+
+# LLM caller gate — the `llm` egress class (design §2.4, three-agent wrap
+# 2026-07-07) is shared by ALL bundled wrapped systems: openclaw, langflow,
+# letta. Each per-system egress-forwarder presents its system's leaf to this
+# listener; the gate narrows "any mesh member" to exactly the three transitional
+# system identities. Same stamped-header pattern as openclaw-egress-caller-gate
+# (no CEL — Caddy 2.11.x *url.URL bug). Multiple `not header` lines AND
+# together: the matcher fires only when the stamped SPIFFE matches NONE of the
+# allowed IDs → 403. Empty env values fail CLOSED (no leaf carries an empty
+# URI SAN). This static gate is transitional — caller↔prefix authorisation
+# also runs in OPA (egress_grants, closed-world); pin deletion is the
+# Laura-gated per-instance migration step (design §3.1 step 2).
+(llm-egress-caller-gate) {
+    request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
+    @caller_not_llm_system {
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_OPENCLAW_SPIFFE_ID:spiffe://yashigani.internal/openclaw}"
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_LANGFLOW_SPIFFE_ID:spiffe://yashigani.internal/langflow}"
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_LETTA_SPIFFE_ID:spiffe://yashigani.internal/letta}"
+    }
+    respond @caller_not_llm_system "Forbidden" 403
 }
 
 # Deliver caller gate — only the Yashigani gateway mesh peer may call /deliver/*.
@@ -207,6 +236,27 @@
     # Transport: (internal-mtls) snippet wires caddy's own client cert +
     # ca_intermediate.crt trust pool for the Caddy → gateway:8080 hop.
     # versions 1.1 matches the min-TLS policy on the gateway listener.
+
+    # ── LLM — wrapped systems /llm/* → gateway /egress/eval/llm/* ──────────
+    # Design §2.4 (three-agent wrap 2026-07-07): openclaw + langflow + letta
+    # LLM traffic arrives here from each system's egress-forwarder
+    # (egress-<system>:9400/llm/* → this listener). Shared prefix, per-system
+    # caller identity (the forwarder presents the system leaf). OPA gates the
+    # (caller, llm) tuple; the static llm-egress-caller-gate is the
+    # transitional belt-and-suspenders. Delivery: /deliver/llm/* below →
+    # gateway:8081 (today's inference surface; :8080 openai_router cutover is
+    # §2.4 open item (i), Tom).
+    handle /llm/* {
+        route {
+            import llm-egress-caller-gate
+            rewrite * /egress/eval{uri}
+            reverse_proxy https://gateway:8080 {
+                import internal-mtls
+                header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+                header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+            }
+        }
+    }
 
     # ── Slack Web API — openclaw /slack/* → gateway /egress/eval/slack/* ───
     handle /slack/* {
@@ -337,6 +387,28 @@
                     tls
                     tls_server_name api.telegram.org
                 }
+            }
+        }
+    }
+
+    # ── Deliver: LLM — gateway inference surface (INTERNAL class) ──────────
+    # deliver_to `gateway-inference` (codegen reserved internal class): the
+    # ONLY deliver handle that never leaves the mesh. Target is gateway:8081
+    # — the same OpenAI-compatible surface the agents dialled directly before
+    # the wrap (plain HTTP; AgentAuthMiddleware bearer auth still applies at
+    # the app layer — the agents' Authorization headers traverse eval →
+    # deliver untouched). handle_path strips /deliver/llm so the upstream
+    # sees /v1/... exactly as before. §2.4 open item (i): cutover to the
+    # mTLS :8080 openai_router is Tom's follow-up; until confirmed, :8081
+    # preserves today's working semantics with governance added in front.
+    handle_path /deliver/llm/* {
+        route {
+            import gateway-egress-deliver-gate
+            reverse_proxy http://gateway:8081 {
+                header_up Host gateway
+                header_up -X-SPIFFE-ID
+                header_up -X-Caddy-Verified-Secret
+                header_up -X-Yashigani-Verified-Spiffe
             }
         }
     }

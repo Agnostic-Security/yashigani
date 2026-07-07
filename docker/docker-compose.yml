@@ -231,6 +231,13 @@ services:
       # per-instance trust domain — matches the URI SAN install.sh bakes into
       # openclaw_client.crt (service_identities.yaml `openclaw` entry).
       YASHIGANI_OPENCLAW_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/openclaw
+      # v4.1 three-agent wrap (2026-07-07): the :18790 /llm eval handle is
+      # shared by openclaw + langflow + letta (llm-egress-caller-gate in
+      # Caddyfile.openclaw-egress; parse-time env substitution). Each system's
+      # egress-forwarder presents that system's leaf; these compose the
+      # admitted IDs from the per-instance trust domain.
+      YASHIGANI_LANGFLOW_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/langflow
+      YASHIGANI_LETTA_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/letta
       # v4.1 Phase 1c (LAURA-I1-03): when "1" (install.sh sets it iff the
       # openclaw profile is enabled), caddy-entrypoint.sh appends
       # slack.com:443 hooks.slack.com:443 api.telegram.org:443 to the iptables
@@ -362,11 +369,17 @@ services:
       # Ollama ringfence bridge. Sole path to Ollama's :11434 is the :11435
       # mesh front above → ringfence → ollama. No shared-bridge L3 side-door.
       - ollama_ringfence
-      # v4.1 Phase 1c (LAURA-I1-03 / FP-03): dedicated 2-member bridge
-      # {caddy, openclaw}. Carries BOTH openclaw directions: outbound
-      # openclaw → caddy:18790 (egress gateway) and inbound webhook delivery
-      # caddy → openclaw:18789. No other container joins this bridge.
-      - openclaw_ringfence
+      # v4.1 three-agent wrap (2026-07-07): the former openclaw_ringfence is
+      # SUBSUMED by the template-standard INGRESS ringfence (design §2.6):
+      # ringfence_openclaw_in = EXACTLY {caddy, openclaw}. Carries both
+      # legacy openclaw directions: inbound webhook delivery
+      # caddy → openclaw:18789 (Caddyfile.openclaw-webhooks) and the
+      # transitional direct openclaw → caddy:18790 overlap path. The egress
+      # FORWARDER is NEVER on this bridge (I1-02 invariant); openclaw's
+      # governed egress rides ringfence_openclaw_eg via egress-openclaw.
+      # (The generated openclaw-egress-forwarder.override.yml also adds this
+      # membership — compose merge dedupes.)
+      - ringfence_openclaw_in
 
   # ---------------------------------------------------------------------------
   # Gateway — MCP reverse proxy (data plane)
@@ -2147,13 +2160,19 @@ services:
       - '--'
     command: ["python", "-m", "langflow", "run", "--host", "0.0.0.0", "--port", "7860"]
     environment:
-      # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
-      # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route langflow
-      # through gateway's internal mesh port (8081, plain HTTP, data-network-only).
-      # open-webui got this fix at v2.23.4 BUG-2; langflow + letta were added later
-      # and inherited the wrong value. Network isolation on `data` bridge is the
-      # transport guard; AgentAuthMiddleware enforces token auth at the app layer.
-      OPENAI_API_BASE: http://gateway:8081/v1
+      # v4.1 three-agent wrap (2026-07-07): ALL LLM calls dial langflow's
+      # EGRESS FORWARDER (egress-langflow:9400 — stood up by
+      # docker/langflow-egress-forwarder.override.yml when the langflow
+      # bundle is enabled; install.sh compose_up layers it, fail-closed).
+      # OPENAI_API_BASE is langflow's REAL config mechanism (OpenAI SDK env,
+      # unchanged key — only the value repoints). The forwarder — sole
+      # holder of the langflow SVID — presents the leaf to caddy:18790/llm
+      # → gateway /egress/eval/llm (body inspection + OPA grant) →
+      # /deliver/llm → gateway:8081/v1 (the same surface as before, now with
+      # governance in front). The langflow_yashigani_token bearer STAYS
+      # (pin-AND-grant overlap): AgentAuthMiddleware still authenticates at
+      # the app layer.
+      OPENAI_API_BASE: http://egress-langflow:9400/llm/v1
       # OPENAI_API_KEY is injected by the entrypoint shim from
       # /run/secrets/yashigani_internal_bearer — do NOT set it here.
       # Default model for new flows
@@ -2211,14 +2230,23 @@ services:
     # langflow is no longer a consumer of the shared yashigani_internal_bearer.
     # YSG-SECRETS-DIST-002: blast radius unchanged (bearer GID 2002 group reduced
     # by 1 consumer — strictly tighter). See compose lines 587-591 for original note.
-    # YSG-RISK-055 UA-10 (v2.24.1): langflow moves from `data` to
-    # `langflow_isolated`. Gateway joins langflow_isolated so langflow can still
-    # resolve `gateway` by DNS and route LLM calls via OPENAI_API_BASE.
-    # langflow CANNOT resolve letta or openclaw by DNS — they are not members
-    # of this bridge. Direct peer-to-peer TCP access is severed at L2.
-    # Does NOT join caddy_internal (auth HELD per synthesis §2.5).
+    # v4.1 three-agent wrap (2026-07-07): langflow moves onto the unified
+    # §2.6 SPLIT-RINGFENCE topology — off `langflow_isolated`:
+    #   ringfence_langflow_in — EXACTLY {langflow, caddy} (ingress zone,
+    #     dormant until the §2.5 verify-gate ingress phase lands).
+    #   ringfence_langflow_eg — EXACTLY {langflow, egress-langflow}. LLM
+    #     egress dials egress-langflow:9400/llm/v1 (OPENAI_API_BASE above).
+    # Leaving langflow_isolated CLOSES the sidecar bypass: langflow can no
+    # longer dial gateway:8081 directly — its only egress is the forwarder.
+    # langflow CANNOT resolve letta or openclaw (separate bridges); L2
+    # severance unchanged. Does NOT join caddy_internal (synthesis §2.5).
+    # KNOWN COST (surfaced, pending §2.5 ingress phase): gateway
+    # langflow_client.py and backoffice user_agents.py dials to
+    # langflow:7860 lose L3 reach — gateway/backoffice are deliberately NOT
+    # ringfence members (2-member invariant, I1-02).
     networks:
-      - langflow_isolated
+      - ringfence_langflow_in
+      - ringfence_langflow_eg
     profiles:
       - langflow
 
@@ -2323,15 +2351,18 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
-    # YSG-RISK-055 UA-10 (v2.24.1): letta-pgbouncer straddles letta_isolated
-    # and data. It needs letta_isolated so letta can resolve letta-pgbouncer
-    # by DNS for the LETTA_PG_URI postgresql://...@letta-pgbouncer:5432/letta
-    # connection. It needs data to dial postgres:5432 upstream (postgres lives
-    # on data). This is a deliberate and documented exception — pgbouncer is
-    # a session-mode TLS sidecar, not an agent. It cannot resolve langflow or
-    # openclaw (they are on their own isolated bridges, not data).
+    # v4.1 three-agent wrap (2026-07-07): letta_isolated membership moves to
+    # the dedicated 2-member `letta_db` bridge — {letta, letta-pgbouncer}
+    # EXACTLY. letta resolves letta-pgbouncer by DNS for the LETTA_PG_URI
+    # postgresql://...@letta-pgbouncer:5432/letta connection over letta_db;
+    # pgbouncer still straddles onto `data` to dial postgres:5432 upstream
+    # over full mTLS. The DB wire protocol is NOT HTTP egress — it does not
+    # traverse the egress-letta forwarder (design §3.3: the pgbouncer
+    # sidecar keeps its own scoped DB leaf). Deliberate, documented
+    # exception — pgbouncer is a session-mode TLS sidecar, not an agent. It
+    # cannot resolve langflow or openclaw (separate bridges, not data).
     networks:
-      - letta_isolated
+      - letta_db
       - data
     profiles:
       - letta
@@ -2484,13 +2515,19 @@ services:
       # "external redis" and does NOT relaunch its own with the bad dir.
       - 'OPENAI_API_KEY=$(cat /run/secrets/yashigani_internal_bearer) && export OPENAI_API_KEY && mkdir -p /root/.letta/redis && redis-server --daemonize yes --bind 127.0.0.1 --dir /root/.letta/redis --stop-writes-on-bgsave-error no && export LETTA_REDIS_HOST=localhost && export LETTA_REDIS_PORT=6379 && exec /app/letta/server/startup.sh'
     environment:
-      # Route LLM calls through Yashigani gateway (OpenAI-compatible)
-      # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route letta
-      # through gateway's internal mesh port (8081, plain HTTP, data-network-only).
-      # open-webui got this fix at v2.23.4 BUG-2; langflow + letta were added later
-      # and inherited the wrong value. Network isolation on `data` bridge is the
-      # transport guard; AgentAuthMiddleware enforces token auth at the app layer.
-      OPENAI_API_BASE: http://gateway:8081/v1
+      # v4.1 three-agent wrap (2026-07-07): ALL LLM calls dial letta's
+      # EGRESS FORWARDER (egress-letta:9400 — stood up by
+      # docker/letta-egress-forwarder.override.yml when the letta bundle is
+      # enabled; install.sh compose_up layers it, fail-closed).
+      # OPENAI_API_BASE is letta's REAL config mechanism (OpenAI SDK env,
+      # unchanged key — only the value repoints). The forwarder — sole
+      # holder of the letta SVID — presents the leaf to caddy:18790/llm
+      # → gateway /egress/eval/llm (body inspection + OPA grant) →
+      # /deliver/llm → gateway:8081/v1 (the same surface as before, now with
+      # governance in front). The yashigani_internal_bearer STAYS
+      # (pin-AND-grant overlap): AgentAuthMiddleware still authenticates at
+      # the app layer.
+      OPENAI_API_BASE: http://egress-letta:9400/llm/v1
       # OPENAI_API_KEY is injected by the entrypoint shim from
       # /run/secrets/yashigani_internal_bearer — do NOT set it here.
       # SC-AGENT-003 (3.1): LETTA_LLM_MODEL and LETTA_EMBEDDING_MODEL are NOT real
@@ -2575,12 +2612,26 @@ services:
     # yashigani_internal_bearer as file owner (host file chowned 0:2002 0640).
     # cap_drop:[ALL] drops DAC_OVERRIDE — UID 0 == file UID 0, so owner-read
     # applies without needing DAC_OVERRIDE. GID 2002 removed from this service.
-    # YSG-RISK-055 UA-10 (v2.24.1): letta moves from `data` to `letta_isolated`.
-    # Gateway joins letta_isolated for dispatch. letta-pgbouncer also joins
-    # letta_isolated so letta can reach it via DNS (letta-pgbouncer:5432).
-    # letta CANNOT resolve langflow or openclaw — they are on separate bridges.
+    # v4.1 three-agent wrap (2026-07-07): letta moves onto the unified §2.6
+    # SPLIT-RINGFENCE topology — off `letta_isolated`:
+    #   ringfence_letta_in — EXACTLY {letta, caddy} (ingress zone, dormant
+    #     until the §2.5 verify-gate ingress phase lands).
+    #   ringfence_letta_eg — EXACTLY {letta, egress-letta}. LLM egress dials
+    #     egress-letta:9400/llm/v1 (OPENAI_API_BASE above).
+    #   letta_db — EXACTLY {letta, letta-pgbouncer}. The DB path
+    #     (LETTA_PG_URI → letta-pgbouncer:5432 → postgres over mTLS) is a
+    #     wire-protocol sidecar leg, not HTTP egress — it stays off the
+    #     forwarder by design (§3.3).
+    # Leaving letta_isolated CLOSES the sidecar bypass: letta can no longer
+    # dial gateway:8081 directly — its only HTTP egress is the forwarder.
+    # letta CANNOT resolve langflow or openclaw — separate bridges.
+    # KNOWN COST (surfaced, pending §2.5 ingress phase): gateway
+    # letta_client.py dials to letta:8283 lose L3 reach — gateway is
+    # deliberately NOT a ringfence member (2-member invariant, I1-02).
     networks:
-      - letta_isolated
+      - ringfence_letta_in
+      - ringfence_letta_eg
+      - letta_db
     profiles:
       - letta
 
@@ -2605,7 +2656,7 @@ services:
     # internal:true — Docker cannot DNAT a host publish into internal-only
     # networks, and inbound must arrive EXCLUSIVELY via the Caddy webhook
     # routes (/webhooks/{slack,telegram} → signature verify → openclaw:18789
-    # over openclaw_ringfence). openclaw's :18789 stays bridge-local.
+    # over ringfence_openclaw_in). openclaw's :18789 stays bridge-local.
     expose:
       - "18789"
     # Captain Bucket-C NOTE: openclaw.json contains __YASHIGANI_INTERNAL_BEARER__
@@ -2620,41 +2671,44 @@ services:
       OPENCLAW_DISABLE_CAMERA: "true"
       OPENCLAW_DISABLE_LOCATION: "true"
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
-      # v4.1 Phase 1c (LAURA-I1-03): trust anchor for the :18790 egress
-      # gateway's server cert (internal PKI). Standard Node.js extra-CA hook —
-      # applies to all of openclaw's outbound TLS.
+      # v4.1 Phase 1c (LAURA-I1-03): trust anchor for internal-PKI server
+      # certs. Standard Node.js extra-CA hook — applies to all of openclaw's
+      # outbound TLS.
       NODE_EXTRA_CA_CERTS: /etc/openclaw/tls/ca.crt
-      # v4.1 Phase 2b (unified-sidecar): openclaw's Slack/Telegram SDK calls
-      # dial the per-system EGRESS FORWARDER (egress-openclaw:9400 — stood up
+      # v4.1 three-agent wrap (2026-07-07): openclaw's outbound is repointed
+      # at the per-system EGRESS FORWARDER (egress-openclaw:9400 — stood up
       # by docker/openclaw-egress-forwarder.override.yml when the openclaw
-      # bundle is enabled; install.sh compose_up layers it, fail-closed).
+      # bundle is enabled; install.sh compose_up layers it, fail-closed)
+      # via openclaw's REAL, schema-validated config keys in openclaw.json:
+      #   models.providers.yashigani.baseUrl → http://egress-openclaw:9400/llm/v1
+      #   channels.telegram.apiRoot          → http://egress-openclaw:9400/telegram
       # The forwarder — SOLE holder of the SVID mount — presents the openclaw
       # leaf to caddy:18790 → /egress/eval; the hop openclaw→forwarder is
       # plain HTTP on the 2-member ringfence_openclaw_eg bridge (T2 rationale).
       #
+      # REMOVED 2026-07-07 (schema-verified against ghcr.io/openclaw/openclaw
+      # 2026.5.6): the former top-level `egress` block in openclaw.json was an
+      # INVENTED key — the binary's config validator REJECTS unknown keys
+      # ("Unrecognized key: egress" → gateway crash-loop). The former
+      # OPENCLAW_{SLACK_API,SLACK_HOOKS,TELEGRAM_API}_BASE_URL and
+      # OPENCLAW_EGRESS_TLS_{CERT,KEY}_FILE env vars were equally fabricated —
+      # the binary never reads them (verified: grep of /app/dist +
+      # /app/extensions in the pinned image).
+      #
+      # Slack: openclaw 2026.5.6 has NO Slack API base-URL config (hardcoded
+      # slack.com in @slack/web-api; only an HTTP CONNECT proxy is supported
+      # via HTTPS_PROXY/OPENCLAW_PROXY_URL — the forwarder is a reverse
+      # proxy, not a CONNECT proxy). Slack egress therefore CANNOT be
+      # repointed yet; the :18790 + forwarder /slack handles stay in place
+      # for the future proxy/upstream mechanism. No regression: openclaw's
+      # bridges are internal-only, so direct slack.com egress was already
+      # unreachable.
+      #
       # OVERLAP (synthesis must-fix #1 — pin-AND-grant, one full release):
-      # the :18790 static caller pin + destination/account pins stay in force;
-      # openclaw's own client-cert material stays mounted and configured:
-      #
-      # (1) openclaw.json egress block (primary): OPENCLAW_CONFIG_PATH points
-      #     the binary at openclaw.json; `egress.slack.apiBaseUrl` /
-      #     `egress.telegram.apiBaseUrl` route SDK calls through the forwarder.
-      #     The `egress.tls.{certFile,keyFile}` fields stay (overlap — retire
-      #     with the pins at the Laura-gated per-instance migration, §3.1).
-      #
-      # (2) OPENCLAW_EGRESS_TLS_* env vars (belt-and-suspenders): cover any
-      #     runtime paths that read env directly rather than the JSON config.
-      #
-      # Static proof: /etc/openclaw/tls/client.crt (mounted from
-      # ./secrets/openclaw_client.crt) carries URI SAN
-      # spiffe://yashigani.internal/openclaw (service_identities.yaml:248) —
-      # the SAME leaf the forwarder presents, so the :18790 CEL caller gate
-      # accepts the forwarder hop unchanged.
-      OPENCLAW_SLACK_API_BASE_URL: "http://egress-openclaw:9400/slack"
-      OPENCLAW_SLACK_HOOKS_BASE_URL: "http://egress-openclaw:9400/slack-hooks"
-      OPENCLAW_TELEGRAM_API_BASE_URL: "http://egress-openclaw:9400/telegram"
-      OPENCLAW_EGRESS_TLS_CERT_FILE: /etc/openclaw/tls/client.crt
-      OPENCLAW_EGRESS_TLS_KEY_FILE: /etc/openclaw/tls/client.key
+      # the :18790 static caller pin + destination/account pins stay in
+      # force; openclaw's own client-cert mounts (below) stay so the direct
+      # :18790 path remains provable until the Laura-gated per-instance
+      # migration (§3.1).
     volumes:
       - openclaw_data:/home/node/.openclaw
       # YSG-BUG-2255-002: mount the runtime copy (bearer substituted by install.sh step 8f),
@@ -2699,29 +2753,31 @@ services:
     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (openclaw profile).
     # No cap_add: openclaw binds port 18789 (non-privileged).
     cap_drop: [ALL]
-    # YSG-RISK-055 UA-10 (v2.24.1): openclaw moves from `data` to
-    # `openclaw_isolated`. Gateway joins openclaw_isolated for dispatch.
-    # openclaw CANNOT resolve langflow or letta — they are on separate bridges.
+    # v4.1 three-agent wrap (2026-07-07): openclaw moves onto the unified
+    # §2.6 SPLIT-RINGFENCE topology — off `openclaw_isolated` and off the
+    # ad-hoc `openclaw_ringfence` (both subsumed):
+    #   ringfence_openclaw_in — EXACTLY {openclaw, caddy}. Inbound webhook
+    #     delivery caddy → openclaw:18789 (Caddyfile.openclaw-webhooks) and
+    #     the transitional direct openclaw → caddy:18790 overlap path.
+    #   ringfence_openclaw_eg — EXACTLY {openclaw, egress-openclaw}. ALL
+    #     governed egress (llm + telegram today; slack when repointable)
+    #     dials egress-openclaw:9400 (the sole SVID holder) → caddy:18790
+    #     → /egress/eval → OPA → deliver.
+    # Leaving openclaw_isolated CLOSES the sidecar bypass: openclaw can no
+    # longer dial gateway:8081 directly — its LLM path traverses the
+    # forwarder + body inspection + OPA like every other wrapped system.
+    # KNOWN COST (surfaced, pending §2.5 ingress phase): the gateway's
+    # registered-upstream dispatch to openclaw:18789 (install.sh agent
+    # registry) loses L3 reach — gateway is deliberately NOT a ringfence
+    # member (2-member invariant, I1-02). Webhook ingress is unaffected.
     #
-    # v4.1 Phase 1c (LAURA-I1-03, High/Bypass, proven live): `edge` REMOVED.
-    # The old rationale ("openclaw needs internet egress for messaging
-    # channels", EX-231-10) built the exfil path Laura proved: internal:false
-    # bridge membership is bidirectional at L3, so "edge for webhooks" was
-    # arbitrary-internet egress for a container holding
-    # YASHIGANI_INTERNAL_BEARER. Now:
-    #   inbound  — internet → caddy:443 /webhooks/{slack,telegram}
-    #              (signature-verified, Caddyfile.openclaw-webhooks)
-    #              → openclaw:18789 over openclaw_ringfence.
-    #   outbound — openclaw → caddy:18790 egress gateway
-    #              (Caddyfile.openclaw-egress; fixed upstreams slack.com /
-    #              hooks.slack.com / api.telegram.org; SAN-bound to the
-    #              openclaw leaf) over openclaw_ringfence.
-    # Both bridges are internal:true — openclaw has NO internal:false NIC and
-    # no L3 route to the internet (enforced by
-    # tests/invariants/test_openclaw_egress_gateway.py).
+    # v4.1 Phase 1c (LAURA-I1-03, High/Bypass, proven live): `edge` REMOVED
+    # (rationale preserved in git history). Both bridges are internal:true —
+    # openclaw has NO internal:false NIC and no L3 route to the internet
+    # (enforced by tests/invariants/test_openclaw_egress_gateway.py).
     networks:
-      - openclaw_isolated
-      - openclaw_ringfence
+      - ringfence_openclaw_in
+      - ringfence_openclaw_eg
     profiles:
       - openclaw
 
@@ -3202,15 +3258,15 @@ networks:
     # Observability-plane: prometheus, grafana, loki, alertmanager,
     # otel-collector, jaeger. Caddy joins to proxy /admin/grafana etc.
   # YSG-RISK-055 UA-10: per-agent isolated bridges (v2.24.1).
-  # Each agent lives on its own bridge. Gateway joins all three for the
-  # registered-upstream dispatch path. Agents CANNOT reach each other
-  # directly — L2 bridge segmentation enforces this at the kernel level.
-  # letta-pgbouncer also joins `data` (straddling) because it must reach
-  # postgres on the data network. This is documented as a deliberate
-  # exception: letta-pgbouncer is a session-mode TLS sidecar, not an
-  # agent container. Its exposure is limited to the postgres port only
-  # and it cannot resolve langflow/openclaw by DNS (they are not members
-  # of the `data` bridge under this design).
+  # v4.1 three-agent wrap (2026-07-07): AGENTS NO LONGER JOIN these bridges —
+  # they live on the §2.6 split ringfences below. The *_isolated definitions
+  # are retained TRANSITIONALLY because gateway (all three) and backoffice
+  # (langflow) still list them: those are now DEAD EDGES — the agents are
+  # not members, so agent DNS names do not resolve here and the
+  # registered-upstream dispatch path has no L3 reach (surfaced known cost,
+  # pending the §2.5 verify-gate ingress phase). Rollback lever: re-adding
+  # one network line per agent stanza restores the pre-wrap reach.
+  # letta-pgbouncer straddling moved to the dedicated `letta_db` bridge.
   langflow_isolated:
     driver: bridge
     enable_ipv6: false
@@ -3220,6 +3276,48 @@ networks:
     enable_ipv6: false
     internal: true
   openclaw_isolated:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  # ── v4.1 unified-sidecar §2.6 split ringfences (three-agent wrap) ────────
+  # Two bridges per wrapped system — NEVER collapsed (I1-02):
+  #   ringfence_<s>_in — EXACTLY {system, caddy}. Ingress zone. The egress
+  #     forwarder is NEVER a member (a compromised forwarder must have no
+  #     L3 path to the system's plaintext port).
+  #   ringfence_<s>_eg — EXACTLY {system, egress-<s>}. Egress zone. The
+  #     codegen override (docker/<s>-egress-forwarder.override.yml) re-declares
+  #     these identically and adds the forwarder + caddy memberships; the
+  #     definitions live here too so the base file is self-consistent.
+  # Membership is the invariant — codegen validate_ringfence_topology()
+  # errors on any 3rd member in the generated overrides;
+  # tests/invariants/test_openclaw_egress_gateway.py asserts the base.
+  ringfence_openclaw_in:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  ringfence_openclaw_eg:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  ringfence_langflow_in:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  ringfence_langflow_eg:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  ringfence_letta_in:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  ringfence_letta_eg:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
+  # letta DB lane — EXACTLY {letta, letta-pgbouncer}. Wire-protocol sidecar
+  # leg (LETTA_PG_URI), deliberately NOT via the egress forwarder (§3.3).
+  letta_db:
     driver: bridge
     enable_ipv6: false
     internal: true
@@ -3249,14 +3347,8 @@ networks:
     driver: bridge
     enable_ipv6: false
     internal: true
-  # v4.1 Phase 1c (LAURA-I1-03 / FP-03): openclaw ringfence.
-  # Members: openclaw + caddy ONLY. internal:true — no host-external routing.
-  # Carries both openclaw directions: openclaw → caddy:18790 (egress gateway,
-  # fixed-upstream allowlist, mTLS SAN-bound) and caddy → openclaw:18789
-  # (signature-verified webhook delivery). A dedicated 2-member bridge so the
-  # egress gateway can never become a shared relay (FP-03: a bridge-open
-  # egress proxy would be the I1-04 root cause reintroduced).
-  openclaw_ringfence:
-    driver: bridge
-    enable_ipv6: false
-    internal: true
+  # v4.1 three-agent wrap (2026-07-07): the former `openclaw_ringfence`
+  # (Phase 1c, {openclaw, caddy}) is REMOVED — fully subsumed by the
+  # template-standard `ringfence_openclaw_in` above (same two members, same
+  # two directions: caddy → openclaw:18789 webhook delivery and the
+  # transitional direct openclaw → caddy:18790 overlap path).

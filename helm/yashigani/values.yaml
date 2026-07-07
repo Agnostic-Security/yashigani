@@ -1078,27 +1078,28 @@ agentBundles:
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
-      # BUG-V241-OPENCLAW-EXTENDED: gateway:8080 is mTLS-only — openclaw has no
-      # client cert; route to plain-HTTP mesh port :8081. Same class as e4f38f8.
-      OPENCLAW_UPSTREAM_URL: "http://yashigani-gateway:8081"
       OPENCLAW_SERVER_MODE: "true"
       OPENCLAW_DISABLE_AUDIO: "true"
       OPENCLAW_DISABLE_CAMERA: "true"
       OPENCLAW_DISABLE_LOCATION: "true"
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
-      # v4.1 Phase 2b (unified-sidecar): outbound Slack/Telegram dials the
-      # per-system egress-forwarder Service (templates/egress-forwarders.yaml,
-      # rendered from the values-openclaw-egress.yaml overlay — install.sh
-      # layers it whenever this bundle is enabled via --agent-bundles). The
-      # forwarder holds the SVID and presents the leaf to
-      # yashigani-caddy:18790 → /egress/eval; the static caller/destination
-      # pins there remain in force (pin-AND-grant OVERLAP — pin deletion is a
-      # later, Laura-gated step). Do NOT point these at yashigani-caddy:18790
-      # directly: the forwarder is openclaw's outbound-messaging path
-      # (allow-openclaw-egress + the forwarder NetworkPolicies enforce it).
-      OPENCLAW_SLACK_API_BASE_URL: "http://yashigani-egress-openclaw:9400/slack"
-      OPENCLAW_SLACK_HOOKS_BASE_URL: "http://yashigani-egress-openclaw:9400/slack-hooks"
-      OPENCLAW_TELEGRAM_API_BASE_URL: "http://yashigani-egress-openclaw:9400/telegram"
+      # REMOVED 2026-07-07 (v4.1 three-agent wrap — schema-verified against
+      # the pinned ghcr.io/openclaw/openclaw:2026.5.6 image):
+      #   OPENCLAW_UPSTREAM_URL, OPENCLAW_{SLACK_API,SLACK_HOOKS,
+      #   TELEGRAM_API}_BASE_URL were FABRICATED env vars — the binary never
+      #   reads any of them (grep of /app/dist + /app/extensions). openclaw's
+      #   REAL wiring mechanism is its config file (openclaw.json:
+      #   models.providers.<name>.baseUrl for LLM,
+      #   channels.telegram.apiRoot for Telegram; Slack has NO base-URL
+      #   config in 2026.5.6 — CONNECT proxy only).
+      # KNOWN K8s PARITY GAP (flagged, Captain/agent-bundles.yaml): the K8s
+      # openclaw Deployment does not yet mount an openclaw.json ConfigMap —
+      # K8s openclaw therefore has NO working LLM/Telegram repoint (and never
+      # had one: the removed env vars were no-ops). Compose carries the
+      # canonical config at docker/openclaw/openclaw.runtime.json; the K8s
+      # equivalent (ConfigMap + OPENCLAW_CONFIG_PATH + bearer substitution)
+      # must be added by the bundle template for the forwarder path
+      # (yashigani-egress-openclaw:9400/{llm,telegram}) to carry traffic.
     service:
       # Expose OpenClaw's own gateway port for incoming messaging webhooks
       port: 18789
@@ -1129,12 +1130,15 @@ agentBundles:
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
-      # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
-      # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route langflow
-      # through gateway's internal mesh port (8081, plain HTTP). NetworkPolicy is the
-      # transport guard; AgentAuthMiddleware enforces token auth at the app layer.
-      # open-webui got this fix at v2.23.4 BUG-2 (values.yaml line 1175).
-      OPENAI_API_BASE: "http://yashigani-gateway:8081/v1"
+      # v4.1 three-agent wrap (2026-07-07): ALL LLM calls dial langflow's
+      # egress-forwarder Service (templates/egress-forwarders.yaml, rendered
+      # from the values-langflow-egress.yaml overlay — install.sh layers it
+      # whenever this bundle is enabled via --agent-bundles). The forwarder
+      # holds the langflow SVID and presents the leaf to
+      # yashigani-caddy:18790/llm → /egress/eval → /deliver/llm →
+      # yashigani-gateway:8081/v1 (same surface as before, governance in
+      # front). Bearer via secretKeyRef STAYS (pin-AND-grant overlap).
+      OPENAI_API_BASE: "http://yashigani-egress-langflow:9400/llm/v1"
       # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
       # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
@@ -1228,12 +1232,15 @@ agentBundles:
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
-      # Route LLM calls through Yashigani gateway (OpenAI-compatible)
-      # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route letta
-      # through gateway's internal mesh port (8081, plain HTTP). NetworkPolicy is the
-      # transport guard; AgentAuthMiddleware enforces token auth at the app layer.
-      # open-webui got this fix at v2.23.4 BUG-2 (values.yaml line 1175).
-      OPENAI_API_BASE: "http://yashigani-gateway:8081/v1"
+      # v4.1 three-agent wrap (2026-07-07): ALL LLM calls dial letta's
+      # egress-forwarder Service (templates/egress-forwarders.yaml, rendered
+      # from the values-letta-egress.yaml overlay — install.sh layers it
+      # whenever this bundle is enabled via --agent-bundles). The forwarder
+      # holds the letta SVID and presents the leaf to
+      # yashigani-caddy:18790/llm → /egress/eval → /deliver/llm →
+      # yashigani-gateway:8081/v1 (same surface as before, governance in
+      # front). Bearer via secretKeyRef STAYS (pin-AND-grant overlap).
+      OPENAI_API_BASE: "http://yashigani-egress-letta:9400/llm/v1"
       # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
       # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LETTA_LLM_MODEL: "qwen2.5:3b"

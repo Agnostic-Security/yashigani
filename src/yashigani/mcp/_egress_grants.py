@@ -67,39 +67,57 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Egress prefixes exposed by the static openclaw egress Caddyfile
-# (docker/Caddyfile.openclaw-egress /slack/*, /slack-hooks/*, /telegram/*
-# eval handles).  The transitional seed grants EXACTLY this set — no more.
-_OPENCLAW_TRANSITIONAL_PREFIXES = ("slack", "slack-hooks", "telegram")
+# Egress prefixes exposed by the static egress Caddyfile per bundled system
+# (docker/Caddyfile.openclaw-egress eval handles).  The transitional seed
+# grants EXACTLY these sets — no more.  Mirrors each bundle descriptor's
+# spec.egress.needs (bundles/<system>-egress.yaml) exactly.
+#
+# v4.1 three-agent wrap (2026-07-07): langflow + letta join openclaw on the
+# unified egress-forwarder template.  Their ONLY governed outbound is the
+# `llm` class (design §2.4 — /llm eval handle → /deliver/llm →
+# gateway:8081); openclaw additionally keeps its Slack/Telegram prefixes.
+_TRANSITIONAL_SYSTEM_PREFIXES: dict[str, tuple[str, ...]] = {
+    "openclaw": ("llm", "slack", "slack-hooks", "telegram"),
+    "langflow": ("llm",),
+    "letta": ("llm",),
+}
+
+# Retained for backwards compatibility (tests/contract references).
+_OPENCLAW_TRANSITIONAL_PREFIXES = _TRANSITIONAL_SYSTEM_PREFIXES["openclaw"]
 
 
 def transitional_egress_seed() -> dict:
-    """Return the transitional bundled-system egress grants (openclaw).
+    """Return the transitional bundled-system egress grants.
 
-    Keyed on the SAME env-configured SPIFFE the static Caddyfile pin uses
-    (``YASHIGANI_OPENCLAW_SPIFFE_ID``, default
-    ``spiffe://<trust_domain>/openclaw``), granting exactly the prefixes the
-    static egress Caddyfile exposes.  ``legacy_system: true`` is REQUIRED by
-    the rego for system-form (non-/agents/) URIs.
+    One entry per pre-migration bundled system (openclaw, langflow, letta).
+    Keyed on the SAME env-configured SPIFFE the static Caddyfile gates use
+    (``YASHIGANI_<SYSTEM>_SPIFFE_ID``, default
+    ``spiffe://<trust_domain>/<system>``), granting exactly the prefixes the
+    static egress Caddyfile exposes for that system.  ``legacy_system: true``
+    is REQUIRED by the rego for system-form (non-/agents/) URIs.
 
-    Harmless when openclaw is not installed: no leaf carries the seeded URI,
-    so the grant is unreachable.  Retires at openclaw's migration to a
-    per-instance identity.
+    Harmless when a system is not installed: no leaf carries the seeded URI,
+    so the grant is unreachable.  Each entry retires at that system's
+    migration to a per-instance identity (design §3.1-§3.3).
     """
     from yashigani.identity.trust_domain import trust_domain  # noqa: PLC0415
 
-    spiffe = (
-        os.environ.get("YASHIGANI_OPENCLAW_SPIFFE_ID", "").strip()
-        or "spiffe://%s/openclaw" % trust_domain()
-    )
+    td = trust_domain()
     tenant = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
-    return {
-        spiffe: {
+    seed: dict = {}
+    for system, prefixes in _TRANSITIONAL_SYSTEM_PREFIXES.items():
+        spiffe = (
+            os.environ.get(
+                "YASHIGANI_%s_SPIFFE_ID" % system.upper().replace("-", "_"), ""
+            ).strip()
+            or "spiffe://%s/%s" % (td, system)
+        )
+        seed[spiffe] = {
             "tenant": tenant,
-            "prefixes": sorted(_OPENCLAW_TRANSITIONAL_PREFIXES),
+            "prefixes": sorted(prefixes),
             "legacy_system": True,
         }
-    }
+    return seed
 
 
 def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:

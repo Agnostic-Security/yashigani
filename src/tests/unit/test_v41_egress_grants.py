@@ -298,14 +298,25 @@ class TestTransitionalSeedAndDocBuilder:
         monkeypatch.delenv("YASHIGANI_SPIFFE_TRUST_DOMAIN", raising=False)
         monkeypatch.setenv("YASHIGANI_TENANT_ID", "default")
         seed = transitional_egress_seed()
-        # Same default SPIFFE the Caddyfile caller gate pins; same prefixes
-        # the static /slack /slack-hooks /telegram eval handles expose.
+        # Same default SPIFFEs the Caddyfile caller gates pin; same prefixes
+        # the static /llm /slack /slack-hooks /telegram eval handles expose.
+        # v4.1 three-agent wrap (2026-07-07): openclaw + langflow + letta.
         assert seed == {
             "spiffe://yashigani.internal/openclaw": {
                 "tenant": "default",
-                "prefixes": ["slack", "slack-hooks", "telegram"],
+                "prefixes": ["llm", "slack", "slack-hooks", "telegram"],
                 "legacy_system": True,
-            }
+            },
+            "spiffe://yashigani.internal/langflow": {
+                "tenant": "default",
+                "prefixes": ["llm"],
+                "legacy_system": True,
+            },
+            "spiffe://yashigani.internal/letta": {
+                "tenant": "default",
+                "prefixes": ["llm"],
+                "legacy_system": True,
+            },
         }
 
     def test_seed_env_override(self, monkeypatch):
@@ -313,8 +324,20 @@ class TestTransitionalSeedAndDocBuilder:
             "YASHIGANI_OPENCLAW_SPIFFE_ID", "spiffe://acme.yashigani.internal/openclaw",
         )
         seed = transitional_egress_seed()
-        assert list(seed) == ["spiffe://acme.yashigani.internal/openclaw"]
+        assert "spiffe://acme.yashigani.internal/openclaw" in seed
+        assert "spiffe://yashigani.internal/openclaw" not in seed
         assert seed["spiffe://acme.yashigani.internal/openclaw"]["legacy_system"] is True
+
+    def test_seed_env_override_langflow_letta(self, monkeypatch):
+        monkeypatch.setenv(
+            "YASHIGANI_LANGFLOW_SPIFFE_ID", "spiffe://acme.yashigani.internal/langflow",
+        )
+        monkeypatch.setenv(
+            "YASHIGANI_LETTA_SPIFFE_ID", "spiffe://acme.yashigani.internal/letta",
+        )
+        seed = transitional_egress_seed()
+        assert seed["spiffe://acme.yashigani.internal/langflow"]["prefixes"] == ["llm"]
+        assert seed["spiffe://acme.yashigani.internal/letta"]["prefixes"] == ["llm"]
 
     def test_doc_builder_merges_store_over_seed(self, monkeypatch):
         monkeypatch.delenv("YASHIGANI_OPENCLAW_SPIFFE_ID", raising=False)
@@ -329,7 +352,7 @@ class TestTransitionalSeedAndDocBuilder:
 
     def test_doc_builder_none_store_degrades_to_seed_only(self):
         doc = build_egress_grants_doc(None)
-        assert len(doc) == 1  # seed only
+        assert len(doc) == 3  # seed only (openclaw + langflow + letta)
 
     def test_doc_builder_never_raises_on_store_failure(self):
         broken = MagicMock()

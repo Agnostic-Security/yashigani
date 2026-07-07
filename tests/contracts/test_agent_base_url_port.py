@@ -117,17 +117,19 @@ class TestAgentBaseUrlPort:
         assert match, "OPENAI_API_BASE not found in langflow service section"
 
         url = match.group(1)
-        assert f":{_MESH_PORT}" in url, (
-            f"langflow OPENAI_API_BASE must use port {_MESH_PORT} (plain-HTTP mesh).\n"
+        # v4.1 three-agent wrap (2026-07-07): the base URL now dials
+        # langflow's egress FORWARDER; the :8081 mesh-port hop moved to the
+        # :18790 /deliver/llm handle (tests/invariants/
+        # test_openclaw_egress_gateway.py::test_llm_eval_and_deliver_handles_present).
+        assert url == "http://egress-langflow:9400/llm/v1", (
+            f"langflow OPENAI_API_BASE must dial its egress forwarder.\n"
             f"  Current value: {url}\n"
-            f"  Required:      http://gateway:{_MESH_PORT}/v1\n"
-            f"  Bug:           port {_MTLS_PORT} is mTLS-only (ssl.CERT_REQUIRED).\n"
-            f"                 Langflow has no client cert — every LLM call fails.\n"
-            f"  Fix:           change OPENAI_API_BASE to http://gateway:{_MESH_PORT}/v1"
+            f"  Required:      http://egress-langflow:9400/llm/v1\n"
+            f"  A direct gateway URL here reopens the sidecar bypass "
+            f"(unified-sidecar design §2.4)."
         )
         assert f":{_MTLS_PORT}" not in url, (
-            f"langflow OPENAI_API_BASE uses mTLS port {_MTLS_PORT}: {url}\n"
-            f"  BUG-V241-LANGFLOW-LETTA-BASE-URL — fix: http://gateway:{_MESH_PORT}/v1"
+            f"langflow OPENAI_API_BASE uses mTLS port {_MTLS_PORT}: {url}"
         )
 
     def test_letta_openai_api_base_uses_mesh_port(self):
@@ -155,16 +157,16 @@ class TestAgentBaseUrlPort:
         assert match, f"OPENAI_API_BASE not found in letta service section. Section: {section[:300]}"
 
         url = match.group(1)
-        assert f":{_MESH_PORT}" in url, (
-            f"letta OPENAI_API_BASE must use port {_MESH_PORT} (plain-HTTP mesh).\n"
+        # v4.1 three-agent wrap (2026-07-07): forwarder URL — see langflow note.
+        assert url == "http://egress-letta:9400/llm/v1", (
+            f"letta OPENAI_API_BASE must dial its egress forwarder.\n"
             f"  Current value: {url}\n"
-            f"  Required:      http://gateway:{_MESH_PORT}/v1\n"
-            f"  Bug:           port {_MTLS_PORT} is mTLS-only. Letta has no client cert.\n"
-            f"  Fix:           change OPENAI_API_BASE to http://gateway:{_MESH_PORT}/v1"
+            f"  Required:      http://egress-letta:9400/llm/v1\n"
+            f"  A direct gateway URL here reopens the sidecar bypass "
+            f"(unified-sidecar design §2.4)."
         )
         assert f":{_MTLS_PORT}" not in url, (
-            f"letta OPENAI_API_BASE uses mTLS port {_MTLS_PORT}: {url}\n"
-            f"  BUG-V241-LANGFLOW-LETTA-BASE-URL — fix: http://gateway:{_MESH_PORT}/v1"
+            f"letta OPENAI_API_BASE uses mTLS port {_MTLS_PORT}: {url}"
         )
 
     def test_open_webui_openai_api_base_url_uses_mesh_port(self):
@@ -176,7 +178,8 @@ class TestAgentBaseUrlPort:
         """
         text = _compose_text()
         section = _extract_service_section(text, "open-webui")
-        assert section, "open-webui service section not found in docker-compose.yml"
+        if not section:
+            pytest.skip("open-webui removed in 4.0 (ui4 SPA served by backoffice)")
 
         match = re.search(r'OPENAI_API_BASE_URL:\s*(\S+)', section)
         assert match, "OPENAI_API_BASE_URL not found in open-webui service section"
@@ -196,30 +199,32 @@ class TestAgentBaseUrlPort:
         Documents the invariant: every service that calls the gateway for LLM
         inference MUST use the internal mesh port (8081), never the mTLS port.
         """
+        # v4.1 three-agent wrap (2026-07-07): each agent dials ITS OWN
+        # egress forwarder — same port (9400), per-agent host. The :8081
+        # mesh-port invariant moved to the :18790 /deliver/llm handle.
         text = _compose_text()
-        ports: dict[str, int | None] = {}
+        urls: dict[str, str] = {}
+        expected = {
+            "langflow": "http://egress-langflow:9400/llm/v1",
+            "letta": "http://egress-letta:9400/llm/v1",
+        }
 
         for service, env_var in [
             ("langflow",   "OPENAI_API_BASE"),
             ("letta",      "OPENAI_API_BASE"),
-            ("open-webui", "OPENAI_API_BASE_URL"),
         ]:
             section = _extract_service_section(text, service)
             if not section:
                 continue
             match = re.search(rf'{re.escape(env_var)}:\s*(\S+)', section)
             if match:
-                url = match.group(1)
-                port_match = re.search(r':(\d+)/', url)
-                ports[service] = int(port_match.group(1)) if port_match else None
+                urls[service] = match.group(1)
 
-        assert len(ports) >= 2, f"Could not extract ports for parity check: {ports}"
-
-        wrong = {svc: p for svc, p in ports.items() if p != _MESH_PORT}
+        assert len(urls) == 2, f"Could not extract agent base URLs: {urls}"
+        wrong = {svc: u for svc, u in urls.items() if u != expected[svc]}
         assert not wrong, (
-            f"Services using wrong gateway port:\n"
-            + "\n".join(f"  {svc}: port {p} (expected {_MESH_PORT})" for svc, p in wrong.items())
-            + f"\n  BUG-V241-LANGFLOW-LETTA-BASE-URL — all must use port {_MESH_PORT}."
+            "Agents not dialling their own egress forwarder:\n"
+            + "\n".join(f"  {svc}: {u} (expected {expected[svc]})" for svc, u in wrong.items())
         )
 
     def test_no_agent_uses_mtls_port_as_base_url(self):
@@ -278,16 +283,21 @@ class TestHelmAgentBaseUrlPort:
         matches = list(re.finditer(r'OPENAI_API_BASE:\s*"?(http://[^"\s]+)"?', text))
         assert matches, "No OPENAI_API_BASE found in Helm values.yaml"
 
+        # v4.1 three-agent wrap (2026-07-07): Helm agents dial their egress
+        # forwarder Services (yashigani-egress-<agent>:9400/llm/v1).
+        allowed = {
+            "http://yashigani-egress-langflow:9400/llm/v1",
+            "http://yashigani-egress-letta:9400/llm/v1",
+        }
         for match in matches:
             url = match.group(1).strip('"')
             assert f":{_MTLS_PORT}" not in url, (
-                f"Helm values.yaml OPENAI_API_BASE uses mTLS port {_MTLS_PORT}: {url}\n"
-                f"  Fix: change to http://yashigani-gateway:{_MESH_PORT}/v1\n"
-                f"  BUG-V241-LANGFLOW-LETTA-BASE-URL / YSG-RISK-059"
+                f"Helm values.yaml OPENAI_API_BASE uses mTLS port {_MTLS_PORT}: {url}"
             )
-            assert f":{_MESH_PORT}" in url, (
-                f"Helm values.yaml OPENAI_API_BASE uses unexpected port: {url}\n"
-                f"  Expected port {_MESH_PORT} (plain-HTTP mesh)."
+            assert url in allowed, (
+                f"Helm values.yaml OPENAI_API_BASE not a per-agent forwarder URL: {url}\n"
+                f"  Allowed: {sorted(allowed)}\n"
+                f"  A direct gateway URL reopens the sidecar bypass (design §2.4)."
             )
 
     def test_helm_no_agent_uses_mtls_port_as_base_url(self):
@@ -388,18 +398,18 @@ class TestOpenclawJsonConfig:
 
         base_url = providers["yashigani"].get("baseUrl", "")
         assert base_url, "openclaw.json: models.providers.yashigani.baseUrl is missing or empty"
-        assert f":{_MESH_PORT}" in base_url, (
-            f"openclaw.json baseUrl must use port {_MESH_PORT} (plain-HTTP mesh).\n"
+        # v4.1 three-agent wrap (2026-07-07): baseUrl dials the openclaw
+        # egress forwarder; the :8081 hop moved to the :18790 /deliver/llm
+        # handle. A direct gateway URL reopens the sidecar bypass.
+        assert base_url == "http://egress-openclaw:9400/llm/v1", (
+            f"openclaw.json baseUrl must dial the egress forwarder.\n"
             f"  Current value: {base_url!r}\n"
-            f"  Required:      http://gateway:{_MESH_PORT}/v1\n"
-            f"  Bug:           port {_MTLS_PORT} is mTLS-only (ssl.CERT_REQUIRED).\n"
-            f"                 openclaw has no client cert — every LLM call fails.\n"
-            f"  Fix:           change baseUrl to http://gateway:{_MESH_PORT}/v1\n"
-            f"  BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076"
+            f"  Required:      http://egress-openclaw:9400/llm/v1"
         )
         assert f":{_MTLS_PORT}" not in base_url, (
             f"openclaw.json baseUrl uses mTLS port {_MTLS_PORT}: {base_url!r}\n"
-            f"  BUG-V241-OPENCLAW-EXTENDED — fix: http://gateway:{_MESH_PORT}/v1"
+            f"  BUG-V241-OPENCLAW-EXTENDED — the mTLS listener requires a "
+            f"client cert openclaw does not hold."
         )
 
     def test_openclaw_json_base_url_scheme(self):
