@@ -35,6 +35,7 @@ _SERVER = "cloud9-demo"
 _NHI = "nhi_0123456789ab"
 _AGENT_SPIFFE = f"spiffe://{_TD}/agents/{_TENANT}/letta/{_NHI}"
 _GATEWAY_SPIFFE = f"spiffe://{_TD}/gateway"
+_BACKOFFICE_SPIFFE = f"spiffe://{_TD}/backoffice"
 
 
 def _mock_request(spiffe: str | None) -> MagicMock:
@@ -120,6 +121,28 @@ class TestVerifyMcpAllows:
         assert resp.headers["X-Yashigani-Mcp-Caller"] == _AGENT_SPIFFE
         assert resp.headers["X-Yashigani-Mcp-Envelope"] == "42"
         state.agent_registry.get.assert_called_once_with(_NHI)
+
+    @pytest.mark.asyncio
+    async def test_backoffice_transport_allowed_toward_langflow(self):
+        """v4.1 §2.5: backoffice mesh leaf may dispatch to the bundled
+        langflow front (draft-flow creation) — envelope still required."""
+        state = _mock_state()
+        resp = await _call(
+            _BACKOFFICE_SPIFFE, state, _envelope_svc(), server="langflow",
+        )
+        assert resp.status_code == 200
+        assert resp.headers["X-Yashigani-Mcp-Caller"] == _BACKOFFICE_SPIFFE
+
+    @pytest.mark.asyncio
+    async def test_bundled_agent_front_with_envelope_allows_gateway(self):
+        """A bundled agent (letta) with a bootstrap-minted envelope passes
+        step 3 for gateway-transport dispatch (the §2.5 dispatch path)."""
+        state = _mock_state()
+        resp = await _call(
+            _GATEWAY_SPIFFE, state, _envelope_svc(), server="letta",
+        )
+        assert resp.status_code == 200
+        assert resp.headers["X-Yashigani-Mcp-Envelope"] == "42"
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +268,46 @@ class TestVerifyMcpDenies:
             await _call(_GATEWAY_SPIFFE, state, _envelope_svc(),
                         tenant=tenant, server=server)
         _assert_denied(exc_info, 403, "invalid_target", state)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("server", ["letta", "openclaw", _SERVER])
+    async def test_backoffice_transport_denied_for_other_servers(self, server):
+        """v4.1 §2.5: the backoffice allow is server-scoped to langflow —
+        every other target denies transport_subject_not_allowed."""
+        state = _mock_state()
+        with pytest.raises(HTTPException) as exc_info:
+            await _call(_BACKOFFICE_SPIFFE, state, _envelope_svc(),
+                        server=server)
+        _assert_denied(exc_info, 403, "transport_subject_not_allowed", state)
+
+    @pytest.mark.asyncio
+    async def test_backoffice_transport_denied_for_foreign_tenant(self):
+        """The backoffice allow is tenant-scoped to the install tenant."""
+        state = _mock_state()
+        with pytest.raises(HTTPException) as exc_info:
+            await _call(_BACKOFFICE_SPIFFE, state, _envelope_svc(),
+                        tenant="other-tenant", server="langflow")
+        _assert_denied(exc_info, 403, "transport_subject_not_allowed", state)
+
+    @pytest.mark.asyncio
+    async def test_backoffice_transport_still_requires_envelope(self):
+        """Backoffice→langflow without an ACTIVE envelope stays denied
+        (server_not_onboarded) — the transport allow never bypasses step 3."""
+        state = _mock_state()
+        with pytest.raises(HTTPException) as exc_info:
+            await _call(_BACKOFFICE_SPIFFE, state, _envelope_svc(rec=None),
+                        server="langflow")
+        _assert_denied(exc_info, 403, "server_not_onboarded", state)
+
+    @pytest.mark.asyncio
+    async def test_bundled_agent_without_envelope_still_denied(self):
+        """A bundled agent whose bootstrap envelope is missing keeps the
+        fail-closed deny even for gateway transport (verify-mcp unweakened)."""
+        state = _mock_state()
+        with pytest.raises(HTTPException) as exc_info:
+            await _call(_GATEWAY_SPIFFE, state, _envelope_svc(rec=None),
+                        server="openclaw")
+        _assert_denied(exc_info, 403, "server_not_onboarded", state)
 
     @pytest.mark.asyncio
     async def test_spoofed_header_for_unregistered_instance_denied(self):

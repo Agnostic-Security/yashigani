@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Optional
 
 import httpx
 
+from yashigani.gateway._dispatch_client import agent_dispatch_client
+
 if TYPE_CHECKING:
     from yashigani.pool.manager import PoolManager, CertMount
 
@@ -567,7 +569,11 @@ async def letta_chat(
     Returns:
         OpenAI ChatCompletionResponse-shaped dict
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # v4.1 §2.5: base_url is the letta Caddy ingress front
+    # (https://caddy:9775/agents/default/letta) — present the gateway mesh
+    # leaf.  (The per-user LettaClientPool dials pool containers directly and
+    # is NOT fronted; its bare clients are intentionally unchanged.)
+    async with agent_dispatch_client(timeout=timeout) as client:
         agent_id = await _ensure_agent(client, base_url)
 
         # Send via native API (supports non-streaming)
