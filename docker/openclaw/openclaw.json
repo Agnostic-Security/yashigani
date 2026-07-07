@@ -15,7 +15,7 @@
     "mode": "replace",
     "providers": {
       "yashigani": {
-        "baseUrl": "http://gateway:8081/v1",
+        "baseUrl": "http://egress-openclaw:9400/llm/v1",
         "apiKey": "__YASHIGANI_INTERNAL_BEARER__",
         "api": "openai-completions",
         "models": [
@@ -34,17 +34,10 @@
       "model": "yashigani/qwen2.5:3b"
     }
   },
-  "egress": {
-    "slack": {
-      "apiBaseUrl": "http://egress-openclaw:9400/slack",
-      "hooksBaseUrl": "http://egress-openclaw:9400/slack-hooks"
-    },
+  "channels": {
     "telegram": {
-      "apiBaseUrl": "http://egress-openclaw:9400/telegram"
-    },
-    "tls": {
-      "certFile": "/etc/openclaw/tls/client.crt",
-      "keyFile": "/etc/openclaw/tls/client.key"
+      "enabled": true,
+      "apiRoot": "http://egress-openclaw:9400/telegram"
     }
   }
 }

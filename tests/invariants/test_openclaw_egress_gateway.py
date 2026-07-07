@@ -48,6 +48,14 @@ CADDY_VARIANTS = [
 ]
 OPENCLAW_JSON = REPO_ROOT / "docker" / "openclaw" / "openclaw.json"
 HELM_CONFIGMAPS = REPO_ROOT / "helm" / "yashigani" / "templates" / "configmaps.yaml"
+# The Helm caddy ConfigMap loads the egress listener via
+# .Files.Get "files/Caddyfile.openclaw-egress" (single-source mirror of the
+# canonical docker/Caddyfile.openclaw-egress — B6-style fix). Helm-parity
+# assertions on the :18790 content therefore read THIS file, not the
+# template that merely embeds it.
+HELM_EGRESS_SNIPPET = (
+    REPO_ROOT / "helm" / "yashigani" / "files" / "Caddyfile.openclaw-egress"
+)
 HELM_NETPOL = REPO_ROOT / "helm" / "yashigani" / "templates" / "networkpolicy.yaml"
 
 EGRESS_UPSTREAMS = ("slack.com", "hooks.slack.com", "api.telegram.org")
@@ -84,20 +92,125 @@ def test_openclaw_has_no_host_port_publish(compose: dict) -> None:
     )
 
 
-def test_openclaw_ringfence_is_two_member(compose: dict) -> None:
-    """FP-03: dedicated bridge {openclaw, caddy} ONLY — anything else makes
-    the egress gateway a shared relay (I1-04 root cause reintroduced)."""
+def test_openclaw_ingress_ringfence_is_two_member(compose: dict) -> None:
+    """FP-03 / §2.6 I1-02: dedicated ingress bridge {openclaw, caddy} ONLY in
+    the BASE file — anything else makes the egress gateway a shared relay
+    (I1-04 root cause reintroduced). v4.1 three-agent wrap: the former
+    openclaw_ringfence is subsumed by the template-standard
+    ringfence_openclaw_in (same 2 members). The egress FORWARDER must never
+    appear here — it joins only via the codegen override, and only onto
+    ringfence_openclaw_eg."""
+    assert "openclaw_ringfence" not in compose["networks"], (
+        "openclaw_ringfence is back — it was subsumed by ringfence_openclaw_in"
+    )
     members = sorted(
         name
         for name, svc in compose["services"].items()
-        if "openclaw_ringfence" in (svc.get("networks") or [])
+        if "ringfence_openclaw_in" in (svc.get("networks") or [])
     )
     assert members == ["caddy", "openclaw"], (
-        f"openclaw_ringfence members must be exactly [caddy, openclaw]; got {members}"
+        f"ringfence_openclaw_in members must be exactly [caddy, openclaw]; got {members}"
     )
-    net_def = compose["networks"]["openclaw_ringfence"]
+    net_def = compose["networks"]["ringfence_openclaw_in"]
     assert net_def.get("internal") is True
     assert net_def.get("enable_ipv6") is False
+
+
+def test_wrapped_agents_off_isolated_bridges(compose: dict) -> None:
+    """v4.1 three-agent wrap (2026-07-07): the sidecar-bypass closure. No
+    wrapped agent may sit on its old *_isolated bridge — membership there
+    restores a direct agent → gateway:8081 path that skips the forwarder +
+    /egress/eval + OPA. Design §2.6 topology: each agent is on exactly its
+    split ringfences (+ letta_db for letta's DB sidecar lane)."""
+    expected = {
+        "openclaw": {"ringfence_openclaw_in", "ringfence_openclaw_eg"},
+        "langflow": {"ringfence_langflow_in", "ringfence_langflow_eg"},
+        "letta": {"ringfence_letta_in", "ringfence_letta_eg", "letta_db"},
+    }
+    for agent, want in expected.items():
+        nets = set(compose["services"][agent].get("networks") or [])
+        assert nets == want, f"{agent} networks must be {sorted(want)}; got {sorted(nets)}"
+        for net in nets:
+            net_def = compose["networks"][net]
+            assert net_def.get("internal") is True, f"{net} must be internal:true"
+            assert net_def.get("enable_ipv6") is False, f"{net} must disable IPv6"
+
+
+def test_letta_db_lane_is_two_member(compose: dict) -> None:
+    """letta_db carries ONLY the letta → letta-pgbouncer wire-protocol leg
+    (design §3.3). A third member turns the DB lane into a lateral path."""
+    members = sorted(
+        name
+        for name, svc in compose["services"].items()
+        if "letta_db" in (svc.get("networks") or [])
+    )
+    assert members == ["letta", "letta-pgbouncer"], (
+        f"letta_db members must be exactly [letta, letta-pgbouncer]; got {members}"
+    )
+
+
+def test_agent_llm_egress_dials_forwarder(compose: dict) -> None:
+    """v4.1 three-agent wrap: each agent's LLM egress must dial ITS OWN
+    forwarder — never gateway:8081 directly (bypass) and never another
+    system's forwarder (cross-system caller confusion)."""
+    assert (
+        compose["services"]["langflow"]["environment"]["OPENAI_API_BASE"]
+        == "http://egress-langflow:9400/llm/v1"
+    )
+    assert (
+        compose["services"]["letta"]["environment"]["OPENAI_API_BASE"]
+        == "http://egress-letta:9400/llm/v1"
+    )
+    openclaw_cfg = OPENCLAW_JSON.read_text()
+    assert '"baseUrl": "http://egress-openclaw:9400/llm/v1"' in openclaw_cfg, (
+        "openclaw models provider baseUrl must dial egress-openclaw:9400/llm/v1"
+    )
+    assert '"apiRoot": "http://egress-openclaw:9400/telegram"' in openclaw_cfg, (
+        "openclaw channels.telegram.apiRoot must dial egress-openclaw:9400/telegram"
+    )
+    # The invented top-level `egress` key crashes the binary (config schema
+    # rejects unknown keys — proven live 2026-07-07). Never reintroduce it.
+    import json
+
+    parsed = json.loads(openclaw_cfg)
+    assert "egress" not in parsed, (
+        'openclaw.json carries a top-level "egress" key — openclaw\'s config '
+        "validator REJECTS unknown keys (Unrecognized key: egress → crash-loop)"
+    )
+    # The fabricated env vars must stay gone (binary never reads them).
+    openclaw_env = compose["services"]["openclaw"]["environment"]
+    for fabricated in (
+        "OPENCLAW_SLACK_API_BASE_URL",
+        "OPENCLAW_SLACK_HOOKS_BASE_URL",
+        "OPENCLAW_TELEGRAM_API_BASE_URL",
+        "OPENCLAW_EGRESS_TLS_CERT_FILE",
+        "OPENCLAW_EGRESS_TLS_KEY_FILE",
+    ):
+        assert fabricated not in openclaw_env, (
+            f"{fabricated} is back in compose — the openclaw binary never "
+            f"reads it (verified against the pinned image, 2026-07-07); "
+            f"fictional wiring masks real gaps"
+        )
+
+
+def test_llm_eval_and_deliver_handles_present() -> None:
+    """v4.1 three-agent wrap: the shared /llm prefix must have BOTH halves at
+    :18790 — the eval handle (→ gateway /egress/eval/llm) and the INTERNAL
+    deliver handle (→ gateway:8081). One without the other is a dead path."""
+    text = EGRESS_SNIPPET.read_text()
+    assert "handle /llm/*" in text, ":18790 /llm eval handle missing"
+    assert "import llm-egress-caller-gate" in text, "/llm route must be caller-gated"
+    assert "handle_path /deliver/llm/*" in text, ":18790 /deliver/llm handle missing"
+    assert "reverse_proxy http://gateway:8081" in text, (
+        "/deliver/llm must target the gateway inference surface (gateway:8081)"
+    )
+    # All three transitional system identities must be admitted on /llm.
+    for env in (
+        "YASHIGANI_OPENCLAW_SPIFFE_ID",
+        "YASHIGANI_LANGFLOW_SPIFFE_ID",
+        "YASHIGANI_LETTA_SPIFFE_ID",
+    ):
+        assert env in text, f"llm-egress-caller-gate missing {env} pin"
 
 
 def test_openclaw_mounts_only_its_own_leaf(compose: dict) -> None:
@@ -221,13 +334,19 @@ def test_caddy_mounts_and_env(compose: dict) -> None:
 
 
 def test_helm_carries_egress_and_webhook_render() -> None:
-    text = HELM_CONFIGMAPS.read_text()
-    assert ":18790 {" in text, "helm caddy ConfigMap missing the :18790 egress listener"
+    # The webhook routes are hand-rendered in configmaps.yaml; the :18790
+    # egress listener is embedded via .Files.Get of the files/ mirror.
+    template = HELM_CONFIGMAPS.read_text()
+    assert '.Files.Get "files/Caddyfile.openclaw-egress"' in template, (
+        "helm caddy ConfigMap no longer embeds files/Caddyfile.openclaw-egress"
+    )
+    text = HELM_EGRESS_SNIPPET.read_text()
+    assert ":18790 {" in text, "helm egress mirror missing the :18790 listener"
     for host in EGRESS_UPSTREAMS:
         assert f"reverse_proxy https://{host}" in text
-    assert "handle /webhooks/slack {" in text
-    assert "handle /webhooks/telegram {" in text
-    assert "/auth/verify-webhook?provider=" in text
+    assert "handle /webhooks/slack {" in template
+    assert "handle /webhooks/telegram {" in template
+    assert "/auth/verify-webhook?provider=" in template
 
 
 def test_helm_openclaw_blanket_egress_stays_dead() -> None:
@@ -297,7 +416,7 @@ def test_egress_audit_log_in_compose_snippet() -> None:
 def test_egress_audit_log_in_helm_render() -> None:
     """FP-06/Phase-2: Helm :18790 block must carry the same log directive
     (compose↔Helm parity, Iris rule)."""
-    text = HELM_CONFIGMAPS.read_text()
+    text = HELM_EGRESS_SNIPPET.read_text()
     # The log must be inside the :18790 block — check both are present
     # in the same file (the :18790 block is gated on openclaw.enabled).
     assert "log {" in text, "log directive missing from Helm :18790 render"
@@ -310,7 +429,7 @@ def test_egress_audit_log_in_helm_render() -> None:
 def test_telegram_bot_id_pin_in_helm_render() -> None:
     """FP-06/Phase-2: Helm :18790 block must carry the bot-ID pin expression
     (compose↔Helm parity)."""
-    text = HELM_CONFIGMAPS.read_text()
+    text = HELM_EGRESS_SNIPPET.read_text()
     # Helm renders the bot ID at template time; the pattern to check for is the
     # Helm template variable and the startsWith expression.
     assert "wrong_bot_id" in text, (
@@ -480,7 +599,7 @@ def test_install_provisions_slack_secret_files() -> None:
 def test_slack_enforcement_in_helm_render() -> None:
     """FP-06/Phase-2 compose↔Helm parity: both Slack enforcement blocks must be
     present in the Helm :18790 render (configmaps.yaml)."""
-    text = HELM_CONFIGMAPS.read_text()
+    text = HELM_EGRESS_SNIPPET.read_text()
     # CHANNEL 1: webhook-path pin
     assert "@wrong_slack_hook" in text, (
         "Helm :18790 block missing @wrong_slack_hook matcher (CHANNEL 1 parity)"

@@ -6630,41 +6630,47 @@ compose_up() {
     log_info "Applying Wazuh Docker-runtime + full-mTLS overlay (docker-compose.wazuh.yml)"
   fi
 
-  # v4.1 Phase 2b (unified-sidecar): openclaw egress-forwarder overlay.
-  # When the openclaw bundle is enabled, layer the codegen-emitted override that
-  # stands up the egress-openclaw forwarder + the SPLIT ringfences
-  # (ringfence_openclaw_in = {openclaw, caddy}; ringfence_openclaw_eg =
-  # {openclaw, egress-openclaw} — design §2.6, 2-member invariant). openclaw's
-  # egress base URLs (openclaw.json + OPENCLAW_*_BASE_URL env) dial the
-  # forwarder (http://egress-openclaw:9400/<prefix>), which presents the leaf
-  # to caddy:18790 → /egress/eval. The static caller/destination pins at
-  # :18790 remain in force (pin-AND-grant OVERLAP — synthesis must-fix #1;
-  # pin deletion is a later, Laura-gated step).
+  # v4.1 unified-sidecar (three-agent wrap, 2026-07-07): per-bundle
+  # egress-forwarder overlays. When a bundled agent (openclaw, langflow,
+  # letta) is enabled, layer the codegen-emitted override that stands up the
+  # egress-<agent> forwarder + the SPLIT ringfences
+  # (ringfence_<agent>_in = {<agent>, caddy}; ringfence_<agent>_eg =
+  # {<agent>, egress-<agent>} — design §2.6, 2-member invariant). Each
+  # agent's egress config dials its forwarder
+  # (http://egress-<agent>:9400/<prefix>) via that agent's REAL config
+  # mechanism (openclaw.json models.providers baseUrl + channels.telegram
+  # apiRoot; langflow/letta OPENAI_API_BASE), and the forwarder presents the
+  # agent's leaf to caddy:18790 → /egress/eval. The static caller/destination
+  # pins at :18790 remain in force (pin-AND-grant OVERLAP — synthesis
+  # must-fix #1; pin deletion is a later, Laura-gated step).
   # Probe BOTH COMPOSE_PROFILES and AGENT_BUNDLES — the non-interactive
   # --agent-bundles value is only pushed into COMPOSE_PROFILES at step 8
   # (same defensive pattern as the YASHIGANI_OPENCLAW_EGRESS flag writer).
-  local _openclaw_fwd_overlay="${WORK_DIR}/docker/openclaw-egress-forwarder.override.yml"
-  local _oc_fwd_enabled="false"
-  if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
-    _oc_fwd_enabled="true"
-  else
-    local _oc_fwd_ab=",${AGENT_BUNDLES//[[:space:]]/},"
-    if [[ "$_oc_fwd_ab" == *",openclaw,"* || "$_oc_fwd_ab" == *",all,"* ]]; then
-      _oc_fwd_enabled="true"
-    fi
-  fi
-  if [[ "$_oc_fwd_enabled" == "true" ]]; then
-    if [[ -f "$_openclaw_fwd_overlay" ]]; then
-      compose_files+=("-f" "$_openclaw_fwd_overlay")
-      log_info "Applying openclaw egress-forwarder overlay (unified-sidecar v4.1: egress-openclaw + split ringfences)"
+  local _fwd_agent _fwd_overlay _fwd_enabled _fwd_ab
+  for _fwd_agent in openclaw langflow letta; do
+    _fwd_overlay="${WORK_DIR}/docker/${_fwd_agent}-egress-forwarder.override.yml"
+    _fwd_enabled="false"
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "$_fwd_agent"; then
+      _fwd_enabled="true"
     else
-      # Fail-closed: openclaw's egress base URLs point at the forwarder, so an
-      # enabled openclaw WITHOUT this overlay has no outbound messaging path.
-      log_error "openclaw bundle enabled but overlay not found: ${_openclaw_fwd_overlay}"
-      log_error "openclaw egress dials egress-openclaw:9400 — without the overlay openclaw has NO egress path (fail-closed)"
-      return 1
+      _fwd_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+      if [[ "$_fwd_ab" == *",${_fwd_agent},"* || "$_fwd_ab" == *",all,"* ]]; then
+        _fwd_enabled="true"
+      fi
     fi
-  fi
+    if [[ "$_fwd_enabled" == "true" ]]; then
+      if [[ -f "$_fwd_overlay" ]]; then
+        compose_files+=("-f" "$_fwd_overlay")
+        log_info "Applying ${_fwd_agent} egress-forwarder overlay (unified-sidecar v4.1: egress-${_fwd_agent} + split ringfences)"
+      else
+        # Fail-closed: the agent's egress config points at the forwarder, so
+        # an enabled bundle WITHOUT this overlay has no egress path at all.
+        log_error "${_fwd_agent} bundle enabled but overlay not found: ${_fwd_overlay}"
+        log_error "${_fwd_agent} egress dials egress-${_fwd_agent}:9400 — without the overlay ${_fwd_agent} has NO egress path (fail-closed)"
+        return 1
+      fi
+    fi
+  done
 
   # GPU overlay (Docker runtime): wire the detected NVIDIA GPU into ollama. The base
   # ollama service has its GPU reservation commented out and the nvidia runtime is not
@@ -10867,29 +10873,35 @@ k8s_helm_install() {
     log_info "CMVP_CERT=${CMVP_CERT} — passing --set fips.cmvpCert to helm"
   fi
 
-  # v4.1 Phase 2b (unified-sidecar): openclaw bundle on K8s.
-  # `--agent-bundles openclaw` (or `all`) enables the bundle Deployment AND
-  # layers the codegen-emitted egress-forwarder overlay
-  # (values-openclaw-egress.yaml → templates/egress-forwarders.yaml renders the
-  # yashigani-egress-openclaw Deployment/Service/NetworkPolicies). openclaw's
-  # env base URLs (values.yaml agentBundles.openclaw.env) dial the forwarder
-  # Service (http://yashigani-egress-openclaw:9400/<prefix>) — the K8s half of
-  # the split-zone contract. Static caller/destination pins at :18790 remain
-  # in force (pin-AND-grant OVERLAP; pin deletion is a later, Laura-gated step).
-  # Merge order note: this -f lands AFTER -f .env.helm — distinct key
-  # (egressForwarders), no collision; --set still wins over both.
-  local _oc_helm_ab=",${AGENT_BUNDLES//[[:space:]]/},"
-  if [[ "$_oc_helm_ab" == *",openclaw,"* || "$_oc_helm_ab" == *",all,"* ]]; then
-    local _oc_helm_overlay="${chart_dir}/values-openclaw-egress.yaml"
-    if [[ ! -f "$_oc_helm_overlay" ]]; then
-      # Fail-closed: openclaw env dials the forwarder Service — enabling the
-      # bundle without the forwarder overlay ships a dead egress path.
-      log_error "openclaw bundle requested (--agent-bundles) but overlay not found: ${_oc_helm_overlay}"
-      exit 1
+  # v4.1 unified-sidecar (three-agent wrap, 2026-07-07): bundled agents on
+  # K8s. `--agent-bundles <agent>` (or `all`) enables the bundle Deployment
+  # AND layers the codegen-emitted egress-forwarder overlay
+  # (values-<agent>-egress.yaml → templates/egress-forwarders.yaml renders
+  # the yashigani-egress-<agent> Deployment/Service/NetworkPolicies). Each
+  # agent's env (values.yaml agentBundles.<agent>.env OPENAI_API_BASE for
+  # langflow/letta; openclaw config-file — K8s ConfigMap gap flagged in
+  # values.yaml) dials the forwarder Service
+  # (http://yashigani-egress-<agent>:9400/llm/v1) — the K8s half of the
+  # split-zone contract. Static caller/destination pins at :18790 remain in
+  # force (pin-AND-grant OVERLAP; pin deletion is a later, Laura-gated step).
+  # Merge order note: these -f land AFTER -f .env.helm — distinct key
+  # (egressForwarders, additive per-system map keys), no collision; --set
+  # still wins over both.
+  local _hb_agent _hb_ab _hb_overlay
+  _hb_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+  for _hb_agent in openclaw langflow letta; do
+    if [[ "$_hb_ab" == *",${_hb_agent},"* || "$_hb_ab" == *",all,"* ]]; then
+      _hb_overlay="${chart_dir}/values-${_hb_agent}-egress.yaml"
+      if [[ ! -f "$_hb_overlay" ]]; then
+        # Fail-closed: the agent's env dials the forwarder Service — enabling
+        # the bundle without the forwarder overlay ships a dead egress path.
+        log_error "${_hb_agent} bundle requested (--agent-bundles) but overlay not found: ${_hb_overlay}"
+        exit 1
+      fi
+      helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay")
+      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay (unified-sidecar v4.1)"
     fi
-    helm_args+=(--set agentBundles.openclaw.enabled=true -f "$_oc_helm_overlay")
-    log_info "openclaw bundle enabled (K8s): agentBundles.openclaw.enabled=true + egress-forwarder overlay (unified-sidecar v4.1)"
-  fi
+  done
 
   helm "${helm_args[@]}"
   log_success "Helm release deployed"

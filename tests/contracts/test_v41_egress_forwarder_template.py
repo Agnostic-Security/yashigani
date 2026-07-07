@@ -540,32 +540,51 @@ class TestOpenclawOverlapWiring:
             assert upstream in canonical
 
     def test_openclaw_env_repointed_at_forwarder_overlap_kept(self) -> None:
-        """Phase 2b: openclaw's egress base URLs (compose env + openclaw.json)
-        dial the FORWARDER (egress-openclaw:9400), not caddy:18790 directly.
-        OVERLAP: the client-cert env vars + TLS mounts STAY (they retire with
-        the static pins at the later, Laura-gated per-instance migration)."""
+        """v4.1 three-agent wrap (2026-07-07, supersedes the Phase-2b
+        fiction): openclaw's outbound dials the FORWARDER via openclaw's
+        REAL, schema-validated config keys — the former top-level `egress`
+        json block crashed the binary (Unrecognized key, proven live) and
+        the OPENCLAW_*_BASE_URL / OPENCLAW_EGRESS_TLS_* env vars were never
+        read by the binary (verified against the pinned image).
+        OVERLAP: the client-cert TLS MOUNTS stay (compose volumes) so the
+        direct :18790 path stays provable until the Laura-gated migration."""
+        import json as _json
+
         compose = (REPO_ROOT / "docker" /
                    "docker-compose.yml").read_text(encoding="utf-8")
-        assert 'OPENCLAW_SLACK_API_BASE_URL: "http://egress-openclaw:9400/slack"' in compose
-        assert ('OPENCLAW_SLACK_HOOKS_BASE_URL: '
-                '"http://egress-openclaw:9400/slack-hooks"') in compose
-        assert ('OPENCLAW_TELEGRAM_API_BASE_URL: '
-                '"http://egress-openclaw:9400/telegram"') in compose
+        # The fabricated env wiring must never come back.
+        for fabricated in (
+            "OPENCLAW_SLACK_API_BASE_URL",
+            "OPENCLAW_SLACK_HOOKS_BASE_URL",
+            "OPENCLAW_TELEGRAM_API_BASE_URL",
+            "OPENCLAW_EGRESS_TLS_CERT_FILE",
+            "OPENCLAW_EGRESS_TLS_KEY_FILE",
+        ):
+            assert f"{fabricated}:" not in compose, (
+                f"{fabricated} is back in docker-compose.yml — the openclaw "
+                f"binary never reads it; fictional wiring masks real gaps")
         # No direct-dial base URL may remain anywhere in the compose file.
         assert "https://caddy:18790/slack" not in compose
         assert "https://caddy:18790/telegram" not in compose
-        # OVERLAP: client-cert env vars stay wired (pin-AND-grant phase).
-        assert "OPENCLAW_EGRESS_TLS_CERT_FILE: /etc/openclaw/tls/client.crt" in compose
-        assert "OPENCLAW_EGRESS_TLS_KEY_FILE: /etc/openclaw/tls/client.key" in compose
-        # Primary config (openclaw.json template) repointed identically.
-        oc_json = (REPO_ROOT / "docker" / "openclaw" /
-                   "openclaw.json").read_text(encoding="utf-8")
-        assert '"apiBaseUrl": "http://egress-openclaw:9400/slack"' in oc_json
-        assert '"hooksBaseUrl": "http://egress-openclaw:9400/slack-hooks"' in oc_json
-        assert '"apiBaseUrl": "http://egress-openclaw:9400/telegram"' in oc_json
-        assert "caddy:18790" not in oc_json
-        # OVERLAP: openclaw.json keeps its client-cert TLS block.
-        assert '"certFile": "/etc/openclaw/tls/client.crt"' in oc_json
+        # OVERLAP: client-cert mounts stay wired (pin-AND-grant phase).
+        assert "./secrets/openclaw_client.crt:/etc/openclaw/tls/client.crt:ro" in compose
+        assert "./secrets/openclaw_client.key:/etc/openclaw/tls/client.key:ro" in compose
+        # Primary config (openclaw.json) repointed via REAL schema keys.
+        oc_json_text = (REPO_ROOT / "docker" / "openclaw" /
+                        "openclaw.json").read_text(encoding="utf-8")
+        oc = _json.loads(oc_json_text)
+        assert "egress" not in oc, (
+            "top-level `egress` key is back in openclaw.json — the config "
+            "validator REJECTS unknown keys (crash-loop, proven 2026-07-07)")
+        assert (oc["models"]["providers"]["yashigani"]["baseUrl"]
+                == "http://egress-openclaw:9400/llm/v1")
+        assert (oc["channels"]["telegram"]["apiRoot"]
+                == "http://egress-openclaw:9400/telegram")
+        # channels.telegram.enabled must be explicit — openclaw persists a
+        # plugin auto-enable delta into its (read-only-mounted) config file
+        # otherwise, and startup fails EACCES (proven 2026-07-07).
+        assert oc["channels"]["telegram"]["enabled"] is True
+        assert "caddy:18790" not in oc_json_text
 
     def test_helm_overlay_projects_scoped_items_only(self) -> None:
         values = yaml.safe_load(
@@ -579,7 +598,8 @@ class TestOpenclawOverlapWiring:
             "caKey": "ca_bundle.crt",
         }
         assert entry["shimPort"] == 18789
-        assert sorted(entry["prefixes"]) == ["slack", "slack-hooks", "telegram"]
+        # v4.1 three-agent wrap: the llm class joins the messaging prefixes.
+        assert sorted(entry["prefixes"]) == ["llm", "slack", "slack-hooks", "telegram"]
 
     @pytest.mark.skipif(_CADDY is None, reason="caddy binary not on PATH")
     def test_committed_openclaw_forwarder_caddyfile_c10(self) -> None:

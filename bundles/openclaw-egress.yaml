@@ -62,6 +62,14 @@ spec:
     # eval handles. Adding a prefix here without a matching grant + :18790
     # handle yields fail-closed 403s, never new reach.
     needs:
+      # LLM class (design §2.4, three-agent wrap directive 2026-07-07):
+      # openclaw's models.providers.yashigani.baseUrl (a REAL openclaw config
+      # key — unlike the removed invented `egress` block) dials the forwarder
+      # /llm/v1; delivery is internal via the :18790 /llm eval→deliver
+      # handles. Reserved internal class → no pins (L-US-3 is for
+      # internet-facing needs).
+      - prefix: llm
+        deliver_to: gateway-inference
       - prefix: slack
         deliver_to: slack.com
         pins:
