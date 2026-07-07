@@ -22,12 +22,16 @@
 # this descriptor's egress block moves into openclaw's full onboard manifest.
 #
 # Regenerating the committed artifacts (drift-gated by
-# tests/contracts/test_v41_egress_forwarder_template.py):
+# tests/contracts/test_v41_egress_forwarder_template.py +
+# tests/contracts/test_v41_agent_ingress_template.py):
 #   PYTHONPATH=src python3 -c "
 #     import yaml, pathlib
-#     from yashigani.manifest import render_egress_forwarder_artifacts
+#     from yashigani.manifest import (render_egress_forwarder_artifacts,
+#                                     render_agent_ingress_artifacts)
 #     parsed = yaml.safe_load(open('bundles/openclaw-egress.yaml'))
-#     for rel, content in render_egress_forwarder_artifacts(parsed, 'docker').items():
+#     arts = render_egress_forwarder_artifacts(parsed, 'docker')
+#     arts.update(render_agent_ingress_artifacts(parsed, 'docker'))
+#     for rel, content in arts.items():
 #         pathlib.Path(rel).write_text(content)"
 #
 apiVersion: yashigani.io/v1alpha1
@@ -55,6 +59,15 @@ spec:
     # openclaw's own gateway port — the intra-zone-deny tuple is
     # egress-openclaw -> openclaw:18789 (REFUSED).
     shim_port: 18789
+    # §2.5 INGRESS FRONT mesh-listener port — PINNED to the deterministic
+    # allocator value (sha256("default/openclaw") in [9500,9900)) so the
+    # install.sh registered upstream URL
+    # (https://caddy:9671/agents/default/openclaw) is stable + reviewable.
+    # Webhook ingress (internet → :443 /webhooks/* → verify-webhook →
+    # openclaw:18789 over ringfence_openclaw_in) is UNCHANGED — this front
+    # carries the gateway's registered-upstream dispatch path only.
+    # Drift-gated by tests/contracts/test_v41_agent_ingress_template.py.
+    mesh_port: 9671
 
   egress:
     # Mirrors the transitional OPA grant seed EXACTLY

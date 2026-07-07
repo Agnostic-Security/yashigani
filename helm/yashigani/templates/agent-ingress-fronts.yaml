@@ -1,0 +1,183 @@
+{{/*
+  Yashigani v4.1 unified-sidecar §2.5 — agent INGRESS fronts: mesh Service +
+  NetworkPolicies (bidirectional wrap; conflict note
+  project_v41_design_conflict_ingress_dispatch resolution).
+
+  One entry per wrapped system under .Values.agentIngressFronts (codegen
+  overlay values-<system>-ingress.yaml; map keys unique per (system, tenant)
+  — additive across -f overlays, mcpSvid pattern). The mesh-listener SNIPPET
+  itself is rendered into the yashigani-caddy-agents ConfigMap by
+  templates/caddy-agents-configmap.yaml (import sentinel — no monolith edit).
+
+  WHY A DEDICATED ClusterIP SERVICE: the yashigani-caddy Service is the
+  PUBLIC edge (type LoadBalancer) — putting mesh-listener ports on it would
+  publish the agent fronts on the external LB IP. Same rationale as the
+  yashigani-caddy-admin Service split (SU-SEAM-1d-04). Defence-in-depth:
+  ClusterIP-only → NetworkPolicy (gateway/backoffice pods only) → mesh mTLS
+  require_and_verify → forward_auth /auth/verify-mcp (fail-closed).
+
+  DISPATCH CONTRACT: gateway/backoffice dial
+      https://yashigani-caddy-mesh:<meshPort>/agents/<tenant>/<system>/...
+  presenting their mesh client leaf. The caddy leaf carries the
+  yashigani-caddy-mesh DNS SAN (service_identities.yaml) so hostname
+  verification passes against the internal CA.
+
+  §2.6 INVARIANT UNTOUCHED: the front is caddy CONFIG + K8s plumbing — no
+  new member joins any ingress ringfence. The K8s analogue of the 2-member
+  ringfence_<s>_in is the per-agent ingress NP admitting the caddy pod only.
+*/}}
+{{- $root := . -}}
+{{- $anyEnabled := false -}}
+{{- range $frontID, $front := .Values.agentIngressFronts }}{{ if $front.enabled }}{{ $anyEnabled = true }}{{ end }}{{ end }}
+{{- if $anyEnabled }}
+---
+# ClusterIP Service exposing the per-agent Caddy mesh-listener ports —
+# NEVER on the public LoadBalancer Service (see header rationale).
+apiVersion: v1
+kind: Service
+metadata:
+  name: yashigani-caddy-mesh
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-caddy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: agent-ingress-front
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: yashigani-caddy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    {{- range $frontID, $front := .Values.agentIngressFronts }}
+    {{- if $front.enabled }}
+    - name: mesh-{{ $front.systemName }}
+      port: {{ int $front.meshPort }}
+      targetPort: {{ int $front.meshPort }}
+      protocol: TCP
+    {{- end }}
+    {{- end }}
+{{- range $frontID, $front := .Values.agentIngressFronts }}
+{{- if $front.enabled }}
+{{- $system := required "agentIngressFronts entry requires systemName" $front.systemName }}
+{{- $meshPort := int (required "agentIngressFronts entry requires meshPort" $front.meshPort) }}
+{{- $shimPort := int (required "agentIngressFronts entry requires shimPort" $front.shimPort) }}
+---
+# Caddy pod ingress: gateway + backoffice may dial the {{ $system }} mesh
+# front (:{{ $meshPort }}). Additive with the base caddy policies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-caddy-mesh-ingress-{{ $system }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/component: agent-ingress-front
+    yashigani.io/agent-ingress-front: {{ $system | quote }}
+    {{- include "yashigani.labels" $root | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-caddy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-backoffice
+      ports:
+        - protocol: TCP
+          port: {{ $meshPort }}
+---
+# Gateway + backoffice egress: to the caddy pod on the {{ $system }} mesh
+# front. Registered-upstream dispatch (gateway) and the backoffice langflow
+# flow-create path both ride the front — the direct-to-agent egress allows
+# (YSG-RISK-055 UA-10) become transitional and retire with the K8s
+# split-ringfence parity step.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dispatch-egress-to-mesh-{{ $system }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/component: agent-ingress-front
+    yashigani.io/agent-ingress-front: {{ $system | quote }}
+    {{- include "yashigani.labels" $root | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["yashigani-gateway", "yashigani-backoffice"]
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: {{ $meshPort }}
+---
+# Caddy egress: to the {{ $system }} agent pod on its serve port — the K8s
+# analogue of caddy's ringfence_{{ $system }}_in membership (§2.6: caddy is
+# the agent's SOLE legitimate ingress peer).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-caddy-egress-to-{{ $system }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/component: agent-ingress-front
+    yashigani.io/agent-ingress-front: {{ $system | quote }}
+    {{- include "yashigani.labels" $root | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-caddy
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              yashigani.io/bundle: {{ $system | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $shimPort }}
+---
+# {{ $system }} agent pod ingress: from the caddy pod only, on the serve
+# port. K8s analogue of the strictly-2-member ringfence_{{ $system }}_in
+# ({{ $system }} + caddy). NP allows are additive — the transitional
+# direct gateway→agent allow (UA-10) is retired by the K8s split-ringfence
+# parity step, not here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-agent-ingress-front-{{ $system }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/component: agent-ingress-front
+    yashigani.io/agent-ingress-front: {{ $system | quote }}
+    {{- include "yashigani.labels" $root | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.io/bundle: {{ $system | quote }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: {{ $shimPort }}
+{{- end }}
+{{- end }}
+{{- end }}

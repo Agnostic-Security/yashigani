@@ -41,8 +41,76 @@ metadata:
     yashigani.io/s4-sentinel: "true"
     yashigani.io/p1-phase: "W3-P2a"
     yashigani.io/rationale: >-
-      Empty base ConfigMap for the Caddy agent snippet directory.
-      Populated by ringfence-init codegen when agents are onboarded.
+      Base ConfigMap for the Caddy agent snippet directory.
+      Populated by ringfence-init codegen when agents are onboarded, and by
+      the v4.1 §2.5 agent INGRESS fronts (.Values.agentIngressFronts).
       Mounted at /etc/caddy/agents/ in the Caddy pod (read-only).
+{{- if .Values.agentIngressFronts }}
+data:
+{{- range $frontID, $front := .Values.agentIngressFronts }}
+{{- if $front.enabled }}
+{{- $system := required "agentIngressFronts entry requires systemName" $front.systemName }}
+{{- $tenant := required "agentIngressFronts entry requires tenantId" $front.tenantId }}
+{{- $meshPort := int (required "agentIngressFronts entry requires meshPort" $front.meshPort) }}
+{{- $shimPort := int (required "agentIngressFronts entry requires shimPort" $front.shimPort) }}
+  # v4.1 unified-sidecar §2.5 — agent INGRESS front for {{ $system }} (tenant {{ $tenant }}).
+  # Semantic parity with the codegen compose artifact
+  # docker/caddy/agents/{{ $system }}-ingress.caddy. Documented K8s deltas ONLY:
+  #   1. forward_auth https://backoffice:8443 → https://yashigani-backoffice:8443
+  #   2. reverse_proxy http://{{ $system }}:{{ $shimPort }} → http://yashigani-{{ $system }}:{{ $shimPort }}
+  # Anything else differing from the compose artifact is drift.
+  {{ $system }}-ingress.caddy: |
+    :{{ $meshPort }} {
+        tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+            client_auth {
+                mode require_and_verify
+                trust_pool file /run/secrets/ca_intermediate.crt
+            }
+            protocols tls1.3
+        }
+
+        handle_path /agents/{{ $tenant }}/{{ $system }}/* {
+            # Zero-trust header discipline (EX-231-08): strip inbound, set from
+            # the VERIFIED peer cert's SPIFFE URI SAN. Only Caddy sets this header.
+            request_header -X-SPIFFE-ID
+            request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+            # Strip any client-supplied Layer-B marker (EX-231-10 hygiene).
+            request_header -X-Caddy-Verified-Secret
+
+            # App-layer ingress gate (Caddy IS the auth perimeter) — the ONE
+            # verify gate (design §2.5). Fails closed (403) until the
+            # bundled-agent capability envelope exists for ({{ $tenant }}, {{ $system }}).
+            forward_auth https://yashigani-backoffice:8443 {
+                uri /auth/verify-mcp?tenant={{ $tenant }}&server={{ $system }}
+                header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+                transport http {
+                    tls
+                    tls_trust_pool file /run/secrets/ca_intermediate.crt
+                    tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+                    versions 1.1
+                }
+            }
+
+            # Upstream: the agent bundle Service. Ingress to the agent pod is
+            # NP-restricted to the caddy pod (K8s analogue of the 2-member
+            # ringfence_{{ $system }}_in). Plain HTTP by design (T2).
+            reverse_proxy http://yashigani-{{ $system }}:{{ $shimPort }} {
+                transport http {
+                    max_conns_per_host 64
+                    read_timeout 300s
+                    write_timeout 300s
+                }
+            }
+        }
+
+        # Default-deny: nothing else is served on this listener.
+        handle {
+            respond "Not Found" 404
+        }
+    }
+{{- end }}
+{{- end }}
+{{- else }}
 data: {}
+{{- end }}
 {{- end }}

@@ -52,7 +52,10 @@ schema_version: 1
 services:
 
   - name: caddy
-    dns_sans: [caddy, caddy.internal, yashigani-caddy, yashigani-caddy-admin]
+    # yashigani-caddy-mesh: v4.1 §2.5 agent INGRESS fronts — K8s dispatchers
+    # (gateway/backoffice) hostname-verify the mesh ClusterIP Service name
+    # when dialling https://yashigani-caddy-mesh:<meshPort>/agents/...
+    dns_sans: [caddy, caddy.internal, yashigani-caddy, yashigani-caddy-admin, yashigani-caddy-mesh]
     spiffe_id: spiffe://yashigani.internal/caddy
     purpose: "TLS edge + internal CA root"
     mtls_capable: true

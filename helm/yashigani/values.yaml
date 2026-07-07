@@ -425,6 +425,11 @@ backoffice:
     - langflow
     - letta
     - openclaw
+    # v4.1 §2.5 ingress-fronting: registered agent upstream URLs point at the
+    # Caddy mesh-front ClusterIP Service (https://yashigani-caddy-mesh:
+    # <meshPort>/agents/<tenant>/<system>) instead of the raw agent service.
+    # The raw names above stay during the transition (rollback lever).
+    - yashigani-caddy-mesh
   image:
     # Built locally by install.sh from the v2.24.0 tagged source.
     # For K8s deployments: push to your own private registry and update
@@ -1000,6 +1005,32 @@ caddy:
 # step (unified-sidecar synthesis must-fix #1).
 # ---------------------------------------------------------------------------
 egressForwarders: {}
+
+# ---------------------------------------------------------------------------
+# v4.1 unified-sidecar §2.5 — agent INGRESS fronts (bidirectional wrap)
+#
+# Empty by default. Codegen emits a values-<system>-ingress.yaml overlay per
+# wrapped system with spec.ingress.surface in {openai-api, http-api}; apply
+# with -f alongside the matching agentBundles.<system>.enabled=true. Map
+# keys are unique camelCase per (system, tenant) — additive merges.
+#
+# Rendered by:
+#   templates/caddy-agents-configmap.yaml — mesh-listener snippet into the
+#     yashigani-caddy-agents ConfigMap (semantic parity with the compose
+#     artifact docker/caddy/agents/<system>-ingress.caddy; documented K8s
+#     hostname deltas only: yashigani-backoffice / yashigani-<system>).
+#   templates/agent-ingress-fronts.yaml — yashigani-caddy-mesh ClusterIP
+#     Service (mesh ports are NEVER on the public LoadBalancer Service —
+#     admin-relay rationale) + additive NetworkPolicies
+#     (gateway/backoffice → caddy:<meshPort>; caddy → system:<shimPort>).
+#
+# Gateway/backoffice dispatch to bundled agents rides these fronts — never a
+# direct pod dial (§2.6: the ingress ringfence is strictly 2-member
+# {system, caddy}; K8s analogue: agent ingress NP admits the caddy pod only).
+#   helm upgrade yashigani ./helm/yashigani \
+#     -f helm/yashigani/values-langflow-ingress.yaml
+# ---------------------------------------------------------------------------
+agentIngressFronts: {}
 
 # ---------------------------------------------------------------------------
 # Optional Agent Bundles (v0.8.0)

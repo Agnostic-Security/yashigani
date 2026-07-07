@@ -779,7 +779,26 @@ services:
       # controls: TOTP step-up on every registration, OPA-gated invocation, audit trail.
       # Operators extending with custom agents: append comma-separated names to this value.
       # Example: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES=langflow,letta,openclaw,custom-agent
-      YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw"
+      # v4.1 §2.5 INGRESS-FRONTING: `caddy` added — registered agent upstream
+      # URLs now point at the per-agent Caddy mesh fronts
+      # (https://caddy:<mesh_port>/agents/<tenant>/<agent>). The raw agent
+      # names stay during the transition (rollback lever). The fronts are
+      # mTLS require_and_verify + forward_auth-gated, so trusting `caddy`
+      # here admits only verified, OPA/verify-gated paths — strictly tighter
+      # than the raw-agent trust it supersedes.
+      YASHIGANI_AGENT_UPSTREAM_HOSTNAMES: "langflow,letta,openclaw,caddy"
+      # v4.1 §2.5 INGRESS-FRONTING: backoffice POST /user/agents/generate
+      # (langflow_client.create_flow) dials langflow's Caddy mesh front over
+      # caddy_internal — langflow left langflow_isolated in the §2.6
+      # split-ringfence migration, so the old direct dial has no L3 route.
+      # Port 9705 is PINNED in bundles/langflow-egress.yaml
+      # (spec.ingress.mesh_port); drift-gated by
+      # tests/contracts/test_v41_agent_ingress_template.py.
+      # NOTE (Tom, §2.5 dispatch repoint): langflow_client must present the
+      # backoffice mesh client leaf on this https dial; until that lands the
+      # call fails CLOSED at the TLS handshake (no regression — the direct
+      # path had no route at all).
+      YASHIGANI_LANGFLOW_URL: https://caddy:9705/agents/default/langflow
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
       # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
@@ -936,11 +955,14 @@ services:
     #   internal:true, no-internet-egress posture as the gateway's broker dispatch path.
     #   Harmless when the demo-mcp profile is not active: the bridge exists, the service
     #   does not. Step-up gated on the admin side (StepUpAdminSession).
-    # langflow_isolated: 4.0 — backoffice hosts POST /user/agents/generate which calls
-    #   langflow_client.create_flow() at http://langflow:7860.  Backoffice must join
-    #   langflow_isolated so Langflow is DNS-resolvable from the backoffice process.
-    #   Same internal:true posture; Langflow cannot reach anything outside this bridge
-    #   except gateway (which is also a member). Harmless when langflow profile inactive.
+    # langflow_isolated: 4.0 — backoffice hosts POST /user/agents/generate which called
+    #   langflow_client.create_flow() at http://langflow:7860 over this bridge.
+    #   v4.1 §2.5 INGRESS-FRONTING: langflow LEFT this bridge (split-ringfence
+    #   migration); backoffice now dials the Caddy mesh front instead
+    #   (YASHIGANI_LANGFLOW_URL below → https://caddy:9705/agents/default/langflow
+    #   over caddy_internal). Membership retained as a DEAD EDGE — the one-line
+    #   rollback lever documented in the three-agent wrap (re-adding langflow to
+    #   langflow_isolated restores pre-wrap reach). Harmless while dead.
     networks:
       - caddy_internal
       - data
@@ -2232,18 +2254,23 @@ services:
     # by 1 consumer — strictly tighter). See compose lines 587-591 for original note.
     # v4.1 three-agent wrap (2026-07-07): langflow moves onto the unified
     # §2.6 SPLIT-RINGFENCE topology — off `langflow_isolated`:
-    #   ringfence_langflow_in — EXACTLY {langflow, caddy} (ingress zone,
-    #     dormant until the §2.5 verify-gate ingress phase lands).
+    #   ringfence_langflow_in — EXACTLY {langflow, caddy} (ingress zone —
+    #     LIVE via the §2.5 Caddy mesh front :9705, see below).
     #   ringfence_langflow_eg — EXACTLY {langflow, egress-langflow}. LLM
     #     egress dials egress-langflow:9400/llm/v1 (OPENAI_API_BASE above).
     # Leaving langflow_isolated CLOSES the sidecar bypass: langflow can no
     # longer dial gateway:8081 directly — its only egress is the forwarder.
     # langflow CANNOT resolve letta or openclaw (separate bridges); L2
     # severance unchanged. Does NOT join caddy_internal (synthesis §2.5).
-    # KNOWN COST (surfaced, pending §2.5 ingress phase): gateway
-    # langflow_client.py and backoffice user_agents.py dials to
-    # langflow:7860 lose L3 reach — gateway/backoffice are deliberately NOT
-    # ringfence members (2-member invariant, I1-02).
+    # §2.5 INGRESS FRONT (resolves the surfaced Phase-2b dispatch cost):
+    # gateway/backoffice reach langflow THROUGH the generated Caddy mesh
+    # front (docker/caddy/agents/langflow-ingress.caddy, :9705 — mTLS
+    # require_and_verify + forward_auth /auth/verify-mcp) over the caddy
+    # membership of ringfence_langflow_in. Dispatch targets repointed:
+    # install.sh registered upstream + YASHIGANI_LANGFLOW_URL (backoffice
+    # env above). Gateway/backoffice stay OFF the ringfence (2-member
+    # invariant, I1-02). Pending Tom: mTLS client presentation in
+    # agent_router/langflow_client (fails closed at TLS until then).
     networks:
       - ringfence_langflow_in
       - ringfence_langflow_eg
@@ -2614,8 +2641,8 @@ services:
     # applies without needing DAC_OVERRIDE. GID 2002 removed from this service.
     # v4.1 three-agent wrap (2026-07-07): letta moves onto the unified §2.6
     # SPLIT-RINGFENCE topology — off `letta_isolated`:
-    #   ringfence_letta_in — EXACTLY {letta, caddy} (ingress zone, dormant
-    #     until the §2.5 verify-gate ingress phase lands).
+    #   ringfence_letta_in — EXACTLY {letta, caddy} (ingress zone — LIVE
+    #     via the §2.5 Caddy mesh front :9775, see below).
     #   ringfence_letta_eg — EXACTLY {letta, egress-letta}. LLM egress dials
     #     egress-letta:9400/llm/v1 (OPENAI_API_BASE above).
     #   letta_db — EXACTLY {letta, letta-pgbouncer}. The DB path
@@ -2625,9 +2652,15 @@ services:
     # Leaving letta_isolated CLOSES the sidecar bypass: letta can no longer
     # dial gateway:8081 directly — its only HTTP egress is the forwarder.
     # letta CANNOT resolve langflow or openclaw — separate bridges.
-    # KNOWN COST (surfaced, pending §2.5 ingress phase): gateway
-    # letta_client.py dials to letta:8283 lose L3 reach — gateway is
-    # deliberately NOT a ringfence member (2-member invariant, I1-02).
+    # §2.5 INGRESS FRONT (resolves the surfaced Phase-2b dispatch cost):
+    # gateway reaches letta THROUGH the generated Caddy mesh front
+    # (docker/caddy/agents/letta-ingress.caddy, :9775 — mTLS
+    # require_and_verify + forward_auth /auth/verify-mcp) over the caddy
+    # membership of ringfence_letta_in. Dispatch target repointed:
+    # install.sh registered upstream https://caddy:9775/agents/default/letta.
+    # Gateway stays OFF the ringfence (2-member invariant, I1-02). Pending
+    # Tom: mTLS client presentation in agent_router (fails closed at TLS
+    # until then).
     networks:
       - ringfence_letta_in
       - ringfence_letta_eg
@@ -2766,10 +2799,15 @@ services:
     # Leaving openclaw_isolated CLOSES the sidecar bypass: openclaw can no
     # longer dial gateway:8081 directly — its LLM path traverses the
     # forwarder + body inspection + OPA like every other wrapped system.
-    # KNOWN COST (surfaced, pending §2.5 ingress phase): the gateway's
-    # registered-upstream dispatch to openclaw:18789 (install.sh agent
-    # registry) loses L3 reach — gateway is deliberately NOT a ringfence
-    # member (2-member invariant, I1-02). Webhook ingress is unaffected.
+    # §2.5 INGRESS FRONT (resolves the surfaced Phase-2b dispatch cost):
+    # the gateway's registered-upstream dispatch rides the generated Caddy
+    # mesh front (docker/caddy/agents/openclaw-ingress.caddy, :9671 — mTLS
+    # require_and_verify + forward_auth /auth/verify-mcp) over the caddy
+    # membership of ringfence_openclaw_in; install.sh registers
+    # https://caddy:9671/agents/default/openclaw. Gateway stays OFF the
+    # ringfence (2-member invariant, I1-02). Webhook ingress is unaffected
+    # (same bridge, separate :443 /webhooks/* path). Pending Tom: mTLS
+    # client presentation in agent_router (fails closed at TLS until then).
     #
     # v4.1 Phase 1c (LAURA-I1-03, High/Bypass, proven live): `edge` REMOVED
     # (rationale preserved in git history). Both bridges are internal:true —

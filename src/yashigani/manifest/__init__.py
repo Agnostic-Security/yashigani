@@ -28,10 +28,15 @@ Entry points:
   render_egress_forwarder_artifacts(p, runtime)
                                        — v4.1 Phase 2a: per-system egress-forwarder
                                          artifact set (spec.egress.needs != [])
+  render_agent_ingress_artifacts(p, runtime)
+                                       — v4.1 §2.5: per-system agent INGRESS-front
+                                         artifact set (surface openai-api/http-api)
+  resolve_agent_ingress_port(p)        — §2.5 ingress mesh-listener port (pinned
+                                         or deterministic; shared MCP allocator)
   validate_ringfence_topology(text, s) — §2.6 I1-02 gate: 2-member ringfence
                                          invariant (errors on any 3rd member)
 
-Last updated: 2026-07-06T00:00:00+00:00
+Last updated: 2026-07-07T00:00:00+00:00
 """
 from yashigani.manifest.parser import parse_manifest, ManifestParseError
 from yashigani.manifest.schema import validate_schema, assert_schema_valid, ManifestSchemaError
@@ -42,8 +47,10 @@ from yashigani.manifest.codegen import (
     CodegenEngine,
     CodegenEngineShapeC,
     CodegenError,
+    render_agent_ingress_artifacts,
     render_egress_forwarder_artifacts,
     reset_codegen_registry,
+    resolve_agent_ingress_port,
     resolve_egress_forwarder_port,
     seed_mesh_ports_from_descriptors,
     validate_ringfence_topology,
@@ -70,6 +77,8 @@ __all__ = [
     "resolve_egress_forwarder_port",
     "MCP_EGRESS_FORWARDER_PORT",
     "is_shape_c",
+    "render_agent_ingress_artifacts",
     "render_egress_forwarder_artifacts",
+    "resolve_agent_ingress_port",
     "validate_ringfence_topology",
 ]

@@ -231,6 +231,18 @@ spec:
             - name: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES
               value: {{ .Values.backoffice.agentUpstreamHostnames | join "," | quote }}
             {{- end }}
+            {{- range $frontID, $front := .Values.agentIngressFronts }}
+            {{- if and $front.enabled (eq $front.systemName "langflow") }}
+            # v4.1 §2.5 INGRESS-FRONTING: backoffice POST /user/agents/generate
+            # (langflow_client.create_flow) dials langflow's Caddy mesh front —
+            # never the agent pod directly (§2.6 K8s analogue: langflow ingress
+            # NP admits the caddy pod only). Mirrors compose
+            # YASHIGANI_LANGFLOW_URL. Port sourced from the codegen overlay
+            # values-langflow-ingress.yaml (single source, drift-gated).
+            - name: YASHIGANI_LANGFLOW_URL
+              value: "https://yashigani-caddy-mesh:{{ int $front.meshPort }}/agents/{{ $front.tenantId }}/{{ $front.systemName }}"
+            {{- end }}
+            {{- end }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:

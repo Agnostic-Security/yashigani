@@ -26,12 +26,16 @@
 # RETIRES when letta migrates to a per-instance /agents/ identity.
 #
 # Regenerating the committed artifacts (drift-gated by
-# tests/contracts/test_v41_egress_forwarder_template.py):
+# tests/contracts/test_v41_egress_forwarder_template.py +
+# tests/contracts/test_v41_agent_ingress_template.py):
 #   PYTHONPATH=src python3 -c "
 #     import yaml, pathlib
-#     from yashigani.manifest import render_egress_forwarder_artifacts
+#     from yashigani.manifest import (render_egress_forwarder_artifacts,
+#                                     render_agent_ingress_artifacts)
 #     parsed = yaml.safe_load(open('bundles/letta-egress.yaml'))
-#     for rel, content in render_egress_forwarder_artifacts(parsed, 'docker').items():
+#     arts = render_egress_forwarder_artifacts(parsed, 'docker')
+#     arts.update(render_agent_ingress_artifacts(parsed, 'docker'))
+#     for rel, content in arts.items():
 #         pathlib.Path(rel).write_text(content)"
 #
 apiVersion: yashigani.io/v1alpha1
@@ -59,6 +63,12 @@ spec:
     # letta's API port — the intra-zone-deny tuple is
     # egress-letta -> letta:8283 (REFUSED).
     shim_port: 8283
+    # §2.5 INGRESS FRONT mesh-listener port — PINNED to the deterministic
+    # allocator value (sha256("default/letta") in [9500,9900)) so the
+    # install.sh registered upstream URL
+    # (https://caddy:9775/agents/default/letta) is stable + reviewable.
+    # Drift-gated by tests/contracts/test_v41_agent_ingress_template.py.
+    mesh_port: 9775
 
   egress:
     needs:

@@ -8506,11 +8506,24 @@ register_agent_bundles() {
     # empty so letta/openclaw inherit the pre-4.0 open-group behaviour unchanged.
     local _lf_groups='[]' _lf_caller_groups='[]' _lf_paths='[]'
     local _lf_kind="" _lf_ceiling=""
+    # v4.1 unified-sidecar §2.5 INGRESS-FRONTING: registered upstream URLs
+    # point at each agent's Caddy mesh front, NOT the raw agent hostname —
+    # the §2.6 split-ringfence migration removed gateway L3 reach to the
+    # agents (ingress ringfence is strictly 2-member {agent, caddy}).
+    #   https://caddy:<mesh_port>/agents/<tenant>/<agent>  →  forward_auth
+    #   /auth/verify-mcp → reverse_proxy agent:<port> over ringfence_<s>_in.
+    # Mesh ports are PINNED in bundles/<agent>-egress.yaml
+    # (spec.ingress.mesh_port) and drift-gated by
+    # tests/contracts/test_v41_agent_ingress_template.py — change them THERE.
+    # NOTE (Tom, §2.5 dispatch repoint): gateway agent_router + backoffice
+    # langflow_client must present the mesh client leaf on https upstreams;
+    # until that lands, dispatch through the front fails CLOSED at the TLS
+    # handshake (no regression — the direct path had no L3 route at all).
     case "$_profile" in
-      langflow)  local _name="agent__langflow"  _url="http://langflow:7860"  _proto="openai"
+      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="openai"
                  # Phase 5 §C — Langflow callee registration caps (RISK-108 / §E.11)
                  # agent__langflow is a P1-only callee: only the gateway can be its upstream
-                 # (OPENAI_API_BASE=http://gateway:8081/v1 — enforced in compose/helm).
+                 # (OPENAI_API_BASE=http://egress-langflow:9400/llm/v1 — enforced in compose/helm).
                  # allowed_caller_groups: any logged-in user or admin may invoke it.
                  # allowed_paths: constrained to the OpenAI-compat chat endpoint only.
                  # sensitivity_ceiling: INTERNAL (hard-cap also enforced in policy/agents.rego).
@@ -8520,8 +8533,8 @@ register_agent_bundles() {
                  _lf_caller_groups='["admin","user"]'
                  _lf_paths='["/v1/chat/completions"]'
                  ;;
-      letta)     local _name="letta"     _url="http://letta:8283"     _proto="letta" ;;
-      openclaw)  local _name="openclaw"  _url="http://openclaw:18789" _proto="openai" ;;
+      letta)     local _name="letta"     _url="https://caddy:9775/agents/default/letta"     _proto="letta" ;;
+      openclaw)  local _name="openclaw"  _url="https://caddy:9671/agents/default/openclaw"  _proto="openai" ;;
       *) continue ;;
     esac
     $first || agents_json+=','

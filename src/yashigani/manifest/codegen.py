@@ -2796,6 +2796,337 @@ def render_egress_forwarder_artifacts(
     }
 
 
+# ---------------------------------------------------------------------------
+# v4.1 unified-sidecar §2.5 — agent INGRESS front (bidirectional wrap)
+# ---------------------------------------------------------------------------
+# Su's Phase-2b conflict note (project_v41_design_conflict_ingress_dispatch):
+# moving the bundled agents onto the §2.6 split ringfences (correct, I1-02)
+# severed gateway→agent + backoffice→langflow dispatch — gateway/backoffice
+# are deliberately NOT members of the strictly-2-member ingress ringfence.
+# §2.5 resolution: every wrapped agent gets a Caddy INGRESS front on its
+# ringfence_<s>_in (Caddy is already the sole legitimate co-member), and
+# dispatchers reach the agent THROUGH the front:
+#     gateway/backoffice ──mTLS──▶ caddy:<mesh_port>/agents/<t>/<s>/*
+#         ──forward_auth /auth/verify-mcp──▶ (ONE gate, §2.5 — no parallel
+#         /auth/verify-system endpoint, no second trust path)
+#         ──reverse_proxy──▶ http://<system>:<shim_port>  (ringfence_<s>_in)
+# The 2-member invariant is untouched: the front is CADDY CONFIG, not a new
+# bridge member — validate_ringfence_topology() still errors on any 3rd
+# member of ringfence_<s>_in.
+
+# Ingress surfaces frontable by the agent ingress template.  "mcp" systems
+# use the dedicated MCP wrap (_gen_caddy_snippet_mcp — per-instance leaf +
+# broker path); "none"/absent means the system serves nothing (egress-only)
+# and gets NO front (capability-keyed, never name-keyed).
+_AGENT_INGRESS_SURFACES: frozenset[str] = frozenset({"openai-api", "http-api"})
+
+
+def _agent_ingress_surface(parsed: dict) -> Optional[str]:
+    """Return the frontable ingress surface for this descriptor, or None.
+
+    Raises:
+        CodegenError: INGRESS_surface_invalid on an unknown surface value.
+    """
+    ingress = ((parsed.get("spec") or {}).get("ingress") or {})
+    surface = ingress.get("surface")
+    if surface is None or surface == "none":
+        return None
+    if surface == "mcp":
+        # MCP systems are fronted by the per-instance MCP wrap, not this
+        # template — returning None keeps the two paths disjoint.
+        return None
+    if surface not in _AGENT_INGRESS_SURFACES:
+        raise CodegenError(
+            "INGRESS_surface_invalid",
+            "spec.ingress.surface=%r for system %r is not one of %s (or "
+            "mcp/none)." % (
+                surface,
+                (parsed.get("metadata") or {}).get("name", ""),
+                sorted(_AGENT_INGRESS_SURFACES)),
+        )
+    return surface
+
+
+def resolve_agent_ingress_port(parsed: dict) -> int:
+    """Resolve the per-agent Caddy ingress mesh-listener port (§2.5).
+
+    Explicit ``spec.ingress.mesh_port`` wins (bundled agents PIN it so
+    install.sh / compose env dispatch URLs are stable and reviewable);
+    otherwise the deterministic sha256(tenant_id/name) default in
+    [_MCP_MESH_PORT_BASE, _MCP_MESH_PORT_BASE + _MCP_MESH_PORT_RANGE) —
+    the SAME algorithm and the SAME session registry as _mcp_mesh_port,
+    so agent ingress fronts and MCP mesh listeners share one collision
+    domain (Captain Q3: one range, one registry, one abort path).
+
+    Raises:
+        CodegenError: INGRESS_mesh_port_invalid, MCP_mesh_port_collision.
+    """
+    meta = parsed.get("metadata") or {}
+    ingress = ((parsed.get("spec") or {}).get("ingress") or {})
+    tenant_id = meta.get("tenant_id", "")
+    system = meta.get("name", "")
+
+    explicit = ingress.get("mesh_port")
+    if explicit is not None:
+        if not isinstance(explicit, int) or isinstance(explicit, bool) or \
+                not (1024 <= explicit <= 65535) or explicit in _MCP_RESERVED_PORTS:
+            raise CodegenError(
+                "INGRESS_mesh_port_invalid",
+                "spec.ingress.mesh_port=%r for system %r is invalid: must be "
+                "an integer in 1024-65535 and not one of the reserved "
+                "base-listener ports %s." % (
+                    explicit, system, sorted(_MCP_RESERVED_PORTS)),
+            )
+        port = explicit
+    else:
+        digest = hashlib.sha256(
+            ("%s/%s" % (tenant_id, system)).encode("utf-8")
+        ).digest()
+        port = _MCP_MESH_PORT_BASE + int.from_bytes(digest[:4], "big") % _MCP_MESH_PORT_RANGE
+
+    prior = _SEEN_MESH_PORTS.get(port)
+    if prior is not None and prior != (tenant_id, system):
+        raise CodegenError(
+            "MCP_mesh_port_collision",
+            "agent ingress mesh port %d for (tenant=%r, system=%r) collides "
+            "with (tenant=%r, server=%r) in this codegen session. Pin a "
+            "distinct spec.ingress.mesh_port on one of them." % (
+                port, tenant_id, system, prior[0], prior[1]),
+        )
+    _SEEN_MESH_PORTS[port] = (tenant_id, system)
+    return port
+
+
+def _gen_agent_ingress_caddyfile(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """Generate docker/caddy/agents/<system>-ingress.caddy — the §2.5 front.
+
+    Auto-imported by the existing ``import /etc/caddy/agents/*.caddy``
+    sentinel (compose mount ./caddy/agents:ro; K8s: the yashigani-caddy-agents
+    ConfigMap renders the same block with documented hostname deltas) — NO
+    monolith edit.
+
+      - tls caddy mesh leaf + client_auth require_and_verify: mirrors the
+        PROVEN Ollama-front listener (docker/Caddyfile.ollama-front:28-37 —
+        live-verified with gateway/backoffice mesh clients).  TRANSITIONAL:
+        the listener presents Caddy's own mesh leaf, NOT a per-instance agent
+        leaf — the bundled agents' hand-minted service leaves are
+        clientAuth-EKU-only (install.sh mint path) and cannot serve a TLS
+        listener.  Per-instance leaf presentation arrives with the §3.1-3.3
+        per-instance identity migration (same upgrade as the MCP wrap).
+      - handle_path /agents/<tenant>/<system>/*: route namespace (C3
+        analogue); prefix stripped so the agent sees its own native paths
+        (langflow /api/v1/*, openai-compat /v1/chat/completions, ...).
+      - X-SPIFFE-ID strip-before-set from the VERIFIED peer cert URI SAN
+        (zero-trust header discipline, EX-231-08).
+      - forward_auth backoffice /auth/verify-mcp — the ONE ingress gate
+        (§2.5: envelope-at-onboard for every system; no parallel
+        /auth/verify-system endpoint).  FAILS CLOSED for bundled agents
+        until the registration flow creates their capability envelopes
+        (Tom — flagged in the §2.5 dispatch report); a deny here is 403,
+        never an open path.
+      - reverse_proxy http://<system>:<shim_port> over ringfence_<s>_in
+        (2-member: system + caddy).  Plain HTTP on the isolated bridge is
+        intentional (T2).  C8 conn-pool cap; long read/write timeouts for
+        LLM generate latency (WARMUP-001 rationale, as the Ollama front).
+      - default handle → 404 (nothing else served on this listener).
+    """
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    shim_port = _resolve_shim_port(parsed)
+    mesh_port = resolve_agent_ingress_port(parsed)
+    route_prefix = "/agents/%s/%s" % (tenant_id, system)
+
+    rootless_note = ""
+    if runtime == "podman-rootless":
+        rootless_note = "    # %s\n" % _ROOTLESS_L1_GAP_WARNING.lstrip("# ")
+
+    content = textwrap.dedent("""\
+        {header}
+        # v4.1 unified-sidecar §2.5 — agent INGRESS front for system: {system} (tenant: {tenant_id})
+        # Restores gateway/backoffice dispatch severed by the §2.6 split-ringfence
+        # migration (I1-02): dispatchers dial THIS mesh listener; Caddy — the sole
+        # legitimate co-member of ringfence_{system}_in — proxies to the agent.
+        # Listener leaf: Caddy mesh leaf (Ollama-front precedent). TRANSITIONAL —
+        # per-instance leaf presentation lands with the §3.x identity migration.
+        :{mesh_port} {{
+            tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {{
+                client_auth {{
+                    mode require_and_verify
+                    trust_pool file /run/secrets/ca_intermediate.crt
+                }}
+                protocols tls1.3
+            }}
+
+            handle_path {route_prefix}/* {{
+        {rootless_note}        # Zero-trust header discipline (EX-231-08): strip inbound, set from
+                # the VERIFIED peer cert's SPIFFE URI SAN. Only Caddy sets this header.
+                request_header -X-SPIFFE-ID
+                request_header X-SPIFFE-ID {{http.request.tls.client.san.uris.0}}
+                # Strip any client-supplied Layer-B marker before we set our own
+                # on the forward_auth hop below (EX-231-10 hygiene).
+                request_header -X-Caddy-Verified-Secret
+
+                # App-layer ingress gate (Caddy IS the auth perimeter) — the ONE
+                # verify gate (§2.5). Fails closed (403) until the bundled-agent
+                # capability envelope exists for ({tenant_id}, {system}).
+                forward_auth https://backoffice:8443 {{
+                    uri /auth/verify-mcp?tenant={tenant_id}&server={system}
+                    # Layer B (EX-231-10): per-install HMAC marker — parse-time env
+                    # substitution, same rationale as the MCP-front snippet.
+                    header_up X-Caddy-Verified-Secret {{$CADDY_INTERNAL_HMAC}}
+                    transport http {{
+                        tls
+                        tls_trust_pool file /run/secrets/ca_intermediate.crt
+                        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+                        versions 1.1
+                    }}
+                }}
+
+                # Upstream: the agent on ringfence_{system}_in (internal:true;
+                # Caddy is the only other member — §2.6 invariant, enforced by
+                # validate_ringfence_topology). Plain HTTP by design (T2).
+                # C8: connection-pool cap. Long timeouts: LLM generate latency
+                # (WARMUP-001 rationale — mirrors the Ollama front).
+                reverse_proxy http://{system}:{shim_port} {{
+                    transport http {{
+                        max_conns_per_host {max_conns}
+                        read_timeout 300s
+                        write_timeout 300s
+                    }}
+                }}
+            }}
+
+            # Default-deny: nothing else is served on this listener.
+            handle {{
+                respond "Not Found" 404
+            }}
+        }}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        system=system,
+        tenant_id=tenant_id,
+        mesh_port=mesh_port,
+        route_prefix=route_prefix,
+        shim_port=shim_port,
+        max_conns=_C8_MAX_CONNS_PER_HOST_DEFAULT,
+        rootless_note=rootless_note,
+    )
+    return content
+
+
+def _gen_values_agent_ingress(
+    parsed: dict,
+    *,
+    manifest_hash: str,
+    runtime: str,
+) -> str:
+    """Generate helm/yashigani/values-<system>-ingress.yaml (K8s parity).
+
+    Additive-map values (mcpSvid / egressForwarders rationale): each system
+    gets a unique camelCase key under ``agentIngressFronts``; the chart
+    renders (a) the snippet into the yashigani-caddy-agents ConfigMap
+    (templates/caddy-agents-configmap.yaml — semantic parity with the
+    compose artifact, documented K8s hostname deltas only), (b) the
+    yashigani-caddy-mesh ClusterIP Service port, and (c) the additive
+    NetworkPolicies for gateway/backoffice→caddy:<meshPort> and
+    caddy→system:<shimPort> (templates/agent-ingress-fronts.yaml).
+    """
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    shim_port = _resolve_shim_port(parsed)
+    mesh_port = resolve_agent_ingress_port(parsed)
+    helm_key = _mcp_svid_helm_key(tenant_id, system)
+
+    content = textwrap.dedent("""\
+        {header}
+        # v4.1 unified-sidecar §2.5 — agent INGRESS front Helm values for
+        # system: {system} (tenant: {tenant_id})
+        # Rendered by templates/caddy-agents-configmap.yaml (snippet) +
+        # templates/agent-ingress-fronts.yaml (mesh Service + NetworkPolicies).
+        # Map key is unique per (system, tenant) so multiple -f overlays merge
+        # additively (mcpSvid pattern).
+        agentIngressFronts:
+          {helm_key}:
+            enabled: true
+            systemName: {system}
+            tenantId: {tenant_id}
+            # Agent's serve port — Caddy proxies to it over the K8s analogue
+            # of ringfence_{system}_in (agent ingress NP: caddy pod only).
+            shimPort: {shim_port}
+            # Mesh-front listener port (shared allocator with the MCP range
+            # [9500,9900); pinned in the bundle descriptor).
+            meshPort: {mesh_port}
+    """).format(
+        header=_header_comment(manifest_hash, runtime),
+        system=system,
+        tenant_id=tenant_id,
+        helm_key=helm_key,
+        shim_port=shim_port,
+        mesh_port=mesh_port,
+    )
+    return content
+
+
+def render_agent_ingress_artifacts(
+    parsed: dict,
+    runtime: str,
+    *,
+    caddy_validator: Optional[Callable[[str], int]] = None,
+) -> dict[str, str]:
+    """Render the per-system agent INGRESS-front artifact set (§2.5 public API).
+
+    Capability-keyed, never name-keyed: any system descriptor with
+    ``spec.ingress.surface`` in {openai-api, http-api} gets the set; surface
+    mcp/none/absent gets ``{}`` (MCP systems use the per-instance MCP wrap;
+    egress-only systems serve nothing).
+
+    Artifact set:
+      docker/caddy/agents/<system>-ingress.caddy   (C10-validated; picked up
+          by the import /etc/caddy/agents/*.caddy sentinel — no monolith edit)
+      helm/yashigani/values-<system>-ingress.yaml  (K8s parity)
+
+    Raises:
+        CodegenError: INVALID_RUNTIME, INGRESS_*, MCP_mesh_port_collision, C10_*.
+    """
+    if runtime not in VALID_RUNTIMES:
+        raise CodegenError(
+            "INVALID_RUNTIME",
+            "runtime %r is not one of %s" % (runtime, sorted(VALID_RUNTIMES)),
+        )
+    if _agent_ingress_surface(parsed) is None:
+        return {}
+
+    meta = parsed.get("metadata") or {}
+    system = meta.get("name", "")
+
+    mhash = _manifest_hash(parsed)
+    kwargs: dict[str, Any] = {"manifest_hash": mhash, "runtime": runtime}
+
+    caddy_content = _gen_agent_ingress_caddyfile(parsed, **kwargs)
+    values_content = _gen_values_agent_ingress(parsed, **kwargs)
+
+    # C10 on the front snippet — same two-stage gate as the MCP front
+    # (adapt on raw + validate with ephemeral cert substitution).
+    _validate_caddy_snippet_mcp(
+        caddy_content,
+        ["/run/secrets/caddy_client.crt", "/run/secrets/ca_intermediate.crt"],
+        ["/run/secrets/caddy_client.key"],
+        _validator=caddy_validator,
+    )
+
+    return {
+        "docker/caddy/agents/%s-ingress.caddy" % system: caddy_content,
+        "helm/yashigani/values-%s-ingress.yaml" % system: values_content,
+    }
+
+
 def _gen_caddy_snippet_mcp(
     parsed: dict,
     *,
