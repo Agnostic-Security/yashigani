@@ -53,6 +53,9 @@ import './modules/crypto-inventory.js';
 // Observability module group (feat/4.0-monitoring-ui): Grafana / Wazuh SIEM /
 // Loki logs / Alertmanager, embedded via Su's same-origin admin-gated proxy.
 import './modules/monitoring.js';
+// 4.1 Phase B — Agent Policy Templates (agent-admin-policy-templates-design-20260708.md).
+// New module in the Agents group — B1 apply/revoke, B4 XSS-safe render, B5 residuals.
+import './modules/agent-policies.js';
 
 // Register the named TT policy before any sink runs (spec §1). `widgets` is
 // referenced so its side-effect import (ys-* custom elements incl. ys-toast /

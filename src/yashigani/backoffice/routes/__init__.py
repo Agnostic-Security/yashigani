@@ -76,6 +76,8 @@ from yashigani.backoffice.routes.user_conversations import router as user_conver
 from yashigani.backoffice.routes.user_workflows import router as user_workflows_router
 # 4.0 Admin workflow-oversight (cross-user read + disable; AdminSession / StepUpAdminSession)
 from yashigani.backoffice.routes.admin_workflows import router as admin_workflows_router
+# 4.1 Phase B — Agent Policy Templates (policy template apply/revoke + status join)
+from yashigani.backoffice.routes.agent_policies import router as agent_policies_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -140,4 +142,6 @@ __all__ = [
     "user_workflows_router",
     # 4.0 Admin workflow-oversight (cross-user read + disable)
     "admin_workflows_router",
+    # 4.1 Phase B — Agent Policy Templates
+    "agent_policies_router",
 ]

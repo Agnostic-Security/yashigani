@@ -382,6 +382,27 @@ endpoint_acls:
       - spiffe://yashigani.internal/caddy
       - spiffe://yashigani.internal/backoffice
 
+  # 4.1 Phase B — Agent Policy Templates mutation routes (B1).
+  #
+  # POST /admin/agent-policies/{tenant}/{system}/apply,
+  # POST .../adjust, DELETE .../grant  are StepUpAdminSession mutations gated
+  # to the same two callers as /admin/agents:
+  #
+  #   caddy      — all admin-UI browser sessions reach the backoffice via Caddy's
+  #               TLS reverse-proxy leg; Caddy presents caddy_client.crt (SPIFFE
+  #               spiffe://yashigani.internal/caddy). A stolen admin session cookie
+  #               cannot be replayed without also presenting Caddy's private key.
+  #   backoffice — install.sh and programmatic callers that present backoffice_client.crt
+  #               (SPIFFE spiffe://yashigani.internal/backoffice).
+  #
+  # Read-only GET routes (/templates, /status) use AdminSession without
+  # require_spiffe_id — they are included here as documentation only;
+  # the ACL library skips routes not listed in the allow_* fields.
+  "/admin/agent-policies":
+    allowed_spiffe_ids:
+      - spiffe://yashigani.internal/caddy
+      - spiffe://yashigani.internal/backoffice
+
   # 4.0 Phase 0 / §2 of svid-mesh-container-spec.md — Agent cert rotation ACL.
   #
   # POST /admin/agents/{agent_id}/cert/rotate is the admin-approval endpoint

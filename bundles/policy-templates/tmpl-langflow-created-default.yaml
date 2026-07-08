@@ -1,0 +1,67 @@
+# Yashigani v4.1 — Agent Policy Template: langflow-created agent default
+#
+# Applies to: agents created inside langflow's own UI (discovered via reconciler)
+# Version: 1
+#
+# This is the NARROWEST useful grant — LLM only. A discovered flow does not
+# inherit any wider grant automatically. An admin must explicitly apply a
+# different or extended template to widen egress.
+#
+# IDENTITY NOTE (Nico Q-N1): per-instance NHI leaf authenticates and attributes
+# the flow on the ingress/dispatch plane. Egress enforcement is at the
+# langflow-instance grant (union of all active created-agent templates). Widening
+# beyond {llm} widens egress for ALL flows in the langflow instance — disclosed
+# to the admin at apply time (UNION-WIDEN residual).
+#
+# Last updated: 2026-07-08T00:00:00+00:00
+apiVersion: yashigani.io/v1alpha1
+kind: AgentPolicyTemplate
+metadata:
+  template_id: tmpl-langflow-created-default
+  version: 1
+  applies_to: langflow-created
+  description: >-
+    Default governance policy for agents discovered inside langflow's own UI.
+    Narrowest useful grant: LLM egress only (Mode A). Admin must explicitly
+    widen for additional prefixes.
+
+spec:
+  ingress:
+    enabled: true
+
+  egress:
+    - prefix: llm
+      mode: reverse_proxy
+      deliver_to: gateway-inference
+      ceiling: PUBLIC
+      scan_secrets: true
+      filter_description: true
+
+  disclosure:
+    enforced:
+      - "Destination closed-world — perimeter-owned Caddy config"
+      - "Body DLP + injection screen + OPA ceiling/PII on llm (Mode A)"
+      - "Per-caller positive grant; absence = deny; revocation = grant removal"
+      - "Narrowest useful grant — LLM only by default"
+    residuals:
+      - id: UNION-N1
+        applies_to: llm
+        text: >-
+          Revoking this agent's grant kills its LLM ingress. While a sibling
+          flow holds llm via the langflow union grant, the forwarder route
+          remains active — the kill switch removes this caller's grant entry,
+          not the forwarder route itself.
+      - id: UNION-WIDEN
+        text: >-
+          Widening egress beyond {llm} affects ALL flows in this langflow
+          instance (shared transport identity). Widening is WEAKEN-class and
+          requires the dual-admin dp_weaken ceremony.
+      - id: GRAPH-N3
+        text: >-
+          graph_hash is drift-detection metadata only. It is NOT attestation
+          of the flow's behaviour or tool surface.
+      - id: IDENTITY-MF6
+        text: >-
+          Audit identity_basis is ringfence-position. Per-instance leaf
+          authenticates on the ingress plane only; egress is shared with the
+          langflow instance.

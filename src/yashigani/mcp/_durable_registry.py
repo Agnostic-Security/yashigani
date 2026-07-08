@@ -65,6 +65,10 @@ _KEY_BASELINE = "mcp:broker:baseline:{tenant}:{server}"
 # egress_grant: {spiffe: "<exact per-instance URI>", tenant: "<tenant_id>",
 #                prefixes: ["slack", ...], connect?: {...}}
 _KEY_EGRESS_GRANT = "mcp:broker:egress_grant:{tenant}:{server}"
+# v4.1 Phase B — policy template application record.
+# template_application: {template_id, version, overrides, acknowledgements,
+#                        applied_by, applied_at}
+_KEY_TEMPLATE_APPLICATION = "mcp:tmpl:{tenant}:{system}"
 # Seed-claimed set (Redis SET, write-only grow) — every SPIFFE that has ever
 # had put_egress_grant called for it.  Used by build_egress_grants_doc to
 # suppress the transitional seed for claimed SPIFFEs so that a revocation
@@ -535,6 +539,69 @@ class DurableMcpRegistryStore:
             if desc is not None:
                 out.append(desc)
         return out
+
+    # ── v4.1 Phase B: policy template application record ─────────────────────
+
+    def put_template_application(
+        self, tenant_id: str, system_id: str, app_data: dict
+    ) -> None:
+        """Store the policy template application record for ``{tenant}:{system}``.
+
+        v4.1 Phase B (design §4.2).  Called inside the apply transaction.
+        Raises on Redis failure — the transaction treats this as a step failure.
+
+        app_data shape::
+
+            {
+              "template_id":    "tmpl-openclaw-default",
+              "version":        1,
+              "overrides":      {},               # optional per-instance overrides
+              "acknowledgements": [],             # [{residual_id, justification}]
+              "applied_by":     "<admin_account_id>",
+              "applied_at":     "<ISO 8601 UTC>",
+            }
+        """
+        if not tenant_id or not system_id:
+            raise ValueError("tenant_id and system_id must be non-empty")
+        self._redis.set(
+            _KEY_TEMPLATE_APPLICATION.format(tenant=tenant_id, system=system_id),
+            json.dumps(app_data),
+        )
+        logger.info(
+            "mcp-durable-registry: stored template application for %s:%s tmpl=%s v%s",
+            tenant_id, system_id,
+            app_data.get("template_id", "?"), app_data.get("version", "?"),
+        )
+
+    def get_template_application(
+        self, tenant_id: str, system_id: str
+    ) -> Optional[dict]:
+        """Return the stored template application for ``{tenant}:{system}``, or None."""
+        try:
+            raw = self._redis.get(
+                _KEY_TEMPLATE_APPLICATION.format(tenant=tenant_id, system=system_id)
+            )
+        except Exception as exc:  # noqa: BLE001 — read degrades to miss
+            logger.warning(
+                "mcp-durable-registry: get_template_application %s:%s failed: %s",
+                tenant_id, system_id, exc,
+            )
+            return None
+        return self._decode(raw)
+
+    def delete_template_application(
+        self, tenant_id: str, system_id: str
+    ) -> None:
+        """Remove a template application record (rollback / revoke — best-effort)."""
+        try:
+            self._redis.delete(
+                _KEY_TEMPLATE_APPLICATION.format(tenant=tenant_id, system=system_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "mcp-durable-registry: delete_template_application %s:%s failed: %s",
+                tenant_id, system_id, exc,
+            )
 
     @staticmethod
     def _decode(raw: Any) -> Optional[dict]:

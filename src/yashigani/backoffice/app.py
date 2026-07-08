@@ -119,6 +119,8 @@ from yashigani.backoffice.routes import (
     user_workflows_router,
     # 4.0 Admin workflow-oversight (cross-user read + disable)
     admin_workflows_router,
+    # 4.1 Phase B — Agent Policy Templates (policy template apply/revoke + status join)
+    agent_policies_router,
 )
 # 4.0 LAURA-V400-R2-001 — Dual-admin data-protection maker-checker (lazy import)
 from yashigani.backoffice.routes.dp_weaken import router as dp_weaken_router
@@ -1528,6 +1530,11 @@ def create_backoffice_app() -> FastAPI:
     # Cross-user read + disable.  AdminSession on GETs; StepUpAdminSession on PATCH.
     # EU AI Act Art.14 HITL: disabling a governed workflow is a consequential action.
     app.include_router(admin_workflows_router, tags=["admin-workflows"])
+
+    # 4.1 Phase B — Agent Policy Templates admin surface.
+    # Routes carry their own /admin/agent-policies/ paths (no prefix stripping).
+    # Step-up (StepUpAdminSession) on mutating ops; SPIFFE-gated per service_identities ACL.
+    app.include_router(agent_policies_router, tags=["agent-policies"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:
