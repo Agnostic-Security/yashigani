@@ -67,6 +67,17 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
 COPY src/yashigani/backoffice/templates/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/templates/
 COPY src/yashigani/backoffice/static/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/static/
 
+# v4.1 Phase B (F-01): policy templates for /admin/agent-policies routes.
+# _TEMPLATES_DIR in agent_policies.py:
+#   Path(__file__).parent * 5 / "bundles" / "policy-templates"
+# In the installed package __file__ is:
+#   /usr/local/lib/python3.14/site-packages/yashigani/backoffice/routes/agent_policies.py
+# Five .parent() calls ascend to /usr/local/lib/python3.14/, so the resolved
+# target is /usr/local/lib/python3.14/bundles/policy-templates/.
+# Without this COPY the directory is absent, _template_cache caches {}, and
+# GET /admin/agent-policies/templates returns [] while POST .../apply returns 404.
+COPY bundles/policy-templates/ /usr/local/lib/python3.14/bundles/policy-templates/
+
 # 4.0-phase1: Build-time vendor integrity gate (RISK-101 / SC-NEW-002)
 # Verifies every file listed in scripts/vendor-integrity.lock against its
 # stored SHA-384 hash. Fails the build if any hash mismatches or if a vendored

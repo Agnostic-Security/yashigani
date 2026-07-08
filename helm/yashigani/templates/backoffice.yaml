@@ -248,6 +248,17 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.redis.existingSecretName | default "yashigani-redis-secrets" }}
                   key: redis_password
+            # v4.1 F-03: backoffice _registry_store() reads YASHIGANI_REDIS_URL and
+            # passes it directly to redis.Redis.from_url(). Uses $(REDIS_PASSWORD) via
+            # K8s dependent env-var substitution (Kubelet replaces before container
+            # start). REDIS_PASSWORD must appear before this entry in the list.
+            # Note: if the Redis password contains URL sub-delimiters (e.g. ','), the
+            # K8s Redis secret should store a URL-encoded variant as redis_password_urlenc
+            # and reference that key instead. Compose uses REDIS_PASSWORD_URLENC written
+            # by install.sh; Helm operators must ensure the password is URL-safe OR
+            # override this value with a pre-encoded reference.
+            - name: YASHIGANI_REDIS_URL
+              value: "rediss://:$(REDIS_PASSWORD)@yashigani-redis:6380/3?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/ca_root.crt&ssl_certfile=/run/secrets/backoffice_client.crt&ssl_keyfile=/run/secrets/backoffice_client.key"
             # v2.23.3 (#59) — W6 fix: YASHIGANI_DB_AES_KEY required for pgcrypto
             # pgp_sym_encrypt on auth_settings table (HIBP API key at rest).
             # Sourced from backoffice secret (same secret as install.sh writes).

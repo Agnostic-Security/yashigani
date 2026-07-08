@@ -671,6 +671,14 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6380"             # TLS-only
       REDIS_USE_TLS: "true"
+      # v4.1 F-03: backoffice _registry_store() (agent_policies.py) reads
+      # YASHIGANI_REDIS_URL and passes it directly to redis.Redis.from_url().
+      # Without this the code defaults to redis://redis:6379/3 (wrong scheme +
+      # port) → every DurableMcpRegistryStore call fails "Error 111 connecting
+      # to redis:6379" → status returns egress_grant:null, apply/revoke 503.
+      # Uses backoffice_client certs (same leaf the anomaly detector uses on
+      # db/2). Password must be URL-encoded; install.sh writes REDIS_PASSWORD_URLENC.
+      YASHIGANI_REDIS_URL: "rediss://:${REDIS_PASSWORD_URLENC}@redis:6380/3?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/ca_root.crt&ssl_certfile=/run/secrets/backoffice_client.crt&ssl_keyfile=/run/secrets/backoffice_client.key"
       # v2.23.2: OPA serves mTLS; backoffice uses internal_httpx_client (EX-231-01).
       YASHIGANI_OPA_URL: https://policy:8181
       # Optional-service profiles deployed at install time (deploy-time/IaC).
