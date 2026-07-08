@@ -193,7 +193,7 @@ def _fetch_flows(langflow_url: str, bearer: str) -> list[dict]:
     """
     from yashigani.pki.client import internal_httpx_sync_client  # noqa: PLC0415
 
-    url = langflow_url.rstrip("/") + "/api/v1/flows"
+    url = langflow_url.rstrip("/") + "/api/v1/flows/"
     # Internal bearer auth — forwarded to langflow (harmless: LANGFLOW_AUTO_LOGIN=true).
     # Also present in the Caddy forward_auth subrequest but ignored by verify-mcp
     # (verify-mcp authenticates via X-SPIFFE-ID from the verified TLS peer cert,
