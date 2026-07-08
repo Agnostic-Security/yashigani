@@ -583,12 +583,79 @@ async def lifespan(app: FastAPI):
             id="sod_conflict_audit",
             replace_existing=True,
         )
+
+        # TRACK1-F-04 — Langflow flow-discovery reconciler (60s interval).
+        # Discovers flows created in langflow's own UI (not through Yashigani's
+        # governed builder path) and creates INERT pending records so they
+        # surface in the admin UI as "discovered — pending admin approval".
+        # Guard: only register if langflow is in the enabled profiles; avoids
+        # log noise on non-langflow installs (reconciler degrades gracefully on
+        # network/store errors regardless, but skip registration is cleaner).
+        _lf_profiles = {
+            p.strip().lower()
+            for p in (os.getenv("YASHIGANI_ENABLED_PROFILES", "") or "").split(",")
+            if p.strip()
+        }
+        if "langflow" in _lf_profiles:
+            from yashigani.backoffice.langflow_reconciler import (  # noqa: PLC0415
+                run_langflow_discovery as _run_lf_discovery,
+            )
+            _lf_log = _sched_log.getLogger("yashigani.backoffice.langflow_reconciler")
+
+            def _langflow_discovery_job() -> None:
+                """Sync scheduler wrapper: wire store/writer then run reconciler."""
+                from yashigani.backoffice.state import (  # noqa: PLC0415
+                    backoffice_state as _bs,
+                )
+                try:
+                    import redis as _redis_lf  # noqa: PLC0415
+                    from yashigani.gateway._redis_url import (  # noqa: PLC0415
+                        build_redis_url as _build_lf_redis_url,
+                    )
+                    from yashigani.mcp._durable_registry import (  # noqa: PLC0415
+                        DurableMcpRegistryStore as _LfRegistryStore,
+                    )
+                    _lf_redis_url = _build_lf_redis_url(
+                        3,
+                        use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+                        secrets_dir=os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+                        client_cert_name="backoffice_client",
+                    )
+                    _lf_redis = _redis_lf.from_url(_lf_redis_url, decode_responses=False)
+                    _lf_store = _LfRegistryStore(_lf_redis)
+                except Exception as _lf_store_exc:  # noqa: BLE001
+                    _lf_log.warning(
+                        "langflow-reconciler-job: registry store unavailable (%s) "
+                        "— skipping this run (TRACK1-F-04)", _lf_store_exc,
+                    )
+                    return
+                _run_lf_discovery(
+                    registry_store=_lf_store,
+                    audit_writer=_bs.audit_writer,
+                )
+
+            # max_instances=1: if a tick takes longer than 60 s (e.g. langflow
+            # has many flows), APScheduler skips the next tick rather than
+            # stacking concurrent runs (Laura F9 overlap guard).
+            scheduler.add_job(
+                _langflow_discovery_job,
+                trigger="interval",
+                seconds=60,
+                id="langflow_flow_discovery",
+                replace_existing=True,
+                max_instances=1,
+            )
+
         scheduler.start()
         # Fire all immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
         asyncio.ensure_future(emit_grace_period_audit())
         asyncio.ensure_future(run_inactive_account_disable())
         asyncio.ensure_future(run_sod_conflict_audit())
+        if "langflow" in _lf_profiles:
+            # Sync job — run in the default executor so the event loop stays
+            # responsive.  asyncio.to_thread() is Python 3.9+ (Yashigani ≥3.12).
+            asyncio.ensure_future(asyncio.to_thread(_langflow_discovery_job))
     except ImportError:
         pass  # apscheduler not installed — expiry alerts + inactive-disable disabled
     except Exception as exc:

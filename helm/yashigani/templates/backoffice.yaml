@@ -241,6 +241,14 @@ spec:
             # values-langflow-ingress.yaml (single source, drift-gated).
             - name: YASHIGANI_LANGFLOW_URL
               value: "https://yashigani-caddy-mesh:{{ int $front.meshPort }}/agents/{{ $front.tenantId }}/{{ $front.systemName }}"
+            # TRACK1-F-04 — langflow flow-discovery reconciler. Points at the
+            # same mesh front as YASHIGANI_LANGFLOW_URL; reconciler appends
+            # /api/v1/flows. Auth: backoffice mTLS leaf (backoffice_client.crt)
+            # → forward_auth verify-mcp ALLOW (subject=backoffice, server=langflow).
+            # NO new NetworkPolicy needed — caddy↔langflow already allowed by
+            # the agentIngressFronts NP (agent-ingress-fronts.yaml).
+            - name: YASHIGANI_LANGFLOW_INTERNAL_URL
+              value: "https://yashigani-caddy-mesh:{{ int $front.meshPort }}/agents/{{ $front.tenantId }}/{{ $front.systemName }}"
             {{- end }}
             {{- end }}
             - name: REDIS_PASSWORD

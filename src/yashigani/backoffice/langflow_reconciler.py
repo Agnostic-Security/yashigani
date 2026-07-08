@@ -178,20 +178,31 @@ def _build_inert_record(
 def _fetch_flows(langflow_url: str, bearer: str) -> list[dict]:
     """Fetch flows from langflow GET /api/v1/flows.
 
-    Uses httpx (same client the dispatch layer uses for internal calls).
+    Routes through the Caddy mesh front (YASHIGANI_LANGFLOW_INTERNAL_URL →
+    https://caddy:9705/agents/default/langflow) using the backoffice mTLS
+    leaf so Caddy's forward_auth gate (verify-mcp) admits the request
+    as subject=backoffice toward server=langflow (§2.5 closed allowlist).
+
+    Uses internal_httpx_sync_client (backoffice_client.crt mTLS identity)
+    for the Caddy mesh dial — same trust anchor as the langflow_client
+    dispatch path (TRACK1-F-04 wiring).
+
     Treat response as UNTRUSTED (Laura F9): cap count + body.
 
     Raises on HTTP error or network failure — caller logs and skips.
     """
-    import httpx  # noqa: PLC0415
+    from yashigani.pki.client import internal_httpx_sync_client  # noqa: PLC0415
 
     url = langflow_url.rstrip("/") + "/api/v1/flows"
-    # Internal bearer auth (same as langflow_client.py _INTERNAL_BEARER pattern)
+    # Internal bearer auth — forwarded to langflow (harmless: LANGFLOW_AUTO_LOGIN=true).
+    # Also present in the Caddy forward_auth subrequest but ignored by verify-mcp
+    # (verify-mcp authenticates via X-SPIFFE-ID from the verified TLS peer cert,
+    # not via the bearer token).
     headers = {
         "Authorization": f"Bearer {bearer}",
         "Accept": "application/json",
     }
-    with httpx.Client(verify=False, timeout=10.0) as client:  # noqa: S501 — internal mesh
+    with internal_httpx_sync_client(timeout=10.0) as client:
         resp = client.get(url, headers=headers)
         resp.raise_for_status()
         # Cap total body before parsing (Laura F9: oversized response → skip all)
