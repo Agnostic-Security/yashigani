@@ -83,6 +83,11 @@ data:
             forward_auth https://yashigani-backoffice:8443 {
                 uri /auth/verify-mcp?tenant={{ $tenant }}&server={{ $system }}
                 header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+                # Forward the verified caller SPIFFE ID so verify-mcp can
+                # check the transport subject allowlist. Uses the cert SAN
+                # directly (not the request_header-set value) — immune to
+                # any header spoofing since require_and_verify already ran.
+                header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}
                 transport http {
                     tls
                     tls_trust_pool file /run/secrets/ca_intermediate.crt

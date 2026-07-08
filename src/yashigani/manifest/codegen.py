@@ -2980,6 +2980,11 @@ def _gen_agent_ingress_caddyfile(
                     # Layer B (EX-231-10): per-install HMAC marker — parse-time env
                     # substitution, same rationale as the MCP-front snippet.
                     header_up X-Caddy-Verified-Secret {{$CADDY_INTERNAL_HMAC}}
+                    # Forward the verified caller SPIFFE ID so verify-mcp can
+                    # check the transport subject allowlist. Uses the cert SAN
+                    # directly (not the request_header-set value) — immune to
+                    # any header spoofing since require_and_verify already ran.
+                    header_up X-SPIFFE-ID {{http.request.tls.client.san.uris.0}}
                     transport http {{
                         tls
                         tls_trust_pool file /run/secrets/ca_intermediate.crt

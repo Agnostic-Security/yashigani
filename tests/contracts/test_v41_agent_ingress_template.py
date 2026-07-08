@@ -121,6 +121,11 @@ class TestFrontSnippetContract:
         # The ONE verify gate (§2.5) — no parallel endpoint.
         assert ("uri /auth/verify-mcp?tenant=default&server=%s" % system) in snippet
         assert "header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}" in snippet
+        # TRACK1-F-04 / §2.5 gap fix: verify-mcp reads X-SPIFFE-ID to
+        # authenticate the caller's transport identity. forward_auth does not
+        # auto-copy headers — must be explicit. Without this the gate returns
+        # 401 no_spiffe_id on every request (never passes).
+        assert "header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}" in snippet
         assert ("handle_path /agents/default/%s/*" % system) in snippet
         assert ("reverse_proxy http://%s:%d" % (system, shim_port)) in snippet
         assert 'respond "Not Found" 404' in snippet
@@ -344,6 +349,9 @@ class TestHelmRenderGates:
             assert ":%d {" % mesh_port in snippet
             assert "mode require_and_verify" in snippet
             assert ("uri /auth/verify-mcp?tenant=default&server=%s" % system) in snippet
+            # TRACK1-F-04 / §2.5 gap fix — Helm parity: X-SPIFFE-ID must be
+            # forwarded in the K8s configmap snippet too.
+            assert "header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}" in snippet
             # Documented K8s deltas ONLY:
             assert "forward_auth https://yashigani-backoffice:8443" in snippet
             assert ("reverse_proxy http://yashigani-%s:%d" % (system, shim_port)) in snippet

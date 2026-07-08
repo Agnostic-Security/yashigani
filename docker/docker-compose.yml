@@ -671,6 +671,14 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6380"             # TLS-only
       REDIS_USE_TLS: "true"
+      # v4.1 F-03: backoffice _registry_store() (agent_policies.py) reads
+      # YASHIGANI_REDIS_URL and passes it directly to redis.Redis.from_url().
+      # Without this the code defaults to redis://redis:6379/3 (wrong scheme +
+      # port) → every DurableMcpRegistryStore call fails "Error 111 connecting
+      # to redis:6379" → status returns egress_grant:null, apply/revoke 503.
+      # Uses backoffice_client certs (same leaf the anomaly detector uses on
+      # db/2). Password must be URL-encoded; install.sh writes REDIS_PASSWORD_URLENC.
+      YASHIGANI_REDIS_URL: "rediss://:${REDIS_PASSWORD_URLENC}@redis:6380/3?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/ca_root.crt&ssl_certfile=/run/secrets/backoffice_client.crt&ssl_keyfile=/run/secrets/backoffice_client.key"
       # v2.23.2: OPA serves mTLS; backoffice uses internal_httpx_client (EX-231-01).
       YASHIGANI_OPA_URL: https://policy:8181
       # Optional-service profiles deployed at install time (deploy-time/IaC).
@@ -799,6 +807,17 @@ services:
       # call fails CLOSED at the TLS handshake (no regression — the direct
       # path had no route at all).
       YASHIGANI_LANGFLOW_URL: https://caddy:9705/agents/default/langflow
+      # TRACK1-F-04 — langflow flow-discovery reconciler (60s APScheduler job).
+      # Points at the SAME Caddy mesh front as YASHIGANI_LANGFLOW_URL; the
+      # reconciler appends /api/v1/flows to list flows for discovery.
+      # Auth path: backoffice → caddy:9705 (mTLS, backoffice_client.crt) →
+      # forward_auth /auth/verify-mcp?tenant=default&server=langflow (ALLOW:
+      # subject=backoffice ∈ _VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS + active
+      # capability envelope) → http://langflow:7860/api/v1/flows (plain HTTP
+      # inside ringfence_langflow_in). NO new L3 reachability required —
+      # backoffice↔caddy already via caddy_internal; caddy↔langflow already
+      # via ringfence_langflow_in.
+      YASHIGANI_LANGFLOW_INTERNAL_URL: https://caddy:9705/agents/default/langflow
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
       # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).

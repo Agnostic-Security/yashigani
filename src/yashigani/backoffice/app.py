@@ -119,6 +119,8 @@ from yashigani.backoffice.routes import (
     user_workflows_router,
     # 4.0 Admin workflow-oversight (cross-user read + disable)
     admin_workflows_router,
+    # 4.1 Phase B — Agent Policy Templates (policy template apply/revoke + status join)
+    agent_policies_router,
 )
 # 4.0 LAURA-V400-R2-001 — Dual-admin data-protection maker-checker (lazy import)
 from yashigani.backoffice.routes.dp_weaken import router as dp_weaken_router
@@ -581,12 +583,79 @@ async def lifespan(app: FastAPI):
             id="sod_conflict_audit",
             replace_existing=True,
         )
+
+        # TRACK1-F-04 — Langflow flow-discovery reconciler (60s interval).
+        # Discovers flows created in langflow's own UI (not through Yashigani's
+        # governed builder path) and creates INERT pending records so they
+        # surface in the admin UI as "discovered — pending admin approval".
+        # Guard: only register if langflow is in the enabled profiles; avoids
+        # log noise on non-langflow installs (reconciler degrades gracefully on
+        # network/store errors regardless, but skip registration is cleaner).
+        _lf_profiles = {
+            p.strip().lower()
+            for p in (os.getenv("YASHIGANI_ENABLED_PROFILES", "") or "").split(",")
+            if p.strip()
+        }
+        if "langflow" in _lf_profiles:
+            from yashigani.backoffice.langflow_reconciler import (  # noqa: PLC0415
+                run_langflow_discovery as _run_lf_discovery,
+            )
+            _lf_log = _sched_log.getLogger("yashigani.backoffice.langflow_reconciler")
+
+            def _langflow_discovery_job() -> None:
+                """Sync scheduler wrapper: wire store/writer then run reconciler."""
+                from yashigani.backoffice.state import (  # noqa: PLC0415
+                    backoffice_state as _bs,
+                )
+                try:
+                    import redis as _redis_lf  # noqa: PLC0415
+                    from yashigani.gateway._redis_url import (  # noqa: PLC0415
+                        build_redis_url as _build_lf_redis_url,
+                    )
+                    from yashigani.mcp._durable_registry import (  # noqa: PLC0415
+                        DurableMcpRegistryStore as _LfRegistryStore,
+                    )
+                    _lf_redis_url = _build_lf_redis_url(
+                        3,
+                        use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+                        secrets_dir=os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+                        client_cert_name="backoffice_client",
+                    )
+                    _lf_redis = _redis_lf.from_url(_lf_redis_url, decode_responses=False)
+                    _lf_store = _LfRegistryStore(_lf_redis)
+                except Exception as _lf_store_exc:  # noqa: BLE001
+                    _lf_log.warning(
+                        "langflow-reconciler-job: registry store unavailable (%s) "
+                        "— skipping this run (TRACK1-F-04)", _lf_store_exc,
+                    )
+                    return
+                _run_lf_discovery(
+                    registry_store=_lf_store,
+                    audit_writer=_bs.audit_writer,
+                )
+
+            # max_instances=1: if a tick takes longer than 60 s (e.g. langflow
+            # has many flows), APScheduler skips the next tick rather than
+            # stacking concurrent runs (Laura F9 overlap guard).
+            scheduler.add_job(
+                _langflow_discovery_job,
+                trigger="interval",
+                seconds=60,
+                id="langflow_flow_discovery",
+                replace_existing=True,
+                max_instances=1,
+            )
+
         scheduler.start()
         # Fire all immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
         asyncio.ensure_future(emit_grace_period_audit())
         asyncio.ensure_future(run_inactive_account_disable())
         asyncio.ensure_future(run_sod_conflict_audit())
+        if "langflow" in _lf_profiles:
+            # Sync job — run in the default executor so the event loop stays
+            # responsive.  asyncio.to_thread() is Python 3.9+ (Yashigani ≥3.12).
+            asyncio.ensure_future(asyncio.to_thread(_langflow_discovery_job))
     except ImportError:
         pass  # apscheduler not installed — expiry alerts + inactive-disable disabled
     except Exception as exc:
@@ -747,6 +816,47 @@ async def lifespan(app: FastAPI):
             "AGENT-RECONCILE: startup reconcile FAILED (%s) — @agent routes may "
             "return agent_not_found until the registry is restored", _areconcile_exc
         )
+
+    # TRACK1-F-04 RCA-2 — post-reconcile bundled-envelope bootstrap (ordering fix).
+    #
+    # The FIRST bootstrap pass (inside `if db_dsn:`, ~40 lines into lifespan)
+    # runs with a potentially-empty agent registry: Redis db/3 has NO persistence
+    # (appendonly no / save "") so a container/Docker-Desktop restart wipes all
+    # registered agents from db/3 BEFORE the first bootstrap fires.
+    #
+    # reconcile_agents_from_durable (immediately above) re-pushes any agents
+    # present in the durable Postgres mirror back into Redis db/3.  Running
+    # bootstrap a SECOND TIME here guarantees that envelopes are always minted
+    # after the registry is fully re-hydrated, regardless of the Redis state at
+    # the start of the lifespan.
+    #
+    # Idempotent: bootstrap_bundled_agent_envelopes skips any ACTIVE envelope.
+    # Same non-fatal SOP-1 exception rationale as the first pass: the failure
+    # mode is fail-closed (verify-mcp keeps denying until next boot), so a
+    # transient DB blip MUST NOT abort the lifespan.
+    if db_dsn:
+        try:
+            from yashigani.backoffice.bundled_envelopes import (  # noqa: PLC0415
+                bootstrap_bundled_agent_envelopes as _bootstrap_post_reconcile,
+            )
+            from yashigani.mcp.envelope_service import (  # noqa: PLC0415
+                CapabilityEnvelopeService as _CES2,
+            )
+            _minted_post = await _bootstrap_post_reconcile(
+                _CES2(get_pool()),
+                backoffice_state.agent_registry,
+            )
+            if _minted_post:
+                _log.info(
+                    "Backoffice: bundled-agent envelopes minted (post-reconcile pass): %s",
+                    ", ".join(_minted_post),
+                )
+        except Exception as _be2_exc:  # noqa: BLE001 — see SOP-1 rationale, line ~483
+            _log.error(
+                "Backoffice: post-reconcile bundled-envelope bootstrap FAILED (%s) "
+                "— bundled ingress fronts remain fail-closed until the next boot",
+                _be2_exc,
+            )
 
     # --- Document-enforcement policy matrix (data.yashigani.document) — 2.26 ---
     # Same persistence + re-push pattern as RBAC, targeting the document sub-tree
@@ -1528,6 +1638,11 @@ def create_backoffice_app() -> FastAPI:
     # Cross-user read + disable.  AdminSession on GETs; StepUpAdminSession on PATCH.
     # EU AI Act Art.14 HITL: disabling a governed workflow is a consequential action.
     app.include_router(admin_workflows_router, tags=["admin-workflows"])
+
+    # 4.1 Phase B — Agent Policy Templates admin surface.
+    # Routes carry their own /admin/agent-policies/ paths (no prefix stripping).
+    # Step-up (StepUpAdminSession) on mutating ops; SPIFFE-gated per service_identities ACL.
+    app.include_router(agent_policies_router, tags=["agent-policies"])
 
     # 4.0 Phase 2 — user-plane CSP violation report endpoint (Su's report-uri target).
     # Su's Caddy config for /chat and /user/* will set:

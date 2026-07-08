@@ -42,7 +42,7 @@ pre-existing behaviour).  Write paths raise — the approve transaction treats
 a failed registration as a step failure and rolls back (fail-closed; a wrap
 the broker can never dial is a partial onboarding).
 
-Last updated: 2026-07-06T00:00:00+00:00
+Last updated: 2026-07-08T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -63,8 +63,18 @@ _KEY_BASELINE = "mcp:broker:baseline:{tenant}:{server}"
 # v4.1 unified-sidecar Phase 1 (Lu M1) — (caller SPIFFE, egress prefixes)
 # grant, written inside the approve transaction, read by the OPA data push.
 # egress_grant: {spiffe: "<exact per-instance URI>", tenant: "<tenant_id>",
-#                prefixes: ["slack", ...]}
+#                prefixes: ["slack", ...], connect?: {...}}
 _KEY_EGRESS_GRANT = "mcp:broker:egress_grant:{tenant}:{server}"
+# v4.1 Phase B — policy template application record.
+# template_application: {template_id, version, overrides, acknowledgements,
+#                        applied_by, applied_at}
+_KEY_TEMPLATE_APPLICATION = "mcp:tmpl:{tenant}:{system}"
+# Seed-claimed set (Redis SET, write-only grow) — every SPIFFE that has ever
+# had put_egress_grant called for it.  Used by build_egress_grants_doc to
+# suppress the transitional seed for claimed SPIFFEs so that a revocation
+# (delete_egress_grant) cannot be overridden by the seed (Lu MF-2 / §4.4).
+# Never cleared — claiming is permanent for the lifetime of the installation.
+_KEY_EGRESS_SEED_CLAIMED = "mcp:broker:egress_seed_claimed_set"
 
 
 def canonical_server_key(tenant_id: str, server_id: str) -> str:
@@ -158,6 +168,41 @@ class DurableMcpRegistryStore:
             tenant_id, server_id, baseline_data.get("surface_hash", "?")[:20],
         )
 
+    def claim_egress_seed(self, spiffe: str) -> None:
+        """Permanently mark ``spiffe`` as store-claimed in the seed-claimed set.
+
+        Idempotent (Redis SADD is a no-op if already a member).  Raises on
+        Redis failure — callers that write a grant MUST claim first so that a
+        future revocation (delete_egress_grant) cannot be overridden by the
+        transitional seed (design §4.4, Lu MF-2a).
+
+        The set is write-only-grow: it is NEVER cleared, even by
+        delete_egress_grant.  Once claimed, the SPIFFE is permanently excluded
+        from the seed in build_egress_grants_doc.
+        """
+        if not spiffe:
+            return  # non-bundled /agents/ SPIFFEs are fine either way
+        self._redis.sadd(_KEY_EGRESS_SEED_CLAIMED, spiffe)
+        logger.debug(
+            "mcp-durable-registry: egress seed claimed for spiffe=%s", spiffe,
+        )
+
+    def get_claimed_egress_seed_spiffes(self) -> frozenset:
+        """Return all SPIFFEs ever claimed via put_egress_grant.
+
+        Used by build_egress_grants_doc to suppress seed entries for claimed
+        SPIFFEs (design §4.4).  Returns frozenset() if the key does not exist
+        (no claims yet).  Raises on Redis failure — caller decides whether to
+        skip suppression (fail-open on seed) or abort the push.
+        """
+        members = self._redis.smembers(_KEY_EGRESS_SEED_CLAIMED)
+        if not members:
+            return frozenset()
+        return frozenset(
+            m.decode() if isinstance(m, bytes) else str(m)
+            for m in members
+        )
+
     def put_egress_grant(self, tenant_id: str, server_id: str, grant_data: dict) -> None:
         """Store the (caller SPIFFE, egress prefixes) grant for ``<tenant>:<server>``.
 
@@ -169,22 +214,32 @@ class DurableMcpRegistryStore:
 
             {"spiffe": "<EXACT per-instance SPIFFE URI>",
              "tenant": "<tenant_id>",
-             "prefixes": ["slack", ...]}   # positive set; [] = no egress
+             "prefixes": ["slack", ...],   # positive set; [] = no egress
+             "connect": {...}}             # optional Mode-B map (Phase 3+)
 
         The OPA data push keys the grant on the EXACT ``spiffe`` value
         (byte-match at decision time — never name-collapsed).
+
+        Seed-claim ordering: ``claim_egress_seed`` is called BEFORE the main
+        SET so that the claim is permanent even if the SET fails (fail-closed
+        for future revocations — better to deny a bundled system temporarily
+        than to allow a revoked seed grant to resurface).
         """
         if not tenant_id or not server_id:
             raise ValueError("tenant_id and server_id must be non-empty")
-        if not str(grant_data.get("spiffe", "")).strip():
+        spiffe = str(grant_data.get("spiffe", "")).strip()
+        if not spiffe:
             raise ValueError("egress grant requires a non-empty spiffe key")
+        # Claim BEFORE the main write: permanent seed-suppression for this
+        # SPIFFE regardless of whether the grant is later revoked (Lu MF-2a).
+        self.claim_egress_seed(spiffe)
         self._redis.set(
             _KEY_EGRESS_GRANT.format(tenant=tenant_id, server=server_id),
             json.dumps(grant_data),
         )
         logger.info(
             "mcp-durable-registry: stored egress grant for %s:%s spiffe=%s prefixes=%s",
-            tenant_id, server_id, grant_data.get("spiffe"),
+            tenant_id, server_id, spiffe,
             sorted(grant_data.get("prefixes", [])),
         )
 
@@ -219,15 +274,49 @@ class DurableMcpRegistryStore:
     def build_egress_grants_data(self) -> dict:
         """Build the ``egress_grants`` OPA data sub-document from the store.
 
-        Returns ``{"<exact SPIFFE URI>": {"tenant": ..., "prefixes": [...]}}``
-        — the shape policy/mcp.rego keys on at
-        ``data.yashigani.mcp.egress_grants[input.caller.spiffe]``.
+        Returns a mapping from exact SPIFFE URI to grant entry::
+
+            {
+              "<spiffe>": {
+                "tenant":        "<tenant_id>",
+                "prefixes":      ["slack", ...],
+                "legacy_system": True,           # ONLY for bundled SPIFFEs
+                "connect":       {...},           # ONLY if stored (Mode-B)
+              }
+            }
+
+        **Field passthrough rules (Nico gap-1 / Lu MF-5, HIGH):**
+
+        - ``legacy_system``: SERVER-DERIVED only — never read from the stored
+          grant.  Set to ``True`` iff the SPIFFE is in the current bundled-
+          system set (``bundled_system_spiffe_set()``).  Any other SPIFFE
+          gets no ``legacy_system`` key (OPA treats absence as falsy).
+          Rationale: a store-suppliable ``legacy_system`` is a tenant-conjunct
+          bypass (Lu MF-1, HIGH) — any SPIFFE without a ``/agents/`` tenant
+          segment could use it to satisfy ``_egress_grant_tenant_ok`` without
+          a real per-tenant check.
+
+        - ``connect``: passed through verbatim from the stored grant if
+          present.  This is the Mode-B destination-host allowlist; it is
+          admin-applied data (not a security bypass vector), and the OPA
+          ``egress_connect_decision`` (Phase 3) requires it to be present.
 
         Descriptors without an egress grant record are simply absent from the
         document → OPA denies their egress fail-closed (closed world).
         Callers that need the transitional bundled-system seed merged in
         should use ``yashigani.mcp._egress_grants.build_egress_grants_doc``.
         """
+        try:
+            from yashigani.mcp._egress_grants import bundled_system_spiffe_set  # noqa: PLC0415
+            _bundled = bundled_system_spiffe_set()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mcp-durable-registry: bundled_system_spiffe_set failed (%s) — "
+                "legacy_system will NOT be set for any SPIFFE (fail-closed: "
+                "bundled pre-migration systems deny egress; fix trust_domain)", exc,
+            )
+            _bundled: frozenset = frozenset()
+
         out: dict = {}
         for desc in self.list_all():
             server_id = desc.get("agent_name", "")
@@ -240,12 +329,22 @@ class DurableMcpRegistryStore:
             spiffe = str(grant.get("spiffe", "")).strip()
             if not spiffe:
                 continue
-            out[spiffe] = {
+            entry: dict = {
                 "tenant": str(grant.get("tenant", tenant_id)),
                 "prefixes": sorted(
                     str(p) for p in grant.get("prefixes", []) if p
                 ),
             }
+            # Server-derived: only hardcoded bundled SPIFFEs get legacy_system.
+            # NEVER copied from the stored grant value (Lu MF-1 bypass fix).
+            if spiffe in _bundled:
+                entry["legacy_system"] = True
+            # Mode-B connect map: pass through if present (admin-applied; safe
+            # to forward as-is — it is not a bypass vector, and OPA
+            # egress_connect_decision validates it separately).
+            if "connect" in grant:
+                entry["connect"] = grant["connect"]
+            out[spiffe] = entry
         return out
 
     def delete_grant(self, tenant_id: str, server_id: str) -> None:
@@ -440,6 +539,69 @@ class DurableMcpRegistryStore:
             if desc is not None:
                 out.append(desc)
         return out
+
+    # ── v4.1 Phase B: policy template application record ─────────────────────
+
+    def put_template_application(
+        self, tenant_id: str, system_id: str, app_data: dict
+    ) -> None:
+        """Store the policy template application record for ``{tenant}:{system}``.
+
+        v4.1 Phase B (design §4.2).  Called inside the apply transaction.
+        Raises on Redis failure — the transaction treats this as a step failure.
+
+        app_data shape::
+
+            {
+              "template_id":    "tmpl-openclaw-default",
+              "version":        1,
+              "overrides":      {},               # optional per-instance overrides
+              "acknowledgements": [],             # [{residual_id, justification}]
+              "applied_by":     "<admin_account_id>",
+              "applied_at":     "<ISO 8601 UTC>",
+            }
+        """
+        if not tenant_id or not system_id:
+            raise ValueError("tenant_id and system_id must be non-empty")
+        self._redis.set(
+            _KEY_TEMPLATE_APPLICATION.format(tenant=tenant_id, system=system_id),
+            json.dumps(app_data),
+        )
+        logger.info(
+            "mcp-durable-registry: stored template application for %s:%s tmpl=%s v%s",
+            tenant_id, system_id,
+            app_data.get("template_id", "?"), app_data.get("version", "?"),
+        )
+
+    def get_template_application(
+        self, tenant_id: str, system_id: str
+    ) -> Optional[dict]:
+        """Return the stored template application for ``{tenant}:{system}``, or None."""
+        try:
+            raw = self._redis.get(
+                _KEY_TEMPLATE_APPLICATION.format(tenant=tenant_id, system=system_id)
+            )
+        except Exception as exc:  # noqa: BLE001 — read degrades to miss
+            logger.warning(
+                "mcp-durable-registry: get_template_application %s:%s failed: %s",
+                tenant_id, system_id, exc,
+            )
+            return None
+        return self._decode(raw)
+
+    def delete_template_application(
+        self, tenant_id: str, system_id: str
+    ) -> None:
+        """Remove a template application record (rollback / revoke — best-effort)."""
+        try:
+            self._redis.delete(
+                _KEY_TEMPLATE_APPLICATION.format(tenant=tenant_id, system=system_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "mcp-durable-registry: delete_template_application %s:%s failed: %s",
+                tenant_id, system_id, exc,
+            )
 
     @staticmethod
     def _decode(raw: Any) -> Optional[dict]:

@@ -487,6 +487,22 @@ class EventType(str, Enum):
     # identity.  The promotion is suppressed and the header is logged.
     # ASVS V4.1.1 / CWE-269 (Improper Privilege Management) / CWE-290.
     MESH_ORCH_DEPTH_FORGED = "MESH_ORCH_DEPTH_FORGED"
+    # ---------------------------------------------------------------------------
+    # v4.1 Phase B — Agent Policy Templates (design §4.3 / B1 / B3 / B5)
+    # All events route to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    # identity_basis: "ringfence-position" on all events — honest attribution.
+    # ---------------------------------------------------------------------------
+    # Admin applied a policy template to a bundled or onboarded agent.
+    # Records template_id, version, granted prefixes, SPIFFE, acknowledgements.
+    AGENT_POLICY_TEMPLATE_APPLIED = "AGENT_POLICY_TEMPLATE_APPLIED"
+    # Admin revoked a policy template / egress grant from an agent.
+    # The grant-absence in the re-pushed OPA data IS the kill switch (Nico Q3).
+    AGENT_POLICY_TEMPLATE_REVOKED = "AGENT_POLICY_TEMPLATE_REVOKED"
+    # Langflow reconciler discovered a flow created in langflow's own UI.
+    # An INERT pending registry record was written (no leaf, no grant, no envelope).
+    # Surfaces in nhi-approvals.js as "discovered — pending admin approval".
+    LANGFLOW_FLOW_DISCOVERED = "LANGFLOW_FLOW_DISCOVERED"
 
 
 # ---------------------------------------------------------------------------
@@ -4296,3 +4312,89 @@ class MeshOrchDepthForgedEvent(AuditEvent):
     # Value of the forged depth header (truncated to 16 chars)
     depth_value_truncated: str = ""
     severity: str = "HIGH"          # immutable floor
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase B — Agent Policy Template events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentPolicyTemplateAppliedEvent(AuditEvent):
+    """An admin applied a policy template to an agent (step-up-gated).
+
+    v4.1 Phase B (design §4.3 / B1 / B5).  The grant write (MCP_EGRESS_GRANT_WRITTEN)
+    is the enforcement record; this event adds provenance: which template, which
+    version, which prefixes, which SPIFFE, any overrides/acknowledgements.
+
+    identity_basis: "ringfence-position" — honest attribution per Lu MF-6.
+    The grant document is the sole OPA enforcement input; templates are UX/provenance.
+
+    Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.AGENT_POLICY_TEMPLATE_APPLIED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    tenant_id: str = ""
+    system_id: str = ""
+    template_id: str = ""
+    template_version: int = 1
+    spiffe_id: str = ""
+    granted_prefixes: list = field(default_factory=list)
+    overrides_digest: str = ""       # SHA-256 of JSON-serialised overrides (or "")
+    acknowledgements: list = field(default_factory=list)  # [{residual_id, justification}]
+    # Honest attribution — never implies mTLS/attestation (Lu MF-6)
+    identity_basis: str = "ringfence-position"
+
+
+@dataclass
+class AgentPolicyTemplateRevokedEvent(AuditEvent):
+    """An admin revoked a policy template / egress grant from an agent (step-up-gated).
+
+    v4.1 Phase B (design §4.3 / B1).  Grant absence in the re-pushed OPA data
+    IS the kill switch (Nico Q3); this event is the audit evidence.
+
+    identity_basis: "ringfence-position" — honest attribution per Lu MF-6.
+
+    Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.AGENT_POLICY_TEMPLATE_REVOKED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    tenant_id: str = ""
+    system_id: str = ""
+    spiffe_id: str = ""
+    revoked_prefixes: list = field(default_factory=list)
+    # Honest attribution
+    identity_basis: str = "ringfence-position"
+
+
+@dataclass
+class LangflowFlowDiscoveredEvent(AuditEvent):
+    """Langflow reconciler discovered a flow created in langflow's own UI.
+
+    v4.1 Phase B (design §6 / B3).  An INERT pending registry record was written
+    (no leaf, no grant, no envelope — gateway 403s unapproved NHIs fail-closed).
+    The flow surfaces in nhi-approvals.js as 'discovered — pending admin approval'.
+
+    graph_hash is drift-detection metadata only (Nico Q-N3): canonical JSON of
+    the flow graph stripped of UI positions/viewport/timestamps, SHA-256.
+    NOT attestation; NOT a leaf binding input.
+
+    Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1.
+    """
+
+    event_type: str = EventType.LANGFLOW_FLOW_DISCOVERED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    flow_id: str = ""
+    # Flow name as returned by langflow — stored raw, encoded at render
+    flow_name_truncated: str = ""    # truncated to 128 chars
+    graph_hash: str = ""             # SHA-256 of canonical graph JSON (drift-detection only)
+    parser_version: int = 1          # canonical-JSON parser version (for hash stability)
+    langflow_instance: str = ""      # which langflow instance (trust_domain/system label)

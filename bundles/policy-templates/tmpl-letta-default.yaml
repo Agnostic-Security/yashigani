@@ -1,0 +1,49 @@
+# Yashigani v4.1 — Agent Policy Template: letta default
+#
+# Applies to: letta bundled agent (stateful memory / MemGPT)
+# Version: 1
+#
+# Mode-A prefixes (reverse-proxy / body-inspected):
+#   llm — LLM inference via gateway-inference deliver class
+#
+# Last updated: 2026-07-08T00:00:00+00:00
+apiVersion: yashigani.io/v1alpha1
+kind: AgentPolicyTemplate
+metadata:
+  template_id: tmpl-letta-default
+  version: 1
+  applies_to: letta
+  description: >-
+    Default governance policy for the bundled letta agent. Enables LLM egress
+    only (Mode A — body-inspected). No internet-facing egress; internal
+    delivery only.
+
+spec:
+  ingress:
+    enabled: true
+
+  egress:
+    - prefix: llm
+      mode: reverse_proxy
+      deliver_to: gateway-inference
+      ceiling: PUBLIC
+      scan_secrets: true
+      filter_description: true
+
+  disclosure:
+    enforced:
+      - "Destination closed-world — perimeter-owned Caddy config"
+      - "Body DLP + injection screen + OPA ceiling/PII on llm (Mode A)"
+      - "Per-caller positive grant; absence = deny; revocation = grant removal"
+    residuals:
+      - id: UNION-N1
+        applies_to: llm
+        text: >-
+          Revoking this agent's grant kills its LLM ingress. While a sibling
+          agent holds the same prefix in the union grant, the forwarder route
+          remains active — the kill switch removes this caller's grant entry,
+          not the forwarder route itself.
+      - id: IDENTITY-MF6
+        text: >-
+          Audit identity_basis is ringfence-position: caller identity is the
+          2-member ringfence topology, not mTLS/attestation on this hop.
