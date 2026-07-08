@@ -817,6 +817,47 @@ async def lifespan(app: FastAPI):
             "return agent_not_found until the registry is restored", _areconcile_exc
         )
 
+    # TRACK1-F-04 RCA-2 — post-reconcile bundled-envelope bootstrap (ordering fix).
+    #
+    # The FIRST bootstrap pass (inside `if db_dsn:`, ~40 lines into lifespan)
+    # runs with a potentially-empty agent registry: Redis db/3 has NO persistence
+    # (appendonly no / save "") so a container/Docker-Desktop restart wipes all
+    # registered agents from db/3 BEFORE the first bootstrap fires.
+    #
+    # reconcile_agents_from_durable (immediately above) re-pushes any agents
+    # present in the durable Postgres mirror back into Redis db/3.  Running
+    # bootstrap a SECOND TIME here guarantees that envelopes are always minted
+    # after the registry is fully re-hydrated, regardless of the Redis state at
+    # the start of the lifespan.
+    #
+    # Idempotent: bootstrap_bundled_agent_envelopes skips any ACTIVE envelope.
+    # Same non-fatal SOP-1 exception rationale as the first pass: the failure
+    # mode is fail-closed (verify-mcp keeps denying until next boot), so a
+    # transient DB blip MUST NOT abort the lifespan.
+    if db_dsn:
+        try:
+            from yashigani.backoffice.bundled_envelopes import (  # noqa: PLC0415
+                bootstrap_bundled_agent_envelopes as _bootstrap_post_reconcile,
+            )
+            from yashigani.mcp.envelope_service import (  # noqa: PLC0415
+                CapabilityEnvelopeService as _CES2,
+            )
+            _minted_post = await _bootstrap_post_reconcile(
+                _CES2(get_pool()),
+                backoffice_state.agent_registry,
+            )
+            if _minted_post:
+                _log.info(
+                    "Backoffice: bundled-agent envelopes minted (post-reconcile pass): %s",
+                    ", ".join(_minted_post),
+                )
+        except Exception as _be2_exc:  # noqa: BLE001 — see SOP-1 rationale, line ~483
+            _log.error(
+                "Backoffice: post-reconcile bundled-envelope bootstrap FAILED (%s) "
+                "— bundled ingress fronts remain fail-closed until the next boot",
+                _be2_exc,
+            )
+
     # --- Document-enforcement policy matrix (data.yashigani.document) — 2.26 ---
     # Same persistence + re-push pattern as RBAC, targeting the document sub-tree
     # so the production rego (policy/document.rego) evaluates the operator's live
