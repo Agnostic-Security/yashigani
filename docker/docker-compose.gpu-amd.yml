@@ -1,0 +1,71 @@
+# GPU overlay — AMD ROCm device passthrough to ollama.
+# last-updated: 2026-07-08 (feat(gpu): AMD ROCm overlay — UNTESTED ON HARDWARE)
+#
+# Passes /dev/kfd (HPC compute scheduler) and /dev/dri/renderD128 (DRM render
+# node) into the ollama container so the ROCm runtime can drive the GPU for
+# local LLM inference.
+#
+# STATUS: IMPLEMENTED, NOT TESTED ON PHYSICAL AMD HARDWARE.
+# Implemented per ollama GPU documentation + AMD ROCm container guide.
+# Tested only for YAML syntax correctness; verified against ollama/ollama
+# container runtime behaviour described in upstream docs.
+#
+# SUPPORTED GPU TARGETS (ollama 0.23+, ROCm 7):
+#   gfx908 gfx90a gfx942 gfx950          (MI100 / MI200 / MI300 series)
+#   gfx1030 gfx1100 gfx1101 gfx1102      (Navi21 / Navi31 / Navi32 / Navi33)
+#   gfx1150 gfx1151 gfx1200 gfx1201      (Navi41 / Navi42 / Navi44 / Navi48)
+#
+# REQUIREMENTS (must be provisioned before install):
+#   1. ROCm runtime installed on the host:
+#        https://rocm.docs.amd.com/en/latest/deploy/linux/
+#   2. User in `render` and `video` groups:
+#        sudo usermod -aG render,video $USER && newgrp render
+#   3. Verify ROCm is working:
+#        rocm-smi --showproductname
+#   4. For pre-Navi21 cards (gfx1010/1012/etc) set in docker/.env:
+#        HSA_OVERRIDE_GFX_VERSION=10.3.0
+#      This forces ROCm to treat the card as gfx1030. Without it, ollama
+#      falls back to CPU (library=cpu) with unsupported-device error.
+#   5. For multi-GPU hosts: adjust renderD128 → renderD129/130/... per GPU index.
+#        lspci -v | grep -A1 VGA   # identify your cards
+#        ls /dev/dri/              # list available render nodes
+#
+# install.sh adds this overlay when YSG_GPU_TYPE=amd_rocm on Docker runtime.
+# Podman: same devices work; apply via `--device /dev/kfd --device /dev/dri/renderD128`.
+#
+# DOCKER + PODMAN PARITY:
+#   Docker runtime: this file (device passthrough via compose devices:)
+#   Podman runtime: same device syntax works (Podman reads compose devices: natively)
+#   Kubernetes: use the AMD device plugin (github.com/ROCm/k8s-device-plugin)
+#               and set values.yaml ollama.gpu.type=amd_rocm (adds amd.com/gpu limit)
+
+services:
+  ollama:
+    devices:
+      # /dev/kfd — ROCm compute queue interface (primary GPU scheduler).
+      # Required for all ROCm compute workloads.
+      - "/dev/kfd"
+      # /dev/dri/renderD128 — DRM render node for GPU 0.
+      # Adjust suffix for multi-GPU: renderD129=GPU1, renderD130=GPU2, etc.
+      # Run `ls /dev/dri/` to enumerate available render nodes.
+      - "/dev/dri/renderD128"
+    group_add:
+      # ROCm requires the container process to be in the render + video groups
+      # to access /dev/kfd and /dev/dri/renderD128 without root.
+      # These are the host group IDs — Docker maps them into the container.
+      - "render"
+      - "video"
+    environment:
+      # HSA_OVERRIDE_GFX_VERSION: override reported GPU architecture for ROCm.
+      # Required for cards without an exact ROCm driver match (pre-Navi21 / gfx10xx).
+      # Set in docker/.env: HSA_OVERRIDE_GFX_VERSION=10.3.0 (treats card as gfx1030).
+      # Leave empty for supported gfx targets (listed above) — ROCm auto-detects.
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+      # ROCR_VISIBLE_DEVICES: analogous to CUDA_VISIBLE_DEVICES.
+      # Leave empty for default (all devices visible). Set to "0" to restrict to
+      # the first GPU only on multi-GPU hosts without explicit device node selection.
+      ROCR_VISIBLE_DEVICES: ${ROCR_VISIBLE_DEVICES:-}
+    # NOTE: read_only:true is preserved from the base ollama service (docker-compose.yml).
+    # ROCm does NOT write into the container rootfs at runtime (unlike NVIDIA's
+    # cdi-hook), so read_only: true is compatible with AMD ROCm on Docker.
+    # If you see EACCES errors on startup, check /dev/kfd + /dev/dri perms instead.

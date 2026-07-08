@@ -764,6 +764,25 @@ ollama:
       limits:
         cpu: "500m"
         memory: "256Mi"
+  # gpu: Kubernetes GPU resource configuration (source: docs.ollama.com/gpu).
+  # Apple Metal (apple_metal) is NOT applicable to Kubernetes — it is a macOS-only
+  # host-native path handled by the compose overlay (docker-compose.gpu-mac-metal.yml).
+  #
+  # Supported K8s paths:
+  #   nvidia  — requires NVIDIA device plugin (k8s.io/nvidia-device-plugin)
+  #             sets: resources.limits."nvidia.com/gpu": "1"
+  #   amd_rocm— requires AMD device plugin (github.com/ROCm/k8s-device-plugin)
+  #             sets: resources.limits."amd.com/gpu": "1"
+  #   vulkan  — no standard K8s device plugin; manual device mount required
+  #             (extraDevices not yet implemented — fall back to CPU or use hostPath)
+  #   none    — CPU-only (default)
+  #
+  # additionalResourceLimits: merged into ollama.resources.limits when non-empty.
+  # Example for NVIDIA:  additionalResourceLimits: {"nvidia.com/gpu": "1"}
+  # Example for AMD:     additionalResourceLimits: {"amd.com/gpu": "1"}
+  gpu:
+    type: "none"
+    additionalResourceLimits: {}
 
 # ---------------------------------------------------------------------------
 # Prometheus — metrics collection

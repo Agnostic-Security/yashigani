@@ -1,0 +1,103 @@
+# GPU overlay — Mac / Apple Metal — host-native ollama path.
+# last-updated: 2026-07-08 (feat(gpu): Mac/Metal host-ollama path — LAURA-METAL-01 GO-WITH-CONSTRAINTS)
+#
+# CONTEXT: Apple Metal cannot be passed into a Linux container. Docker Desktop
+# on Mac runs containers inside a Linux VM; the Linux VM has no Metal access,
+# so the container ollama runs CPU-only (library=cpu). A host-native ollama
+# (library=metal) must be running on the Mac instead. This overlay routes the
+# Caddy ollama-front upstream to that host-native process.
+#
+# MECHANISM — caddy service changes ONLY:
+#   1. extra_hosts "host.docker.internal:host-gateway"
+#      Makes host.docker.internal resolvable inside caddy (Step 6
+#      egress-allowlist resolver uses getent ahosts, which checks /etc/hosts).
+#   2. extra_hosts "ollama:host-gateway"
+#      Caddyfile.ollama-front uses `reverse_proxy http://ollama:11434`.
+#      /etc/hosts resolution takes precedence over Docker embedded DNS, so
+#      caddy's TCP dial for "ollama" goes to the host bridge gateway IP
+#      (the Mac host's Docker-internal IP), not the container. The Caddyfile
+#      is NOT modified — Helm ConfigMap parity preserved.
+#   3. YASHIGANI_CADDY_EGRESS_ALLOWLIST=host.docker.internal:11434
+#      caddy-entrypoint.sh Step 6 resolves host.docker.internal → host IP,
+#      then adds: iptables -A OUTPUT -p tcp --dport 11434 -d <host-IP> -j ACCEPT
+#      This is the ONLY host-egress port opened (scoped to TCP/11434).
+#
+# CONTAINER OLLAMA: still starts (CPU-only). gateway.depends_on: ollama: service_healthy
+# requires it. Caddy bypasses it via /etc/hosts → host ollama. The container
+# is a lightweight waiter; 4GB VM RAM is the cost. Documented limitation v4.1.
+# When gateway.depends_on supports required:false on a profile-gated service
+# cleanly, we'll revisit removing the container ollama.
+#
+# HOST-EGRESS SURFACE (LAURA-METAL-01 — GO-WITH-CONSTRAINTS):
+#   Path opened:  caddy container → host-gateway-IP:11434 (TCP, port-scoped)
+#   Who can use:  caddy ONLY (extra_hosts + EGRESS_ALLOWLIST applied to caddy only)
+#   iptables:     Step 5 covers bridge subnets; host-gateway-IP is typically
+#                 OUTSIDE bridge subnets on Docker Desktop Mac (192.168.65.1),
+#                 so Step 6 is the controlling mechanism for this path.
+#   Other containers: cannot reach host:11434 (no extra_hosts, no iptables rule)
+#   Internet reachability of host ollama: none (host firewall / LAN boundary)
+#   Auth gate:    all /ollama/* requests still pass Caddyfile.ollama-front
+#                 require_and_verify mTLS gate (SPIFFE leaf + intermediate CA)
+#                 before reaching host ollama — auth perimeter unchanged.
+#   C7 preserved: X-SPIFFE-ID header_up forwarding unchanged in Caddyfile.
+#
+# OPERATOR REQUIREMENTS (before install.sh runs on Mac Metal):
+#   1. Host ollama installed and running on :11434:
+#        brew install ollama && ollama serve   (or Ollama.app)
+#   2. Models pre-pulled on the host (ollama-init is disabled here):
+#        ollama pull qwen2.5:3b
+#        ollama pull qwen2.5:7b   # or whichever VRAM-tier model is selected
+#   3. Verify Metal is in use:
+#        curl -s http://localhost:11434/api/tags   # host must respond
+#        # ollama logs show: library=metal
+#   4. (Security hardening, C3 recommendation): bind host ollama to bridge-gateway
+#      IP only to restrict LAN exposure:
+#        # Derive the Docker bridge gateway IP:
+#        docker network inspect bridge \
+#          --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+#        # Then start ollama bound to that IP (e.g. 192.168.65.1):
+#        OLLAMA_HOST=192.168.65.1:11434 ollama serve
+#        # Binding 0.0.0.0 exposes ollama to the full LAN.
+#        # Binding bridge-gateway-IP restricts to Docker-routable connections only.
+#   5. OLLAMA_ORIGINS must NOT be set to * — inference-only, no tool/fs extensions.
+#
+# INSTALL.SH AUTO-SELECTS THIS OVERLAY when:
+#   YSG_GPU_TYPE=apple_metal AND uname==Darwin AND Docker runtime (not K8s, not Podman).
+#
+# MANUAL APPLY (for testing without full reinstall):
+#   cd /path/to/yashigani/docker && \
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose.gpu-mac-metal.yml \
+#     up -d --force-recreate caddy
+#
+# NOT APPLICABLE TO:
+#   - Linux (no Metal)
+#   - Kubernetes (no host-gateway concept; use dedicated K8s inference service)
+#   - Podman-on-Mac (verify podman machine inspect for host IP; gap in testing)
+
+services:
+  caddy:
+    extra_hosts:
+      # C5: resolve host.docker.internal inside caddy (used by Step 6 egress resolver).
+      - "host.docker.internal:host-gateway"
+      # Reroute Caddyfile.ollama-front's `reverse_proxy http://ollama:11434` to the
+      # host bridge IP. /etc/hosts takes priority over Docker embedded DNS — caddy
+      # dials the HOST ollama (Metal) rather than the container.
+      - "ollama:host-gateway"
+    environment:
+      # C2: add host-ollama to caddy-entrypoint.sh iptables egress allowlist (Step 6).
+      # Resolved at container startup: host.docker.internal → <host-bridge-IP>
+      # iptables rule: -A OUTPUT -p tcp --dport 11434 -d <host-bridge-IP> -j ACCEPT
+      # This is the ONLY host-egress TCP path opened (port-scoped, caddy only).
+      YASHIGANI_CADDY_EGRESS_ALLOWLIST: "host.docker.internal:11434"
+
+  # C4 (partial): neutralise ollama-init — models are managed on the host ollama.
+  # ollama-init runs when agent-bundle profiles (langflow/letta/openclaw) are active.
+  # On Mac Metal it would wastefully pull models to the container volume (unused).
+  # Override to a no-op so it exits 0 without pulling. The host ollama already has
+  # the required models. healthcheck disabled (no port to probe after immediate exit).
+  ollama-init:
+    entrypoint: ["true"]
+    restart: "no"
+    healthcheck:
+      disable: true
