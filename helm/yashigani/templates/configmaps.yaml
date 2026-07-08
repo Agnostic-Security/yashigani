@@ -1043,6 +1043,9 @@ data:
         reverse_proxy http://yashigani-ollama:11434 {
           header_up X-Forwarded-Proto https
           header_up X-Real-IP {remote_host}
+          # Rewrite Host to localhost — ollama's checkHostMiddleware accepts
+          # "localhost" universally. K8s parity with docker/Caddyfile.ollama-front.
+          header_up Host "localhost"
           transport http {
             read_timeout 300s
             write_timeout 300s

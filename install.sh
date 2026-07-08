@@ -383,6 +383,30 @@ OPTIONS
                                           VRAM and prompts interactively when multiple cards
                                           are present. Equivalent to setting YSG_GPU_INDEX.
                                           Example: --gpu-index 1 (selects the second card).
+
+  GPU support (source: docs.ollama.com/gpu — Linux + macOS platforms):
+    NVIDIA CUDA      — Linux: compute capability 5.0+ (GTX 750 Ti/K2200 through RTX/GB10);
+                       driver 550+ (570+ for cc5.0–6.2). Auto-detected via nvidia-smi.
+                       Overlay: docker-compose.gpu.yml (Docker) / gpu-podman.yml (Podman).
+    AMD ROCm         — Linux: Radeon RX series, Instinct, PRO (ROCm v7).
+                       Supported gfx: gfx908 gfx90a gfx942 gfx950 gfx1030
+                       gfx1100 gfx1101 gfx1102 gfx1150 gfx1151 gfx1200 gfx1201.
+                       Auto-detected via rocm-smi.
+                       Overlay: docker-compose.gpu-amd.yml [untested on hardware here].
+    Apple Metal      — macOS: M1/M2/M3/M4 via host-native ollama (Metal GPU, full UMA).
+                       Container ollama bypassed; host ollama must be pre-installed
+                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding,
+                       Docker Desktop VPNKit relays container→host.docker.internal
+                       to Mac loopback — LAN fully isolated):
+                         OLLAMA_HOST=127.0.0.1:11434 ollama serve
+                       Auto-detected on Darwin arm64.
+                       Overlay: docker-compose.gpu-mac-metal.yml. [TESTED: Apple M4 ✓]
+    Vulkan           — Linux: Intel Arc (A/B-series) + Intel iGPU (HD/UHD/Iris/Xe)
+    (Intel iGPU /      + AMD Ryzen AI APUs (gfx1150/1151 — ROCm experimental on APU,
+     AMD APU)           Vulkan preferred). Requires mesa-vulkan-drivers + /dev/dri.
+                       Auto-detected via lspci when native GPU drivers absent.
+                       Overlay: docker-compose.gpu-vulkan.yml [untested on hardware here].
+    CPU-only         — Default when no GPU detected. ollama logs library=cpu.
   --non-interactive                       Skip all interactive prompts
   --runtime <docker|podman|k8s>          Lock the container runtime (admin-must-choose
                                           rule per feedback_runtime_choice.md;
@@ -2308,11 +2332,12 @@ _interactive_platform_fallback() {
   fi
   if [[ "${YSG_GPU_TYPE:-none}" == "none" ]]; then
     printf "  No GPU was detected automatically. Do you have a GPU?\n"
-    printf "    1) NVIDIA GPU (CUDA)\n"
-    printf "    2) Apple Silicon (M1 / M2 / M3 / M4)\n"
-    printf "    3) AMD GPU (ROCm)\n"
-    printf "    4) No GPU / CPU only\n"
-    printf "  Choice [1-4]: "
+    printf "    1) NVIDIA GPU (CUDA — compute capability 5.0+, driver 550+)\n"
+    printf "    2) Apple Silicon (M1 / M2 / M3 / M4 — Metal via host ollama)\n"
+    printf "    3) AMD GPU discrete (ROCm v7 — Radeon RX 5000+/6000+/7000+, Instinct)\n"
+    printf "    4) Intel Arc / iGPU, or AMD APU (Vulkan backend — best-effort)\n"
+    printf "    5) No GPU / CPU only\n"
+    printf "  Choice [1-5]: "
     read -r gpu_choice
     case "$gpu_choice" in
       1)
@@ -2337,7 +2362,14 @@ _interactive_platform_fallback() {
         printf "  Enter GPU VRAM in GB: "; read -r vram_gb
         [[ "${vram_gb:-0}" =~ ^[0-9]+$ ]] || vram_gb=0
         YSG_GPU_VRAM_MB=$(( ${vram_gb:-0} * 1024 )) ;;
-      4|*) YSG_GPU_TYPE=none ;;
+      4)
+        # Intel Arc/iGPU + AMD APU: Vulkan backend (docs.ollama.com/gpu — no native Intel
+        # support; AMD APU gfx1150/1151 ROCm is experimental, Vulkan is more reliable).
+        YSG_GPU_TYPE=vulkan; YSG_GPU_COMPUTE=vulkan; YSG_GPU_NAME="Intel/AMD APU (user-reported)"
+        printf "  Enter GPU VRAM in GB (or shared memory in GB for iGPU/APU): "; read -r vram_gb
+        [[ "${vram_gb:-0}" =~ ^[0-9]+$ ]] || vram_gb=0
+        YSG_GPU_VRAM_MB=$(( ${vram_gb:-0} * 1024 )) ;;
+      5|*) YSG_GPU_TYPE=none ;;
     esac
     printf "\n"
   fi
@@ -6774,6 +6806,15 @@ compose_up() {
     fi
   done
 
+  # ── GPU overlay selection ─────────────────────────────────────────────────────
+  # Supported types (source: docs.ollama.com/gpu):
+  #   nvidia     — CUDA cc5.0+, driver 550+; CDI path (Docker) or CDI+devpath (Podman)
+  #   apple_metal— Metal via host-native ollama (Mac only; container ollama bypassed)
+  #   amd_rocm   — ROCm v7 discrete (Radeon RX 5000+/6000+/7000+, Instinct); /dev/kfd+dri
+  #   vulkan     — Vulkan backend (Intel Arc/iGPU, AMD APU gfx1150/1151); /dev/dri only
+  #   none       — CPU-only (no overlay applied; ollama runs library=cpu)
+  # ─────────────────────────────────────────────────────────────────────────────
+
   # GPU overlay (Docker runtime): wire the detected NVIDIA GPU into ollama. The base
   # ollama service has its GPU reservation commented out and the nvidia runtime is not
   # the daemon default, so without this ollama runs CPU-only. Pin a card with YSG_GPU_UUID
@@ -6816,6 +6857,82 @@ compose_up() {
       log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
     fi
   fi
+
+  # GPU overlay — Apple Metal / macOS host-native ollama.
+  # Container ollama cannot access Apple Metal (Docker Desktop = Linux VM, no Metal).
+  # Route caddy's ollama-front upstream to the host-native ollama (library=metal) via
+  # extra_hosts[ollama:host-gateway] + YASHIGANI_CADDY_EGRESS_ALLOWLIST.
+  # Container ollama is disabled (no-op entrypoint; gateway.depends_on overridden to
+  # service_started). ollama-init is also a no-op (models managed on host).
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via VPNKit (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  #   VPNKit relays container→host.docker.internal to Mac loopback; LAN fully isolated.
+  local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
+     [[ "$(uname -s)" == "Darwin" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_mac_metal" ]]; then
+    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
+    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
+    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      log_error "Apple Metal: host ollama not reachable on 127.0.0.1:11434"
+      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
+      log_error "  Then pre-pull models:"
+      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
+      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
+      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
+      return 1
+    fi
+    compose_files+=("-f" "$_gpu_overlay_mac_metal")
+    log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml)"
+    log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:host-gateway]"
+    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
+    log_info "  ollama-init disabled (models managed on host)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via VPNKit (Laura C3: CLOSED — loopback only)"
+  fi
+
+  # GPU overlay — AMD ROCm (discrete: Radeon RX 5000+/6000+/7000+, Instinct).
+  # Device passthrough: /dev/kfd (ROCm compute) + /dev/dri/renderD128 (render node).
+  # UNTESTED ON HARDWARE — implemented per docs.ollama.com/gpu + ROCm container guide.
+  local _gpu_overlay_amd="${WORK_DIR}/docker/docker-compose.gpu-amd.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "amd_rocm" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_amd" ]]; then
+    # Preflight: verify /dev/kfd exists (ROCm runtime installed)
+    if [[ ! -e "/dev/kfd" ]]; then
+      log_warn "AMD ROCm: /dev/kfd not found — ROCm runtime may not be installed."
+      log_warn "  Install: https://rocm.docs.amd.com/en/latest/deploy/linux/"
+      log_warn "  ollama will run CPU-only without ROCm."
+    fi
+    compose_files+=("-f" "$_gpu_overlay_amd")
+    log_info "Applying AMD ROCm GPU overlay (docker-compose.gpu-amd.yml)"
+    log_info "  ollama on /dev/kfd + /dev/dri/renderD128 [UNTESTED ON HARDWARE]"
+  fi
+
+  # GPU overlay — Vulkan backend (Intel Arc/iGPU, AMD APU).
+  # Device passthrough: /dev/dri/renderD128 (DRM render node, no /dev/kfd needed).
+  # ollama auto-selects Vulkan llama.cpp library when other backends are absent.
+  # UNTESTED ON HARDWARE — per docs.ollama.com/gpu (Intel=Vulkan only; AMD APU=Vulkan preferred).
+  local _gpu_overlay_vulkan="${WORK_DIR}/docker/docker-compose.gpu-vulkan.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "vulkan" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_vulkan" ]]; then
+    if [[ ! -e "/dev/dri/renderD128" ]]; then
+      log_warn "Vulkan GPU: /dev/dri/renderD128 not found — GPU drivers may not be installed."
+      log_warn "  Intel: sudo apt install mesa-vulkan-drivers intel-media-va-driver-non-free"
+      log_warn "  AMD APU: sudo apt install mesa-vulkan-drivers (Mesa RADV)"
+      log_warn "  ollama will run CPU-only without DRM render access."
+    fi
+    compose_files+=("-f" "$_gpu_overlay_vulkan")
+    log_info "Applying Vulkan GPU overlay (docker-compose.gpu-vulkan.yml)"
+    log_info "  ollama on /dev/dri/renderD128 (Intel Arc/iGPU / AMD APU) [UNTESTED ON HARDWARE]"
+  fi
+
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
     log_info "Podman detected — configuring rootless deployment"
 
