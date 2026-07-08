@@ -1,4 +1,4 @@
-# Last updated: 2026-07-08T00:00:00+00:00
+# Last updated: 2026-07-08T12:00:00+00:00
 """
 Yashigani MCP — (caller, prefix) egress grant document builder.
 
@@ -63,9 +63,53 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level LKG cache (R2 — transient Redis failure fallback)
+#
+# Canonical home for the LKG claimed-SPIFFE snapshot.  Relocated here from
+# agent_policies.py (R2 closure: the builder's elif self-read branch needs the
+# same LKG; putting it at the source closes the fail-open for ALL callers,
+# including mcp_onboard.py:854 which passes claimed_spiffes=None).
+#
+# agent_policies.py imports _lkg_claimed_lock and _get_claimed_spiffes_lkg from
+# here — no duplicate, no circular import (this module only imports stdlib +
+# yashigani.identity.trust_domain inside a function).
+# ---------------------------------------------------------------------------
+_lkg_claimed_lock = threading.Lock()
+_lkg_claimed_spiffes: frozenset = frozenset()
+
+
+def _get_claimed_spiffes_lkg(registry_store: Any) -> frozenset:
+    """Return claimed SPIFFEs with LKG fallback on transient store failure (R2).
+
+    On success, updates the module-level snapshot so future failures have a
+    fresh baseline.  On failure, returns the last-good snapshot — suppression
+    is never dropped to fail-open on a transient Redis blip.
+
+    Used by:
+    - agent_policies._run_apply / revoke_grant (explicit pre-resolved path)
+    - build_egress_grants_doc's elif self-read branch (mcp_onboard path)
+    """
+    global _lkg_claimed_spiffes
+    try:
+        result = registry_store.get_claimed_egress_seed_spiffes()
+        with _lkg_claimed_lock:
+            _lkg_claimed_spiffes = result
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "egress-grants: get_claimed_egress_seed_spiffes failed (%s) — "
+            "using LKG snapshot (%d entries, R2 fallback)",
+            exc, len(_lkg_claimed_spiffes),
+        )
+        with _lkg_claimed_lock:
+            return frozenset(_lkg_claimed_spiffes)
+
 
 # Egress prefixes exposed by the static egress Caddyfile per bundled system
 # (docker/Caddyfile.openclaw-egress eval handles).  The transitional seed
@@ -167,9 +211,10 @@ def build_egress_grants_doc(
     ``agent_policies.py`` resolve it through ``_get_claimed_spiffes_lkg``
     before calling this function — on a transient Redis failure the LKG
     snapshot is used, so suppression never drops to fail-open on a single
-    blip.  When ``claimed_spiffes`` is None (e.g. the gateway startup push
-    that has no LKG state yet), the store is called directly with the
-    original fail-open-on-failure fallback.
+    blip.  When ``claimed_spiffes`` is None (e.g. mcp_onboard.py post-commit
+    push or gateway startup push), the builder's elif branch calls
+    ``_get_claimed_spiffes_lkg`` directly — same LKG fallback, no fail-open
+    regardless of which path the caller takes (Lu R2 structural closure).
 
     Never raises.
     """
@@ -192,18 +237,19 @@ def build_egress_grants_doc(
         for spiffe in claimed_spiffes:
             seed.pop(spiffe, None)
     elif registry_store is not None:
-        # Direct path: no LKG snapshot available (e.g. gateway startup push).
-        try:
-            claimed = registry_store.get_claimed_egress_seed_spiffes()
-            for spiffe in claimed:
-                seed.pop(spiffe, None)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "egress-grants: claimed-seed lookup failed (%s) — seed "
-                "suppression SKIPPED; revoked seed grants may resurface "
-                "(fail-OPEN risk on revoke — restore the store connection "
-                "and re-push to enforce revocations)", exc,
-            )
+        # Self-read path (claimed_spiffes=None): caller did not pre-resolve.
+        # mcp_onboard.py:854 (onboard-approve post-commit push) is the live
+        # caller — it commits the envelope then re-pushes the full doc without
+        # an explicit claimed set.
+        #
+        # Use _get_claimed_spiffes_lkg: on transient failure it returns the
+        # last-good snapshot rather than dropping suppression to fail-open.
+        # Every successful read updates the snapshot for future fallbacks.
+        # Net: a single Redis blip can never resurface a previously-revoked
+        # bundled seed grant (Lu R2 Medium×Bypass, structural closure).
+        claimed = _get_claimed_spiffes_lkg(registry_store)
+        for spiffe in claimed:
+            seed.pop(spiffe, None)
 
     doc: dict = {}
     doc.update(seed)
@@ -224,4 +270,7 @@ __all__ = [
     "build_egress_grants_doc",
     "bundled_system_spiffe_set",
     "transitional_egress_seed",
+    "_get_claimed_spiffes_lkg",
+    "_lkg_claimed_lock",
+    "_lkg_claimed_spiffes",
 ]

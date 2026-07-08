@@ -55,6 +55,7 @@ from pydantic import BaseModel, Field, field_validator
 from yashigani.auth.spiffe import require_spiffe_id
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
+from yashigani.mcp._egress_grants import _lkg_claimed_lock, _get_claimed_spiffes_lkg  # noqa: F401 — re-exported for tests + used below
 
 logger = logging.getLogger(__name__)
 
@@ -75,37 +76,6 @@ _TEMPLATES_DIR = Path(__file__).parent.parent.parent.parent.parent / "bundles" /
 _FQDN_RE = re.compile(
     r"^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$"
 )
-
-# ---------------------------------------------------------------------------
-# Module-level LKG cache (R2 — transient Redis failure fallback)
-#
-# get_claimed_egress_seed_spiffes() returns the set of SPIFFEs that have ever
-# had put_egress_grant called.  A transient Redis failure here (at revoke time)
-# would drop suppression and allow the transitional seed to resurface a grant
-# we already revoked (fail-OPEN risk on seed).  Cache the last-good snapshot
-# so a transient failure falls back safely instead of dropping suppression.
-# ---------------------------------------------------------------------------
-_lkg_claimed_lock = threading.Lock()
-_lkg_claimed_spiffes: frozenset = frozenset()
-
-
-def _get_claimed_spiffes_lkg(registry_store: Any) -> frozenset:
-    """Return claimed SPIFFEs with LKG fallback (R2)."""
-    global _lkg_claimed_spiffes
-    try:
-        result = registry_store.get_claimed_egress_seed_spiffes()
-        with _lkg_claimed_lock:
-            _lkg_claimed_spiffes = result
-        return result
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "agent-policies: get_claimed_egress_seed_spiffes failed (%s) — "
-            "using LKG snapshot (%d entries, R2 fallback)",
-            exc, len(_lkg_claimed_spiffes),
-        )
-        with _lkg_claimed_lock:
-            return frozenset(_lkg_claimed_spiffes)
-
 
 # ---------------------------------------------------------------------------
 # Template loader (code-versioned YAML)
@@ -696,7 +666,10 @@ async def _run_apply(
     # 4. Resolve issued-leaf SPIFFE (Nico gap-4)
     spiffe_id = _resolve_agent_spiffe(tenant, system, store)
 
-    # Build granted prefixes from Mode-A entries only (Mode-B skipped in Track 1)
+    # Build granted prefixes from Mode-A entries only (Mode-B skipped in Track 1).
+    # Lu informational: also exclude enabled:false entries — a Mode-A entry
+    # marked enabled:false is not an active grant (latent-gap hardening; no
+    # shipped template hits this, but the filter must be exhaustive).
     granted_prefixes = sorted(
         str(e.get("prefix", "")).strip()
         for e in egress_entries
@@ -704,6 +677,7 @@ async def _run_apply(
         and str(e.get("mode", "reverse_proxy")).strip() != "connect"
         and str(e.get("prefix", "")).strip()
         and not bool(e.get("track_2_only", False))
+        and bool(e.get("enabled", True))
     )
 
     rollback_steps: list = []

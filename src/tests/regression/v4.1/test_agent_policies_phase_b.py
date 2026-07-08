@@ -616,12 +616,12 @@ def test_xss_payload_in_flow_name_stored_raw():
 
 def test_r2_lkg_cache_falls_back_on_redis_failure():
     """_get_claimed_spiffes_lkg falls back to last-good snapshot on transient failure (R2)."""
-    import yashigani.backoffice.routes.agent_policies as ap
+    import yashigani.mcp._egress_grants as eg
 
-    # Seed the module-level LKG cache with a known set
+    # Seed the module-level LKG cache with a known set (canonical home is _egress_grants)
     known_spiffes = frozenset(["spiffe://yashigani.internal/langflow"])
-    with ap._lkg_claimed_lock:
-        ap._lkg_claimed_spiffes = known_spiffes
+    with eg._lkg_claimed_lock:
+        eg._lkg_claimed_spiffes = known_spiffes
 
     # Store that raises on get_claimed_egress_seed_spiffes
     store = MagicMock()
@@ -637,11 +637,11 @@ def test_r2_lkg_cache_falls_back_on_redis_failure():
 
 def test_r2_lkg_cache_updates_on_success():
     """_get_claimed_spiffes_lkg updates the cache on successful read."""
-    import yashigani.backoffice.routes.agent_policies as ap
+    import yashigani.mcp._egress_grants as eg
 
-    # Reset cache
-    with ap._lkg_claimed_lock:
-        ap._lkg_claimed_spiffes = frozenset()
+    # Reset cache (canonical home is _egress_grants)
+    with eg._lkg_claimed_lock:
+        eg._lkg_claimed_spiffes = frozenset()
 
     new_spiffes = frozenset(["spiffe://yashigani.internal/openclaw"])
 
@@ -651,8 +651,8 @@ def test_r2_lkg_cache_updates_on_success():
     result = _get_claimed_spiffes_lkg(store)
 
     assert result == new_spiffes
-    with ap._lkg_claimed_lock:
-        assert ap._lkg_claimed_spiffes == new_spiffes, "LKG must be updated after successful read"
+    with eg._lkg_claimed_lock:
+        assert eg._lkg_claimed_spiffes == new_spiffes, "LKG must be updated after successful read"
 
 
 # ---------------------------------------------------------------------------
@@ -733,8 +733,8 @@ def test_r2_lkg_suppresses_revoked_spiffe_on_transient_failure(monkeypatch):
     This is the R2 wiring fix: without it, build_egress_grants_doc would drop
     suppression on the transient failure and resurface the revoked seed grant.
     """
-    import yashigani.backoffice.routes.agent_policies as ap
-    from yashigani.mcp._egress_grants import build_egress_grants_doc
+    import yashigani.mcp._egress_grants as eg
+    from yashigani.mcp._egress_grants import build_egress_grants_doc, _get_claimed_spiffes_lkg
 
     openclaw_spiffe = "spiffe://yashigani.test.r2/openclaw"
     langflow_spiffe = "spiffe://yashigani.test.r2/langflow"
@@ -745,9 +745,10 @@ def test_r2_lkg_suppresses_revoked_spiffe_on_transient_failure(monkeypatch):
     monkeypatch.setenv("YASHIGANI_LETTA_SPIFFE_ID", letta_spiffe)
     monkeypatch.setenv("YASHIGANI_TENANT_ID", "r2-test")
 
-    # Prime the LKG: openclaw was claimed (a prior successful read saw it)
-    with ap._lkg_claimed_lock:
-        ap._lkg_claimed_spiffes = frozenset([openclaw_spiffe])
+    # Prime the LKG: openclaw was claimed (a prior successful read saw it).
+    # Canonical home is _egress_grants (relocated from agent_policies in R2 closure).
+    with eg._lkg_claimed_lock:
+        eg._lkg_claimed_spiffes = frozenset([openclaw_spiffe])
 
     # Store: transient Redis failure on get_claimed_egress_seed_spiffes.
     # No grants remain (admin already deleted openclaw's grant).
@@ -758,7 +759,7 @@ def test_r2_lkg_suppresses_revoked_spiffe_on_transient_failure(monkeypatch):
     store.build_egress_grants_data.return_value = {}  # grant deleted
 
     # _get_claimed_spiffes_lkg must return LKG (containing openclaw) on failure
-    claimed = ap._get_claimed_spiffes_lkg(store)
+    claimed = _get_claimed_spiffes_lkg(store)
     assert openclaw_spiffe in claimed, (
         "R2: LKG must return openclaw SPIFFE on transient get_claimed_egress_seed_spiffes failure"
     )
@@ -939,3 +940,129 @@ async def test_apply_rejects_template_mismatch(monkeypatch):
 
     assert exc_info.value.status_code == 422
     assert "template_mismatch" in str(exc_info.value.detail)
+
+
+# ---------------------------------------------------------------------------
+# R2 structural closure: build_egress_grants_doc elif branch (mcp_onboard path)
+# ---------------------------------------------------------------------------
+
+def test_build_egress_grants_doc_elif_lkg_on_transient_failure(monkeypatch):
+    """R2 structural closure: build_egress_grants_doc elif branch uses LKG.
+
+    Drives build_egress_grants_doc with claimed_spiffes=None and registry_store
+    provided — this is exactly the path mcp_onboard.py:854 takes (onboard-approve
+    post-commit push).  When get_claimed_egress_seed_spiffes raises (transient
+    Redis failure), the elif branch must fall back to the LKG snapshot rather
+    than continuing fail-open (which would resurface a previously-revoked
+    bundled seed grant).
+
+    Before the R2 structural fix, the elif branch would log a warning and
+    continue — dropping suppression, allowing the seed to resurface.  After the
+    fix, the elif branch calls _get_claimed_spiffes_lkg which returns the LKG
+    snapshot and suppresses the revoked entry.
+
+    This test proves the builder itself is safe even when called without a
+    pre-resolved claimed_spiffes argument (the mcp_onboard caller pattern).
+    """
+    import yashigani.mcp._egress_grants as eg
+    from yashigani.mcp._egress_grants import build_egress_grants_doc
+
+    openclaw_spiffe = "spiffe://yashigani.test.elif/openclaw"
+    langflow_spiffe = "spiffe://yashigani.test.elif/langflow"
+    letta_spiffe = "spiffe://yashigani.test.elif/letta"
+
+    monkeypatch.setenv("YASHIGANI_OPENCLAW_SPIFFE_ID", openclaw_spiffe)
+    monkeypatch.setenv("YASHIGANI_LANGFLOW_SPIFFE_ID", langflow_spiffe)
+    monkeypatch.setenv("YASHIGANI_LETTA_SPIFFE_ID", letta_spiffe)
+    monkeypatch.setenv("YASHIGANI_TENANT_ID", "elif-test")
+
+    # Prime the LKG: openclaw was previously claimed (successful read pre-blip)
+    with eg._lkg_claimed_lock:
+        eg._lkg_claimed_spiffes = frozenset([openclaw_spiffe])
+
+    # Store: simulates the mcp_onboard post-commit state — grant deleted, but
+    # transient Redis failure on get_claimed_egress_seed_spiffes.
+    store = MagicMock()
+    store.get_claimed_egress_seed_spiffes.side_effect = RuntimeError(
+        "Redis transient: connection reset"
+    )
+    store.build_egress_grants_data.return_value = {}  # grant was deleted before push
+
+    # Call with claimed_spiffes=None — exercises the elif branch, NOT if branch.
+    doc = build_egress_grants_doc(registry_store=store, claimed_spiffes=None)
+
+    # CRITICAL: revoked openclaw seed must stay suppressed via LKG fallback
+    assert openclaw_spiffe not in doc, (
+        f"R2 elif: revoked openclaw SPIFFE {openclaw_spiffe!r} must be suppressed "
+        "by LKG fallback even when claimed_spiffes=None and get_claimed_egress_seed_spiffes "
+        "raises (mcp_onboard.py:854 path must not resurface revoked seed grants)"
+    )
+
+    # langflow and letta were never claimed — their seeds must still be present
+    assert langflow_spiffe in doc, (
+        "langflow unclaimed seed must not be suppressed"
+    )
+    assert letta_spiffe in doc, (
+        "letta unclaimed seed must not be suppressed"
+    )
+
+    # get_claimed_egress_seed_spiffes was attempted exactly once (by _get_claimed_spiffes_lkg)
+    store.get_claimed_egress_seed_spiffes.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Lu informational: enabled:false Mode-A entry not granted
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_enabled_false_mode_a_entry_not_in_granted_prefixes(monkeypatch):
+    """enabled:false Mode-A entry is excluded from granted_prefixes (Lu informational).
+
+    No shipped template has an enabled:false Mode-A entry, but the filter must
+    be exhaustive.  A future template carrying a Mode-A entry with enabled:false
+    must NOT have that prefix granted to OPA.
+    """
+    monkeypatch.setenv("YASHIGANI_TENANT_ID", "acme")
+    monkeypatch.setenv("YASHIGANI_LANGFLOW_SPIFFE_ID", "spiffe://yashigani.internal/langflow")
+
+    # Template with one enabled and one explicitly disabled Mode-A prefix
+    tmpl = _make_minimal_template(
+        template_id="tmpl-enabled-false-test",
+        applies_to="langflow",
+        egress_entries=[
+            {"prefix": "llm", "mode": "reverse_proxy", "ceiling": "PUBLIC", "enabled": True},
+            {"prefix": "slack", "mode": "reverse_proxy", "ceiling": "PUBLIC", "enabled": False},
+        ],
+    )
+    store = _make_store()
+    body = ApplyTemplateRequest(template_id="tmpl-enabled-false-test")
+    session = _make_session("admin@acme")
+
+    from yashigani.backoffice.routes import agent_policies as ap
+
+    mock_state = MagicMock()
+    mock_state.audit_writer = None
+    mock_state.mcp_registry_store = None
+
+    with (
+        patch.object(ap, "_registry_store", return_value=store),
+        patch.object(ap, "_load_templates", return_value={"tmpl-enabled-false-test": tmpl}),
+        patch.object(ap, "backoffice_state", mock_state),
+        patch("yashigani.mcp._opa_push.push_and_verify_egress_grants"),
+        patch("yashigani.mcp._egress_grants.build_egress_grants_doc", return_value={}),
+    ):
+        result = await ap._run_apply("acme", "langflow", body, session)
+
+    assert result["status"] == "applied"
+
+    grant = store._grants.get("acme:langflow")
+    assert grant is not None, "Grant must be written"
+
+    # enabled:true entry must be granted
+    assert "llm" in grant["prefixes"], "enabled:true Mode-A entry must be in granted prefixes"
+
+    # enabled:false entry must NOT be granted (Lu informational latent-gap hardening)
+    assert "slack" not in grant["prefixes"], (
+        "enabled:false Mode-A entry must NOT appear in granted prefixes "
+        "(Lu informational: latent-gap hardening; filter must be exhaustive)"
+    )
