@@ -395,7 +395,11 @@ OPTIONS
                        Overlay: docker-compose.gpu-amd.yml [untested on hardware here].
     Apple Metal      — macOS: M1/M2/M3/M4 via host-native ollama (Metal GPU, full UMA).
                        Container ollama bypassed; host ollama must be pre-installed
-                       and running on :11434. Auto-detected on Darwin arm64.
+                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding,
+                       Docker Desktop VPNKit relays container→host.docker.internal
+                       to Mac loopback — LAN fully isolated):
+                         OLLAMA_HOST=127.0.0.1:11434 ollama serve
+                       Auto-detected on Darwin arm64.
                        Overlay: docker-compose.gpu-mac-metal.yml. [TESTED: Apple M4 ✓]
     Vulkan           — Linux: Intel Arc (A/B-series) + Intel iGPU (HD/UHD/Iris/Xe)
     (Intel iGPU /      + AMD Ryzen AI APUs (gfx1150/1151 — ROCm experimental on APU,
@@ -6858,27 +6862,36 @@ compose_up() {
   # Container ollama cannot access Apple Metal (Docker Desktop = Linux VM, no Metal).
   # Route caddy's ollama-front upstream to the host-native ollama (library=metal) via
   # extra_hosts[ollama:host-gateway] + YASHIGANI_CADDY_EGRESS_ALLOWLIST.
-  # Container ollama + ollama-init are disabled in the overlay (profile-gated off).
-  # HOST-EGRESS SURFACE: caddy→host-gateway-IP:11434 (TCP only). Laura: GO-WITH-CONSTRAINTS.
-  # PREREQUISITE: host-native ollama running on :11434 with models pre-pulled.
+  # Container ollama is disabled (no-op entrypoint; gateway.depends_on overridden to
+  # service_started). ollama-init is also a no-op (models managed on host).
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via VPNKit (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  #   VPNKit relays container→host.docker.internal to Mac loopback; LAN fully isolated.
   local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
   if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
      [[ "$(uname -s)" == "Darwin" ]] && \
      [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
      [[ "$MODE" != "k8s" ]] && \
      [[ -f "$_gpu_overlay_mac_metal" ]]; then
-    # Verify host ollama is reachable before applying the overlay.
-    if ! curl -fs --max-time 3 --connect-timeout 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
-      log_warn "Apple Metal: host ollama not reachable on :11434 — verify ollama is running:"
-      log_warn "  brew install ollama && ollama serve"
-      log_warn "  ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
-      log_warn "Applying Metal overlay anyway (host ollama must be running for inference)."
+    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
+    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
+    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      log_error "Apple Metal: host ollama not reachable on 127.0.0.1:11434"
+      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
+      log_error "  Then pre-pull models:"
+      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
+      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
+      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
+      return 1
     fi
     compose_files+=("-f" "$_gpu_overlay_mac_metal")
     log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml)"
     log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:host-gateway]"
-    log_info "  container ollama + ollama-init disabled (models managed on host)"
-    log_warn "  HOST-EGRESS: caddy→host:11434 opened (Laura METAL-01: GO-WITH-CONSTRAINTS)"
+    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
+    log_info "  ollama-init disabled (models managed on host)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via VPNKit (Laura C3: CLOSED — loopback only)"
   fi
 
   # GPU overlay — AMD ROCm (discrete: Radeon RX 5000+/6000+/7000+, Instinct).

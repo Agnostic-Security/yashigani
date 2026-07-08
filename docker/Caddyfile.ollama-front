@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Ollama inference-plane Caddy front — v4.1 Phase 1b-ii (LAURA-I1-01 close)
-# Last updated: 2026-07-05
+# Last updated: 2026-07-08 (METAL-01 C3: header_up Host localhost — ollama checkHostMiddleware fix)
 #
 # SINGLE SOURCE. This file is imported (top-level) by every Caddyfile variant
 #   docker/Caddyfile.{selfsigned,ca,acme}   via  import /etc/caddy/Caddyfile.ollama-front
@@ -51,6 +51,12 @@
         reverse_proxy http://ollama:11434 {
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+            # Rewrite Host to localhost so ollama's checkHostMiddleware accepts
+            # the request regardless of which name resolves to the upstream
+            # (container "ollama" via Docker DNS, or host loopback on Mac Metal
+            # via extra_hosts[ollama:host-gateway] + VPNKit relay).
+            # "localhost" is always in ollama's allowed-host list (METAL-01 C3).
+            header_up Host "localhost"
             transport http {
                 read_timeout 300s
                 write_timeout 300s
