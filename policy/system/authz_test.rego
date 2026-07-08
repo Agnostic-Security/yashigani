@@ -263,8 +263,59 @@ test_gateway_dn_post_eval_allowed if {
     }
 }
 
-# 24. gateway RFC 2253 DN: PUT /v1/data → DENY (gateway eval-only)
+# 24. gateway RFC 2253 DN: PUT /v1/data → DENY (gateway eval-only for root namespace)
 test_gateway_dn_put_data_denied if {
+    not data.system.authz.allow with input as {
+        "identity": _gateway_dn,
+        "method": "PUT",
+        "path": ["v1", "data", "yashigani"],
+    }
+}
+
+# ── 25–29. F-02: gateway MCP seed write — PUT /v1/data/yashigani/mcp/** ──────
+# The gateway must be able to PUT to the mcp subtree for startup egress-grants
+# seed push (entrypoint.py:1075) and Seam-3 full grants+baselines push
+# (entrypoint.py:1035). Before the F-02 fix these returned 401.
+
+# 25. gateway SPIFFE: PUT /v1/data/yashigani/mcp/egress_grants → ALLOW
+test_gateway_spiffe_put_mcp_egress_grants_allowed if {
+    data.system.authz.allow with input as {
+        "identity": _gateway_spiffe,
+        "method": "PUT",
+        "path": ["v1", "data", "yashigani", "mcp", "egress_grants"],
+    }
+}
+
+# 26. gateway DN: PUT /v1/data/yashigani/mcp (Seam-3 full push) → ALLOW
+test_gateway_dn_put_mcp_root_allowed if {
+    data.system.authz.allow with input as {
+        "identity": _gateway_dn,
+        "method": "PUT",
+        "path": ["v1", "data", "yashigani", "mcp"],
+    }
+}
+
+# 27. gateway CN: PUT /v1/data/yashigani/mcp/egress_grants → ALLOW (bare CN fallback)
+test_gateway_cn_put_mcp_egress_grants_allowed if {
+    data.system.authz.allow with input as {
+        "identity": _gateway_cn,
+        "method": "PUT",
+        "path": ["v1", "data", "yashigani", "mcp", "egress_grants"],
+    }
+}
+
+# 28. gateway: PUT /v1/data/yashigani/rbac → DENY (mcp subtree ONLY; no broader write)
+test_gateway_put_rbac_denied if {
+    not data.system.authz.allow with input as {
+        "identity": _gateway_spiffe,
+        "method": "PUT",
+        "path": ["v1", "data", "yashigani", "rbac"],
+    }
+}
+
+# 29. gateway: PUT /v1/data/yashigani → DENY (root yashigani namespace unchanged)
+# (regression guard — existing test 9 covers SPIFFE form; this covers DN form)
+test_gateway_dn_put_yashigani_root_denied if {
     not data.system.authz.allow with input as {
         "identity": _gateway_dn,
         "method": "PUT",

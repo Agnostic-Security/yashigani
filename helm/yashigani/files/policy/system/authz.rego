@@ -22,8 +22,9 @@
 # SPIFFE identities (URI SANs on the leaf certs; OPA surfaces the Subject CN
 # or the first URI SAN as input.identity depending on OPA version — both are
 # anchored to the cert presented, which is the mesh identity):
-#   backoffice    — SOLE writer;  may PUT/DELETE /v1/policies/*, PUT/PATCH /v1/data/*
-#   gateway       — EVAL only;    may POST  /v1/data/yashigani/**
+#   backoffice    — SOLE policy/data writer; PUT/DELETE /v1/policies/*, PUT/PATCH /v1/data/*
+#   gateway       — EVAL + MCP-seed writer; POST /v1/data/yashigani/**,
+#                   PUT /v1/data/yashigani/mcp (Seam-3) + /v1/data/yashigani/mcp/egress_grants
 #   <all others>  — DENY;         agents, MCPs, APIs are SUBJECTS of policy,
 #                                  never OPA admins (approval grants mesh access,
 #                                  never OPA management-API access)
@@ -42,7 +43,7 @@
 #
 # Run tests with: opa test policy/system/
 #
-# Last updated: LAURA-30-001 fix (2026-06-14)
+# Last updated: 2026-07-08 — F-02 gateway MCP seed write rule
 
 package system.authz
 
@@ -135,10 +136,9 @@ allow if {
     input.path[1] in {"policies", "data"}
 }
 
-# ── gateway: EVAL only (POST /v1/data/yashigani/**) ─────────────────────────
-# The gateway evaluates OPA decisions per-request. It only POSTs to
+# ── gateway: EVAL (POST /v1/data/yashigani/**) ───────────────────────────────
+# The gateway evaluates OPA decisions per-request. It POSTs to
 # /v1/data/yashigani/<decision_path> and /v1/data/client_enforce/<aggregate>.
-# It never reads or writes policy modules or arbitrary data namespaces.
 
 allow if {
     input.identity in _gateway_identities
@@ -149,8 +149,32 @@ allow if {
     input.path[2] in {"yashigani", "client_enforce", "client_bindings", "clients"}
 }
 
+# ── gateway: MCP data seed (PUT /v1/data/yashigani/mcp/**) ──────────────────
+# F-02 (v4.1): the gateway pushes MCP data to OPA at startup:
+#   * PUT /v1/data/yashigani/mcp/egress_grants — transitional bundled-agent seed
+#     (entrypoint.py:1075, push_egress_grants, v4.1 Phase 1 / Lu M1)
+#   * PUT /v1/data/yashigani/mcp — full grants+baselines+egress_grants document
+#     (entrypoint.py:1035, push_mcp_opa_data, Seam-3 / v4.1 Phase 2b)
+# Scoped narrowly to the yashigani/mcp subtree. The gateway is NOT a general
+# data writer; backoffice remains the sole writer for all other data paths
+# (policies, rbac, bindings, document rules, etc.).
+# Both push calls use internal_httpx_sync_client → gateway mTLS identity
+# (CN=gateway,O=Agnostic Security). Before this rule the gateway identity was
+# eval-only (POST), so every startup PUT to /v1/data/yashigani/mcp returned
+# 401 from the management-API authz layer → egress seed never landed →
+# openclaw egress denied fail-closed until the backoffice approve push ran.
+
+allow if {
+    input.identity in _gateway_identities
+    input.method == "PUT"
+    input.path[0] == "v1"
+    input.path[1] == "data"
+    input.path[2] == "yashigani"
+    input.path[3] == "mcp"
+}
+
 # ── Default: deny ─────────────────────────────────────────────────────────────
-# Any request not matched above is rejected (403).
+# Any request not matched above is rejected (401).
 # This covers:
 #   - All agent / MCP / API service identities (cert-bearing but not OPA-admin).
 #   - Requests to undeclared paths (admin API paths not explicitly allowed above).
