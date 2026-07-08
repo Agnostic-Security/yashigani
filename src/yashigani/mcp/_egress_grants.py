@@ -143,7 +143,10 @@ def bundled_system_spiffe_set() -> frozenset:
         return frozenset()
 
 
-def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:
+def build_egress_grants_doc(
+    registry_store: Optional[Any],
+    claimed_spiffes: Optional[frozenset] = None,
+) -> dict:
     """Build the full ``egress_grants`` OPA data sub-document.
 
     Merges the transitional seed with the durable-registry grants (registry
@@ -152,15 +155,21 @@ def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:
     seed-only: onboarded instances then deny fail-closed until the store is
     reachable and the document re-pushed.
 
-    Seed suppression (design §4.4 / Lu MF-2 fix-2a): once the store has
+    Seed suppression (design §4.4 / Lu MF-2 fix-2a, R2): once the store has
     been asked to ``put_egress_grant`` for a bundled-system SPIFFE (admin
     applied or has ever been applied), that SPIFFE's seed entry is removed
     before the merge — grant-absence after a subsequent ``delete_egress_grant``
-    IS the kill switch (the seed can never resurface it).  Suppression is
-    gated on the store's ``get_claimed_egress_seed_spiffes`` call; if the
-    call fails, suppression is skipped with a WARNING (fail-open on the seed
-    only — same as the pre-fix behaviour — rather than silently denying
-    every unclaimed bundled system).
+    IS the kill switch (the seed can never resurface it).
+
+    ``claimed_spiffes`` (R2 LKG wiring): when provided, use this pre-resolved
+    frozenset for suppression instead of calling
+    ``registry_store.get_claimed_egress_seed_spiffes()``.  Callers in
+    ``agent_policies.py`` resolve it through ``_get_claimed_spiffes_lkg``
+    before calling this function — on a transient Redis failure the LKG
+    snapshot is used, so suppression never drops to fail-open on a single
+    blip.  When ``claimed_spiffes`` is None (e.g. the gateway startup push
+    that has no LKG state yet), the store is called directly with the
+    original fail-open-on-failure fallback.
 
     Never raises.
     """
@@ -175,10 +184,15 @@ def build_egress_grants_doc(registry_store: Optional[Any]) -> dict:
             "(fail-closed; static Caddy pins alone cannot allow)", exc,
         )
 
-    if registry_store is not None:
-        # Suppress seed entries for SPIFFEs the store has ever claimed
-        # (admin apply or revoke).  Once claimed, grant-absence = kill switch;
-        # the seed must never override a deliberate revocation (Lu MF-2a).
+    # Seed suppression: remove entries for SPIFFEs the store has ever claimed.
+    # Once claimed, grant-absence = kill switch; seed must never resurface a
+    # deliberate revocation (Lu MF-2a).
+    if claimed_spiffes is not None:
+        # R2 path: caller pre-resolved via LKG — use directly, no store call.
+        for spiffe in claimed_spiffes:
+            seed.pop(spiffe, None)
+    elif registry_store is not None:
+        # Direct path: no LKG snapshot available (e.g. gateway startup push).
         try:
             claimed = registry_store.get_claimed_egress_seed_spiffes()
             for spiffe in claimed:

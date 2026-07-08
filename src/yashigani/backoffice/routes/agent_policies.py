@@ -633,11 +633,17 @@ async def _run_apply(
 
     egress_entries = list(spec.get("egress") or [])
 
-    # 3. Reject Mode-B (connect) entries in Track 1 (B1 — Mode-B is Track 2 ONLY)
+    # 3. Reject Mode-B (connect) entries in Track 1 (B1 — Mode-B is Track 2 ONLY).
+    #    Fix (Lu incidental / openclaw applicability): skip entries that are
+    #    track_2_only or enabled:false — they are inert in Track 1 and must not
+    #    prevent the template's enabled Mode-A entries from applying.  The reject
+    #    stays for any connect entry that IS active (enabled:true, not track_2_only).
     for entry in egress_entries:
         if not isinstance(entry, dict):
             continue
         if str(entry.get("mode", "")).strip() == "connect":
+            if bool(entry.get("track_2_only", False)) or not bool(entry.get("enabled", True)):
+                continue  # Inert entry — do not build, do not 422
             prefix = entry.get("prefix", "")
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -647,6 +653,33 @@ async def _run_apply(
                         f"Mode-B CONNECT egress (prefix={prefix!r}) is Track 2 ONLY. "
                         "It is not available in Track 1. "
                         "See design §3.2 — gated on Laura FP-01 re-review."
+                    ),
+                },
+            )
+
+    # 3b. Fail-closed on requires_acknowledgement (Nico latent bypass fix).
+    #    No dual-admin ceremony infra exists in Track 1.  Any ACTIVE entry that
+    #    carries requires_acknowledgement:true is a weaken-class operation and
+    #    MUST be rejected 422 rather than silently applied (UI-only enforcement
+    #    is not enough).  Inert entries (track_2_only or enabled:false) are
+    #    skipped — they carry the flag as a future-ceremony annotation only.
+    for entry in egress_entries:
+        if not isinstance(entry, dict):
+            continue
+        if bool(entry.get("track_2_only", False)) or not bool(entry.get("enabled", True)):
+            continue  # Inert — skip
+        if bool(entry.get("requires_acknowledgement", False)):
+            prefix = entry.get("prefix", "")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "acknowledgement_ceremony_required",
+                    "message": (
+                        f"Egress entry {prefix!r} requires an acknowledgement ceremony "
+                        "(requires_acknowledgement:true) that is not available in "
+                        "Track 1. This is a weaken-class operation and cannot be "
+                        "applied without dual-admin ceremony infrastructure "
+                        "(design §5.3). Gated until Track 2."
                     ),
                 },
             )
@@ -776,11 +809,17 @@ async def _run_apply(
         except Exception as audit_exc:  # noqa: BLE001
             logger.error("agent-policies: audit write failed: %s", audit_exc)
 
-    # 9. Post-commit: push egress grants to OPA (add-only — no must_be_absent needed)
+    # 9. Post-commit: push egress grants to OPA (add-only — no must_be_absent needed).
+    #    R2: resolve the claimed set through the LKG before building the doc so that
+    #    a transient Redis failure here does not drop suppression for previously
+    #    revoked bundled-system SPIFFEs (they would resurface from the seed).
     try:
         from yashigani.mcp._egress_grants import build_egress_grants_doc  # noqa: PLC0415
         from yashigani.mcp._opa_push import push_and_verify_egress_grants  # noqa: PLC0415
-        push_and_verify_egress_grants(_opa_url(), build_egress_grants_doc(store))
+        claimed_for_push = _get_claimed_spiffes_lkg(store)
+        push_and_verify_egress_grants(
+            _opa_url(), build_egress_grants_doc(store, claimed_spiffes=claimed_for_push)
+        )
     except Exception as push_exc:  # noqa: BLE001 — committed; deny-until-pushed is fail-closed
         logger.error(
             "agent-policies: OPA push failed after apply %s/%s (%s) — "
@@ -816,9 +855,13 @@ async def apply_template(
     template application, and pushes to OPA.  Mode-B CONNECT is Track 2 only;
     any template with connect entries returns 422 in this track.
 
-    Step-up (Laura F10): StepUpAdminSession enforces TOTP re-verification within
-    YASHIGANI_STEPUP_TTL_SECONDS (default 300s) — action-bound, not reusable
-    beyond the TTL window, consistent with mcp_onboard approve semantics.
+    Step-up (Laura F10): StepUpAdminSession enforces TOTP re-verification via a
+    5-minute reusable TTL window (YASHIGANI_STEPUP_TTL_SECONDS, default 300s),
+    consistent with mcp_onboard approve semantics.  The step-up window is
+    reusable within its TTL — multiple /apply calls in the same window are
+    permitted.  Single-use enforcement is only required on the weaken-class path
+    (requires_acknowledgement / Mode-B), which is now fail-closed in Track 1
+    (rejected 422 before any grant write — see _run_apply step 3b).
     """
     return await _run_apply(tenant, system, body, session)
 
@@ -837,8 +880,9 @@ async def adjust_template(
     """Re-apply a policy template with updated overrides (step-up-gated).
 
     Semantically identical to /apply: re-writes the grant (idempotent) and
-    updates the application record.  Mode-B widening re-triggers acknowledgement
-    requirement (enforcement: Mode-B rejected in Track 1 by /apply logic).
+    updates the application record.  Weaken-class widening (Mode-B / any entry
+    with requires_acknowledgement:true) is fail-closed in Track 1 — rejected
+    422 before any grant write (see _run_apply steps 3 + 3b).
     """
     return await _run_apply(tenant, system, body, session)
 
@@ -908,10 +952,10 @@ async def revoke_grant(
         )
         from yashigani.mcp._opa_push import push_and_verify_egress_grants  # noqa: PLC0415
 
-        # Refresh LKG cache before building the doc (R2)
-        _get_claimed_spiffes_lkg(store)
+        # R2: resolve LKG claimed set — transient failure returns snapshot, never drops suppression.
+        claimed_for_push = _get_claimed_spiffes_lkg(store)
 
-        full_doc = build_egress_grants_doc(store)
+        full_doc = build_egress_grants_doc(store, claimed_spiffes=claimed_for_push)
         push_and_verify_egress_grants(
             _opa_url(),
             full_doc,

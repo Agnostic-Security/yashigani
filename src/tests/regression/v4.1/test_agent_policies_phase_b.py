@@ -715,6 +715,198 @@ def test_resolve_bundled_spiffe_falls_back_to_derived(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# R2 integration test: real build_egress_grants_doc + LKG wiring
+# ---------------------------------------------------------------------------
+
+def test_r2_lkg_suppresses_revoked_spiffe_on_transient_failure(monkeypatch):
+    """R2 integration: real build_egress_grants_doc uses LKG-resolved claimed set.
+
+    Drives the REAL build_egress_grants_doc (NOT patched to {}).
+
+    Scenario: openclaw SPIFFE was previously claimed (put_egress_grant was called).
+    Admin revokes the grant (delete_egress_grant).  During the subsequent OPA push,
+    get_claimed_egress_seed_spiffes raises (transient Redis failure).
+    _get_claimed_spiffes_lkg falls back to the LKG snapshot → returns the
+    claimed set including openclaw's SPIFFE → build_egress_grants_doc suppresses
+    the openclaw seed entry → OPA doc does NOT contain openclaw's SPIFFE.
+
+    This is the R2 wiring fix: without it, build_egress_grants_doc would drop
+    suppression on the transient failure and resurface the revoked seed grant.
+    """
+    import yashigani.backoffice.routes.agent_policies as ap
+    from yashigani.mcp._egress_grants import build_egress_grants_doc
+
+    openclaw_spiffe = "spiffe://yashigani.test.r2/openclaw"
+    langflow_spiffe = "spiffe://yashigani.test.r2/langflow"
+    letta_spiffe = "spiffe://yashigani.test.r2/letta"
+
+    monkeypatch.setenv("YASHIGANI_OPENCLAW_SPIFFE_ID", openclaw_spiffe)
+    monkeypatch.setenv("YASHIGANI_LANGFLOW_SPIFFE_ID", langflow_spiffe)
+    monkeypatch.setenv("YASHIGANI_LETTA_SPIFFE_ID", letta_spiffe)
+    monkeypatch.setenv("YASHIGANI_TENANT_ID", "r2-test")
+
+    # Prime the LKG: openclaw was claimed (a prior successful read saw it)
+    with ap._lkg_claimed_lock:
+        ap._lkg_claimed_spiffes = frozenset([openclaw_spiffe])
+
+    # Store: transient Redis failure on get_claimed_egress_seed_spiffes.
+    # No grants remain (admin already deleted openclaw's grant).
+    store = MagicMock()
+    store.get_claimed_egress_seed_spiffes.side_effect = RuntimeError(
+        "Redis transient: ECONNRESET"
+    )
+    store.build_egress_grants_data.return_value = {}  # grant deleted
+
+    # _get_claimed_spiffes_lkg must return LKG (containing openclaw) on failure
+    claimed = ap._get_claimed_spiffes_lkg(store)
+    assert openclaw_spiffe in claimed, (
+        "R2: LKG must return openclaw SPIFFE on transient get_claimed_egress_seed_spiffes failure"
+    )
+
+    # Drive the REAL build_egress_grants_doc with the LKG-resolved claimed set.
+    # This is the path that _run_apply and revoke_grant now take (Fix 1).
+    doc = build_egress_grants_doc(store, claimed_spiffes=claimed)
+
+    # CRITICAL: openclaw's seed entry must be suppressed (revoke enforced)
+    assert openclaw_spiffe not in doc, (
+        f"R2: revoked openclaw SPIFFE {openclaw_spiffe!r} must remain suppressed "
+        "from the transitional seed even when get_claimed_egress_seed_spiffes fails "
+        "(transient Redis failure must NOT drop suppression to fail-open)"
+    )
+
+    # langflow and letta seeds must still be present (not claimed/revoked)
+    assert langflow_spiffe in doc, (
+        "langflow unclaimed seed must not be suppressed"
+    )
+    assert letta_spiffe in doc, (
+        "letta unclaimed seed must not be suppressed"
+    )
+
+    # Verify the function used claimed_spiffes (not the store call)
+    store.get_claimed_egress_seed_spiffes.assert_called_once()  # called by _get_claimed_spiffes_lkg
+    # build_egress_grants_doc itself must NOT have called get_claimed_egress_seed_spiffes
+    # again (it uses the passed claimed_spiffes parameter instead)
+    assert store.get_claimed_egress_seed_spiffes.call_count == 1, (
+        "build_egress_grants_doc must not call get_claimed_egress_seed_spiffes when "
+        "claimed_spiffes is provided — exactly one call (from _get_claimed_spiffes_lkg)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: requires_acknowledgement fail-closed gate (Nico latent bypass)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_requires_acknowledgement_active_entry_rejected_at_apply(monkeypatch):
+    """Active entry with requires_acknowledgement:true → 422 before any grant write (Nico)."""
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("YASHIGANI_TENANT_ID", "acme")
+    monkeypatch.setenv("YASHIGANI_LANGFLOW_SPIFFE_ID", "spiffe://yashigani.internal/langflow")
+
+    # Template with an active (enabled, not track_2_only) entry requiring acknowledgement
+    tmpl = _make_minimal_template(
+        template_id="tmpl-ack-gate-test",
+        applies_to="langflow",
+        egress_entries=[
+            {"prefix": "llm", "mode": "reverse_proxy", "ceiling": "PUBLIC"},
+            {
+                "prefix": "slack",
+                "mode": "reverse_proxy",
+                "enabled": True,
+                # NOT track_2_only — this is an active entry
+                "requires_acknowledgement": True,
+            },
+        ],
+    )
+    store = _make_store()
+    body = ApplyTemplateRequest(template_id="tmpl-ack-gate-test")
+    session = _make_session()
+
+    from yashigani.backoffice.routes import agent_policies as ap
+
+    mock_state = MagicMock()
+    mock_state.audit_writer = None
+    mock_state.mcp_registry_store = None
+
+    with (
+        patch.object(ap, "_registry_store", return_value=store),
+        patch.object(ap, "_load_templates", return_value={"tmpl-ack-gate-test": tmpl}),
+        patch.object(ap, "backoffice_state", mock_state),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await ap._run_apply("acme", "langflow", body, session)
+
+    assert exc_info.value.status_code == 422
+    assert "acknowledgement_ceremony_required" in str(exc_info.value.detail)
+
+    # No grant must have been written (fail-closed = reject BEFORE grant write)
+    assert "acme:langflow" not in store._grants, (
+        "requires_acknowledgement gate must reject BEFORE any grant write"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requires_acknowledgement_inert_entry_skipped_at_apply(monkeypatch):
+    """track_2_only/disabled entries with requires_acknowledgement are skipped — NOT rejected.
+
+    The openclaw slack entry is track_2_only AND enabled:false AND requires_acknowledgement.
+    It must not trigger the fail-closed gate; the template's enabled Mode-A entries apply.
+    """
+    monkeypatch.setenv("YASHIGANI_TENANT_ID", "acme")
+    monkeypatch.setenv("YASHIGANI_OPENCLAW_SPIFFE_ID", "spiffe://yashigani.internal/openclaw")
+
+    # In-memory representation of the openclaw template structure
+    openclaw_tmpl = _make_minimal_template(
+        template_id="tmpl-openclaw-default",
+        applies_to="openclaw",
+        egress_entries=[
+            {"prefix": "llm", "mode": "reverse_proxy", "ceiling": "PUBLIC", "scan_secrets": True},
+            {"prefix": "telegram", "mode": "reverse_proxy", "ceiling": "PUBLIC", "scan_secrets": True},
+            {
+                "prefix": "slack",
+                "mode": "connect",
+                "track_2_only": True,
+                "enabled": False,
+                "requires_acknowledgement": True,
+                "connect_hosts": ["slack.com:443", "hooks.slack.com:443"],
+            },
+        ],
+    )
+    store = _make_store()
+    body = ApplyTemplateRequest(template_id="tmpl-openclaw-default")
+    session = _make_session()
+
+    from yashigani.backoffice.routes import agent_policies as ap
+
+    mock_state = MagicMock()
+    mock_state.audit_writer = None
+    mock_state.mcp_registry_store = None
+
+    with (
+        patch.object(ap, "_registry_store", return_value=store),
+        patch.object(ap, "_load_templates", return_value={"tmpl-openclaw-default": openclaw_tmpl}),
+        patch.object(ap, "backoffice_state", mock_state),
+        patch("yashigani.mcp._opa_push.push_and_verify_egress_grants"),
+        patch("yashigani.mcp._egress_grants.build_egress_grants_doc", return_value={}),
+    ):
+        result = await ap._run_apply("acme", "openclaw", body, session)
+
+    # Mode-A grants must be written
+    grant = store._grants.get("acme:openclaw")
+    assert grant is not None, "Grant must be written for openclaw"
+    assert "llm" in grant["prefixes"], "llm (Mode A) must be in granted prefixes"
+    assert "telegram" in grant["prefixes"], "telegram (Mode A) must be in granted prefixes"
+
+    # Mode-B connect (slack) must NOT appear in granted prefixes
+    assert "slack" not in grant["prefixes"], (
+        "slack (Mode B / track_2_only / disabled) must NOT be in granted prefixes"
+    )
+
+    assert result["status"] == "applied"
+
+
+# ---------------------------------------------------------------------------
 # Additional: template applies_to mismatch → 422
 # ---------------------------------------------------------------------------
 
