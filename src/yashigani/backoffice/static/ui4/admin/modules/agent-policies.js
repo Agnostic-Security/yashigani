@@ -221,6 +221,11 @@ class YsAdminAgentPolicies extends LitElement {
               ℹ ${r.graph_hash_note}
             </p>
           ` : nothing}
+          ${r.egress_attribution_note ? html`
+            <p class="residual-egress-attribution">
+              ⚠ Egress attribution: ${r.egress_attribution_note}
+            </p>
+          ` : nothing}
         </div>
       </details>
     `;

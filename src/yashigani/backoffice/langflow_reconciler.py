@@ -25,6 +25,10 @@ WHAT THIS DOES NOT DO
 - NEVER issues a leaf, writes a grant, or mints an envelope automatically.
 - Does NOT trust the langflow API: caps flow count (MAX_FLOWS=50) and per-flow
   body size (MAX_FLOW_BYTES=65536 — Laura F9 anti-flood).
+- Auth: x-api-key via langflow_auth (F-G fix — auto_login → list/delete stale
+  'yashigani-service' keys → create fresh; Laura constraint 2 one-key invariant).
+  The previous YASHIGANI_INTERNAL_BEARER bearer approach was broken (langflow
+  validates Bearer as a langflow JWT → 401).
 
 GRAPH HASH (Nico Q-N3 / B5)
 -----------------------------
@@ -53,7 +57,7 @@ LANGFLOW RESPONSE AS UNTRUSTED INPUT (Laura F9)
   context-aware output encoding at the UI render layer (B4, agent-policies.js
   uses textContent exclusively).
 
-Last updated: 2026-07-08T00:00:00+00:00
+Last updated: 2026-07-09T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -175,7 +179,7 @@ def _build_inert_record(
 # Langflow API client (backoffice→langflow internal dispatch)
 # ---------------------------------------------------------------------------
 
-def _fetch_flows(langflow_url: str, bearer: str) -> list[dict]:
+def _fetch_flows(langflow_url: str) -> list[dict]:
     """Fetch flows from langflow GET /api/v1/flows.
 
     Routes through the Caddy mesh front (YASHIGANI_LANGFLOW_INTERNAL_URL →
@@ -187,38 +191,50 @@ def _fetch_flows(langflow_url: str, bearer: str) -> list[dict]:
     for the Caddy mesh dial — same trust anchor as the langflow_client
     dispatch path (TRACK1-F-04 wiring).
 
-    Treat response as UNTRUSTED (Laura F9): cap count + body.
+    Auth is x-api-key from langflow_auth (F-G fix): auto_login →
+    list/delete stale 'yashigani-service' keys → create fresh key (Laura
+    constraint 2).  The previous YASHIGANI_INTERNAL_BEARER bearer approach
+    was broken: langflow validates Bearer as a langflow JWT → 401.
+
+    Treat response as UNTRUSTED (Laura F9): per-flow body cap + count cap.
+    The total-body pre-parse cap was removed (F-H): it fired on langflow
+    1.9.2's ~3.7 MB of default flows (below the 13 MiB OOM guard kept here).
 
     Raises on HTTP error or network failure — caller logs and skips.
     """
     from yashigani.pki.client import internal_httpx_sync_client  # noqa: PLC0415
+    from yashigani.backoffice.langflow_auth import get_langflow_api_headers  # noqa: PLC0415
+
+    # F-H: transport-level OOM guard at a high ceiling so legitimate langflow
+    # 1.9.2 default flows (~3.7 MB) are not rejected.  The per-flow body cap
+    # (MAX_FLOW_BYTES = 64 KiB) and the flow count cap (MAX_FLOWS = 50) are
+    # the PRIMARY Laura F9 anti-flood defences; this guard only protects
+    # against pathological response sizes far above any real content.
+    _OOM_GUARD_BYTES = 13 * 1024 * 1024  # 13 MiB
 
     url = langflow_url.rstrip("/") + "/api/v1/flows/"
-    # Internal bearer auth — forwarded to langflow (harmless: LANGFLOW_AUTO_LOGIN=true).
-    # Also present in the Caddy forward_auth subrequest but ignored by verify-mcp
-    # (verify-mcp authenticates via X-SPIFFE-ID from the verified TLS peer cert,
-    # not via the bearer token).
     headers = {
-        "Authorization": f"Bearer {bearer}",
+        **get_langflow_api_headers(),
         "Accept": "application/json",
     }
     with internal_httpx_sync_client(timeout=10.0) as client:
         resp = client.get(url, headers=headers)
         resp.raise_for_status()
-        # Cap total body before parsing (Laura F9: oversized response → skip all)
         raw = resp.content
-        if len(raw) > MAX_FLOWS * MAX_FLOW_BYTES:
+        # OOM guard only — NOT a semantic flood cap (F-H: old 3.2 MB cap removed).
+        if len(raw) > _OOM_GUARD_BYTES:
             logger.warning(
-                "langflow-reconciler: response body %d bytes exceeds flood cap "
-                "(%d flows × %d bytes) — ignoring entire response (Laura F9)",
-                len(raw), MAX_FLOWS, MAX_FLOW_BYTES,
+                "langflow-reconciler: response body %d bytes exceeds OOM guard "
+                "%d bytes — ignoring entire response",
+                len(raw),
+                _OOM_GUARD_BYTES,
             )
             return []
         data = json.loads(raw)
         if not isinstance(data, list):
             logger.warning("langflow-reconciler: /api/v1/flows did not return a list — skipping")
             return []
-        # Cap flow count
+        # Count cap (Laura F9 primary defence)
         if len(data) > MAX_FLOWS:
             logger.warning(
                 "langflow-reconciler: %d flows returned; capping at %d (Laura F9)",
@@ -262,17 +278,10 @@ def run_langflow_discovery(
         "YASHIGANI_LANGFLOW_INTERNAL_URL",
         "http://langflow:7860",
     ).strip()
-    bearer = os.environ.get("YASHIGANI_INTERNAL_BEARER", "").strip()
-    if not bearer:
-        logger.warning(
-            "langflow-reconciler: YASHIGANI_INTERNAL_BEARER not set — "
-            "cannot authenticate to langflow; discovery skipped"
-        )
-        return stats
 
-    # Fetch flows
+    # Fetch flows — auth via langflow_auth (F-G fix: x-api-key, not bearer)
     try:
-        flows = _fetch_flows(langflow_url, bearer)
+        flows = _fetch_flows(langflow_url)
     except Exception as exc:  # noqa: BLE001
         logger.error("langflow-reconciler: flow fetch failed: %s", exc)
         return stats
@@ -367,6 +376,7 @@ def run_langflow_discovery(
                     graph_hash=graph_hash,
                     parser_version=_GRAPH_PARSER_VERSION,
                     langflow_instance=langflow_system,
+                    # Lu disclosure (v4.1): egress is instance-level, not per-flow
                 ))
             except Exception as audit_exc:  # noqa: BLE001
                 logger.error("langflow-reconciler: audit write failed: %s", audit_exc)

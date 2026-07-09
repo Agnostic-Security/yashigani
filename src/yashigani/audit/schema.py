@@ -4385,6 +4385,13 @@ class LangflowFlowDiscoveredEvent(AuditEvent):
     the flow graph stripped of UI positions/viewport/timestamps, SHA-256.
     NOT attestation; NOT a leaf binding input.
 
+    egress_attribution (Lu disclosure, v4.1 F-G/F-H): egress attribution for
+    flows running under this langflow instance is INSTANCE-LEVEL (langflow
+    SPIFFE), NOT per-flow.  All flows share the union egress grant.  Per-flow
+    egress isolation requires per-instance containers (Track 3+).  This
+    disclosure is surfaced in the admin UI residuals panel for every discovered
+    NHI record (agent-policies.js _renderResiduals).
+
     Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1.
     """
 
@@ -4398,3 +4405,9 @@ class LangflowFlowDiscoveredEvent(AuditEvent):
     graph_hash: str = ""             # SHA-256 of canonical graph JSON (drift-detection only)
     parser_version: int = 1          # canonical-JSON parser version (for hash stability)
     langflow_instance: str = ""      # which langflow instance (trust_domain/system label)
+    # Lu disclosure (v4.1): egress attribution is instance-level, not per-flow
+    egress_attribution: str = (
+        "INSTANCE-LEVEL (langflow SPIFFE), NOT per-flow. "
+        "All flows under this instance share the union egress grant. "
+        "Per-flow isolation requires per-instance containers (Track 3+)."
+    )

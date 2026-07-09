@@ -428,11 +428,11 @@ async def list_templates(session: AdminSession) -> list[dict]:
 # GET /admin/agent-policies/status
 # ---------------------------------------------------------------------------
 
-@router.get("/admin/agent-policies/status")
-async def policy_status(session: AdminSession) -> list[dict]:
-    """Return the joined policy status view (registry + grants + applications).
+def get_status_rows() -> list[dict]:
+    """Build and return the joined policy status view rows.
 
-    Joins three sources:
+    Extracted from policy_status for testability — policy_status delegates
+    to this function.  Joins three sources:
       - Bundled agent catalogue (openclaw, langflow, letta)
       - Onboarded MCP instances (durable registry)
       - Active template applications (mcp:tmpl:* Redis keys)
@@ -441,6 +441,7 @@ async def policy_status(session: AdminSession) -> list[dict]:
       - Union-grant kill-switch degradation notice (Nico Q-N1)
       - graph_hash is drift-detection only (Nico Q-N3)
       - identity_basis: ringfence-position (Lu MF-6)
+      - egress_attribution_note for NHI discovered flows (Lu disclosure, v4.1)
     """
     store = _registry_store()
     templates = _load_templates()
@@ -506,6 +507,9 @@ async def policy_status(session: AdminSession) -> list[dict]:
         if system in _BUNDLED_SYSTEMS:
             continue   # already covered above
         spiffe = desc.get("spiffe_id", "")
+        is_nhi_discovered = (
+            desc.get("kind") == "nhi" and bool(desc.get("langflow_flow_id"))
+        )
         grant = None
         try:
             grant = store.get_egress_grant(tenant, system)
@@ -513,10 +517,29 @@ async def policy_status(session: AdminSession) -> list[dict]:
             pass
         app = store.get_template_application(tenant, system)
         tmpl_id = (app or {}).get("template_id") if app else None
+        # Residuals — base set shared by all descriptors
+        residuals: dict = {
+            "union_grant_note": (
+                "Kill switch = grant absence in the pushed OPA data (Nico Q-N1)."
+            ),
+            "identity_basis": "ringfence-position",
+            "graph_hash_note": (
+                "graph_hash is drift-detection metadata only — NOT attestation "
+                "(Nico Q-N3)."
+            ),
+        }
+        # Lu disclosure (v4.1 F-G/F-H): discovered langflow NHI flows share the
+        # langflow instance SPIFFE grant — egress is per-INSTANCE, NOT per-flow.
+        if is_nhi_discovered:
+            residuals["egress_attribution_note"] = (
+                "Egress attribution: INSTANCE-LEVEL (langflow SPIFFE), NOT per-flow. "
+                "All flows under this langflow instance share the union egress grant. "
+                "Per-flow egress isolation requires per-instance containers (Track 3+)."
+            )
         rows.append({
             "system_id": system,
             "tenant_id": tenant,
-            "kind": "onboarded",
+            "kind": desc.get("kind", "onboarded"),
             "spiffe_id": spiffe,
             "svid_issued": bool(desc.get("svid_issued", desc.get("svid_instance_id"))),
             "egress_grant": {
@@ -529,19 +552,20 @@ async def policy_status(session: AdminSession) -> list[dict]:
                 "applied_by": (app or {}).get("applied_by"),
                 "applied_at": (app or {}).get("applied_at"),
             } if app else None,
-            "residuals": {
-                "union_grant_note": (
-                    "Kill switch = grant absence in the pushed OPA data (Nico Q-N1)."
-                ),
-                "identity_basis": "ringfence-position",
-                "graph_hash_note": (
-                    "graph_hash is drift-detection metadata only — NOT attestation "
-                    "(Nico Q-N3)."
-                ),
-            },
+            "residuals": residuals,
         })
 
     return rows
+
+
+@router.get("/admin/agent-policies/status")
+async def policy_status(session: AdminSession) -> list[dict]:
+    """Return the joined policy status view (registry + grants + applications).
+
+    Delegates to :func:`get_status_rows` — see its docstring for the full
+    data model and residual-disclosure specification.
+    """
+    return get_status_rows()
 
 
 # ---------------------------------------------------------------------------
