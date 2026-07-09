@@ -113,6 +113,17 @@ if [[ -z "$YASHIGANI_GIT_SHA" ]]; then
   YASHIGANI_GIT_SHA="${YASHIGANI_GIT_SHA:-dev}"
 fi
 export YASHIGANI_GIT_SHA
+
+# Build-arg passthrough for proxied/airgapped builds (Fix 2 — cold-build robustness).
+# Each yashigani Dockerfile declares ARG HTTP_PROXY / HTTPS_PROXY / NO_PROXY in every
+# stage that runs pip/apt/apk/npm; pip/apt honour these env vars during `docker build`.
+# When the shell env is proxy-free the array stays empty → no-op, unchanged behaviour.
+# Usage: podman build "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" ...
+YSG_PROXY_BUILD_ARGS=()
+[[ -n "${HTTP_PROXY:-}" ]]  && YSG_PROXY_BUILD_ARGS+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}")
+[[ -n "${HTTPS_PROXY:-}" ]] && YSG_PROXY_BUILD_ARGS+=(--build-arg "HTTPS_PROXY=${HTTPS_PROXY}")
+[[ -n "${NO_PROXY:-}" ]]    && YSG_PROXY_BUILD_ARGS+=(--build-arg "NO_PROXY=${NO_PROXY}")
+
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
 # MI-1: record whether the operator pinned YSG_INSTALL_DIR explicitly in the
@@ -457,6 +468,14 @@ ENVIRONMENT
   YASHIGANI_HTTP_PORT    Host HTTP port (overridden by --http-port flag if both set)
   YASHIGANI_HTTPS_PORT   Host HTTPS port (overridden by --https-port flag if both set)
   YSG_DEBUG              Set to 1 for verbose output
+  YSG_HEALTHZ_TIMEOUT_S  Convergence gate timeout in seconds (default: 1200).
+                         Cold builds (fresh image compile + all services starting)
+                         can take 10–15 min on a modest host before the gateway
+                         becomes healthy.  Set lower (e.g. 300) in warm-cache CI.
+  HTTP_PROXY             Outbound HTTP proxy forwarded to every image build stage
+  HTTPS_PROXY            Outbound HTTPS proxy forwarded to every image build stage
+  NO_PROXY               Comma-separated hosts that bypass the proxy (forwarded to
+                         every image build stage). All three are NO-OP when unset.
 
 EXAMPLES
   # Interactive compose install
@@ -5404,7 +5423,9 @@ _build_ringfence_images() {
     log_info "ringfence-init image already present ($_rf_img) — skipping build"
   else
     log_info "Building ringfence-init image ($_rf_img)..."
-    "$_ctr_cmd" build -t "$_rf_img" "${WORK_DIR}/docker/ringfence-init/" || {
+    "$_ctr_cmd" build \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+        -t "$_rf_img" "${WORK_DIR}/docker/ringfence-init/" || {
       log_error "ringfence-init image build FAILED — the egress-forwarder overlay"
       log_error "references $_rf_img and compose up cannot pull it (unpublished). ABORTING."
       exit 1
@@ -5419,6 +5440,7 @@ _build_ringfence_images() {
   else
     log_info "Building svid-sidecar image ($_svid_img)..."
     "$_ctr_cmd" build -f "${WORK_DIR}/docker/Dockerfile.svid-sidecar" \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
         -t "$_svid_img" "${WORK_DIR}/docker" || {
       log_error "svid-sidecar image build FAILED — onboarded-agent SVID stanzas"
       log_error "reference this unpublished image. ABORTING."
@@ -7214,10 +7236,12 @@ compose_up() {
       # Verbose terminal output is the explicit tradeoff for visibility.
       podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
         --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
         -t "yashigani/gateway:${YASHIGANI_VERSION}" \
         -t yashigani/gateway:latest "${WORK_DIR}"
       podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
         --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
         -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
         -t yashigani/backoffice:latest "${WORK_DIR}"
       log_success "Images built with Podman"
@@ -7241,6 +7265,7 @@ compose_up() {
       log_info "Building per-job extractor image with Podman (release artifact)..."
       if podman build -f "${WORK_DIR}/docker/Dockerfile.extractor" \
            --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+           "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
            -t "yashigani/extractor:${YASHIGANI_VERSION}" \
            -t "yashigani/extractor:latest" "${WORK_DIR}"; then
         log_success "Extractor image built with Podman (yashigani/extractor:${YASHIGANI_VERSION})"
@@ -7875,14 +7900,19 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 #   2. Backoffice /login → must return HTTP 200 via Caddy (proves Caddy→backoffice
 #      routing; /login is unauth-200 per health-check.sh retro #3n comment)
 #
-# If either check times out (60s), dumps gateway + postgres logs and exits 1.
-# Exit 0 from compose_up is therefore conditional on both checks passing.
+# If either check times out (see YSG_HEALTHZ_TIMEOUT_S), dumps gateway + postgres
+# logs and exits 1.  Exit 0 from compose_up is therefore conditional on both checks passing.
 #
 # Timeout and poll interval are tunable via env vars for CI:
-#   YSG_HEALTHZ_TIMEOUT_S   (default: 60)
+#   YSG_HEALTHZ_TIMEOUT_S   (default: 1200)
 #   YSG_HEALTHZ_POLL_S      (default: 2)
 _verify_gateway_healthz() {
-  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-300}"   # 60→180→300: a FULL fresh install (all services + DB migrations + agent/SIEM bringup) can take >180s for the gateway to converge while healthy (observed on a clean --wazuh install; gateway does NOT depend on wazuh, it's just overall bringup time). The gate still fail-closes after this. Override with YSG_HEALTHZ_TIMEOUT_S.
+  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-1200}"  # 60→180→300→1200: cold builds (fresh image
+  # compile + all services starting together on a modest host) can take well over 300s for the
+  # gateway to converge. 1200s (20 min) is safe for the worst-case cold-build on a single-core
+  # VM (observed on clean --wazuh installs with Wazuh indexer + manager bringing up simultaneously).
+  # Warm-cache re-installs converge in <30s; the gate polls every 2s and exits as soon as healthy.
+  # Override with YSG_HEALTHZ_TIMEOUT_S (e.g. set 300 in a warm-cache CI harness).
   local _poll_s="${YSG_HEALTHZ_POLL_S:-2}"
   local _https_port="${YASHIGANI_HTTPS_PORT:-443}"
   local _domain="${DOMAIN:-localhost}"

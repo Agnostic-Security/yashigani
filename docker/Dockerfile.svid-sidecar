@@ -53,6 +53,13 @@
 
 FROM docker.io/library/alpine:3.21.3
 
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars so apk respects them.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 # openssl: cert parse + expiry calculation (openssl x509 -enddate -noout)
 # curl: mTLS POST to backoffice /admin/agents/*/cert/rotate
 # No package manager retained after install.

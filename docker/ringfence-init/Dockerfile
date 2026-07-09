@@ -65,6 +65,13 @@
 # TODO(captain,post-runtime): pin digest after first manifest inspect.
 FROM docker.io/library/alpine:3.21.3
 
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars so apk respects them.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 # Install iptables (nf_tables shim on Alpine 3.21 — semantically equivalent
 # to legacy iptables for OUTPUT chain manipulation), ip6tables (same package),
 # and bind-tools for getent(1) / nss_dns hostname resolution.

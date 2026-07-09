@@ -57,6 +57,13 @@ FROM node:26-slim@sha256:290a2c506b95b22041abd8c4114a0be3780860b39060e83f417f6c6
 # Select the correct node stage based on TARGETARCH
 FROM node-${TARGETARCH} AS node-base
 
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars so npm respects them.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 # Install the pinned MCP filesystem server from npm.
 # --ignore-scripts: prevents arbitrary postinstall scripts running as root.
 # --no-fund --no-audit: silence network probes during build (no internet in CI).
@@ -94,6 +101,11 @@ FROM python-${TARGETARCH} AS python-base
 # Inherits the arch-correct python via python-base (see selector above).
 FROM python-base AS builder
 
+# ARGs must be re-declared in each stage (they do not cross stage boundaries).
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 WORKDIR /build
 
 RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
@@ -121,6 +133,12 @@ RUN python -m build --wheel --outdir /dist
 #   - No dev tools, no package managers, no build tools in final image.
 #   - node binary is present (required at runtime). npm/npx are NOT copied.
 FROM python-base AS runtime
+
+# ARGs must be re-declared in each stage (they do not cross stage boundaries).
+# (TARGETARCH is also re-declared below, before the libatomic case statement that needs it.)
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 # Non-root user — UID 10001 matches _SC_RUN_AS_USER in codegen.py:1302.
 # No home directory, no login shell. Mirrors bridge container security posture.

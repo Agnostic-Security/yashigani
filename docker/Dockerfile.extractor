@@ -18,6 +18,13 @@
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
 FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS runtime
 
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars for RUN commands in this stage.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 # nonroot numeric UID/GID 65532 (distroless convention) — the sandbox runs the
 # worker as this user; combined with --user 65532:65532 at run-time it can never
 # be root even if the entrypoint is overridden.

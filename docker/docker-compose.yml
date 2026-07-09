@@ -171,6 +171,10 @@ services:
     build:
       context: ..
       dockerfile: docker/caddy/Dockerfile.caddy
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     image: yashigani/caddy:${YASHIGANI_VERSION:-4.1.0}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_CADDY_MEM_LIMIT:-256m}
@@ -392,6 +396,9 @@ services:
       dockerfile: docker/Dockerfile.gateway
       args:
         GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_GATEWAY_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_GATEWAY_CPU_LIMIT:-1.0}
@@ -671,6 +678,9 @@ services:
       dockerfile: docker/Dockerfile.backoffice
       args:
         GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_BACKOFFICE_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_BACKOFFICE_CPU_LIMIT:-1.0}
@@ -1036,6 +1046,9 @@ services:
       dockerfile: docker/Dockerfile.extractor
       args:
         GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     restart: unless-stopped
     mem_limit: 512m
     cpus: 1.0

@@ -88,6 +88,14 @@ printf '[build-filesystem-mcp] Context: %s\n' "$REPO_ROOT"
 
 BUILD_ARGS=()
 
+# Proxy passthrough for proxied/airgapped enterprise builds.
+# When HTTP_PROXY / HTTPS_PROXY / NO_PROXY are set in the shell, pass them as
+# build-args so npm in the node-base stage and pip in the builder/runtime stages
+# can reach the proxy.  Empty (default) = direct internet, behaviour unchanged.
+[[ -n "${HTTP_PROXY:-}" ]]  && BUILD_ARGS+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}")
+[[ -n "${HTTPS_PROXY:-}" ]] && BUILD_ARGS+=(--build-arg "HTTPS_PROXY=${HTTPS_PROXY}")
+[[ -n "${NO_PROXY:-}" ]]    && BUILD_ARGS+=(--build-arg "NO_PROXY=${NO_PROXY}")
+
 # Platform flag — if supplied, use buildx (multi-arch) or --platform (single).
 if [[ -n "$PLATFORM" ]]; then
   # Multi-arch with BuildKit / buildx

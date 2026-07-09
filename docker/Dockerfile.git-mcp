@@ -50,6 +50,13 @@ FROM python-${TARGETARCH} AS python-base
 # Inherits the arch-correct python via python-base (see selector above).
 FROM python-base AS builder
 
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars for RUN commands in this stage.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 WORKDIR /build
 
 RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
@@ -79,6 +86,11 @@ RUN python -m build --wheel --outdir /dist
 #   - --repository /workspace is hardcoded in subprocess args (Laura GIT-TM-001).
 #   - No dev tools, no package managers, no build tools in final image.
 FROM python-base AS runtime
+
+# ARGs must be re-declared in each stage (they do not cross stage boundaries).
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 # Non-root user — UID 10001 matches _SC_RUN_AS_USER in codegen.py:1302.
 # No home directory, no login shell.
