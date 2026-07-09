@@ -153,6 +153,37 @@
   {{- fail "MCP-GUARD-001 CONFIGURATION ERROR: gateway.mcpServers is non-empty but agentBundles.filesystemMcp.enabled is false. The MCP broker registry would reference upstream(s) with no corresponding Deployment, Service, or NetworkPolicy rendered. A JWT would be issued for an unreachable call target. Set agentBundles.filesystemMcp.enabled=true alongside gateway.mcpServers, or set gateway.mcpServers=[] to disable MCP routing. Finding: Laura SB-2." -}}
 {{- end -}}
 
+{{- /*
+  LANGFLOW-001 (Laura constraint 3): reject langflow-enabled configurations
+  where LANGFLOW_AUTO_LOGIN is overridden to anything other than "true".
+
+  LANGFLOW_AUTO_LOGIN=true is a HARD dependency for the Yashigani reconciler
+  to access the Langflow API programmatically (token exchange, flow registration,
+  health probing). If overridden to "false" or "0" at deploy time, the reconciler
+  loses API access silently — agent flows appear registered but are unreachable.
+
+  The default in values.yaml is "true". This guard catches --set overrides like:
+    --set agentBundles.langflow.env.LANGFLOW_AUTO_LOGIN=false
+    --set agentBundles.langflow.env.LANGFLOW_AUTO_LOGIN=0
+
+  If you need LANGFLOW_AUTO_LOGIN disabled (non-default auth mode), disable the
+  langflow bundle (agentBundles.langflow.enabled=false) and integrate langflow
+  independently outside of Yashigani's managed flow.
+
+  Finding: Laura reds-review constraint 3, v4.1 design doc (2026-07-09).
+*/ -}}
+{{- if .Values.agentBundles.langflow.enabled -}}
+  {{- $langflowEnv := dict -}}
+  {{- if ((.Values.agentBundles).langflow).env -}}
+    {{- $langflowEnv = .Values.agentBundles.langflow.env -}}
+  {{- end -}}
+  {{- /* toString normalises boolean false → "false", string "false" → "false", int 0 → "0". */ -}}
+  {{- $autoLoginStr := (get $langflowEnv "LANGFLOW_AUTO_LOGIN") | toString -}}
+  {{- if or (eq $autoLoginStr "false") (eq $autoLoginStr "0") -}}
+    {{- fail (printf "LANGFLOW-001 SECURITY VIOLATION: agentBundles.langflow.enabled=true but LANGFLOW_AUTO_LOGIN is set to %q. Yashigani's reconciler requires LANGFLOW_AUTO_LOGIN=true for programmatic API access. Overriding this to false/0 breaks flow registration and health probing silently. Either restore agentBundles.langflow.env.LANGFLOW_AUTO_LOGIN=\"true\" (the default) or disable the bundle with agentBundles.langflow.enabled=false. Finding: Laura constraint 3, v4.1 reds-review." $autoLoginStr) -}}
+  {{- end -}}
+{{- end -}}
+
 {{- if (.Values.imagePolicy).requireImageDigests -}}
   {{- if not (contains "@sha256:" .Values.gateway.image.tag) -}}
     {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but gateway.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' yashigani-gateway:<tag>` and set gateway.image.tag=\"<tag>@sha256:<digest>\"." -}}

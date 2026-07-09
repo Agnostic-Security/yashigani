@@ -343,7 +343,13 @@ OPTIONS
   --license-key    PATH                   Path to .ysg license file
   --db-aes-key     KEY                    Database AES-256 encryption key (64-char hex)
   --namespace      NAMESPACE              Kubernetes namespace (default: yashigani)
-  --agent-bundles  BUNDLES               Comma-separated opt-in agents: langflow,letta,openclaw (or "all")
+  --agent-bundles  BUNDLES               Agent bundles to include: langflow,letta,openclaw (or "all", or "none"
+                                          to disable the default-on bundles). In non-interactive mode,
+                                          langflow and letta are included by default; pass --no-agents
+                                          (or --agent-bundles none) to exclude them on lean installs.
+  --no-agents                             Exclude ALL agent bundles. Non-interactive shorthand for
+                                          --agent-bundles none. Lean/minimal installs should pass this
+                                          flag explicitly to suppress the langflow+letta defaults.
   --with-openwebui                        Install Open WebUI chat surface (non-interactive explicit opt-in).
                                           In interactive mode a wizard question is presented instead
                                           ("Will Yashigani be used by humans with a web UI? [Y/n]").
@@ -672,8 +678,12 @@ parse_args() {
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
       --agent-bundles)
-        AGENT_BUNDLES="${2:?'--agent-bundles requires a value, e.g. langflow,letta'}"
+        AGENT_BUNDLES="${2:?'--agent-bundles requires a value, e.g. langflow,letta or none'}"
         shift 2
+        ;;
+      --no-agents)
+        AGENT_BUNDLES="none"
+        shift
         ;;
       --gpu-index)
         _raw_gpu_index="${2:?'--gpu-index requires a non-negative integer'}"
@@ -5170,16 +5180,24 @@ select_agent_bundles() {
   printf "${C_YELLOW}╚═══════════════════════════════════════════════════════════╝${C_RESET}\n"
   printf "\n"
 
-  # Non-interactive: honour --agent-bundles flag (comma-separated list or empty)
+  # Non-interactive: honour --agent-bundles / --no-agents flag.
+  # DEFAULT (no flag): include langflow + letta — they are first-class Yashigani UX.
+  # CONSTRAINT (Laura): a non-interactive installer must NOT silently include containers.
+  # This block always emits an explicit log line naming what will be started and how to
+  # opt out, satisfying the mandatory-visibility requirement.
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
     if [[ -n "$AGENT_BUNDLES" ]]; then
       IFS=',' read -ra _bundles <<< "$AGENT_BUNDLES"
       for _b in "${_bundles[@]}"; do
         _b="${_b// /}"   # trim spaces
         case "$_b" in
+          none)
+            # Explicit opt-out via --no-agents or --agent-bundles none.
+            log_info "Agent bundles: EXCLUDED (--no-agents / --agent-bundles none). Langflow and Letta will not be installed."
+            ;;
           all)
             COMPOSE_PROFILES+=("langflow" "letta" "openclaw")
-            log_info "Agent bundle enabled (--agent-bundles): langflow, letta, openclaw"
+            log_info "Agent bundles: langflow, letta, openclaw (--agent-bundles all)"
             ;;
           langflow|letta|openclaw)
             COMPOSE_PROFILES+=("$_b")
@@ -5191,23 +5209,29 @@ select_agent_bundles() {
         esac
       done
     else
-      log_info "No agent bundles selected (--non-interactive, --agent-bundles not set)"
+      # DEFAULT: no --agent-bundles flag → include langflow + letta.
+      # Lean / minimal installs that do not want these containers MUST pass --no-agents
+      # (or --agent-bundles none) to exclude them.  This log line is mandatory so that
+      # non-interactive pipelines always have explicit evidence of which containers start.
+      COMPOSE_PROFILES+=("langflow" "letta")
+      log_info "Agent bundles: langflow, letta INCLUDED BY DEFAULT (first-class Yashigani UX)."
+      log_info "  To exclude on lean / minimal installs: re-run with --no-agents or --agent-bundles none."
     fi
     return 0
   fi
 
   printf "${C_BOLD}Available agent bundles:${C_RESET}\n\n"
-  printf "    1) Langflow    — Visual multi-agent workflow builder (MIT)\n"
-  printf "    2) Letta       — Stateful agent with persistent memory (Apache 2.0)\n"
+  printf "    1) Langflow    — Visual multi-agent workflow builder (MIT)  ${C_GREEN}[default]${C_RESET}\n"
+  printf "    2) Letta       — Stateful agent with persistent memory (Apache 2.0)  ${C_GREEN}[default]${C_RESET}\n"
   printf "    3) OpenClaw    — Node.js 24 personal AI, 30+ channels (${C_YELLOW}~800 MB${C_RESET}, MIT)\n"
   printf "    4) All of the above\n"
   printf "    0) None — skip agent bundles\n"
   printf "\n"
-  printf "${C_BOLD}  Enter your choices (comma-separated, e.g. 1,2 or 4 for all) [0]: ${C_RESET}"
+  printf "${C_BOLD}  Enter your choices (comma-separated, e.g. 1,2 or 4 for all) [1,2]: ${C_RESET}"
 
   local choices
-  read -r choices </dev/tty 2>/dev/null || choices="0"
-  choices="${choices:-0}"
+  read -r choices </dev/tty 2>/dev/null || choices="1,2"
+  choices="${choices:-1,2}"
 
   # Normalize: remove spaces
   choices="$(echo "$choices" | tr -d ' ')"
@@ -15282,6 +15306,60 @@ main() {
 
     # Step 8: Optional agent bundle selection
     select_agent_bundles
+
+    # Step 8a: LANGFLOW_AUTO_LOGIN preflight (Laura constraint 3 — MANDATORY).
+    # LANGFLOW_AUTO_LOGIN=true is a REQUIRED, NON-OVERRIDABLE operational setting when
+    # langflow is installed. The reconciler (langflow_reconciler.py) calls
+    # GET /api/v1/auto_login to obtain a session token and then creates an API key for
+    # system→langflow communication. If AUTO_LOGIN is disabled, this call returns 401 and
+    # ALL system→langflow API access (flow discovery, reconciliation, admin visibility)
+    # is permanently lost for the lifetime of that backoffice process.
+    #
+    # docker-compose.yml hardcodes LANGFLOW_AUTO_LOGIN: "true" in the langflow service
+    # definition (not a variable, cannot be overridden by shell env). However, an operator
+    # could apply a compose override file that changes it. This check catches the most
+    # likely misconfiguration paths: shell environment export and docker/.env entry.
+    #
+    # See: /Users/max/Documents/Claude/AgnosticSecurity/Products/Yashigani/
+    #       langflow-letta-default-availability-design-20260709.md §2.2 FLAG-5
+    _check_langflow_auto_login() {
+      local _lf_in_profiles=false
+      for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+        [[ "$_p" == "langflow" ]] && _lf_in_profiles=true
+      done
+      [[ "$_lf_in_profiles" == "false" ]] && return 0
+
+      local _fail=false
+      # Check 1: shell environment (does not affect compose literal, but indicates confusion)
+      if [[ "${LANGFLOW_AUTO_LOGIN:-}" == "false" || "${LANGFLOW_AUTO_LOGIN:-}" == "0" ]]; then
+        log_error "PREFLIGHT FAIL: LANGFLOW_AUTO_LOGIN is set to '${LANGFLOW_AUTO_LOGIN}' in the shell environment."
+        log_error "  LANGFLOW_AUTO_LOGIN=true is REQUIRED for Yashigani's system→langflow API access."
+        log_error "  The reconciler and gateway client both rely on the /api/v1/auto_login endpoint."
+        log_error "  Disabling AUTO_LOGIN breaks flow discovery, reconciliation, and admin visibility."
+        log_error "  Unset LANGFLOW_AUTO_LOGIN from your shell environment before re-running install.sh."
+        _fail=true
+      fi
+      # Check 2: docker/.env override (would affect compose if the var were parameterized;
+      # flag proactively to catch operators who may later parameterize the compose env)
+      local _env_file="${WORK_DIR}/docker/.env"
+      if [[ -f "$_env_file" ]]; then
+        local _env_val
+        _env_val="$(grep -E '^LANGFLOW_AUTO_LOGIN=' "$_env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')" || true
+        if [[ "$_env_val" == "false" || "$_env_val" == "0" ]]; then
+          log_error "PREFLIGHT FAIL: LANGFLOW_AUTO_LOGIN=${_env_val} found in docker/.env."
+          log_error "  LANGFLOW_AUTO_LOGIN=true is REQUIRED for Yashigani's system→langflow API access."
+          log_error "  Remove or correct the LANGFLOW_AUTO_LOGIN entry in docker/.env before re-running."
+          _fail=true
+        fi
+      fi
+      if [[ "$_fail" == "true" ]]; then
+        log_error "Installer aborted: LANGFLOW_AUTO_LOGIN constraint violated."
+        log_error "  This setting is documented as REQUIRED and NON-OVERRIDABLE in the operator guide."
+        return 1
+      fi
+      log_info "LANGFLOW_AUTO_LOGIN constraint satisfied (required=true, no contradicting override detected)"
+    }
+    _check_langflow_auto_login || exit 1
 
     # Step 8b-0: BYO Internal CA wizard — Q1 + Q1a (Tiago directive 2026-05-23).
     # Q1 (BYO internal CA) and Q2 (edge TLS mode) are INDEPENDENT decisions.

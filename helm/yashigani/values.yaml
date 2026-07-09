@@ -1170,8 +1170,11 @@ agentBundles:
   # Single container, embedded SQLite. OpenAI-compatible API on port 7860.
   # Users build custom agent workflows visually via the Langflow UI.
   # All LLM calls route through Yashigani gateway (OpenAI-compatible).
+  #
+  # DEFAULT: enabled=true (v4.1 — first-class Yashigani UX).
+  # Operators who do not want langflow should set enabled=false explicitly.
   langflow:
-    enabled: false
+    enabled: true
     image:
       # Pinned to 1.9.2 to match docker-compose.yml.
       # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
@@ -1270,10 +1273,15 @@ agentBundles:
   # Agent with long-term memory, tool use, and conversation persistence.
   # Exposes REST API on port 8283. Uses shared Postgres (separate `letta` DB).
   # Dependency: Postgres must be available and the `letta` database must exist.
-  # The install.sh installer creates the `letta` database; for K8s deployments
-  # run `CREATE DATABASE letta OWNER yashigani_app;` before enabling this bundle.
+  # The install.sh installer creates the `letta` database and yashigani_app role
+  # idempotently (v4.1 F-B fix). For K8s deployments a pre-install Job or manual
+  # init is still required: `CREATE ROLE yashigani_app LOGIN; CREATE DATABASE letta
+  # OWNER yashigani_app; GRANT ALL ON SCHEMA public TO yashigani_app;`
+  #
+  # DEFAULT: enabled=true (v4.1 — first-class Yashigani UX).
+  # Operators who do not want letta should set enabled=false explicitly.
   letta:
-    enabled: false
+    enabled: true
     image:
       # Pinned to 0.16.7 to match docker-compose.yml.
       # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
