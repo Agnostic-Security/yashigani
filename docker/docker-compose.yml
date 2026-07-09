@@ -171,7 +171,7 @@ services:
     build:
       context: ..
       dockerfile: docker/caddy/Dockerfile.caddy
-    image: yashigani/caddy:${YASHIGANI_VERSION:-3.0.0}
+    image: yashigani/caddy:${YASHIGANI_VERSION:-4.1.0}
     restart: unless-stopped
     mem_limit: ${YASHIGANI_CADDY_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_CADDY_CPU_LIMIT:-0.5}
@@ -386,7 +386,7 @@ services:
   # ---------------------------------------------------------------------------
   gateway:
     dns_search: ["."]
-    image: yashigani/gateway:${YASHIGANI_VERSION:-3.0.0}
+    image: yashigani/gateway:${YASHIGANI_VERSION:-4.1.0}
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
@@ -656,7 +656,7 @@ services:
   # ---------------------------------------------------------------------------
   backoffice:
     dns_search: ["."]
-    image: yashigani/backoffice:${YASHIGANI_VERSION:-3.0.0}
+    image: yashigani/backoffice:${YASHIGANI_VERSION:-4.1.0}
     build:
       context: ..
       dockerfile: docker/Dockerfile.backoffice
@@ -1021,7 +1021,7 @@ services:
   # ---------------------------------------------------------------------------
   extractor-svc:
     dns_search: ["."]
-    image: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
+    image: "yashigani/extractor:${YASHIGANI_VERSION:-4.1.0}"
     build:
       context: ..
       dockerfile: docker/Dockerfile.extractor
@@ -2483,7 +2483,14 @@ services:
         export PGSSLROOTCERT=/run/secrets/ca_root.crt
         export PGSSLCERT=/run/secrets/backoffice_client.crt
         export PGSSLKEY=/run/secrets/backoffice_client.key
-        # Step 1: create the letta database if it does not already exist.
+        # Step 1: ensure yashigani_app role exists (idempotent).
+        # On a clean postgres volume the role is created here (before migrations).
+        # On an existing volume it is already present (migration 0001 ran) — DO $$ is a no-op.
+        psql -v ON_ERROR_STOP=1 \
+             --host=postgres --port=5432 \
+             --username=yashigani_admin --dbname=postgres \
+             -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'yashigani_app') THEN CREATE ROLE yashigani_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END \$\$;"
+        # Step 2: create the letta database if it does not already exist.
         # \gexec is a psql metacommand that executes the result of the preceding
         # SELECT as SQL. It requires input on stdin (not -c). The WHERE NOT EXISTS
         # guard makes this idempotent: if letta already exists the SELECT returns
@@ -2494,12 +2501,19 @@ services:
           | psql -v ON_ERROR_STOP=1 \
                  --host=postgres --port=5432 \
                  --username=yashigani_admin --dbname=postgres
-        # Step 2: enable pgvector extension in the letta database (IF NOT EXISTS guard).
+        # Step 3: enable pgvector extension in the letta database (IF NOT EXISTS guard).
         psql -v ON_ERROR_STOP=1 \
              --host=postgres --port=5432 \
              --username=yashigani_admin --dbname=letta \
              -c "CREATE EXTENSION IF NOT EXISTS vector;"
-        echo "[agent-db-init] Done — letta database and pgvector extension ready"
+        # Step 4: grant schema access so letta's Alembic run (startup.sh: alembic upgrade head)
+        # succeeds on a fresh letta database.  Without this, Alembic fails with PG error 42501
+        # (permission denied for schema public) when attempting CREATE TABLE.  Idempotent.
+        psql -v ON_ERROR_STOP=1 \
+             --host=postgres --port=5432 \
+             --username=yashigani_admin --dbname=letta \
+             -c "GRANT ALL ON SCHEMA public TO yashigani_app;"
+        echo "[agent-db-init] Done — letta database, pgvector extension, and schema grants ready"
     volumes:
       # Internal mTLS material (same bind-mount as all core `data`-network services).
       # Provides: ca_root.crt, backoffice_client.crt, backoffice_client.key,

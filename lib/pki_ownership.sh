@@ -84,11 +84,16 @@
 #   promtail:0        Promtail root (accesses docker.sock + /var/lib/docker)
 #   grafana:472       Grafana (USER 472 upstream Dockerfile)
 #   prometheus:1001   Prometheus nobody (65534) + group_add 1001 → 0640 group-read
-#   langflow:1000     Bucket-C — langflowai/langflow:1.9.2 USER langflow (UID 1000)
-#   letta:0           Bucket-C — letta/letta:0.16.7 root (data at /root/.letta)
-#   open-webui:0      Bucket-C — open-webui:v0.9.2 root (runs bash start.sh as root)
-#   openclaw:1000     Bucket-C — openclaw Node image USER node (UID 1000); reads
-#                     openclaw_gateway_token via env only (not file at runtime)
+#   langflow:1000     v4.1 egress-langflow forwarder (user: "1000:1000") — langflow service
+#                     itself runs at UID 1000 but does NOT mount langflow_client.key; the
+#                     forwarder does. Key UID 1000 serves both paths.
+#   letta:1000        v4.1 egress-letta forwarder (user: "1000:1000").  The letta SERVICE
+#                     itself runs as root (UID 0) but does NOT mount letta_client.key
+#                     (letta only mounts yashigani_internal_bearer).  The forwarder is the
+#                     sole reader of letta_client.key, so UID 1000 is correct here.
+#   openclaw:1000     v4.1 egress-openclaw forwarder (user: "1000:1000").  openclaw service
+#                     also mounts openclaw_client.key directly (runs as UID 1000 / node);
+#                     UID 1000 satisfies both the service and the forwarder.
 #
 # Do NOT add services here that do NOT read a *_client.key from docker/secrets/.
 # Service identities are defined in docker/service_identities.yaml.
@@ -148,6 +153,23 @@ _YSG_PKI_SERVICE_MAP=(
   # Key owned by 1001:1001, mode 0640 → group-readable by prometheus.
   # Pentest EX-231-10 closure.
   "prometheus:1001:0640"
+  # v4.1 egress forwarders (unified-sidecar Phase 2a):
+  # Each bundled agent (openclaw, langflow, letta) has a Caddy-based egress-forwarder
+  # sidecar that runs as UID 1000 (user: "1000:1000" in *-egress-forwarder.override.yml).
+  # The forwarder mounts ./secrets/<system>_client.key as its SVID (presented to
+  # caddy:18790 as the mTLS client cert).  After PKI bootstrap the secrets dir is
+  # chowned to UID 1001 by the issuer container, leaving these keys at 1001:0600 —
+  # unreadable by the UID 1000 forwarder on Linux (macOS virtiofs hides this: F-C).
+  #
+  # Key: UID 1000 matches the forwarder's runtime user, NOT the agent service's native UID
+  # (letta service itself runs as root/UID 0, but letta_client.key is NOT mounted into
+  # the letta service — only into egress-letta).
+  #
+  # pki_key_missing_is_error: returns false for openclaw/langflow/letta (profile-gated,
+  # absence normal on lean installs — already handled in pki_key_missing_is_error below).
+  "openclaw:1000:0600"
+  "langflow:1000:0600"
+  "letta:1000:0600"
 )
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,7 @@ services:
   # presents the leaf to caddy:18790; listens plain-HTTP :9400 on the
   # egress ringfence. NO CADDY_INTERNAL_HMAC is mounted or injected here.
   egress-openclaw:
-    image: ${YASHIGANI_EGRESS_FORWARDER_IMAGE:-yashigani/caddy}:${YASHIGANI_VERSION:-3.0.0}
+    image: ${YASHIGANI_EGRESS_FORWARDER_IMAGE:-yashigani/caddy}:${YASHIGANI_VERSION:-4.1.0}
     restart: unless-stopped
     # Plain `caddy run` — caddy-entrypoint.sh (iptables logic, needs
     # NET_ADMIN) deliberately bypassed; NET_ADMIN stays dropped.

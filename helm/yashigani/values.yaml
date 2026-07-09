@@ -246,7 +246,7 @@ adminBootstrap:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "3.0.0"
+    tag: "4.1.0"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -289,7 +289,7 @@ gateway:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "3.0.0"
+    tag: "4.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -436,7 +436,7 @@ backoffice:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "3.0.0"
+    tag: "4.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
