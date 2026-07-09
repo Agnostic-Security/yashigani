@@ -369,8 +369,16 @@ def run_langflow_discovery(
         if audit_writer is not None:
             try:
                 from yashigani.audit.schema import LangflowFlowDiscoveredEvent  # noqa: PLC0415
+                # Do NOT pass tenant_id here — the reconciler is a system/service
+                # process, not a tenant-scoped action.  The default tenant_id=""
+                # on LangflowFlowDiscoveredEvent maps to _NULL_TENANT_UUID in
+                # PostgresSink._flush_batch, keeping it consistent with other
+                # system audit events (IdentityStoreConflictEvent, SoD).
+                # Passing the slug ("default") caused
+                # "ERROR: invalid input syntax for type uuid: 'default'" every
+                # ~60s because sinks.py set_config used the slug raw and the
+                # RLS policy tried current_setting('app.tenant_id')::uuid.
                 audit_writer.write(LangflowFlowDiscoveredEvent(
-                    tenant_id=tenant_id,
                     flow_id=flow_id,
                     flow_name_truncated=flow_name[:128],
                     graph_hash=graph_hash,

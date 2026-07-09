@@ -17,6 +17,8 @@ Test matrix:
   7. disclosure_string_in_audit_event — LangflowFlowDiscoveredEvent has egress_attribution
   8. disclosure_in_nhi_residuals — agent_policies row for NHI discovered flow includes
      egress_attribution_note in residuals
+  9. reconciler_audit_event_tenant_id_not_slug — audit event tenant_id is never the
+     slug "default"; regression for "invalid input syntax for type uuid: 'default'" ~60s
 """
 from __future__ import annotations
 
@@ -568,3 +570,72 @@ class TestDisclosure:
         evt = written_events[0]
         assert hasattr(evt, "egress_attribution")
         assert "INSTANCE-LEVEL" in evt.egress_attribution
+
+    def test_reconciler_audit_event_tenant_id_not_slug(self, monkeypatch):
+        """LangflowFlowDiscoveredEvent must never carry the tenant SLUG as tenant_id.
+
+        Regression for: "ERROR: invalid input syntax for type uuid: 'default'" every ~60s.
+
+        Root cause: run_langflow_discovery() defaulted tenant_id="default" (a slug)
+        and forwarded it to LangflowFlowDiscoveredEvent(tenant_id="default").
+        PostgresSink._flush_batch then called set_config('app.tenant_id', 'default', true),
+        and the RLS policy current_setting('app.tenant_id')::uuid raised a cast error.
+
+        Fix: reconciler omits tenant_id on the audit event (uses the "" default),
+        and sinks.py coerces via _coerce_uuid before set_config so the config
+        always holds a valid UUID string.
+        """
+        flow = _make_flow()
+        raw = json.dumps([flow]).encode()
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.content = raw
+        fake_resp.raise_for_status = MagicMock()
+
+        fake_client = MagicMock()
+        fake_client.__enter__ = MagicMock(return_value=fake_client)
+        fake_client.__exit__ = MagicMock(return_value=False)
+        fake_client.get = MagicMock(return_value=fake_resp)
+
+        registry_store = MagicMock()
+        registry_store.get = MagicMock(return_value=None)
+        registry_store.put = MagicMock()
+
+        written_events: list = []
+
+        class _W:
+            def write(self, evt):
+                written_events.append(evt)
+
+        monkeypatch.setenv("YASHIGANI_LANGFLOW_INTERNAL_URL", "http://langflow:7860")
+
+        with (
+            patch("yashigani.pki.client.internal_httpx_sync_client", return_value=fake_client),
+            patch(
+                "yashigani.backoffice.langflow_auth.get_langflow_api_headers",
+                return_value={"x-api-key": "k"},
+            ),
+        ):
+            from yashigani.backoffice.langflow_reconciler import run_langflow_discovery
+            # Simulate the scheduler call: no tenant_id arg (uses slug default)
+            run_langflow_discovery(registry_store, audit_writer=_W())
+
+        assert len(written_events) == 1, "expected exactly one audit event"
+        evt = written_events[0]
+
+        tenant_id_val = getattr(evt, "tenant_id", None)
+
+        # Must NOT be a non-UUID slug — "default" is the slug that caused the bug
+        assert tenant_id_val != "default", (
+            f"audit event tenant_id must not be the slug 'default', got {tenant_id_val!r}"
+        )
+
+        # tenant_id must be either empty ("" → null UUID in sinks) or a valid UUID
+        if tenant_id_val:
+            try:
+                uuid.UUID(str(tenant_id_val))
+            except (ValueError, AttributeError) as exc:
+                raise AssertionError(
+                    f"audit event tenant_id {tenant_id_val!r} is not a valid UUID: {exc}"
+                ) from exc

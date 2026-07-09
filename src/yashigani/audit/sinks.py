@@ -183,10 +183,17 @@ class PostgresSink(AuditSink):
         async with pool.acquire() as conn:
             async with conn.transaction():
                 for event in batch:
-                    tenant_id = event.get("tenant_id") or "00000000-0000-0000-0000-000000000000"
+                    # _coerce_uuid handles None / "" / non-UUID slugs (e.g. "default")
+                    # → None; fallback to _NULL_TENANT_UUID.  set_config MUST receive
+                    # a valid UUID string — the RLS policy on audit_events and other
+                    # tables evaluates current_setting('app.tenant_id')::uuid, so a
+                    # non-UUID value (slug like "default") raises
+                    # "invalid input syntax for type uuid" inside the RLS check even
+                    # though the INSERT value itself is correctly coerced below.
+                    tenant_uuid = _coerce_uuid(event.get("tenant_id")) or _NULL_TENANT_UUID
                     await conn.execute(
                         "SELECT set_config('app.tenant_id', $1, true)",
-                        str(tenant_id),
+                        str(tenant_uuid),
                     )
                     req_id = event.get("request_id")
 
@@ -242,12 +249,10 @@ class PostgresSink(AuditSink):
                     # canonical ordering key; its value is DB-assigned (BIGSERIAL).
                     row = await conn.fetchrow(
                         INSERT_AUDIT_EVENT,
-                        # FINDING F-AUDIT: tenant_id column is NOT NULL, so a
-                        # non-UUID tenant (e.g. the synthetic "internal" service
-                        # identity) must fall back to the all-zeros UUID rather
-                        # than crash the batch. Empty/missing already mapped to
-                        # the zeros UUID above (event.get(... ) or "0000...").
-                        (_coerce_uuid(tenant_id) or _NULL_TENANT_UUID),
+                        # tenant_uuid already coerced above (non-UUID slugs like
+                        # "default" → _NULL_TENANT_UUID); reuse directly so the
+                        # set_config value and the INSERT value are identical.
+                        tenant_uuid,
                         event.get("event_type", "UNKNOWN"),
                         # FINDING F-AUDIT: chat completions carry a non-UUID
                         # correlation id (e.g. "chatcmpl-..."). Coerce to NULL
