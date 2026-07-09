@@ -192,6 +192,15 @@ spec:
             # Set to "false" in values.yaml or via --set to disable.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.gateway.semanticIntentSidecar | default "true" | quote }}
+            # FLAG-3 fix: per-instance /egress/eval LLM rate cap (EgressLimitEnforcer).
+            # Compose parity: docker-compose.yml gateway env YASHIGANI_EGRESS_LIMIT_*.
+            # mode: "cap" (default) deny+fail-closed; "monitor" meter-only, never deny.
+            - name: YASHIGANI_EGRESS_LIMIT_MODE
+              value: {{ .Values.gateway.egressLimitMode | default "cap" | quote }}
+            - name: YASHIGANI_EGRESS_LIMIT_CALLS
+              value: {{ .Values.gateway.egressLimitCalls | default "200" | quote }}
+            - name: YASHIGANI_EGRESS_LIMIT_WINDOW_SECONDS
+              value: {{ .Values.gateway.egressLimitWindowSeconds | default "60" | quote }}
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: POSTGRES_PASSWORD

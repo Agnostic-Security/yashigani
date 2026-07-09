@@ -85,6 +85,7 @@ class EgressProxyState:
     opa_url: str = ""
     audit_writer: Any = field(default=None, repr=False)
     caddy_egress_base: str = "https://caddy:18790"
+    egress_limit_enforcer: Any = field(default=None, repr=False)
 
 
 _state = EgressProxyState()
@@ -96,12 +97,22 @@ def configure(
     opa_url: str,
     audit_writer: Any,
     caddy_egress_base: str = "",
+    egress_limit_enforcer: Any = None,
 ) -> None:
     """
     Wire the egress proxy state.  Called from gateway entrypoint.py lifespan.
 
     ``caddy_egress_base`` is taken from the YASHIGANI_CADDY_EGRESS_BASE env
     var when not passed explicitly; falls back to ``"https://caddy:18790"``.
+
+    ``egress_limit_enforcer`` is an optional
+    :class:`~yashigani.gateway.egress_limit.EgressLimitEnforcer` instance.
+    When supplied, every request through ``/egress/eval`` is counted and
+    checked against the per-instance cap BEFORE body inspection and OPA.
+    When ``None``, the limiter is skipped (graceful degradation on Redis
+    unavailability during startup — cap is wired in entrypoint.py with a
+    try/except so Redis failure only disables the limiter, it does not abort
+    the gateway).
     """
     _state.opa_url = opa_url
     _state.audit_writer = audit_writer
@@ -109,10 +120,13 @@ def configure(
         caddy_egress_base
         or os.getenv("YASHIGANI_CADDY_EGRESS_BASE", "https://caddy:18790")
     )
+    _state.egress_limit_enforcer = egress_limit_enforcer
     logger.info(
-        "egress-eval: configured opa_url=%s caddy_egress_base=%s",
+        "egress-eval: configured opa_url=%s caddy_egress_base=%s "
+        "egress_limit_enforcer=%s",
         opa_url,
         _state.caddy_egress_base,
+        "enabled" if egress_limit_enforcer is not None else "disabled",
     )
 
 
@@ -165,6 +179,54 @@ async def egress_eval(
                 "message": "No caller identity presented.",
             },
         )
+
+    # ── 1b. Per-instance egress rate/budget cap (FLAG-3) ────────────────────
+    # Enforces YASHIGANI_EGRESS_LIMIT_CALLS per YASHIGANI_EGRESS_LIMIT_WINDOW_SECONDS
+    # for every agent that routes LLM calls through /egress/eval (langflow,
+    # letta, openclaw).  Keyed on SHA-256(caller_spiffe) — per-instance, same
+    # hash as OPA's _spiffe_hash in mcp.rego:649.
+    #
+    # Mode=cap (default): over-limit → 429, fail-closed on Redis error.
+    # Mode=monitor:       over-limit → log warning but allow, Redis error → allow.
+    #
+    # Placed BEFORE body read so the 429 is cheap (no I/O for the body) and
+    # so that an instance flooding the gateway with egress calls cannot force
+    # expensive body + OPA processing on every request.
+    if _state.egress_limit_enforcer is not None:
+        _rl_result = _state.egress_limit_enforcer.check_and_record(caller_spiffe)
+        if not _rl_result.allowed:
+            logger.warning(
+                "egress-eval: rate cap DENY caller=%s count=%d/%d "
+                "key=%s retry_after_s=%d mode=%s prefix=%s path=%s",
+                caller_spiffe,
+                _rl_result.count,
+                _rl_result.limit,
+                _rl_result.rate_limit_key,
+                _rl_result.retry_after_s,
+                _rl_result.mode,
+                prefix,
+                path,
+            )
+            _emit_deny_audit(
+                caller_spiffe=caller_spiffe,
+                prefix=prefix,
+                result_sensitivity="PUBLIC",  # pre-inspection — unknown; use default
+                pii_detected=False,
+                deny_reason="egress_rate_limit_exceeded",
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "egress_rate_limit_exceeded",
+                    "message": (
+                        "Egress LLM call rate limit exceeded for this instance. "
+                        f"Limit: {_rl_result.limit} calls per "
+                        f"{_state.egress_limit_enforcer.window_seconds}s window."
+                    ),
+                },
+                headers={"Retry-After": str(_rl_result.retry_after_s)},
+            )
 
     # ── 2. Body ─────────────────────────────────────────────────────────────
     body_bytes = await request.body()

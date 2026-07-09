@@ -556,6 +556,15 @@ services:
       #     a model pulled by the installer (currently qwen2.5:3b).
       YASHIGANI_LETTA_BRAIN_MODEL: ${YASHIGANI_LETTA_BRAIN_MODEL:-openai-proxy/qwen2.5:3b}
       YASHIGANI_LETTA_EMBEDDING_MODEL: ${YASHIGANI_LETTA_EMBEDDING_MODEL:-qwen2.5:3b}
+      # FLAG-3 fix: per-instance /egress/eval LLM call rate cap (EgressLimitEnforcer).
+      # MODE: "cap" (default) → deny with 429 when limit exceeded, fail-closed on
+      #       Redis error.  "monitor" → meter only, never deny; operators observe
+      #       real usage before switching to cap.
+      # CALLS: max egress LLM calls per instance per WINDOW (default: 200/60s).
+      # WINDOW_SECONDS: fixed window size in seconds (default: 60).
+      YASHIGANI_EGRESS_LIMIT_MODE: ${YASHIGANI_EGRESS_LIMIT_MODE:-cap}
+      YASHIGANI_EGRESS_LIMIT_CALLS: ${YASHIGANI_EGRESS_LIMIT_CALLS:-200}
+      YASHIGANI_EGRESS_LIMIT_WINDOW_SECONDS: ${YASHIGANI_EGRESS_LIMIT_WINDOW_SECONDS:-60}
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap

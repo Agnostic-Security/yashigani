@@ -844,9 +844,34 @@ def _build_app(mesh_mode: bool = False):
     # Mounts /egress/eval/{prefix}/{path:path}: every sidecar-wrapped system's
     # outbound body traverses this endpoint for secret_detector + M4 injection
     # inspection + OPA mcp_response_decision before Caddy forwards to destination.
+    #
+    # FLAG-3 fix: wire per-instance egress rate/budget cap via EgressLimitEnforcer.
+    # Uses Redis DB-2 (same DB as EndpointRateLimiter, distinct egress:rlk: prefix).
+    # On Redis failure: enforcer is set to None → limiter gracefully disabled for
+    # this boot (gateway does not abort — consistent with endpoint ratelimit pattern).
+    _egress_limit_enforcer = None
+    try:
+        import redis as _redis
+        from yashigani.gateway.egress_limit import EgressLimitEnforcer
+        _redis_client_egress_rl = _redis.from_url(_gw_redis_url(2), decode_responses=False)
+        _redis_client_egress_rl.ping()
+        _egress_limit_enforcer = EgressLimitEnforcer(redis_client=_redis_client_egress_rl)
+        logger.info(
+            "Egress limit enforcer ready (mode=%s calls=%d window=%ds)",
+            _egress_limit_enforcer.mode,
+            _egress_limit_enforcer.calls_per_window,
+            _egress_limit_enforcer.window_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Egress limit enforcer unavailable (%s) — /egress/eval rate cap disabled",
+            exc,
+        )
+
     configure_egress_proxy(
         opa_url=opa_url,
         audit_writer=audit_writer,
+        egress_limit_enforcer=_egress_limit_enforcer,
     )
 
     # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────
