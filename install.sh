@@ -9036,6 +9036,50 @@ for agent_spec in agents_spec:
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
 
+# POST-REGISTRATION: mint capability envelopes for bundled agents (SEC-ENVELOPE-001).
+#
+# bootstrap_bundled_agent_envelopes in app.py lifespan fires BEFORE this script
+# runs: backoffice starts at step 10 (compose_up), lifespan completes, THEN
+# step 11b calls register_agent_bundles.  On a cold install the agent registry
+# (Redis db/3) is empty at lifespan time, so both bootstrap passes in the
+# lifespan find 0 bundled agents and mint 0 envelopes.
+#
+# Fix: mint here, immediately after each agent is written to Redis+Postgres,
+# so mcp_tool_surface_pins has rows before the first request reaches
+# /auth/verify-mcp step 3.  Idempotent: get_active_envelope() skips already-
+# active rows (covers re-run / upgrade paths where envelopes already exist).
+#
+# decode_responses=False for the registry client: AgentRegistry._decode_agent
+# does byte-key lookups on the hgetall return dict, which only works when Redis
+# returns bytes (the default); decode_responses=True would flip all keys to str
+# and cause every field lookup to silently return the empty-bytes default.
+import asyncio as _asyncio
+
+async def _mint_bundled_envelopes():
+    import asyncpg as _asyncpg
+    import redis as _r2
+    from yashigani.gateway._redis_url import build_redis_url as _bru
+    from yashigani.agents.registry import AgentRegistry as _AR
+    from yashigani.mcp.envelope_service import CapabilityEnvelopeService as _CES
+    from yashigani.backoffice.bundled_envelopes import bootstrap_bundled_agent_envelopes as _bbe
+    _dsn = os.environ.get("YASHIGANI_DB_DSN_DIRECT") or os.environ.get("YASHIGANI_DB_DSN", "")
+    if not _dsn or "${POSTGRES_PASSWORD}" in _dsn:
+        return []
+    _ru = _bru(3, use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+               secrets_dir="/run/secrets", client_cert_name="backoffice_client")
+    _rc2 = _r2.from_url(_ru, decode_responses=False)
+    _pool = await _asyncpg.create_pool(_dsn, min_size=1, max_size=1)
+    try:
+        return await _bbe(_CES(_pool), _AR(_rc2))
+    finally:
+        await _pool.close()
+
+try:
+    for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
+        results.append("ENVELOPE_MINTED:" + _pid)
+except Exception as _me:
+    results.append("ENVELOPE_WARN:" + str(_me))
+
 for r in results:
     print(r)
 ' 2>&1)" || reg_exit=$?
@@ -9090,6 +9134,14 @@ for r in results:
         ;;
       ERROR:*)
         log_warn "Agent registration: ${line#ERROR:}"
+        ;;
+      ENVELOPE_MINTED:*)
+        # SEC-ENVELOPE-001: capability envelope minted for this bundled agent front.
+        log_success "  envelope minted: ${line#ENVELOPE_MINTED:}"
+        ;;
+      ENVELOPE_WARN:*)
+        # Non-fatal: fail-closed (verify-mcp denies until next boot retries).
+        log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}"
         ;;
     esac
   done <<< "$reg_output"
